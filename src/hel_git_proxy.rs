@@ -1,10 +1,13 @@
 //! Authenticated, path-confined Git smart-protocol bridge for local bundles.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -12,9 +15,12 @@ use tokio::process::Command;
 use crate::hel_local_git::canonical_repository;
 use crate::hel_targets::CommandSpec;
 
-const BRIDGE_MAGIC: &[u8] = b"HEL-GIT-BRIDGE-1\n";
+const BRIDGE_MAGIC: &[u8] = b"HEL-GIT-BRIDGE-2\n";
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_OPEN: usize = 16 * 1024;
+/// How long a broker waits for its target bridge to exit once the frame
+/// stream between them has closed.
+const BRIDGE_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,21 +54,62 @@ impl GitBrokerSpec {
     }
 }
 
-#[cfg(unix)]
+/// Whether a broker process still owns this session's bridge.
+///
+/// A live broker holds an exclusive advisory lock on its PID file for as long
+/// as it runs, so liveness is the lock rather than the number written in the
+/// file: a PID file left behind by a killed broker, or one whose PID the
+/// system has since handed to an unrelated process, reads as dead and is
+/// restarted instead of being trusted or blocking the session forever.
 pub fn broker_is_alive(pid_path: &Path) -> bool {
-    let Ok(pid) = std::fs::read_to_string(pid_path) else {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(pid_path) else {
         return false;
     };
-    let Ok(pid) = pid.trim().parse::<i32>() else {
-        return false;
-    };
-    // Signal zero performs existence/permission checking without changing the process.
-    unsafe { libc::kill(pid, 0) == 0 }
+    match file.try_lock() {
+        // Nobody holds the lock, so the broker that wrote this file is gone.
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(error)) => {
+            tracing::warn!(
+                path = %pid_path.display(),
+                error = %error,
+                "could not test the Git broker lock; treating the broker as gone"
+            );
+            false
+        }
+    }
 }
 
-#[cfg(not(unix))]
-pub fn broker_is_alive(_pid_path: &Path) -> bool {
-    false
+/// Take ownership of this session's broker slot for the life of the process.
+fn claim_broker_pid_file(pid_path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(pid_path)
+        .with_context(|| format!("open Git broker lock {}", pid_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => bail!(
+            "another local Git broker already owns {}",
+            pid_path.display()
+        ),
+        Err(TryLockError::Error(error)) => {
+            return Err(error)
+                .with_context(|| format!("lock Git broker file {}", pid_path.display()));
+        }
+    }
+    file.set_len(0)?;
+    file.write_all(std::process::id().to_string().as_bytes())?;
+    file.flush()?;
+    Ok(file)
 }
 
 pub async fn run_broker(spec_path: &Path) -> Result<()> {
@@ -75,10 +122,12 @@ pub async fn run_broker(spec_path: &Path) -> Result<()> {
     if let Some(parent) = spec.ready_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&spec.pid_path, std::process::id().to_string())?;
+    // Held until this process exits: it is what `broker_is_alive` observes.
+    let pid_file = claim_broker_pid_file(&spec.pid_path)?;
     let result = run_bridge_process(&spec, repositories).await;
     let _ = std::fs::remove_file(&spec.ready_path);
     let _ = std::fs::remove_file(&spec.pid_path);
+    drop(pid_file);
     result
 }
 
@@ -107,39 +156,135 @@ async fn run_bridge_process(
     ensure!(magic == BRIDGE_MAGIC, "target Git bridge version mismatch");
     crate::hel_config::atomic_write(&spec.ready_path, b"ready\n")?;
 
-    loop {
-        let Some(open) = read_frame_optional(&mut output, MAX_OPEN).await? else {
-            break;
-        };
-        let open: GitOpen = serde_json::from_slice(&open).context("decode Git bridge request")?;
-        let repository = repositories.get(&open.repository).with_context(|| {
-            format!(
-                "Git bridge requested unknown repository {:?}",
-                open.repository
-            )
-        })?;
-        serve_git(&mut input, &mut output, repository, &open.service).await?;
-    }
-    let status = child.wait().await.context("wait for target Git bridge")?;
+    let outcome = serve_bridge(&mut input, &mut output, &repositories, &spec.session_id).await;
+    // Closing the frame stream is how an idle target bridge learns that its
+    // broker is finished with it.
+    drop(input);
+    drop(output);
+    let status = match tokio::time::timeout(BRIDGE_EXIT_GRACE, child.wait()).await {
+        Ok(status) => Some(status.context("wait for target Git bridge")?),
+        Err(_) => {
+            let _ = child.kill().await;
+            None
+        }
+    };
+    outcome?;
+    let status = status.context("target Git bridge did not exit after its stream closed")?;
     ensure!(status.success(), "target Git bridge exited with {status}");
     Ok(())
+}
+
+/// Outcome of one bridged Git exchange whose frame stream is still in sync.
+///
+/// A failed exchange costs its own connection and nothing else, so both loops
+/// report it and keep serving. A frame stream that can no longer be
+/// interpreted is returned as `Err` instead, because no later exchange could
+/// be framed correctly after it.
+#[must_use]
+enum Exchange {
+    Completed,
+    Failed(anyhow::Error),
+}
+
+/// Serve bridged Git exchanges until the target bridge closes its stream.
+async fn serve_bridge(
+    input: &mut (impl AsyncWrite + Unpin),
+    output: &mut (impl AsyncRead + Unpin),
+    repositories: &BTreeMap<String, PathBuf>,
+    session_id: &str,
+) -> Result<()> {
+    loop {
+        let open = match read_frame(output, MAX_OPEN).await? {
+            Frame::Data(open) => open,
+            // The target bridge is gone: no further exchange is possible.
+            Frame::Closed => return Ok(()),
+            Frame::End => {
+                tracing::warn!(
+                    session_id,
+                    "target Git bridge ended an exchange that was not open"
+                );
+                continue;
+            }
+        };
+        match serve_exchange(input, output, repositories, &open).await? {
+            Exchange::Completed => {}
+            Exchange::Failed(error) => tracing::warn!(
+                session_id,
+                error = format!("{error:#}"),
+                "bridged Git exchange failed"
+            ),
+        }
+    }
+}
+
+async fn serve_exchange(
+    input: &mut (impl AsyncWrite + Unpin),
+    output: &mut (impl AsyncRead + Unpin),
+    repositories: &BTreeMap<String, PathBuf>,
+    open: &[u8],
+) -> Result<Exchange> {
+    let request: GitOpen = match serde_json::from_slice(open) {
+        Ok(request) => request,
+        Err(error) => {
+            let error = anyhow!(error).context("decode Git bridge request");
+            return refuse_exchange(input, output, error).await;
+        }
+    };
+    let Some(repository) = repositories.get(&request.repository) else {
+        let error = anyhow!(
+            "Git bridge requested unknown repository {:?}",
+            request.repository
+        );
+        return refuse_exchange(input, output, error).await;
+    };
+    let command = match git_service(&request.service) {
+        Ok(command) => command,
+        Err(error) => return refuse_exchange(input, output, error).await,
+    };
+    serve_git(input, output, repository, command).await
+}
+
+fn git_service(service: &str) -> Result<&'static str> {
+    match service {
+        "git-upload-pack" => Ok("upload-pack"),
+        "git-receive-pack" => Ok("receive-pack"),
+        _ => bail!("unsupported Git service {service:?}"),
+    }
+}
+
+/// Refuse one exchange without losing the frame stream: end this side of it,
+/// then read the target's side through to its end frame.
+async fn refuse_exchange(
+    input: &mut (impl AsyncWrite + Unpin),
+    output: &mut (impl AsyncRead + Unpin),
+    error: anyhow::Error,
+) -> Result<Exchange> {
+    write_frame(input, &[]).await?;
+    drain_exchange(output).await?;
+    Ok(Exchange::Failed(error))
+}
+
+/// Read the peer's remaining frames for the exchange in progress.
+async fn drain_exchange(output: &mut (impl AsyncRead + Unpin)) -> Result<()> {
+    loop {
+        match read_frame(output, MAX_FRAME).await? {
+            Frame::Data(_) => {}
+            Frame::End => return Ok(()),
+            Frame::Closed => bail!("the target Git bridge closed during an exchange"),
+        }
+    }
 }
 
 async fn serve_git<W, R>(
     bridge_input: &mut W,
     bridge_output: &mut R,
     repository: &Path,
-    service: &str,
-) -> Result<()>
+    command: &str,
+) -> Result<Exchange>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let command = match service {
-        "git-upload-pack" => "upload-pack",
-        "git-receive-pack" => "receive-pack",
-        _ => bail!("unsupported Git service {service:?}"),
-    };
     let mut git = Command::new("git");
     git.args([
         "-c",
@@ -156,43 +301,69 @@ where
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let mut git = git
-        .spawn()
-        .with_context(|| format!("start git {command}"))?;
-    let mut git_input = git.stdin.take().context("Git service stdin is missing")?;
-    let mut git_output = git.stdout.take().context("Git service stdout is missing")?;
-
-    let from_target = async {
-        while let Some(frame) = read_frame_optional(bridge_output, MAX_FRAME).await? {
-            git_input.write_all(&frame).await?;
-        }
-        git_input.shutdown().await?;
-        Ok::<(), anyhow::Error>(())
+    let mut git = match git.spawn().with_context(|| format!("start git {command}")) {
+        Ok(git) => git,
+        Err(error) => return refuse_exchange(bridge_input, bridge_output, error).await,
     };
+    let (Some(mut git_input), Some(mut git_output)) = (git.stdin.take(), git.stdout.take()) else {
+        let _ = git.kill().await;
+        let error = anyhow!("git {command} was started without both pipes");
+        return refuse_exchange(bridge_input, bridge_output, error).await;
+    };
+
     let to_target = async {
         let mut buffer = vec![0; 64 * 1024];
+        let mut failure = None;
         loop {
-            let count = git_output.read(&mut buffer).await?;
-            if count == 0 {
-                write_frame(bridge_input, &[]).await?;
-                break;
+            match git_output.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(count) => write_frame(bridge_input, &buffer[..count]).await?,
+                Err(error) => {
+                    failure = Some(anyhow!(error).context(format!("read git {command} output")));
+                    break;
+                }
             }
-            write_frame(bridge_input, &buffer[..count]).await?;
         }
-        Ok::<(), anyhow::Error>(())
+        // Exactly one end frame per exchange, on every path: the target reads
+        // until it arrives.
+        write_frame(bridge_input, &[]).await?;
+        Ok::<_, anyhow::Error>(failure)
     };
-    tokio::pin!(from_target);
-    tokio::pin!(to_target);
-    tokio::select! {
-        result = &mut to_target => result?,
-        result = &mut from_target => {
-            result?;
-            to_target.await?;
+    let from_target = async move {
+        loop {
+            match read_frame(bridge_output, MAX_FRAME).await? {
+                // A service that has already exited must not stop the drain:
+                // the frame stream stays in sync only if every frame of this
+                // exchange is read.
+                Frame::Data(frame) => {
+                    let _ = git_input.write_all(&frame).await;
+                }
+                Frame::End => break,
+                Frame::Closed => bail!("the target Git bridge closed mid-exchange"),
+            }
         }
+        // Closing the handle is what ends the service's input: shutting a
+        // child's stdin down leaves the pipe open, and Git would wait on it
+        // forever.
+        drop(git_input);
+        Ok::<_, anyhow::Error>(())
+    };
+    // Both halves always run to completion, so one interrupted transfer can
+    // never leave unread frames in front of the next exchange.
+    let (service_failure, ()) = tokio::try_join!(to_target, from_target)?;
+    if let Some(failure) = service_failure {
+        let _ = git.kill().await;
+        return Ok(Exchange::Failed(failure));
     }
-    let status = git.wait().await.context("wait for Git service")?;
-    ensure!(status.success(), "git {command} exited with {status}");
-    Ok(())
+    match git.wait().await {
+        Ok(status) if status.success() => Ok(Exchange::Completed),
+        Ok(status) => Ok(Exchange::Failed(anyhow!(
+            "git {command} exited with {status}"
+        ))),
+        Err(error) => Ok(Exchange::Failed(
+            anyhow!(error).context("wait for Git service"),
+        )),
+    }
 }
 
 async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), data: &[u8]) -> Result<()> {
@@ -203,26 +374,44 @@ async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), data: &[u8]) -> Res
     Ok(())
 }
 
-async fn read_frame_optional(
-    reader: &mut (impl AsyncRead + Unpin),
-    maximum: usize,
-) -> Result<Option<Vec<u8>>> {
+/// One read from a bridge frame stream.
+enum Frame {
+    /// Payload bytes belonging to the exchange in progress.
+    Data(Vec<u8>),
+    /// The peer finished its half of the exchange in progress.
+    End,
+    /// The peer closed the stream: no further exchange is possible.
+    Closed,
+}
+
+async fn read_frame(reader: &mut (impl AsyncRead + Unpin), maximum: usize) -> Result<Frame> {
     let length = match reader.read_u32().await {
         Ok(length) => length as usize,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(Frame::Closed);
+        }
         Err(error) => return Err(error.into()),
     };
     if length == 0 {
-        return Ok(None);
+        return Ok(Frame::End);
     }
     ensure!(length <= maximum, "Git bridge frame is too large");
     let mut data = vec![0; length];
     reader.read_exact(&mut data).await?;
-    Ok(Some(data))
+    Ok(Frame::Data(data))
 }
 
 #[cfg(unix)]
 pub async fn run_worker_bridge(root: &Path) -> Result<()> {
+    run_worker_bridge_over(root, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+#[cfg(unix)]
+async fn run_worker_bridge_over(
+    root: &Path,
+    mut broker_input: impl AsyncRead + Unpin,
+    mut broker_output: impl AsyncWrite + Unpin,
+) -> Result<()> {
     use tokio::net::UnixListener;
 
     std::fs::create_dir_all(root)?;
@@ -234,44 +423,93 @@ pub async fn run_worker_bridge(root: &Path) -> Result<()> {
         .with_context(|| format!("bind Git proxy socket {}", socket.display()))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    stdout.write_all(BRIDGE_MAGIC).await?;
-    stdout.flush().await?;
+    broker_output.write_all(BRIDGE_MAGIC).await?;
+    broker_output.flush().await?;
     loop {
-        let (stream, _) = listener.accept().await.context("accept Git proxy client")?;
-        let (mut read, mut write) = stream.into_split();
-        let open = read_handshake(&mut read).await?;
-        write_frame(&mut stdout, &open).await?;
-        let from_git = async {
-            let mut buffer = vec![0; 64 * 1024];
-            loop {
-                let count = read.read(&mut buffer).await?;
-                if count == 0 {
-                    write_frame(&mut stdout, &[]).await?;
-                    break;
-                }
-                write_frame(&mut stdout, &buffer[..count]).await?;
-            }
-            Ok::<(), anyhow::Error>(())
+        let stream = tokio::select! {
+            accepted = listener.accept() => accepted.context("accept Git proxy client")?.0,
+            // Between exchanges the broker sends nothing, so the only thing
+            // this read can report is the broker going away. Nothing is in
+            // flight to lose when the branch that is not taken is dropped.
+            frame = read_frame(&mut broker_input, MAX_FRAME) => match frame? {
+                Frame::Closed => return Ok(()),
+                _ => bail!("Git broker sent a frame between exchanges"),
+            },
         };
-        let to_git = async {
-            while let Some(frame) = read_frame_optional(&mut stdin, MAX_FRAME).await? {
-                write.write_all(&frame).await?;
-            }
-            write.shutdown().await?;
-            Ok::<(), anyhow::Error>(())
-        };
-        tokio::pin!(from_git);
-        tokio::pin!(to_git);
-        tokio::select! {
-            result = &mut to_git => result?,
-            result = &mut from_git => {
-                result?;
-                to_git.await?;
+        match serve_client(stream, &mut broker_input, &mut broker_output).await? {
+            Exchange::Completed => {}
+            Exchange::Failed(error) => {
+                tracing::warn!(error = format!("{error:#}"), "bridged Git client failed")
             }
         }
     }
+}
+
+/// Bridge one accepted client through the broker's frame stream.
+#[cfg(unix)]
+async fn serve_client(
+    stream: tokio::net::UnixStream,
+    broker_input: &mut (impl AsyncRead + Unpin),
+    broker_output: &mut (impl AsyncWrite + Unpin),
+) -> Result<Exchange> {
+    let (mut read, mut write) = stream.into_split();
+    let open = match read_handshake(&mut read).await {
+        Ok(open) => open,
+        // Nothing has been framed upstream yet, so a client that dies during
+        // its handshake costs the bridge nothing at all.
+        Err(error) => return Ok(Exchange::Failed(error)),
+    };
+    write_frame(broker_output, &open).await?;
+
+    let served = tokio::sync::Notify::new();
+    let to_broker = async {
+        let mut buffer = vec![0; 64 * 1024];
+        let mut failure = None;
+        loop {
+            let count = tokio::select! {
+                biased;
+                // The service finished, so stop reading a client that may
+                // never hang up instead of holding the exchange open.
+                () = served.notified() => break,
+                // `read` is cancel-safe, and every frame is written outside
+                // the select, so no partial frame can reach the broker.
+                result = read.read(&mut buffer) => match result {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) => {
+                        failure = Some(anyhow!(error).context("read Git proxy client"));
+                        break;
+                    }
+                },
+            };
+            write_frame(broker_output, &buffer[..count]).await?;
+        }
+        // Exactly one end frame per exchange, on every path.
+        write_frame(broker_output, &[]).await?;
+        Ok::<_, anyhow::Error>(failure)
+    };
+    let from_broker = async {
+        loop {
+            match read_frame(broker_input, MAX_FRAME).await? {
+                // A client that has gone away must not stop the drain: the
+                // frame stream stays in sync only if every frame of this
+                // exchange is read.
+                Frame::Data(frame) => {
+                    let _ = write.write_all(&frame).await;
+                }
+                Frame::End => break,
+                Frame::Closed => bail!("the Git broker closed the bridge"),
+            }
+        }
+        let _ = write.shutdown().await;
+        served.notify_one();
+        Ok::<_, anyhow::Error>(())
+    };
+    let (client_failure, ()) = tokio::try_join!(to_broker, from_broker)?;
+    Ok(match client_failure {
+        Some(error) => Exchange::Failed(error),
+        None => Exchange::Completed,
+    })
 }
 
 #[cfg(unix)]
@@ -334,6 +572,249 @@ async fn read_handshake(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>
 #[cfg(not(unix))]
 pub async fn run_worker_bridge(_root: &Path) -> Result<()> {
     bail!("Git proxy workers require Unix")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Read one exchange's frames through the peer's end frame.
+    async fn read_exchange(reader: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+        let mut received = Vec::new();
+        loop {
+            match read_frame(reader, MAX_FRAME).await.unwrap() {
+                Frame::Data(frame) => received.extend_from_slice(&frame),
+                Frame::End => return received,
+                Frame::Closed => panic!("the bridge stream closed mid-exchange"),
+            }
+        }
+    }
+
+    async fn read_data_frame(reader: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+        match read_frame(reader, MAX_FRAME).await.unwrap() {
+            Frame::Data(frame) => frame,
+            Frame::End => panic!("expected a data frame, not the end of an exchange"),
+            Frame::Closed => panic!("expected a data frame, not a closed stream"),
+        }
+    }
+
+    async fn write_all_framed(writer: &mut (impl AsyncWrite + Unpin), data: &[u8]) {
+        for chunk in data.chunks(64 * 1024) {
+            write_frame(writer, chunk).await.unwrap();
+        }
+        write_frame(writer, &[]).await.unwrap();
+    }
+
+    fn open_frame(repository: &str) -> Vec<u8> {
+        serde_json::to_vec(&GitOpen {
+            repository: repository.into(),
+            service: "git-upload-pack".into(),
+        })
+        .unwrap()
+    }
+
+    fn git(directory: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A repository whose ref advertisement is far larger than one pipe
+    /// buffer, so a bridged transfer really has to stream.
+    fn repository_with_large_advertisement(root: &Path) -> PathBuf {
+        let repository = root.join("main");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.name", "Hel Test"]);
+        git(&repository, &["config", "user.email", "hel@example.test"]);
+        std::fs::write(repository.join("tracked"), "content").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-qm", "base"]);
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+        let mut packed = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+        packed.push_str(&format!("{head} refs/heads/main\n"));
+        for index in 0..3000 {
+            packed.push_str(&format!("{head} refs/tags/advertised-{index:04}\n"));
+        }
+        std::fs::write(repository.join(".git/packed-refs"), packed).unwrap();
+        repository
+    }
+
+    /// A refused request, a failing Git service, and a transfer the target
+    /// abandons midway are all one exchange's failure: the broker keeps
+    /// serving the exchanges that follow them.
+    #[tokio::test]
+    async fn the_broker_serves_later_exchanges_after_one_fails_mid_transfer() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = repository_with_large_advertisement(directory.path());
+        let not_a_repository = directory.path().join("not-a-repository");
+        std::fs::create_dir_all(&not_a_repository).unwrap();
+        let repositories = BTreeMap::from([
+            ("main".to_owned(), repository),
+            ("broken".to_owned(), not_a_repository),
+        ]);
+
+        let (broker_end, target_end) = tokio::io::duplex(16 * 1024);
+        let (mut broker_read, mut broker_write) = tokio::io::split(broker_end);
+        let (mut target_read, mut target_write) = tokio::io::split(target_end);
+        let serving = tokio::spawn(async move {
+            serve_bridge(&mut broker_write, &mut broker_read, &repositories, "test").await
+        });
+
+        // An unknown repository is refused, not fatal.
+        write_frame(&mut target_write, &open_frame("absent"))
+            .await
+            .unwrap();
+        write_frame(&mut target_write, &[]).await.unwrap();
+        assert!(read_exchange(&mut target_read).await.is_empty());
+
+        // A Git service that exits non-zero is refused the same way.
+        write_frame(&mut target_write, &open_frame("broken"))
+            .await
+            .unwrap();
+        write_frame(&mut target_write, &[]).await.unwrap();
+        assert!(read_exchange(&mut target_read).await.is_empty());
+
+        // A client that hangs up midway through a large transfer leaves the
+        // frame stream in sync for the next exchange.
+        write_frame(&mut target_write, &open_frame("main"))
+            .await
+            .unwrap();
+        let mut abandoned = read_data_frame(&mut target_read).await.len();
+        while abandoned <= 64 * 1024 {
+            abandoned += read_data_frame(&mut target_read).await.len();
+        }
+        write_frame(&mut target_write, &[]).await.unwrap();
+        let remainder = read_exchange(&mut target_read).await;
+        assert!(abandoned + remainder.len() > 64 * 1024);
+
+        // The bridge still serves a complete exchange afterwards.
+        write_frame(&mut target_write, &open_frame("main"))
+            .await
+            .unwrap();
+        // A client that wants nothing sends a flush packet and hangs up.
+        write_frame(&mut target_write, b"0000").await.unwrap();
+        write_frame(&mut target_write, &[]).await.unwrap();
+        let advertisement = read_exchange(&mut target_read).await;
+        assert!(
+            advertisement.len() > 64 * 1024,
+            "advertisement was {} bytes",
+            advertisement.len()
+        );
+        assert!(String::from_utf8_lossy(&advertisement).contains("refs/heads/main"));
+
+        // Both halves have to go for the stream itself to close.
+        drop((target_read, target_write));
+        serving.await.unwrap().unwrap();
+    }
+
+    /// A client that dies mid-transfer must cost its own connection only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_worker_bridge_serves_the_next_client_after_one_dies_mid_transfer() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let (worker_end, broker_end) = tokio::io::duplex(16 * 1024);
+        let (worker_read, worker_write) = tokio::io::split(worker_end);
+        let (mut broker_read, mut broker_write) = tokio::io::split(broker_end);
+        let serving =
+            tokio::spawn(
+                async move { run_worker_bridge_over(&root, worker_read, worker_write).await },
+            );
+
+        let mut magic = vec![0; BRIDGE_MAGIC.len()];
+        broker_read.read_exact(&mut magic).await.unwrap();
+        assert_eq!(magic, BRIDGE_MAGIC);
+        let socket = directory.path().join("git.sock");
+        let request = vec![b'q'; 256 * 1024];
+        let reply = vec![b'r'; 256 * 1024];
+
+        // The first client streams a large request and vanishes without ever
+        // reading its reply.
+        let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        client
+            .write_all(b"{\"repository\":\"main\",\"service\":\"git-upload-pack\"}\n")
+            .await
+            .unwrap();
+        let open = read_data_frame(&mut broker_read).await;
+        assert!(String::from_utf8_lossy(&open).contains("git-upload-pack"));
+        let abandoning = tokio::spawn({
+            let request = request.clone();
+            async move {
+                let _ = client.write_all(&request).await;
+                drop(client);
+            }
+        });
+        let abandoned = read_exchange(&mut broker_read).await;
+        abandoning.await.unwrap();
+        assert!(!abandoned.is_empty());
+        write_all_framed(&mut broker_write, &reply).await;
+
+        // The next client is served in full, both ways.
+        let (mut client_read, mut client_write) = tokio::net::UnixStream::connect(&socket)
+            .await
+            .unwrap()
+            .into_split();
+        client_write
+            .write_all(b"{\"repository\":\"main\",\"service\":\"git-upload-pack\"}\n")
+            .await
+            .unwrap();
+        let open = read_data_frame(&mut broker_read).await;
+        assert!(String::from_utf8_lossy(&open).contains("main"));
+        let sending = tokio::spawn(async move {
+            client_write.write_all(&request).await.unwrap();
+            client_write.shutdown().await.unwrap();
+        });
+        let receiving = tokio::spawn(async move {
+            let mut received = Vec::new();
+            client_read.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let received_request = read_exchange(&mut broker_read).await;
+        sending.await.unwrap();
+        write_all_framed(&mut broker_write, &reply).await;
+        let received_reply = receiving.await.unwrap();
+
+        assert_eq!(received_request.len(), 256 * 1024);
+        assert_eq!(received_reply.len(), 256 * 1024);
+
+        // Closing the frame stream stops an idle bridge; both halves have to
+        // go for the stream itself to close.
+        drop((broker_read, broker_write));
+        serving.await.unwrap().unwrap();
+    }
+
+    /// A PID file whose broker is gone must read as dead, however it was
+    /// left behind.
+    #[test]
+    fn broker_liveness_follows_the_lock_and_not_the_written_pid() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("session.pid");
+
+        assert!(!broker_is_alive(&pid_path));
+
+        // A PID file naming this very much alive process still reads as dead
+        // while no broker holds its lock.
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        assert!(!broker_is_alive(&pid_path));
+
+        let claimed = claim_broker_pid_file(&pid_path).unwrap();
+        assert!(broker_is_alive(&pid_path));
+        assert!(claim_broker_pid_file(&pid_path).is_err());
+        let written = std::fs::read_to_string(&pid_path).unwrap();
+        assert_eq!(written.trim(), std::process::id().to_string());
+
+        drop(claimed);
+        assert!(!broker_is_alive(&pid_path));
+    }
 }
 
 #[cfg(not(unix))]

@@ -87,6 +87,11 @@ pub struct CommandSpec {
     /// whose neighbors do not share it, keep running strictly in plan order.
     #[serde(default)]
     pub parallel_group: Option<u32>,
+    /// Whether this command brings the session's target into existence. Every
+    /// command after it in a provisioning plan runs against a target that
+    /// already exists, so a later failure owes that target's teardown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub creates_target: bool,
 }
 
 impl CommandSpec {
@@ -101,6 +106,7 @@ impl CommandSpec {
             purpose: String::new(),
             stage: None,
             parallel_group: None,
+            creates_target: false,
         }
     }
 
@@ -118,6 +124,12 @@ impl CommandSpec {
     /// plan-adjacent siblings that share the same group.
     pub fn parallel_group(mut self, group: u32) -> Self {
         self.parallel_group = Some(group);
+        self
+    }
+
+    /// Mark this command as the one that creates the session's target.
+    pub fn creates_target(mut self) -> Self {
+        self.creates_target = true;
         self
     }
 }
@@ -972,6 +984,31 @@ impl CommandPlan {
         }
         Ok(outputs)
     }
+
+    /// Split the plan around the command that creates the session's target:
+    /// the commands through that one, then the commands that run against a
+    /// target which already exists.
+    ///
+    /// A plan that creates nothing — an existing project directory, say —
+    /// splits into nothing, so a caller never arms a teardown for a target it
+    /// did not bring into existence.
+    pub fn split_at_target_creation(&self) -> Option<(Self, Self)> {
+        let created = self
+            .commands
+            .iter()
+            .position(|command| command.creates_target)?;
+        let (creation, remainder) = self.commands.split_at(created + 1);
+        Some((
+            Self {
+                description: self.description.clone(),
+                commands: creation.to_vec(),
+            },
+            Self {
+                description: self.description.clone(),
+                commands: remainder.to_vec(),
+            },
+        ))
+    }
 }
 
 /// Fail the same way [`CommandPlan::execute`] does for a non-zero exit
@@ -1262,7 +1299,8 @@ pub fn provision_plan(
             commands.push(
                 CommandSpec::new("aws", args)
                     .purpose("launch EC2 session instance")
-                    .stage(ProvisionStage::Provisioning),
+                    .stage(ProvisionStage::Provisioning)
+                    .creates_target(),
             );
         }
         TargetTemplate::SshBare {
@@ -1274,7 +1312,8 @@ pub fn provision_plan(
             commands.push(
                 ssh_command(ssh, ["mkdir", "-p", &workspace])
                     .purpose("create SSH session workspace")
-                    .stage(ProvisionStage::Provisioning),
+                    .stage(ProvisionStage::Provisioning)
+                    .creates_target(),
             );
             commands.extend(install_git_plan(ExecutionBoundary::Ssh(ssh)).commands);
             commands.extend(clone_commands(bundle, &workspace, |args| {
@@ -1295,7 +1334,8 @@ pub fn provision_plan(
             commands.push(
                 ssh_command_owned(ssh, run)
                     .purpose("start remote Podman container")
-                    .stage(ProvisionStage::Provisioning),
+                    .stage(ProvisionStage::Provisioning)
+                    .creates_target(),
             );
             commands.extend(
                 install_git_plan(ExecutionBoundary::SshPodman {
@@ -2249,7 +2289,8 @@ fn container_run(
         container_run_args(engine, template, name, session_id, additional_mounts)?,
     )
     .purpose("start session container")
-    .stage(ProvisionStage::Provisioning))
+    .stage(ProvisionStage::Provisioning)
+    .creates_target())
 }
 
 fn container_run_args(
@@ -3661,6 +3702,92 @@ mod tests {
                 .last()
                 .unwrap()
                 .contains("ls -d -- '/srv/pr'*/")
+        );
+    }
+
+    /// Provisioning has to know exactly when its target came into existence,
+    /// because every step after that owes the target's teardown on failure.
+    #[test]
+    fn every_provisioning_plan_names_the_command_that_creates_its_target() {
+        let container = ContainerTemplate {
+            image: "ubuntu:24.04".to_owned(),
+            extra_run_args: vec![],
+        };
+        let creating = [
+            (
+                TargetTemplate::LocalPodman(container.clone()),
+                "start session container",
+            ),
+            (
+                TargetTemplate::AppleContainer(container.clone()),
+                "start session container",
+            ),
+            (
+                TargetTemplate::SshPodman {
+                    ssh: ssh(),
+                    container,
+                },
+                "start remote Podman container",
+            ),
+            (
+                TargetTemplate::SshBare {
+                    ssh: ssh(),
+                    workspace_prefix: "/srv/hel".to_owned(),
+                },
+                "create SSH session workspace",
+            ),
+            (
+                TargetTemplate::AwsEc2(AwsTemplate {
+                    profile: "work".to_owned(),
+                    region: "us-east-2".to_owned(),
+                    launch_template: "hel-dev".to_owned(),
+                    launch_template_version: None,
+                    instance_type: None,
+                    ssh: ssh(),
+                }),
+                "launch EC2 session instance",
+            ),
+        ];
+        for (template, purpose) in creating {
+            let plan = provision_plan(&template, SESSION, &bundle(), &[]).unwrap();
+            let (creation, remainder) = plan.split_at_target_creation().unwrap();
+
+            assert_eq!(creation.commands.last().unwrap().purpose, purpose);
+            assert_eq!(
+                creation
+                    .commands
+                    .iter()
+                    .filter(|command| command.creates_target)
+                    .count(),
+                1
+            );
+            assert!(
+                !remainder
+                    .commands
+                    .iter()
+                    .any(|command| command.creates_target)
+            );
+            assert_eq!(
+                creation.commands.len() + remainder.commands.len(),
+                plan.commands.len()
+            );
+            // Cloning a bundle happens against a target that already exists.
+            assert_eq!(
+                remainder
+                    .commands
+                    .iter()
+                    .any(|command| command.purpose.starts_with("clone ")),
+                !matches!(template, TargetTemplate::AwsEc2(_)),
+            );
+        }
+
+        // An existing project directory is never created, so nothing about it
+        // can leak.
+        assert!(
+            provision_bare_project_plan(&TargetTemplate::LocalBare, SESSION, "/srv/project")
+                .unwrap()
+                .split_at_target_creation()
+                .is_none()
         );
     }
 

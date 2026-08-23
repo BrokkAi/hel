@@ -269,30 +269,24 @@ impl Controller {
                 )?
             };
 
-            let outputs = preflight_target(template, executor).and_then(|()| {
-                let started = Instant::now();
-                let result = provision.execute_concurrent(executor);
-                tracing::debug!(
+            preflight_target(template, executor)?;
+            let started = Instant::now();
+            let result = provision_target(&provision, &target, session_id, executor, |outputs| {
+                locator_after_provision(
+                    template,
+                    &target,
                     session_id,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "provisioning plan execution completed"
-                );
-                result
-            })?;
-            locator_after_provision(
-                template,
-                &target,
+                    outputs.first(),
+                    executor,
+                    bundle.as_ref(),
+                )
+            });
+            tracing::debug!(
                 session_id,
-                outputs.first(),
-                executor,
-                bundle.as_ref(),
-            )
-            .map_err(|error| {
-                match cleanup_failed_provision(template, session_id, outputs.first(), executor) {
-                    Some(note) => error.context(note),
-                    None => error,
-                }
-            })
+                elapsed_ms = started.elapsed().as_millis(),
+                "provisioning plan execution completed"
+            );
+            result
         })();
         let result = match result {
             Err(error)
@@ -717,68 +711,118 @@ pub(super) fn install_attached_resources(
     Ok(())
 }
 
-/// Best-effort teardown of a freshly created resource whose provisioning
-/// failed before a locator was recorded. Returns a note describing what
-/// happened for inclusion in the session error.
-fn cleanup_failed_provision(
-    canonical: &TargetTemplate,
+/// Run a provisioning plan and discover the locator it produced, tearing the
+/// target down again if anything after its creation fails.
+///
+/// Creation is the boundary that matters. A step that fails before the target
+/// exists has left nothing behind; every failure after it — a later plan step
+/// or locator discovery — owns a target no session record will point at.
+fn provision_target(
+    plan: &hel_targets::CommandPlan,
+    target: &hel_targets::TargetTemplate,
     session_id: &str,
-    first_output: Option<&CommandOutput>,
+    executor: &(impl CommandExecutor + Sync),
+    discover: impl FnOnce(&[CommandOutput]) -> Result<TargetLocator>,
+) -> Result<TargetLocator> {
+    let Some((creation, remainder)) = plan.split_at_target_creation() else {
+        // Nothing this plan runs can leave a target behind.
+        return discover(&plan.execute_concurrent(executor)?);
+    };
+    let mut outputs = creation.execute_concurrent(executor)?;
+    let result = match remainder.execute_concurrent(executor) {
+        Ok(rest) => {
+            outputs.extend(rest);
+            discover(&outputs)
+        }
+        Err(error) => Err(error),
+    };
+    result.map_err(|error| {
+        match cleanup_failed_provision(target, session_id, outputs.first(), executor) {
+            Some(note) => error.context(note),
+            None => error,
+        }
+    })
+}
+
+/// Best-effort teardown of a target whose creation succeeded but whose
+/// provisioning failed before a locator was recorded. Returns a note
+/// describing what happened for inclusion in the session error.
+///
+/// The teardown is the session's own close plan, so a failed launch and an
+/// ordinary close can never disagree about what removing a target means.
+fn cleanup_failed_provision(
+    target: &hel_targets::TargetTemplate,
+    session_id: &str,
+    create_output: Option<&CommandOutput>,
     executor: &impl CommandExecutor,
 ) -> Option<String> {
-    let command = match canonical {
-        TargetTemplate::LocalPodman { .. } => {
-            let name = hel_targets::resource_name(session_id).ok()?;
-            CommandSpec::new("podman", ["rm", "--force", &name])
-                .purpose("remove container after failed provisioning")
+    let locator = provisioned_locator(target, session_id, create_output)?;
+    let leak = format!(
+        "the resource may still exist; find it via its dev.hel.session={session_id} label/tag"
+    );
+    let plan = match hel_targets::close_plan(&locator, session_id) {
+        Ok(plan) => plan,
+        Err(error) => return Some(format!("cleanup FAILED: {error:#}; {leak}")),
+    };
+    let purpose = plan
+        .commands
+        .iter()
+        .map(|command| command.purpose.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let Err(error) = plan.execute(executor) else {
+        return Some(format!("cleanup succeeded: {purpose}"));
+    };
+    match hel_targets::cleanup_target_is_confirmed_absent(&locator, session_id, executor) {
+        Ok(true) => Some(format!("cleanup succeeded: {purpose}")),
+        _ => Some(format!("cleanup FAILED ({purpose}): {error:#}; {leak}")),
+    }
+}
+
+/// The locator a provisioning plan's creating command brought into existence.
+///
+/// Every target but AWS is named before its plan runs; an EC2 instance
+/// reports its own ID in the launch response.
+fn provisioned_locator(
+    target: &hel_targets::TargetTemplate,
+    session_id: &str,
+    create_output: Option<&CommandOutput>,
+) -> Option<hel_targets::TargetLocator> {
+    let container_id = || hel_targets::resource_name(session_id).ok();
+    Some(match target {
+        // A bare project directory belongs to the user: provisioning creates
+        // nothing that a failure could leak.
+        hel_targets::TargetTemplate::LocalBare => return None,
+        hel_targets::TargetTemplate::LocalPodman(_) => hel_targets::TargetLocator::LocalPodman {
+            container_id: container_id()?,
+        },
+        hel_targets::TargetTemplate::AppleContainer(_) => {
+            hel_targets::TargetLocator::AppleContainer {
+                container_id: container_id()?,
+            }
         }
-        TargetTemplate::AppleContainer { .. } => {
-            let name = hel_targets::resource_name(session_id).ok()?;
-            CommandSpec::new("container", ["rm", "--force", &name])
-                .purpose("remove container after failed provisioning")
+        hel_targets::TargetTemplate::SshPodman { ssh, .. } => {
+            hel_targets::TargetLocator::SshPodman {
+                ssh: ssh.clone(),
+                container_id: container_id()?,
+            }
         }
-        TargetTemplate::AwsEc2 {
-            aws_profile,
-            region,
-            ..
-        } => {
-            let instance_id = serde_json::from_slice::<serde_json::Value>(&first_output?.stdout)
+        hel_targets::TargetTemplate::SshBare { ssh, .. } => hel_targets::TargetLocator::SshBare {
+            ssh: ssh.clone(),
+            workspace: hel_targets::workspace_for(target, session_id).ok()?,
+        },
+        hel_targets::TargetTemplate::AwsEc2(aws) => hel_targets::TargetLocator::AwsEc2 {
+            profile: aws.profile.clone(),
+            region: aws.region.clone(),
+            instance_id: serde_json::from_slice::<serde_json::Value>(&create_output?.stdout)
                 .ok()?
                 .pointer("/Instances/0/InstanceId")?
                 .as_str()?
-                .to_string();
-            let profile = aws_profile.clone().unwrap_or_else(|| "default".into());
-            CommandSpec::new(
-                "aws",
-                [
-                    "--profile",
-                    &profile,
-                    "--region",
-                    region,
-                    "ec2",
-                    "terminate-instances",
-                    "--instance-ids",
-                    &instance_id,
-                ],
-            )
-            .purpose("terminate EC2 instance after failed provisioning")
-        }
-        // SSH machines are persistent; nothing was created that must die.
-        TargetTemplate::LocalBare
-        | TargetTemplate::SshBare { .. }
-        | TargetTemplate::SshPodman { .. } => return None,
-    };
-    let purpose = command.purpose.clone();
-    match executor.execute(&command) {
-        Ok(output) if output.status == 0 => Some(format!("cleanup succeeded: {purpose}")),
-        Ok(output) => Some(format!(
-            "cleanup FAILED ({purpose}, status {}): the resource may still exist; find it via its dev.hel.session={session_id} label/tag",
-            output.status
-        )),
-        Err(error) => Some(format!(
-            "cleanup FAILED ({purpose}): {error:#}; the resource may still exist; find it via its dev.hel.session={session_id} label/tag"
-        )),
-    }
+                .to_owned(),
+            ssh: aws.ssh.clone(),
+            workspace: hel_targets::workspace_for(target, session_id).ok()?,
+        },
+    })
 }
 
 fn local_branch(repository: &Path) -> Result<String> {
@@ -933,6 +977,40 @@ fn bootstrap_local_repositories(
     Ok(())
 }
 
+/// The files one session's local Git broker is identified by.
+#[derive(Debug, Clone)]
+struct BrokerFiles {
+    spec: PathBuf,
+    ready: PathBuf,
+    pid: PathBuf,
+    log: PathBuf,
+}
+
+impl BrokerFiles {
+    fn in_directory(directory: &Path, session_id: &str) -> Self {
+        Self {
+            spec: directory.join(format!("{session_id}.json")),
+            ready: directory.join(format!("{session_id}.ready")),
+            pid: directory.join(format!("{session_id}.pid")),
+            log: directory.join(format!("{session_id}.log")),
+        }
+    }
+}
+
+/// How long a starting broker has to publish its ready marker.
+const BROKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Consecutive restarts a supervisor attempts before it reports the session's
+/// local origin as unserved.
+const BROKER_RESTART_ATTEMPTS: u32 = 5;
+
+/// Delay before the first restart; later attempts wait a multiple of it.
+const BROKER_RESTART_BACKOFF: Duration = Duration::from_millis(250);
+
+/// A run at least this long counts as healthy, so its ending starts a fresh
+/// restart budget instead of continuing a restart storm.
+const BROKER_HEALTHY_RUN: Duration = Duration::from_secs(30);
+
 fn ensure_git_broker(
     session_id: &str,
     locator: &hel_targets::TargetLocator,
@@ -940,41 +1018,71 @@ fn ensure_git_broker(
 ) -> Result<()> {
     let directory = data_dir().join("git-brokers");
     std::fs::create_dir_all(&directory)?;
-    let spec_path = directory.join(format!("{session_id}.json"));
-    let ready_path = directory.join(format!("{session_id}.ready"));
-    let pid_path = directory.join(format!("{session_id}.pid"));
-    let log_path = directory.join(format!("{session_id}.log"));
+    let files = BrokerFiles::in_directory(&directory, session_id);
     let spec = GitBrokerSpec {
         session_id: session_id.to_owned(),
         bridge: hel_targets::git_bridge_command(locator, session_id)?,
         repositories,
-        ready_path: ready_path.clone(),
-        pid_path: pid_path.clone(),
+        ready_path: files.ready.clone(),
+        pid_path: files.pid.clone(),
     };
-    if broker_is_alive(&pid_path) {
-        if GitBrokerSpec::read(&spec_path).is_ok_and(|existing| existing == spec)
-            && ready_path.exists()
-        {
+    if broker_is_alive(&files.pid) {
+        if broker_serves(&files, &spec) {
             return Ok(());
         }
         bail!(
             "a different local Git broker is still active for session {session_id}; close its target before reconnecting"
         );
     }
-    let _ = std::fs::remove_file(&ready_path);
-    spec.write(&spec_path)?;
+    spec.write(&files.spec)?;
+    let child = match start_git_broker(&files) {
+        Ok(child) => child,
+        // A supervisor may have restarted this session's broker from the same
+        // spec while this one was starting. That broker serves the session,
+        // and only one of them can hold the session's broker lock.
+        Err(error) if broker_serves(&files, &spec) => {
+            tracing::debug!(
+                session_id,
+                error = format!("{error:#}"),
+                "reused a concurrently started local Git broker"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    // A broker that dies later takes the session's `origin` remote with it,
+    // so it is supervised rather than merely reaped.
+    let session_id = session_id.to_owned();
+    std::thread::spawn(move || supervise_git_broker(&session_id, &files, child));
+    Ok(())
+}
 
+/// Whether a broker is already serving exactly this session and spec.
+fn broker_serves(files: &BrokerFiles, spec: &GitBrokerSpec) -> bool {
+    broker_is_alive(&files.pid)
+        && files.ready.exists()
+        && GitBrokerSpec::read(&files.spec).is_ok_and(|existing| &existing == spec)
+}
+
+/// Start the broker process and wait for it to publish its ready marker.
+fn start_git_broker(files: &BrokerFiles) -> Result<std::process::Child> {
+    // A broker killed outright leaves its marker behind, and the new one has
+    // to publish its own before it counts as ready. A marker a live broker
+    // owns is never touched.
+    if !broker_is_alive(&files.pid) {
+        let _ = std::fs::remove_file(&files.ready);
+    }
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
-        .with_context(|| format!("open Git broker log {}", log_path.display()))?;
+        .open(&files.log)
+        .with_context(|| format!("open Git broker log {}", files.log.display()))?;
     let stderr = log.try_clone()?;
     let executable = std::env::current_exe().context("locate Hel controller executable")?;
     let mut command = Command::new(executable);
     command
         .args(["broker", "--spec"])
-        .arg(&spec_path)
+        .arg(&files.spec)
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(stderr);
@@ -984,27 +1092,102 @@ fn ensure_git_broker(
         command.process_group(0);
     }
     let mut child = command.spawn().context("start local Git broker")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + BROKER_READY_TIMEOUT;
     loop {
-        if ready_path.exists() && broker_is_alive(&pid_path) {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok(());
+        if files.ready.exists() && broker_is_alive(&files.pid) {
+            return Ok(child);
         }
         if let Some(status) = child.try_wait().context("poll local Git broker")? {
             bail!(
                 "local Git broker exited with {status}; see {}",
-                log_path.display()
+                files.log.display()
             );
         }
         if Instant::now() >= deadline {
+            // Leave no half-started broker behind holding the session slot.
+            let _ = child.kill();
+            let _ = child.wait();
             bail!(
                 "timed out starting local Git broker; see {}",
-                log_path.display()
+                files.log.display()
             );
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Keep this session's Git broker running until another controller takes it
+/// over, or until restarting it stops helping.
+fn supervise_git_broker(session_id: &str, files: &BrokerFiles, child: std::process::Child) {
+    let mut started = Some(child);
+    let outcome = supervise_broker_restarts(
+        BROKER_RESTART_ATTEMPTS,
+        || {
+            // A restart always spawns from the spec on disk, so a rewritten
+            // one needs no special handling; a removed spec, or a broker
+            // another controller already has running, does.
+            files.spec.exists() && !broker_is_alive(&files.pid)
+        },
+        || {
+            let running = Instant::now();
+            let mut child = match started.take() {
+                Some(child) => child,
+                None => start_git_broker(files)?,
+            };
+            let status = child.wait().context("wait for the local Git broker")?;
+            Ok((running.elapsed(), format!("{status}")))
+        },
+        std::thread::sleep,
+    );
+    let Err(error) = outcome else {
+        return;
+    };
+    tracing::error!(
+        session_id,
+        error = format!("{error:#}"),
+        "the session's local Git origin is no longer served"
+    );
+    // Every broker error the user sees names this log, so the last word on
+    // the broker belongs in it too.
+    use std::io::Write as _;
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&files.log)
+    {
+        let _ = writeln!(log, "[hel {}] local Git origin lost: {error:#}", now());
+    }
+}
+
+/// Restart the broker whenever it stops, until stopping is no longer this
+/// supervisor's business or a run of restarts has failed to fix anything.
+fn supervise_broker_restarts(
+    attempts: u32,
+    mut needs_restart: impl FnMut() -> bool,
+    mut run: impl FnMut() -> Result<(Duration, String)>,
+    mut back_off: impl FnMut(Duration),
+) -> Result<()> {
+    let mut consecutive = 0;
+    loop {
+        let failure = match run() {
+            Ok((ran_for, status)) => {
+                if ran_for >= BROKER_HEALTHY_RUN {
+                    consecutive = 0;
+                }
+                anyhow::anyhow!("the local Git broker exited with {status}")
+            }
+            Err(error) => error,
+        };
+        if !needs_restart() {
+            return Ok(());
+        }
+        consecutive += 1;
+        if consecutive > attempts {
+            return Err(failure.context(format!(
+                "the local Git broker stopped {consecutive} times in a row and was not restarted again"
+            )));
+        }
+        back_off(BROKER_RESTART_BACKOFF * consecutive);
     }
 }
 
@@ -1652,6 +1835,227 @@ mod tests {
             .is_empty()
         );
     }
+    const PROVISIONED_SESSION: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Records every command a plan runs, and fails the one whose purpose it
+    /// was told to fail.
+    struct RecordingExecutor {
+        failing_purpose: String,
+        commands: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl RecordingExecutor {
+        fn failing(purpose: impl Into<String>) -> Self {
+            Self {
+                failing_purpose: purpose.into(),
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn succeeding() -> Self {
+            Self::failing(String::new())
+        }
+
+        fn commands(&self) -> Vec<Vec<String>> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandExecutor for RecordingExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            let mut argv = vec![command.program.clone()];
+            argv.extend(command.args.clone());
+            self.commands.lock().unwrap().push(argv);
+            Ok(CommandOutput {
+                status: i32::from(command.purpose == self.failing_purpose),
+                stdout: Vec::new(),
+                stderr: b"the step failed".to_vec(),
+            })
+        }
+    }
+
+    fn container_targets() -> Vec<hel_targets::TargetTemplate> {
+        let container = ContainerTemplate {
+            image: "ubuntu:24.04".into(),
+            extra_run_args: Vec::new(),
+        };
+        vec![
+            hel_targets::TargetTemplate::LocalPodman(container.clone()),
+            hel_targets::TargetTemplate::AppleContainer(container.clone()),
+            hel_targets::TargetTemplate::SshPodman {
+                ssh: SshTarget {
+                    destination: "dev@example.test".into(),
+                    ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+                },
+                container,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_failure_after_the_container_exists_removes_it_and_keeps_the_original_error() {
+        let name = hel_targets::resource_name(PROVISIONED_SESSION).unwrap();
+        for target in container_targets() {
+            let plan =
+                hel_targets::provision_plan(&target, PROVISIONED_SESSION, &probe_bundle(), &[])
+                    .unwrap();
+            let executor = RecordingExecutor::failing("clone app");
+
+            let error = provision_target(&plan, &target, PROVISIONED_SESSION, &executor, |_| {
+                unreachable!("locator discovery must not run after a failed plan")
+            })
+            .unwrap_err();
+
+            let reported = format!("{error:#}");
+            assert!(reported.contains("clone app failed"), "{reported}");
+            assert!(reported.contains("cleanup succeeded"), "{reported}");
+            // Remote commands reach the target posix-quoted.
+            let removal = executor
+                .commands()
+                .last()
+                .unwrap()
+                .join(" ")
+                .replace('\'', "");
+            assert!(removal.contains("rm --force"), "{removal}");
+            assert!(removal.contains(&name), "{removal}");
+        }
+    }
+
+    #[test]
+    fn a_target_whose_creation_failed_is_never_torn_down() {
+        for target in container_targets() {
+            let plan =
+                hel_targets::provision_plan(&target, PROVISIONED_SESSION, &probe_bundle(), &[])
+                    .unwrap();
+            let creation = plan.split_at_target_creation().unwrap().0;
+            let executor =
+                RecordingExecutor::failing(creation.commands.last().unwrap().purpose.clone());
+
+            let error = provision_target(&plan, &target, PROVISIONED_SESSION, &executor, |_| {
+                unreachable!("locator discovery must not run after a failed plan")
+            })
+            .unwrap_err();
+
+            let reported = format!("{error:#}");
+            assert!(!reported.contains("cleanup"), "{reported}");
+            assert!(
+                !executor
+                    .commands()
+                    .iter()
+                    .any(|argv| argv.join(" ").contains("rm --force")),
+                "{:?}",
+                executor.commands()
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_whose_locator_cannot_be_discovered_is_removed_again() {
+        let target = podman_target();
+        let plan = hel_targets::provision_plan(&target, PROVISIONED_SESSION, &probe_bundle(), &[])
+            .unwrap();
+        let executor = RecordingExecutor::succeeding();
+
+        let error = provision_target(&plan, &target, PROVISIONED_SESSION, &executor, |_| {
+            bail!("the container never reported an address")
+        })
+        .unwrap_err();
+
+        let reported = format!("{error:#}");
+        assert!(reported.contains("never reported an address"), "{reported}");
+        assert!(reported.contains("cleanup succeeded"), "{reported}");
+        let removal = executor.commands().last().unwrap().join(" ");
+        assert!(removal.contains("podman rm --force --ignore"), "{removal}");
+    }
+
+    /// A raw project directory is the user's own: provisioning it creates
+    /// nothing that a failure could leak.
+    #[test]
+    fn a_bare_project_failure_removes_nothing() {
+        let target = hel_targets::TargetTemplate::LocalBare;
+        let plan =
+            hel_targets::provision_bare_project_plan(&target, PROVISIONED_SESSION, "/srv/project")
+                .unwrap();
+        let executor = RecordingExecutor::succeeding();
+
+        let error = provision_target(&plan, &target, PROVISIONED_SESSION, &executor, |_| {
+            bail!("the worker root was unreadable")
+        })
+        .unwrap_err();
+
+        assert!(!format!("{error:#}").contains("cleanup"));
+        assert!(executor.commands().is_empty());
+    }
+
+    #[test]
+    fn a_broker_that_keeps_stopping_is_restarted_a_bounded_number_of_times() {
+        let mut runs = 0;
+        let mut waits = Vec::new();
+
+        let error = supervise_broker_restarts(
+            3,
+            || true,
+            || {
+                runs += 1;
+                Ok((Duration::from_millis(1), "signal: 9".into()))
+            },
+            |delay| waits.push(delay),
+        )
+        .unwrap_err();
+
+        // The first run, then one restart per attempt.
+        assert_eq!(runs, 4);
+        assert_eq!(waits.len(), 3);
+        assert!(waits[0] < waits[2], "{waits:?}");
+        assert!(
+            format!("{error:#}").contains("stopped 4 times in a row"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_broker_another_controller_took_over_is_left_alone() {
+        let mut runs = 0;
+
+        supervise_broker_restarts(
+            3,
+            || false,
+            || {
+                runs += 1;
+                Ok((Duration::from_millis(1), "exit status: 0".into()))
+            },
+            |_| unreachable!("a broker that needs no restart must not be waited on"),
+        )
+        .unwrap();
+
+        assert_eq!(runs, 1);
+    }
+
+    /// A broker that served the session for a while before dying starts a
+    /// fresh restart budget, so one bad hour never exhausts a session.
+    #[test]
+    fn a_broker_that_ran_healthily_earns_a_fresh_restart_budget() {
+        let mut runs = 0;
+
+        let error = supervise_broker_restarts(
+            2,
+            || true,
+            || {
+                runs += 1;
+                Ok(if runs <= 4 {
+                    (BROKER_HEALTHY_RUN, "signal: 9".into())
+                } else {
+                    (Duration::from_millis(1), "signal: 9".into())
+                })
+            },
+            |_| (),
+        )
+        .unwrap_err();
+
+        assert_eq!(runs, 6);
+        assert!(format!("{error:#}").contains("stopped 3 times in a row"));
+    }
+
     #[test]
     fn a_converting_resume_seeds_from_its_own_checkout() {
         let repository = ProjectRepository {
