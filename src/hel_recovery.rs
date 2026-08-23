@@ -17,7 +17,15 @@ use crate::hel_state::{
 };
 use crate::hel_targets::CancellableProcessExecutor;
 
+/// How long an automatic checkpoint stays fresh: a copy is due once the
+/// session's newest checkpoint is at least this old, and a failed copy waits at
+/// least this long before it is retried.
 pub const AUTO_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Ceiling on the widening retry delay. Doubling forever would retire a target
+/// that is broken rather than blipping; a capped delay keeps probing it, just
+/// rarely enough to be free.
+const MAX_AUTO_CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Upper bound on one background recovery copy. A copy that wedges - a child
 /// that never exits, a remote helper that stops reading - must become a
@@ -135,7 +143,7 @@ impl RecoveryCoordinator {
                         let policy = policies.entry(result.session_id.clone()).or_default();
                         match &result.outcome {
                             Ok(artifact) => {
-                                policy.checkpoint = Some(artifact.metadata.clone());
+                                policy.record_success(artifact.metadata.clone());
                             }
                             Err(detail) => {
                                 if result.cancelled {
@@ -147,6 +155,7 @@ impl RecoveryCoordinator {
                                     let _ = results_tx.send(result);
                                     continue;
                                 }
+                                policy.record_failure(Utc::now());
                                 let session_id = result.session_id.clone();
                                 let detail = detail.clone();
                                 let persisted = tokio::task::spawn_blocking(move || {
@@ -199,22 +208,63 @@ struct PolicyState {
     latest_completed_turn: u64,
     last_attempted_turn: Option<u64>,
     checkpoint: Option<CheckpointMetadata>,
+    /// When the last copy failed for a reason other than cancellation, and how
+    /// many have failed in a row. An idle session may never complete another
+    /// turn, so a failure has to expire instead of retiring its turn boundary
+    /// for good and leaving the session's newest work uncovered.
+    failed_at: Option<chrono::DateTime<Utc>>,
+    consecutive_failures: u32,
+}
+
+/// How long a boundary that just failed waits before it may be retried: one
+/// checkpoint interval, doubling per consecutive failure up to
+/// [`MAX_AUTO_CHECKPOINT_RETRY_INTERVAL`].
+fn retry_delay(consecutive_failures: u32) -> Duration {
+    let doublings = consecutive_failures.saturating_sub(1).min(u32::BITS - 1);
+    AUTO_CHECKPOINT_INTERVAL
+        .checked_mul(1 << doublings)
+        .unwrap_or(MAX_AUTO_CHECKPOINT_RETRY_INTERVAL)
+        .min(MAX_AUTO_CHECKPOINT_RETRY_INTERVAL)
 }
 
 impl PolicyState {
+    fn record_success(&mut self, checkpoint: CheckpointMetadata) {
+        self.checkpoint = Some(checkpoint);
+        self.failed_at = None;
+        self.consecutive_failures = 0;
+    }
+
+    fn record_failure(&mut self, now: chrono::DateTime<Utc>) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.failed_at = Some(now);
+    }
+
+    /// Whether a failed attempt at the current boundary has waited out its
+    /// backoff. A boundary with no recorded failure is not retryable: either a
+    /// copy is still running or it succeeded.
+    fn retry_due(&self, now: chrono::DateTime<Utc>) -> bool {
+        self.failed_at.is_some_and(|failed_at| {
+            elapsed_at_least(failed_at, now, retry_delay(self.consecutive_failures))
+        })
+    }
+
     fn observe_completed_turn(&mut self, sequence: Option<u64>) {
         if let Some(sequence) = sequence {
             self.latest_completed_turn = self.latest_completed_turn.max(sequence);
         }
     }
 
+    /// A checkpoint newer than the one this policy knows about - a manual copy,
+    /// or one made before the coordinator started - is the same evidence a
+    /// finished copy is: the target works, so any failure run ends here too.
     fn observe_checkpoint(&mut self, checkpoint: Option<&CheckpointMetadata>) {
-        if checkpoint.is_some_and(|candidate| {
-            self.checkpoint
+        if let Some(candidate) = checkpoint
+            && self
+                .checkpoint
                 .as_ref()
                 .is_none_or(|current| candidate.event_frontier > current.event_frontier)
-        }) {
-            self.checkpoint = checkpoint.cloned();
+        {
+            self.record_success(candidate.clone());
         }
     }
 
@@ -225,16 +275,35 @@ impl PolicyState {
                 .checkpoint
                 .as_ref()
                 .is_some_and(|checkpoint| checkpoint.event_frontier >= self.latest_completed_turn)
-            || self.last_attempted_turn == Some(self.latest_completed_turn)
         {
+            return false;
+        }
+        // This boundary was already attempted. Only a failure that has waited
+        // out its backoff makes it due again: an unattended session completes
+        // no further turn, so one transient failure must not leave its newest
+        // work uncovered until someone prompts it.
+        if self.last_attempted_turn == Some(self.latest_completed_turn) && !self.retry_due(now) {
             return false;
         }
         self.checkpoint.as_ref().is_none_or(|checkpoint| {
             chrono::DateTime::parse_from_rfc3339(&checkpoint.created_at)
-                .map(|created| now.signed_duration_since(created).num_seconds() >= 600)
+                .map(|created| elapsed_at_least(created.into(), now, AUTO_CHECKPOINT_INTERVAL))
                 .unwrap_or(true)
         })
     }
+}
+
+/// Whether `now` is at least `window` past `since`. A timestamp in the future -
+/// a clock that moved backwards, a target whose clock runs ahead - is not
+/// elapsed.
+fn elapsed_at_least(
+    since: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    window: Duration,
+) -> bool {
+    now.signed_duration_since(since)
+        .to_std()
+        .is_ok_and(|elapsed| elapsed >= window)
 }
 
 #[cfg(test)]
@@ -445,29 +514,121 @@ mod tests {
         ));
     }
 
+    fn interval() -> chrono::Duration {
+        chrono::Duration::from_std(AUTO_CHECKPOINT_INTERVAL).unwrap()
+    }
+
+    fn checkpoint_at(created_at: chrono::DateTime<Utc>, event_frontier: u64) -> CheckpointMetadata {
+        CheckpointMetadata {
+            archive_path: "copy.hel.zip".into(),
+            sha256: "a".repeat(64),
+            created_at: created_at.to_rfc3339(),
+            event_frontier,
+        }
+    }
+
+    /// The checkpoint interval has one definition; the age rule follows it
+    /// rather than a number that repeats it.
     #[test]
-    fn checkpoint_must_be_ten_minutes_old_and_behind_the_turn() {
+    fn checkpoint_must_reach_the_interval_and_stay_behind_the_turn() {
         let now = Utc::now();
         let mut policy = PolicyState {
             latest_completed_turn: 8,
-            checkpoint: Some(CheckpointMetadata {
-                archive_path: "copy.hel.zip".into(),
-                sha256: "a".repeat(64),
-                created_at: (now - chrono::Duration::minutes(9)).to_rfc3339(),
-                event_frontier: 4,
-            }),
+            checkpoint: Some(checkpoint_at(
+                now - interval() + chrono::Duration::seconds(1),
+                4,
+            )),
             ..Default::default()
         };
         assert!(!policy.due(MaterializedExecutionState::Idle, now));
-        policy.checkpoint.as_mut().unwrap().created_at =
-            (now - chrono::Duration::minutes(10)).to_rfc3339();
+        policy.checkpoint.as_mut().unwrap().created_at = (now - interval()).to_rfc3339();
         assert!(policy.due(MaterializedExecutionState::Idle, now));
         policy.checkpoint.as_mut().unwrap().event_frontier = 8;
         assert!(!policy.due(MaterializedExecutionState::Idle, now));
     }
 
+    /// An idle session may never complete another turn, so a failed copy has to
+    /// become due again on its own - after a cooldown, so a target that keeps
+    /// failing is not hammered.
     #[test]
-    fn failed_boundary_waits_for_another_completed_turn() {
+    fn a_failed_boundary_retries_after_a_cooldown() {
+        let now = Utc::now();
+        let mut policy = PolicyState {
+            latest_completed_turn: 8,
+            last_attempted_turn: Some(8),
+            ..Default::default()
+        };
+        policy.record_failure(now);
+
+        assert!(!policy.due(MaterializedExecutionState::Idle, now));
+        assert!(!policy.due(
+            MaterializedExecutionState::Idle,
+            now + interval() - chrono::Duration::seconds(1)
+        ));
+        assert!(policy.due(MaterializedExecutionState::Idle, now + interval()));
+    }
+
+    /// Consecutive failures widen the wait, so a target that is broken rather
+    /// than blipping is probed less and less - but never stops being probed.
+    #[test]
+    fn repeated_failures_back_off_up_to_a_capped_delay() {
+        let now = Utc::now();
+        let mut policy = PolicyState {
+            latest_completed_turn: 8,
+            last_attempted_turn: Some(8),
+            ..Default::default()
+        };
+        policy.record_failure(now);
+        policy.record_failure(now);
+
+        assert!(!policy.due(
+            MaterializedExecutionState::Idle,
+            now + interval() * 2 - chrono::Duration::seconds(1)
+        ));
+        assert!(policy.due(MaterializedExecutionState::Idle, now + interval() * 2));
+
+        for _ in 0..64 {
+            policy.record_failure(now);
+        }
+        let cap = chrono::Duration::from_std(MAX_AUTO_CHECKPOINT_RETRY_INTERVAL).unwrap();
+        assert!(!policy.due(
+            MaterializedExecutionState::Idle,
+            now + cap - chrono::Duration::seconds(1)
+        ));
+        assert!(policy.due(MaterializedExecutionState::Idle, now + cap));
+    }
+
+    /// A copy that succeeds ends the failure run, so the next unrelated failure
+    /// starts its backoff over instead of inheriting an old target's history.
+    #[test]
+    fn a_successful_copy_restarts_the_backoff() {
+        let now = Utc::now();
+        let mut policy = PolicyState {
+            latest_completed_turn: 8,
+            last_attempted_turn: Some(8),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            policy.record_failure(now);
+        }
+        policy.record_success(checkpoint_at(now, 8));
+
+        policy.observe_completed_turn(Some(12));
+        policy.last_attempted_turn = Some(12);
+        let failed_at = now + interval() * 2;
+        policy.record_failure(failed_at);
+
+        assert!(!policy.due(
+            MaterializedExecutionState::Idle,
+            failed_at + interval() - chrono::Duration::seconds(1)
+        ));
+        assert!(policy.due(MaterializedExecutionState::Idle, failed_at + interval()));
+    }
+
+    /// A copy that is still running has not failed, so its boundary stays
+    /// suppressed however long it takes.
+    #[test]
+    fn an_attempt_in_flight_never_becomes_due_again() {
         let now = Utc::now();
         let policy = PolicyState {
             latest_completed_turn: 8,
@@ -475,5 +636,9 @@ mod tests {
             ..Default::default()
         };
         assert!(!policy.due(MaterializedExecutionState::Idle, now));
+        assert!(!policy.due(
+            MaterializedExecutionState::Idle,
+            now + chrono::Duration::days(1)
+        ));
     }
 }

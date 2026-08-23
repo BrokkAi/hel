@@ -867,6 +867,10 @@ fn collect_export_native_artifacts(
 /// A session delta is measured against every origin ref, so a repository that
 /// lost its remote-tracking refs would silently have nothing to exclude. Try
 /// one repair fetch, then fail the checkpoint instead of bundling full history.
+///
+/// This is the one network call in an export. It cannot stop on a prompt:
+/// [`SystemGit`] runs every child with
+/// [`NON_INTERACTIVE_GIT_ENV`](crate::hel_archive::NON_INTERACTIVE_GIT_ENV).
 fn repair_origin_refs(git: &dyn GitCommandRunner, path: &Path, id: &str) -> Result<()> {
     let listed = || has_origin_refs(git, path).with_context(|| format!("repository '{id}'"));
     if listed()? {

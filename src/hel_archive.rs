@@ -2116,6 +2116,20 @@ pub struct GitOutput {
     pub stderr: Vec<u8>,
 }
 
+/// Environment that keeps a Git child from waiting on a person. No command run
+/// through [`SystemGit`] has an operator watching its terminal - a checkpoint
+/// export shares the controller's - so a credential prompt or a promisor lazy
+/// fetch would hold the command open until its caller's deadline. Both have to
+/// fail fast instead.
+pub const NON_INTERACTIVE_GIT_ENV: [(&str, &str); 2] =
+    [("GIT_TERMINAL_PROMPT", "0"), ("GIT_NO_LAZY_FETCH", "1")];
+
+/// SSH asks about an unknown host key itself, which `GIT_TERMINAL_PROMPT` does
+/// not reach. An operator who set `GIT_SSH_COMMAND` already chose how to reach
+/// the host and keeps their command; otherwise Git gets a batch-mode one.
+pub const NON_INTERACTIVE_GIT_SSH_COMMAND: &str =
+    "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15";
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemGit;
 
@@ -2123,6 +2137,12 @@ impl GitCommandRunner for SystemGit {
     fn run(&self, repository: &Path, command: &GitCommand) -> Result<GitOutput> {
         let mut process = Command::new("git");
         process.args(&command.arguments).current_dir(repository);
+        for (name, value) in NON_INTERACTIVE_GIT_ENV {
+            process.env(name, value);
+        }
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            process.env("GIT_SSH_COMMAND", NON_INTERACTIVE_GIT_SSH_COMMAND);
+        }
         let output = crate::hel_subprocess::run_with_input(&mut process, &command.stdin)
             .with_context(|| format!("run git in {}", repository.display()))?;
         Ok(GitOutput {
@@ -4309,6 +4329,53 @@ vendor-credentials.json\0nested/.credentials.json\0note.txt\0";
         assert_eq!(snapshot.staged_patch, b"staged");
         assert_eq!(snapshot.unstaged_patch, b"unstaged");
         assert_eq!(runner.commands().len(), 10);
+    }
+
+    /// Checkpoint work runs with nobody watching the terminal it inherits, so
+    /// a Git child that would ask for a password or a host key has to fail
+    /// instead of holding the checkpoint open until its deadline.
+    #[test]
+    fn system_git_children_cannot_stop_on_a_prompt() {
+        let repository = tempfile::tempdir().unwrap();
+        initialize_repository(repository.path());
+
+        // A `!` alias runs through the shell with the environment Git handed
+        // its children, so this reports what a real fetch would inherit.
+        let output = SystemGit
+            .run(
+                repository.path(),
+                &GitCommand {
+                    arguments: ["-c", "alias.helenv=!printenv", "helenv"]
+                        .into_iter()
+                        .map(OsString::from)
+                        .collect(),
+                    stdin: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            output.status,
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let environment = String::from_utf8(output.stdout).unwrap();
+        let value = |name: &str| {
+            environment
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .map(str::to_owned)
+        };
+        assert_eq!(value("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
+        assert_eq!(value("GIT_NO_LAZY_FETCH").as_deref(), Some("1"));
+        assert_eq!(
+            value("GIT_SSH_COMMAND"),
+            std::env::var("GIT_SSH_COMMAND")
+                .ok()
+                .or_else(|| Some(NON_INTERACTIVE_GIT_SSH_COMMAND.to_owned())),
+            "an operator's own SSH command wins; otherwise SSH runs in batch mode"
+        );
     }
 
     #[test]
