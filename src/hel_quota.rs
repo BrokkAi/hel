@@ -602,8 +602,22 @@ struct KimiRefreshLock {
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// A holder republishes the lock directory's modification time on this
+/// interval, so a lock whose mtime stopped moving has no live holder.
+const KIMI_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+/// Several heartbeats of slack, so a live holder delayed by the scheduler keeps
+/// its lock. Derived from the heartbeat so the two cannot drift apart.
+const KIMI_LOCK_STALE_AFTER: Duration =
+    Duration::from_secs(5 * KIMI_LOCK_HEARTBEAT_INTERVAL.as_secs());
+const KIMI_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+const KIMI_LOCK_WAIT: Duration = Duration::from_secs(60);
+
 impl KimiRefreshLock {
     async fn acquire(home: &Path) -> Result<Self> {
+        Self::acquire_within(home, KIMI_LOCK_WAIT).await
+    }
+
+    async fn acquire_within(home: &Path, wait: Duration) -> Result<Self> {
         let oauth_dir = home.join("oauth");
         tokio::fs::create_dir_all(&oauth_dir)
             .await
@@ -616,32 +630,44 @@ impl KimiRefreshLock {
             .await
             .context("prepare Kimi Code OAuth lock sentinel")?;
         let path = oauth_dir.join("kimi-code.lock");
-        for _ in 0..120 {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
             match tokio::fs::create_dir(&path).await {
-                Ok(()) => {
-                    let heartbeat_path = path.clone();
-                    let heartbeat = tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            if let Ok(directory) = std::fs::File::open(&heartbeat_path) {
-                                let _ = directory.set_times(
-                                    std::fs::FileTimes::new().set_modified(SystemTime::now()),
-                                );
-                            }
-                        }
-                    });
-                    return Ok(Self {
-                        path,
-                        heartbeat: Some(heartbeat),
-                    });
-                }
+                Ok(()) => return Ok(Self::held(path)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    // A holder killed mid-refresh leaves its directory behind
+                    // forever; break the lock once its heartbeat has stopped
+                    // and retry the create immediately.
+                    if !break_stale_kimi_lock(&path).await {
+                        tokio::time::sleep(KIMI_LOCK_RETRY_INTERVAL).await;
+                    }
                 }
                 Err(error) => return Err(error).context("acquire Kimi Code OAuth refresh lock"),
             }
         }
-        bail!("timed out waiting for Kimi Code OAuth refresh lock")
+        bail!(
+            "timed out waiting for Kimi Code OAuth refresh lock {}; another Kimi Code refresh is holding it, or a crashed one left it behind and the directory has to be removed",
+            path.display()
+        )
+    }
+
+    fn held(path: std::path::PathBuf) -> Self {
+        let heartbeat_path = path.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(KIMI_LOCK_HEARTBEAT_INTERVAL).await;
+                if let Err(error) = touch_kimi_lock(&heartbeat_path, SystemTime::now()) {
+                    tracing::debug!(path = %heartbeat_path.display(), %error, "heartbeat Kimi Code OAuth refresh lock");
+                }
+            }
+        });
+        Self {
+            path,
+            heartbeat: Some(heartbeat),
+        }
     }
 
     async fn release(mut self) {
@@ -660,6 +686,61 @@ impl Drop for KimiRefreshLock {
             heartbeat.abort();
         }
         let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+/// Publish a lock directory's modification time, the signal that its holder is
+/// still alive. Windows opens a directory handle only under backup semantics,
+/// so the heartbeat would otherwise be a silent no-op there and every live lock
+/// would look abandoned.
+fn touch_kimi_lock(path: &Path, modified: SystemTime) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options
+        .open(path)?
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+}
+
+/// Remove a lock directory whose heartbeat has stopped, so a holder killed
+/// mid-refresh cannot poison the profile home until someone removes it by hand.
+/// Returns whether the lock is gone and the caller should retry the create at
+/// once; a lock another process removes or recreates underneath simply loses or
+/// wins the next create.
+async fn break_stale_kimi_lock(path: &Path) -> bool {
+    let age = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "inspect Kimi Code OAuth refresh lock");
+            return false;
+        }
+    };
+    let Some(age) = age.filter(|age| *age >= KIMI_LOCK_STALE_AFTER) else {
+        return false;
+    };
+    match tokio::fs::remove_dir(path).await {
+        Ok(()) => {
+            tracing::warn!(
+                path = %path.display(),
+                age_seconds = age.as_secs(),
+                "removed a Kimi Code OAuth refresh lock whose holder stopped heartbeating"
+            );
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "remove stale Kimi Code OAuth refresh lock");
+            false
+        }
     }
 }
 
@@ -1189,5 +1270,50 @@ mod tests {
         assert_eq!(saved.refresh_token, "fresh-refresh");
         assert!(!home.path().join("oauth/kimi-code.lock").exists());
         server.abort();
+    }
+
+    /// Backdate the lock directory the way a holder that stopped heartbeating
+    /// leaves it behind.
+    fn age_kimi_lock(path: &Path, age: Duration) {
+        touch_kimi_lock(path, SystemTime::now() - age).expect("backdate lock directory");
+    }
+
+    #[tokio::test]
+    async fn a_kimi_refresh_lock_left_by_a_crashed_holder_is_broken_and_reacquired() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("oauth/kimi-code.lock");
+        std::fs::create_dir_all(&lock).unwrap();
+        age_kimi_lock(&lock, KIMI_LOCK_STALE_AFTER + Duration::from_secs(60));
+
+        let started = std::time::Instant::now();
+        let held = KimiRefreshLock::acquire_within(home.path(), Duration::from_secs(10))
+            .await
+            .expect("an orphaned lock must not block a refresh");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_secs(5),
+            "acquisition waited {waited:?}"
+        );
+        held.release().await;
+        assert!(!lock.exists(), "the released lock must be gone");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeating_kimi_refresh_lock_is_not_broken_by_a_waiter() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("oauth/kimi-code.lock");
+        std::fs::create_dir_all(&lock).unwrap();
+
+        let error = KimiRefreshLock::acquire_within(home.path(), Duration::from_millis(600))
+            .await
+            .err()
+            .expect("a lock with a live holder must be waited out, not stolen");
+
+        assert!(
+            error.to_string().contains("kimi-code.lock"),
+            "the timeout must name the lock: {error}"
+        );
+        assert!(lock.exists(), "a live holder's lock must survive a waiter");
     }
 }
