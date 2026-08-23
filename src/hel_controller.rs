@@ -381,14 +381,23 @@ impl Controller {
             last_checkpoint_error: None,
             checkpoint: None,
         };
+        // Creation authors the whole record, so it writes the whole row. The
+        // record reaches memory only once it is durable: a session this process
+        // alone knows about is one the database can never resume or clean up.
+        crate::hel_database::save_session(&record)?;
         self.state.sessions.insert(id.clone(), record);
         if let Some(host) = mount_history_host(template) {
-            self.state.remember_mount_sources(host, &additional_mounts);
-        }
-        // Creation authors the whole record, so it writes the whole row.
-        crate::hel_database::save_session(&self.state.sessions[&id])?;
-        if let Some(host) = mount_history_host(template) {
-            crate::hel_database::remember_mount_sources(host, &additional_mounts)?;
+            // Mount history only seeds the attach dialog's suggestions. The
+            // session row is already committed, so a failed suggestion write is
+            // reported rather than turned into a failed registration.
+            match crate::hel_database::remember_mount_sources(host, &additional_mounts) {
+                Ok(()) => self.state.remember_mount_sources(host, &additional_mounts),
+                Err(error) => tracing::warn!(
+                    session_id = id,
+                    error = format!("{error:#}"),
+                    "could not remember the attached resource directories for later suggestions"
+                ),
+            }
         }
         Ok(id)
     }
@@ -637,11 +646,189 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use crate::hel_config::{ContainerTemplate as ConfigContainer, HelConfig, TargetTemplate};
+    use crate::hel_config::{
+        ContainerTemplate as ConfigContainer, HarnessKind, HarnessProfile, HelConfig,
+        ProjectBundle, ProjectRepository, TargetTemplate,
+    };
     use crate::hel_state::HelState;
     use crate::hel_targets::ProcessExecutor;
 
     use super::*;
+
+    /// One profile, one bundle with nothing checked out locally, and one
+    /// container target, which is all `register_session_with_resources` reads.
+    fn registration_config() -> HelConfig {
+        let mut config = HelConfig::default();
+        config.profiles.insert(
+            "codex".into(),
+            HarnessProfile {
+                kind: HarnessKind::Codex,
+                home: PathBuf::from("/home/dev/.codex"),
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        );
+        config.bundles.insert(
+            "project".into(),
+            ProjectBundle {
+                primary_repo: "project".into(),
+                repositories: vec![ProjectRepository {
+                    id: "project".into(),
+                    github: Some("owner/project".into()),
+                    local: None,
+                    destination: PathBuf::from("project"),
+                    git_ref: None,
+                }],
+            },
+        );
+        config.targets.insert(
+            "podman".into(),
+            TargetTemplate::LocalPodman {
+                container: ConfigContainer {
+                    image: "example.invalid/hel-test:latest".into(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: BTreeMap::new(),
+                },
+            },
+        );
+        config
+    }
+
+    fn launch_options(additional_mounts: Vec<AdditionalMount>) -> SessionLaunchOptions {
+        SessionLaunchOptions {
+            additional_mounts,
+            allow_dirty_local: false,
+            resource_allocation: None,
+            project_directory: None,
+            session_title_override: None,
+        }
+    }
+
+    /// HEL_DATA_DIR is process-global, so every test that reaches the
+    /// controller database runs in an exact child with its own data directory.
+    fn run_registration_child(marker: &str, test: &str, data_directory: &Path) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("hel_controller::tests::{test}"),
+                "--nocapture",
+            ])
+            .env(marker, "1")
+            .env("HEL_DATA_DIR", data_directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated {test} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    const UNPERSISTABLE_SESSION_CHILD: &str = "HEL_TEST_UNPERSISTABLE_SESSION_CHILD";
+
+    #[test]
+    fn a_session_the_database_rejects_is_never_left_in_memory() {
+        if std::env::var_os(UNPERSISTABLE_SESSION_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            // A directory where the database file belongs fails every write.
+            std::fs::create_dir(directory.path().join("hel.sqlite3")).unwrap();
+            run_registration_child(
+                UNPERSISTABLE_SESSION_CHILD,
+                "a_session_the_database_rejects_is_never_left_in_memory",
+                directory.path(),
+            );
+            return;
+        }
+
+        let mut controller = Controller {
+            config: registration_config(),
+            state: HelState::default(),
+        };
+        let error = controller
+            .register_session_with_resources(
+                "codex",
+                "project",
+                "podman",
+                "unpersistable",
+                launch_options(Vec::new()),
+            )
+            .expect_err("an unwritable store cannot register a session");
+        assert!(
+            format!("{error:#}").contains("Hel database"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            controller.state.sessions.is_empty(),
+            "a session the database never accepted stayed in controller memory"
+        );
+    }
+
+    const MOUNT_HISTORY_FAILURE_CHILD: &str = "HEL_TEST_MOUNT_HISTORY_FAILURE_CHILD";
+
+    #[test]
+    fn a_failed_mount_history_write_does_not_fail_the_registered_session() {
+        if std::env::var_os(MOUNT_HISTORY_FAILURE_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            run_registration_child(
+                MOUNT_HISTORY_FAILURE_CHILD,
+                "a_failed_mount_history_write_does_not_fail_the_registered_session",
+                directory.path(),
+            );
+            return;
+        }
+
+        let mut controller = Controller {
+            config: registration_config(),
+            state: HelState::default(),
+        };
+        // The first registration builds the schema this test then breaks.
+        controller
+            .register_session_with_resources(
+                "codex",
+                "project",
+                "podman",
+                "first",
+                launch_options(Vec::new()),
+            )
+            .expect("a healthy store registers a session");
+        let database = crate::hel_database::database_path();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TABLE mount_history")
+            .unwrap();
+
+        let id = controller
+            .register_session_with_resources(
+                "codex",
+                "project",
+                "podman",
+                "attached",
+                launch_options(vec![AdditionalMount {
+                    source: PathBuf::from("/host/models"),
+                    destination: PathBuf::from("/mnt/models"),
+                    read_only: false,
+                }]),
+            )
+            .expect("a suggestion list that cannot be written must not fail a registration");
+
+        let stored: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE session_id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1, "the registered session was not committed");
+        assert!(
+            controller.state.mount_history.is_empty(),
+            "controller memory remembered mount sources the database never stored"
+        );
+    }
 
     #[test]
     fn command_errors_report_the_root_cause_without_worker_wrappers() {

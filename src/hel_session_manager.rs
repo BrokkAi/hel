@@ -1197,6 +1197,20 @@ fn publish_view(
     }
 }
 
+/// Read a stored projection without blocking the runtime. The rusqlite read
+/// and the transcript deserialization behind it are synchronous and grow with
+/// the conversation, so a long session must not stall a worker thread that
+/// other actors share.
+async fn load_projection(session_id: &str) -> Result<MaterializedSession> {
+    let session_id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<MaterializedSession> {
+        let loaded = crate::hel_database::load_materialized_session(&session_id)?;
+        Ok(loaded.unwrap_or_else(|| MaterializedSession::empty(session_id)))
+    })
+    .await
+    .context("controller projection load task failed")?
+}
+
 pub struct StandaloneSession {
     client: RelayClient,
     materialized: MaterializedSession,
@@ -1206,10 +1220,12 @@ pub struct StandaloneSession {
 
 impl StandaloneSession {
     pub async fn connect(target: &RelaySessionTarget) -> Result<Self> {
-        let materialized = crate::hel_database::load_materialized_session(&target.session_id)?
-            .unwrap_or_else(|| MaterializedSession::empty(target.session_id.clone()));
+        // Reach the worker before reading the projection. A stored session can
+        // be tens of megabytes, and the reconnect loop would otherwise pay that
+        // whole synchronous read on every attempt against a worker that is down.
         let mut client = RelayClient::connect(&target.spec, &target.session_id).await?;
         let operational = client.status().await?;
+        let materialized = load_projection(&target.session_id).await?;
         let mut connection = Self {
             client,
             materialized,
@@ -1870,6 +1886,64 @@ mod tests {
             .expect("dashboard feed received the error view");
         assert_eq!(update.session_id, "session-1");
         assert!(!update.view.connected);
+    }
+
+    const UNREADABLE_PROJECTION_TEST_CHILD: &str = "HEL_TEST_UNREADABLE_PROJECTION_CHILD";
+
+    #[tokio::test]
+    async fn connecting_to_an_absent_worker_never_reads_the_projection() {
+        // HEL_DATA_DIR is process-global, so run the database-backed half in
+        // an exact child test instead of racing unrelated tests in this
+        // process.
+        if std::env::var_os(UNREADABLE_PROJECTION_TEST_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            // A directory where the database file belongs makes every
+            // projection read fail, so a read that happens at all shows up in
+            // the reported error.
+            std::fs::create_dir(directory.path().join("hel.sqlite3")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!(
+                        "{}::connecting_to_an_absent_worker_never_reads_the_projection",
+                        module_path!()
+                            .strip_prefix("hel::")
+                            .unwrap_or(module_path!())
+                    ),
+                    "--nocapture",
+                ])
+                .env(UNREADABLE_PROJECTION_TEST_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated projection ordering test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        assert!(
+            crate::hel_database::load_materialized_session("session-1").is_err(),
+            "this store must fail every projection read for the test to mean anything"
+        );
+        let connected =
+            StandaloneSession::connect(&target("hel-relay-program-that-does-not-exist")).await;
+        let error = match connected {
+            Ok(_) => panic!("a relay program that does not exist cannot connect"),
+            Err(error) => error,
+        };
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("session relay proxy"),
+            "unexpected error: {detail}"
+        );
+        assert!(
+            !detail.contains("Hel database"),
+            "connect read the projection before it reached the relay: {detail}"
+        );
     }
 
     const LEASED_RELAY_ROOT: &str = "HEL_TEST_LEASED_RELAY_ROOT";

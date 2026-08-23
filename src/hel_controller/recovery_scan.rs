@@ -64,91 +64,114 @@ impl Controller {
         bundle_override: Option<&str>,
         executor: &impl CommandExecutor,
     ) -> Result<()> {
-        if self.state.sessions.contains_key(session_id) {
-            bail!("session {session_id} is already tracked");
-        }
-        let candidate = self
-            .scan_orphan_workers(executor)
-            .candidates
-            .into_iter()
-            .find(|candidate| {
-                candidate.session_id == session_id && candidate.target_template_id == target_id
-            })
-            .with_context(|| {
-                format!("no managed orphan {session_id} was found on target {target_id:?}")
-            })?;
-        let profile_id = profile_override
-            .map(str::to_owned)
-            .or_else(|| {
-                candidate
-                    .ownership
-                    .as_ref()
-                    .map(|marker| marker.profile_id.clone())
-            })
-            .context("orphan has no ownership marker; pass --profile")?;
-        let bundle_id = bundle_override
-            .map(str::to_owned)
-            .or_else(|| {
-                candidate
-                    .ownership
-                    .as_ref()
-                    .map(|marker| marker.bundle_id.clone())
-            })
-            .context("orphan has no ownership marker; pass --bundle")?;
-        let profile = self
-            .config
-            .profiles
-            .get(&profile_id)
-            .with_context(|| format!("unknown profile {profile_id:?}"))?;
-        self.config
-            .bundles
-            .get(&bundle_id)
-            .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
-        let now = now();
-        let record = SessionRecord {
-            archived: false,
-            container_cpus: None,
-            container_memory: None,
-            id: session_id.to_owned(),
-            title: format!("Recovered {}", &session_id[..session_id.len().min(8)]),
-            harness_kind: profile.kind,
-            last_profile: profile_id,
-            bundle_id,
-            project_directory: None,
-            managed_worktree: None,
-            target_template_id: target_id.to_owned(),
-            resource_allocation: None,
-            additional_mounts: Vec::new(),
-            state: SessionState::Disconnected,
-            target: Some(candidate.locator),
-            native_session_id: None,
-            acp_session_title: None,
-            session_title_override: None,
-            created_at: now.clone(),
-            updated_at: now,
-            detached_after_event_ordinal: 0,
-            draft_input: String::new(),
-            last_error: None,
-            last_checkpoint_error: None,
-            checkpoint: None,
+        let (record, newly_adopted) = match self.state.sessions.get(session_id).cloned() {
+            // Adoption records its session before the handshake, so a failed
+            // handshake leaves a tracked session that never connected. That
+            // record is the one to finish, not a reason to refuse the retry.
+            Some(existing) if adoption_unfinished(&existing, target_id) => {
+                for (flag, requested, adopted) in [
+                    ("profile", profile_override, existing.last_profile.as_str()),
+                    ("bundle", bundle_override, existing.bundle_id.as_str()),
+                ] {
+                    if let Some(requested) = requested
+                        && requested != adopted
+                    {
+                        bail!(
+                            "session {session_id} was already adopted with {flag} {adopted:?}; retry without --{flag}"
+                        );
+                    }
+                }
+                (existing, false)
+            }
+            Some(_) => bail!("session {session_id} is already tracked"),
+            None => {
+                let candidate = self
+                    .scan_orphan_workers(executor)
+                    .candidates
+                    .into_iter()
+                    .find(|candidate| {
+                        candidate.session_id == session_id
+                            && candidate.target_template_id == target_id
+                    })
+                    .with_context(|| {
+                        format!("no managed orphan {session_id} was found on target {target_id:?}")
+                    })?;
+                let profile_id = profile_override
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        candidate
+                            .ownership
+                            .as_ref()
+                            .map(|marker| marker.profile_id.clone())
+                    })
+                    .context("orphan has no ownership marker; pass --profile")?;
+                let bundle_id = bundle_override
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        candidate
+                            .ownership
+                            .as_ref()
+                            .map(|marker| marker.bundle_id.clone())
+                    })
+                    .context("orphan has no ownership marker; pass --bundle")?;
+                let profile = self
+                    .config
+                    .profiles
+                    .get(&profile_id)
+                    .with_context(|| format!("unknown profile {profile_id:?}"))?;
+                self.config
+                    .bundles
+                    .get(&bundle_id)
+                    .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
+                let record = adopted_session_record(
+                    session_id,
+                    target_id,
+                    profile_id,
+                    profile.kind,
+                    bundle_id,
+                    candidate.locator,
+                );
+                (record, true)
+            }
         };
-        let backend = backend_locator(record.target.as_ref().unwrap(), &record, &self.config)?;
+        let locator = record
+            .target
+            .as_ref()
+            .context("adopted session has no target locator")?;
+        let backend = backend_locator(locator, &record, &self.config)?;
         let spec = hel_targets::reconnect_plan(&backend, session_id)?
             .commands
             .into_iter()
             .next()
             .context("reconnect plan is empty")?;
-        self.state
-            .sessions
-            .insert(session_id.to_owned(), record.clone());
-        // Adoption authors the whole record for a session Hel has never
-        // tracked, so it writes the whole row.
-        crate::hel_database::save_session(&record)?;
-        let mut relay = StandaloneSession::connect_command(&spec, session_id)
+        if newly_adopted {
+            // Adoption authors the whole record for a session Hel has never
+            // tracked, so it writes the whole row, and it writes it before the
+            // handshake: a crash in between must not orphan the worker again.
+            // The record reaches memory only once it is durable.
+            crate::hel_database::save_session(&record)?;
+            self.state.sessions.insert(session_id.to_owned(), record);
+        }
+        match self.complete_adoption(session_id, &spec, executor).await {
+            Ok(()) => Ok(()),
+            // Provisioning leaves its failure on the session it failed for.
+            // Adoption owes the same: the record it already committed is all
+            // the user has to see why the worker never connected.
+            Err(error) => Err(self.record_adoption_failure(session_id, error)),
+        }
+    }
+
+    /// Connect the adopted worker's relay and promote the session to running.
+    async fn complete_adoption(
+        &mut self,
+        session_id: &str,
+        spec: &CommandSpec,
+        executor: &impl CommandExecutor,
+    ) -> Result<()> {
+        let mut relay = StandaloneSession::connect_command(spec, session_id)
             .await
             .context("orphan relay did not complete the v1 handshake")?;
         let native_session_id = wait_for_native_session(&mut relay, executor).await?;
-        self.state.sessions.insert(session_id.to_owned(), record);
         self.mark_worker_connected(session_id, Some(native_session_id))?;
         if let Some(title) = relay.snapshot().materialized.session_title {
             crate::hel_database::set_session_acp_title(session_id, Some(&title))?;
@@ -159,6 +182,24 @@ impl Controller {
                 .acp_session_title = Some(title);
         }
         Ok(())
+    }
+
+    /// Leave a failed adoption on the session itself. The state stays
+    /// `Disconnected`, which is the truth — the target exists and no worker is
+    /// connected — and keeps the record adoptable so the handshake can be
+    /// retried once the worker is reachable again.
+    fn record_adoption_failure(&mut self, session_id: &str, error: anyhow::Error) -> anyhow::Error {
+        let Some(record) = self.state.sessions.get_mut(session_id) else {
+            return error;
+        };
+        record.updated_at = now();
+        record.last_error = Some(format!("orphan adoption failed: {error:#}"));
+        match self.persist_session_state(session_id) {
+            Ok(()) => error,
+            Err(persist_error) => error.context(format!(
+                "recorded the adoption failure in memory, but failed to persist it: {persist_error:#}"
+            )),
+        }
     }
 
     pub fn destroy_orphan_worker(
@@ -187,6 +228,56 @@ impl Controller {
             .execute(executor)
             .map(|_| ())
     }
+}
+
+/// The session record adoption commits before it tries the relay handshake.
+fn adopted_session_record(
+    session_id: &str,
+    target_id: &str,
+    profile_id: String,
+    harness_kind: crate::hel_config::HarnessKind,
+    bundle_id: String,
+    locator: TargetLocator,
+) -> SessionRecord {
+    let now = now();
+    SessionRecord {
+        archived: false,
+        container_cpus: None,
+        container_memory: None,
+        id: session_id.to_owned(),
+        title: format!("Recovered {}", &session_id[..session_id.len().min(8)]),
+        harness_kind,
+        last_profile: profile_id,
+        bundle_id,
+        project_directory: None,
+        managed_worktree: None,
+        target_template_id: target_id.to_owned(),
+        resource_allocation: None,
+        additional_mounts: Vec::new(),
+        state: SessionState::Disconnected,
+        target: Some(locator),
+        native_session_id: None,
+        acp_session_title: None,
+        session_title_override: None,
+        created_at: now.clone(),
+        updated_at: now,
+        detached_after_event_ordinal: 0,
+        draft_input: String::new(),
+        last_error: None,
+        last_checkpoint_error: None,
+        checkpoint: None,
+    }
+}
+
+/// Whether a tracked session is one an adoption committed and never finished:
+/// it names this target, carries the locator the scan found, and no harness
+/// session has ever been observed on it. Such a record is the retry, so
+/// adoption completes it instead of refusing it as already tracked.
+fn adoption_unfinished(record: &SessionRecord, target_id: &str) -> bool {
+    record.state == SessionState::Disconnected
+        && record.native_session_id.is_none()
+        && record.target_template_id == target_id
+        && record.target.is_some()
 }
 
 fn scan_target_workers(
@@ -601,11 +692,132 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::hel_config::{
-        AwsAddressSource, ContainerTemplate as ConfigContainer, TargetTemplate,
+        AwsAddressSource, ContainerTemplate as ConfigContainer, HarnessKind, HelConfig,
+        TargetTemplate,
     };
-    use crate::hel_state::TargetLocator;
+    use crate::hel_state::{HelState, TargetLocator};
+    use crate::hel_targets::ProcessExecutor;
 
     use super::*;
+
+    const FAILED_ADOPTION_CHILD: &str = "HEL_TEST_FAILED_ADOPTION_CHILD";
+
+    #[tokio::test]
+    async fn a_failed_adoption_records_the_failure_and_stays_retryable() {
+        // HEL_DATA_DIR is process-global, so the database-backed half runs in
+        // an exact child test with its own data directory.
+        if std::env::var_os(FAILED_ADOPTION_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hel_controller::recovery_scan::tests::\
+                     a_failed_adoption_records_the_failure_and_stays_retryable",
+                    "--nocapture",
+                ])
+                .env(FAILED_ADOPTION_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated adoption retry test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let workers = tempfile::tempdir().unwrap();
+        // Exactly what an adoption commits before its handshake, on a worker
+        // root that holds no worker binary, so the handshake cannot succeed.
+        let record = adopted_session_record(
+            session_id,
+            "local-bare",
+            "codex".into(),
+            HarnessKind::Codex,
+            "project".into(),
+            TargetLocator::LocalBare {
+                worker_root: workers.path().join(session_id),
+            },
+        );
+        assert!(
+            adoption_unfinished(&record, "local-bare"),
+            "the record adoption commits must be the record adoption can retry"
+        );
+        crate::hel_database::save_session(&record).unwrap();
+        let mut config = HelConfig::default();
+        config
+            .targets
+            .insert("local-bare".into(), TargetTemplate::LocalBare);
+        let mut state = HelState::default();
+        state.sessions.insert(session_id.to_owned(), record);
+        let mut controller = Controller { config, state };
+
+        let failure = controller
+            .adopt_orphan_worker(session_id, "local-bare", None, None, &ProcessExecutor)
+            .await
+            .expect_err("a worker root without a worker cannot complete the handshake");
+        assert!(
+            format!("{failure:#}").contains("orphan relay"),
+            "unexpected failure: {failure:#}"
+        );
+        let recorded = controller.state.sessions[session_id]
+            .last_error
+            .clone()
+            .expect("the failed handshake was recorded on the session");
+        assert!(
+            recorded.contains("orphan adoption failed"),
+            "unexpected recorded failure: {recorded}"
+        );
+        assert_eq!(
+            controller.state.sessions[session_id].state,
+            SessionState::Disconnected
+        );
+        let stored = crate::hel_database::load_state().unwrap();
+        assert_eq!(
+            stored.sessions[session_id].last_error.as_deref(),
+            Some(recorded.as_str()),
+            "the adoption failure was not persisted"
+        );
+
+        let retry = controller
+            .adopt_orphan_worker(session_id, "local-bare", None, None, &ProcessExecutor)
+            .await
+            .expect_err("the worker is still unreachable");
+        let retry = format!("{retry:#}");
+        assert!(
+            retry.contains("orphan relay"),
+            "adoption did not retry the handshake: {retry}"
+        );
+        assert!(
+            !retry.contains("already tracked"),
+            "a session adoption never finished blocked its own retry: {retry}"
+        );
+    }
+
+    #[test]
+    fn a_session_that_completed_its_handshake_is_not_adoptable_again() {
+        let mut record = adopted_session_record(
+            "0123456789abcdef0123456789abcdef",
+            "local-bare",
+            "codex".into(),
+            HarnessKind::Codex,
+            "project".into(),
+            TargetLocator::LocalBare {
+                worker_root: std::path::PathBuf::from("/workers/0123456789abcdef0123456789abcdef"),
+            },
+        );
+        record.native_session_id = Some("native-session".into());
+        assert!(!adoption_unfinished(&record, "local-bare"));
+
+        record.native_session_id = None;
+        assert!(
+            !adoption_unfinished(&record, "other-target"),
+            "a record adopted onto another target is not this target's retry"
+        );
+    }
 
     #[test]
     fn recovery_container_scan_requires_both_managed_and_session_labels() {
