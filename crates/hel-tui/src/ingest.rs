@@ -269,14 +269,13 @@ impl DashboardState {
 
     pub fn set_config(&mut self, config: HelConfig) {
         self.config = config;
-        self.invalidate_resume_rows();
+        // Closing the modal drops the resume dialog, and with it its rows.
         self.cancel_modal();
         self.clamp_selections();
     }
 
     pub fn set_state(&mut self, state: HelState) {
         self.state = state;
-        self.invalidate_resume_rows();
         self.session_details
             .retain(|session_id, _| self.state.sessions.contains_key(session_id));
         for session_id in self.state.sessions.keys() {
@@ -295,6 +294,8 @@ impl DashboardState {
                 .filter(|ordinal| **ordinal > detached_after_event_ordinal)
                 .count();
         }
+        // After the projection, so the rows see the records the dashboard does.
+        self.rebuild_resume_rows();
         self.clamp_selections();
     }
 
@@ -319,7 +320,7 @@ impl DashboardState {
             },
         );
         self.apply_operation_projection();
-        self.invalidate_resume_rows();
+        self.rebuild_resume_rows();
         self.clamp_selections();
     }
 
@@ -361,7 +362,7 @@ impl DashboardState {
             self.session_operations.insert(session_id, operation);
         }
         self.apply_operation_projection();
-        self.invalidate_resume_rows();
+        self.rebuild_resume_rows();
         self.clamp_selections();
     }
 
@@ -375,7 +376,7 @@ impl DashboardState {
         {
             self.state.sessions.remove(session_id);
         }
-        self.invalidate_resume_rows();
+        self.rebuild_resume_rows();
         self.clamp_selections();
     }
 
@@ -565,7 +566,7 @@ impl DashboardState {
             && let Some(record) = self.state.sessions.get_mut(&prepared.session_id)
         {
             record.acp_session_title = Some(title.clone());
-            self.invalidate_resume_rows();
+            self.rebuild_resume_rows();
         }
         true
     }
@@ -590,7 +591,7 @@ impl DashboardState {
 
     pub fn apply_checkpoint_archive_sizes(&mut self, sizes: BTreeMap<String, Option<u64>>) {
         self.checkpoint_archive_sizes = sizes;
-        self.invalidate_resume_rows();
+        self.rebuild_resume_rows();
     }
 
     /// Installs the process-wide notifications bar, so every view reports

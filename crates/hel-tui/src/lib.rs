@@ -301,9 +301,10 @@ pub struct DashboardState {
     pub(crate) resume_sessions_area: Option<Rect>,
     /// Native sessions the resume dialog hides, loaded from Hel's database.
     pub(crate) hidden_native_sessions: BTreeSet<(HarnessKind, String)>,
-    /// The row list the open resume dialog shows, kept so one key press and
-    /// the frame that follows it share a single build.
-    pub(crate) resume_rows_cache: crate::resume::ResumeRowsCache,
+    /// The rows the open resume dialog shows, derived from the records, the
+    /// scans, and the dialog's own filters. Rebuilt where those change and
+    /// once a second for the relative ages; empty when no dialog is open.
+    pub(crate) resume_rows: Vec<crate::resume::ResumeRow>,
     /// Hitbox of the selected session's conversation preview, so the wheel can
     /// scroll that preview instead of moving the selection.
     pub(crate) selected_preview_area: Option<Rect>,
@@ -344,7 +345,7 @@ impl DashboardState {
             pane_areas: None,
             resume_sessions_area: None,
             hidden_native_sessions: BTreeSet::new(),
-            resume_rows_cache: crate::resume::ResumeRowsCache::default(),
+            resume_rows: Vec::new(),
             selected_preview_area: None,
             active_row_areas: Vec::new(),
             preview_scroll: 0,
@@ -496,7 +497,7 @@ impl DashboardState {
                 MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
                 _ => return DashboardAction::None,
             };
-            let len = self.refreshed_resume_rows().len();
+            let len = self.resume_rows().len();
             let Mode::ResumeDialog(dialog) = &mut self.mode else {
                 return DashboardAction::None;
             };
@@ -820,6 +821,7 @@ impl DashboardState {
 
     pub(crate) fn cancel_modal(&mut self) {
         self.mode = Mode::Dashboard;
+        self.rebuild_resume_rows();
     }
 
     fn focus_len(&self) -> usize {

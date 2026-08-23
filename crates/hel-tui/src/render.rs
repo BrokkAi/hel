@@ -55,10 +55,6 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     }
     dashboard.resume_sessions_area =
         matches!(dashboard.mode, Mode::ResumeDialog(_)).then(|| resume_sessions_pane(area));
-    // One build per frame, before the frame decides what to draw: the dialog
-    // and its scrollbar then read the same list.
-    dashboard.refresh_resume_rows();
-
     if !dashboard.config_is_empty() {
         render_adaptive_dashboard(frame, area, area, dashboard);
         return;

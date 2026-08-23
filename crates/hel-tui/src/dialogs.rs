@@ -1260,7 +1260,10 @@ impl DashboardState {
     /// dashboard when the confirmation did not come from one.
     fn restore_after_confirmation(&mut self, reopen: Option<Box<crate::resume::ResumeDialog>>) {
         match reopen {
-            Some(dialog) => self.mode = Mode::ResumeDialog(*dialog),
+            Some(dialog) => {
+                self.mode = Mode::ResumeDialog(*dialog);
+                self.rebuild_resume_rows();
+            }
             None => self.cancel_modal(),
         }
     }
