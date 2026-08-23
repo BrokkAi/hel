@@ -54,37 +54,70 @@ impl GitBrokerSpec {
     }
 }
 
-/// Whether a broker process still owns this session's bridge.
+/// What a PID file says about the broker that wrote it.
+enum BrokerLock {
+    /// A broker holds the lock; the file names its process when it is
+    /// readable, which it is for every broker past its own startup.
+    Held(Option<i32>),
+    /// Nobody holds the lock, so no broker is serving this session.
+    Free,
+}
+
+/// Read a broker's PID file through the lock its owner holds.
 ///
 /// A live broker holds an exclusive advisory lock on its PID file for as long
 /// as it runs, so liveness is the lock rather than the number written in the
 /// file: a PID file left behind by a killed broker, or one whose PID the
 /// system has since handed to an unrelated process, reads as dead and is
-/// restarted instead of being trusted or blocking the session forever.
-pub fn broker_is_alive(pid_path: &Path) -> bool {
+/// restarted instead of being trusted, blocking the session forever, or —
+/// worse — being signalled.
+fn broker_lock(pid_path: &Path) -> BrokerLock {
     let Ok(file) = OpenOptions::new().read(true).write(true).open(pid_path) else {
-        return false;
+        return BrokerLock::Free;
     };
     match file.try_lock() {
         // Nobody holds the lock, so the broker that wrote this file is gone.
         Ok(()) => {
             let _ = file.unlock();
-            false
+            BrokerLock::Free
         }
-        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::WouldBlock) => BrokerLock::Held(
+            std::fs::read_to_string(pid_path)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok()),
+        ),
         Err(TryLockError::Error(error)) => {
             tracing::warn!(
                 path = %pid_path.display(),
                 error = %error,
                 "could not test the Git broker lock; treating the broker as gone"
             );
-            false
+            BrokerLock::Free
         }
     }
 }
 
+/// Whether a broker process still owns this session's bridge.
+pub fn broker_is_alive(pid_path: &Path) -> bool {
+    matches!(broker_lock(pid_path), BrokerLock::Held(_))
+}
+
+/// The process ID of the broker serving this session, when one is running.
+///
+/// Only a broker that still holds its lock is named, so a caller that stops a
+/// broker can never signal a PID the system has reassigned.
+pub fn running_broker_pid(pid_path: &Path) -> Option<i32> {
+    match broker_lock(pid_path) {
+        BrokerLock::Held(pid) => pid,
+        BrokerLock::Free => None,
+    }
+}
+
 /// Take ownership of this session's broker slot for the life of the process.
-fn claim_broker_pid_file(pid_path: &Path) -> Result<File> {
+///
+/// Visible to the crate so tests can stand in for a broker exactly as one
+/// behaves: holding this lock is what makes a process the session's broker.
+pub(crate) fn claim_broker_pid_file(pid_path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]
@@ -800,20 +833,40 @@ mod tests {
         let pid_path = directory.path().join("session.pid");
 
         assert!(!broker_is_alive(&pid_path));
+        assert_eq!(running_broker_pid(&pid_path), None);
 
         // A PID file naming this very much alive process still reads as dead
-        // while no broker holds its lock.
+        // while no broker holds its lock, and never names a process to signal.
         std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
         assert!(!broker_is_alive(&pid_path));
+        assert_eq!(running_broker_pid(&pid_path), None);
 
         let claimed = claim_broker_pid_file(&pid_path).unwrap();
         assert!(broker_is_alive(&pid_path));
+        assert_eq!(
+            running_broker_pid(&pid_path),
+            Some(std::process::id() as i32)
+        );
         assert!(claim_broker_pid_file(&pid_path).is_err());
         let written = std::fs::read_to_string(&pid_path).unwrap();
         assert_eq!(written.trim(), std::process::id().to_string());
 
         drop(claimed);
-        assert!(!broker_is_alive(&pid_path));
+        // The lock lives on the open file description, so it survives until
+        // every copy of that description is closed. A sibling thread that
+        // forks while this one is open hands a copy to its child until the
+        // child execs, which is why an owner that let go is observed free
+        // shortly rather than instantly. Measured here: a few hundred
+        // microseconds at worst.
+        let released = std::time::Instant::now();
+        while broker_is_alive(&pid_path) {
+            assert!(
+                released.elapsed() < Duration::from_secs(5),
+                "a released broker lock was never observed free"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(running_broker_pid(&pid_path), None);
     }
 }
 

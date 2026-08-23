@@ -13,7 +13,7 @@ use crate::hel_archive::{
 };
 use crate::hel_checkpoint::RepositoryRestoreSpec;
 use crate::hel_config::{ProjectBundle, TargetTemplate, atomic_write, data_dir};
-use crate::hel_git_proxy::{GitBrokerSpec, broker_is_alive};
+use crate::hel_git_proxy::{GitBrokerSpec, broker_is_alive, running_broker_pid};
 use crate::hel_local_git::canonical_repository;
 use crate::hel_projection::canonical_session_from_materialized;
 use crate::hel_state::{HelState, SessionRecord, SessionState, TargetLocator};
@@ -114,6 +114,10 @@ impl Controller {
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?
             .clone();
+        // The broker bridges into the target, so it is stopped before the
+        // target goes away. A launch this rollback discards is over: nothing
+        // will connect to its local origin again.
+        let broker_cleanup = retire_git_broker(session_id);
         let target_cleanup = match session.target.as_ref() {
             Some(locator) => (|| -> Result<()> {
                 let backend = backend_locator(locator, &session, &self.config)?;
@@ -129,7 +133,7 @@ impl Controller {
         };
         let worktree_cleanup =
             self.cleanup_new_session_worktree_after_failure(session_id, executor);
-        let cleanup_error = [target_cleanup, worktree_cleanup]
+        let cleanup_error = [broker_cleanup, target_cleanup, worktree_cleanup]
             .into_iter()
             .filter_map(Result::err)
             .map(|error| format!("{error:#}"))
@@ -1011,12 +1015,23 @@ const BROKER_RESTART_BACKOFF: Duration = Duration::from_millis(250);
 /// restart budget instead of continuing a restart storm.
 const BROKER_HEALTHY_RUN: Duration = Duration::from_secs(30);
 
+/// How long a retired broker has to exit after being asked, and again after
+/// being killed, before the stop is reported as failed.
+const BROKER_STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// How often a stopping broker's lock is re-tested.
+const BROKER_STOP_POLL: Duration = Duration::from_millis(25);
+
+fn broker_directory() -> PathBuf {
+    data_dir().join("git-brokers")
+}
+
 fn ensure_git_broker(
     session_id: &str,
     locator: &hel_targets::TargetLocator,
     repositories: BTreeMap<String, PathBuf>,
 ) -> Result<()> {
-    let directory = data_dir().join("git-brokers");
+    let directory = broker_directory();
     std::fs::create_dir_all(&directory)?;
     let files = BrokerFiles::in_directory(&directory, session_id);
     let spec = GitBrokerSpec {
@@ -1116,18 +1131,109 @@ fn start_git_broker(files: &BrokerFiles) -> Result<std::process::Child> {
     }
 }
 
+/// Stop this session's local Git broker for good and clear the state that
+/// would invite any controller to start another one.
+///
+/// Closing, deleting, or abandoning a session all end its local origin: the
+/// target the broker bridges into is about to disappear, so a broker left
+/// running would be restarted against nothing and finally reported as a
+/// failure the user never caused.
+pub(super) fn retire_git_broker(session_id: &str) -> Result<()> {
+    retire_broker_files(&BrokerFiles::in_directory(&broker_directory(), session_id))
+}
+
+/// Retire one broker: signal the intent, stop the process, then remove the
+/// files it left behind.
+///
+/// The spec is removed *first*, and that ordering is the whole design. Every
+/// supervisor consults the spec before restarting, so its absence is how a
+/// deliberate stop is told apart from a broker that died. Removing it after
+/// the kill would race the supervisor into restarting a broker for a session
+/// that is being torn down. The process is then stopped before its remaining
+/// files go, so nothing is ever deleted under a live writer.
+fn retire_broker_files(files: &BrokerFiles) -> Result<()> {
+    remove_broker_file(&files.spec)?;
+    stop_running_broker(&files.pid)?;
+    remove_broker_file(&files.ready)?;
+    remove_broker_file(&files.pid)?;
+    // The log stays: it is where this session's Git failures were reported,
+    // and reading it after the session ends is the point of keeping it.
+    Ok(())
+}
+
+/// Whether this session still wants a broker that has stopped to be started
+/// again.
+///
+/// A restart always spawns from the spec on disk, so a rewritten one needs no
+/// special handling; a retired session's spec is gone, and a broker another
+/// controller already has running belongs to that controller.
+fn broker_needs_restart(files: &BrokerFiles) -> bool {
+    files.spec.exists() && !broker_is_alive(&files.pid)
+}
+
+fn remove_broker_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove Git broker file {}", path.display()))
+        }
+    }
+}
+
+/// Terminate whatever broker still holds this session's slot, and wait for it
+/// to let go of the lock.
+///
+/// The PID is re-read on every pass: a restart that was already in flight
+/// when the session was retired claims the slot a moment later, and it has to
+/// be stopped too.
+fn stop_running_broker(pid_path: &Path) -> Result<()> {
+    for escalate in [false, true] {
+        let deadline = Instant::now() + BROKER_STOP_GRACE;
+        loop {
+            if !broker_is_alive(pid_path) {
+                return Ok(());
+            }
+            if let Some(pid) = running_broker_pid(pid_path) {
+                stop_broker_process_group(pid, escalate);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(BROKER_STOP_POLL);
+        }
+    }
+    bail!(
+        "the local Git broker holding {} did not stop",
+        pid_path.display()
+    )
+}
+
+/// Signal the process group a broker leads. Brokers are started as their own
+/// group leader, so this stops the target-side bridge with the broker instead
+/// of leaving it attached to a target that is going away.
+#[cfg(unix)]
+fn stop_broker_process_group(pid: i32, escalate: bool) {
+    crate::hel_worker_runtime::terminate_process_group(
+        pid,
+        if escalate {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        },
+    );
+}
+
+#[cfg(not(unix))]
+fn stop_broker_process_group(_pid: i32, _escalate: bool) {}
+
 /// Keep this session's Git broker running until another controller takes it
-/// over, or until restarting it stops helping.
+/// over, until the session retires it, or until restarting it stops helping.
 fn supervise_git_broker(session_id: &str, files: &BrokerFiles, child: std::process::Child) {
     let mut started = Some(child);
     let outcome = supervise_broker_restarts(
         BROKER_RESTART_ATTEMPTS,
-        || {
-            // A restart always spawns from the spec on disk, so a rewritten
-            // one needs no special handling; a removed spec, or a broker
-            // another controller already has running, does.
-            files.spec.exists() && !broker_is_alive(&files.pid)
-        },
+        || broker_needs_restart(files),
         || {
             let running = Instant::now();
             let mut child = match started.take() {
@@ -2054,6 +2160,146 @@ mod tests {
 
         assert_eq!(runs, 6);
         assert!(format!("{error:#}").contains("stopped 3 times in a row"));
+    }
+
+    /// Turns a re-executed copy of the stop test into a stand-in for a running
+    /// broker. Holding the slot's lock is exactly what makes a process this
+    /// session's broker, so a stand-in that holds it is indistinguishable from
+    /// the real thing to everything that has to stop one.
+    const BROKER_STAND_IN_PID_PATH: &str = "HEL_TEST_BROKER_STAND_IN_PID_PATH";
+
+    fn retirable_broker_files(directory: &Path) -> BrokerFiles {
+        let files = BrokerFiles::in_directory(directory, PROVISIONED_SESSION);
+        GitBrokerSpec {
+            session_id: PROVISIONED_SESSION.into(),
+            bridge: CommandSpec::new("true", Vec::<String>::new()),
+            repositories: BTreeMap::new(),
+            ready_path: files.ready.clone(),
+            pid_path: files.pid.clone(),
+        }
+        .write(&files.spec)
+        .unwrap();
+        std::fs::write(&files.ready, "ready\n").unwrap();
+        std::fs::write(&files.log, "broker log\n").unwrap();
+        files
+    }
+
+    /// A closing session stops its broker on purpose: the process goes, the
+    /// supervisor that was keeping it alive returns quietly, and the log keeps
+    /// what it had without a word about a lost origin.
+    #[cfg(unix)]
+    #[test]
+    fn retiring_a_session_stops_its_running_broker_and_reports_nothing() {
+        if let Some(pid_path) = std::env::var_os(BROKER_STAND_IN_PID_PATH) {
+            let _slot = crate::hel_git_proxy::claim_broker_pid_file(Path::new(&pid_path)).unwrap();
+            // Retirement is what ends this process; the sleep only bounds the
+            // damage when it fails to.
+            std::thread::sleep(Duration::from_secs(60));
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let files = retirable_broker_files(directory.path());
+        let test_name = format!(
+            "{}::retiring_a_session_stops_its_running_broker_and_reports_nothing",
+            module_path!()
+                .strip_prefix("hel::")
+                .unwrap_or(module_path!())
+        );
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &test_name, "--nocapture"])
+            .env(BROKER_STAND_IN_PID_PATH, &files.pid)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        {
+            use std::os::unix::process::CommandExt;
+            // Brokers lead their own process group, and stopping one signals
+            // that group.
+            command.process_group(0);
+        }
+        let child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !broker_is_alive(&files.pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the stand-in broker never claimed its slot"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (finished, supervised) = std::sync::mpsc::channel();
+        let supervisor = {
+            let files = files.clone();
+            std::thread::spawn(move || {
+                supervise_git_broker(PROVISIONED_SESSION, &files, child);
+                let _ = finished.send(());
+            })
+        };
+
+        retire_broker_files(&files).unwrap();
+
+        supervised
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the retired broker's supervisor never finished");
+        supervisor.join().unwrap();
+        assert!(!broker_is_alive(&files.pid));
+        assert!(!files.spec.exists());
+        assert!(!files.pid.exists());
+        assert!(!files.ready.exists());
+        assert_eq!(std::fs::read_to_string(&files.log).unwrap(), "broker log\n");
+    }
+
+    /// The same stop that ends a broker also ends its restarts: a broker that
+    /// died is started again, a broker its session retired is not.
+    #[test]
+    fn a_retired_broker_is_never_restarted_where_a_dead_one_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let files = retirable_broker_files(directory.path());
+        // A PID file whose broker is gone: the death was unexpected.
+        std::fs::write(&files.pid, "424242").unwrap();
+        assert!(broker_needs_restart(&files));
+
+        retire_broker_files(&files).unwrap();
+
+        assert!(!broker_needs_restart(&files));
+        let mut runs = 0;
+        supervise_broker_restarts(
+            BROKER_RESTART_ATTEMPTS,
+            || broker_needs_restart(&files),
+            || {
+                runs += 1;
+                Ok((Duration::from_millis(1), "signal: 15".into()))
+            },
+            |_| unreachable!("a retired broker must never be waited on for a restart"),
+        )
+        .unwrap();
+
+        // The broker that was already running, and not one restart after it.
+        assert_eq!(runs, 1);
+        assert!(!files.spec.exists());
+        assert!(!files.pid.exists());
+        assert!(!files.ready.exists());
+        assert_eq!(std::fs::read_to_string(&files.log).unwrap(), "broker log\n");
+    }
+
+    /// A session with no local repositories never had a broker, so retiring it
+    /// touches nothing at all.
+    #[test]
+    fn retiring_a_session_that_never_had_a_broker_creates_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let brokers = directory.path().join("git-brokers");
+
+        retire_broker_files(&BrokerFiles::in_directory(&brokers, PROVISIONED_SESSION)).unwrap();
+
+        assert!(!brokers.exists());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
