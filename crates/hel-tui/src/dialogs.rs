@@ -6,7 +6,7 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use hel::hel_config::{HarnessKind, mount_history_host};
 use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_additional_mounts};
 
-use crate::widgets::{centered_rect, focused_buttons, popup_height, truncate_text};
+use crate::widgets::{action_buttons, centered_rect, focused_buttons, popup_height, truncate_text};
 use crate::wizards::read_only_marker;
 use crate::{
     ButtonKey, DashboardAction, DashboardState, Mode, button_row_key, cycle_button_focus,
@@ -75,17 +75,6 @@ pub(crate) enum RepositoryOriginFocus {
     Field,
     Cancel,
     Validate,
-}
-
-const REPOSITORY_ORIGIN_BUTTONS: &[&str] = &["Cancel", "Check origin"];
-
-impl RepositoryOriginFocus {
-    fn button_index(self) -> usize {
-        match self {
-            Self::Cancel => 0,
-            Self::Field | Self::Validate => 1,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,18 +621,34 @@ pub(crate) fn render_repository_origin(
     area: Rect,
     dialog: &RepositoryOriginDialog,
 ) {
+    let field_focused = dialog.focus == RepositoryOriginFocus::Field;
+    let field_cursor = if field_focused { "▏" } else { "" };
+    let field_style = if field_focused {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
     let mut lines = vec![
         Line::raw(format!("Repository: {}", dialog.repository_id)),
         Line::raw(""),
         Line::raw(format!(
-            "Checkpoint base {} is absent from the configured source.",
+            "The configured source does not contain checkpoint base {}.",
             dialog.missing_commit
         )),
-        Line::raw(format!("Archived origin: {}", dialog.archived_origin)),
-        Line::raw(format!("Configured source: {}", dialog.configured_origin)),
+        Line::raw(format!("Checkpoint origin: {}", dialog.archived_origin)),
+        Line::raw(format!(
+            "Configured source checked: {}",
+            dialog.configured_origin
+        )),
         Line::raw(""),
-        Line::raw("Did this repository move? Enter its new GitHub origin or absolute local path:"),
-        Line::styled(dialog.replacement.clone(), Style::default().fg(Color::Cyan)),
+        Line::raw("Enter a GitHub origin or absolute local path that contains this history:"),
+        Line::from(vec![
+            Span::raw("Source: "),
+            Span::styled(
+                format!(" {}{field_cursor} ", dialog.replacement),
+                field_style,
+            ),
+        ]),
     ];
     if let Some(error) = &dialog.error {
         lines.push(Line::styled(
@@ -653,7 +658,17 @@ pub(crate) fn render_repository_origin(
     }
     lines.extend([
         Line::raw(""),
-        focused_buttons(REPOSITORY_ORIGIN_BUTTONS, dialog.focus.button_index()),
+        Line::styled(
+            "Type or paste into Source · Tab moves · Enter checks",
+            Style::default().fg(Color::DarkGray),
+        ),
+        action_buttons(&[
+            ("Cancel", dialog.focus == RepositoryOriginFocus::Cancel),
+            (
+                "Check origin",
+                dialog.focus == RepositoryOriginFocus::Validate,
+            ),
+        ]),
     ]);
     let paragraph = Paragraph::new(lines)
         .block(
@@ -2316,6 +2331,63 @@ mod tests {
             DashboardAction::None
         );
         assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn missing_checkpoint_history_dialog_makes_the_source_field_visible() {
+        let mut dashboard = dashboard_with_session(stopped_session());
+        dashboard.show_repository_origin_dialog(
+            "session-1".into(),
+            "bifrost".into(),
+            "b41dc78".into(),
+            "https://github.com/BrokkAi/bifrost.git".into(),
+            "BrokkAi/bifrost-dev".into(),
+            DashboardAction::None,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw repository origin dialog");
+
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let source_row = lines
+            .iter()
+            .position(|line| line.contains("Source:") && line.contains('▏'))
+            .expect("focused source field");
+        let source_y = buffer.area.y + source_row as u16;
+        let cursor_x = buffer.area.x + cell_column(&lines[source_row], "▏");
+        assert_eq!(buffer[(cursor_x, source_y)].bg, Color::Cyan);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Type or paste into Source"))
+        );
+
+        let button_row = lines
+            .iter()
+            .position(|line| line.contains(" Cancel ") && line.contains(" Check origin "))
+            .expect("button row");
+        let button_y = buffer.area.y + button_row as u16;
+        let cancel_x = buffer.area.x + cell_column(&lines[button_row], "Cancel");
+        let check_x = buffer.area.x + cell_column(&lines[button_row], "Check origin");
+        assert_eq!(buffer[(cancel_x, button_y)].bg, Color::DarkGray);
+        assert_eq!(buffer[(check_x, button_y)].bg, Color::DarkGray);
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw repository origin dialog with cancel focused");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        assert!(!lines.iter().any(|line| line.contains('▏')));
+        let button_row = lines
+            .iter()
+            .position(|line| line.contains(" Cancel ") && line.contains(" Check origin "))
+            .expect("button row");
+        let button_y = buffer.area.y + button_row as u16;
+        let cancel_x = buffer.area.x + cell_column(&lines[button_row], "Cancel");
+        assert_eq!(buffer[(cancel_x, button_y)].bg, Color::Cyan);
     }
 
     #[test]
