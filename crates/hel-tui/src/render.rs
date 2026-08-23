@@ -13,7 +13,7 @@ use ratatui::widgets::{
 };
 
 use hel::hel_chat::render_agent_message_tail;
-use hel::hel_config::HelConfig;
+use hel::hel_config::{HarnessKind, HelConfig};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
 use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
@@ -1066,7 +1066,13 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         .unwrap_or_default()
         .as_secs();
     let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
-        let (weekly, five_hour, resets) = if dashboard.quota_refreshing.contains(id) {
+        let (weekly, five_hour, resets) = if profile.kind == HarnessKind::Deepseek {
+            (
+                Line::raw(hel::hel_quota::API_PRICING_LABEL),
+                Line::default(),
+                String::new(),
+            )
+        } else if dashboard.quota_refreshing.contains(id) {
             (Line::raw("refreshing…"), Line::default(), String::new())
         } else {
             match dashboard.quotas.get(id) {
@@ -2576,6 +2582,29 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("login expired"));
         assert!(!rendered.contains("unavailable: login expired"));
+    }
+
+    #[test]
+    fn deepseek_quota_row_shows_api_pricing_without_bars_or_reset_dates() {
+        let mut config = config();
+        config.profiles.get_mut("codex-1").unwrap().kind = HarnessKind::Deepseek;
+        let mut dashboard = DashboardState::new(config, HelState::default(), BTreeMap::new());
+        dashboard.quota_refreshing.insert("codex-1".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 28)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("API Pricing"));
+        assert!(!rendered.contains("unavailable"));
+        assert!(!rendered.contains('%'));
     }
 
     #[test]

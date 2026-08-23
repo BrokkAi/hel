@@ -16,6 +16,8 @@ use crate::hel_config::HarnessKind;
 use crate::hel_credentials::{MAX_CREDENTIAL_BYTES, credential_fingerprint};
 use crate::hel_setup::harness_authentication_marker;
 
+pub const API_PRICING_LABEL: &str = "API Pricing";
+
 #[derive(Debug, Clone)]
 pub struct QuotaRefreshRequest {
     pub profile_id: String,
@@ -359,9 +361,14 @@ async fn refresh_profile(
                 })
                 .map_err(|error| anyhow::anyhow!(error.to_string()))
         }
-        HarnessKind::Deepseek => Err(anyhow::anyhow!(
-            "usage-priced harness; no subscription quota window"
-        )),
+        HarnessKind::Deepseek => Ok(ProfileQuota {
+            profile_id: profile_id.clone(),
+            harness,
+            windows: Vec::new(),
+            extra: Some(API_PRICING_LABEL.to_owned()),
+            error: None,
+            refreshed_at_epoch_seconds,
+        }),
     };
     let report = result.unwrap_or_else(|error| ProfileQuota {
         profile_id,
@@ -1448,7 +1455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepseek_reports_no_subscription_window_instead_of_inventing_quota() {
+    async fn deepseek_reports_api_pricing_instead_of_inventing_quota() {
         let directory = tempfile::tempdir().unwrap();
         let (outcome, _) = refresh_profile(
             QuotaRefreshRequest {
@@ -1464,10 +1471,9 @@ mod tests {
         .await;
 
         assert!(outcome.report.windows.is_empty());
-        assert_eq!(
-            outcome.report.error.as_deref(),
-            Some("usage-priced harness; no subscription quota window")
-        );
+        assert_eq!(outcome.report.error, None);
+        assert_eq!(outcome.report.extra.as_deref(), Some(API_PRICING_LABEL));
+        assert_eq!(outcome.report.compact(), API_PRICING_LABEL);
     }
 
     #[tokio::test]
