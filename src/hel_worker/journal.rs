@@ -21,13 +21,13 @@ use crate::hel_archive::CanonicalQueuedPrompt;
 use super::snapshot::{
     RelayCommand, RelayDispatchState, RelayEvent, RelayObservation, RelaySnapshot,
     apply_relay_event, clamp_observation, ensure_byte_budget, ensure_serialized_budget,
-    relay_event_digest, validate_relay_digest, validate_relay_event,
+    observation_changes_state, relay_event_digest, validate_relay_digest, validate_relay_event,
 };
 use super::{
     DurableRelay, RELAY_ACTIVE_SEGMENT, RELAY_EVENT_BYTE_BUDGET, RELAY_EVENT_ENVELOPE_RESERVE,
     RELAY_EVENT_GENESIS_DIGEST, RELAY_HOT_EVENT_CAPACITY, RELAY_JOURNAL_DIR,
-    RELAY_SEGMENT_BYTE_LIMIT, RELAY_SNAPSHOT_BYTE_BUDGET, RELAY_STATE_BYTE_BUDGET,
-    RELAY_STATE_FILE, RESTORED_RELAY_SEED_FILE,
+    RELAY_SEGMENT_BYTE_LIMIT, RELAY_SNAPSHOT_BYTE_BUDGET, RELAY_SNAPSHOT_LAG_BYTE_LIMIT,
+    RELAY_STATE_BYTE_BUDGET, RELAY_STATE_FILE, RESTORED_RELAY_SEED_FILE,
 };
 
 #[derive(Debug, Clone)]
@@ -524,15 +524,28 @@ impl DurableRelay {
             digest: relay_event_digest(&event)?,
             ..event
         };
-        ensure_serialized_budget(&event, RELAY_EVENT_BYTE_BUDGET, "relay event")?;
-        let mut next_snapshot = self.snapshot.clone();
-        apply_relay_event(&mut next_snapshot, &event)?;
-        ensure_serialized_budget(&next_snapshot, RELAY_SNAPSHOT_BYTE_BUDGET, "relay snapshot")?;
-        ensure_serialized_budget(
-            &next_snapshot.operational_state(),
-            RELAY_STATE_BYTE_BUDGET,
-            "relay operational state",
-        )?;
+        // The same bytes are measured against the event budget and written to
+        // the journal, so the encoding is done once.
+        let mut encoded = serde_json::to_vec(&event).context("serialize relay event")?;
+        ensure_byte_budget(encoded.len(), RELAY_EVENT_BYTE_BUDGET, "relay event")?;
+        encoded.push(b'\n');
+        // A transcript observation leaves everything but the frontier alone, so
+        // only a state-moving event pays for the staged snapshot copy and the
+        // two budget serializations that validate it.
+        let stage_snapshot = self.stages_snapshot(&event.observation);
+        let staged = if stage_snapshot {
+            let mut next_snapshot = self.snapshot.clone();
+            apply_relay_event(&mut next_snapshot, &event)?;
+            ensure_serialized_budget(&next_snapshot, RELAY_SNAPSHOT_BYTE_BUDGET, "relay snapshot")?;
+            ensure_serialized_budget(
+                &next_snapshot.operational_state(),
+                RELAY_STATE_BYTE_BUDGET,
+                "relay operational state",
+            )?;
+            Some(next_snapshot)
+        } else {
+            None
+        };
         self.seal_active_segment_if_needed()?;
         let journal = self.root.join(RELAY_JOURNAL_DIR);
         let path = journal.join(RELAY_ACTIVE_SEGMENT);
@@ -542,22 +555,57 @@ impl DurableRelay {
             .append(true)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        serde_json::to_writer(&mut file, &event)?;
-        file.write_all(b"\n")?;
+        file.write_all(&encoded)?;
         file.sync_data()?;
         if created_active_segment {
             sync_directory(&journal)?;
         }
 
-        self.snapshot = next_snapshot;
+        match staged {
+            Some(next_snapshot) => self.snapshot = next_snapshot,
+            // Applying is still what moves the frontier, so a misclassified
+            // observation cannot silently lose its state change. It cannot
+            // fail here either: this event was digested from this exact
+            // frontier, which `relay_event_digest` already validated.
+            None => apply_relay_event(&mut self.snapshot, &event)?,
+        }
         self.record_journal_append(&path, &event);
         self.push_hot_event(event);
-        self.persist_snapshot()?;
+        self.unpersisted_journal_bytes =
+            self.unpersisted_journal_bytes.saturating_add(encoded.len());
+        // Recovery replays journal events past the snapshot frontier, so a
+        // streamed observation does not need its own snapshot write. Persisting
+        // on every state move and once per bounded run of transcript bytes
+        // keeps that replay short without paying two fsyncs per chunk.
+        if stage_snapshot || self.unpersisted_journal_bytes >= RELAY_SNAPSHOT_LAG_BYTE_LIMIT {
+            self.persist_snapshot()?;
+        }
         Ok(ordinal)
     }
 
-    pub(crate) fn persist_snapshot(&self) -> Result<()> {
-        persist_relay_snapshot(&self.root, &self.snapshot)
+    /// Whether appending this observation has to stage and persist a snapshot.
+    fn stages_snapshot(&self, observation: &RelayObservation) -> bool {
+        #[cfg(test)]
+        if self.stage_snapshot_every_append {
+            return true;
+        }
+        observation_changes_state(observation)
+    }
+
+    pub(crate) fn persist_snapshot(&mut self) -> Result<()> {
+        persist_relay_snapshot(&self.root, &self.snapshot)?;
+        self.unpersisted_journal_bytes = 0;
+        Ok(())
+    }
+
+    /// Adopt a staged snapshot only once it is durable. Every write of
+    /// `relay-state.json` goes through here or [`Self::persist_snapshot`], so
+    /// `unpersisted_journal_bytes == 0` means the file matches memory.
+    pub(crate) fn commit_snapshot(&mut self, next_snapshot: RelaySnapshot) -> Result<()> {
+        persist_relay_snapshot(&self.root, &next_snapshot)?;
+        self.snapshot = next_snapshot;
+        self.unpersisted_journal_bytes = 0;
+        Ok(())
     }
 
     fn seal_active_segment_if_needed(&mut self) -> Result<()> {
@@ -678,46 +726,56 @@ impl DurableRelay {
 
     pub(crate) fn garbage_collect_relay_history(&mut self) -> Result<()> {
         let through = self.snapshot.retained_through();
-        let mut next_snapshot = self.snapshot.clone();
-        Self::prune_command_ledger(&mut next_snapshot, through);
         let journal_floor = self
             .journal_spans
             .first()
             .map_or(self.snapshot.latest_ordinal, |span| span.after_ordinal);
+        let rewrites_journal = through > journal_floor;
 
-        // Stage every in-memory mutation. The already-durable ACK/recovery
-        // frontiers make either the old or rewritten journal valid after a
-        // crash. Only publish the pruned ledger in memory after both durable
-        // writes succeed, so a transient write failure cannot forget command
-        // IDs while the daemon keeps serving retries.
-        if through > journal_floor {
+        // The retained frontier this collection acts on has to be durable
+        // before the journal loses the events below it: recovery reads that
+        // frontier from the snapshot and replays forward from there.
+        if rewrites_journal && self.unpersisted_journal_bytes > 0 {
+            self.persist_snapshot()?;
+        }
+        // With the ACK and recovery frontiers durable, either the old or the
+        // rewritten journal is valid after a crash.
+        if rewrites_journal {
             self.rewrite_relay_journal(through)?;
         }
-        persist_relay_snapshot(&self.root, &next_snapshot)?;
-        self.snapshot = next_snapshot;
+        // The pruned ledger reaches memory only after its own durable write
+        // succeeds, so a transient failure cannot forget command IDs while the
+        // daemon keeps serving retries. A catch-up ACK usually prunes nothing
+        // and rewrites nothing, and its own persist already made this snapshot
+        // durable; writing it again would cost two more fsyncs for a file that
+        // would not change.
+        let prunable = Self::prunable_command_ids(&self.snapshot, through);
+        if !prunable.is_empty() || self.unpersisted_journal_bytes > 0 {
+            let mut next_snapshot = self.snapshot.clone();
+            for command_id in prunable {
+                next_snapshot.handled_commands.remove(&command_id);
+                next_snapshot.dispatches.remove(&command_id);
+            }
+            self.commit_snapshot(next_snapshot)?;
+        }
         self.hot_events.retain(|event| event.ordinal > through);
         Ok(())
     }
 
-    fn prune_command_ledger(snapshot: &mut RelaySnapshot, through: u64) {
-        let removable: Vec<String> = snapshot
+    /// Ledger entries whose command is terminal at or below `through`. Their
+    /// events are no longer retained, so the IDs no longer have to be
+    /// remembered for idempotency.
+    fn prunable_command_ids(snapshot: &RelaySnapshot, through: u64) -> Vec<String> {
+        snapshot
             .handled_commands
             .iter()
-            .filter_map(|(command_id, handled)| {
-                if handled
+            .filter(|(_, handled)| {
+                handled
                     .terminal_ordinal
                     .is_some_and(|terminal| terminal <= through)
-                {
-                    Some(command_id.clone())
-                } else {
-                    None
-                }
             })
-            .collect();
-        for command_id in removable {
-            snapshot.handled_commands.remove(&command_id);
-            snapshot.dispatches.remove(&command_id);
-        }
+            .map(|(command_id, _)| command_id.clone())
+            .collect()
     }
 
     pub(crate) fn recover_nonterminal_commands(&mut self) -> Result<()> {
@@ -830,6 +888,232 @@ mod tests {
         RelayCursor, RelayErrorCode, RelayErrorDetail, RelayExecutionState, RelayProtocolError,
         RelayRequest, RelayResponseBody, RelayResponsePayload,
     };
+
+    /// Streamed chunk cost, measured both ways in one process so a loaded
+    /// machine cannot flatter either policy. Run with
+    /// `cargo test --lib hel_worker::journal::tests::streamed_chunk_append_cost
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing measurement, not a behavior assertion"]
+    fn streamed_chunk_append_cost() {
+        const BACKLOG: usize = 40;
+        const CHUNKS: usize = 200;
+        const ROUNDS: u32 = 3;
+
+        fn stream_chunks(stage_every_append: bool) -> (std::time::Duration, usize) {
+            let temp = tempfile::tempdir().unwrap();
+            let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+            // Give the snapshot the weight a real session carries: a queue of
+            // prompts the checkpoint has not pruned yet.
+            for index in 0..BACKLOG {
+                submit_relay(
+                    &mut relay,
+                    &format!("backlog-command-{index:04}"),
+                    prompt(&"q".repeat(4096)),
+                );
+            }
+            let snapshot_bytes = fs::read(temp.path().join(RELAY_STATE_FILE)).unwrap().len();
+            relay.stage_snapshot_every_append = stage_every_append;
+
+            let chunk = "token ".repeat(40);
+            let started = std::time::Instant::now();
+            for _ in 0..CHUNKS {
+                relay
+                    .record_session_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                        ContentBlock::from(chunk.clone()),
+                    )))
+                    .unwrap();
+            }
+            (started.elapsed(), snapshot_bytes)
+        }
+
+        let mut amortized = std::time::Duration::ZERO;
+        let mut every_append = std::time::Duration::ZERO;
+        let mut snapshot_bytes = 0;
+        for _ in 0..ROUNDS {
+            let (elapsed, bytes) = stream_chunks(false);
+            amortized += elapsed;
+            snapshot_bytes = bytes;
+            every_append += stream_chunks(true).0;
+        }
+
+        // What one redundant snapshot write costs: the collection that follows
+        // an advancing acknowledgement used to pay exactly this.
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        for index in 0..BACKLOG {
+            submit_relay(
+                &mut relay,
+                &format!("backlog-command-{index:04}"),
+                prompt(&"q".repeat(4096)),
+            );
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..CHUNKS {
+            relay.persist_snapshot().unwrap();
+        }
+        let persists = started.elapsed();
+
+        let appends = CHUNKS as u32 * ROUNDS;
+        println!(
+            "snapshot {snapshot_bytes} bytes, {appends} chunk appends per policy\n  \
+             snapshot per append: {every_append:?} ({:?}/append)\n  \
+             amortized:           {amortized:?} ({:?}/append)\n  \
+             one snapshot write:  {:?}",
+            every_append / appends,
+            amortized / appends,
+            persists / u32::try_from(CHUNKS).unwrap(),
+        );
+    }
+
+    fn persisted_relay_snapshot(root: &Path) -> RelaySnapshot {
+        serde_json::from_slice(&fs::read(root.join(RELAY_STATE_FILE)).unwrap()).unwrap()
+    }
+
+    /// The journal is what makes a streamed chunk durable. Rewriting the whole
+    /// snapshot per chunk bought nothing, because recovery already replays
+    /// journal events past the snapshot frontier.
+    #[test]
+    fn streamed_chunks_are_journaled_without_rewriting_the_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "streaming-prompt", prompt("stream"));
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "streaming-prompt"
+        );
+        let persisted = persisted_relay_snapshot(temp.path());
+
+        for index in 0..8 {
+            relay
+                .record_session_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::from(format!("chunk {index}")),
+                )))
+                .unwrap();
+        }
+        assert_eq!(relay.latest_ordinal(), persisted.latest_ordinal + 8);
+        assert_eq!(
+            persisted_relay_snapshot(temp.path()),
+            persisted,
+            "streamed chunks rewrote relay-state.json"
+        );
+
+        // A state move is still durable the moment it is recorded.
+        finish_prompt(&mut relay, "streaming-prompt");
+        assert_eq!(
+            persisted_relay_snapshot(temp.path()).latest_ordinal,
+            relay.latest_ordinal()
+        );
+    }
+
+    /// A relay that dies mid-turn keeps every chunk it acknowledged, and the
+    /// relay that reopens republishes the frontier it replayed.
+    #[test]
+    fn a_relay_that_dies_mid_stream_recovers_its_unpersisted_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        // The prompt stays promoted but unclaimed, so recovery has no in-flight
+        // ACP command to interrupt and the frontier is exactly what was
+        // journaled.
+        submit_relay(&mut relay, "interrupted-prompt", prompt("stream"));
+        for index in 0..8 {
+            relay
+                .record_session_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::from(format!("chunk {index}")),
+                )))
+                .unwrap();
+        }
+        let frontier = relay.latest_ordinal();
+        let digest = relay.latest_digest().to_owned();
+        // No teardown: the process is gone before anything else is written.
+        drop(relay);
+
+        let reopened = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(reopened.latest_ordinal(), frontier);
+        assert_eq!(reopened.latest_digest(), digest);
+        assert_eq!(
+            reopened
+                .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                .unwrap()
+                .len(),
+            usize::try_from(frontier).unwrap()
+        );
+        assert_eq!(
+            persisted_relay_snapshot(temp.path()).latest_ordinal,
+            frontier,
+            "recovery must republish the frontier it replayed"
+        );
+    }
+
+    /// Amortization is bounded: a long stream still rewrites the snapshot, so
+    /// a restart never has to replay an unbounded journal.
+    #[test]
+    fn a_long_stream_persists_the_snapshot_before_replay_grows_unbounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let chunk = "y".repeat(64 * 1024);
+        let mut journaled = 0_usize;
+        while journaled <= RELAY_SNAPSHOT_LAG_BYTE_LIMIT {
+            relay
+                .record_session_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::from(chunk.clone()),
+                )))
+                .unwrap();
+            journaled += chunk.len();
+        }
+
+        let persisted = persisted_relay_snapshot(temp.path()).latest_ordinal;
+        assert!(
+            persisted > 1,
+            "a stream past the replay budget never rewrote the snapshot"
+        );
+        assert!(persisted <= relay.latest_ordinal());
+    }
+
+    /// A catch-up acknowledgement wrote `relay-state.json` twice: once for the
+    /// ACK, then again for a collection that had nothing to collect.
+    #[test]
+    fn an_acknowledgement_with_nothing_to_collect_does_not_rewrite_the_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        // Pin retained history at a verified checkpoint and let the collection
+        // that follows it finish.
+        let ready = ready_checkpoint(&mut relay, "catch-up-barrier");
+        acknowledge_relay(&mut relay, "ack-catch-up-barrier", ready.ordinal);
+        submit_relay(
+            &mut relay,
+            "complete-catch-up",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "catch-up-barrier".into(),
+            },
+        );
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "streamed past the floor".into(),
+            })
+            .unwrap();
+        let through = relay.latest_ordinal();
+        acknowledge_relay(&mut relay, "ack-catch-up", through);
+
+        // From here any snapshot write fails, so a redundant one is visible.
+        let state_path = temp.path().join(RELAY_STATE_FILE);
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+        let repeated = acknowledge_relay(&mut relay, "ack-catch-up-again", through);
+        assert!(
+            matches!(
+                repeated.body,
+                RelayResponseBody::Ok {
+                    payload: RelayResponsePayload::Acknowledged {
+                        through_ordinal,
+                        ..
+                    }
+                } if through_ordinal == through
+            ),
+            "history collection rewrote an unchanged snapshot: {:?}",
+            repeated.body
+        );
+    }
 
     #[test]
     fn restart_finishes_a_durably_accepted_queue_removal() {
@@ -1362,7 +1646,8 @@ mod tests {
         relay.snapshot.acknowledged_digest.clone_from(&digest);
         relay.snapshot.recovery_floor_ordinal = through;
         relay.snapshot.recovery_floor_digest.clone_from(&digest);
-        relay.persist_snapshot().unwrap();
+        // The snapshot stays unpersisted, so the collection below has to make
+        // the retained frontier durable before it drops history under it.
 
         let state_path = temp.path().join(RELAY_STATE_FILE);
         fs::remove_file(&state_path).unwrap();

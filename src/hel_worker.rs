@@ -50,8 +50,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedCommandKind;
 use journal::{
-    RelayJournalSpan, open_relay_journal, persist_relay_snapshot, read_restored_relay_seed,
-    visit_relay_journal_file,
+    RelayJournalSpan, open_relay_journal, read_restored_relay_seed, visit_relay_journal_file,
 };
 use protocol::{incompatible_request_protocol, relay_error, relay_protocol_error};
 use snapshot::{
@@ -110,6 +109,10 @@ pub const RESTORED_RELAY_SEED_FILE: &str = "relay-seed.json";
 pub const WORKER_PID_FILE: &str = "worker.pid";
 const RELAY_ACTIVE_SEGMENT: &str = "active.jsonl";
 const RELAY_SEGMENT_BYTE_LIMIT: u64 = 1024 * 1024;
+/// Journal bytes a restart may have to replay before the snapshot is rewritten.
+/// Transcript observations are reconstructed by that replay, so they are
+/// journaled without their own snapshot write until this much has accumulated.
+const RELAY_SNAPSHOT_LAG_BYTE_LIMIT: usize = 1024 * 1024;
 const RELAY_HOT_EVENT_CAPACITY: usize = 32;
 const NATIVE_SESSION_IDENTITY_FILE: &str = "native-session.json";
 
@@ -129,6 +132,14 @@ pub struct DurableRelay {
     /// A small optimization for recent cursor validation. This is never the
     /// source of truth and is deliberately fixed-size.
     hot_events: VecDeque<RelayEvent>,
+    /// Journal bytes appended since `relay-state.json` last matched this
+    /// snapshot. Zero means the durable file is exactly this state.
+    unpersisted_journal_bytes: usize,
+    /// Benchmark aid: stage and persist a snapshot on every append, the way
+    /// the relay did before transcript appends were amortized, so both
+    /// policies can be timed in one process.
+    #[cfg(test)]
+    stage_snapshot_every_append: bool,
 }
 
 impl DurableRelay {
@@ -260,6 +271,9 @@ impl DurableRelay {
             snapshot,
             journal_spans,
             hot_events,
+            unpersisted_journal_bytes: 0,
+            #[cfg(test)]
+            stage_snapshot_every_append: false,
         };
         if !state_path.exists() || relay.snapshot.latest_ordinal > snapshot_ordinal {
             relay.persist_snapshot()?;
@@ -528,8 +542,7 @@ impl DurableRelay {
             next_snapshot.acknowledged_through = through_ordinal;
             next_snapshot.acknowledged_digest = through_digest.to_owned();
             // The acknowledgement becomes durable before any journal GC.
-            persist_relay_snapshot(&self.root, &next_snapshot)?;
-            self.snapshot = next_snapshot;
+            self.commit_snapshot(next_snapshot)?;
         }
         // An earlier attempt may have durably advanced the ACK and then
         // failed while rewriting or pruning history. Retrying the exact ACK
@@ -953,8 +966,9 @@ impl DurableRelay {
             });
         }
         if !claimed.is_empty() {
-            persist_relay_snapshot(&self.root, &next_snapshot)?;
-            self.snapshot = next_snapshot;
+            // An in-flight claim is not in the journal, so it is only durable
+            // once the snapshot itself is.
+            self.commit_snapshot(next_snapshot)?;
         }
         Ok(claimed)
     }

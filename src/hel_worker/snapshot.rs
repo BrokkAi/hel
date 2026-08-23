@@ -597,14 +597,16 @@ pub(crate) fn clamp_observation(
     observation: RelayObservation,
     budget: usize,
 ) -> Result<RelayObservation> {
-    let mut value =
-        serde_json::to_value(&observation).context("serialize relay observation for clamping")?;
-    let mut size = serde_json::to_vec(&value)
+    let mut size = serde_json::to_vec(&observation)
         .context("measure relay observation")?
         .len();
     if size <= budget {
         return Ok(observation);
     }
+    // Only an observation that really has to shrink pays for the JSON tree
+    // the truncation pass walks.
+    let mut value =
+        serde_json::to_value(&observation).context("serialize relay observation for clamping")?;
     let original = size;
     while size > budget {
         let Some((path, length)) = longest_string_path(&value) else {
@@ -718,6 +720,44 @@ pub(crate) fn validate_relay_digest(digest: &str, name: &str) -> Result<()> {
         bail!("{name} must be 64 lowercase hexadecimal characters");
     }
     Ok(())
+}
+
+/// Whether applying this observation moves durable relay state beyond the
+/// event frontier.
+///
+/// Transcript observations do not: replaying them from the journal reaches the
+/// same snapshot, so appending one need not stage a snapshot copy, re-check the
+/// snapshot budgets, or rewrite `relay-state.json`. Every arm here mirrors an
+/// arm of [`apply_relay_event`]; `transcript_observations_move_nothing_but_the_frontier`
+/// fails if the two ever disagree.
+pub(crate) fn observation_changes_state(observation: &RelayObservation) -> bool {
+    match observation {
+        RelayObservation::AgentInitialized { .. }
+        | RelayObservation::SessionOpened { .. }
+        | RelayObservation::SessionConfigured { .. }
+        | RelayObservation::CommandQueued { .. }
+        | RelayObservation::CommandStarted { .. }
+        | RelayObservation::CommandCompleted { .. }
+        | RelayObservation::CommandRejected { .. }
+        | RelayObservation::CommandInterrupted { .. }
+        | RelayObservation::ConfigurationUpdated { .. }
+        | RelayObservation::CheckpointReady { .. }
+        | RelayObservation::Closing
+        | RelayObservation::Closed => true,
+        RelayObservation::SessionUpdate { update } => matches!(
+            update.as_ref(),
+            SessionUpdate::AvailableCommandsUpdate(_)
+                | SessionUpdate::ConfigOptionUpdate(_)
+                | SessionUpdate::CurrentModeUpdate(_)
+        ),
+        RelayObservation::PermissionAutoApproved { .. }
+        | RelayObservation::ElicitationRequested { .. }
+        | RelayObservation::ElicitationResolved { .. }
+        | RelayObservation::ElicitationsCleared
+        | RelayObservation::Warning { .. }
+        | RelayObservation::TerminalOutput { .. }
+        | RelayObservation::Notice { .. } => false,
+    }
 }
 
 pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent) -> Result<()> {
@@ -1213,6 +1253,105 @@ mod tests {
         assert_eq!(state.config_options, vec![option]);
         assert_eq!(state.config["mode"], "plan");
         assert_eq!(state.available_commands[0].name, "review");
+    }
+
+    /// Transcript observations skip the staged snapshot copy and its budget
+    /// checks, which is only sound while applying one really moves nothing but
+    /// the frontier. Anything that can grow the snapshot must classify as a
+    /// state move so its budget is still checked before it is journaled.
+    #[test]
+    fn transcript_observations_move_nothing_but_the_frontier() {
+        use agent_client_protocol::schema::v1::{
+            AvailableCommandsUpdate, ContentBlock, ContentChunk,
+        };
+
+        let transcript = [
+            RelayObservation::Warning {
+                message: "warned".into(),
+            },
+            RelayObservation::Notice {
+                message: "noticed".into(),
+            },
+            RelayObservation::TerminalOutput {
+                terminal_id: "terminal-1".into(),
+                output: "output".into(),
+                truncated: false,
+                exit_code: Some(0),
+                signal: None,
+            },
+            RelayObservation::PermissionAutoApproved {
+                option_id: "allow".into(),
+                option_name: "Allow".into(),
+            },
+            RelayObservation::ElicitationRequested {
+                request: crate::hel_elicitation::ElicitationRequest {
+                    id: "elicitation-1".into(),
+                    message: "confirm".into(),
+                    title: None,
+                    description: None,
+                    fields: Vec::new(),
+                },
+            },
+            RelayObservation::ElicitationResolved {
+                elicitation_id: "elicitation-1".into(),
+                action: "accept".into(),
+            },
+            RelayObservation::ElicitationsCleared,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::from("streamed"),
+                ))),
+            },
+        ];
+        for observation in transcript {
+            assert!(
+                !observation_changes_state(&observation),
+                "{observation:?} is classified as a state move"
+            );
+            let mut snapshot = RelaySnapshot::new(SESSION.to_owned());
+            let event = RelayEvent {
+                ordinal: 1,
+                previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+                digest: String::new(),
+                recorded_at_ms: 7,
+                command_id: None,
+                observation,
+            };
+            let event = RelayEvent {
+                digest: relay_event_digest(&event).unwrap(),
+                ..event
+            };
+            let mut expected = snapshot.clone();
+            expected.latest_ordinal = event.ordinal;
+            expected.latest_digest.clone_from(&event.digest);
+            apply_relay_event(&mut snapshot, &event).unwrap();
+            assert_eq!(
+                snapshot, expected,
+                "{:?} changed durable state",
+                event.observation
+            );
+        }
+
+        for observation in [
+            RelayObservation::CommandQueued {
+                command_id: "queued-command".into(),
+                command: prompt("grow the snapshot"),
+                created_at_ms: 7,
+            },
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::AvailableCommandsUpdate(
+                    AvailableCommandsUpdate::new(vec![AvailableCommand::new(
+                        "review",
+                        "Review the current work",
+                    )]),
+                )),
+            },
+        ] {
+            assert!(
+                observation_changes_state(&observation),
+                "{observation:?} can grow the snapshot and must be budget-checked"
+            );
+        }
     }
 
     #[test]
