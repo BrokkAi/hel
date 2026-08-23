@@ -245,6 +245,10 @@ pub struct ChatState {
     /// a large session opens on its tail and converts the rest off the event
     /// loop. Zero whenever the projection is complete.
     unconverted_prefix: usize,
+    /// The last unconverted transcript item: the projection item a pending
+    /// prefix has to end at to be spliced in front of the tail. `None`
+    /// whenever the projection is complete.
+    prefix_seam: Option<Arc<TranscriptItem>>,
     input: String,
     input_cursor: usize,
     /// Stored prompts from other sessions in this project, oldest-first.
@@ -313,6 +317,7 @@ impl ChatState {
             pending_diffstats: VecDeque::new(),
             scheduled_diffstats: BTreeSet::new(),
             unconverted_prefix: 0,
+            prefix_seam: None,
             input: String::new(),
             input_cursor: 0,
             project_history: Vec::new(),
@@ -476,6 +481,13 @@ impl ChatState {
                 self.unconverted_prefix,
                 std::mem::take(&mut self.entries),
             );
+            // Re-read the seam from the projection that produced this tail, so
+            // a prefix converted against replaced history is refused.
+            self.prefix_seam = self
+                .unconverted_prefix
+                .checked_sub(1)
+                .and_then(|index| session.transcript.get(index))
+                .cloned();
             for item in session.transcript.iter().skip(self.unconverted_prefix) {
                 let Some(request) = ToolDiffstatRequest::from_item(item) else {
                     continue;

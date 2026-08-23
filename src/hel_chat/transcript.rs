@@ -107,8 +107,9 @@ impl TranscriptSnapshot {
 
     /// Render the controller's durable logical-session projection. Relay
     /// ordinals remain the public cursor: an item's first ordinal is its
-    /// stable browser identity, while the current projection frontier is a
-    /// conservative update cursor for rebuilt snapshots.
+    /// stable browser identity, and its update cursor is the latest ordinal
+    /// the projection records for it (see `item_update_ordinal`), so a delta
+    /// carries the entries that changed rather than the whole window.
     pub fn from_materialized(session: &MaterializedSession) -> Self {
         Self::from_materialized_with_diffstats(session, &BTreeMap::new())
     }
@@ -308,11 +309,11 @@ pub(super) fn materialized_chat_entries_reusing(
                 return materialized_chat_entry(item, session.applied_event_ordinal);
             };
             if entry.source.is(item) {
-                entry.seq = session.applied_event_ordinal.max(item.position);
+                entry.seq = item_update_ordinal(item, session.applied_event_ordinal);
                 return entry;
             }
             if entry_matches_transcript_item(&entry, item) {
-                entry.seq = session.applied_event_ordinal.max(item.position);
+                entry.seq = item_update_ordinal(item, session.applied_event_ordinal);
                 entry.source = TranscriptSource(Some(item.clone()));
                 return entry;
             }
@@ -350,6 +351,32 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
 
 fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEntry {
     materialized_chat_entry_with_diffstats(item, frontier, None)
+}
+
+/// The latest relay ordinal at which this item's rendered form can have
+/// changed. It is the entry's update cursor, so a remote viewer polling with
+/// `after_seq` receives an entry again only when the projection says the entry
+/// moved: stamping every entry with the frontier retransmits the whole window
+/// on every event.
+///
+/// Overshooting is safe and undershooting is not, so an item whose changes the
+/// projection records no ordinal for keeps the frontier. Those are the bodies
+/// the projection edits in place — thoughts, tool calls, plans, and loose
+/// terminal output — and they stay conservative until the projection records a
+/// change ordinal for them the way it already does for agent messages.
+fn item_update_ordinal(item: &TranscriptItem, frontier: u64) -> u64 {
+    let latest = match &item.body {
+        // Created once and never revisited, so the creating event is exact.
+        TranscriptBody::User { .. } | TranscriptBody::System { .. } => item.position,
+        // Every appended chunk records the ordinal that appended it. Closing
+        // the stream is the only other edit and nothing rendered reads it.
+        TranscriptBody::Agent { .. } => item.latest_content_event_ordinal.unwrap_or(frontier),
+        TranscriptBody::Thought { .. }
+        | TranscriptBody::Tool { .. }
+        | TranscriptBody::Plan { .. }
+        | TranscriptBody::TerminalOutput { .. } => frontier,
+    };
+    latest.max(item.position)
 }
 
 fn materialized_chat_entry_with_diffstats(
@@ -424,7 +451,7 @@ fn materialized_chat_entry_with_diffstats(
         ),
         TranscriptBody::System { text } => ChatEntry::plain(item.position, ChatRole::System, text),
     };
-    entry.seq = frontier.max(item.position);
+    entry.seq = item_update_ordinal(item, frontier);
     entry.recorded_at_ms = Some(item.created_at_ms);
     entry.revision = u64::try_from(item.last_changed_at_ms).unwrap_or_default();
     if matches!(
@@ -741,26 +768,41 @@ impl ChatState {
     /// be rewritten by compaction while the conversion runs, and a prefix that
     /// no longer meets the tail is refused rather than spliced into the wrong
     /// place.
+    ///
+    /// Fitting is an identity question, not a counting one. A rewrite that
+    /// leaves the transcript at or above the pending prefix's length keeps
+    /// every count valid, so the seam decides: the prefix's last entry has to
+    /// be the projection item that still sits immediately in front of the
+    /// tail. Anything else is history the projection has replaced.
     pub(super) fn splice_transcript_prefix(&mut self, mut prefix: Vec<ChatEntry>) -> bool {
         if self.unconverted_prefix == 0 || prefix.len() != self.unconverted_prefix {
             return false;
         }
-        let meets_the_tail = match (prefix.last(), self.entries.first()) {
-            (Some(last), Some(first)) => last.start_seq < first.start_seq,
-            (Some(_), None) => true,
-            (None, _) => false,
+        let meets_the_tail = match (prefix.last(), self.prefix_seam.as_ref()) {
+            // Pointer identity settles the common case; the field comparison
+            // covers items a restore from the canonical log rebuilt with equal
+            // content.
+            (Some(last), Some(seam)) => {
+                last.source.is(seam) || entry_matches_transcript_item(last, seam)
+            }
+            _ => false,
         };
         if !meets_the_tail {
             return false;
         }
-        // The prefix was converted against the frontier the view opened at.
+        // The prefix was converted against the frontier the view opened at, so
+        // its update cursors are restamped against the current one.
         for entry in &mut prefix {
-            entry.seq = self.latest_seq.max(entry.start_seq);
+            entry.seq = match &entry.source.0 {
+                Some(item) => item_update_ordinal(item, self.latest_seq),
+                None => self.latest_seq.max(entry.start_seq),
+            };
         }
         let shift = prefix.len();
         let tail = std::mem::replace(&mut self.entries, prefix);
         self.entries.extend(tail);
         self.unconverted_prefix = 0;
+        self.prefix_seam = None;
         if let TranscriptAnchor::Row { entry, row } = self.anchor {
             self.anchor = TranscriptAnchor::Row {
                 entry: entry.saturating_add(shift),
@@ -1522,7 +1564,10 @@ mod tests {
         Arc::new(TranscriptItem {
             stable_id,
             position,
-            latest_content_event_ordinal: None,
+            // The projection requires an agent message to carry the ordinal of
+            // its latest content chunk, and carries none for anything else.
+            latest_content_event_ordinal: matches!(body, TranscriptBody::Agent { .. })
+                .then_some(position),
             created_at_ms: FIXTURE_MS,
             last_changed_at_ms: FIXTURE_MS,
             body,
@@ -1620,10 +1665,12 @@ mod tests {
         )
     }
 
-    /// A conversation with the mix of bodies a real session carries.
-    fn long_materialized_session(items: u64) -> MaterializedSession {
+    /// A conversation with the mix of bodies a real session carries, its first
+    /// item at `first_position`. A compaction rewrite replaces the history in
+    /// place, so it produces the same shape of transcript at fresh ordinals.
+    fn materialized_session_from(first_position: u64, items: u64) -> MaterializedSession {
         let mut session = MaterializedSession::empty("session-long");
-        session.transcript = (1..=items)
+        session.transcript = (first_position..first_position + items)
             .map(|position| match position % 6 {
                 0 => fixture_tool_item(position),
                 1 => fixture_user_item(position),
@@ -1633,8 +1680,13 @@ mod tests {
                 _ => fixture_system_item(position),
             })
             .collect();
-        session.applied_event_ordinal = items + 1;
+        session.applied_event_ordinal = first_position + items;
         session
+    }
+
+    /// A conversation with the mix of bodies a real session carries.
+    fn long_materialized_session(items: u64) -> MaterializedSession {
+        materialized_session_from(1, items)
     }
 
     fn entry_texts(entries: &[ChatEntry]) -> Vec<&str> {
@@ -1691,10 +1743,15 @@ mod tests {
         assert_eq!(entries[5].text, "notice 6");
         for (index, entry) in entries.iter().enumerate() {
             assert_eq!(entry.start_seq, index as u64 + 1);
-            assert_eq!(entry.seq, 9);
             assert_eq!(entry.recorded_at_ms, Some(FIXTURE_MS));
             assert_eq!(entry.revision, FIXTURE_MS as u64);
         }
+        // The bodies the projection records a change ordinal for keep their
+        // own cursor; the ones it edits in place without one keep the frontier.
+        assert_eq!(
+            entries.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            [1, 2, 9, 9, 9, 6]
+        );
     }
 
     #[test]
@@ -1801,6 +1858,33 @@ mod tests {
 
         assert_eq!(chat.unconverted_prefix(), pending);
         assert_eq!(chat.entries.len(), TAIL_SEED_ITEMS);
+    }
+
+    #[test]
+    fn a_prefix_from_replaced_history_is_refused_when_the_rewrite_keeps_the_length() {
+        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 60);
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+        let stale = converted_prefix(&session, &chat);
+        let pending = chat.unconverted_prefix();
+        assert_eq!(stale.len(), pending);
+
+        // Compaction rewrites the whole conversation at fresh ordinals and
+        // leaves it exactly as long, so counting alone still lines up.
+        let rewritten = materialized_session_from(1_000, session.transcript.len() as u64);
+        chat.apply_materialized(&rewritten, &[], &[]);
+        assert_eq!(chat.unconverted_prefix(), pending);
+        assert!(
+            stale.last().unwrap().start_seq < chat.entries[0].start_seq,
+            "the replaced history still sorts in front of the rewritten tail"
+        );
+
+        assert!(!chat.splice_transcript_prefix(stale));
+
+        assert_eq!(chat.unconverted_prefix(), pending);
+        assert_eq!(
+            entry_texts(&chat.entries),
+            entry_texts(&materialized_chat_entries(&rewritten)[pending..])
+        );
     }
 
     #[test]
@@ -2438,6 +2522,91 @@ mod tests {
         assert_eq!(browser.entries.len(), 1);
         assert_eq!(browser.entries[0].lines, ["current"]);
         assert_eq!(browser_tail_label(&browser.entries[0]), "Agent: current");
+    }
+
+    /// A delta has to be proportional to what changed, not to the window. The
+    /// bodies the projection records no change ordinal for still overshoot, so
+    /// this asserts a large reduction rather than a minimal one.
+    #[test]
+    fn a_delta_costs_a_fraction_of_the_window_it_updates() {
+        let mut session = long_materialized_session(600);
+        let frontier = session.applied_event_ordinal;
+        let bytes = |transcript: &BrowserTranscript| {
+            serde_json::to_string(&transcript.entries).unwrap().len()
+        };
+        let window =
+            bytes(&TranscriptSnapshot::from_materialized(&session).browser_transcript(None));
+
+        let appended = frontier + 1;
+        session.transcript.push(fixture_agent_item(appended));
+        session.applied_event_ordinal = appended;
+        let delta =
+            TranscriptSnapshot::from_materialized(&session).browser_transcript(Some(frontier));
+
+        println!("window {window} bytes, delta {} bytes", bytes(&delta));
+        assert!(
+            bytes(&delta) * 4 < window,
+            "one appended message resent {} of {window} bytes",
+            bytes(&delta)
+        );
+    }
+
+    /// The conversation a delta test needs: settled messages the projection
+    /// records an exact update cursor for.
+    fn message_session(items: u64) -> MaterializedSession {
+        let mut session = MaterializedSession::empty("session-delta");
+        session.transcript = (1..=items)
+            .map(|position| match position % 2 {
+                1 => fixture_user_item(position),
+                _ => fixture_agent_item(position),
+            })
+            .collect();
+        session.applied_event_ordinal = items;
+        session
+    }
+
+    fn delta_ids(session: &MaterializedSession, after_seq: u64) -> Vec<u64> {
+        let delta =
+            TranscriptSnapshot::from_materialized(session).browser_transcript(Some(after_seq));
+        assert!(!delta.reset, "the window still covers the viewer's cursor");
+        delta.entries.iter().map(|entry| entry.id).collect()
+    }
+
+    #[test]
+    fn appending_one_message_marks_only_that_entry_changed() {
+        let mut session = message_session(8);
+        let opened = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        assert_eq!(opened.entries.len(), 8);
+        let cursor = opened.latest_seq;
+
+        session.transcript.push(fixture_agent_item(9));
+        session.applied_event_ordinal = 9;
+
+        assert_eq!(delta_ids(&session, cursor), [9]);
+    }
+
+    #[test]
+    fn a_growing_agent_message_is_the_only_entry_its_delta_carries() {
+        let mut session = message_session(6);
+        let cursor = TranscriptSnapshot::from_materialized(&session)
+            .browser_transcript(None)
+            .latest_seq;
+
+        let streaming = Arc::make_mut(&mut session.transcript[5]);
+        let TranscriptBody::Agent { chunks, .. } = &mut streaming.body else {
+            panic!("expected an agent message");
+        };
+        chunks.push(serde_json::json!({
+            "content": {"type": "text", "text": " and one more thing"}
+        }));
+        streaming.latest_content_event_ordinal = Some(7);
+        streaming.last_changed_at_ms = FIXTURE_MS + 1;
+        session.applied_event_ordinal = 7;
+
+        assert_eq!(delta_ids(&session, cursor), [6]);
+        let delta =
+            TranscriptSnapshot::from_materialized(&session).browser_transcript(Some(cursor));
+        assert!(delta.entries[0].lines[0].ends_with(" and one more thing"));
     }
 
     #[test]
