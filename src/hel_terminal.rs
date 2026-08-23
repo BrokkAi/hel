@@ -6,7 +6,7 @@
 //! Every terminal owns a process group, so one signal reaches the descendants
 //! that inherited its pipes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::hel_acp::RuntimeEvent;
 
@@ -297,6 +297,10 @@ impl TerminalRegistry {
     /// Kill every live terminal and reap its supervisor. A connection must not
     /// leave process groups behind: nothing else in the container would stop
     /// them.
+    ///
+    /// Every group is killed before any supervisor is awaited, and the
+    /// supervisors are then reaped concurrently under one deadline, so teardown
+    /// costs one reap timeout rather than one per terminal.
     pub async fn shutdown(&self, events: &mpsc::Sender<RuntimeEvent>) {
         let entries = std::mem::take(
             &mut *self
@@ -304,28 +308,45 @@ impl TerminalRegistry {
                 .lock()
                 .expect("terminal registry lock poisoned"),
         );
+        let mut unreaped = BTreeSet::new();
+        let mut supervisors = JoinSet::new();
         for (terminal_id, entry) in entries {
             entry.group.kill_if_live();
-            match tokio::time::timeout(TERMINAL_REAP_TIMEOUT, entry.supervisor).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    report(
-                        events,
-                        format!("client terminal {terminal_id} supervisor failed: {error}"),
-                    )
-                    .await;
+            let TerminalEntry { supervisor, .. } = entry;
+            unreaped.insert(terminal_id.clone());
+            supervisors.spawn(async move { (terminal_id, supervisor.await) });
+        }
+
+        let deadline = tokio::time::Instant::now() + TERMINAL_REAP_TIMEOUT;
+        let mut failures = Vec::new();
+        // Collect first and report after: a report waits on the event channel,
+        // and that wait must not spend the reap deadline.
+        loop {
+            match tokio::time::timeout_at(deadline, supervisors.join_next()).await {
+                Ok(Some(Ok((terminal_id, reaped)))) => {
+                    if let Err(error) = reaped {
+                        failures.push(format!(
+                            "client terminal {terminal_id} supervisor failed: {error}"
+                        ));
+                    }
+                    unreaped.remove(&terminal_id);
                 }
-                Err(_) => {
-                    report(
-                        events,
-                        format!(
-                            "client terminal {terminal_id} did not finish within \
-                             {TERMINAL_REAP_TIMEOUT:?} of being killed"
-                        ),
-                    )
-                    .await;
-                }
+                // The task that awaited one supervisor was itself cancelled or
+                // panicked, so its terminal stays unreaped and is reported as
+                // such below.
+                Ok(Some(Err(_))) => {}
+                Ok(None) => break,
+                Err(_) => break,
             }
+        }
+        for terminal_id in unreaped {
+            failures.push(format!(
+                "client terminal {terminal_id} did not finish within \
+                 {TERMINAL_REAP_TIMEOUT:?} of being killed"
+            ));
+        }
+        for message in failures {
+            report(events, message).await;
         }
     }
 }
@@ -600,6 +621,96 @@ mod tests {
             shell_line("/bin/bash -lc 'echo hi'", &[]),
             "/bin/bash -lc 'echo hi'"
         );
+    }
+
+    /// Register a terminal whose supervisor never finishes. Its exit is already
+    /// published, so teardown signals no process group: the PID is never used.
+    fn register_stuck_terminal(registry: &TerminalRegistry, terminal_id: &str) {
+        let (_exit, exit_rx) = watch::channel(Some(TerminalExit::default()));
+        registry
+            .terminals
+            .lock()
+            .expect("terminal registry lock poisoned")
+            .insert(
+                terminal_id.to_owned(),
+                TerminalEntry {
+                    group: ProcessGroup {
+                        pid: i32::MAX,
+                        exit: exit_rx.clone(),
+                    },
+                    buffer: Arc::new(Mutex::new(TerminalBuffer::new(1024))),
+                    exit: exit_rx,
+                    supervisor: tokio::spawn(std::future::pending::<()>()),
+                },
+            );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reaps_stuck_terminals_under_one_shared_deadline() {
+        let registry = TerminalRegistry::new();
+        let (events, mut reports) = mpsc::channel(16);
+        for index in 0..4 {
+            register_stuck_terminal(&registry, &format!("term-{index}"));
+        }
+
+        let started = tokio::time::Instant::now();
+        registry.shutdown(&events).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < TERMINAL_REAP_TIMEOUT * 2,
+            "teardown must be bounded by one reap timeout, took {elapsed:?}"
+        );
+        let mut reported = Vec::new();
+        while let Ok(RuntimeEvent::Warning { message }) = reports.try_recv() {
+            reported.push(message);
+        }
+        assert_eq!(reported.len(), 4, "{reported:?}");
+        for index in 0..4 {
+            assert!(
+                reported
+                    .iter()
+                    .any(|message| message.contains(&format!("term-{index} did not finish"))),
+                "every stuck terminal must still be reported: {reported:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_a_supervisor_that_finished() {
+        let registry = TerminalRegistry::new();
+        let (events, mut reports) = mpsc::channel(16);
+        register_stuck_terminal(&registry, "stuck");
+        let (_exit, exit_rx) = watch::channel(Some(TerminalExit::default()));
+        registry
+            .terminals
+            .lock()
+            .expect("terminal registry lock poisoned")
+            .insert(
+                "finished".to_owned(),
+                TerminalEntry {
+                    group: ProcessGroup {
+                        pid: i32::MAX,
+                        exit: exit_rx.clone(),
+                    },
+                    buffer: Arc::new(Mutex::new(TerminalBuffer::new(1024))),
+                    exit: exit_rx,
+                    supervisor: tokio::spawn(async {}),
+                },
+            );
+
+        registry.shutdown(&events).await;
+
+        let mut reported = Vec::new();
+        while let Ok(RuntimeEvent::Warning { message }) = reports.try_recv() {
+            reported.push(message);
+        }
+        assert_eq!(
+            reported.len(),
+            1,
+            "a supervisor that finished is not a failure: {reported:?}"
+        );
+        assert!(reported[0].contains("stuck did not finish"), "{reported:?}");
     }
 
     #[cfg(unix)]

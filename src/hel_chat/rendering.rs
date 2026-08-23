@@ -202,8 +202,11 @@ pub(super) fn sanitize_terminal_text(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.next_if_eq(&'[').is_some() {
-            let _ = chars.find(|ch| ('@'..='~').contains(ch));
+        if ch == '\x1b' {
+            // One escape can end at the ESC introducing the next one, so keep
+            // consuming rather than recursing: transcript text is untrusted and
+            // may nest these arbitrarily deep.
+            while consume_escape_body(&mut chars) {}
         } else if ch == '\r' {
             if chars.peek() != Some(&'\n') {
                 sanitized.push('\n');
@@ -213,6 +216,55 @@ pub(super) fn sanitize_terminal_text(text: &str) -> String {
         }
     }
     sanitized
+}
+
+/// Consume one escape sequence's body, after its introducing ESC. Returns
+/// whether the body ended at another ESC, which introduces the next sequence.
+///
+/// Dropping the ESC alone is not enough: an OSC payload (a build tool setting
+/// the window title) or the second byte of a charset selection would otherwise
+/// reach the transcript as visible text.
+fn consume_escape_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    match chars.next() {
+        // CSI: parameter and intermediate bytes up to a final byte.
+        Some('[') => {
+            let _ = chars.find(|ch| ('@'..='~').contains(ch));
+            false
+        }
+        // OSC, DCS, SOS, PM, and APC all carry a string payload.
+        Some(']' | 'P' | 'X' | '^' | '_') => consume_string_body(chars),
+        // Two-byte sequences: charset selection (ESC ( B), ESC # 8, ESC SP F.
+        Some('(' | ')' | '*' | '+' | '-' | '.' | '/' | '#' | '%' | ' ') => {
+            chars.next();
+            false
+        }
+        // Everything else is a complete one-byte escape: ESC 7, ESC 8, ESC M,
+        // ESC =, and a trailing ESC with nothing after it.
+        _ => false,
+    }
+}
+
+/// Consume a string payload, which ends at BEL or at ST (ESC \). A line break
+/// or a cancel control aborts it instead, so one malformed OSC cannot swallow
+/// the rest of a transcript.
+fn consume_string_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            '\n' | '\r' | '\x18' | '\x1a' => return false,
+            '\x07' => {
+                chars.next();
+                return false;
+            }
+            '\x1b' => {
+                chars.next();
+                return true;
+            }
+            _ => {
+                chars.next();
+            }
+        }
+    }
+    false
 }
 
 pub(super) fn markdown_lines(
@@ -688,6 +740,31 @@ mod tests {
             sanitize_terminal_text("safe\x1b[31mred\x1b[0m\rnext\u{7}"),
             "safered\nnext"
         );
+    }
+
+    #[test]
+    fn sanitizer_consumes_osc_payloads_and_two_byte_escapes() {
+        // A build tool setting the window title, terminated by BEL and by ST.
+        assert_eq!(sanitize_terminal_text("\x1b]0;make: build\x07done"), "done");
+        assert_eq!(
+            sanitize_terminal_text("\x1b]2;cargo test\x1b\\done"),
+            "done"
+        );
+        // Charset selection and cursor save/restore.
+        assert_eq!(
+            sanitize_terminal_text("\x1b(B\x1b)0plain\x1b7saved\x1b8"),
+            "plainsaved"
+        );
+        // An OSC that is never terminated stops at the line break instead of
+        // eating the rest of the transcript.
+        assert_eq!(
+            sanitize_terminal_text("\x1b]0;title\nnext line"),
+            "\nnext line"
+        );
+        // An OSC ended by another escape does not swallow that escape's own
+        // sequence, and nesting cannot recurse without bound.
+        assert_eq!(sanitize_terminal_text("\x1b]0;title\x1b[31mred"), "red");
+        assert_eq!(sanitize_terminal_text(&"\x1b]".repeat(50_000)), "");
     }
 
     #[test]

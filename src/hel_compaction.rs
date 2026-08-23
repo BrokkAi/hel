@@ -32,12 +32,163 @@ const EXACT_TAIL_TURNS: usize = 2;
 const TOOL_OUTPUT_PROTECT_BYTES: usize = 40_000 * 4;
 const TOOL_OUTPUT_PRUNE_MINIMUM_BYTES: usize = 20_000 * 4;
 const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared]";
+/// The smallest page worth halving. Below it a rejection is about the content
+/// or the backend, not the size.
+const MIN_SPLIT_PAGE_BYTES: usize = 4 * 1024;
+/// How many failures whose reason this boundary cannot place may happen in a
+/// row before a compaction gives up. A backend that names a size problem may
+/// split all the way down to the floor; one that says something else buys a
+/// couple of smaller retries, then its own reason is the answer.
+const UNPLACEABLE_FAILURE_RUN_LIMIT: usize = 2;
 
 pub trait CompactionBackend {
     fn compact<'a>(
         &'a mut self,
         prompt: String,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+
+    /// What a failed request means for the rest of the compaction. Backends
+    /// that carry a typed error should override this; the default reads the
+    /// provider text an ACP harness passes through.
+    fn classify_failure(&self, error: &anyhow::Error) -> CompactionFailure {
+        classify_failure_detail(&format!("{error:#}"))
+    }
+}
+
+/// What a failed compaction request means for the rest of the compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionFailure {
+    /// The backend named a size or limit problem, so a smaller page can work.
+    /// Splitting continues down to [`MIN_SPLIT_PAGE_BYTES`].
+    Oversize,
+    /// The reason does not place. It may be the size, it may be the backend, so
+    /// the pipeline retries a smaller page a couple of times before giving up.
+    Unplaceable,
+    /// No smaller page can help: dead credentials, an exhausted quota, a closed
+    /// session, a broken transport. The reason reaches the caller unchanged.
+    Fatal,
+}
+
+/// Read a backend failure the only way an ACP harness reports one: the text the
+/// provider sent. Size complaints are checked first, because a provider can
+/// name both a limit and a token count in one message.
+fn classify_failure_detail(detail: &str) -> CompactionFailure {
+    const OVERSIZE_MARKERS: &[&str] = &[
+        "too long",
+        "too large",
+        "too many tokens",
+        "context length",
+        "context window",
+        "maximum context",
+        "token limit",
+        "input length",
+        "payload too large",
+        "exceeds the maximum",
+    ];
+    const FATAL_MARKERS: &[&str] = &[
+        "unauthorized",
+        "forbidden",
+        "authentication",
+        "credential",
+        "api key",
+        "log in",
+        "login",
+        "expired",
+        "quota",
+        "usage limit",
+        "rate limit",
+        "connection refused",
+        "connection reset",
+        "broken pipe",
+        "network",
+        "session is closed",
+        "no acp runtime",
+        "stopped before",
+        "cancel",
+    ];
+
+    let detail = detail.to_ascii_lowercase();
+    if OVERSIZE_MARKERS
+        .iter()
+        .any(|marker| detail.contains(marker))
+    {
+        return CompactionFailure::Oversize;
+    }
+    if FATAL_MARKERS.iter().any(|marker| detail.contains(marker)) {
+        return CompactionFailure::Fatal;
+    }
+    CompactionFailure::Unplaceable
+}
+
+/// One compaction's model requests: the backend plus the failure budget they
+/// share, so a backend that fails every request cannot walk the split tree
+/// before its first reason surfaces.
+struct Requests<'a, B: CompactionBackend> {
+    backend: &'a mut B,
+    /// Failures in a row whose reason the boundary could not place.
+    unplaceable_run: usize,
+    /// The reason of the first failed request, kept for the report that ends a
+    /// compaction the pipeline could not retry its way out of.
+    first_failure: Option<String>,
+}
+
+enum RequestOutcome {
+    Summary(String),
+    /// The request failed for a reason a smaller prompt may fix. The caller
+    /// owns the split; it returns this error when it has none left to make.
+    Splittable(anyhow::Error),
+}
+
+impl<'a, B: CompactionBackend> Requests<'a, B> {
+    fn new(backend: &'a mut B) -> Self {
+        Self {
+            backend,
+            unplaceable_run: 0,
+            first_failure: None,
+        }
+    }
+
+    /// Run one compaction request against the shared failure budget. A fatal
+    /// failure and an exhausted budget both return `Err`; only a failure worth
+    /// retrying smaller comes back as an outcome.
+    async fn run(&mut self, prompt: String) -> Result<RequestOutcome> {
+        let result = self.backend.compact(prompt).await.and_then(|text| {
+            let text = text.trim().to_owned();
+            ensure!(
+                !text.is_empty(),
+                "compaction model returned an empty snapshot"
+            );
+            Ok(text)
+        });
+        let error = match result {
+            Ok(summary) => {
+                self.unplaceable_run = 0;
+                return Ok(RequestOutcome::Summary(summary));
+            }
+            Err(error) => error,
+        };
+        let first_failure = self
+            .first_failure
+            .get_or_insert_with(|| format!("{error:#}"))
+            .clone();
+        match self.backend.classify_failure(&error) {
+            CompactionFailure::Fatal => Err(error),
+            CompactionFailure::Oversize => {
+                self.unplaceable_run = 0;
+                Ok(RequestOutcome::Splittable(error))
+            }
+            CompactionFailure::Unplaceable => {
+                self.unplaceable_run += 1;
+                ensure!(
+                    self.unplaceable_run <= UNPLACEABLE_FAILURE_RUN_LIMIT,
+                    "compaction gave up after {} failed requests in a row; \
+                     first failure: {first_failure}",
+                    self.unplaceable_run,
+                );
+                Ok(RequestOutcome::Splittable(error))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,11 +224,16 @@ pub async fn compact_snapshot(
         .enumerate()
         .map(|(index, turn)| rendered_turn_len(turn, index))
         .sum::<usize>();
+    let mut requests = Requests::new(backend);
 
     if rendered_bytes.saturating_add(page_overhead) <= context_bytes {
         let transcript = render_turns(&compactable_turns, 0);
-        if let Ok(summary) = run_compaction(backend, page_prompt(&transcript)).await {
-            return handoff(&summary, None, context_bytes);
+        match requests.run(page_prompt(&transcript)).await? {
+            RequestOutcome::Summary(summary) => return handoff(&summary, None, context_bytes),
+            // The transcript fit Hel's byte budget but not the model's real
+            // context, so fall through to the paged pipeline, whose prompts are
+            // strictly smaller. A fatal failure never reaches here.
+            RequestOutcome::Splittable(_) => {}
         }
     }
 
@@ -94,8 +250,8 @@ pub async fn compact_snapshot(
     let head = &compactable_turns[..tail_start];
     let tail = &turns[tail_start..];
     let page_payload_bytes = context_bytes.saturating_sub(page_overhead).max(1);
-    let summaries = summarize_turn_pages(head, page_payload_bytes, backend).await?;
-    let summary = reduce_summaries(summaries, context_bytes, backend).await?;
+    let summaries = summarize_turn_pages(head, page_payload_bytes, &mut requests).await?;
+    let summary = reduce_summaries(summaries, context_bytes, &mut requests).await?;
     let exact_tail = (!tail.is_empty()).then(|| render_turns(tail, tail_start));
     handoff(&summary, exact_tail.as_deref(), context_bytes)
 }
@@ -143,10 +299,10 @@ fn completed_tool_output_bytes(value: &Value) -> Option<usize> {
     })
 }
 
-async fn summarize_turn_pages(
+async fn summarize_turn_pages<B: CompactionBackend>(
     turns: &[Turn],
     limit: usize,
-    backend: &mut impl CompactionBackend,
+    requests: &mut Requests<'_, B>,
 ) -> Result<Vec<String>> {
     let mut summaries = Vec::new();
     let mut page = String::new();
@@ -156,23 +312,23 @@ async fn summarize_turn_pages(
         if rendered.len() > limit {
             if !page.is_empty() {
                 summaries.extend(
-                    summarize_pages_adaptively(vec![std::mem::take(&mut page)], backend).await?,
+                    summarize_pages_adaptively(vec![std::mem::take(&mut page)], requests).await?,
                 );
             }
             for fragment in render_oversize_turn(turn, index, limit) {
-                summaries.extend(summarize_pages_adaptively(vec![fragment], backend).await?);
+                summaries.extend(summarize_pages_adaptively(vec![fragment], requests).await?);
             }
         } else {
             if !page.is_empty() && page.len().saturating_add(rendered.len()) > limit {
                 summaries.extend(
-                    summarize_pages_adaptively(vec![std::mem::take(&mut page)], backend).await?,
+                    summarize_pages_adaptively(vec![std::mem::take(&mut page)], requests).await?,
                 );
             }
             page.push_str(&rendered);
         }
     }
     if !page.is_empty() {
-        summaries.extend(summarize_pages_adaptively(vec![page], backend).await?);
+        summaries.extend(summarize_pages_adaptively(vec![page], requests).await?);
     }
     ensure!(
         !summaries.is_empty(),
@@ -248,21 +404,25 @@ fn tool_event_finished(value: &Value) -> bool {
     )
 }
 
-async fn summarize_pages_adaptively(
+async fn summarize_pages_adaptively<B: CompactionBackend>(
     pages: Vec<String>,
-    backend: &mut impl CompactionBackend,
+    requests: &mut Requests<'_, B>,
 ) -> Result<Vec<String>> {
     let mut pending = VecDeque::from(pages);
     let mut summaries = Vec::new();
     while let Some(page) = pending.pop_front() {
-        match run_compaction(backend, page_prompt(&page)).await {
-            Ok(summary) => summaries.push(summary),
-            Err(_) if page.len() > 4 * 1024 => {
+        match requests.run(page_prompt(&page)).await? {
+            RequestOutcome::Summary(summary) => summaries.push(summary),
+            RequestOutcome::Splittable(error) => {
+                // Below the split floor the size is no longer a plausible
+                // reason, so the backend's own reason is the answer.
+                if page.len() <= MIN_SPLIT_PAGE_BYTES {
+                    return Err(error);
+                }
                 let (left, right) = split_at_utf8_midpoint(&page);
                 pending.push_front(right.to_owned());
                 pending.push_front(left.to_owned());
             }
-            Err(error) => return Err(error),
         }
     }
     Ok(summaries)
@@ -455,10 +615,10 @@ fn reduction_prompt(summaries: &[String]) -> String {
     )
 }
 
-async fn reduce_summaries(
+async fn reduce_summaries<B: CompactionBackend>(
     mut summaries: Vec<String>,
     context_bytes: usize,
-    backend: &mut impl CompactionBackend,
+    requests: &mut Requests<'_, B>,
 ) -> Result<String> {
     while summaries.len() > 1 {
         let mut next = Vec::new();
@@ -472,21 +632,16 @@ async fn reduce_summaries(
                 prompt.len() <= context_bytes,
                 "compaction response exceeds the target context byte budget"
             );
-            next.push(run_compaction(backend, prompt).await?);
+            // A reduction prompt has no smaller form to retry: the summaries it
+            // merges are already the pipeline's output.
+            next.push(match requests.run(prompt).await? {
+                RequestOutcome::Summary(summary) => summary,
+                RequestOutcome::Splittable(error) => return Err(error),
+            });
         }
         summaries = next;
     }
     summaries.pop().context("compaction produced no summaries")
-}
-
-async fn run_compaction(backend: &mut impl CompactionBackend, prompt: String) -> Result<String> {
-    let result = backend.compact(prompt).await?;
-    let result = result.trim().to_owned();
-    ensure!(
-        !result.is_empty(),
-        "compaction model returned an empty snapshot"
-    );
-    Ok(result)
 }
 
 fn handoff(summary: &str, exact_tail: Option<&str>, context_bytes: usize) -> Result<String> {
@@ -526,6 +681,60 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             self.prompts.push(prompt);
             Box::pin(async { Ok("<state_snapshot>kept</state_snapshot>".into()) })
+        }
+    }
+
+    /// A backend that fails every request the same way, counting the attempts.
+    struct FailingBackend {
+        message: &'static str,
+        attempts: usize,
+    }
+
+    impl FailingBackend {
+        fn new(message: &'static str) -> Self {
+            Self {
+                message,
+                attempts: 0,
+            }
+        }
+    }
+
+    impl CompactionBackend for FailingBackend {
+        fn compact<'a>(
+            &'a mut self,
+            _prompt: String,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            self.attempts += 1;
+            let message = self.message;
+            Box::pin(async move { Err(anyhow::anyhow!("{message}")) })
+        }
+    }
+
+    /// A backend that rejects an oversize prompt the way a provider does and
+    /// summarizes anything that fits.
+    struct OversizeRejectingBackend {
+        prompt_limit: usize,
+        rejections: usize,
+    }
+
+    impl CompactionBackend for OversizeRejectingBackend {
+        fn compact<'a>(
+            &'a mut self,
+            prompt: String,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            let rejected = prompt.len() > self.prompt_limit;
+            if rejected {
+                self.rejections += 1;
+            }
+            Box::pin(async move {
+                if rejected {
+                    Err(anyhow::anyhow!(
+                        "prompt is too long: input exceeds the context window"
+                    ))
+                } else {
+                    Ok("<state_snapshot>kept</state_snapshot>".to_owned())
+                }
+            })
         }
     }
 
@@ -642,6 +851,95 @@ mod tests {
                 .iter()
                 .any(|prompt| prompt.contains("oversize turn fragment"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_fatal_backend_failure_surfaces_on_the_first_request() {
+        let mut backend = FailingBackend::new("session/prompt failed: 401 unauthorized");
+
+        let error = compact_snapshot(&exchanges(&[("fix it", "done")]), 64 * 1024, &mut backend)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            backend.attempts, 1,
+            "a dead backend must not be asked again"
+        );
+        assert!(error.to_string().contains("401 unauthorized"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_repeating_failure_stops_before_the_split_tree_fans_out() {
+        let large = "x".repeat(200 * 1024);
+        let input = exchanges(&[("first", &large), ("second", &large), ("latest", "answer")]);
+        let mut backend = FailingBackend::new("relay request failed: backend exploded");
+
+        let error = compact_snapshot(&input, DEFAULT_CONTEXT_BYTES, &mut backend)
+            .await
+            .unwrap_err();
+
+        // Halving a 256 KiB page down to the 4 KiB split floor costs seven
+        // doomed requests. A reason the boundary cannot place is worth a couple
+        // of smaller retries, not the whole descent.
+        assert!(
+            backend.attempts <= UNPLACEABLE_FAILURE_RUN_LIMIT + 1,
+            "an unplaceable failure must not walk the split tree: {} requests",
+            backend.attempts
+        );
+        assert!(error.to_string().contains("backend exploded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_oversize_rejection_still_splits_until_the_pages_fit() {
+        let large = "x".repeat(200 * 1024);
+        let input = exchanges(&[("first", &large), ("latest user", "latest answer")]);
+        let mut backend = OversizeRejectingBackend {
+            prompt_limit: 32 * 1024,
+            rejections: 0,
+        };
+
+        let handoff = compact_snapshot(&input, DEFAULT_CONTEXT_BYTES, &mut backend)
+            .await
+            .unwrap();
+
+        assert!(
+            backend.rejections >= 3,
+            "the pages had to shrink to fit: {} rejections",
+            backend.rejections
+        );
+        assert!(handoff.contains("<state_snapshot>kept</state_snapshot>"));
+        assert!(handoff.contains("latest answer"));
+    }
+
+    #[test]
+    fn failures_are_classified_by_what_a_smaller_page_could_fix() {
+        for oversize in [
+            "prompt is too long",
+            "input exceeds the context window",
+            "429 too many tokens for this model",
+        ] {
+            assert_eq!(
+                classify_failure_detail(oversize),
+                CompactionFailure::Oversize,
+                "{oversize}"
+            );
+        }
+        assert_eq!(
+            classify_failure_detail("relay request failed: backend exploded"),
+            CompactionFailure::Unplaceable
+        );
+        for fatal in [
+            "401 Unauthorized: invalid API key",
+            "credentials expired; run the login flow again",
+            "usage limit reached until 3pm",
+            "connection refused",
+        ] {
+            assert_eq!(
+                classify_failure_detail(fatal),
+                CompactionFailure::Fatal,
+                "{fatal}"
+            );
+        }
     }
 
     #[tokio::test]
