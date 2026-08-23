@@ -621,6 +621,9 @@ impl DurableRelay {
         else {
             bail!("active relay segment has data but no journal metadata");
         };
+        // Sealing moves the active segment's events into a new file, so any
+        // replay plan already captured stops describing the journal here.
+        self.invalidate_replay_plans();
         seal_active_relay_segment(&journal, &mut self.journal_spans[index])
     }
 
@@ -652,7 +655,16 @@ impl DurableRelay {
         self.hot_events.push_back(event);
     }
 
+    /// Announce that the journal's files no longer match any replay plan a
+    /// reader captured earlier. Callers reading a page off the relay lock
+    /// compare the generation to tell a stale plan from a real desync.
+    fn invalidate_replay_plans(&mut self) {
+        self.journal_generation = self.journal_generation.wrapping_add(1);
+    }
+
     fn rewrite_relay_journal(&mut self, retain_after: u64) -> Result<()> {
+        // Rewriting replaces the active segment and deletes every sealed one.
+        self.invalidate_replay_plans();
         let journal = self.root.join(RELAY_JOURNAL_DIR);
         fs::create_dir_all(&journal)?;
         let replacement = journal.join("active.jsonl.new");

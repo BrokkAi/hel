@@ -108,8 +108,8 @@ mod unix {
     use super::{AcpSupervisorSpec, CredentialEndpoint, WorkerLaunchConfig};
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_worker::{
-        ClaimedRelayCommand, DurableRelay, RelayCommand, RelayCommandOutcome, RelayErrorCode,
-        RelayObservation, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
+        ClaimedRelayCommand, DeferredRelayAttach, DurableRelay, RelayCommand, RelayCommandOutcome,
+        RelayErrorCode, RelayObservation, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
         RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
         incompatible_request_protocol_response, invalid_relay_request_response,
         unsupported_relay_method_response,
@@ -876,6 +876,63 @@ mod unix {
         ) && !root.is_dir()
     }
 
+    /// Answer one relay request, keeping the relay lock for exactly as long as
+    /// the request needs it.
+    ///
+    /// Every request but attach is a bounded mutation of durable state and is
+    /// served under the lock. Attach is not: validating a controller's cursor
+    /// can decompress a sealed segment and the reply carries up to a
+    /// [`crate::hel_worker::RELAY_REPLAY_BYTE_BUDGET`] page read from disk, and
+    /// a controller catching up over a long offline history asks for page
+    /// after page. Holding the lock across that stalls the coordinator's
+    /// `record_runtime_event`, and once its bounded event channel fills the
+    /// agent's turn stalls with it. So attach captures a plan under the lock
+    /// and does its reading on a blocking thread with the lock released.
+    pub(super) async fn handle_request(
+        relay: &Arc<Mutex<DurableRelay>>,
+        envelope: RelayRequestEnvelope,
+    ) -> Result<RelayResponseEnvelope> {
+        // Sealing and garbage collection can move the segments a plan named
+        // while it is being read. That is not the controller's fault and not
+        // its problem: plan again against the journal as it now stands. The
+        // journal only moves that way once per sealed megabyte or per
+        // acknowledgement, so a couple of attempts always outrun it.
+        const REPLAN_ATTEMPTS: usize = 3;
+
+        let mut deferred = {
+            let mut guard = relay.lock().expect("relay state lock poisoned");
+            match guard.take_deferred_attach(&envelope) {
+                Some(deferred) => deferred,
+                None => return Ok(guard.handle(envelope)),
+            }
+        };
+        for _ in 0..REPLAN_ATTEMPTS {
+            let generation = deferred.journal_generation();
+            let response = tokio::task::spawn_blocking(move || deferred.finish())
+                .await
+                .context("assemble relay replay page")?;
+            if !matches!(response.body, RelayResponseBody::Error { .. }) {
+                return Ok(response);
+            }
+            let replanned = {
+                let guard = relay.lock().expect("relay state lock poisoned");
+                if guard.journal_generation() == generation {
+                    // The journal never moved, so this really is the answer.
+                    return Ok(response);
+                }
+                guard.take_deferred_attach(&envelope)
+            };
+            match replanned {
+                Some(next) => deferred = next,
+                None => break,
+            }
+        }
+        Ok(DeferredRelayAttach::stale_journal_response(
+            envelope.request_id,
+            envelope.protocol_version,
+        ))
+    }
+
     /// `commands` is the ACP coordinator's command channel, or `None` once the
     /// session is sealed and no ACP runtime is left to serve scratch prompts.
     pub(super) async fn serve_client(
@@ -958,10 +1015,7 @@ mod unix {
                 }
                 let wakes_dispatch = matches!(&envelope.request, RelayRequest::Submit { .. });
                 let checkpoint_change = checkpoint_change(&envelope.request);
-                let response = relay
-                    .lock()
-                    .expect("relay state lock poisoned")
-                    .handle(envelope);
+                let response = handle_request(&relay, envelope).await?;
                 if worker_root_was_removed(&response.body, &relay_root) {
                     // One report is enough; the daemon is already winding down.
                     let _ = fatal.try_send(anyhow::anyhow!(
@@ -4880,6 +4934,323 @@ mod relay_tests {
             unix::select_resume_session(&config, &relay).as_deref(),
             Some("native-explicit")
         );
+    }
+
+    /// A history that seals several journal segments and overflows one replay
+    /// page, so an attach against it really reads and decompresses from disk.
+    fn paged_relay_history(root: &Path, events: usize) -> DurableRelay {
+        let mut relay = DurableRelay::open(root, SESSION_ID, "1.0.0").unwrap();
+        for index in 0..events {
+            relay
+                .record_observation(RelayObservation::Warning {
+                    message: format!("{index:04}:{}", "x".repeat(64 * 1024)),
+                })
+                .unwrap();
+        }
+        relay
+    }
+
+    fn attach_frame(request_id: &str, after_ordinal: u64, after_digest: &str) -> Vec<u8> {
+        let mut encoded = serde_json::to_vec(&RelayRequestEnvelope {
+            request_id: request_id.to_owned(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Attach {
+                after_ordinal,
+                after_digest: after_digest.to_owned(),
+            },
+        })
+        .unwrap();
+        encoded.push(b'\n');
+        encoded
+    }
+
+    /// Records small observations through the relay lock until it is stopped,
+    /// reporting how many landed and the worst time it ever waited for the
+    /// lock. The wait is the contention this test is about; the append's own
+    /// fsync is deliberately left out of it.
+    struct LiveRecorder {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        task: tokio::task::JoinHandle<(u64, std::time::Duration)>,
+    }
+
+    impl LiveRecorder {
+        fn start(relay: Arc<Mutex<DurableRelay>>) -> Self {
+            // Sample the lock often enough that a page read cannot hide in the
+            // gaps, but append rarely enough that the fsync per event neither
+            // dominates the sampling nor grows the active segment far enough
+            // to seal it under the reader.
+            const SAMPLES_PER_RECORD: u64 = 8;
+            const RECORD_LIMIT: u64 = 512;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let recorder_stop = stop.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let mut samples = 0_u64;
+                let mut recorded = 0_u64;
+                let mut worst_wait = std::time::Duration::ZERO;
+                while !recorder_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let waiting = std::time::Instant::now();
+                    let mut guard = relay.lock().expect("relay state lock poisoned");
+                    worst_wait = worst_wait.max(waiting.elapsed());
+                    if samples.is_multiple_of(SAMPLES_PER_RECORD) && recorded < RECORD_LIMIT {
+                        guard
+                            .record_observation(RelayObservation::Warning {
+                                message: format!("live-{recorded}"),
+                            })
+                            .unwrap();
+                        recorded += 1;
+                    }
+                    drop(guard);
+                    samples += 1;
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                (recorded, worst_wait)
+            });
+            Self { stop, task }
+        }
+
+        async fn stop(self) -> (u64, std::time::Duration) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.task.await.unwrap()
+        }
+    }
+
+    /// Controllers are supposed to come and go without perturbing the session.
+    /// A catch-up over a long offline history reads page after page from disk
+    /// and decompresses sealed segments; doing that under the relay lock stops
+    /// the coordinator from recording ACP events, and once its bounded channel
+    /// fills the agent's turn stops with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replaying_controller_does_not_stall_live_event_recording() {
+        let temp = tempfile::tempdir().unwrap();
+        let durable = paged_relay_history(temp.path(), 80);
+        let frontier = durable.latest_ordinal();
+        let relay = Arc::new(Mutex::new(durable));
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let served = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx,
+            test_credentials(),
+            None,
+            fatal_reports().0,
+        ));
+
+        let recorder = LiveRecorder::start(relay.clone());
+        client
+            .write_all(&attach_frame("catch-up", 0, RELAY_EVENT_GENESIS_DIGEST))
+            .await
+            .unwrap();
+        let response = BufReader::new(&mut client)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        let (recorded, worst_wait) = recorder.stop().await;
+
+        let response: RelayResponseEnvelope = serde_json::from_str(&response).unwrap();
+        let RelayResponseBody::Ok {
+            payload:
+                RelayResponsePayload::Attached {
+                    events,
+                    through_ordinal,
+                    ..
+                },
+        } = response.body
+        else {
+            panic!("catch-up attach failed: {:?}", response.body);
+        };
+        assert!(
+            !events.is_empty() && through_ordinal < frontier,
+            "this history should need several pages: {through_ordinal} of {frontier}"
+        );
+
+        // What one page costs to assemble, measured on this machine with
+        // nothing else running. Serving it under the relay lock would make a
+        // recorder wait about this long; serving it off the lock costs a
+        // recorder only the plan capture.
+        let page_cost = std::time::Instant::now();
+        let _ = unix::handle_request(
+            &relay,
+            RelayRequestEnvelope {
+                request_id: "page-cost".into(),
+                protocol_version: RELAY_PROTOCOL_VERSION,
+                request: RelayRequest::Attach {
+                    after_ordinal: 0,
+                    after_digest: RELAY_EVENT_GENESIS_DIGEST.into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let page_cost = page_cost.elapsed();
+        assert!(
+            page_cost >= std::time::Duration::from_millis(10),
+            "a page assembled in {page_cost:?}; too cheap to say anything about contention"
+        );
+        assert!(recorded > 0, "no event was recorded during the replay");
+        assert!(
+            worst_wait * 3 < page_cost,
+            "recording waited {worst_wait:?} for a page that takes {page_cost:?} to assemble: \
+             the page is being read under the relay lock"
+        );
+
+        drop(client);
+        served.await.unwrap().unwrap();
+    }
+
+    /// Sealing the active segment moves events into a file no captured replay
+    /// plan names, and a busy session seals one per megabyte of transcript. A
+    /// controller catching up through that must still get its pages: the relay
+    /// plans again against the journal as it now stands instead of handing the
+    /// controller a failure it did nothing to cause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_catch_up_completes_while_the_journal_keeps_sealing_under_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let durable = paged_relay_history(temp.path(), 96);
+        let target = durable.latest_ordinal();
+        let generation = durable.journal_generation();
+        let relay = Arc::new(Mutex::new(durable));
+
+        // Events large enough to seal a segment every few appends, written as
+        // fast as the durable path allows.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_relay = relay.clone();
+        let writer_stop = stop.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut written = 0_u64;
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) && written < 24 {
+                writer_relay
+                    .lock()
+                    .expect("relay state lock poisoned")
+                    .record_observation(RelayObservation::Warning {
+                        message: format!("{written:04}:{}", "y".repeat(256 * 1024)),
+                    })
+                    .unwrap();
+                written += 1;
+            }
+            written
+        });
+
+        let mut cursor = (0_u64, RELAY_EVENT_GENESIS_DIGEST.to_owned());
+        let mut pages = 0_usize;
+        while cursor.0 < target {
+            let body = unix::handle_request(
+                &relay,
+                RelayRequestEnvelope {
+                    request_id: format!("sealing-page-{pages}"),
+                    protocol_version: RELAY_PROTOCOL_VERSION,
+                    request: RelayRequest::Attach {
+                        after_ordinal: cursor.0,
+                        after_digest: cursor.1.clone(),
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .body;
+            let RelayResponseBody::Ok {
+                payload:
+                    RelayResponsePayload::Attached {
+                        through_ordinal,
+                        through_digest,
+                        ..
+                    },
+            } = body
+            else {
+                panic!("page {pages} of a catch-up under a sealing journal failed: {body:?}");
+            };
+            assert!(
+                through_ordinal > cursor.0,
+                "page {pages} made no progress from event {}",
+                cursor.0
+            );
+            cursor = (through_ordinal, through_digest);
+            pages += 1;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+
+        assert!(
+            relay
+                .lock()
+                .expect("relay state lock poisoned")
+                .journal_generation()
+                > generation,
+            "the journal never sealed, so this run proved nothing"
+        );
+    }
+
+    /// Recording throughput during a full catch-up, measured with the page
+    /// read inside and outside the relay lock so both policies are timed in
+    /// one process. Run with
+    /// `cargo test --lib
+    /// hel_worker_runtime::relay_tests::catch_up_recording_throughput
+    /// -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "timing measurement, not a behavior assertion"]
+    async fn catch_up_recording_throughput() {
+        const HISTORY_EVENTS: usize = 200;
+
+        async fn catch_up(defer_page_reads: bool) -> (u64, std::time::Duration, usize) {
+            let temp = tempfile::tempdir().unwrap();
+            let durable = paged_relay_history(temp.path(), HISTORY_EVENTS);
+            let frontier = durable.latest_ordinal();
+            let genesis = RELAY_EVENT_GENESIS_DIGEST.to_owned();
+            let relay = Arc::new(Mutex::new(durable));
+            let recorder = LiveRecorder::start(relay.clone());
+
+            let started = std::time::Instant::now();
+            let mut cursor = (0_u64, genesis);
+            let mut pages = 0_usize;
+            while cursor.0 < frontier {
+                let envelope = RelayRequestEnvelope {
+                    request_id: format!("page-{pages}"),
+                    protocol_version: RELAY_PROTOCOL_VERSION,
+                    request: RelayRequest::Attach {
+                        after_ordinal: cursor.0,
+                        after_digest: cursor.1.clone(),
+                    },
+                };
+                let body = if defer_page_reads {
+                    unix::handle_request(&relay, envelope).await.unwrap().body
+                } else {
+                    // The coupled policy: the whole read runs under the lock.
+                    relay
+                        .lock()
+                        .expect("relay state lock poisoned")
+                        .handle(envelope)
+                        .body
+                };
+                let RelayResponseBody::Ok {
+                    payload:
+                        RelayResponsePayload::Attached {
+                            through_ordinal,
+                            through_digest,
+                            ..
+                        },
+                } = body
+                else {
+                    panic!("catch-up page {pages} (defer={defer_page_reads}) failed: {body:?}");
+                };
+                cursor = (through_ordinal, through_digest);
+                pages += 1;
+            }
+            let elapsed = started.elapsed();
+            let (recorded, _) = recorder.stop().await;
+            (recorded, elapsed, pages)
+        }
+
+        for round in 0..2 {
+            let (coupled, coupled_elapsed, pages) = catch_up(false).await;
+            let (deferred, deferred_elapsed, _) = catch_up(true).await;
+            println!(
+                "round {round}: {pages} pages | under the lock {coupled} events in \
+                 {coupled_elapsed:?} | off the lock {deferred} events in {deferred_elapsed:?}"
+            );
+        }
     }
 
     #[test]

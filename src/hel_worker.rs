@@ -135,6 +135,12 @@ pub struct DurableRelay {
     /// Journal bytes appended since `relay-state.json` last matched this
     /// snapshot. Zero means the durable file is exactly this state.
     unpersisted_journal_bytes: usize,
+    /// Bumped whenever a captured [`RelayReplayPlan`] stops describing the
+    /// journal on disk: sealing moves the active segment's events into a new
+    /// file, and garbage collection rewrites and prunes segments. Plain
+    /// appends never bump it — they only extend the active segment, which a
+    /// lock-free reader already tolerates.
+    journal_generation: u64,
     /// Benchmark aid: stage and persist a snapshot on every append, the way
     /// the relay did before transcript appends were amortized, so both
     /// policies can be timed in one process.
@@ -272,6 +278,7 @@ impl DurableRelay {
             journal_spans,
             hot_events,
             unpersisted_journal_bytes: 0,
+            journal_generation: 0,
             #[cfg(test)]
             stage_snapshot_every_append: false,
         };
@@ -370,9 +377,73 @@ impl DurableRelay {
     }
 
     pub fn events_after(&self, after_ordinal: u64, after_digest: &str) -> Result<Vec<RelayEvent>> {
-        self.validate_replay_cursor(after_ordinal, after_digest)?;
-        self.read_events_after(after_ordinal, usize::MAX)
+        let plan = self.replay_plan();
+        plan.validate_cursor(after_ordinal, after_digest)?;
+        plan.read_events_after(after_ordinal, usize::MAX)
             .map(|page| page.events)
+    }
+
+    /// How many times the journal's files stopped matching a captured
+    /// [`RelayReplayPlan`]. A lock-free reader compares this before and after
+    /// its read to tell a stale plan from a real desynchronization.
+    pub fn journal_generation(&self) -> u64 {
+        self.journal_generation
+    }
+
+    /// Capture everything a replay page needs from this relay, so the file
+    /// reads and gzip decompression behind it can run without the relay lock.
+    fn replay_plan(&self) -> RelayReplayPlan {
+        RelayReplayPlan {
+            spans: self.journal_spans.clone(),
+            hot_digests: self
+                .hot_events
+                .iter()
+                .map(|event| (event.ordinal, event.digest.clone()))
+                .collect(),
+            latest_ordinal: self.snapshot.latest_ordinal,
+            latest_digest: self.snapshot.latest_digest.clone(),
+            acknowledged_through: self.snapshot.acknowledged_through,
+            acknowledged_digest: self.snapshot.acknowledged_digest.clone(),
+            recovery_floor_ordinal: self.snapshot.recovery_floor_ordinal,
+            recovery_floor_digest: self.snapshot.recovery_floor_digest.clone(),
+            retained_through: self.snapshot.retained_through(),
+            retained_digest: self.snapshot.retained_digest().to_owned(),
+            generation: self.journal_generation,
+        }
+    }
+
+    /// Split an attach into the cheap part that needs the relay lock and the
+    /// expensive part that does not.
+    ///
+    /// Catch-up over a long offline history reads page after page from disk
+    /// and decompresses sealed segments. Doing that under the relay lock
+    /// blocks live event recording until it finishes, which is exactly what a
+    /// controller attaching is not supposed to cost the session. `None` means
+    /// this envelope is not an attach, or is one that cannot be served at all;
+    /// the caller falls back to [`Self::handle`], which answers it.
+    pub fn take_deferred_attach(
+        &self,
+        envelope: &RelayRequestEnvelope,
+    ) -> Option<DeferredRelayAttach> {
+        let RelayRequest::Attach {
+            after_ordinal,
+            after_digest,
+        } = &envelope.request
+        else {
+            return None;
+        };
+        if self.envelope_rejection(envelope).is_some() {
+            return None;
+        }
+        let state = self.operational_state();
+        Some(DeferredRelayAttach {
+            request_id: envelope.request_id.clone(),
+            protocol_version: envelope.protocol_version,
+            plan: self.replay_plan(),
+            state,
+            after_ordinal: *after_ordinal,
+            after_digest: after_digest.clone(),
+        })
     }
 
     pub fn handle(&mut self, envelope: RelayRequestEnvelope) -> RelayResponseEnvelope {
@@ -400,9 +471,14 @@ impl DurableRelay {
         }
     }
 
-    fn handle_inner(&mut self, envelope: &RelayRequestEnvelope) -> Result<RelayResponseBody> {
+    /// Everything answered before a request reaches relay state: a usable
+    /// request ID, protocol negotiation, and a method this peer's protocol
+    /// version admits. `Some` is the response to send instead of handling.
+    /// [`Self::take_deferred_attach`] consults the same checks so an attach it
+    /// defers is one the normal path would have accepted.
+    fn envelope_rejection(&self, envelope: &RelayRequestEnvelope) -> Option<RelayResponseBody> {
         if envelope.request_id.trim().is_empty() || envelope.request_id.len() > 256 {
-            return Ok(relay_error(
+            return Some(relay_error(
                 RelayErrorCode::InvalidRequest,
                 "request_id is required",
                 false,
@@ -411,7 +487,7 @@ impl DurableRelay {
         }
         if let RelayRequest::Hello { supported, .. } = &envelope.request {
             let Some(negotiated) = RelayVersionRange::CURRENT.negotiate(*supported) else {
-                return Ok(relay_error(
+                return Some(relay_error(
                     RelayErrorCode::IncompatibleProtocol,
                     format!(
                         "controller supports {}-{}, relay supports protocol {}-{}",
@@ -424,7 +500,7 @@ impl DurableRelay {
                     None,
                 ));
             };
-            return Ok(RelayResponseBody::Ok {
+            return Some(RelayResponseBody::Ok {
                 payload: RelayResponsePayload::Hello {
                     negotiated,
                     relay_version: self.relay_version.clone(),
@@ -433,7 +509,14 @@ impl DurableRelay {
             });
         }
         if !envelope.request.supported_at(envelope.protocol_version) {
-            return Ok(incompatible_request_protocol(envelope.protocol_version));
+            return Some(incompatible_request_protocol(envelope.protocol_version));
+        }
+        None
+    }
+
+    fn handle_inner(&mut self, envelope: &RelayRequestEnvelope) -> Result<RelayResponseBody> {
+        if let Some(body) = self.envelope_rejection(envelope) {
+            return Ok(body);
         }
 
         let payload = match &envelope.request {
@@ -505,23 +588,9 @@ impl DurableRelay {
         after_ordinal: u64,
         after_digest: &str,
     ) -> Result<std::result::Result<RelayResponsePayload, RelayProtocolError>> {
-        if let Err(error) = self.validate_replay_cursor(after_ordinal, after_digest) {
-            return Ok(Err(relay_protocol_error(
-                RelayErrorCode::Desynchronized,
-                error.to_string(),
-                false,
-                Some(self.desynchronized_detail(after_ordinal, after_digest)),
-            )));
-        }
-        let page = self.read_events_after(after_ordinal, RELAY_REPLAY_BYTE_BUDGET)?;
         let state = self.operational_state();
-        ensure_serialized_budget(&state, RELAY_STATE_BYTE_BUDGET, "relay operational state")?;
-        Ok(Ok(RelayResponsePayload::Attached {
-            state,
-            events: page.events,
-            through_ordinal: page.through_ordinal,
-            through_digest: page.through_digest,
-        }))
+        self.replay_plan()
+            .attach(after_ordinal, after_digest, state)
     }
 
     fn acknowledge(
@@ -529,12 +598,13 @@ impl DurableRelay {
         through_ordinal: u64,
         through_digest: &str,
     ) -> Result<std::result::Result<RelayResponsePayload, RelayProtocolError>> {
-        if let Err(error) = self.validate_replay_cursor(through_ordinal, through_digest) {
+        let plan = self.replay_plan();
+        if let Err(error) = plan.validate_cursor(through_ordinal, through_digest) {
             return Ok(Err(relay_protocol_error(
                 RelayErrorCode::Desynchronized,
                 error.to_string(),
                 false,
-                Some(self.desynchronized_detail(through_ordinal, through_digest)),
+                Some(plan.desynchronized_detail(through_ordinal, through_digest)),
             )));
         }
         if through_ordinal > self.snapshot.acknowledged_through {
@@ -1232,135 +1302,8 @@ impl DurableRelay {
         })
     }
 
-    fn validate_replay_cursor(&self, after_ordinal: u64, after_digest: &str) -> Result<()> {
-        let retained_through = self.snapshot.retained_through();
-        if after_ordinal < retained_through {
-            bail!(
-                "event {after_ordinal} is no longer available; relay retained events after {}",
-                retained_through
-            );
-        }
-        if after_ordinal > self.snapshot.latest_ordinal {
-            bail!(
-                "event {after_ordinal} is newer than relay frontier {}",
-                self.snapshot.latest_ordinal
-            );
-        }
-        validate_relay_digest(after_digest, "event cursor digest")?;
-        let expected = self
-            .digest_at(after_ordinal)?
-            .ok_or_else(|| anyhow!("relay digest missing at event {after_ordinal}"))?;
-        if after_digest != expected {
-            bail!("event {after_ordinal} digest does not match the relay event chain");
-        }
-        Ok(())
-    }
-
     fn digest_at(&self, ordinal: u64) -> Result<Option<String>> {
-        if ordinal == 0 {
-            return Ok(Some(RELAY_EVENT_GENESIS_DIGEST.to_owned()));
-        }
-        if ordinal == self.snapshot.latest_ordinal {
-            return Ok(Some(self.snapshot.latest_digest.clone()));
-        }
-        if ordinal == self.snapshot.acknowledged_through {
-            return Ok(Some(self.snapshot.acknowledged_digest.clone()));
-        }
-        if ordinal == self.snapshot.recovery_floor_ordinal {
-            return Ok(Some(self.snapshot.recovery_floor_digest.clone()));
-        }
-        if let Some(span) = self.journal_spans.iter().find(|span| {
-            span.file_first_ordinal.checked_sub(1) == Some(ordinal) && ordinal >= span.after_ordinal
-        }) {
-            return Ok(Some(span.file_first_previous_digest.clone()));
-        }
-        if let Some(event) = self
-            .hot_events
-            .iter()
-            .find(|event| event.ordinal == ordinal)
-        {
-            return Ok(Some(event.digest.clone()));
-        }
-        let Some(span) = self
-            .journal_spans
-            .iter()
-            .find(|span| ordinal > span.after_ordinal && ordinal <= span.file_last_ordinal)
-        else {
-            return Ok(None);
-        };
-        let mut digest = None;
-        visit_relay_journal_file(&span.path, false, |event, _| {
-            if event.ordinal == ordinal {
-                digest = Some(event.digest.clone());
-                return Ok(ControlFlow::Break(()));
-            }
-            Ok(ControlFlow::Continue(()))
-        })?;
-        Ok(digest)
-    }
-
-    fn read_events_after(&self, after_ordinal: u64, byte_budget: usize) -> Result<RelayEventPage> {
-        let mut events = Vec::new();
-        let mut used = 0_usize;
-        let mut through_ordinal = after_ordinal;
-        let mut through_digest = self
-            .digest_at(after_ordinal)?
-            .ok_or_else(|| anyhow!("relay digest missing at event {after_ordinal}"))?;
-        let mut page_full = false;
-
-        for span in &self.journal_spans {
-            if page_full || span.file_last_ordinal <= through_ordinal {
-                continue;
-            }
-            visit_relay_journal_file(&span.path, false, |event, encoded_len| {
-                if event.ordinal <= span.after_ordinal || event.ordinal <= through_ordinal {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                if event.ordinal
-                    != through_ordinal
-                        .checked_add(1)
-                        .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?
-                {
-                    bail!(
-                        "relay journal page has a gap after event {through_ordinal}: found {}",
-                        event.ordinal
-                    );
-                }
-                if !events.is_empty() && used.saturating_add(encoded_len) > byte_budget {
-                    page_full = true;
-                    return Ok(ControlFlow::Break(()));
-                }
-                used = used.saturating_add(encoded_len);
-                through_ordinal = event.ordinal;
-                through_digest = event.digest.clone();
-                events.push(event);
-                Ok(ControlFlow::Continue(()))
-            })?;
-        }
-        if !page_full {
-            through_ordinal = self.snapshot.latest_ordinal;
-            through_digest = self.snapshot.latest_digest.clone();
-        }
-        Ok(RelayEventPage {
-            events,
-            through_ordinal,
-            through_digest,
-        })
-    }
-
-    fn desynchronized_detail(
-        &self,
-        requested_after: u64,
-        requested_digest: &str,
-    ) -> RelayErrorDetail {
-        RelayErrorDetail::Desynchronized {
-            requested_after,
-            requested_digest: requested_digest.to_owned(),
-            earliest_available: self.snapshot.retained_through(),
-            earliest_digest: self.snapshot.retained_digest().to_owned(),
-            latest: self.snapshot.latest_ordinal,
-            latest_digest: self.snapshot.latest_digest.clone(),
-        }
+        self.replay_plan().digest_at(ordinal)
     }
 
     /// Start the head of the durable command queue once the relay is idle.
@@ -1418,6 +1361,290 @@ struct RelayEventPage {
     events: Vec<RelayEvent>,
     through_ordinal: u64,
     through_digest: String,
+}
+
+/// A point-in-time view of the durable journal: everything needed to validate
+/// a replay cursor and assemble a replay page, and nothing that requires the
+/// relay lock to read.
+///
+/// Sealed segments are immutable and the active segment is append-only, so a
+/// captured span list stays readable while the relay keeps recording events.
+/// Sealing and garbage collection do invalidate it, so every read here is
+/// written to fail loudly rather than return a short or torn page, and
+/// `generation` lets the caller recognize that failure as a stale plan instead
+/// of a real desynchronization.
+pub struct RelayReplayPlan {
+    spans: Vec<RelayJournalSpan>,
+    /// Digests of the newest events, so a controller cursor near the frontier
+    /// validates without touching the disk at all.
+    hot_digests: Vec<(u64, String)>,
+    latest_ordinal: u64,
+    latest_digest: String,
+    acknowledged_through: u64,
+    acknowledged_digest: String,
+    recovery_floor_ordinal: u64,
+    recovery_floor_digest: String,
+    retained_through: u64,
+    retained_digest: String,
+    generation: u64,
+}
+
+impl RelayReplayPlan {
+    fn attach(
+        &self,
+        after_ordinal: u64,
+        after_digest: &str,
+        state: RelayOperationalState,
+    ) -> Result<std::result::Result<RelayResponsePayload, RelayProtocolError>> {
+        if let Err(error) = self.validate_cursor(after_ordinal, after_digest) {
+            return Ok(Err(relay_protocol_error(
+                RelayErrorCode::Desynchronized,
+                error.to_string(),
+                false,
+                Some(self.desynchronized_detail(after_ordinal, after_digest)),
+            )));
+        }
+        let page = self.read_events_after(after_ordinal, RELAY_REPLAY_BYTE_BUDGET)?;
+        ensure_serialized_budget(&state, RELAY_STATE_BYTE_BUDGET, "relay operational state")?;
+        Ok(Ok(RelayResponsePayload::Attached {
+            state,
+            events: page.events,
+            through_ordinal: page.through_ordinal,
+            through_digest: page.through_digest,
+        }))
+    }
+
+    fn validate_cursor(&self, after_ordinal: u64, after_digest: &str) -> Result<()> {
+        if after_ordinal < self.retained_through {
+            bail!(
+                "event {after_ordinal} is no longer available; relay retained events after {}",
+                self.retained_through
+            );
+        }
+        if after_ordinal > self.latest_ordinal {
+            bail!(
+                "event {after_ordinal} is newer than relay frontier {}",
+                self.latest_ordinal
+            );
+        }
+        validate_relay_digest(after_digest, "event cursor digest")?;
+        let expected = self
+            .digest_at(after_ordinal)?
+            .ok_or_else(|| anyhow!("relay digest missing at event {after_ordinal}"))?;
+        if after_digest != expected {
+            bail!("event {after_ordinal} digest does not match the relay event chain");
+        }
+        Ok(())
+    }
+
+    fn digest_at(&self, ordinal: u64) -> Result<Option<String>> {
+        if ordinal == 0 {
+            return Ok(Some(RELAY_EVENT_GENESIS_DIGEST.to_owned()));
+        }
+        if ordinal == self.latest_ordinal {
+            return Ok(Some(self.latest_digest.clone()));
+        }
+        if ordinal == self.acknowledged_through {
+            return Ok(Some(self.acknowledged_digest.clone()));
+        }
+        if ordinal == self.recovery_floor_ordinal {
+            return Ok(Some(self.recovery_floor_digest.clone()));
+        }
+        if let Some(span) = self.spans.iter().find(|span| {
+            span.file_first_ordinal.checked_sub(1) == Some(ordinal) && ordinal >= span.after_ordinal
+        }) {
+            return Ok(Some(span.file_first_previous_digest.clone()));
+        }
+        if let Some((_, digest)) = self.hot_digests.iter().find(|(hot, _)| *hot == ordinal) {
+            return Ok(Some(digest.clone()));
+        }
+        let Some(span) = self
+            .spans
+            .iter()
+            .find(|span| ordinal > span.after_ordinal && ordinal <= span.file_last_ordinal)
+        else {
+            return Ok(None);
+        };
+        let mut digest = None;
+        visit_relay_journal_file(&span.path, false, |event, _| {
+            if event.ordinal == ordinal {
+                digest = Some(event.digest.clone());
+                return Ok(ControlFlow::Break(()));
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(digest)
+    }
+
+    fn read_events_after(&self, after_ordinal: u64, byte_budget: usize) -> Result<RelayEventPage> {
+        let mut events = Vec::new();
+        let mut used = 0_usize;
+        let mut through_ordinal = after_ordinal;
+        let mut through_digest = self
+            .digest_at(after_ordinal)?
+            .ok_or_else(|| anyhow!("relay digest missing at event {after_ordinal}"))?;
+        let mut page_full = false;
+
+        for span in &self.spans {
+            if page_full || span.file_last_ordinal <= through_ordinal {
+                continue;
+            }
+            visit_relay_journal_file(&span.path, false, |event, encoded_len| {
+                if event.ordinal <= span.after_ordinal || event.ordinal <= through_ordinal {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                if event.ordinal > self.latest_ordinal {
+                    // The active segment kept growing after this plan was
+                    // captured. Those events are real, but the reply's
+                    // operational state describes the frontier the plan saw,
+                    // so the page stops there and the caller asks again.
+                    return Ok(ControlFlow::Break(()));
+                }
+                let expected = through_ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
+                if event.ordinal != expected {
+                    bail!(
+                        "relay journal page has a gap after event {through_ordinal}: found {}",
+                        event.ordinal
+                    );
+                }
+                // The page is assembled off the relay lock, so it carries its
+                // own proof that it is one unbroken run of the chain the cursor
+                // named rather than fragments of a journal that moved.
+                if event.previous_digest != through_digest {
+                    bail!(
+                        "relay journal event {} does not chain from event {through_ordinal}",
+                        event.ordinal
+                    );
+                }
+                if !events.is_empty() && used.saturating_add(encoded_len) > byte_budget {
+                    page_full = true;
+                    return Ok(ControlFlow::Break(()));
+                }
+                used = used.saturating_add(encoded_len);
+                through_ordinal = event.ordinal;
+                through_digest.clone_from(&event.digest);
+                events.push(event);
+                Ok(ControlFlow::Continue(()))
+            })?;
+            // A canonical span contributes every ordinal through its last one.
+            // Stopping short means the file no longer holds what this plan
+            // captured: it was sealed, rewritten, or pruned under the reader.
+            if !page_full && through_ordinal < span.file_last_ordinal.min(self.latest_ordinal) {
+                bail!(
+                    "relay journal {} no longer covers event {}",
+                    span.path.display(),
+                    span.file_last_ordinal
+                );
+            }
+        }
+        if !page_full
+            && (through_ordinal != self.latest_ordinal || through_digest != self.latest_digest)
+        {
+            // The spans end at the frontier this plan captured. Anything else
+            // is a page assembled from a journal that moved, never a short
+            // answer a caller could mistake for a complete one.
+            bail!(
+                "relay journal ended at event {through_ordinal}, expected frontier {}",
+                self.latest_ordinal
+            );
+        }
+        Ok(RelayEventPage {
+            events,
+            through_ordinal,
+            through_digest,
+        })
+    }
+
+    fn desynchronized_detail(
+        &self,
+        requested_after: u64,
+        requested_digest: &str,
+    ) -> RelayErrorDetail {
+        RelayErrorDetail::Desynchronized {
+            requested_after,
+            requested_digest: requested_digest.to_owned(),
+            earliest_available: self.retained_through,
+            earliest_digest: self.retained_digest.clone(),
+            latest: self.latest_ordinal,
+            latest_digest: self.latest_digest.clone(),
+        }
+    }
+}
+
+/// An attach whose disk work has been lifted out of the relay lock.
+///
+/// [`DurableRelay::take_deferred_attach`] builds one while holding the lock;
+/// [`Self::finish`] then does the reading, decompressing and page assembly
+/// with the lock released, so live event recording keeps running underneath a
+/// controller's catch-up.
+pub struct DeferredRelayAttach {
+    request_id: String,
+    protocol_version: u32,
+    plan: RelayReplayPlan,
+    state: RelayOperationalState,
+    after_ordinal: u64,
+    after_digest: String,
+}
+
+impl DeferredRelayAttach {
+    /// The journal generation this attach was planned against. Compare it with
+    /// [`DurableRelay::journal_generation`] after [`Self::finish`] fails: an
+    /// unchanged generation means the failure is real, and a changed one means
+    /// the journal was resealed or collected mid-read and the controller
+    /// should simply attach again.
+    pub fn journal_generation(&self) -> u64 {
+        self.plan.generation
+    }
+
+    /// Blocking: reads journal segments and decompresses sealed ones. Callers
+    /// on an async runtime must run this off the event loop.
+    pub fn finish(self) -> RelayResponseEnvelope {
+        let body = match self
+            .plan
+            .attach(self.after_ordinal, &self.after_digest, self.state)
+        {
+            Ok(Ok(payload)) => RelayResponseBody::Ok { payload },
+            Ok(Err(error)) => RelayResponseBody::Error { error },
+            Err(error) => RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::Internal,
+                    message: format!("{error:#}"),
+                    retryable: true,
+                    detail: None,
+                },
+            },
+        };
+        RelayResponseEnvelope {
+            request_id: self.request_id,
+            protocol_version: self.protocol_version,
+            body,
+        }
+    }
+
+    /// The answer for an attach whose plan went stale while it was reading:
+    /// nothing is wrong with the controller's cursor, so it retries against
+    /// the journal as it now stands.
+    pub fn stale_journal_response(
+        request_id: String,
+        protocol_version: u32,
+    ) -> RelayResponseEnvelope {
+        RelayResponseEnvelope {
+            request_id,
+            protocol_version,
+            body: RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::Internal,
+                    message: "relay journal was resealed or collected while the replay page was \
+                              being read; attach again"
+                        .to_owned(),
+                    retryable: true,
+                    detail: None,
+                },
+            },
+        }
+    }
 }
 
 pub(crate) fn clear_native_session_identity(root: &Path) -> Result<()> {
@@ -1603,8 +1830,213 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use test_support::*;
+
+    /// A history large enough to seal several segments and to overflow one
+    /// replay page, so an attach against it really does read and decompress.
+    fn record_paged_history(relay: &mut DurableRelay, events: usize) {
+        for index in 0..events {
+            relay
+                .record_observation(RelayObservation::Warning {
+                    message: format!("{index:04}:{}", "x".repeat(64 * 1024)),
+                })
+                .unwrap();
+        }
+    }
+
+    fn attach_envelope(
+        relay: &DurableRelay,
+        request_id: &str,
+        after_ordinal: u64,
+    ) -> RelayRequestEnvelope {
+        relay_request(
+            request_id,
+            RelayRequest::Attach {
+                after_ordinal,
+                after_digest: relay.digest_at(after_ordinal).unwrap().unwrap(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_deferred_attach_reads_its_page_while_the_relay_keeps_recording() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap(),
+        ));
+        record_paged_history(&mut relay.lock().unwrap(), 80);
+        let planned_frontier = relay.lock().unwrap().latest_ordinal();
+
+        let deferred = {
+            let guard = relay.lock().unwrap();
+            guard
+                .take_deferred_attach(&attach_envelope(&guard, "catch-up", 0))
+                .expect("an attach is deferred off the relay lock")
+        };
+
+        // The catch-up page has not been assembled yet, and the relay is free.
+        for index in 0..8 {
+            relay
+                .lock()
+                .expect("the relay lock is not held by the pending replay")
+                .record_observation(RelayObservation::Warning {
+                    message: format!("live-{index}"),
+                })
+                .unwrap();
+        }
+        let live_frontier = relay.lock().unwrap().latest_ordinal();
+        assert_eq!(live_frontier, planned_frontier + 8);
+
+        let response = deferred.finish();
+        let RelayResponseBody::Ok {
+            payload:
+                RelayResponsePayload::Attached {
+                    events,
+                    through_ordinal,
+                    through_digest,
+                    state,
+                },
+        } = response.body
+        else {
+            panic!("deferred attach failed");
+        };
+        assert!(
+            !events.is_empty() && through_ordinal < planned_frontier,
+            "the history should not fit in one page: {through_ordinal} of {planned_frontier}"
+        );
+        // The page is one unbroken run of the chain the cursor asked for, and
+        // it reports the frontier captured with the plan rather than the one
+        // the live appends moved it to.
+        let mut cursor = RelayCursor {
+            ordinal: 0,
+            digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+        };
+        for event in &events {
+            validate_relay_event(cursor.ordinal, &cursor.digest, event).unwrap();
+            cursor.ordinal = event.ordinal;
+            cursor.digest.clone_from(&event.digest);
+        }
+        assert_eq!(cursor.ordinal, through_ordinal);
+        assert_eq!(cursor.digest, through_digest);
+        assert_eq!(state.latest_ordinal, planned_frontier);
+    }
+
+    #[test]
+    fn a_deferred_attach_refuses_a_page_from_a_collected_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        record_paged_history(&mut relay, 80);
+        let sealed = |root: &Path| {
+            fs::read_dir(root.join(RELAY_JOURNAL_DIR))
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|name| name == "gz"))
+                .count()
+        };
+        assert!(sealed(temp.path()) >= 2, "history did not seal segments");
+
+        let deferred = relay
+            .take_deferred_attach(&attach_envelope(&relay, "catch-up", 0))
+            .expect("an attach is deferred off the relay lock");
+        let generation = deferred.journal_generation();
+
+        // Another controller acknowledges the whole history, which rewrites
+        // the journal and deletes every sealed segment this plan named.
+        let frontier = relay.latest_ordinal();
+        let frontier_digest = relay.latest_digest().to_owned();
+        submit_floor(
+            &mut relay,
+            "floor-command-0001",
+            RelayCursor {
+                ordinal: frontier,
+                digest: frontier_digest,
+            },
+        );
+        acknowledge_relay(&mut relay, "ack-everything", frontier);
+        assert_eq!(sealed(temp.path()), 0, "collection kept sealed segments");
+
+        let response = deferred.finish();
+        let RelayResponseBody::Error { error } = &response.body else {
+            panic!("a page read from a collected journal must not be served: {response:?}");
+        };
+        assert!(
+            error.retryable,
+            "a collected journal is retryable, not a controller fault: {error:?}"
+        );
+        assert_ne!(
+            relay.journal_generation(),
+            generation,
+            "collection must mark captured replay plans stale"
+        );
+    }
+
+    /// A replay page is assembled from files the relay lock no longer guards,
+    /// so a span whose file was pruned under the reader must fail the read.
+    /// Silently contributing nothing would answer a catch-up with a page that
+    /// claims to reach the frontier while carrying none of the events.
+    #[test]
+    fn a_deferred_attach_never_serves_a_torn_page_after_its_segments_are_pruned() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        record_paged_history(&mut relay, 80);
+        let frontier = relay.latest_ordinal();
+
+        let deferred = relay
+            .take_deferred_attach(&attach_envelope(&relay, "catch-up", 0))
+            .expect("an attach is deferred off the relay lock");
+        for entry in fs::read_dir(temp.path().join(RELAY_JOURNAL_DIR)).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+
+        let response = deferred.finish();
+        match response.body {
+            RelayResponseBody::Error { error } => assert!(
+                error.retryable,
+                "a pruned segment is retryable, not a controller fault: {error:?}"
+            ),
+            RelayResponseBody::Ok {
+                payload:
+                    RelayResponsePayload::Attached {
+                        events,
+                        through_ordinal,
+                        ..
+                    },
+            } => panic!(
+                "served {} events but claimed to reach event {through_ordinal} of {frontier}",
+                events.len()
+            ),
+            other => panic!("unexpected attach response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deferred_attach_refuses_a_page_from_a_resealed_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        // Fill the active segment without crossing its seal threshold.
+        record_paged_history(&mut relay, 8);
+        let deferred = relay
+            .take_deferred_attach(&attach_envelope(&relay, "catch-up", 0))
+            .expect("an attach is deferred off the relay lock");
+        let generation = deferred.journal_generation();
+
+        // The next append seals the active segment, moving every event the
+        // plan expects to find in `active.jsonl` into a compressed file.
+        record_paged_history(&mut relay, 12);
+        assert_ne!(relay.journal_generation(), generation);
+
+        let response = deferred.finish();
+        let RelayResponseBody::Error { error } = &response.body else {
+            panic!("a page read from a resealed segment must not be served: {response:?}");
+        };
+        assert!(
+            error.retryable,
+            "a resealed segment is retryable: {error:?}"
+        );
+    }
 
     #[test]
     fn relay_runs_queued_prompts_in_order_without_a_controller() {

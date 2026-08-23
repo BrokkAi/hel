@@ -1210,9 +1210,8 @@ mod tests {
     use super::*;
     use crate::hel_worker::test_support::*;
     use crate::hel_worker::{
-        DurableRelay, RELAY_COMMAND_BYTE_BUDGET, RELAY_EVENT_BYTE_BUDGET, RELAY_REPLAY_BYTE_BUDGET,
-        RELAY_STATE_BYTE_BUDGET, RelayErrorCode, RelayProtocolError, RelayRequest,
-        RelayResponseBody,
+        DurableRelay, RELAY_COMMAND_BYTE_BUDGET, RELAY_EVENT_BYTE_BUDGET, RELAY_STATE_BYTE_BUDGET,
+        RelayErrorCode, RelayProtocolError, RelayRequest, RelayResponseBody,
     };
 
     #[test]
@@ -1434,10 +1433,10 @@ mod tests {
         assert_eq!(ordinal, 1);
         assert_eq!(relay.latest_ordinal(), 1);
 
-        let page = relay
-            .read_events_after(0, RELAY_REPLAY_BYTE_BUDGET)
+        let replayed = relay
+            .events_after(0, crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST)
             .unwrap();
-        let recorded = &page.events[0];
+        let recorded = &replayed[0];
         let RelayObservation::Warning { message } = &recorded.observation else {
             panic!(
                 "expected the truncated warning, found {:?}",
