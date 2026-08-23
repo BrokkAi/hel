@@ -319,8 +319,8 @@ pub(crate) async fn run_dashboard() -> Result<()> {
             // a running turn clock in the session header, or the checkpoint
             // title.
             _ = clock_tick.tick() => {
-                // The resume dialog's rows carry relative ages ("2m ago"), so
-                // the same clock that redraws them rebuilds them.
+                // Resume search covers the moving "Last active" text, so the
+                // same clock that redraws the dialog rebuilds its rows.
                 context.dashboard.rebuild_resume_rows();
                 context.dirty |= match (context.view, context.active_chat.as_ref()) {
                     (View::Chat, Some(chat)) => chat.needs_clock_tick(),

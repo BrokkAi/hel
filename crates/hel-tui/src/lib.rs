@@ -302,8 +302,8 @@ pub struct DashboardState {
     /// Native sessions the resume dialog hides, loaded from Hel's database.
     pub(crate) hidden_native_sessions: BTreeSet<(HarnessKind, String)>,
     /// The rows the open resume dialog shows, derived from the records, the
-    /// scans, and the dialog's own filters. Rebuilt where those change and
-    /// once a second for the relative ages; empty when no dialog is open.
+    /// scans, and the dialog's own search. Rebuilt where those change and once
+    /// a second for the activity labels; empty when no dialog is open.
     pub(crate) resume_rows: Vec<crate::resume::ResumeRow>,
     /// Hitbox of the selected session's conversation preview, so the wheel can
     /// scroll that preview instead of moving the selection.

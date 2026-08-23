@@ -443,8 +443,7 @@ pub(crate) fn discover_import_profile(
 fn import_session_option(session: hel::hel_import::NativeSessionListing) -> ImportSessionOption {
     let project_directory = display_home_relative(&session.cwd);
     let details = format!(
-        "{} · {} · {} · {}",
-        system_time_age(session.modified_at),
+        "{} · {} · {}",
         session.git_branch,
         format_byte_size(session.size_bytes),
         project_directory
@@ -467,20 +466,6 @@ fn system_time_epoch_ms(time: SystemTime) -> i64 {
         .ok()
         .and_then(|since| i64::try_from(since.as_millis()).ok())
         .unwrap_or(0)
-}
-
-fn system_time_age(time: SystemTime) -> String {
-    let age = SystemTime::now().duration_since(time).unwrap_or_default();
-    let seconds = age.as_secs();
-    if seconds < 60 {
-        format!("{seconds}s ago")
-    } else if seconds < 3_600 {
-        format!("{}m ago", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h ago", seconds / 3_600)
-    } else {
-        format!("{}d ago", seconds / 86_400)
-    }
 }
 
 fn format_byte_size(bytes: u64) -> String {

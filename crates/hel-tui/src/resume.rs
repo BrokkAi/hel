@@ -36,14 +36,14 @@ pub(crate) const LOCAL_ORIGIN: &str = "local";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeFocus {
-    Filter,
+    Search,
     Sessions,
     Cancel,
     Open,
 }
 
 const RESUME_FOCUS_ORDER: [ResumeFocus; 4] = [
-    ResumeFocus::Filter,
+    ResumeFocus::Search,
     ResumeFocus::Sessions,
     ResumeFocus::Cancel,
     ResumeFocus::Open,
@@ -142,7 +142,7 @@ pub(crate) struct ResumeDialog {
     pub(crate) profiles: Arc<Vec<ImportProfileOption>>,
     pub(crate) selected: Option<ResumeRowKey>,
     pub(crate) row_index: usize,
-    pub(crate) filter: String,
+    pub(crate) search: String,
     pub(crate) focus: ResumeFocus,
     pub(crate) show_archived: bool,
     pub(crate) opened_at: Instant,
@@ -206,22 +206,47 @@ fn hel_row_status(session: &SessionRecord) -> ResumeRowStatus {
     }
 }
 
-fn relative_age(now_ms: i64, then_ms: i64) -> String {
-    let seconds = now_ms.saturating_sub(then_ms).max(0) / 1_000;
-    if seconds < 60 {
-        format!("{seconds}s ago")
-    } else if seconds < 3_600 {
-        format!("{}m ago", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h ago", seconds / 3_600)
-    } else {
-        format!("{}d ago", seconds / 86_400)
+const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+fn format_last_active<Tz>(now: &chrono::DateTime<Tz>, then_ms: i64) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    if then_ms <= 0 {
+        return "unknown".to_owned();
     }
+    let Some(then) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(then_ms) else {
+        return "unknown".to_owned();
+    };
+    let elapsed_ms = now.timestamp_millis().saturating_sub(then_ms).max(0);
+    if elapsed_ms > SEVEN_DAYS_MS {
+        return then
+            .with_timezone(&now.timezone())
+            .format("%b %-d, %Y")
+            .to_string();
+    }
+
+    let seconds = elapsed_ms / 1_000;
+    if seconds < 60 {
+        "just now".to_owned()
+    } else if seconds < 3_600 {
+        relative_time(seconds / 60, "minute")
+    } else if seconds < 86_400 {
+        relative_time(seconds / 3_600, "hour")
+    } else {
+        relative_time(seconds / 86_400, "day")
+    }
+}
+
+fn relative_time(value: i64, unit: &str) -> String {
+    let plural = if value == 1 { "" } else { "s" };
+    format!("{value} {unit}{plural} ago")
 }
 
 /// Merge Hel's non-live records with the scanned native sessions into one list,
 /// newest first. Rows are returned unfiltered; the dialog applies the archived
-/// toggle and the text filter on top.
+/// toggle and search on top.
 ///
 /// Dedupe rule: a Hel record whose `native_session_id` matches a scanned native
 /// session of the same harness replaces that native row entirely.
@@ -230,7 +255,6 @@ pub(crate) fn merged_resume_rows(
     state: &HelState,
     profiles: &[ImportProfileOption],
     hidden_native: &BTreeSet<(HarnessKind, String)>,
-    now_ms: i64,
 ) -> Vec<ResumeRow> {
     let mut adopted = BTreeSet::new();
     let mut rows = Vec::new();
@@ -251,17 +275,18 @@ pub(crate) fn merged_resume_rows(
             .or_else(|| timestamp_ms(&session.updated_at))
             .unwrap_or(0);
         let status = hel_row_status(session);
-        let checkpoint = match (&session.checkpoint, status.explanation()) {
-            (_, Some(reason)) => reason.to_owned(),
-            (None, None) => "no checkpoint".to_owned(),
-            (Some(_), None) => relative_age(now_ms, last_activity_ms),
+        let project = session.project_name(config);
+        let details = match (&session.checkpoint, status.explanation()) {
+            (_, Some(reason)) => format!("{reason} · {project}"),
+            (None, None) => format!("no checkpoint · {project}"),
+            (Some(_), None) => project,
         };
         rows.push(ResumeRow {
             key: ResumeRowKey::Hel(session.id.clone()),
             profile_id: session.last_profile.clone(),
             title: session.display_title().to_owned(),
             origin: session.target_template_id.clone(),
-            details: format!("{checkpoint} · {}", session.project_name(config)),
+            details,
             last_activity_ms,
             status,
             archived: session.archived,
@@ -301,17 +326,17 @@ pub(crate) fn merged_resume_rows(
 }
 
 /// The rows one dialog shows: the merged list with the checkpoint sizes
-/// appended, the archived toggle applied, and the text filter applied.
+/// appended, the archived toggle applied, and the search applied.
 fn build_resume_rows(
     config: &HelConfig,
     state: &HelState,
     dialog: &ResumeDialog,
     hidden_native: &BTreeSet<(HarnessKind, String)>,
     checkpoint_archive_sizes: &BTreeMap<String, Option<u64>>,
-    now_ms: i64,
+    now: &chrono::DateTime<chrono::Local>,
 ) -> Vec<ResumeRow> {
-    let needle = dialog.filter.to_lowercase();
-    merged_resume_rows(config, state, &dialog.profiles, hidden_native, now_ms)
+    let needle = dialog.search.to_lowercase();
+    merged_resume_rows(config, state, &dialog.profiles, hidden_native)
         .into_iter()
         .map(|mut row| {
             // The checkpoint's size is loaded in the background, so it is
@@ -329,10 +354,13 @@ fn build_resume_rows(
         })
         .filter(|row| dialog.show_archived || !row.is_hidden())
         .filter(|row| {
+            let activity = format_last_active(now, row.last_activity_ms).to_lowercase();
             needle.is_empty()
                 || row.title.to_lowercase().contains(&needle)
                 || row.details.to_lowercase().contains(&needle)
                 || row.profile_id.to_lowercase().contains(&needle)
+                || row.origin.to_lowercase().contains(&needle)
+                || activity.contains(&needle)
         })
         .collect()
 }
@@ -340,9 +368,9 @@ fn build_resume_rows(
 impl DashboardState {
     /// Rebuilds the open dialog's rows from what they are derived from: the
     /// Hel records, the scanned native sessions, the hidden set, the
-    /// checkpoint sizes, the filter, the archived toggle, and the clock the
-    /// relative ages read. Every mutation of those inputs calls this, and the
-    /// dashboard's one-second clock calls it again so the ages keep moving.
+    /// checkpoint sizes, the search, the archived toggle, and the clock the
+    /// activity labels read. Every mutation of those inputs calls this, and
+    /// the dashboard's one-second clock calls it again so searches keep moving.
     /// Moving the selection only reads the rows.
     pub fn rebuild_resume_rows(&mut self) {
         let Mode::ResumeDialog(dialog) = &self.mode else {
@@ -355,7 +383,7 @@ impl DashboardState {
             dialog,
             &self.hidden_native_sessions,
             &self.checkpoint_archive_sizes,
-            chrono::Utc::now().timestamp_millis(),
+            &chrono::Local::now(),
         );
     }
 
@@ -381,7 +409,7 @@ impl DashboardState {
             profiles: Arc::new(profiles),
             selected: None,
             row_index: 0,
-            filter: String::new(),
+            search: String::new(),
             focus: ResumeFocus::Sessions,
             show_archived: false,
             opened_at: Instant::now(),
@@ -502,7 +530,7 @@ impl DashboardState {
             return DashboardAction::None;
         };
         let focus = dialog.focus;
-        let typing = focus == ResumeFocus::Filter;
+        let typing = focus == ResumeFocus::Search;
         match key.code {
             KeyCode::Esc => {
                 self.cancel_modal();
@@ -514,7 +542,7 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Backspace if typing => {
-                dialog.filter.pop();
+                dialog.search.pop();
                 self.rebuild_resume_rows();
                 self.select_resume_row(0);
                 DashboardAction::None
@@ -525,13 +553,13 @@ impl DashboardState {
                         KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                     ) =>
             {
-                dialog.filter.push(character);
+                dialog.search.push(character);
                 self.rebuild_resume_rows();
                 self.select_resume_row(0);
                 DashboardAction::None
             }
-            // Down leaves the filter for the list, so typing a filter and
-            // walking its results needs no Tab in between.
+            // Down leaves search for the list, so typing a query and walking
+            // its results needs no Tab in between.
             KeyCode::Down if typing => {
                 dialog.focus = ResumeFocus::Sessions;
                 DashboardAction::None
@@ -544,10 +572,10 @@ impl DashboardState {
                 self.move_resume_selection(1);
                 DashboardAction::None
             }
-            // `/` jumps to the filter from anywhere, so the list keeps its
+            // `/` jumps to search from anywhere, so the list keeps its
             // single-letter action keys.
             KeyCode::Char('/') if !typing => {
-                dialog.focus = ResumeFocus::Filter;
+                dialog.focus = ResumeFocus::Search;
                 DashboardAction::None
             }
             KeyCode::Char('s') if !typing => {
@@ -593,7 +621,7 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::None
             }
-            KeyCode::Enter if focus == ResumeFocus::Filter => {
+            KeyCode::Enter if focus == ResumeFocus::Search => {
                 dialog.focus = ResumeFocus::Sessions;
                 DashboardAction::None
             }
@@ -676,16 +704,21 @@ struct RowLayout {
     title: usize,
     profile: usize,
     origin: usize,
+    activity: usize,
 }
 
 fn row_layout(width: u16) -> RowLayout {
     let width = usize::from(width);
     let profile = 14.min(width / 5).max(6);
     let origin = 14.min(width / 5).max(6);
+    let activity = 14.min(width / 4).max(8);
     RowLayout {
-        title: width.saturating_sub(profile + origin + 6).max(10),
+        title: width
+            .saturating_sub(profile + origin + activity + 8)
+            .max(10),
         profile,
         origin,
+        activity,
     }
 }
 
@@ -731,13 +764,13 @@ pub(crate) fn render_resume_dialog(
         ])
         .split(inner);
 
-    let filter_focused = dialog.focus == ResumeFocus::Filter;
-    let cursor = if filter_focused { "▏" } else { "" };
+    let search_focused = dialog.focus == ResumeFocus::Search;
+    let cursor = if search_focused { "▏" } else { "" };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                format!("Filter: {}{cursor}", dialog.filter),
-                if filter_focused {
+                format!("Search: {}{cursor}", dialog.search),
+                if search_focused {
                     Style::default().bg(Color::DarkGray).fg(Color::White)
                 } else {
                     Style::default().fg(Color::Gray)
@@ -759,34 +792,36 @@ pub(crate) fn render_resume_dialog(
     let sessions_focused = dialog.focus == ResumeFocus::Sessions;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(focus_border(sessions_focused || filter_focused))
+        .border_type(focus_border(sessions_focused || search_focused))
         .title(" Sessions · newest first ");
     let list_area = block.inner(rows[1]);
     frame.render_widget(block, rows[1]);
-    let layout = row_layout(list_area.width);
+    let table_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(list_area);
+    let header_area = Rect::new(
+        table_rows[0].x.saturating_add(2),
+        table_rows[0].y,
+        table_rows[0].width.saturating_sub(2),
+        table_rows[0].height,
+    );
+    let list_area = table_rows[1];
+    let layout = row_layout(list_area.width.saturating_sub(2));
+    frame.render_widget(Paragraph::new(resume_header_line(&layout)), header_area);
+    let now = chrono::Local::now();
     let items = if list_rows.is_empty() {
         vec![ListItem::new(if dialog.is_scanning() {
             "Scanning native sessions…"
-        } else if dialog.filter.is_empty() {
+        } else if dialog.search.is_empty() {
             "No stopped or importable sessions"
         } else {
             "No matching sessions"
         })]
     } else {
-        // Profiles group the list visually: the first row of each profile
-        // repeats its name, the rest leave the column blank.
-        let mut previous_profile: Option<&str> = None;
         list_rows
             .iter()
-            .map(|row| {
-                let group = if previous_profile == Some(row.profile_id.as_str()) {
-                    String::new()
-                } else {
-                    previous_profile = Some(&row.profile_id);
-                    truncate_text(&row.profile_id, layout.profile)
-                };
-                ListItem::new(resume_row_line(row, &group, &layout))
-            })
+            .map(|row| ListItem::new(resume_row_line(row, &layout, &now)))
             .collect()
     };
     let mut state = ListState::default().with_selected(selected_index(dialog, list_rows.len()));
@@ -828,7 +863,7 @@ pub(crate) fn render_resume_dialog(
         ));
     }
     footer.push(Line::styled(
-        "Enter resumes or imports · a archives · d deletes · s shows archived · / filters · Tab moves",
+        "Enter resumes or imports · a archives · d deletes · s shows archived · / searches · Tab moves",
         Style::default().fg(Color::DarkGray),
     ));
     footer.push(action_buttons(&[
@@ -855,7 +890,34 @@ pub(crate) fn render_resume_dialog(
     }
 }
 
-fn resume_row_line(row: &ResumeRow, group: &str, layout: &RowLayout) -> Line<'static> {
+fn resume_header_line(layout: &RowLayout) -> Line<'static> {
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(padded_cell("PROFILE", layout.profile), style),
+        Span::raw("  "),
+        Span::styled(padded_cell("TARGET", layout.origin), style),
+        Span::raw("  "),
+        Span::styled(padded_cell("LAST ACTIVE", layout.activity), style),
+        Span::raw("  "),
+        Span::styled(truncate_text("SESSION", layout.title), style),
+    ])
+}
+
+fn padded_cell(text: &str, width: usize) -> String {
+    format!("{:<width$}", truncate_text(text, width), width = width)
+}
+
+fn resume_row_line<Tz>(
+    row: &ResumeRow,
+    layout: &RowLayout,
+    now: &chrono::DateTime<Tz>,
+) -> Line<'static>
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
     let title_style = if row.status.is_recoverable() {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -886,11 +948,19 @@ fn resume_row_line(row: &ResumeRow, group: &str, layout: &RowLayout) -> Line<'st
     }
     Line::from(vec![
         Span::styled(
-            format!("{:<width$}", group, width = layout.profile),
+            padded_cell(&row.profile_id, layout.profile),
             Style::default().fg(Color::Magenta),
         ),
         Span::raw("  "),
         origin,
+        Span::raw("  "),
+        Span::styled(
+            padded_cell(
+                &format_last_active(now, row.last_activity_ms),
+                layout.activity,
+            ),
+            Style::default().fg(Color::Gray),
+        ),
         Span::raw("  "),
         Span::styled(truncate_text(&row.title, layout.title), title_style),
         Span::styled(marks, Style::default().fg(Color::DarkGray)),
@@ -936,7 +1006,7 @@ mod tests {
             native_session_id: id.into(),
             title: title.into(),
             project_directory: "~/Projects/hel".into(),
-            details: "2m ago · master · 1.0KB · ~/Projects/hel".into(),
+            details: "master · 1.0KB · ~/Projects/hel".into(),
             unavailable_reason: None,
             last_activity_ms,
             natively_archived: false,
@@ -976,6 +1046,50 @@ mod tests {
         rows.iter().map(|row| row.title.as_str()).collect()
     }
 
+    fn replace_search(dashboard: &mut DashboardState, search: &str) {
+        let Mode::ResumeDialog(dialog) = &mut dashboard.mode else {
+            panic!("expected the resume dialog");
+        };
+        dialog.search = search.to_owned();
+        dashboard.rebuild_resume_rows();
+    }
+
+    #[test]
+    fn last_active_uses_words_through_seven_days_then_a_local_date() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-23T12:00:00-05:00").unwrap();
+        let before = |milliseconds| now.timestamp_millis() - milliseconds;
+
+        assert_eq!(format_last_active(&now, before(30_000)), "just now");
+        assert_eq!(format_last_active(&now, before(60_000)), "1 minute ago");
+        assert_eq!(
+            format_last_active(&now, before(2 * 60_000)),
+            "2 minutes ago"
+        );
+        assert_eq!(format_last_active(&now, before(60 * 60_000)), "1 hour ago");
+        assert_eq!(
+            format_last_active(&now, before(24 * 60 * 60_000)),
+            "1 day ago"
+        );
+        assert_eq!(
+            format_last_active(&now, before(SEVEN_DAYS_MS)),
+            "7 days ago"
+        );
+        assert_eq!(
+            format_last_active(&now, before(SEVEN_DAYS_MS + 1)),
+            "Aug 16, 2026"
+        );
+        assert_eq!(
+            format_last_active(&now, before(9 * 24 * 60 * 60_000)),
+            "Aug 14, 2026"
+        );
+        assert_eq!(
+            format_last_active(&now, now.timestamp_millis() + 1),
+            "just now"
+        );
+        assert_eq!(format_last_active(&now, 0), "unknown");
+        assert_eq!(format_last_active(&now, i64::MAX), "unknown");
+    }
+
     /// A Hel record and the native session it was imported from are one
     /// conversation, so the dialog shows the Hel record's row and drops the
     /// native duplicate.
@@ -995,7 +1109,6 @@ mod tests {
                 native("native-2", "A different conversation", 5),
             ])],
             &BTreeSet::new(),
-            0,
         );
 
         assert_eq!(merged.len(), 2, "{:?}", titles(&merged));
@@ -1033,7 +1146,6 @@ mod tests {
                 native("native-2", "Idle native session", 5),
             ])],
             &BTreeSet::new(),
-            0,
         );
         assert_eq!(titles(&merged), ["Idle native session"]);
     }
@@ -1046,13 +1158,7 @@ mod tests {
         session.target_template_id = "retired-target".into();
         let mut config = config();
         config.targets.clear();
-        let merged = merged_resume_rows(
-            &config,
-            &state_with(vec![session]),
-            &[],
-            &BTreeSet::new(),
-            0,
-        );
+        let merged = merged_resume_rows(&config, &state_with(vec![session]), &[], &BTreeSet::new());
         assert_eq!(merged[0].origin, "retired-target");
     }
 
@@ -1082,7 +1188,6 @@ mod tests {
                 native("native-new", "Native July", july),
             ])],
             &BTreeSet::new(),
-            july,
         );
 
         assert_eq!(
@@ -1444,6 +1549,39 @@ mod tests {
         assert!(rendered.contains("Scan failed for codex-1"), "{rendered}");
     }
 
+    #[test]
+    fn resume_table_has_headers_repeated_profiles_and_last_active_values() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut dashboard = DashboardState::new(config(), state_with(Vec::new()), BTreeMap::new());
+        dashboard.show_resume_dialog(
+            1,
+            vec![codex_profile(vec![
+                native("native-1", "Recent session", now_ms - 2 * 60_000),
+                native("native-2", "Older session", now_ms - 60 * 60_000),
+            ])],
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 34)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw the resume dialog");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        for heading in ["PROFILE", "TARGET", "LAST ACTIVE", "SESSION"] {
+            assert!(rendered.contains(heading), "{rendered}");
+        }
+        for title in ["Recent session", "Older session"] {
+            let row = rendered
+                .lines()
+                .find(|line| line.contains(title))
+                .expect("rendered session row");
+            assert!(row.contains("codex-1"), "{row}");
+        }
+        assert!(rendered.contains("2 minutes ago"), "{rendered}");
+        assert!(rendered.contains("1 hour ago"), "{rendered}");
+        assert!(rendered.contains("Search:"), "{rendered}");
+    }
+
     /// The dialog is the only surface for non-live sessions, and Ctrl+T opens it.
     #[test]
     fn the_dashboard_opens_the_dialog_and_names_the_key_in_the_footer() {
@@ -1547,10 +1685,10 @@ mod tests {
         assert_eq!(dialog.selected, Some(before[2].key.clone()));
     }
 
-    /// The filter is one of the inputs the rows are built from, so each
-    /// keystroke narrows what the dialog lists, and erasing it restores them.
+    /// Search is one of the inputs the rows are built from, so each keystroke
+    /// narrows what the dialog lists, and erasing it restores them.
     #[test]
-    fn typing_a_filter_narrows_the_visible_rows() {
+    fn typing_a_search_narrows_the_visible_rows() {
         let mut dashboard = DashboardState::new(
             config(),
             state_with(vec![stopped_session()]),
@@ -1575,6 +1713,38 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Backspace));
         }
         assert_eq!(rows(&dashboard).len(), 3);
+    }
+
+    #[test]
+    fn search_matches_every_row_text_field_case_insensitively() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut dashboard = DashboardState::new(
+            config(),
+            state_with(vec![stopped_session()]),
+            BTreeMap::new(),
+        );
+        dashboard.show_resume_dialog(
+            1,
+            vec![codex_profile(vec![
+                native("native-2", "Native alpha", now_ms - 2 * 60_000),
+                native("native-3", "Native beta", 1),
+            ])],
+        );
+
+        for (query, expected) in [
+            ("ACP PRETTY", vec!["ACP pretty name"]),
+            ("PODMAN", vec!["ACP pretty name"]),
+            ("LOCAL", vec!["Native alpha", "Native beta"]),
+            ("MINUTES AGO", vec!["Native alpha"]),
+            ("MASTER", vec!["Native alpha", "Native beta"]),
+            (
+                "CODEX-1",
+                vec!["Native alpha", "ACP pretty name", "Native beta"],
+            ),
+        ] {
+            replace_search(&mut dashboard, query);
+            assert_eq!(titles(&rows(&dashboard)), expected, "query {query:?}");
+        }
     }
 
     /// Cost of the merged row list and of one keypress, on a dialog the size a
@@ -1611,7 +1781,7 @@ mod tests {
         let Mode::ResumeDialog(dialog) = dashboard.mode.clone() else {
             panic!("expected the resume dialog");
         };
-        // What one rebuild costs: the merge, the sizes, and the filters.
+        // What one rebuild costs: the merge, the sizes, and search.
         let started = Instant::now();
         let mut built = 0;
         for _ in 0..ROUNDS {
@@ -1621,7 +1791,7 @@ mod tests {
                 &dialog,
                 &dashboard.hidden_native_sessions,
                 &dashboard.checkpoint_archive_sizes,
-                chrono::Utc::now().timestamp_millis(),
+                &chrono::Local::now(),
             )
             .len();
         }
@@ -1659,7 +1829,7 @@ mod tests {
             .draw(|frame| crate::render::render(frame, &mut dashboard))
             .expect("draw the resume dialog");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        for hint in ["a archives", "d deletes", "s shows archived"] {
+        for hint in ["a archives", "d deletes", "s shows archived", "/ searches"] {
             assert!(rendered.contains(hint), "{rendered}");
         }
     }

@@ -34,7 +34,8 @@ pub struct ImportSessionOption {
     pub unavailable_reason: Option<String>,
     /// When the harness last wrote this session's file, in epoch milliseconds.
     /// The resume dialog sorts hel records and native sessions against each
-    /// other, so the raw instant travels alongside the rendered age.
+    /// other and renders their activity in one column, so the raw instant
+    /// travels alongside the details.
     pub last_activity_ms: i64,
     /// Archived inside the harness itself; only Codex reports this. Hel
     /// mirrors it one way and never writes the harness home back.
