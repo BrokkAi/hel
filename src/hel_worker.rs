@@ -875,10 +875,12 @@ impl DurableRelay {
         self.claim_pending_commands_up_to(acp_session_configured, usize::MAX)
     }
 
-    /// Claim no more work than the caller can hand to ACP without waiting.
-    /// Keeping the durable in-flight batch within the transport's available
-    /// capacity prevents command backpressure from blocking the coordinator
-    /// that must drain ACP's bounded event channel.
+    /// Claim no more work than the caller already holds transport permits for.
+    /// The dispatcher reserves one ACP command permit per claimed command
+    /// before calling, so every claim can be handed over without waiting even
+    /// when other senders share that channel. Bounding the durable in-flight
+    /// batch that way is what keeps command backpressure from parking the
+    /// coordinator that must keep draining ACP's bounded event channel.
     pub fn claim_pending_commands_up_to(
         &mut self,
         acp_session_configured: bool,
