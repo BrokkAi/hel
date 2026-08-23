@@ -40,7 +40,6 @@ pub(crate) const DETACH_PERSIST_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Everything the dashboard learns from a background job.
 pub(crate) enum DashboardIoUpdate {
     WorkerRecordPersistence {
-        session_id: String,
         operation: WorkerRecordPersistence,
         result: std::result::Result<(), String>,
     },
@@ -698,22 +697,12 @@ impl DashboardContext {
     /// Folds one finished background job into dashboard and controller state.
     pub(super) fn apply_dashboard_io_update(&mut self, update: DashboardIoUpdate) {
         match update {
-            DashboardIoUpdate::WorkerRecordPersistence {
-                session_id,
-                operation,
-                result,
-            } => {
+            DashboardIoUpdate::WorkerRecordPersistence { operation, result } => {
                 if let Err(error) = result {
                     match operation {
                         WorkerRecordPersistence::AcpTitle { .. } => self
                             .dashboard
                             .set_notice(format!("Could not save harness title: {error}")),
-                        WorkerRecordPersistence::RelayReconnect => {
-                            self.dashboard.set_notice(format!(
-                                "Could not save relay reconnect for {}: {error}",
-                                short_id(&session_id)
-                            ))
-                        }
                     }
                 }
             }
@@ -1071,9 +1060,7 @@ impl DashboardContext {
     ) {
         let completion = self.worker_diagnoses.finish(&session_id, episode_id);
         if let Some(error) = completion.display_error {
-            // The database owns this wording: a reconnection clears exactly the
-            // errors this constructor produces.
-            let mut message = hel::hel_database::relay_unreachable_error(&error);
+            let mut message = format!("relay unreachable: {error}");
             match &result {
                 Ok(Some(diagnosis)) => {
                     message.push_str("; ");

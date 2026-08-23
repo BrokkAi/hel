@@ -1054,9 +1054,9 @@ pub(crate) fn apply_worker_poll_update(
             ));
         }
         Some(ViewError::ProjectionIntegrity(detail)) => {
-            // Deterministic failure: no worker diagnostics, and no
-            // "relay unreachable:" last_error, which reconnect handling
-            // reserves for genuinely unreachable relays.
+            // Deterministic failure: no worker diagnostics. Like an
+            // unreachable relay, it is a live poll fact and is never
+            // persisted as a session last_error.
             dashboard.mark_transcript_unavailable(&update.session_id);
             dashboard.set_notice(format!(
                 "Session {}: transcript projection failed: {detail}",
@@ -1081,12 +1081,6 @@ pub(crate) fn apply_worker_record_update(
     };
     let changed_title = (session.acp_session_title != snapshot.materialized.session_title)
         .then(|| snapshot.materialized.session_title.clone());
-    let reconnect_observed = update.view.connected
-        && session.state == SessionState::Error
-        && session
-            .last_error
-            .as_deref()
-            .is_some_and(hel::hel_database::is_relay_unreachable_error);
     let mut changed = false;
     if let Some(title) = changed_title {
         if dashboard_io_tx.is_none() {
@@ -1109,34 +1103,11 @@ pub(crate) fn apply_worker_record_update(
         }
         changed = true;
     }
-    let reconnect_applies = if dashboard_io_tx.is_some() {
-        reconnect_observed
-    } else {
-        reconnect_observed && hel::hel_database::mark_session_relay_reconnected(&update.session_id)?
-    };
-    if reconnect_applies {
-        let session = controller
-            .state
-            .sessions
-            .get_mut(&update.session_id)
-            .expect("session disappeared while recording relay reconnection");
-        session.state = SessionState::Running;
-        session.last_error = None;
-        if let Some(dashboard_io_tx) = dashboard_io_tx {
-            spawn_worker_record_persistence(
-                update.session_id.clone(),
-                WorkerRecordPersistence::RelayReconnect,
-                dashboard_io_tx.clone(),
-            );
-        }
-        changed = true;
-    }
     Ok(changed)
 }
 
 pub(crate) enum WorkerRecordPersistence {
     AcpTitle { title: Option<String> },
-    RelayReconnect,
 }
 
 fn spawn_worker_record_persistence(
@@ -1149,16 +1120,9 @@ fn spawn_worker_record_persistence(
             WorkerRecordPersistence::AcpTitle { title } => {
                 hel::hel_database::set_session_acp_title(&session_id, title.as_deref())
             }
-            WorkerRecordPersistence::RelayReconnect => {
-                hel::hel_database::mark_session_relay_reconnected(&session_id).map(|_| ())
-            }
         }
         .map_err(|error| format!("{error:#}"));
-        let _ = updates.send(DashboardIoUpdate::WorkerRecordPersistence {
-            session_id,
-            operation,
-            result,
-        });
+        let _ = updates.send(DashboardIoUpdate::WorkerRecordPersistence { operation, result });
     });
 }
 
