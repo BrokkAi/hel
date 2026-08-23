@@ -35,11 +35,6 @@ const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared]";
 /// The smallest page worth halving. Below it a rejection is about the content
 /// or the backend, not the size.
 const MIN_SPLIT_PAGE_BYTES: usize = 4 * 1024;
-/// How many failures whose reason this boundary cannot place may happen in a
-/// row before a compaction gives up. A backend that names a size problem may
-/// split all the way down to the floor; one that says something else buys a
-/// couple of smaller retries, then its own reason is the answer.
-const UNPLACEABLE_FAILURE_RUN_LIMIT: usize = 2;
 
 pub trait CompactionBackend {
     fn compact<'a>(
@@ -61,17 +56,16 @@ pub enum CompactionFailure {
     /// The backend named a size or limit problem, so a smaller page can work.
     /// Splitting continues down to [`MIN_SPLIT_PAGE_BYTES`].
     Oversize,
-    /// The reason does not place. It may be the size, it may be the backend, so
-    /// the pipeline retries a smaller page a couple of times before giving up.
-    Unplaceable,
-    /// No smaller page can help: dead credentials, an exhausted quota, a closed
-    /// session, a broken transport. The reason reaches the caller unchanged.
+    /// Every other reason: dead credentials, an exhausted quota, a closed
+    /// session, a broken transport, or anything this boundary cannot read. No
+    /// smaller page is known to help, so the reason reaches the caller
+    /// unchanged.
     Fatal,
 }
 
 /// Read a backend failure the only way an ACP harness reports one: the text the
-/// provider sent. Size complaints are checked first, because a provider can
-/// name both a limit and a token count in one message.
+/// provider sent. Only a named size complaint earns a smaller retry; any other
+/// reason, recognized or not, is the answer the caller gets.
 fn classify_failure_detail(detail: &str) -> CompactionFailure {
     const OVERSIZE_MARKERS: &[&str] = &[
         "too long",
@@ -85,27 +79,6 @@ fn classify_failure_detail(detail: &str) -> CompactionFailure {
         "payload too large",
         "exceeds the maximum",
     ];
-    const FATAL_MARKERS: &[&str] = &[
-        "unauthorized",
-        "forbidden",
-        "authentication",
-        "credential",
-        "api key",
-        "log in",
-        "login",
-        "expired",
-        "quota",
-        "usage limit",
-        "rate limit",
-        "connection refused",
-        "connection reset",
-        "broken pipe",
-        "network",
-        "session is closed",
-        "no acp runtime",
-        "stopped before",
-        "cancel",
-    ];
 
     let detail = detail.to_ascii_lowercase();
     if OVERSIZE_MARKERS
@@ -114,22 +87,14 @@ fn classify_failure_detail(detail: &str) -> CompactionFailure {
     {
         return CompactionFailure::Oversize;
     }
-    if FATAL_MARKERS.iter().any(|marker| detail.contains(marker)) {
-        return CompactionFailure::Fatal;
-    }
-    CompactionFailure::Unplaceable
+    CompactionFailure::Fatal
 }
 
-/// One compaction's model requests: the backend plus the failure budget they
-/// share, so a backend that fails every request cannot walk the split tree
-/// before its first reason surfaces.
+/// One compaction's model requests. Every request in the pipeline goes through
+/// here, so the empty-snapshot check and the reading of a failure stay in one
+/// place.
 struct Requests<'a, B: CompactionBackend> {
     backend: &'a mut B,
-    /// Failures in a row whose reason the boundary could not place.
-    unplaceable_run: usize,
-    /// The reason of the first failed request, kept for the report that ends a
-    /// compaction the pipeline could not retry its way out of.
-    first_failure: Option<String>,
 }
 
 enum RequestOutcome {
@@ -141,16 +106,12 @@ enum RequestOutcome {
 
 impl<'a, B: CompactionBackend> Requests<'a, B> {
     fn new(backend: &'a mut B) -> Self {
-        Self {
-            backend,
-            unplaceable_run: 0,
-            first_failure: None,
-        }
+        Self { backend }
     }
 
-    /// Run one compaction request against the shared failure budget. A fatal
-    /// failure and an exhausted budget both return `Err`; only a failure worth
-    /// retrying smaller comes back as an outcome.
+    /// Run one compaction request. Only a size failure comes back as an
+    /// outcome the caller can retry smaller; every other failure ends the
+    /// compaction with the backend's own reason.
     async fn run(&mut self, prompt: String) -> Result<RequestOutcome> {
         let result = self.backend.compact(prompt).await.and_then(|text| {
             let text = text.trim().to_owned();
@@ -161,32 +122,12 @@ impl<'a, B: CompactionBackend> Requests<'a, B> {
             Ok(text)
         });
         let error = match result {
-            Ok(summary) => {
-                self.unplaceable_run = 0;
-                return Ok(RequestOutcome::Summary(summary));
-            }
+            Ok(summary) => return Ok(RequestOutcome::Summary(summary)),
             Err(error) => error,
         };
-        let first_failure = self
-            .first_failure
-            .get_or_insert_with(|| format!("{error:#}"))
-            .clone();
         match self.backend.classify_failure(&error) {
+            CompactionFailure::Oversize => Ok(RequestOutcome::Splittable(error)),
             CompactionFailure::Fatal => Err(error),
-            CompactionFailure::Oversize => {
-                self.unplaceable_run = 0;
-                Ok(RequestOutcome::Splittable(error))
-            }
-            CompactionFailure::Unplaceable => {
-                self.unplaceable_run += 1;
-                ensure!(
-                    self.unplaceable_run <= UNPLACEABLE_FAILURE_RUN_LIMIT,
-                    "compaction gave up after {} failed requests in a row; \
-                     first failure: {first_failure}",
-                    self.unplaceable_run,
-                );
-                Ok(RequestOutcome::Splittable(error))
-            }
         }
     }
 }
@@ -869,7 +810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_repeating_failure_stops_before_the_split_tree_fans_out() {
+    async fn an_unrecognized_backend_failure_surfaces_on_the_first_request() {
         let large = "x".repeat(200 * 1024);
         let input = exchanges(&[("first", &large), ("second", &large), ("latest", "answer")]);
         let mut backend = FailingBackend::new("relay request failed: backend exploded");
@@ -878,13 +819,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        // Halving a 256 KiB page down to the 4 KiB split floor costs seven
-        // doomed requests. A reason the boundary cannot place is worth a couple
-        // of smaller retries, not the whole descent.
-        assert!(
-            backend.attempts <= UNPLACEABLE_FAILURE_RUN_LIMIT + 1,
-            "an unplaceable failure must not walk the split tree: {} requests",
-            backend.attempts
+        assert_eq!(
+            backend.attempts, 1,
+            "only a named size problem earns a smaller retry"
         );
         assert!(error.to_string().contains("backend exploded"), "{error}");
     }
@@ -924,15 +861,14 @@ mod tests {
                 "{oversize}"
             );
         }
-        assert_eq!(
-            classify_failure_detail("relay request failed: backend exploded"),
-            CompactionFailure::Unplaceable
-        );
+        // Anything that does not name a size problem is fatal, including a
+        // reason this boundary has no marker for.
         for fatal in [
             "401 Unauthorized: invalid API key",
             "credentials expired; run the login flow again",
             "usage limit reached until 3pm",
             "connection refused",
+            "relay request failed: backend exploded",
         ] {
             assert_eq!(
                 classify_failure_detail(fatal),
