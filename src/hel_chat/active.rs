@@ -13,7 +13,6 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
-use crate::hel_config::HarnessKind;
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
@@ -579,6 +578,7 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
             &snapshot.operational.config_options,
             &snapshot.operational.available_commands,
         );
+        state.set_session_modes(snapshot.operational.modes.clone());
     }
     if let Some(error) = view.error {
         match error {
@@ -646,9 +646,6 @@ impl ActiveChat {
     /// new state before any notice is raised below, so recovery and connection
     /// notices land in the same shared slot the dashboard reads.
     ///
-    /// `harness` is the kind of the session's configured profile, or `None`
-    /// when that profile is gone. It selects the harness-specific slash
-    /// command shims.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         session: ManagedSessionHandle,
@@ -658,7 +655,6 @@ impl ActiveChat {
         header: SessionHeaderIdentity,
         draft: String,
         notices: Notices,
-        harness: Option<HarnessKind>,
     ) -> Self {
         let view = session.view();
         let needs_initial_sync = view.snapshot.is_none();
@@ -671,7 +667,7 @@ impl ActiveChat {
             let materialized = snapshot
                 .as_ref()
                 .map_or(&empty, |snapshot| &snapshot.materialized);
-            let state = ChatState::from_materialized_tail(
+            let mut state = ChatState::from_materialized_tail(
                 materialized,
                 snapshot
                     .as_ref()
@@ -680,11 +676,15 @@ impl ActiveChat {
                     .as_ref()
                     .map_or(&[][..], |snapshot| &snapshot.operational.available_commands),
             );
+            state.set_session_modes(
+                snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.operational.modes.clone()),
+            );
             let pending = PendingPrefix::of(materialized, state.unconverted_prefix());
             (state, pending)
         };
         state.set_history_context(bundle_id);
-        state.set_harness(harness);
         state.set_header_identity(header.project, header.position);
         state.restore_draft(draft);
         state.notices = notices;
@@ -1401,6 +1401,7 @@ mod tests {
                     agent_capabilities: None,
                     agent_info: None,
                     config_options: Vec::new(),
+                    modes: None,
                     available_commands: Vec::new(),
                     config: BTreeMap::new(),
                     active_prompt: None,

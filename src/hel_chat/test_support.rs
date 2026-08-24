@@ -8,9 +8,12 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use crate::hel_config::HarnessKind;
 use crate::hel_state::{QueuedCommandKind, TranscriptBody, TranscriptItem};
 use crate::hel_worker::WorkerSnapshot;
+use agent_client_protocol::schema::v1::{
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionMode, SessionModeState,
+};
 
 use super::active::render;
 use super::transcript::transcript_lines;
@@ -130,8 +133,31 @@ pub(super) fn agent_message_item(stable_id: &str, ordinal: u64, text: &str) -> A
 
 pub(super) fn grok_chat() -> ChatState {
     let mut chat = ChatState::new(&snapshot(), &[]);
-    chat.set_harness(Some(HarnessKind::Grok));
+    chat.set_session_modes(Some(SessionModeState::new(
+        "default",
+        vec![
+            SessionMode::new("default", "Default"),
+            SessionMode::new("plan", "Plan"),
+        ],
+    )));
     chat
+}
+
+pub(super) fn mode_config_option(current: &str, values: &[&str]) -> SessionConfigOption {
+    SessionConfigOption::select(
+        "interaction_mode",
+        "Mode",
+        current.to_owned(),
+        SessionConfigSelectOptions::Ungrouped(
+            values
+                .iter()
+                .map(|value| {
+                    SessionConfigSelectOption::new((*value).to_owned(), (*value).to_owned())
+                })
+                .collect(),
+        ),
+    )
+    .category(SessionConfigOptionCategory::Mode)
 }
 
 pub(super) fn advertise(chat: &mut ChatState, seq: u64, names: &[&str]) {

@@ -1168,11 +1168,6 @@ async fn open_chat_view(
             project: record.project_name(&controller.config),
         });
     }
-    let harness = controller
-        .config
-        .profiles
-        .get(&session_record.last_profile)
-        .map(|profile| profile.kind);
     let recovery_context = hel::hel_state::RecoveryContext {
         observer: recovery_observer.clone(),
         session: session_record,
@@ -1187,7 +1182,6 @@ async fn open_chat_view(
         header,
         saved_draft,
         notices,
-        harness,
     ))
 }
 

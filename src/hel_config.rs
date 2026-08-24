@@ -79,14 +79,6 @@ impl UnrestrictedEnforcement {
     }
 }
 
-/// Opaque ACP `session/set_mode` ids a harness uses for plan mode when it does
-/// not advertise a `plan` command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlanModeIds {
-    pub on: &'static str,
-    pub off: &'static str,
-}
-
 impl HarnessKind {
     pub const ALL: [Self; 5] = [
         Self::Codex,
@@ -194,18 +186,6 @@ impl HarnessKind {
         match self.unrestricted_enforcement().launch_flag() {
             Some(flag) if unrestricted || self.auto_approves_on_bare_targets() => Some(flag),
             _ => None,
-        }
-    }
-
-    /// Mode ids that drive plan mode for a harness that has plan mode but does
-    /// not advertise a `plan` command. `None` means Hel passes `/plan` through.
-    pub const fn plan_mode_ids(self) -> Option<PlanModeIds> {
-        match self {
-            Self::Grok => Some(PlanModeIds {
-                on: "plan",
-                off: "default",
-            }),
-            Self::Codex | Self::Claude | Self::Kimi | Self::Deepseek => None,
         }
     }
 
@@ -970,25 +950,6 @@ mod tests {
         assert_eq!(HarnessKind::Deepseek.display_name(), "DSH");
         assert_eq!(HarnessKind::Deepseek.home_env(), "DSH_HOME");
         assert!("nope".parse::<HarnessKind>().is_err());
-    }
-
-    #[test]
-    fn harness_plan_mode_ids_are_grok_only() {
-        assert_eq!(
-            HarnessKind::Grok.plan_mode_ids(),
-            Some(PlanModeIds {
-                on: "plan",
-                off: "default",
-            })
-        );
-        for kind in [
-            HarnessKind::Codex,
-            HarnessKind::Claude,
-            HarnessKind::Kimi,
-            HarnessKind::Deepseek,
-        ] {
-            assert_eq!(kind.plan_mode_ids(), None);
-        }
     }
 
     #[test]

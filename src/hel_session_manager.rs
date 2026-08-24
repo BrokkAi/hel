@@ -1691,6 +1691,7 @@ mod tests {
                     agent_capabilities: None,
                     agent_info: None,
                     config_options: Vec::new(),
+                    modes: None,
                     available_commands: Vec::new(),
                     config: BTreeMap::new(),
                     active_prompt: None,

@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     AvailableCommand, ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, SessionConfigOption, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallStatus,
+    PlanEntryStatus, SessionConfigOption, SessionModeState, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallStatus,
 };
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -35,8 +35,7 @@ use ratatui::style::Color;
 use sha2::{Digest, Sha256};
 
 use crate::clock::epoch_seconds;
-use crate::hel_acp::RuntimeEvent;
-use crate::hel_config::{HarnessKind, PlanModeIds};
+use crate::hel_acp::{RuntimeEvent, find_session_config_option, select_contains};
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
@@ -270,9 +269,8 @@ pub struct ChatState {
     elicitation: Option<ElicitationDialog>,
     recovery_busy: bool,
     goal_prompt_active: bool,
-    /// Harness behind this session, when the profile is still configured. It
-    /// decides whether `/plan` is a Hel shim or a pass-through prompt.
-    harness: Option<HarnessKind>,
+    config_options: Vec<SessionConfigOption>,
+    session_modes: Option<SessionModeState>,
     /// Latest ACP session mode, from `current_mode_update` by way of the
     /// projection, or set optimistically when Hel asks for a change.
     current_mode: Option<String>,
@@ -339,7 +337,8 @@ impl ChatState {
                 .active_prompt
                 .as_ref()
                 .is_some_and(|prompt| is_goal_prompt(&prompt.text)),
-            harness: None,
+            config_options: Vec::new(),
+            session_modes: None,
             current_mode: snapshot
                 .config
                 .get("mode")
@@ -618,29 +617,46 @@ impl ChatState {
         self.bundle_id = Some(bundle_id.into());
     }
 
-    /// Names the harness behind this session. `None` when its profile is gone,
-    /// which only costs the harness-specific command shims.
-    pub fn set_harness(&mut self, harness: Option<HarnessKind>) {
-        self.harness = harness;
+    pub fn set_session_modes(&mut self, modes: Option<SessionModeState>) {
+        let changed = self.session_modes != modes;
+        self.session_modes = modes;
+        if find_session_config_option(&self.config_options, "mode").is_none()
+            && (changed || self.current_mode.is_none())
+        {
+            self.current_mode = self
+                .session_modes
+                .as_ref()
+                .map(|modes| modes.current_mode_id.to_string());
+        }
         self.rebuild_command_choices();
     }
 
-    /// Mode ids this session drives `/plan` with, or `None` when the agent
-    /// advertises its own `plan` command or the harness has no plan mode.
-    fn plan_mode_ids(&self) -> Option<PlanModeIds> {
+    /// Whether Hel should synthesize `/plan`. An agent command wins; otherwise
+    /// stabilized config options win over the legacy session mode catalogue.
+    fn supports_plan_mode(&self) -> bool {
         if self
             .agent_commands
             .iter()
-            .any(|command| command.name == "plan")
+            .any(|command| command.name.trim().eq_ignore_ascii_case("plan"))
         {
-            return None;
+            return false;
         }
-        self.harness?.plan_mode_ids()
+        if let Some(option) = find_session_config_option(&self.config_options, "mode") {
+            return select_contains(&option.kind, "plan")
+                && select_contains(&option.kind, "default");
+        }
+        self.session_modes.as_ref().is_some_and(|modes| {
+            ["plan", "default"].into_iter().all(|desired| {
+                modes
+                    .available_modes
+                    .iter()
+                    .any(|mode| mode.id.to_string() == desired)
+            })
+        })
     }
 
     fn plan_mode_active(&self) -> bool {
-        self.plan_mode_ids()
-            .is_some_and(|ids| self.current_mode.as_deref() == Some(ids.on))
+        self.supports_plan_mode() && self.current_mode.as_deref() == Some("plan")
     }
 
     /// Names this session in the header and places its line among the other
@@ -1013,13 +1029,10 @@ impl ChatState {
                         value: args.to_owned(),
                     }
                 }
-                // Grok Build has plan mode but never advertises a `plan`
-                // command, so Hel drives it over `session/set_mode`. Any other
-                // harness keeps today's pass-through.
                 LocalCommand::Plan => {
-                    let Some(ids) = self.plan_mode_ids() else {
+                    if !self.supports_plan_mode() {
                         return self.submit_prompt(prompt);
-                    };
+                    }
                     let requested = match args.to_ascii_lowercase().as_str() {
                         "" => !self.plan_mode_active(),
                         "on" => true,
@@ -1034,7 +1047,7 @@ impl ChatState {
                         return ChatAction::None;
                     }
                     self.clear_input();
-                    let mode_id = if requested { ids.on } else { ids.off };
+                    let mode_id = if requested { "plan" } else { "default" };
                     self.current_mode = Some(mode_id.to_owned());
                     self.set_notice(if requested {
                         "Plan mode on"
@@ -1408,6 +1421,7 @@ impl ChatState {
             RuntimeEvent::SessionConfigured { config_options } => {
                 self.set_config_options(&config_options)
             }
+            RuntimeEvent::SessionModesConfigured { modes } => self.set_session_modes(modes),
             RuntimeEvent::SessionStarted { resumed, .. } => self.entries.push(ChatEntry::plain(
                 seq,
                 ChatRole::System,
@@ -1528,6 +1542,12 @@ impl ChatState {
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.set_config_options(&update.config_options);
+            }
+            SessionUpdate::CurrentModeUpdate(update) => {
+                self.current_mode = Some(update.current_mode_id.to_string());
+                if let Some(modes) = self.session_modes.as_mut() {
+                    modes.current_mode_id = update.current_mode_id;
+                }
             }
             _ => {}
         }
@@ -1763,7 +1783,9 @@ fn last_nonempty_line(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hel_chat::test_support::{advertise, ctrl, grok_chat, key, queued, snapshot};
+    use crate::hel_chat::test_support::{
+        advertise, ctrl, grok_chat, key, mode_config_option, queued, snapshot,
+    };
     use crate::hel_worker::ActivePrompt;
 
     /// Mirrors what `ActiveChat::open` does for a session with no warm view:
@@ -2279,6 +2301,45 @@ mod tests {
     }
 
     #[test]
+    fn plan_uses_an_advertised_mode_config_option() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&[mode_config_option("default", &["default", "plan"])]);
+        chat.set_input("/plan".into());
+
+        assert_eq!(
+            chat.submit_input(),
+            ChatAction::SetSessionMode {
+                mode_id: "plan".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_mode_config_option_without_the_plan_pair_disables_the_legacy_shim() {
+        let mut chat = grok_chat();
+        chat.set_config_options(&[mode_config_option("default", &["default", "act"])]);
+        chat.set_input("/plan".into());
+
+        assert_eq!(chat.submit_input(), ChatAction::Prompt("/plan".into()));
+    }
+
+    #[test]
+    fn an_unchanged_mode_catalogue_does_not_undo_an_optimistic_toggle() {
+        let options = [mode_config_option("default", &["default", "plan"])];
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&options);
+        chat.set_input("/plan".into());
+        assert!(matches!(
+            chat.submit_input(),
+            ChatAction::SetSessionMode { .. }
+        ));
+
+        chat.set_config_options(&options);
+
+        assert!(chat.plan_mode_active());
+    }
+
+    #[test]
     fn plan_falls_back_to_a_prompt_when_the_agent_advertises_its_own_command() {
         let mut chat = grok_chat();
         advertise(&mut chat, 1, &["plan"]);
@@ -2291,18 +2352,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_stays_a_prompt_for_a_harness_without_mode_based_planning() {
-        for harness in [None, Some(HarnessKind::Codex), Some(HarnessKind::Claude)] {
-            let mut chat = ChatState::new(&snapshot(), &[]);
-            chat.set_harness(harness);
-            chat.set_input("/plan".into());
+    fn plan_stays_a_prompt_without_an_advertised_mode_surface() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("/plan".into());
 
-            assert_eq!(
-                chat.submit_input(),
-                ChatAction::Prompt("/plan".into()),
-                "{harness:?}"
-            );
-        }
+        assert_eq!(chat.submit_input(), ChatAction::Prompt("/plan".into()));
     }
 
     #[test]

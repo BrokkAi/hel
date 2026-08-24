@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use agent_client_protocol::schema::ProtocolVersion as AcpProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, ContentBlock, Implementation, SessionConfigOption,
-    SessionUpdate,
+    SessionModeState, SessionUpdate,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -218,6 +218,8 @@ pub struct RelayOperationalState {
     pub agent_capabilities: Option<Box<AgentCapabilities>>,
     pub agent_info: Option<Implementation>,
     pub config_options: Vec<SessionConfigOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<SessionModeState>,
     pub available_commands: Vec<AvailableCommand>,
     pub config: BTreeMap<String, String>,
     pub active_prompt: Option<ActiveRelayPrompt>,
@@ -251,6 +253,9 @@ pub enum RelayObservation {
     },
     SessionConfigured {
         config_options: Vec<SessionConfigOption>,
+    },
+    SessionModesConfigured {
+        modes: Option<SessionModeState>,
     },
     SessionUpdate {
         update: Box<SessionUpdate>,
@@ -382,6 +387,8 @@ pub(crate) struct RelaySnapshot {
     pub(crate) agent_capabilities: Option<Box<AgentCapabilities>>,
     pub(crate) agent_info: Option<Implementation>,
     pub(crate) config_options: Vec<SessionConfigOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) modes: Option<SessionModeState>,
     pub(crate) available_commands: Vec<AvailableCommand>,
     pub(crate) config: BTreeMap<String, String>,
     pub(crate) active_prompt: Option<StoredActiveRelayPrompt>,
@@ -409,6 +416,7 @@ impl RelaySnapshot {
             agent_capabilities: None,
             agent_info: None,
             config_options: Vec::new(),
+            modes: None,
             available_commands: Vec::new(),
             config: BTreeMap::new(),
             active_prompt: None,
@@ -435,6 +443,7 @@ impl RelaySnapshot {
             agent_capabilities: self.agent_capabilities.clone(),
             agent_info: self.agent_info.clone(),
             config_options: self.config_options.clone(),
+            modes: self.modes.clone(),
             available_commands: self.available_commands.clone(),
             config: self.config.clone(),
             active_prompt: self.active_prompt.as_ref().map(|prompt| ActiveRelayPrompt {
@@ -735,6 +744,7 @@ pub(crate) fn observation_changes_state(observation: &RelayObservation) -> bool 
         RelayObservation::AgentInitialized { .. }
         | RelayObservation::SessionOpened { .. }
         | RelayObservation::SessionConfigured { .. }
+        | RelayObservation::SessionModesConfigured { .. }
         | RelayObservation::CommandQueued { .. }
         | RelayObservation::CommandStarted { .. }
         | RelayObservation::CommandCompleted { .. }
@@ -776,6 +786,9 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
         } => snapshot.native_session_id = Some(native_session_id.clone()),
         RelayObservation::SessionConfigured { config_options } => {
             snapshot.config_options = config_options.clone();
+        }
+        RelayObservation::SessionModesConfigured { modes } => {
+            snapshot.modes = modes.clone();
         }
         RelayObservation::CommandQueued {
             command_id,
@@ -1116,6 +1129,9 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
                 snapshot.config_options = update.config_options.clone();
             }
             SessionUpdate::CurrentModeUpdate(update) => {
+                if let Some(modes) = snapshot.modes.as_mut() {
+                    modes.current_mode_id = update.current_mode_id.clone();
+                }
                 snapshot
                     .config
                     .insert("mode".to_owned(), update.current_mode_id.to_string());
@@ -1218,7 +1234,7 @@ mod tests {
     fn relay_operational_state_tracks_mutable_acp_options_and_commands() {
         use agent_client_protocol::schema::v1::{
             AvailableCommandsUpdate, ConfigOptionUpdate, CurrentModeUpdate,
-            SessionConfigSelectOption,
+            SessionConfigSelectOption, SessionMode, SessionModeState,
         };
 
         let temp = tempfile::tempdir().unwrap();
@@ -1233,6 +1249,17 @@ mod tests {
             .record_session_update(SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
                 vec![option.clone()],
             )))
+            .unwrap();
+        relay
+            .record_observation(RelayObservation::SessionModesConfigured {
+                modes: Some(SessionModeState::new(
+                    "default",
+                    vec![
+                        SessionMode::new("default", "Default"),
+                        SessionMode::new("plan", "Plan"),
+                    ],
+                )),
+            })
             .unwrap();
         relay
             .record_session_update(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
@@ -1251,7 +1278,23 @@ mod tests {
         let state = relay.operational_state();
         assert_eq!(state.config_options, vec![option]);
         assert_eq!(state.config["mode"], "plan");
+        assert_eq!(
+            state.modes.unwrap().current_mode_id.to_string(),
+            "plan",
+            "current_mode_update keeps the legacy catalogue synchronized"
+        );
         assert_eq!(state.available_commands[0].name, "review");
+    }
+
+    #[test]
+    fn snapshots_without_legacy_modes_still_deserialize() {
+        let snapshot = RelaySnapshot::new(SESSION.into());
+        let mut encoded = serde_json::to_value(snapshot).unwrap();
+        encoded.as_object_mut().unwrap().remove("modes");
+
+        let restored: RelaySnapshot = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(restored.modes, None);
     }
 
     /// Transcript observations skip the staged snapshot copy and its budget

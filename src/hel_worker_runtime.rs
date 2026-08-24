@@ -569,6 +569,9 @@ mod unix {
             RuntimeEvent::SessionConfigured { config_options } => {
                 relay.record_observation(RelayObservation::SessionConfigured { config_options })?;
             }
+            RuntimeEvent::SessionModesConfigured { modes } => {
+                relay.record_observation(RelayObservation::SessionModesConfigured { modes })?;
+            }
             RuntimeEvent::SessionUpdate { update } => {
                 let typed = serde_json::from_value::<SessionUpdate>(update).map_err(|error| {
                     anyhow::anyhow!("decode ACP session update for relay journal: {error}")
@@ -629,8 +632,16 @@ mod unix {
             }
             RuntimeEvent::SessionModeApplied {
                 request_id,
-                mode_id: _,
+                mode_id,
+                config_options,
+                modes,
             } => {
+                relay.record_observation(RelayObservation::ConfigurationUpdated {
+                    key: "mode".to_owned(),
+                    value: mode_id,
+                })?;
+                relay.record_observation(RelayObservation::SessionConfigured { config_options })?;
+                relay.record_observation(RelayObservation::SessionModesConfigured { modes })?;
                 relay.record_command_completed(&request_id, RelayCommandOutcome::SessionModeSet)?;
                 in_flight.remove(&request_id);
             }
@@ -3187,6 +3198,8 @@ mod relay_tests {
             .send(RuntimeEvent::SessionModeApplied {
                 request_id: "session-mode-1".into(),
                 mode_id: "plan".into(),
+                config_options: Vec::new(),
+                modes: None,
             })
             .unwrap();
         wait_for_relay_state(&relay, |state| {

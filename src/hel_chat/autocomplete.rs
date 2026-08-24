@@ -2,14 +2,14 @@
 //! chosen completion lands back in the composer.
 
 use agent_client_protocol::schema::v1::{
-    AvailableCommandInput, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOptions,
+    AvailableCommandInput, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
 };
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem};
 
+use crate::hel_acp::find_session_config_option;
 use crate::hel_transcript::{ChatEntry, ChatRole};
 
 use super::ChatState;
@@ -145,7 +145,7 @@ impl ChatState {
 
     pub(super) fn rebuild_command_choices(&mut self) {
         let mut commands = builtin_command_choices();
-        if self.plan_mode_ids().is_some() {
+        if self.supports_plan_mode() {
             commands.push(CommandChoice {
                 name: "plan".to_owned(),
                 description: "toggle plan mode".to_owned(),
@@ -178,11 +178,20 @@ impl ChatState {
     }
 
     pub(super) fn set_config_options(&mut self, options: &[SessionConfigOption]) {
+        let changed = self.config_options != options;
+        self.config_options = options.to_vec();
         self.current_model = config_current_value(options, "model");
         self.current_effort = config_current_value(options, "effort");
+        if changed || self.current_mode.is_none() {
+            self.current_mode = config_current_value(options, "mode").or_else(|| {
+                self.session_modes
+                    .as_ref()
+                    .map(|modes| modes.current_mode_id.to_string())
+            });
+        }
         self.model_values = config_values(options, "model");
         self.effort_values = config_values(options, "effort");
-        self.update_autocomplete();
+        self.rebuild_command_choices();
     }
 
     pub(super) fn show_help(&mut self) {
@@ -302,32 +311,7 @@ fn find_config_option<'a>(
     options: &'a [SessionConfigOption],
     key: &str,
 ) -> Option<&'a SessionConfigOption> {
-    match key {
-        "model" => options
-            .iter()
-            .find(|option| option.id.to_string() == "model")
-            .or_else(|| {
-                options.iter().find(|option| {
-                    option.category == Some(SessionConfigOptionCategory::Model)
-                        && !matches!(
-                            option.id.to_string().as_str(),
-                            "effort" | "reasoning_effort"
-                        )
-                })
-            }),
-        "effort" => options
-            .iter()
-            .find(|option| option.category == Some(SessionConfigOptionCategory::ThoughtLevel))
-            .or_else(|| {
-                options.iter().find(|option| {
-                    matches!(
-                        option.id.to_string().as_str(),
-                        "effort" | "reasoning_effort"
-                    )
-                })
-            }),
-        _ => None,
-    }
+    find_session_config_option(options, key)
 }
 
 pub(super) fn config_current_value(options: &[SessionConfigOption], key: &str) -> Option<String> {
@@ -454,8 +438,7 @@ fn config_value_row(choice: &ConfigValueChoice) -> Option<String> {
 mod tests {
     use super::*;
     use crate::hel_chat::ChatAction;
-    use crate::hel_chat::test_support::{advertise, grok_chat, key, snapshot};
-    use crate::hel_config::HarnessKind;
+    use crate::hel_chat::test_support::{advertise, grok_chat, key, mode_config_option, snapshot};
     use crossterm::event::KeyCode;
 
     #[test]
@@ -570,7 +553,7 @@ mod tests {
     #[test]
     fn config_value_autocomplete_uses_advertised_acp_choices() {
         use agent_client_protocol::schema::v1::{
-            SessionConfigSelectOption, SessionConfigSelectOptions,
+            SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
         };
 
         let options = vec![
@@ -608,8 +591,10 @@ mod tests {
         advertise(&mut chat, 1, &["plan"]);
         assert!(!lists_plan(&chat));
 
-        let mut codex = ChatState::new(&snapshot(), &[]);
-        codex.set_harness(Some(HarnessKind::Codex));
-        assert!(!lists_plan(&codex));
+        assert!(!lists_plan(&ChatState::new(&snapshot(), &[])));
+
+        let mut config_mode = ChatState::new(&snapshot(), &[]);
+        config_mode.set_config_options(&[mode_config_option("default", &["default", "plan"])]);
+        assert!(lists_plan(&config_mode));
     }
 }

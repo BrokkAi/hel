@@ -173,6 +173,7 @@ fn project_observation(
         RelayObservation::SessionConfigured { config_options } => {
             mutation.configuration = Some(configuration_values(config_options));
         }
+        RelayObservation::SessionModesConfigured { .. } => {}
         RelayObservation::SessionUpdate { update } => {
             project_session_update(current, event, update, mutation)?;
         }

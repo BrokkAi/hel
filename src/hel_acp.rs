@@ -19,7 +19,7 @@ use agent_client_protocol::schema::v1::{
     PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
+    SessionConfigValueId, SessionId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalExitStatus,
     TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
     WaitForTerminalExitRequest, WaitForTerminalExitResponse,
@@ -85,8 +85,8 @@ pub enum CommandRequest {
         key: String,
         value: String,
     },
-    /// Opaque ACP `session/set_mode`. Used for harnesses whose plan mode is a
-    /// session mode rather than an advertised slash command.
+    /// Select an ACP session mode. The runtime prefers the stabilized mode
+    /// config option and falls back to legacy `session/set_mode`.
     SetSessionMode {
         request_id: String,
         mode_id: String,
@@ -131,6 +131,9 @@ pub enum RuntimeEvent {
     },
     SessionConfigured {
         config_options: Vec<SessionConfigOption>,
+    },
+    SessionModesConfigured {
+        modes: Option<SessionModeState>,
     },
     SessionUpdate {
         update: serde_json::Value,
@@ -182,6 +185,10 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         request_id: String,
         mode_id: String,
+        #[serde(default)]
+        config_options: Vec<SessionConfigOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modes: Option<SessionModeState>,
     },
     CommandRejected {
         request_id: String,
@@ -1375,6 +1382,7 @@ async fn serve_session(
         .await?;
     }
     let mut config_options = config_options.unwrap_or_default();
+    let mut modes = modes;
     // Grok Build never returns `configOptions`; present its catalogue in the
     // shape the rest of Hel reads so `/model` and `/effort` work unchanged.
     if let Some(state) = &grok_models
@@ -1404,6 +1412,13 @@ async fn serve_session(
         events,
         RuntimeEvent::SessionConfigured {
             config_options: config_options.clone(),
+        },
+    )
+    .await?;
+    emit_runtime_event(
+        events,
+        RuntimeEvent::SessionModesConfigured {
+            modes: modes.clone(),
         },
     )
     .await?;
@@ -1670,20 +1685,45 @@ async fn serve_session(
                 request_id,
                 mode_id,
             } => {
-                match connection
-                    .send_request(SetSessionModeRequest::new(
-                        session_id.clone(),
-                        mode_id.clone(),
-                    ))
-                    .block_task()
+                let applied = if find_session_config_option(&config_options, "mode").is_some() {
+                    set_session_config(
+                        connection,
+                        &session_id,
+                        &mut config_options,
+                        "mode",
+                        &mode_id,
+                    )
                     .await
-                {
-                    Ok(_) => {
+                } else if modes.as_ref().is_some_and(|state| {
+                    state
+                        .available_modes
+                        .iter()
+                        .any(|mode| mode.id.to_string() == mode_id)
+                }) {
+                    connection
+                        .send_request(SetSessionModeRequest::new(
+                            session_id.clone(),
+                            mode_id.clone(),
+                        ))
+                        .block_task()
+                        .await
+                        .map(|_| ())
+                        .with_context(|| format!("set session mode to {mode_id}"))
+                } else {
+                    Err(anyhow!("{mode_id:?} is not an available session mode"))
+                };
+                match applied {
+                    Ok(()) => {
+                        if let Some(state) = modes.as_mut() {
+                            state.current_mode_id = mode_id.clone().into();
+                        }
                         emit_runtime_event(
                             events,
                             RuntimeEvent::SessionModeApplied {
                                 request_id,
                                 mode_id,
+                                config_options: config_options.clone(),
+                                modes: modes.clone(),
                             },
                         )
                         .await?;
@@ -1693,7 +1733,7 @@ async fn serve_session(
                             events,
                             RuntimeEvent::CommandRejected {
                                 request_id,
-                                message: format!("set session mode to {mode_id}: {error}"),
+                                message: format!("{error:#}"),
                             },
                         )
                         .await?;
@@ -1945,7 +1985,7 @@ async fn set_grok_model(
     Ok(())
 }
 
-fn find_session_config_option<'a>(
+pub(crate) fn find_session_config_option<'a>(
     options: &'a [SessionConfigOption],
     key: &str,
 ) -> Option<&'a SessionConfigOption> {
@@ -1972,6 +2012,14 @@ fn find_session_config_option<'a>(
                         "effort" | "reasoning_effort"
                     )
                 })
+            }),
+        "mode" => options
+            .iter()
+            .find(|option| option.category == Some(SessionConfigOptionCategory::Mode))
+            .or_else(|| {
+                options
+                    .iter()
+                    .find(|option| option.id.to_string() == "mode")
             }),
         _ => None,
     }
@@ -2149,7 +2197,7 @@ async fn enforce_unrestricted_mode(
     bail!("ACP bridge does not expose required unrestricted mode {desired}")
 }
 
-fn select_contains(kind: &SessionConfigKind, desired: &str) -> bool {
+pub(crate) fn select_contains(kind: &SessionConfigKind, desired: &str) -> bool {
     let SessionConfigKind::Select(select) = kind else {
         return false;
     };
@@ -3067,6 +3115,160 @@ mod tests {
         bridge.abort();
         events.abort();
         observed
+    }
+
+    #[derive(Clone, Copy)]
+    enum ModeSurface {
+        Config,
+        Legacy,
+        Both,
+    }
+
+    async fn mode_change_bridge(
+        stream: tokio::io::DuplexStream,
+        surface: ModeSurface,
+        observed: tokio::sync::oneshot::Sender<serde_json::Value>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let mode_option = |current: &str| {
+            serde_json::json!({
+                "id": "interaction_mode",
+                "name": "Mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": current,
+                "options": [
+                    {"value": "default", "name": "Default"},
+                    {"value": "plan", "name": "Plan"}
+                ]
+            })
+        };
+        let modes = serde_json::json!({
+            "currentModeId": "default",
+            "availableModes": [
+                {"id": "default", "name": "Default"},
+                {"id": "plan", "name": "Plan"}
+            ]
+        });
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut observed = Some(observed);
+        while let Some(line) = lines.next_line().await.expect("read bridge input") {
+            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let Some(method) = message.get("method").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let id = message.get("id").cloned().unwrap_or_default();
+            let response = match method {
+                "initialize" => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}
+                }),
+                "session/new" => {
+                    let mut result = serde_json::json!({"sessionId": "scripted"});
+                    if matches!(surface, ModeSurface::Config | ModeSurface::Both) {
+                        result["configOptions"] = serde_json::json!([mode_option("default")]);
+                    }
+                    if matches!(surface, ModeSurface::Legacy | ModeSurface::Both) {
+                        result["modes"] = modes.clone();
+                    }
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                }
+                "session/set_config_option" => {
+                    if let Some(observed) = observed.take() {
+                        let _ = observed.send(message.clone());
+                    }
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"configOptions": [mode_option("plan")]}
+                    })
+                }
+                _ => {
+                    if let Some(observed) = observed.take() {
+                        let _ = observed.send(message.clone());
+                    }
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
+                }
+            };
+            if write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    async fn mode_change_request(surface: ModeSurface) -> serde_json::Value {
+        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let bridge = tokio::spawn(mode_change_bridge(bridge_stream, surface, observed_tx));
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let events = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let spec = LaunchSpec {
+            command: "scripted".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Claude,
+            force_unrestricted_mode: false,
+        };
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
+        request_tx
+            .send(CommandRequest::SetSessionMode {
+                request_id: "mode-1".into(),
+                mode_id: "plan".into(),
+            })
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx)
+            .await
+            .expect("Hel must send a mode request")
+            .expect("the bridge must publish the request");
+        drop(request_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+        bridge.abort();
+        events.abort();
+        observed
+    }
+
+    #[tokio::test]
+    async fn a_mode_config_option_uses_the_standard_config_request() {
+        let request = mode_change_request(ModeSurface::Config).await;
+
+        assert_eq!(request["method"], "session/set_config_option");
+        assert_eq!(request["params"]["configId"], "interaction_mode");
+        assert_eq!(request["params"]["value"], "plan");
+    }
+
+    #[tokio::test]
+    async fn legacy_modes_use_session_set_mode() {
+        let request = mode_change_request(ModeSurface::Legacy).await;
+
+        assert_eq!(request["method"], "session/set_mode");
+        assert_eq!(request["params"]["modeId"], "plan");
+    }
+
+    #[tokio::test]
+    async fn a_mode_config_option_takes_precedence_over_legacy_modes() {
+        let request = mode_change_request(ModeSurface::Both).await;
+
+        assert_eq!(request["method"], "session/set_config_option");
     }
 
     #[tokio::test]
