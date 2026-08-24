@@ -3177,7 +3177,7 @@ mod tests {
                     environment: BTreeMap::new(),
                 },
             )]);
-            config.targets = BTreeMap::from([("raw-localhost".into(), TargetTemplate::LocalBare)]);
+            config.targets = BTreeMap::from([("localhost".into(), TargetTemplate::LocalBare)]);
             let mut state = HelState::default();
             state.remember_project_directory("local", std::path::Path::new("/home/me/project"));
             let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
@@ -3224,7 +3224,7 @@ mod tests {
                 environment: BTreeMap::new(),
             },
         )]);
-        config.targets = BTreeMap::from([("raw-localhost".into(), TargetTemplate::LocalBare)]);
+        config.targets = BTreeMap::from([("localhost".into(), TargetTemplate::LocalBare)]);
         let mut state = HelState::default();
         state.remember_project_directory("local", std::path::Path::new("/home/me/project"));
         let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
@@ -3252,7 +3252,7 @@ mod tests {
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ValidateProjectDirectory {
-                target_template_id: "raw-localhost".into(),
+                target_template_id: "localhost".into(),
                 directory: "/home/me/project".into(),
             }
         );
@@ -3263,7 +3263,7 @@ mod tests {
                 profile_id: "kimi".into(),
                 bundle_id: raw_project_context_id("/home/me/project"),
                 project_directory: Some("/home/me/project".into()),
-                target_template_id: "raw-localhost".into(),
+                target_template_id: "localhost".into(),
                 additional_mounts: Vec::new(),
                 allow_dirty_local: false,
                 resource_allocation: None,

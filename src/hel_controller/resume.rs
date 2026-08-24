@@ -1666,7 +1666,7 @@ mod tests {
         );
         config
             .targets
-            .insert("raw-localhost".into(), TargetTemplate::LocalBare);
+            .insert("localhost".into(), TargetTemplate::LocalBare);
         let mut controller = Controller {
             config,
             state: HelState {
@@ -1682,7 +1682,7 @@ mod tests {
             .block_on(controller.resume_session_controlled(
                 session_id,
                 "codex",
-                "raw-localhost",
+                "localhost",
                 SessionResumeOptions {
                     additional_mounts: None,
                     resource_allocation: None,
@@ -1895,7 +1895,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-12T00:00:00Z".into(),
             updated_at: "2026-08-12T00:00:00Z".into(),
-            detached_after_event_ordinal: 0,
+            viewed_through_event_ordinal: 0,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,

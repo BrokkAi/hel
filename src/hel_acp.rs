@@ -37,6 +37,7 @@ use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_terminal::{
     DEFAULT_TERMINAL_OUTPUT_BYTES, TerminalExit, TerminalRegistry, TerminalSpawn,
 };
+use crate::hel_worker::AcpActivityClock;
 use crate::hel_worker_runtime::ProjectMemoryLaunchConfig;
 
 #[derive(Debug, Clone)]
@@ -50,6 +51,7 @@ pub struct LaunchSpec {
     pub resume_session: Option<String>,
     pub harness: HarnessKind,
     pub force_unrestricted_mode: bool,
+    pub acp_activity: AcpActivityClock,
 }
 
 fn project_memory_mcp(spec: &LaunchSpec) -> Vec<McpServer> {
@@ -586,10 +588,13 @@ where
     T: ConnectTo<Client>,
 {
     let notification_events = events.clone();
+    let notification_activity = spec.acp_activity.clone();
     let session_update_count = Arc::new(AtomicU64::new(0));
     let notification_session_update_count = session_update_count.clone();
     let permission_events = events.clone();
+    let permission_activity = spec.acp_activity.clone();
     let ext_events = events.clone();
+    let ext_activity = spec.acp_activity.clone();
     let elicitation_events = events.clone();
     let pending_elicitations = PendingElicitations::default();
     let handler_elicitations = pending_elicitations.clone();
@@ -605,6 +610,11 @@ where
     let kill_terminals = terminals.clone();
     let release_terminals = terminals.clone();
     let create_events = events.clone();
+    let create_activity = spec.acp_activity.clone();
+    let output_activity = spec.acp_activity.clone();
+    let wait_activity = spec.acp_activity.clone();
+    let kill_activity = spec.acp_activity.clone();
+    let release_activity = spec.acp_activity.clone();
     let wait_events = events.clone();
     let release_events = events.clone();
     // A terminal runs where the session runs unless the agent names a
@@ -616,6 +626,7 @@ where
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                notification_activity.mark();
                 let scratch_id = notification.session_id.to_string();
                 {
                     let mut scratch = notification_scratch_outputs
@@ -646,6 +657,7 @@ where
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _cx| {
+                permission_activity.mark();
                 permission_events
                     .send(RuntimeEvent::Warning {
                         message: UNEXPECTED_PERMISSION_REQUEST_WARNING.to_owned(),
@@ -689,6 +701,7 @@ where
         )
         .on_receive_request(
             async move |request: CreateTerminalRequest, responder, _cx| {
+                create_activity.mark();
                 let spawn = TerminalSpawn {
                     command: request.command.clone(),
                     args: request.args.clone(),
@@ -726,6 +739,7 @@ where
         )
         .on_receive_request(
             async move |request: TerminalOutputRequest, responder, _cx| {
+                output_activity.mark();
                 let terminal_id = request.terminal_id.to_string();
                 let Some(snapshot) = output_terminals.output(&terminal_id) else {
                     return responder.respond_with_error(unknown_terminal_error(&terminal_id));
@@ -740,6 +754,7 @@ where
         )
         .on_receive_request(
             async move |request: WaitForTerminalExitRequest, responder, _cx| {
+                wait_activity.mark();
                 let terminal_id = request.terminal_id.to_string();
                 let Some(exit) = wait_terminals.exit_receiver(&terminal_id) else {
                     return responder.respond_with_error(unknown_terminal_error(&terminal_id));
@@ -769,6 +784,7 @@ where
         )
         .on_receive_request(
             async move |request: KillTerminalRequest, responder, _cx| {
+                kill_activity.mark();
                 let terminal_id = request.terminal_id.to_string();
                 // The terminal stays valid: output and wait_for_exit still
                 // answer for it until the agent releases it.
@@ -781,6 +797,7 @@ where
         )
         .on_receive_request(
             async move |request: ReleaseTerminalRequest, responder, _cx| {
+                release_activity.mark();
                 let terminal_id = request.terminal_id.to_string();
                 let Some(supervisor) = release_terminals.release(&terminal_id) else {
                     return responder.respond_with_error(unknown_terminal_error(&terminal_id));
@@ -810,6 +827,7 @@ where
         // ends. Hel answers every incoming request, always.
         .on_receive_request(
             async move |request: agent_client_protocol::UntypedMessage, responder, _cx| {
+                ext_activity.mark();
                 let method = request.method().to_owned();
                 if method == "elicitation/create" {
                     let id = format!(
@@ -1306,8 +1324,9 @@ async fn serve_session(
                 .client_capabilities(capabilities),
         )
         .block_task()
-        .await
-        .context("initialize ACP bridge")?;
+        .await;
+    spec.acp_activity.mark();
+    let initialized = initialized.context("initialize ACP bridge")?;
     if initialized.protocol_version != ProtocolVersion::V1 {
         bail!(
             "ACP bridge negotiated unsupported protocol {:?}",
@@ -1344,8 +1363,9 @@ async fn serve_session(
                     .mcp_servers(project_memory_mcp(spec)),
             )
             .block_task()
-            .await
-            .with_context(|| format!("load ACP session {existing}"))?;
+            .await;
+        spec.acp_activity.mark();
+        let loaded = loaded.with_context(|| format!("load ACP session {existing}"))?;
         Some((
             SessionId::from(existing.clone()),
             loaded.config_options,
@@ -1365,8 +1385,9 @@ async fn serve_session(
                         .mcp_servers(project_memory_mcp(spec)),
                 )
                 .block_task()
-                .await
-                .context("create ACP session")?;
+                .await;
+            spec.acp_activity.mark();
+            let created = created.context("create ACP session")?;
             // A session may open on a different model than the agent-wide
             // default, so a fresher catalogue on the session wins.
             if let Some(state) = grok_models.as_mut()
@@ -1467,6 +1488,7 @@ async fn serve_session(
                 loop {
                     tokio::select! {
                         response = &mut prompt => {
+                            spec.acp_activity.mark();
                             // A rejected prompt fails the turn, not the worker: the
                             // bridge can still serve later prompts. A JSON-RPC
                             // error stays on this connection; a dead transport
@@ -2267,6 +2289,7 @@ mod tests {
             resume_session: None,
             harness: HarnessKind::Codex,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let servers = project_memory_mcp(&spec);
         let [McpServer::Stdio(server)] = servers.as_slice() else {
@@ -2620,6 +2643,7 @@ mod tests {
             resume_session: None,
             harness: HarnessKind::Grok,
             force_unrestricted_mode,
+            acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
             drive(
@@ -2767,6 +2791,7 @@ mod tests {
             resume_session: None,
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
             drive(
@@ -3160,6 +3185,7 @@ mod tests {
             resume_session: None,
             harness,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
             drive(
@@ -3294,6 +3320,7 @@ mod tests {
             resume_session: None,
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
             drive(
@@ -3397,6 +3424,7 @@ mod tests {
             resume_session: None,
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
             drive(
@@ -3566,6 +3594,7 @@ mod tests {
             // straight from `session/new` to the prompt that stalls.
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
             drive(
@@ -3743,6 +3772,7 @@ mod tests {
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
             drive(
@@ -3831,6 +3861,7 @@ mod tests {
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
             drive(
@@ -4071,6 +4102,7 @@ mod tests {
                 resume_session: None,
                 harness: HarnessKind::Kimi,
                 force_unrestricted_mode: false,
+                acp_activity: AcpActivityClock::default(),
             };
             let driver = tokio::spawn(async move {
                 drive(
@@ -4558,6 +4590,7 @@ while True:
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
+            acp_activity: AcpActivityClock::default(),
         };
         let runtime = tokio::spawn(run(spec, request_rx, event_tx));
 
@@ -4620,6 +4653,7 @@ while True:
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: true,
+            acp_activity: AcpActivityClock::default(),
         };
 
         let error = tokio::time::timeout(
@@ -4667,6 +4701,7 @@ while True:
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: true,
+            acp_activity: AcpActivityClock::default(),
         };
 
         let error = run(spec, request_rx, event_tx).await.unwrap_err();

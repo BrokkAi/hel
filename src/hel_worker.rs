@@ -43,6 +43,8 @@ use std::fs;
 use std::fs::File;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate};
 use anyhow::{Context, Result, anyhow, bail};
@@ -141,6 +143,7 @@ pub struct DurableRelay {
     /// appends never bump it — they only extend the active segment, which a
     /// lock-free reader already tolerates.
     journal_generation: u64,
+    acp_activity: AcpActivityClock,
     /// Benchmark aid: stage and persist a snapshot on every append, the way
     /// the relay did before transcript appends were amortized, so both
     /// policies can be timed in one process.
@@ -279,6 +282,7 @@ impl DurableRelay {
             hot_events,
             unpersisted_journal_bytes: 0,
             journal_generation: 0,
+            acp_activity: AcpActivityClock::default(),
             #[cfg(test)]
             stage_snapshot_every_append: false,
         };
@@ -352,7 +356,13 @@ impl DurableRelay {
     }
 
     pub fn operational_state(&self) -> RelayOperationalState {
-        self.snapshot.operational_state()
+        let mut state = self.snapshot.operational_state();
+        state.last_acp_activity_at_ms = self.acp_activity.last_at_ms();
+        state
+    }
+
+    pub fn acp_activity_clock(&self) -> AcpActivityClock {
+        self.acp_activity.clone()
     }
 
     /// The directory holding this relay's durable state.
@@ -1409,6 +1419,23 @@ impl DurableRelay {
     }
 }
 
+/// Process-local clock for inbound ACP traffic. It deliberately stays out of
+/// the durable relay journal: this is render timing, not recoverable session
+/// history.
+#[derive(Debug, Clone, Default)]
+pub struct AcpActivityClock(Arc<AtomicI64>);
+
+impl AcpActivityClock {
+    pub fn mark(&self) {
+        self.0.store(epoch_millis(), Ordering::Release);
+    }
+
+    pub fn last_at_ms(&self) -> Option<i64> {
+        let value = self.0.load(Ordering::Acquire);
+        (value > 0).then_some(value)
+    }
+}
+
 struct RelayEventPage {
     events: Vec<RelayEvent>,
     through_ordinal: u64,
@@ -1886,6 +1913,18 @@ mod tests {
 
     use super::*;
     use test_support::*;
+
+    #[test]
+    fn acp_activity_clock_is_shared_with_operational_status_but_not_persisted() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.operational_state().last_acp_activity_at_ms, None);
+        relay.acp_activity_clock().mark();
+        assert!(relay.operational_state().last_acp_activity_at_ms.is_some());
+
+        let reopened = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(reopened.operational_state().last_acp_activity_at_ms, None);
+    }
 
     #[test]
     fn hidden_context_waits_for_a_prompt_and_survives_an_interruption() {

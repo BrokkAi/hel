@@ -1,19 +1,20 @@
 //! Dashboard rendering: pane layout, session tables, capacity, quotas, footer.
-
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
+use hel::hel_chat::render_agent_message_head;
+#[cfg(test)]
 use hel::hel_chat::render_agent_message_tail;
-use hel::hel_config::{HarnessKind, HelConfig};
+use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
 use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
@@ -22,28 +23,27 @@ use crate::dialogs::{
     render_confirmation, render_container_editor, render_import_bundle_confirmation,
     render_import_progress, render_rename_editor, render_repository_origin,
 };
-use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay, TranscriptHydration};
+use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::{render_resume_dialog, resume_sessions_pane};
 use crate::widgets::{focus_border, format_resource_bytes};
 use crate::wizards::{render_new_wizard, render_resume_wizard};
-use crate::{
-    DASHBOARD_PANE_COUNT, DashboardState, Focus, Mode, SessionOperationKind, partition_sessions,
-};
+use crate::{DASHBOARD_PANE_COUNT, DashboardState, Focus, Mode, SessionOperationKind};
 
+#[cfg(test)]
 const ACTIVE_MESSAGE_LINES: usize = 4;
 
-pub(crate) const SELECTED_TRANSCRIPT_LINES: usize = 10;
-
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
+const ACTIVE_PANE_CHROME_HEIGHT: u16 = 2;
 
+#[cfg(test)]
 pub(crate) const SUMMARY_RULE: &str = "─";
 
 const DASHBOARD_FIXED_HEIGHT: u16 = 3;
 
 pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
-    dashboard.selected_preview_area = None;
     dashboard.active_row_areas.clear();
+    dashboard.project_heading_areas.clear();
     let area = frame.area();
     if area.width < MINIMUM_TERMINAL_WIDTH {
         render_terminal_too_small(
@@ -177,57 +177,27 @@ fn render_adaptive_dashboard(
     inner: Rect,
     dashboard: &mut DashboardState,
 ) {
-    let preview_width = inner.width.saturating_sub(4);
-    // One ordering for the whole frame: the pane, the previews, and the row
-    // widgets all read this list. Only live sessions are on the dashboard;
-    // everything else is in the resume dialog.
-    let active = partition_sessions(
-        dashboard.state.sessions.values(),
-        &dashboard.session_details,
-        dashboard.session_order,
-    )
-    .0;
-    let active_count = active.len();
-    let selected_active = (dashboard.focus == Focus::Active)
-        .then_some(dashboard.session_index)
-        .filter(|index| *index < active_count);
-    // Only the selected preview scrolls; moving the selection snaps the one
-    // left behind back to its live tail.
-    let selected_id = selected_active.map(|index| active[index].id.clone());
-    if dashboard.preview_scroll_session != selected_id {
-        dashboard.preview_scroll_session = selected_id;
-        dashboard.preview_scroll = 0;
-    }
-    // A session mid-launch, mid-resume, or mid-stop has nothing worth
-    // previewing, so its row collapses to just the summary line.
-    let active_collapsed = active
-        .iter()
-        .map(|session| {
-            active_row_collapses_to_summary(
-                dashboard.session_operations.get(&session.id),
-                session.state,
-            )
-        })
+    let active = dashboard
+        .ordered_sessions()
+        .into_iter()
+        .map(|session| session.id.clone())
         .collect::<Vec<_>>();
-    // Row heights need the previews, and the selected session's line budget
-    // needs the allocated pane height. Every unselected preview is the same in
-    // both passes, so the transcript tails are walked once here and only the
-    // selected preview is rebuilt below when the pane came up short.
-    let mut active_previews = prepare_active_previews(
-        &active,
-        &mut dashboard.session_details,
-        PreviewRequest {
-            width: preview_width,
-            selected: selected_active,
-            scroll: dashboard.preview_scroll,
-            selected_lines: SELECTED_TRANSCRIPT_LINES,
-        },
-        &active_collapsed,
-    );
-    let active_row_heights = active_previews
-        .previews
+    let active_count = active.len();
+    let mut previous_project = None;
+    let active_row_heights = active
         .iter()
-        .map(|preview| preview.len() as u16 + 1)
+        .filter_map(|id| dashboard.state.sessions.get(id))
+        .map(|session| {
+            let source = session.project_source(&dashboard.config);
+            let heading = u16::from(previous_project.as_ref() != Some(&source.key));
+            previous_project = Some(source.key);
+            heading
+                + if dashboard.project_is_expanded(session) {
+                    4
+                } else {
+                    1
+                }
+        })
         .collect::<Vec<_>>();
     let full = PaneHeights {
         active: active_pane_height(&active_row_heights, active_count),
@@ -236,7 +206,7 @@ fn render_adaptive_dashboard(
     };
     let minimized = PaneHeights {
         active: if dashboard.focus == Focus::Active {
-            SESSION_TABLE_CHROME_HEIGHT
+            ACTIVE_PANE_CHROME_HEIGHT
         } else {
             active_pane_height(&active_row_heights, active_count.min(2))
         },
@@ -285,38 +255,9 @@ fn render_adaptive_dashboard(
         )
         .split(fixed[1]);
     dashboard.pane_areas = Some([panes[0], panes[1], panes[2]]);
-    let selected_lines = usize::from(
-        panes[0]
-            .height
-            .saturating_sub(SESSION_TABLE_CHROME_HEIGHT + 1),
-    )
-    .min(SELECTED_TRANSCRIPT_LINES);
-    // The sizing pass gave the selected preview the full line budget; redo just
-    // that row when the allocated pane grants it fewer lines, so its scroll is
-    // clamped against the height it actually renders at.
-    if selected_lines != SELECTED_TRANSCRIPT_LINES
-        && let Some(index) = selected_active
-        && !active_collapsed[index]
-    {
-        let (preview, applied) = active_transcript_tail(
-            dashboard.session_details.get_mut(&active[index].id),
-            preview_width,
-            selected_lines,
-            dashboard.preview_scroll,
-        );
-        active_previews.previews[index] = preview;
-        active_previews.applied_scroll = applied;
-    }
-    dashboard.preview_scroll = active_previews.applied_scroll;
-    let rendered_rows = render_sessions(
-        frame,
-        panes[0],
-        dashboard,
-        &active,
-        &active_previews.previews,
-    );
-    dashboard.selected_preview_area = rendered_rows.selected_preview_area;
+    let rendered_rows = render_sessions(frame, panes[0], dashboard, &active);
     dashboard.active_row_areas = rendered_rows.active_row_areas;
+    dashboard.project_heading_areas = rendered_rows.project_heading_areas;
     render_capacity(frame, panes[1], dashboard);
     render_quotas(frame, panes[2], dashboard);
     render_footer(frame, fixed[2], dashboard);
@@ -355,80 +296,7 @@ fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
         .iter()
         .copied()
         .fold(0_u16, u16::saturating_add);
-    let spacers = rows.saturating_sub(1).min(u16::MAX as usize) as u16;
-    SESSION_TABLE_CHROME_HEIGHT
-        .saturating_add(row_height)
-        .saturating_add(spacers)
-}
-
-/// A launching, resuming, or stopping session — or one caught mid-provisioning
-/// after an interrupted launch with no operation record — has nothing worth
-/// previewing yet, so its Active row collapses to just the summary line.
-fn active_row_collapses_to_summary(
-    operation: Option<&SessionOperationDisplay>,
-    state: SessionState,
-) -> bool {
-    match operation {
-        Some(operation) => matches!(
-            operation.kind,
-            SessionOperationKind::Launching
-                | SessionOperationKind::Resuming
-                | SessionOperationKind::Stopping
-        ),
-        None => state == SessionState::Provisioning,
-    }
-}
-
-/// What one frame asks of the active previews: the width they wrap to, which
-/// row is selected, how far that row's preview is scrolled, and the line budget
-/// the selected row may use.
-struct PreviewRequest {
-    pub(crate) width: u16,
-    pub(crate) selected: Option<usize>,
-    pub(crate) scroll: usize,
-    selected_lines: usize,
-}
-
-fn prepare_active_previews(
-    active: &[&SessionRecord],
-    session_details: &mut BTreeMap<String, SessionDetail>,
-    request: PreviewRequest,
-    collapsed: &[bool],
-) -> ActivePreviews {
-    let mut previews = Vec::with_capacity(active.len());
-    let mut applied_scroll = 0;
-    for (index, session) in active.iter().enumerate() {
-        if collapsed.get(index).copied().unwrap_or(false) {
-            previews.push(Vec::new());
-            continue;
-        }
-        let selected = request.selected == Some(index);
-        let (maximum_lines, scroll) = if selected {
-            (request.selected_lines, request.scroll)
-        } else {
-            (ACTIVE_MESSAGE_LINES, 0)
-        };
-        let detail = session_details.get_mut(&session.id);
-        let (preview, applied) =
-            active_transcript_tail(detail, request.width, maximum_lines, scroll);
-        if selected {
-            applied_scroll = applied;
-        }
-        previews.push(preview);
-    }
-    ActivePreviews {
-        previews,
-        applied_scroll,
-    }
-}
-
-/// Preview rows for every active session, plus the scroll the selected
-/// session's preview settled on. The caller decides whether to keep the clamped
-/// scroll, because the pass that measures row heights runs against a provisional
-/// line budget and would otherwise narrow how far the preview can scroll.
-struct ActivePreviews {
-    pub(crate) previews: Vec<Vec<Line<'static>>>,
-    applied_scroll: usize,
+    ACTIVE_PANE_CHROME_HEIGHT.saturating_add(row_height)
 }
 
 const MINIMUM_TERMINAL_WIDTH: u16 = 32;
@@ -492,8 +360,8 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
 /// dashboard's mouse hitboxes once the borrow of `active` (which aliases
 /// `dashboard.state.sessions`) has ended.
 struct SessionRowsRendered {
-    selected_preview_area: Option<Rect>,
     active_row_areas: Vec<(usize, Rect)>,
+    project_heading_areas: Vec<(String, Rect)>,
 }
 
 /// Draws the Active pane and reports the selected session's preview hitbox and
@@ -502,105 +370,167 @@ fn render_sessions(
     frame: &mut Frame,
     active_area: Rect,
     dashboard: &DashboardState,
-    active: &[&SessionRecord],
-    active_previews: &[Vec<Line<'static>>],
+    active: &[String],
 ) -> SessionRowsRendered {
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let preview_width = active_area.width.saturating_sub(4);
-    let active_rows =
-        active
-            .iter()
-            .zip(active_previews)
-            .enumerate()
-            .map(|(index, (session, preview))| {
-                active_session_row(
-                    session,
-                    dashboard.session_details.get(&session.id),
-                    dashboard.session_operations.get(&session.id),
-                    now_epoch_seconds,
-                    &dashboard.config,
-                    ActiveSessionRowLayout {
-                        height: preview.len() as u16 + 1,
-                        top_margin: u16::from(index > 0),
-                        rule_width: usize::from(active_area.width),
+    let project_count = dashboard.project_keys().len();
+    let mut short_projects = BTreeMap::<String, BTreeSet<String>>::new();
+    for session in active
+        .iter()
+        .filter_map(|id| dashboard.state.sessions.get(id))
+    {
+        short_projects
+            .entry(session.project_source(&dashboard.config).short)
+            .or_default()
+            .insert(session.project_source(&dashboard.config).key);
+    }
+    let mut previous_project = None;
+    let mut project_number = 0;
+    let mut row_meta = Vec::new();
+    let active_rows = active.iter().enumerate().filter_map(|(index, id)| {
+        let session = dashboard.state.sessions.get(id)?;
+        let source = session.project_source(&dashboard.config);
+        let first = previous_project.as_ref() != Some(&source.key);
+        if first {
+            project_number += 1;
+            previous_project = Some(source.key.clone());
+        }
+        let mut lines = Vec::new();
+        if first {
+            let label = if short_projects
+                .get(&source.short)
+                .is_some_and(|projects| projects.len() > 1)
+            {
+                &source.full
+            } else {
+                &source.short
+            };
+            let hotkey = if project_count > 1 && project_number <= 9 {
+                format!("[{}] ", project_number)
+            } else {
+                String::new()
+            };
+            lines.push(Line::styled(
+                format!("{hotkey}{label}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+        let detail = dashboard.session_details.get(id);
+        let expanded = dashboard.project_is_expanded(session);
+        let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
+        let prefix = if selected { "› " } else { "  " };
+        if expanded {
+            lines.push(session_top_line(
+                prefix,
+                session,
+                detail,
+                dashboard.session_operations.get(id),
+                now_epoch_seconds,
+                &dashboard.config,
+            ));
+            lines.push(prefixed_summary_line(
+                "  ",
+                "You: ",
+                detail.and_then(|detail| detail.last_user_message.as_deref()),
+                usize::from(active_area.width.saturating_sub(4)),
+            ));
+            let mut agent = detail
+                .and_then(|detail| detail.last_agent_message.as_deref())
+                .map(|message| {
+                    render_agent_message_head(
+                        message,
+                        usize::from(active_area.width.saturating_sub(11)),
+                        2,
+                    )
+                })
+                .unwrap_or_default();
+            if agent.is_empty() {
+                agent.push(Line::raw("No messages yet"));
+            }
+            agent.resize(2, Line::default());
+            for (agent_index, mut line) in agent.into_iter().take(2).enumerate() {
+                let mut spans = vec![Span::raw("  ")];
+                spans.push(Span::styled(
+                    if agent_index == 0 {
+                        "Agent: "
+                    } else {
+                        "       "
                     },
-                )
-            });
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                spans.append(&mut line.spans);
+                lines.push(Line::from(spans));
+            }
+        } else {
+            lines.push(collapsed_session_line(
+                prefix,
+                session,
+                detail,
+                now_epoch_seconds,
+                usize::from(active_area.width.saturating_sub(4)),
+            ));
+        }
+        let heading = usize::from(first);
+        let height = lines.len() as u16;
+        row_meta.push((source.key, heading, height, selected));
+        Some(Row::new([Cell::from(Text::from(lines))]).height(height))
+    });
     let active_focused = dashboard.focus == Focus::Active;
-    let active_table = Table::new(active_rows, session_column_constraints())
-        .header(session_header())
-        // Active rows reserve multiple lines for the conversation preview.
-        // Selection styling is applied to the one-line session summary below.
-        .row_highlight_style(Style::default())
-        .highlight_symbol(if active_focused { "› " } else { "  " })
-        .highlight_spacing(HighlightSpacing::Always)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(focus_border(active_focused))
-                .title(" Active "),
-        );
+    let active_table = Table::new(active_rows, [Constraint::Min(1)]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(focus_border(active_focused))
+            .title(" Active "),
+    );
     let mut active_state = TableState::default()
         .with_selected((dashboard.session_index < active.len()).then_some(dashboard.session_index));
     frame.render_stateful_widget(active_table, active_area, &mut active_state);
     let active_offset = active_state.offset();
-    let mut row_y = active_area.y + SESSION_TABLE_CHROME_HEIGHT;
+    let mut row_y = active_area.y + 1;
     let mut visible_sessions = 0;
-    let mut selected_preview_area = None;
     let mut active_row_areas = Vec::new();
-    for (index, session) in active.iter().enumerate().skip(active_offset) {
-        let preview = &active_previews[index];
-        let spacer = u16::from(index > 0);
-        let detail_y = row_y.saturating_add(spacer);
-        if detail_y >= active_area.bottom().saturating_sub(1) {
+    let mut project_heading_areas = Vec::new();
+    for (index, (project_key, heading, height, selected)) in
+        row_meta.iter().enumerate().skip(active_offset)
+    {
+        if row_y >= active_area.bottom().saturating_sub(1) {
             break;
         }
         visible_sessions += 1;
-        let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
-        let info_y = detail_y.saturating_sub(1);
-        if selected && info_y < active_area.bottom().saturating_sub(1) {
-            let summary_area = Rect::new(
-                active_area.x.saturating_add(1),
-                info_y,
-                active_area.width.saturating_sub(2),
-                1,
-            );
-            let band = session_band_color(dashboard.session_details.get(&session.id));
-            let buffer = frame.buffer_mut();
-            buffer.set_style(summary_area, Style::default().bg(Color::DarkGray).fg(band));
-            for x in summary_area.x..summary_area.right() {
-                let cell = &mut buffer[(x, info_y)];
-                if cell.symbol() == SUMMARY_RULE {
-                    cell.fg = Color::Reset;
-                }
-            }
+        if *heading > 0 {
+            project_heading_areas.push((
+                project_key.clone(),
+                Rect::new(
+                    active_area.x + 1,
+                    row_y,
+                    active_area.width.saturating_sub(2),
+                    1,
+                ),
+            ));
         }
-        let preview_height = active_area
-            .bottom()
-            .saturating_sub(1)
-            .saturating_sub(detail_y)
-            .min(preview.len() as u16);
-        if preview_height > 0 {
-            let preview_area =
-                Rect::new(active_area.x + 3, detail_y, preview_width, preview_height);
-            if selected {
-                selected_preview_area = Some(preview_area);
-            }
-            frame.render_widget(Paragraph::new(preview.clone()), preview_area);
-        }
+        let session_y = row_y.saturating_add(*heading as u16);
+        let session_height = height.saturating_sub(*heading as u16);
         let row_rect = Rect::new(
             active_area.x.saturating_add(1),
-            info_y,
+            session_y,
             active_area.width.saturating_sub(2),
-            detail_y
-                .saturating_sub(info_y)
-                .saturating_add(preview_height),
+            session_height.min(
+                active_area
+                    .bottom()
+                    .saturating_sub(1)
+                    .saturating_sub(session_y),
+            ),
         );
         active_row_areas.push((index, row_rect));
-        row_y = row_y.saturating_add(preview.len() as u16 + 1 + spacer);
+        if *selected && active_focused {
+            frame
+                .buffer_mut()
+                .set_style(row_rect, Style::default().bg(Color::DarkGray));
+        }
+        row_y = row_y.saturating_add(*height);
     }
     render_session_scrollbar(
         frame,
@@ -611,9 +541,141 @@ fn render_sessions(
     );
 
     SessionRowsRendered {
-        selected_preview_area,
         active_row_areas,
+        project_heading_areas,
     }
+}
+
+fn collapsed_session_line(
+    prefix: &str,
+    _session: &SessionRecord,
+    detail: Option<&SessionDetail>,
+    now_epoch_seconds: u64,
+    width: usize,
+) -> Line<'static> {
+    let clock = hel::usage_format::format_turn_clock(
+        now_epoch_seconds,
+        detail.and_then(|detail| detail.current_turn_started_at),
+    );
+    let fragment = detail
+        .and_then(|detail| detail.last_agent_message.as_deref())
+        .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
+        .unwrap_or("No messages yet")
+        .trim();
+    let lead = format!("{prefix}{clock} ");
+    Line::raw(format!(
+        "{lead}{}",
+        crate::widgets::truncate_text(fragment, width.saturating_sub(lead.chars().count()))
+    ))
+}
+
+fn session_top_line(
+    prefix: &str,
+    session: &SessionRecord,
+    detail: Option<&SessionDetail>,
+    operation: Option<&SessionOperationDisplay>,
+    now_epoch_seconds: u64,
+    config: &HelConfig,
+) -> Line<'static> {
+    let (profile, target_id) = operation
+        .and_then(|operation| operation.resume_destination.clone())
+        .unwrap_or_else(|| {
+            (
+                session.last_profile.clone(),
+                session.target_template_id.clone(),
+            )
+        });
+    let bare = matches!(
+        config.targets.get(&target_id),
+        Some(TargetTemplate::LocalBare | TargetTemplate::SshBare { .. })
+    );
+    let target = if bare {
+        let directory = session
+            .managed_worktree
+            .as_ref()
+            .map(|worktree| &worktree.source_project_directory)
+            .or(session.project_directory.as_ref())
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned());
+        directory.map_or(target_id.clone(), |directory| {
+            format!("{target_id}/{directory}")
+        })
+    } else {
+        target_id
+    };
+    let status = if let Some(operation) = operation {
+        let (label, started_at) = match (operation.stage, operation.kind) {
+            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
+                stage.label(),
+                operation
+                    .stage_started_at_epoch_seconds
+                    .unwrap_or(operation.started_at_epoch_seconds),
+            ),
+            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
+        };
+        format!(
+            "{label} {}",
+            format_elapsed(now_epoch_seconds.saturating_sub(started_at))
+        )
+    } else if session.state == SessionState::Provisioning {
+        let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
+        format!(
+            "Launch {}",
+            format_elapsed(now_epoch_seconds.saturating_sub(started_at))
+        )
+    } else if let Some(turn_started) = detail.and_then(|detail| detail.current_turn_started_at) {
+        let turn = hel::usage_format::format_turn_clock(now_epoch_seconds, Some(turn_started));
+        let step_started = detail
+            .and_then(|detail| detail.last_acp_activity_at_ms)
+            .map(|value| value / 1_000)
+            .unwrap_or(turn_started)
+            .max(turn_started);
+        let step = hel::usage_format::format_turn_clock(now_epoch_seconds, Some(step_started));
+        format!("Turn {turn} Step {step}")
+    } else {
+        "[idle]".into()
+    };
+    let queued = detail
+        .map(|detail| detail.queued_prompts.len())
+        .filter(|count| *count > 0)
+        .map(|count| format!(" [{count} queued]"))
+        .unwrap_or_default();
+    let content = format!(
+        "{prefix}{target} {status} {profile}{queued} {}",
+        recovery_warning_name(session, session_name(session).to_owned(), now_epoch_seconds)
+    );
+    Line::styled(content, Style::default().fg(session_band_color(detail)))
+}
+
+fn prefixed_summary_line(
+    prefix: &str,
+    label: &str,
+    message: Option<&str>,
+    width: usize,
+) -> Line<'static> {
+    let message = message.unwrap_or("No messages yet");
+    let flattened = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lead = format!("{prefix}{label}");
+    Line::from(vec![
+        Span::raw(prefix.to_owned()),
+        Span::styled(
+            label.to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(crate::widgets::truncate_text(
+            &flattened,
+            width.saturating_sub(lead.chars().count()),
+        )),
+    ])
+}
+
+fn format_elapsed(elapsed: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        elapsed / 3_600,
+        (elapsed % 3_600) / 60,
+        elapsed % 60
+    )
 }
 
 pub(crate) fn render_session_scrollbar(
@@ -642,30 +704,7 @@ pub(crate) fn render_session_scrollbar(
     );
 }
 
-fn session_column_constraints() -> [Constraint; 6] {
-    [
-        Constraint::Length(18),
-        Constraint::Length(10),
-        // Leave a little air before the profile column.
-        Constraint::Length(11),
-        Constraint::Length(14),
-        Constraint::Length(18),
-        Constraint::Min(18),
-    ]
-}
-
-fn session_header() -> Row<'static> {
-    Row::new([
-        "Project",
-        "Unread",
-        "Turn clock",
-        "Profile",
-        "Target",
-        "Session name",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD))
-}
-
+#[cfg(test)]
 fn session_values(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
@@ -729,24 +768,20 @@ fn session_name(session: &SessionRecord) -> &str {
 /// Color of an active session's summary band. A session whose detail has not
 /// loaded yet keeps the default.
 fn session_band_color(detail: Option<&SessionDetail>) -> Color {
-    hel::hel_chat::turn_band_color(
-        detail.is_none_or(|detail| detail.current_turn_started_at.is_some()),
-    )
-}
-
-pub(crate) fn unread_line(unread_count: usize) -> Line<'static> {
-    if unread_count > 0 {
-        Line::from(Span::styled(
-            format!("{unread_count} unread"),
-            Style::default()
-                .fg(Color::LightYellow)
-                .add_modifier(Modifier::BOLD),
-        ))
-    } else {
-        Line::default()
+    match detail {
+        Some(detail)
+            if detail.unread_agent_messages > 0 && detail.current_turn_started_at.is_none() =>
+        {
+            Color::LightBlue
+        }
+        Some(detail) if detail.unread_agent_messages > 0 => Color::LightYellow,
+        // ANSI yellow is the orange/amber ink in common terminal palettes;
+        // bright yellow remains distinct for unread sessions.
+        _ => Color::Yellow,
     }
 }
 
+#[cfg(test)]
 fn active_message_tail(
     detail: Option<&SessionDetail>,
     width: usize,
@@ -758,100 +793,18 @@ fn active_message_tail(
         .unwrap_or_default()
 }
 
-/// The preview rows for one active session, plus the scroll actually applied
-/// after clamping to the history available.
-fn active_transcript_tail(
-    detail: Option<&mut SessionDetail>,
-    width: u16,
-    maximum_lines: usize,
-    scroll: usize,
-) -> (Vec<Line<'static>>, usize) {
-    let Some(detail) = detail else {
-        return (
-            vec![Line::styled(
-                "Loading conversation…",
-                Style::default().fg(Color::DarkGray),
-            )],
-            0,
-        );
-    };
-    match detail.transcript.as_mut() {
-        Some(transcript) => transcript.rich_tail_scrolled(width, maximum_lines, scroll),
-        None if detail.last_agent_message.is_some() => (
-            active_message_tail(Some(detail), usize::from(width), maximum_lines),
-            0,
-        ),
-        None => (
-            vec![Line::styled(
-                match detail.transcript_hydration {
-                    TranscriptHydration::Loading => "Loading conversation…",
-                    TranscriptHydration::Unavailable => "Conversation unavailable",
-                    TranscriptHydration::Ready => "No messages yet",
-                },
-                Style::default().fg(Color::DarkGray),
-            )],
-            0,
-        ),
-    }
-}
-
-struct ActiveSessionRowLayout {
-    pub(crate) height: u16,
-    top_margin: u16,
-    rule_width: usize,
-}
-
-fn active_session_row(
-    session: &SessionRecord,
-    detail: Option<&SessionDetail>,
-    operation: Option<&SessionOperationDisplay>,
-    now_epoch_seconds: u64,
-    config: &HelConfig,
-    layout: ActiveSessionRowLayout,
-) -> Row<'static> {
-    let (clock, profile, target, project, session_name) =
-        session_values(session, detail, operation, now_epoch_seconds, config);
-    let unread_count = detail.map_or(0, |detail| detail.unread_agent_messages);
-    let band = session_band_color(detail);
-    Row::new([
-        summary_rule_cell(Line::raw(project), layout.rule_width, band),
-        summary_rule_cell(unread_line(unread_count), layout.rule_width, band),
-        summary_rule_cell(Line::raw(clock), layout.rule_width, band),
-        summary_rule_cell(Line::raw(profile), layout.rule_width, band),
-        summary_rule_cell(Line::raw(target), layout.rule_width, band),
-        summary_rule_cell(
-            Line::raw(recovery_warning_name(
-                session,
-                session_name,
-                now_epoch_seconds,
-            )),
-            layout.rule_width,
-            band,
-        ),
-    ])
-    .height(layout.height)
-    .top_margin(layout.top_margin)
-}
-
-/// Trails each summary column with the block's rule glyph so every active
-/// session reads as its own band. Table cells clip the fill at the column edge,
-/// so one pane-wide run works for every column.
-fn summary_rule_cell(content: Line<'static>, rule_width: usize, band: Color) -> Cell<'static> {
-    let mut spans = content.spans;
-    for span in &mut spans {
-        span.style = span.style.fg(band);
-    }
-    let gap = if spans.iter().all(|span| span.content.is_empty()) {
-        ""
+#[cfg(test)]
+pub(crate) fn unread_line(unread_count: usize) -> Line<'static> {
+    if unread_count > 0 {
+        Line::from(Span::styled(
+            format!("{unread_count} unread"),
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ))
     } else {
-        " "
-    };
-    spans.push(Span::styled(
-        format!("{gap}{}", SUMMARY_RULE.repeat(rule_width)),
-        // Reset keeps the rule the same weight as the surrounding block border.
-        Style::default().fg(Color::Reset),
-    ));
-    Cell::from(Line::from(spans))
+        Line::default()
+    }
 }
 
 fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
@@ -1244,7 +1197,7 @@ mod tests {
     use hel::hel_state::{
         HelState, MaterializedExecutionState, STATE_VERSION, SessionState, TranscriptBody,
     };
-    use hel::hel_targets::{DeploymentCapacityUsage, ProvisionStage, SessionResourceUsage};
+    use hel::hel_targets::{DeploymentCapacityUsage, ProvisionStage};
 
     use super::*;
     use crate::test_support::*;
@@ -1253,86 +1206,112 @@ mod tests {
     use crate::{DashboardAction, DashboardState, Focus, SessionOperationKind};
 
     #[test]
-    fn resuming_session_with_a_transcript_collapses_to_its_summary_line() {
-        let mut session = stopped_session();
-        session.state = SessionState::Running;
-        let mut dashboard = dashboard_with_session(session);
-        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
-
-        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw with preview");
-        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(rendered.contains("Rendered answer"));
-
-        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw collapsed");
-        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(!collapsed.contains("Rendered answer"));
-        assert!(
-            dashboard.selected_preview_area.is_none(),
-            "a collapsed row has no preview to scroll"
-        );
-
-        dashboard.finish_session_operation("session-1");
-        // Finishing the operation only drops its record; the session state
-        // itself flips back to Running through a later relay update, which a
-        // real resume delivers via `spawn_lifecycle_reload` in main.rs.
+    fn grouped_dashboard_has_no_column_header_and_uses_fixed_session_summaries() {
+        let mut dashboard = dashboard_with_session(running_session());
+        apply_materialized_transcript(&mut dashboard, numbered_conversation(2));
         dashboard
-            .state
-            .sessions
+            .session_details
             .get_mut("session-1")
-            .expect("session")
-            .state = SessionState::Running;
+            .unwrap()
+            .queued_prompts
+            .push(hel::hel_worker::QueuedPrompt {
+                id: "queued-1".into(),
+                text: "later".into(),
+                attachments: Vec::new(),
+                created_at_ms: 1,
+            });
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw restored");
-        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(restored.contains("Rendered answer"));
+            .expect("draw dashboard");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("hel"));
+        assert!(!rendered.contains("[1] hel"));
+        assert!(!rendered.contains("Turn clock"));
+        assert!(!rendered.contains("Session name"));
+        assert!(rendered.contains("Turn "));
+        assert!(rendered.contains(" Step "));
+        assert!(rendered.contains("[1 queued]"));
+        assert!(rendered.contains("You: question 1"));
+        assert!(rendered.contains("Agent: "));
+        assert!(rendered.contains("answer 1"));
     }
 
     #[test]
-    fn pausing_session_with_a_transcript_collapses_to_its_summary_line() {
-        let mut session = stopped_session();
-        session.state = SessionState::Running;
-        let mut dashboard = dashboard_with_session(session);
-        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
-
-        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Stopping, None);
-        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+    fn project_hotkey_expands_one_group_and_collapses_the_other() {
+        let mut first = running_session();
+        first.id = "session-alpha".into();
+        first.project_directory = Some("/projects/alpha".into());
+        let mut second = running_session();
+        second.id = "session-beta".into();
+        second.project_directory = Some("/projects/beta".into());
+        second.created_at = "2026-08-10T00:00:00Z".into();
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        dashboard.apply_materialized_session(&materialized_session_for(
+            "session-alpha",
+            numbered_conversation(1),
+        ));
+        dashboard.apply_materialized_session(&materialized_session_for(
+            "session-beta",
+            vec![
+                transcript_item(
+                    1,
+                    TranscriptBody::User {
+                        content: vec![serde_json::json!({"type":"text","text":"beta question"})],
+                    },
+                ),
+                agent_message(2, "beta answer"),
+            ],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw collapsed");
-        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(!collapsed.contains("Rendered answer"));
+            .expect("draw first project");
+        let first_draw = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(first_draw.contains("[1] alpha"));
+        assert!(first_draw.contains("[2] beta"));
+        assert!(first_draw.contains("You: question 0"));
+        assert!(!first_draw.contains("You: beta question"));
 
-        dashboard.finish_session_operation("session-1");
+        assert_eq!(
+            dashboard.handle_key(crate::test_support::key(KeyCode::Char('2'))),
+            DashboardAction::None
+        );
         terminal
             .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw restored");
-        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(restored.contains("Rendered answer"));
+            .expect("draw second project");
+        let second_draw = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!second_draw.contains("You: question 0"));
+        assert!(second_draw.contains("You: beta question"));
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-beta");
     }
 
     #[test]
-    fn provisioning_without_an_operation_record_collapses_to_its_summary_line() {
-        // Interrupted-launch recovery: the session comes back as Provisioning
-        // with no in-flight operation to track it.
-        let mut session = stopped_session();
-        session.state = SessionState::Provisioning;
-        let mut dashboard = dashboard_with_session(session);
-        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
-        assert!(dashboard.session_operations.is_empty());
+    fn summary_band_colors_distinguish_normal_unread_and_unread_idle() {
+        let normal = SessionDetail {
+            current_turn_started_at: Some(1),
+            ..SessionDetail::default()
+        };
+        assert_eq!(session_band_color(Some(&normal)), Color::Yellow);
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw collapsed");
-        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(!collapsed.contains("Rendered answer"));
+        let unread = SessionDetail {
+            current_turn_started_at: Some(1),
+            unread_agent_messages: 1,
+            ..SessionDetail::default()
+        };
+        assert_eq!(session_band_color(Some(&unread)), Color::LightYellow);
+
+        let unread_idle = SessionDetail {
+            unread_agent_messages: 1,
+            ..SessionDetail::default()
+        };
+        assert_eq!(session_band_color(Some(&unread_idle)), Color::LightBlue);
     }
 
     #[test]
@@ -1409,9 +1388,9 @@ mod tests {
 
     #[test]
     fn active_two_row_minimum_counts_header_rows_spacer_and_borders() {
-        assert_eq!(active_pane_height(&[5, 5], 2), 14);
-        assert_eq!(active_pane_height(&[5], 1), 8);
-        assert_eq!(active_pane_height(&[], 0), 3);
+        assert_eq!(active_pane_height(&[5, 5], 2), 12);
+        assert_eq!(active_pane_height(&[5], 1), 7);
+        assert_eq!(active_pane_height(&[], 0), 2);
     }
 
     #[test]
@@ -1436,7 +1415,7 @@ mod tests {
     #[test]
     fn dashboard_replaces_too_short_layout_with_required_height() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw short dashboard");
@@ -1448,9 +1427,12 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Terminal too small"));
-        assert!(rendered.contains("at least 14 rows (currently 12)"));
+        assert!(
+            rendered.contains("at least 13 rows (currently 10)"),
+            "{rendered:?}"
+        );
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 14)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 13)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw exact minimum dashboard");
@@ -1554,66 +1536,12 @@ mod tests {
     }
 
     #[test]
-    fn active_status_row_leads_with_project_and_separates_clock_from_profile() {
-        let mut session = stopped_session();
-        session.state = SessionState::Running;
-        let mut dashboard = dashboard_with_session(session);
-        dashboard.focus = Focus::Quotas;
-        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "hidden response")]);
-        let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let lines = (terminal.backend().buffer().area.y..terminal.backend().buffer().area.bottom())
-            .map(|y| {
-                (terminal.backend().buffer().area.x..terminal.backend().buffer().area.right())
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        let header = lines
-            .iter()
-            .find(|line| line.contains("Turn clock") && line.contains("Profile"))
-            .expect("active table header");
-        assert!(header.find("Project") < header.find("Unread"));
-        let clock_end = header.find("Turn clock").unwrap() + "Turn clock".len();
-        let profile_start = header.find("Profile").unwrap();
-        assert!(profile_start.saturating_sub(clock_end) >= 2);
-
-        let status_y = lines
-            .iter()
-            .position(|line| line.contains("1 unread") && line.contains("codex-1"))
-            .expect("active status row");
-        let status = &lines[status_y];
-        assert!(status.find("hel") < status.find("1 unread"));
-        assert!(status.find("1 unread") < status.find("codex-1"));
-        let buffer = terminal.backend().buffer();
-        let status_y = buffer.area.y + status_y as u16;
-        // The fixture's turn is still running, so the band keeps the default.
-        assert!(
-            (buffer.area.x + 1..buffer.area.right() - 1)
-                .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
-                .all(|x| buffer[(x, status_y)].fg == Color::Yellow)
-        );
-        assert!(
-            (buffer.area.x + 1..buffer.area.right() - 1)
-                .all(|x| buffer[(x, status_y)].bg != Color::DarkGray)
-        );
-        assert!(status.contains(SUMMARY_RULE));
-        assert!(
-            (buffer.area.x + 1..buffer.area.right() - 1)
-                .filter(|x| buffer[(*x, status_y)].symbol() == SUMMARY_RULE)
-                .all(|x| buffer[(x, status_y)].fg == Color::Reset)
-        );
-    }
-
-    #[test]
-    fn ended_turn_brightens_the_summary_band_even_after_output_is_read() {
+    fn read_idle_session_uses_the_normal_summary_color() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         // The detach cursor sits past the only agent message, so nothing is
         // unread; the band still brightens because no turn is in flight.
-        session.detached_after_event_ordinal = 1;
+        session.viewed_through_event_ordinal = 1;
         let mut dashboard = dashboard_with_session(session);
         dashboard.focus = Focus::Quotas;
         let mut materialized =
@@ -1640,7 +1568,7 @@ mod tests {
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
-                .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
+                .all(|x| buffer[(x, status_y)].fg == Color::Yellow)
         );
     }
 
@@ -1765,295 +1693,6 @@ mod tests {
         );
         let rendered = drawn_dashboard(&mut aged, 200);
         assert!(rendered.contains("stale: sampled 1h ago"), "{rendered}");
-    }
-
-    /// Active sessions whose previews differ in length, plus stopped sessions,
-    /// capacity rows, and quota rows, so every pane contributes to the layout.
-    fn mixed_fleet_dashboard() -> DashboardState {
-        let sessions = (0..4)
-            .map(|index| {
-                let mut session = stopped_session();
-                session.id = format!("session-{index}");
-                if index < 2 {
-                    session.state = SessionState::Running;
-                }
-                (session.id.clone(), session)
-            })
-            .collect();
-        let mut dashboard = DashboardState::new(
-            config(),
-            HelState {
-                version: STATE_VERSION,
-                sessions,
-                mount_history: BTreeMap::new(),
-            },
-            BTreeMap::new(),
-        );
-        apply_materialized_transcript_for(&mut dashboard, "session-0", numbered_conversation(14));
-        apply_materialized_transcript_for(&mut dashboard, "session-1", numbered_conversation(1));
-        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
-        dashboard
-    }
-
-    /// Pane rectangles, the selected preview hitbox, and the row each session
-    /// summary and preview line lands on. Volatile text (turn clocks, message
-    /// timestamps) is reduced to a tag so the fingerprint is pure geometry.
-    fn layout_fingerprint(terminal: &Terminal<TestBackend>, dashboard: &DashboardState) -> String {
-        let mut lines = Vec::new();
-        for (index, area) in dashboard
-            .pane_areas
-            .expect("dashboard pane hitboxes")
-            .iter()
-            .enumerate()
-        {
-            lines.push(format!(
-                "pane {index}: {},{} {}x{}",
-                area.x, area.y, area.width, area.height
-            ));
-        }
-        let preview = dashboard
-            .selected_preview_area
-            .expect("selected preview hitbox");
-        lines.push(format!(
-            "preview: {},{} {}x{}",
-            preview.x, preview.y, preview.width, preview.height
-        ));
-        let buffer = terminal.backend().buffer();
-        for y in buffer.area.y..buffer.area.bottom() {
-            let text = (buffer.area.x..buffer.area.right())
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>();
-            let text = text.trim_end();
-            if text.contains("unread") {
-                lines.push(format!("row {y}: session summary"));
-            } else if let Some(start) = text.find("question ").or_else(|| text.find("answer ")) {
-                // Trailing pane border and scrollbar glyphs are not part of the
-                // message text.
-                let message = text[start..].trim_end_matches(['║', '│', '█', '▲', '▼', ' ']);
-                lines.push(format!("row {y}: {message}"));
-            }
-        }
-        lines.join("\n")
-    }
-
-    /// Locks the Active pane's layout for a fleet that mixes preview lengths
-    /// with capacity and quota rows. Both the row-sizing pass and the pass
-    /// that renders previews feed these numbers.
-    #[test]
-    fn dashboard_layout_is_stable_for_a_mixed_fleet() {
-        let mut dashboard = mixed_fleet_dashboard();
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw the mixed fleet");
-
-        assert_eq!(
-            layout_fingerprint(&terminal, &dashboard),
-            concat!(
-                "pane 0: 0,1 120x27\n",
-                "pane 1: 0,28 120x4\n",
-                "pane 2: 0,32 120x6\n",
-                "preview: 3,4 116x10\n",
-                "row 3: session summary\n",
-                "row 5: answer 11\n",
-                "row 7: question 12\n",
-                "row 9: answer 12\n",
-                "row 11: question 13\n",
-                "row 13: answer 13\n",
-                "row 15: session summary\n",
-                "row 17: question 0\n",
-                "row 19: answer 0",
-            )
-        );
-    }
-
-    /// The same fleet in a terminal too short for the full preview budget, so
-    /// the selected session's line allowance comes from the allocated pane.
-    #[test]
-    fn dashboard_layout_is_stable_when_the_active_pane_is_squeezed() {
-        let mut dashboard = mixed_fleet_dashboard();
-        let mut terminal = Terminal::new(TestBackend::new(120, 26)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw the squeezed fleet");
-
-        assert_eq!(
-            layout_fingerprint(&terminal, &dashboard),
-            concat!(
-                "pane 0: 0,1 120x14\n",
-                "pane 1: 0,15 120x4\n",
-                "pane 2: 0,19 120x5\n",
-                "preview: 3,4 116x10\n",
-                "row 3: session summary\n",
-                "row 5: answer 11\n",
-                "row 7: question 12\n",
-                "row 9: answer 12\n",
-                "row 11: question 13\n",
-                "row 13: answer 13",
-            )
-        );
-    }
-
-    #[test]
-    fn active_session_renders_the_complete_last_agent_message() {
-        let mut session = stopped_session();
-        session.state = SessionState::Running;
-        let mut dashboard = dashboard_with_session(session);
-        dashboard.focus = Focus::Quotas;
-        dashboard.apply_resource_usage(
-            "session-1",
-            SessionResourceUsage {
-                cpu_percent: Some(37),
-                memory_current_bytes: 1_073_741_824,
-                memory_limit_bytes: Some(2_147_483_648),
-                swap_current_bytes: Some(4_096),
-                swap_limit_bytes: None,
-                writable_disk_bytes: Some(8_192),
-            },
-        );
-        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "**a b**\nc")]);
-        assert_eq!(
-            dashboard.session_details["session-1"]
-                .last_agent_message
-                .as_deref(),
-            Some("**a b**\nc")
-        );
-        let backend = TestBackend::new(120, 36);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("a b"));
-        assert!(rendered.contains('c'));
-        assert!(rendered.contains("Turn clock"));
-        assert!(rendered.contains("Profile"));
-        assert!(rendered.contains("Target"));
-        assert!(!rendered.contains("Checkpoint"));
-        assert!(rendered.contains("Project"));
-        assert!(rendered.contains("hel"));
-        assert!(!rendered.contains("C 37% · M 50%"));
-        assert!(!rendered.contains("S 4.0K · D 8.0K"));
-        assert!(rendered.contains("Session name"));
-        assert!(rendered.contains("ACP pretty name"));
-        assert!(!rendered.contains("native-1"));
-        assert!(!rendered.contains("Raise the dead"));
-    }
-
-    #[test]
-    fn highlighted_active_session_renders_rich_transcript_tail_and_collapses_on_blur() {
-        let mut session = stopped_session();
-        session.state = SessionState::Running;
-        let mut dashboard = dashboard_with_session(session);
-        let transcript = vec![
-            transcript_item(
-                1,
-                TranscriptBody::User {
-                    content: vec![serde_json::json!({
-                        "type": "text",
-                        "text": "inspect the dashboard",
-                    })],
-                },
-            ),
-            agent_message(2, "**Rendered answer**"),
-            transcript_item(
-                3,
-                TranscriptBody::Tool {
-                    call: serde_json::json!({
-                        "toolCallId": "dashboard-tests",
-                        "title": "Run dashboard tests",
-                        "status": "completed"
-                    }),
-                    terminal_outputs: Vec::new(),
-                    terminal_refs: Vec::new(),
-                },
-            ),
-        ];
-        apply_materialized_transcript(&mut dashboard, transcript);
-        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw selected dashboard");
-        let selected = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(selected.contains("❯ You"));
-        assert!(selected.contains("inspect the dashboard"));
-        assert!(selected.contains("● Agent"));
-        assert!(selected.contains("Rendered answer"));
-        assert!(selected.contains("✓ Tool · done"));
-        assert!(selected.contains("Run dashboard tests"));
-        let buffer = terminal.backend().buffer();
-        let row_text = |y| {
-            (buffer.area.x..buffer.area.right())
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        };
-        let info_y = (buffer.area.y..buffer.area.bottom())
-            .find(|y| row_text(*y).contains("ACP pretty name"))
-            .expect("session info row");
-        let conversation_y = (buffer.area.y..buffer.area.bottom())
-            .find(|y| row_text(*y).contains("Rendered answer"))
-            .expect("conversation row");
-        assert!(
-            (buffer.area.x + 1..buffer.area.right() - 1)
-                .all(|x| buffer[(x, info_y)].bg == Color::DarkGray)
-        );
-        // The fixture's turn is still running, so the band keeps the default.
-        assert!(
-            (buffer.area.x + 1..buffer.area.right() - 1)
-                .filter(|x| summary_text_cell(&buffer[(*x, info_y)]))
-                .all(|x| buffer[(x, info_y)].fg == Color::Yellow)
-        );
-        // The rule fills the gaps and stays the color of the block border.
-        assert!(
-            (buffer.area.x + 1..buffer.area.right() - 1)
-                .any(|x| buffer[(x, info_y)].symbol() == SUMMARY_RULE)
-        );
-        assert!(
-            (buffer.area.x + 1..buffer.area.right() - 1)
-                .filter(|x| buffer[(*x, info_y)].symbol() == SUMMARY_RULE)
-                .all(|x| buffer[(x, info_y)].fg == Color::Reset
-                    && buffer[(x, info_y)].bg == Color::DarkGray)
-        );
-        assert!(
-            (buffer.area.x + 1..buffer.area.right() - 1)
-                .all(|x| buffer[(x, conversation_y)].bg != Color::DarkGray)
-        );
-        let answer_x = row_text(conversation_y)
-            .find("Rendered answer")
-            .expect("conversation text") as u16;
-        assert_ne!(
-            buffer[(buffer.area.x + answer_x, conversation_y)].fg,
-            Color::Yellow
-        );
-
-        dashboard.handle_key(key(KeyCode::Tab));
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw blurred dashboard");
-        let blurred = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(blurred.contains("Rendered answer"));
-        assert!(!blurred.contains("❯ You"));
-        assert!(blurred.contains("Run dashboard tests"));
     }
 
     #[test]
@@ -2324,13 +1963,13 @@ mod tests {
         assert_eq!(session.last_profile, "codex-1");
         assert_eq!(session.target_template_id, "podman");
         let mut resuming = operation(SessionOperationKind::Resuming, None);
-        resuming.resume_destination = Some(("grok-1".into(), "raw-localhost".into()));
+        resuming.resume_destination = Some(("grok-1".into(), "localhost".into()));
 
         let (_, profile_id, target_template_id, _, _) =
             session_values(&session, None, Some(&resuming), 1_012, &config());
 
         assert_eq!(profile_id, "grok-1");
-        assert_eq!(target_template_id, "raw-localhost");
+        assert_eq!(target_template_id, "localhost");
     }
 
     #[test]

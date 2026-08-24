@@ -354,7 +354,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-09T12:00:00Z".into(),
             updated_at: "2026-08-09T12:01:00Z".into(),
-            detached_after_event_ordinal: 0,
+            viewed_through_event_ordinal: 0,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,

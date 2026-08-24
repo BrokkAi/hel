@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 
 use hel::hel_config::{
@@ -169,7 +167,7 @@ pub(crate) fn stopped_session() -> SessionRecord {
         session_title_override: None,
         created_at: "2026-08-09T00:00:00Z".into(),
         updated_at: "2026-08-09T01:00:00Z".into(),
-        detached_after_event_ordinal: 0,
+        viewed_through_event_ordinal: 0,
         draft_input: String::new(),
         last_error: None,
         last_checkpoint_error: None,
@@ -324,28 +322,6 @@ pub(crate) fn numbered_conversation(count: u64) -> Vec<Arc<TranscriptItem>> {
             ]
         })
         .collect()
-}
-
-/// The text inside one rect, row by row. Session summary rows repeat the
-/// newest agent message, so preview assertions must look only at the
-/// preview itself.
-fn rows_in(terminal: &Terminal<TestBackend>, area: Rect) -> Vec<String> {
-    let buffer = terminal.backend().buffer();
-    (area.y..area.bottom())
-        .map(|y| {
-            (area.x..area.right())
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-                .trim_end()
-                .to_owned()
-        })
-        .collect()
-}
-
-pub(crate) fn rect_shows(terminal: &Terminal<TestBackend>, area: Rect, needle: &str) -> bool {
-    rows_in(terminal, area)
-        .iter()
-        .any(|row| row.contains(needle))
 }
 
 pub(crate) fn operation(

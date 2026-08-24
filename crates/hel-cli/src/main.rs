@@ -273,6 +273,7 @@ async fn main() -> Result<()> {
         .then(ControllerStoreGuard::acquire)
         .transpose()?;
     if is_controller_process {
+        HelConfig::migrate_legacy_localhost_target()?;
         hel::hel_database::recover_interrupted_checkpointing_sessions(
             &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         )?;
@@ -817,7 +818,7 @@ mod tests {
                 session_title_override: None,
                 created_at: "2026-08-12T00:00:00Z".into(),
                 updated_at: "2026-08-12T00:00:00Z".into(),
-                detached_after_event_ordinal: 0,
+                viewed_through_event_ordinal: 0,
                 draft_input: String::new(),
                 last_error: None,
                 last_checkpoint_error: None,

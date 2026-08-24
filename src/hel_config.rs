@@ -663,6 +663,35 @@ impl HelConfig {
         let body = toml::to_string_pretty(self).context("serialize Hel config")?;
         atomic_write(path, body.as_bytes())
     }
+
+    /// Rename the setup-generated local bare target without rewriting
+    /// unrelated configuration. This runs under the controller store lock
+    /// before SQLite is opened, so config and persisted sessions converge in
+    /// one startup.
+    pub fn migrate_legacy_localhost_target() -> Result<bool> {
+        Self::migrate_legacy_localhost_target_at(&config_path())
+    }
+
+    fn migrate_legacy_localhost_target_at(path: &Path) -> Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut config = Self::load_from(path)?;
+        let Some(legacy) = config.targets.get("raw-localhost").cloned() else {
+            return Ok(false);
+        };
+        if let Some(current) = config.targets.get("localhost")
+            && current != &legacy
+        {
+            bail!(
+                "cannot rename target `raw-localhost` to `localhost`: both exist with different configurations"
+            );
+        }
+        config.targets.remove("raw-localhost");
+        config.targets.entry("localhost".into()).or_insert(legacy);
+        config.save_to(path)?;
+        Ok(true)
+    }
 }
 
 fn reject_removed_profile_overrides(contents: &str) -> Result<()> {
@@ -884,6 +913,54 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn legacy_localhost_target_migration_is_atomic_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = sample_config();
+        config.targets.clear();
+        config
+            .targets
+            .insert("raw-localhost".into(), TargetTemplate::LocalBare);
+        config.save_to(&path).unwrap();
+
+        assert!(HelConfig::migrate_legacy_localhost_target_at(&path).unwrap());
+        let migrated = HelConfig::load_from(&path).unwrap();
+        assert_eq!(
+            migrated.targets.get("localhost"),
+            Some(&TargetTemplate::LocalBare)
+        );
+        assert!(!migrated.targets.contains_key("raw-localhost"));
+        assert!(!HelConfig::migrate_legacy_localhost_target_at(&path).unwrap());
+    }
+
+    #[test]
+    fn conflicting_localhost_target_migration_leaves_config_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = sample_config();
+        config
+            .targets
+            .insert("raw-localhost".into(), TargetTemplate::LocalBare);
+        config.targets.insert(
+            "localhost".into(),
+            TargetTemplate::LocalPodman {
+                container: ContainerTemplate {
+                    image: "different".into(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: BTreeMap::new(),
+                },
+            },
+        );
+        config.save_to(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        assert!(HelConfig::migrate_legacy_localhost_target_at(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub(super) fn checkpoint_test_session(session_id: &str) -> SessionRecord {
         session_title_override: None,
         created_at: "2026-08-12T00:00:00Z".into(),
         updated_at: "2026-08-12T00:00:00Z".into(),
-        detached_after_event_ordinal: 0,
+        viewed_through_event_ordinal: 0,
         draft_input: String::new(),
         last_error: None,
         last_checkpoint_error: None,

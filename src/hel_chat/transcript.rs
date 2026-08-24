@@ -1260,6 +1260,29 @@ pub fn render_agent_message_tail(
     lines.into_iter().skip(start).collect()
 }
 
+/// First rows of an agent message for dashboard summaries. Rich formatting is
+/// retained, but the final visible row announces omitted content.
+pub fn render_agent_message_head(
+    source: &str,
+    width: usize,
+    maximum_lines: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 || maximum_lines == 0 {
+        return Vec::new();
+    }
+    let entry = ChatEntry::plain(0, ChatRole::Agent, source);
+    let mut lines = entry_body_rows(&entry, width, TranscriptRenderMode::Rich)
+        .into_iter()
+        .filter(|line| !line_is_empty(line))
+        .collect::<Vec<_>>();
+    let truncated = lines.len() > maximum_lines;
+    lines.truncate(maximum_lines);
+    if truncated && let Some(last) = lines.last_mut() {
+        last.spans.push(Span::raw("…"));
+    }
+    lines
+}
+
 /// Render every row of the transcript. Rendering surfaces are all incremental
 /// now, so this exists only for tests that assert on the whole projection.
 #[cfg(test)]

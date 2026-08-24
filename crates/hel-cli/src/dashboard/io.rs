@@ -61,6 +61,10 @@ pub(crate) enum DashboardIoUpdate {
         session_id: String,
         result: std::result::Result<(), String>,
     },
+    ReadReceipt {
+        session_id: String,
+        result: std::result::Result<u64, String>,
+    },
     CreatedBundle {
         result: Box<std::result::Result<CreatedBundleUpdate, String>>,
     },
@@ -300,7 +304,7 @@ pub(crate) fn spawn_lifecycle_operation(
 
 pub(crate) fn spawn_materialized_session_projection(
     materialized: MaterializedSession,
-    detached_after_event_ordinal: u64,
+    viewed_through_event_ordinal: u64,
     previous: hel_tui::MaterializedProjectionCache,
     updates: UnboundedSender<DashboardIoUpdate>,
     permits: Arc<tokio::sync::Semaphore>,
@@ -312,7 +316,7 @@ pub(crate) fn spawn_materialized_session_projection(
                 let result = tokio::task::spawn_blocking(move || {
                     PreparedMaterializedSessionDetail::from_materialized(
                         materialized,
-                        detached_after_event_ordinal,
+                        viewed_through_event_ordinal,
                         previous,
                     )
                 })
@@ -398,7 +402,7 @@ pub(crate) fn spawn_detached_session_state_persist(
     spawn_io(
         updates,
         move || {
-            let receipt = hel::hel_database::advance_detached_after_event_ordinal(
+            let receipt = hel::hel_database::advance_viewed_through_event_ordinal(
                 &persisted_session_id,
                 event_ordinal,
             )
@@ -411,6 +415,21 @@ pub(crate) fn spawn_detached_session_state_persist(
         },
         move |result| DashboardIoUpdate::DetachedSessionState { session_id, result },
     )
+}
+
+pub(crate) fn spawn_read_receipt_persist(
+    session_id: String,
+    through: u64,
+    updates: UnboundedSender<DashboardIoUpdate>,
+) {
+    let persisted_session_id = session_id.clone();
+    spawn_io(
+        updates,
+        move || {
+            hel::hel_database::advance_viewed_through_event_ordinal(&persisted_session_id, through)
+        },
+        move |result| DashboardIoUpdate::ReadReceipt { session_id, result },
+    );
 }
 
 pub(crate) fn spawn_create_bundle(source: String, updates: UnboundedSender<DashboardIoUpdate>) {
@@ -792,6 +811,9 @@ impl DashboardContext {
                     ));
                 }
             }
+            DashboardIoUpdate::ReadReceipt { session_id, result } => {
+                self.finish_read_receipt(session_id, result);
+            }
             DashboardIoUpdate::CreatedBundle { result } => match *result {
                 Ok(created) => {
                     self.controller.config = created.config;
@@ -1004,13 +1026,13 @@ impl DashboardContext {
                 target_id,
                 materialized,
             }) => {
-                let detached_after_event_ordinal = self
+                let viewed_through_event_ordinal = self
                     .controller
                     .state
                     .sessions
                     .get(&session_id)
-                    .map_or(0, |session| session.detached_after_event_ordinal);
-                self.request_materialized_projection(*materialized, detached_after_event_ordinal);
+                    .map_or(0, |session| session.viewed_through_event_ordinal);
+                self.request_materialized_projection(*materialized, viewed_through_event_ordinal);
                 self.dashboard.select_active_session(&session_id);
                 self.dashboard.set_notice(format!(
                     "Resumed {} with {profile_id} on {target_id}",
@@ -1247,7 +1269,7 @@ mod tests {
             session_title_override: Some("Raise the dead".into()),
             created_at: "2026-08-14T00:00:00Z".into(),
             updated_at: "2026-08-14T00:00:00Z".into(),
-            detached_after_event_ordinal: 0,
+            viewed_through_event_ordinal: 0,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,

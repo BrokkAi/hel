@@ -45,6 +45,8 @@ pub(crate) struct SessionDetail {
     pub(crate) current_turn_started_at: Option<u64>,
     pub(crate) last_activity_at_ms: Option<u64>,
     pub(crate) last_agent_message: Option<Arc<str>>,
+    pub(crate) last_user_message: Option<Arc<str>>,
+    pub(crate) last_acp_activity_at_ms: Option<u64>,
     /// Latest agent-content ordinals retained so a state-only read-cursor
     /// update can recompute the single unread count exactly.
     pub(crate) agent_message_latest_content_ordinals: Vec<u64>,
@@ -141,6 +143,7 @@ pub struct PreparedMaterializedSessionDetail {
     pub(crate) current_turn_started_at: Option<u64>,
     pub(crate) last_activity_at_ms: Option<u64>,
     pub(crate) last_agent_message: Option<Arc<str>>,
+    pub(crate) last_user_message: Option<Arc<str>>,
     agent_message_latest_content_ordinals: Vec<u64>,
     pub(crate) unread_agent_messages: usize,
     pub(crate) transcript: TranscriptSnapshot,
@@ -153,7 +156,7 @@ impl PreparedMaterializedSessionDetail {
     /// derived for the transcript items that did not change.
     pub fn from_materialized(
         session: MaterializedSession,
-        detached_after_event_ordinal: u64,
+        viewed_through_event_ordinal: u64,
         previous: MaterializedProjectionCache,
     ) -> Self {
         let current_turn_started_at = match session.execution {
@@ -167,6 +170,13 @@ impl PreparedMaterializedSessionDetail {
         let unchanged_prefix = previous.unchanged_prefix(&session.transcript);
         let last_agent_message =
             last_agent_message(&session.transcript, unchanged_prefix, &previous);
+        let last_user_message = session.transcript.iter().rev().find_map(|item| {
+            let TranscriptBody::User { content } = &item.body else {
+                return None;
+            };
+            let text = materialized_content_text(content);
+            (!text.trim().is_empty()).then(|| Arc::from(text))
+        });
         let mut cached_tool_diffstats = previous.tool_diffstats;
         let mut tool_diffstats = BTreeMap::new();
         let mut current_tool_diffstats = BTreeMap::new();
@@ -198,7 +208,7 @@ impl PreparedMaterializedSessionDetail {
             .collect::<Vec<_>>();
         let unread_agent_messages = agent_message_latest_content_ordinals
             .iter()
-            .filter(|ordinal| **ordinal > detached_after_event_ordinal)
+            .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
             .count();
         let queued_prompts = session
             .queued_prompts
@@ -227,6 +237,7 @@ impl PreparedMaterializedSessionDetail {
             last_agent_message: last_agent_message
                 .as_ref()
                 .map(|(_, text)| Arc::clone(text)),
+            last_user_message,
             agent_message_latest_content_ordinals,
             unread_agent_messages,
             transcript,
@@ -283,15 +294,15 @@ impl DashboardState {
         }
         self.apply_operation_projection();
         for (session_id, detail) in &mut self.session_details {
-            let detached_after_event_ordinal = self
+            let viewed_through_event_ordinal = self
                 .state
                 .sessions
                 .get(session_id)
-                .map_or(0, |session| session.detached_after_event_ordinal);
+                .map_or(0, |session| session.viewed_through_event_ordinal);
             detail.unread_agent_messages = detail
                 .agent_message_latest_content_ordinals
                 .iter()
-                .filter(|ordinal| **ordinal > detached_after_event_ordinal)
+                .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
                 .count();
         }
         // After the projection, so the rows see the records the dashboard does.
@@ -512,16 +523,16 @@ impl DashboardState {
     /// projection. Unread is a count of logical agent messages with content
     /// added after the last detach cursor, never a count of stream chunks.
     pub fn apply_materialized_session(&mut self, session: &MaterializedSession) {
-        let detached_after_event_ordinal = self
+        let viewed_through_event_ordinal = self
             .state
             .sessions
             .get(&session.session_id)
-            .map_or(0, |record| record.detached_after_event_ordinal);
+            .map_or(0, |record| record.viewed_through_event_ordinal);
         let previous = self.take_projection_cache(&session.session_id);
         self.apply_prepared_materialized_session(
             PreparedMaterializedSessionDetail::from_materialized(
                 session.clone(),
-                detached_after_event_ordinal,
+                viewed_through_event_ordinal,
                 previous,
             ),
         );
@@ -555,6 +566,7 @@ impl DashboardState {
         detail.current_turn_started_at = prepared.current_turn_started_at;
         detail.last_activity_at_ms = prepared.last_activity_at_ms;
         detail.last_agent_message = prepared.last_agent_message;
+        detail.last_user_message = prepared.last_user_message;
         detail.agent_message_latest_content_ordinals =
             prepared.agent_message_latest_content_ordinals;
         detail.unread_agent_messages = prepared.unread_agent_messages;
@@ -569,6 +581,13 @@ impl DashboardState {
             self.rebuild_resume_rows();
         }
         true
+    }
+
+    pub fn set_last_acp_activity(&mut self, session_id: &str, timestamp_ms: Option<i64>) {
+        self.session_details
+            .entry(session_id.to_owned())
+            .or_default()
+            .last_acp_activity_at_ms = timestamp_ms.and_then(|value| u64::try_from(value).ok());
     }
 
     pub fn mark_transcript_unavailable(&mut self, session_id: &str) {
@@ -730,7 +749,7 @@ mod tests {
             .sessions
             .get_mut("session-1")
             .unwrap()
-            .detached_after_event_ordinal = 1;
+            .viewed_through_event_ordinal = 1;
         dashboard.set_state(state);
         assert_eq!(
             dashboard.session_details["session-1"].unread_agent_messages,
@@ -742,7 +761,7 @@ mod tests {
             .sessions
             .get_mut("session-1")
             .unwrap()
-            .detached_after_event_ordinal = 4;
+            .viewed_through_event_ordinal = 4;
         dashboard.set_state(state);
         assert_eq!(
             dashboard.session_details["session-1"].unread_agent_messages,
@@ -771,7 +790,7 @@ mod tests {
             .sessions
             .get_mut("session-1")
             .unwrap()
-            .detached_after_event_ordinal = 1;
+            .viewed_through_event_ordinal = 1;
         dashboard.set_state(state);
         assert_eq!(
             dashboard.session_details["session-1"].unread_agent_messages,
@@ -798,7 +817,7 @@ mod tests {
             .sessions
             .get_mut("session-1")
             .unwrap()
-            .detached_after_event_ordinal = 2;
+            .viewed_through_event_ordinal = 2;
         dashboard.set_state(state);
         assert_eq!(
             dashboard.session_details["session-1"].unread_agent_messages,
@@ -857,7 +876,7 @@ mod tests {
     /// of transcript change must land where a full rescan would.
     #[test]
     fn incremental_projection_matches_a_full_rescan_through_transcript_changes() {
-        let detached_after_event_ordinal = 1;
+        let viewed_through_event_ordinal = 1;
         // One transcript, changed the way the projection changes it: items are
         // appended, and an item that changes is replaced by a copy while the
         // rest keep their handles.
@@ -890,12 +909,12 @@ mod tests {
             let session = materialized_session_for("session-1", transcript);
             let incremental = PreparedMaterializedSessionDetail::from_materialized(
                 session.clone(),
-                detached_after_event_ordinal,
+                viewed_through_event_ordinal,
                 cache,
             );
             let rescanned = PreparedMaterializedSessionDetail::from_materialized(
                 session,
-                detached_after_event_ordinal,
+                viewed_through_event_ordinal,
                 MaterializedProjectionCache::default(),
             );
             assert_eq!(
@@ -1064,18 +1083,18 @@ mod tests {
     fn set_resume_destination_updates_the_in_flight_operation() {
         let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
-        dashboard.set_resume_destination("session-1", "grok-1".into(), "raw-localhost".into());
+        dashboard.set_resume_destination("session-1", "grok-1".into(), "localhost".into());
 
         assert_eq!(
             dashboard.session_operations["session-1"].resume_destination,
-            Some(("grok-1".to_string(), "raw-localhost".to_string()))
+            Some(("grok-1".to_string(), "localhost".to_string()))
         );
     }
 
     #[test]
     fn set_resume_destination_for_an_unknown_session_is_ignored() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        dashboard.set_resume_destination("missing", "grok-1".into(), "raw-localhost".into());
+        dashboard.set_resume_destination("missing", "grok-1".into(), "localhost".into());
         assert!(dashboard.session_operations.is_empty());
     }
 

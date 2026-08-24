@@ -136,12 +136,12 @@ impl MaterializedSession {
         self.last_activity_at_ms
     }
 
-    pub fn unread_agent_messages_after(&self, detached_after_event_ordinal: u64) -> u64 {
+    pub fn unread_agent_messages_after(&self, viewed_through_event_ordinal: u64) -> u64 {
         self.transcript
             .iter()
             .filter(|item| {
                 item.latest_content_event_ordinal
-                    .is_some_and(|ordinal| ordinal > detached_after_event_ordinal)
+                    .is_some_and(|ordinal| ordinal > viewed_through_event_ordinal)
                     && item.is_nonempty_agent_message()
             })
             .count() as u64
@@ -730,7 +730,8 @@ pub struct SessionRecord {
     pub session_title_override: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-    pub detached_after_event_ordinal: u64,
+    #[serde(default, alias = "detached_after_event_ordinal")]
+    pub viewed_through_event_ordinal: u64,
     /// Unsent chat input carried across a detach, so returning to a session
     /// restores what the user was typing. Empty means no draft.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -775,6 +776,50 @@ impl SessionRecord {
             })
             .map(|repository| path_leaf(&repository.destination))
             .unwrap_or_else(|| path_leaf(Path::new(&self.bundle_id)))
+    }
+
+    /// Stable source identity used to group sessions. Managed worktrees point
+    /// back at their source repository, and bundles use only their primary
+    /// repository, so temporary destinations never split one project.
+    pub fn project_source(&self, config: &HelConfig) -> ProjectSourceIdentity {
+        if let Some(worktree) = &self.managed_worktree {
+            return ProjectSourceIdentity::path(&worktree.source_repository, None);
+        }
+        if let Some(project_directory) = &self.project_directory {
+            let remote = match &self.target {
+                Some(TargetLocator::SshBare { host, .. }) => Some(host.as_str()),
+                _ => None,
+            };
+            return ProjectSourceIdentity::path(project_directory, remote);
+        }
+        if let Some(repository) = config
+            .bundles
+            .get(&self.bundle_id)
+            .and_then(|bundle| bundle.primary().or_else(|| bundle.repositories.first()))
+        {
+            if let Some(source) = repository.github.as_deref()
+                && let Some(normalized) = normalize_github_source(source)
+            {
+                let short = normalized
+                    .rsplit_once('/')
+                    .map_or(normalized.as_str(), |(_, repository)| repository)
+                    .to_owned();
+                return ProjectSourceIdentity {
+                    key: format!("github:{}", normalized.to_lowercase()),
+                    short,
+                    full: normalized,
+                };
+            }
+            if let Some(path) = repository.local.as_deref() {
+                return ProjectSourceIdentity::path(path, None);
+            }
+        }
+        let name = path_leaf(Path::new(&self.bundle_id));
+        ProjectSourceIdentity {
+            key: format!("bundle:{}", self.bundle_id),
+            short: name,
+            full: self.bundle_id.clone(),
+        }
     }
 
     /// Orders two sessions the way the session list's sequence view does:
@@ -844,6 +889,46 @@ impl SessionRecord {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProjectSourceIdentity {
+    pub key: String,
+    pub short: String,
+    pub full: String,
+}
+
+impl ProjectSourceIdentity {
+    fn path(path: &Path, remote: Option<&str>) -> Self {
+        let normalized = path.components().collect::<PathBuf>();
+        let path_text = normalized.to_string_lossy().into_owned();
+        let full = remote.map_or_else(|| path_text.clone(), |host| format!("{host}:{path_text}"));
+        let key = remote.map_or_else(
+            || format!("path:{path_text}"),
+            |host| format!("path:{}:{path_text}", host.to_lowercase()),
+        );
+        Self {
+            key,
+            short: path_leaf(path),
+            full,
+        }
+    }
+}
+
+fn normalize_github_source(source: &str) -> Option<String> {
+    let path = source
+        .trim()
+        .strip_prefix("https://github.com/")
+        .or_else(|| source.trim().strip_prefix("http://github.com/"))
+        .or_else(|| source.trim().strip_prefix("git@github.com:"))
+        .or_else(|| source.trim().strip_prefix("ssh://git@github.com/"))
+        .unwrap_or(source.trim())
+        .trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    (!owner.is_empty() && !repository.is_empty() && parts.next().is_none())
+        .then(|| format!("{owner}/{repository}"))
 }
 
 /// Last component of a path, falling back to the whole path when it has none.
@@ -1107,7 +1192,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-09T12:00:00Z".into(),
             updated_at: "2026-08-09T12:01:00Z".into(),
-            detached_after_event_ordinal: 0,
+            viewed_through_event_ordinal: 0,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
@@ -1236,6 +1321,30 @@ mod tests {
     }
 
     #[test]
+    fn project_source_normalizes_github_and_ignores_managed_worktree_destinations() {
+        let config = sample_config();
+        let mut session = sample_session();
+        assert_eq!(session.project_source(&config).full, "BrokkAi/hel");
+
+        session.project_directory = Some(PathBuf::from(
+            "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+        ));
+        session.managed_worktree = Some(ManagedWorktree {
+            source_project_directory: PathBuf::from("/home/test/Projects/source/crate"),
+            source_repository: PathBuf::from("/home/test/Projects/source"),
+            worktree_root: PathBuf::from(
+                "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+            ),
+            branch: "hel/0123456789abcdef".into(),
+            target: ManagedWorktreeTarget::Local,
+        });
+        let source = session.project_source(&config);
+        assert_eq!(source.short, "source");
+        assert_eq!(source.full, "/home/test/Projects/source");
+        assert!(!source.full.contains(".hel/worktrees"));
+    }
+
+    #[test]
     fn sessions_order_by_creation_time_and_fall_back_to_the_id() {
         let older = sample_session();
         let mut newer = sample_session();
@@ -1275,9 +1384,24 @@ mod tests {
         let session = old_detach_cursor["sessions"][session_id]
             .as_object_mut()
             .unwrap();
-        let ordinal = session.remove("detached_after_event_ordinal").unwrap();
+        let ordinal = session.remove("viewed_through_event_ordinal").unwrap();
         session.insert("last_viewed_event_sequence".into(), ordinal);
         assert!(serde_json::from_value::<HelState>(old_detach_cursor).is_err());
+    }
+
+    #[test]
+    fn detached_cursor_field_loads_as_the_viewed_cursor() {
+        let session_id = "0123456789abcdef";
+        let mut legacy = serde_json::to_value(sample_state()).unwrap();
+        let session = legacy["sessions"][session_id].as_object_mut().unwrap();
+        let ordinal = session.remove("viewed_through_event_ordinal").unwrap();
+        session.insert("detached_after_event_ordinal".into(), ordinal);
+
+        let loaded: HelState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            loaded.sessions[session_id].viewed_through_event_ordinal,
+            sample_state().sessions[session_id].viewed_through_event_ordinal
+        );
     }
 
     #[test]

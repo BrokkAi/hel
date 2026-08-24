@@ -366,7 +366,6 @@ struct ConversationRow {
     session_id: String,
     position: usize,
     current: bool,
-    project: String,
     turn_started_at_epoch_seconds: Option<u64>,
     last_agent_line: Option<String>,
 }
@@ -388,7 +387,6 @@ fn conversation_rows(chat: &ChatState) -> Vec<ConversationRow> {
         session_id: chat.session_id.clone(),
         position: chat.position,
         current: true,
-        project: chat.project.clone(),
         turn_started_at_epoch_seconds: chat.turn_started_at_epoch_seconds,
         last_agent_line: chat.last_agent_line(),
     }];
@@ -396,7 +394,6 @@ fn conversation_rows(chat: &ChatState) -> Vec<ConversationRow> {
         session_id: session.session_id.clone(),
         position: session.position,
         current: false,
-        project: session.project.clone(),
         turn_started_at_epoch_seconds: session.turn_started_at_epoch_seconds,
         last_agent_line: session.last_agent_line.clone(),
     }));
@@ -456,9 +453,9 @@ fn conversation_line(row: &ConversationRow, now_epoch_seconds: u64, width: usize
     let band = Style::default().fg(turn_band_color(row.turn_started_at_epoch_seconds.is_some()));
     let last_line = row.last_agent_line.as_deref().unwrap_or_default().trim();
     let prefix = if last_line.is_empty() {
-        format!("{caret}{} {clock}", row.project)
+        format!("{caret}{clock}")
     } else {
-        format!("{caret}{} {clock} ", row.project)
+        format!("{caret}{clock} ")
     };
     let mut spans = vec![Span::styled(prefix, band)];
     // The tail is agent text, so style it the way the conversation does.
@@ -473,7 +470,6 @@ fn other_session_activity(
     OtherSessionActivity {
         session_id: identity.session_id.clone(),
         position: identity.position,
-        project: identity.project.clone(),
         turn_started_at_epoch_seconds: turn_started_at_epoch_seconds(session.execution),
         last_agent_line: session
             .transcript
@@ -685,7 +681,7 @@ impl ActiveChat {
             (state, pending)
         };
         state.set_history_context(bundle_id);
-        state.set_header_identity(header.project, header.position);
+        state.set_header_position(header.position);
         state.restore_draft(draft);
         state.notices = notices;
         let (chat_io_tx, chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
@@ -766,6 +762,10 @@ impl ActiveChat {
     /// unsent input survives a quit or a crash while the view is off screen.
     pub fn draft(&self) -> &str {
         &self.state.input
+    }
+
+    pub fn latest_event_ordinal(&self) -> u64 {
+        self.state.latest_seq()
     }
 
     /// Waits for the next background message, applies it, and drains whatever
@@ -1366,6 +1366,25 @@ fn append_dictation(prefix: &str, transcript: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_rows_show_hour_clock_and_agent_fragment_without_project() {
+        let row = ConversationRow {
+            session_id: "session-1".into(),
+            position: 0,
+            current: true,
+            turn_started_at_epoch_seconds: Some(1_000),
+            last_agent_line: Some("most recent answer".into()),
+        };
+        let line = conversation_line(&row, 4_725, 80);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "› 01:02:05 most recent answer");
+        assert!(!text.contains("project"));
+    }
     use crate::hel_chat::test_support::{
         agent_message_item, agent_transcript_item, ctrl, drawn_transcript, key, mouse_at_row,
         mouse_in, queued, snapshot,
@@ -1408,6 +1427,7 @@ mod tests {
                     queued_prompts: Vec::new(),
                     checkpoint_barrier: None,
                     checkpoint_ready: None,
+                    last_acp_activity_at_ms: None,
                 },
             }),
             connected: true,
@@ -1417,14 +1437,13 @@ mod tests {
 
     fn other_session(
         position: usize,
-        project: &str,
+        _project: &str,
         turn_started_at_epoch_seconds: Option<u64>,
         last_agent_line: &str,
     ) -> OtherSessionActivity {
         OtherSessionActivity {
             session_id: other_session_id(position),
             position,
-            project: project.to_owned(),
             turn_started_at_epoch_seconds,
             last_agent_line: (!last_agent_line.is_empty()).then(|| last_agent_line.to_owned()),
         }
@@ -1436,9 +1455,13 @@ mod tests {
         format!("session-{position}")
     }
 
-    fn header_chat(project: &str, position: usize, others: Vec<OtherSessionActivity>) -> ChatState {
+    fn header_chat(
+        _project: &str,
+        position: usize,
+        others: Vec<OtherSessionActivity>,
+    ) -> ChatState {
         let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.set_header_identity(project, position);
+        chat.set_header_position(position);
         chat.other_sessions = others;
         chat
     }
@@ -1481,9 +1504,18 @@ mod tests {
     }
 
     fn window_projects(chat: &ChatState, max_rows: usize) -> Vec<String> {
-        pane_text(&conversations_pane(chat, 0, 80, max_rows))
-            .iter()
-            .map(|line| line.trim_start_matches(['›', ' ']).replace(" [idle]", ""))
+        let rows = conversation_rows(chat);
+        let current = rows.iter().position(|row| row.current).unwrap_or(0);
+        let start = conversations_window_start(
+            rows.len(),
+            current,
+            max_rows.max(1).min(rows.len()),
+            chat.conversations_window_start,
+        );
+        rows.iter()
+            .skip(start)
+            .take(max_rows)
+            .map(|row| format!("project-{}", row.position))
             .collect()
     }
 
@@ -1736,11 +1768,7 @@ mod tests {
 
         assert_eq!(
             header_text(&chat, 0, 80),
-            [
-                "  first [idle] earlier work",
-                "› middle [idle]",
-                "  last [idle] later work",
-            ]
+            ["  [idle] earlier work", "› [idle]", "  [idle] later work",]
         );
     }
 
@@ -1754,7 +1782,7 @@ mod tests {
 
         assert_eq!(
             header_text(&chat, 1_125, 80),
-            ["› current [idle]", "  other 02:05 still going"]
+            ["› [idle]", "  00:02:05 still going"]
         );
         assert_eq!(
             header_colors(&chat, 1_125),
@@ -2189,7 +2217,7 @@ mod tests {
 
         let lines = conversations_pane(&chat, 1_125, 80, 10).lines;
         let tail = &lines[1];
-        assert_eq!(tail.spans[0].content.as_ref(), "  other 02:05 ");
+        assert_eq!(tail.spans[0].content.as_ref(), "  00:02:05 ");
         assert_eq!(tail.spans[0].style.fg, Some(Color::Yellow));
         assert_eq!(tail.spans[1].content.as_ref(), "still going");
         assert_eq!(tail.spans[1].style.fg, None);
@@ -2205,7 +2233,7 @@ mod tests {
 
         assert_eq!(
             header_text(&chat, 0, 20),
-            ["› current [idle]", "  other [idle] a ta…"]
+            ["› [idle]", "  [idle] a tail tha…"]
         );
     }
 
@@ -2216,7 +2244,6 @@ mod tests {
             // identity's, not the materialized session's.
             session_id: other_session_id(3),
             position: 3,
-            project: "api-fix".into(),
         };
         let mut session = MaterializedSession::empty("other");
         session.transcript = vec![
@@ -2252,18 +2279,12 @@ mod tests {
         };
         chat.apply_materialized(&session, &[], &[]);
 
-        assert_eq!(
-            header_text(&chat, 125, 80),
-            ["› current 01:05 closing line"]
-        );
+        assert_eq!(header_text(&chat, 125, 80), ["› 00:01:05 closing line"]);
 
         session.applied_event_ordinal = 6;
         session.execution = MaterializedExecutionState::Idle;
         chat.apply_materialized(&session, &[], &[]);
-        assert_eq!(
-            header_text(&chat, 125, 80),
-            ["› current [idle] closing line"]
-        );
+        assert_eq!(header_text(&chat, 125, 80), ["› [idle] closing line"]);
     }
 
     #[test]
@@ -2291,7 +2312,7 @@ mod tests {
             .draw(|frame| render(frame, &mut chat))
             .expect("draw chat");
         // Row 0 is the pane's own top border; the header row sits inside it.
-        assert_eq!(bordered_row(&terminal, 1), "› current [idle]");
+        assert_eq!(bordered_row(&terminal, 1), "› [idle]");
         // Row 2 is the pane's bottom border, so the transcript's chrome
         // starts at row 3.
         assert!(row(&terminal, 3).contains("Conversation"));
@@ -2303,8 +2324,8 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut chat))
             .expect("draw chat");
-        assert_eq!(bordered_row(&terminal, 1), "› current [idle]");
-        assert_eq!(bordered_row(&terminal, 2), "  docs [idle] wrote the guide");
+        assert_eq!(bordered_row(&terminal, 1), "› [idle]");
+        assert_eq!(bordered_row(&terminal, 2), "  [idle] wrote the guide");
         // The transcript keeps its own chrome, below the header and the
         // pane's now-taller bottom border.
         assert!(row(&terminal, 4).contains("Conversation"));

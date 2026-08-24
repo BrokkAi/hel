@@ -20,7 +20,7 @@ use crate::hel_state::{
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -413,6 +413,20 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     }
     if version < 11 {
         migrate_deepseek_harness_kind(connection)?;
+    }
+    if version < 12 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sessions
+                 RENAME COLUMN detached_after_event_ordinal TO viewed_through_event_ordinal;
+             UPDATE sessions
+                 SET target_template_id = 'localhost'
+                 WHERE target_template_id = 'raw-localhost';
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 12;
+             COMMIT;",
+        )?;
     }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
@@ -868,7 +882,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
         "SELECT s.session_id, s.title, s.harness_kind, s.last_profile, c.bundle_id,
                 s.target_template_id, s.state, s.native_session_id, s.acp_session_title,
                 s.session_title_override, c.created_at, s.updated_at,
-                s.detached_after_event_ordinal, s.last_error, s.resource_allocation,
+                s.viewed_through_event_ordinal, s.last_error, s.resource_allocation,
                 s.last_checkpoint_error, s.project_directory, s.managed_worktree,
                 s.draft_input, s.container_cpus, s.container_memory, s.archived
          FROM sessions s JOIN session_contexts c USING(session_id)
@@ -922,7 +936,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             session_title_override: row.get(9)?,
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
-            detached_after_event_ordinal: row.get::<_, u64>(12)?,
+            viewed_through_event_ordinal: row.get::<_, u64>(12)?,
             draft_input: row.get(18)?,
             last_error: row.get(13)?,
             last_checkpoint_error: row.get(15)?,
@@ -1762,11 +1776,11 @@ fn apply_projection_event_to(
 
 /// Advance the persisted detach/read receipt monotonically. A receipt cannot
 /// acknowledge an event the controller projection has not durably applied.
-pub fn advance_detached_after_event_ordinal(session_id: &str, through: u64) -> Result<u64> {
-    advance_detached_after_event_ordinal_to(&database_path(), session_id, through)
+pub fn advance_viewed_through_event_ordinal(session_id: &str, through: u64) -> Result<u64> {
+    advance_viewed_through_event_ordinal_to(&database_path(), session_id, through)
 }
 
-fn advance_detached_after_event_ordinal_to(
+fn advance_viewed_through_event_ordinal_to(
     path: &Path,
     session_id: &str,
     through: u64,
@@ -1788,12 +1802,12 @@ fn advance_detached_after_event_ordinal_to(
     }
     tx.execute(
         "UPDATE sessions
-         SET detached_after_event_ordinal = max(detached_after_event_ordinal, ?2)
+         SET viewed_through_event_ordinal = max(viewed_through_event_ordinal, ?2)
          WHERE session_id = ?1",
         params![session_id, through],
     )?;
     let receipt = tx.query_row(
-        "SELECT detached_after_event_ordinal FROM sessions WHERE session_id = ?1",
+        "SELECT viewed_through_event_ordinal FROM sessions WHERE session_id = ?1",
         [session_id],
         |row| row.get::<_, u64>(0),
     )?;
@@ -2213,7 +2227,7 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
         "INSERT INTO sessions(
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
-             detached_after_event_ordinal, last_error, resource_allocation,
+             viewed_through_event_ordinal, last_error, resource_allocation,
              last_checkpoint_error, project_directory, managed_worktree,
              container_cpus, container_memory, archived
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
@@ -2227,9 +2241,9 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
              acp_session_title = excluded.acp_session_title,
              session_title_override = excluded.session_title_override,
              updated_at = excluded.updated_at,
-             detached_after_event_ordinal = max(
-                 sessions.detached_after_event_ordinal,
-                 excluded.detached_after_event_ordinal
+             viewed_through_event_ordinal = max(
+                 sessions.viewed_through_event_ordinal,
+                 excluded.viewed_through_event_ordinal
              ),
              last_error = excluded.last_error,
              resource_allocation = excluded.resource_allocation,
@@ -2250,7 +2264,7 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
             session.acp_session_title,
             session.session_title_override,
             session.updated_at,
-            session.detached_after_event_ordinal,
+            session.viewed_through_event_ordinal,
             session.last_error,
             session
                 .resource_allocation
@@ -2313,7 +2327,7 @@ fn update_lifecycle_fields(tx: &Transaction<'_>, session: &SessionRecord) -> Res
              target_template_id = ?5,
              state = ?6,
              updated_at = ?7,
-             detached_after_event_ordinal = max(detached_after_event_ordinal, ?8),
+             viewed_through_event_ordinal = max(viewed_through_event_ordinal, ?8),
              last_error = ?9,
              resource_allocation = ?10,
              last_checkpoint_error = ?11,
@@ -2328,7 +2342,7 @@ fn update_lifecycle_fields(tx: &Transaction<'_>, session: &SessionRecord) -> Res
             session.target_template_id,
             session_state_name(session.state),
             session.updated_at,
-            session.detached_after_event_ordinal,
+            session.viewed_through_event_ordinal,
             session.last_error,
             session
                 .resource_allocation
@@ -2728,7 +2742,7 @@ fn migrate_legacy_state_from(legacy: &Path, database: &Path) -> Result<()> {
     // them across the new compatibility floor could mark unseen relay events
     // as read.
     for session in state.sessions.values_mut() {
-        session.detached_after_event_ordinal = 0;
+        session.viewed_through_event_ordinal = 0;
     }
     save_state_to(database, &state)?;
     let migrated = legacy.with_file_name("state.json.migrated-v1");
@@ -2851,7 +2865,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-12T00:00:00Z".into(),
             updated_at: "2026-08-12T01:00:00Z".into(),
-            detached_after_event_ordinal: 7,
+            viewed_through_event_ordinal: 7,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: Some("temporary recovery failure".into()),
@@ -3575,7 +3589,7 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT detached_after_event_ordinal FROM sessions WHERE session_id = 'session-1'",
+                    "SELECT viewed_through_event_ordinal FROM sessions WHERE session_id = 'session-1'",
                     [],
                     |row| row.get::<_, u64>(0),
                 )
@@ -3772,7 +3786,7 @@ mod tests {
                      session_id, title, harness_kind, last_profile, target_template_id,
                      state, updated_at, detached_after_event_ordinal, last_error
                  ) VALUES (
-                     'session-1', 'old session', 'kimi', 'kimi-1', 'podman',
+                     'session-1', 'old session', 'kimi', 'kimi-1', 'raw-localhost',
                      'running', 'now', 12, 'nothing yet'
                  );
                  INSERT INTO session_contexts VALUES ('session-2', 'project-1', 'now');
@@ -3803,6 +3817,16 @@ mod tests {
                 .unwrap(),
             SCHEMA_VERSION
         );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT target_template_id FROM sessions WHERE session_id = 'session-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "localhost"
+        );
         // Version 8 gave queue entries a kind. A row written before it is a
         // prompt.
         assert!(table_has_column(&connection, "materialized_queued_prompts", "kind_json").unwrap());
@@ -3822,7 +3846,7 @@ mod tests {
         let (title, harness, ordinal, error, draft): (String, String, u64, String, String) =
             connection
                 .query_row(
-                    "SELECT title, harness_kind, detached_after_event_ordinal, last_error,
+                    "SELECT title, harness_kind, viewed_through_event_ordinal, last_error,
                             draft_input
                      FROM sessions WHERE session_id = 'session-1'",
                     [],
@@ -4086,7 +4110,7 @@ mod tests {
             SCHEMA_VERSION
         );
         for (table, column) in [
-            ("sessions", "detached_after_event_ordinal"),
+            ("sessions", "viewed_through_event_ordinal"),
             ("sessions", "managed_worktree"),
             ("session_checkpoints", "event_frontier"),
             ("prompt_history", "event_ordinal"),
@@ -4450,7 +4474,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("hel.sqlite3");
         let mut operational = session("session-1", "project-1");
-        operational.detached_after_event_ordinal = 0;
+        operational.viewed_through_event_ordinal = 0;
         save_session_to(&database, &operational).unwrap();
         let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
         for ordinal in 1..=2 {
@@ -4468,21 +4492,21 @@ mod tests {
         }
 
         assert_eq!(
-            advance_detached_after_event_ordinal_to(&database, "session-1", 2).unwrap(),
+            advance_viewed_through_event_ordinal_to(&database, "session-1", 2).unwrap(),
             2
         );
         assert_eq!(
-            advance_detached_after_event_ordinal_to(&database, "session-1", 1).unwrap(),
+            advance_viewed_through_event_ordinal_to(&database, "session-1", 1).unwrap(),
             2
         );
         assert!(
-            advance_detached_after_event_ordinal_to(&database, "session-1", 3)
+            advance_viewed_through_event_ordinal_to(&database, "session-1", 3)
                 .unwrap_err()
                 .to_string()
                 .contains("projection is at 2")
         );
         assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].detached_after_event_ordinal,
+            load_state_from(&database).unwrap().sessions["session-1"].viewed_through_event_ordinal,
             2
         );
     }
@@ -4970,7 +4994,7 @@ mod tests {
             .sessions
             .get_mut("session-1")
             .unwrap()
-            .detached_after_event_ordinal = 0;
+            .viewed_through_event_ordinal = 0;
         assert_eq!(load_state_from(&database).unwrap(), state);
         assert!(!legacy.exists());
         assert!(directory.path().join("state.json.migrated-v1").exists());

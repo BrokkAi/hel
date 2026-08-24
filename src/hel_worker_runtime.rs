@@ -269,6 +269,10 @@ mod unix {
             resume_session,
             harness: config.harness,
             force_unrestricted_mode: config.force_unrestricted_mode,
+            acp_activity: relay
+                .lock()
+                .expect("relay lock poisoned")
+                .acp_activity_clock(),
         };
         let mut acp_task = tokio::spawn(hel_acp::run(acp_spec, acp_commands_rx, acp_events_tx));
 

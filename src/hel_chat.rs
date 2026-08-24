@@ -64,7 +64,8 @@ use transcript::{
 pub use active::ActiveChat;
 pub use transcript::{
     BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, materialized_chunks_text,
-    materialized_content_text, materialized_tool_diffstats, render_agent_message_tail,
+    materialized_content_text, materialized_tool_diffstats, render_agent_message_head,
+    render_agent_message_tail,
 };
 
 const MOUSE_SCROLL_ROWS: usize = 3;
@@ -142,22 +143,19 @@ impl QueuedPrompt {
 }
 
 /// What the chat's session header shows when it opens: where this session sits
-/// among the active sessions, and the other sessions it lists.
+/// among the same-project active sessions, and the other sessions it lists.
 #[derive(Debug, Clone, Default)]
 pub struct SessionHeaderIdentity {
-    pub project: String,
     pub position: usize,
     pub others: Vec<OtherSessionIdentity>,
 }
 
-/// Identity of another session, snapshotted when the chat opens. Both fields
-/// stay fixed for the visit: `position` is the session's place in the ordered
-/// list of active sessions at that moment, not a live value.
+/// Identity of another same-project session, snapshotted when the chat opens.
+/// `position` is its place in that list at that moment, not a live value.
 #[derive(Debug, Clone)]
 pub struct OtherSessionIdentity {
     pub session_id: String,
     pub position: usize,
-    pub project: String,
 }
 
 /// What the conversations pane says about one other session. The id travels
@@ -166,7 +164,6 @@ pub struct OtherSessionIdentity {
 struct OtherSessionActivity {
     session_id: String,
     position: usize,
-    project: String,
     turn_started_at_epoch_seconds: Option<u64>,
     last_agent_line: Option<String>,
 }
@@ -289,7 +286,6 @@ pub struct ChatState {
     voice_active: bool,
     /// Project name and header position of this session, snapshotted when the
     /// chat opened.
-    project: String,
     position: usize,
     turn_started_at_epoch_seconds: Option<u64>,
     other_sessions: Vec<OtherSessionActivity>,
@@ -365,7 +361,6 @@ impl ChatState {
             render_cache: TranscriptRenderCache::default(),
             notices: Notices::default(),
             voice_active: false,
-            project: String::new(),
             position: 0,
             turn_started_at_epoch_seconds: None,
             other_sessions: Vec::new(),
@@ -661,8 +656,7 @@ impl ChatState {
 
     /// Names this session in the header and places its line among the other
     /// sessions. Both are fixed for the visit.
-    pub fn set_header_identity(&mut self, project: impl Into<String>, position: usize) {
-        self.project = project.into();
+    pub fn set_header_position(&mut self, position: usize) {
         self.position = position;
     }
 

@@ -226,6 +226,8 @@ pub struct RelayOperationalState {
     pub queued_prompts: Vec<QueuedRelayPrompt>,
     pub checkpoint_barrier: Option<String>,
     pub checkpoint_ready: Option<RelayCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_acp_activity_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -479,6 +481,7 @@ impl RelaySnapshot {
                     ordinal,
                     digest: digest.clone(),
                 }),
+            last_acp_activity_at_ms: None,
         }
     }
 

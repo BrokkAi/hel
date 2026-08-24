@@ -261,7 +261,7 @@ fn adopted_session_record(
         session_title_override: None,
         created_at: now.clone(),
         updated_at: now,
-        detached_after_event_ordinal: 0,
+        viewed_through_event_ordinal: 0,
         draft_input: String::new(),
         last_error: None,
         last_checkpoint_error: None,

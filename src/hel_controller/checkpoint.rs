@@ -1710,6 +1710,7 @@ mod tests {
                 queued_prompts: Vec::new(),
                 checkpoint_barrier: Some("checkpoint-1".into()),
                 checkpoint_ready: None,
+                last_acp_activity_at_ms: None,
             },
         }
     }

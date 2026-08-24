@@ -125,7 +125,7 @@ fn plan_read_receipt(state: &HelState, session_id: &str, through: u64) -> ReadRe
     let Some(session) = state.sessions.get(session_id) else {
         return ReadReceiptPlan::UnknownSession;
     };
-    if through > session.detached_after_event_ordinal {
+    if through > session.viewed_through_event_ordinal {
         ReadReceiptPlan::Persist
     } else {
         ReadReceiptPlan::AlreadyRead
@@ -139,10 +139,10 @@ fn apply_read_receipt(state: &mut HelState, session_id: &str, receipt: u64) -> b
     let Some(session) = state.sessions.get_mut(session_id) else {
         return false;
     };
-    if receipt <= session.detached_after_event_ordinal {
+    if receipt <= session.viewed_through_event_ordinal {
         return false;
     }
-    session.detached_after_event_ordinal = receipt;
+    session.viewed_through_event_ordinal = receipt;
     true
 }
 
@@ -478,7 +478,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             let persisted_session_id = session_id.clone();
                             tokio::spawn(async move {
                                 let joined = tokio::task::spawn_blocking(move || {
-                                    hel::hel_database::advance_detached_after_event_ordinal(
+                                    hel::hel_database::advance_viewed_through_event_ordinal(
                                         &persisted_session_id,
                                         through,
                                     )
@@ -1061,7 +1061,7 @@ mod tests {
         }
     }
 
-    fn phone_session(id: &str, detached_after_event_ordinal: u64) -> SessionRecord {
+    fn phone_session(id: &str, viewed_through_event_ordinal: u64) -> SessionRecord {
         SessionRecord {
             archived: false,
             container_cpus: None,
@@ -1083,7 +1083,7 @@ mod tests {
             session_title_override: Some("Phone launch".into()),
             created_at: "2026-08-14T00:00:00Z".into(),
             updated_at: "2026-08-14T00:00:00Z".into(),
-            detached_after_event_ordinal,
+            viewed_through_event_ordinal,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
@@ -1119,7 +1119,7 @@ mod tests {
         );
 
         assert!(apply_read_receipt(&mut state, session_id, 9));
-        assert_eq!(state.sessions[session_id].detached_after_event_ordinal, 9);
+        assert_eq!(state.sessions[session_id].viewed_through_event_ordinal, 9);
         assert!(!apply_read_receipt(&mut state, session_id, 9));
         assert!(!apply_read_receipt(&mut state, session_id, 7));
         assert!(!apply_read_receipt(&mut state, "missing", 9));

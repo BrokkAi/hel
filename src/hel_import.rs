@@ -2941,7 +2941,7 @@ fn import_claude_session_inner(
             session_title_override,
             created_at: timestamp.clone(),
             updated_at: timestamp,
-            detached_after_event_ordinal: 0,
+            viewed_through_event_ordinal: 0,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
@@ -3242,7 +3242,7 @@ fn import_native_session(
             session_title_override,
             created_at: timestamp.clone(),
             updated_at: timestamp,
-            detached_after_event_ordinal: 0,
+            viewed_through_event_ordinal: 0,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
@@ -3279,7 +3279,7 @@ fn raw_import_target_id(config: &HelConfig) -> Option<String> {
     let local_bare = |template: &TargetTemplate| matches!(template, TargetTemplate::LocalBare);
     config
         .targets
-        .get_key_value("raw-localhost")
+        .get_key_value("localhost")
         .filter(|(_, template)| local_bare(template))
         .map(|(id, _)| id.clone())
         .or_else(|| {
@@ -4523,7 +4523,7 @@ mod tests {
             },
         )]);
         if local_bare {
-            targets.insert("raw-localhost".to_owned(), TargetTemplate::LocalBare);
+            targets.insert("localhost".to_owned(), TargetTemplate::LocalBare);
         }
         targets
     }
@@ -4567,7 +4567,7 @@ mod tests {
             record.project_directory,
             Some(fs::canonicalize(&app).unwrap())
         );
-        assert_eq!(record.target_template_id, "raw-localhost");
+        assert_eq!(record.target_template_id, "localhost");
         assert_eq!(record.bundle_id, "app");
     }
 
@@ -4701,7 +4701,7 @@ mod tests {
             record.project_directory,
             Some(fs::canonicalize(&app).unwrap())
         );
-        assert_eq!(record.target_template_id, "raw-localhost");
+        assert_eq!(record.target_template_id, "localhost");
     }
 
     #[test]

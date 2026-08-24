@@ -1125,7 +1125,7 @@ mod tests {
         let mut config = HelConfig::default();
         config
             .targets
-            .insert("raw-localhost".into(), TargetTemplate::LocalBare);
+            .insert("localhost".into(), TargetTemplate::LocalBare);
         let controller = Controller {
             config,
             state: HelState::default(),
@@ -1135,7 +1135,7 @@ mod tests {
         };
 
         controller
-            .validate_project_directory("raw-localhost", project.path(), &executor)
+            .validate_project_directory("localhost", project.path(), &executor)
             .unwrap();
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 1);

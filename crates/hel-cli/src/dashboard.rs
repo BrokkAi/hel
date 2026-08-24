@@ -157,6 +157,8 @@ pub(crate) struct DashboardContext {
     materialized_projection_permits: Arc<tokio::sync::Semaphore>,
     materialized_projections_in_flight: BTreeSet<String>,
     pending_materialized_projections: BTreeMap<String, (MaterializedSession, u64)>,
+    read_receipt_in_flight: Option<String>,
+    pending_read_receipts: BTreeMap<String, u64>,
 
     checkpoint_archive_targets_seen: BTreeMap<String, std::path::PathBuf>,
     checkpoint_archive_generation: u64,
@@ -174,7 +176,7 @@ fn enqueue_materialized_projection(
     in_flight: &mut BTreeSet<String>,
     pending: &mut BTreeMap<String, (MaterializedSession, u64)>,
     materialized: MaterializedSession,
-    detached_after_event_ordinal: u64,
+    viewed_through_event_ordinal: u64,
 ) -> Option<(MaterializedSession, u64)> {
     let session_id = materialized.session_id.clone();
     if !in_flight.insert(session_id.clone()) {
@@ -182,11 +184,11 @@ fn enqueue_materialized_projection(
             materialized.applied_event_ordinal >= queued.applied_event_ordinal
         });
         if replace {
-            pending.insert(session_id, (materialized, detached_after_event_ordinal));
+            pending.insert(session_id, (materialized, viewed_through_event_ordinal));
         }
         return None;
     }
-    Some((materialized, detached_after_event_ordinal))
+    Some((materialized, viewed_through_event_ordinal))
 }
 
 pub(crate) async fn run_dashboard() -> Result<()> {
@@ -268,6 +270,9 @@ pub(crate) async fn run_dashboard() -> Result<()> {
             // off-screen chat current.
             () = hel::hel_chat::ActiveChat::pump(context.active_chat.as_mut()) => {
                 context.dirty |= context.view == View::Chat;
+                if context.view == View::Chat {
+                    context.acknowledge_visible_chat();
+                }
             }
             update = context.quota.wait(), if context.quota.is_open() => {
                 let woke = context.quota.accept(update);
@@ -362,6 +367,54 @@ pub(crate) async fn run_dashboard() -> Result<()> {
 }
 
 impl DashboardContext {
+    pub(super) fn acknowledge_visible_chat(&mut self) {
+        let Some((session_id, through)) = self
+            .active_chat
+            .as_ref()
+            .map(|chat| (chat.session_id().to_owned(), chat.latest_event_ordinal()))
+        else {
+            return;
+        };
+        let Some(session) = self.controller.state.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if through <= session.viewed_through_event_ordinal {
+            return;
+        }
+        session.viewed_through_event_ordinal = through;
+        self.dashboard.set_state(self.controller.state.clone());
+        if self.read_receipt_in_flight.is_some() {
+            self.pending_read_receipts
+                .entry(session_id)
+                .and_modify(|pending| *pending = (*pending).max(through))
+                .or_insert(through);
+            return;
+        }
+        self.spawn_read_receipt(session_id, through);
+    }
+
+    fn spawn_read_receipt(&mut self, session_id: String, through: u64) {
+        self.read_receipt_in_flight = Some(session_id.clone());
+        io::spawn_read_receipt_persist(session_id, through, self.dashboard_io_tx.clone());
+    }
+
+    pub(super) fn finish_read_receipt(
+        &mut self,
+        session_id: String,
+        result: std::result::Result<u64, String>,
+    ) {
+        self.read_receipt_in_flight = None;
+        if let Err(error) = result {
+            self.dashboard.set_notice(format!(
+                "Could not save read status for {}: {error}",
+                short_id(&session_id)
+            ));
+        }
+        if let Some((next_session, through)) = self.pending_read_receipts.pop_first() {
+            self.spawn_read_receipt(next_session, through);
+        }
+    }
+
     /// Loads state, takes the terminal, and starts every background feed.
     /// `Ok(None)` means first-run setup was cancelled and there is nothing to
     /// run.
@@ -502,6 +555,8 @@ impl DashboardContext {
             materialized_projection_permits: Arc::new(tokio::sync::Semaphore::new(2)),
             materialized_projections_in_flight: BTreeSet::new(),
             pending_materialized_projections: BTreeMap::new(),
+            read_receipt_in_flight: None,
+            pending_read_receipts: BTreeMap::new(),
             checkpoint_archive_targets_seen: BTreeMap::new(),
             checkpoint_archive_generation: 0,
         };
@@ -515,13 +570,13 @@ impl DashboardContext {
     pub(super) fn request_materialized_projection(
         &mut self,
         materialized: MaterializedSession,
-        detached_after_event_ordinal: u64,
+        viewed_through_event_ordinal: u64,
     ) {
-        let Some((materialized, detached_after_event_ordinal)) = enqueue_materialized_projection(
+        let Some((materialized, viewed_through_event_ordinal)) = enqueue_materialized_projection(
             &mut self.materialized_projections_in_flight,
             &mut self.pending_materialized_projections,
             materialized,
-            detached_after_event_ordinal,
+            viewed_through_event_ordinal,
         ) else {
             return;
         };
@@ -530,7 +585,7 @@ impl DashboardContext {
         let previous = self.dashboard.take_projection_cache(&session_id);
         spawn_materialized_session_projection(
             materialized,
-            detached_after_event_ordinal,
+            viewed_through_event_ordinal,
             previous,
             self.dashboard_io_tx.clone(),
             Arc::clone(&self.materialized_projection_permits),
@@ -551,10 +606,10 @@ impl DashboardContext {
                 .dashboard
                 .set_notice(format!("Could not update session transcript: {error}")),
         }
-        if let Some((materialized, detached_after_event_ordinal)) =
+        if let Some((materialized, viewed_through_event_ordinal)) =
             self.pending_materialized_projections.remove(&session_id)
         {
-            self.request_materialized_projection(materialized, detached_after_event_ordinal);
+            self.request_materialized_projection(materialized, viewed_through_event_ordinal);
         }
     }
 
@@ -798,6 +853,13 @@ impl DashboardContext {
                 .snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.materialized.clone());
+            let last_acp_activity_at_ms = update
+                .view
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.operational.last_acp_activity_at_ms);
+            self.dashboard
+                .set_last_acp_activity(&session_id, last_acp_activity_at_ms);
             match apply_worker_poll_update(
                 &mut self.controller,
                 &mut self.dashboard,
@@ -807,15 +869,15 @@ impl DashboardContext {
                 Ok(true) => {
                     let _ = self.resource_triggers_tx.try_send(session_id.clone());
                     if let Some(materialized) = materialized {
-                        let detached_after_event_ordinal = self
+                        let viewed_through_event_ordinal = self
                             .controller
                             .state
                             .sessions
                             .get(&session_id)
-                            .map_or(0, |session| session.detached_after_event_ordinal);
+                            .map_or(0, |session| session.viewed_through_event_ordinal);
                         self.request_materialized_projection(
                             materialized,
-                            detached_after_event_ordinal,
+                            viewed_through_event_ordinal,
                         );
                     }
                 }
@@ -1057,6 +1119,7 @@ impl DashboardContext {
                     && let Some(chat) = self.active_chat.as_mut()
                 {
                     chat.focus_conversations();
+                    self.acknowledge_visible_chat();
                 }
                 self.dirty = true;
             }
@@ -1144,19 +1207,20 @@ async fn open_chat_view(
     // Only a fresh view is seeded: a warm chat the loop kept alive holds newer
     // input than this saved copy.
     let saved_draft = session_record.draft_input.clone();
-    // The header lists every active session in the order the session list
-    // shows them, so each one keeps the same place in both views.
+    // Conversation switching stays inside the canonical source project. A
+    // managed worktree and its source checkout therefore remain together,
+    // while unrelated repositories never crowd this pane.
+    let project_key = session_record.project_source(&controller.config).key;
     let mut active = controller
         .state
         .sessions
         .values()
-        .filter(|record| record.state.is_active())
+        .filter(|record| {
+            record.state.is_active() && record.project_source(&controller.config).key == project_key
+        })
         .collect::<Vec<_>>();
     active.sort_by(|left, right| left.compare_by_creation(right));
-    let mut header = hel::hel_chat::SessionHeaderIdentity {
-        project: session_record.project_name(&controller.config),
-        ..hel::hel_chat::SessionHeaderIdentity::default()
-    };
+    let mut header = hel::hel_chat::SessionHeaderIdentity::default();
     for (position, record) in active.into_iter().enumerate() {
         if record.id == session_id {
             header.position = position;
@@ -1165,7 +1229,6 @@ async fn open_chat_view(
         header.others.push(hel::hel_chat::OtherSessionIdentity {
             session_id: record.id.clone(),
             position,
-            project: record.project_name(&controller.config),
         });
     }
     let recovery_context = hel::hel_state::RecoveryContext {
@@ -1236,7 +1299,7 @@ fn record_chat_detach_state(
         ));
         return None;
     };
-    session.detached_after_event_ordinal = session.detached_after_event_ordinal.max(event_ordinal);
+    session.viewed_through_event_ordinal = session.viewed_through_event_ordinal.max(event_ordinal);
     session.draft_input = draft.to_owned();
     dashboard.set_state(controller.state.clone());
     dashboard.clear_notice();

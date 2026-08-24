@@ -446,7 +446,7 @@ fn build_config_with_runtime(
     #[cfg(unix)]
     config
         .targets
-        .insert("raw-localhost".to_owned(), TargetTemplate::LocalBare);
+        .insert("localhost".to_owned(), TargetTemplate::LocalBare);
     if let Some((runtime, image)) = runtime {
         let container = ContainerTemplate {
             image: image.trim().to_owned(),
@@ -1306,7 +1306,7 @@ mod tests {
             TargetTemplate::LocalPodman { .. }
         ));
         assert!(matches!(
-            config.targets["raw-localhost"],
+            config.targets["localhost"],
             TargetTemplate::LocalBare
         ));
     }
@@ -1917,7 +1917,7 @@ Host builder
         );
         let config = HelConfig::load_from(&config_path).unwrap();
         assert!(matches!(
-            config.targets["raw-localhost"],
+            config.targets["localhost"],
             TargetTemplate::LocalBare
         ));
         // No smoke test runs without a runtime; the trailing commands belong to

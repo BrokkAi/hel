@@ -291,6 +291,7 @@ pub(crate) async fn apply_dashboard_action(
         DashboardAction::Open { session_id } => {
             if context.hold_chat_session(&session_id).await.is_ok() {
                 context.view = View::Chat;
+                context.acknowledge_visible_chat();
             }
             context.dirty = true;
         }

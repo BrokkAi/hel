@@ -50,9 +50,6 @@ pub(crate) const MOUSE_SCROLL_ROWS: isize = 3;
 /// to count as a double click.
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Rows one wheel notch moves the selected session's conversation preview.
-const PREVIEW_SCROLL_ROWS: usize = 3;
-
 /// A side effect requested by the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardAction {
@@ -305,19 +302,13 @@ pub struct DashboardState {
     /// scans, and the dialog's own search. Rebuilt where those change and once
     /// a second for the activity labels; empty when no dialog is open.
     pub(crate) resume_rows: Vec<crate::resume::ResumeRow>,
-    /// Hitbox of the selected session's conversation preview, so the wheel can
-    /// scroll that preview instead of moving the selection.
-    pub(crate) selected_preview_area: Option<Rect>,
     /// Row hitboxes for the Active pane, keyed by the row's index into the
     /// active session list. Each rect spans the summary line and every
     /// visible preview line beneath it, so a click anywhere on the row
     /// selects it.
     pub(crate) active_row_areas: Vec<(usize, Rect)>,
-    /// Rows the selected session's preview sits above its live tail. Only one
-    /// preview scrolls at a time; selecting another session snaps this back to
-    /// the tail, which is why the owning session is tracked alongside it.
-    pub(crate) preview_scroll: usize,
-    pub(crate) preview_scroll_session: Option<String>,
+    pub(crate) project_heading_areas: Vec<(String, Rect)>,
+    pub(crate) expanded_project_key: Option<String>,
     /// The pane, row index, and time of the most recent left click on a
     /// session row, so the next click can be recognized as a double click.
     last_row_click: Option<(Focus, usize, Instant)>,
@@ -346,10 +337,9 @@ impl DashboardState {
             resume_sessions_area: None,
             hidden_native_sessions: BTreeSet::new(),
             resume_rows: Vec::new(),
-            selected_preview_area: None,
             active_row_areas: Vec::new(),
-            preview_scroll: 0,
-            preview_scroll_session: None,
+            project_heading_areas: Vec::new(),
+            expanded_project_key: None,
             last_row_click: None,
             mode: Mode::Dashboard,
             notices: Notices::default(),
@@ -510,6 +500,15 @@ impl DashboardState {
             return DashboardAction::None;
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some((project_key, _)) = self
+                .project_heading_areas
+                .iter()
+                .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
+            {
+                let project_key = project_key.clone();
+                self.expand_project(&project_key);
+                return DashboardAction::None;
+            }
             if let Some(&(index, _)) = self
                 .active_row_areas
                 .iter()
@@ -520,22 +519,6 @@ impl DashboardState {
             // The click missed every row; forget any pending double click so
             // a stray click elsewhere can't pair up with the next row click.
             self.last_row_click = None;
-        }
-        // The selected session's conversation preview scrolls its own history;
-        // anywhere else the wheel moves the hovered list's selection.
-        if let Some(area) = self.selected_preview_area
-            && rect_contains(area, mouse.column, mouse.row)
-        {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.preview_scroll = self.preview_scroll.saturating_add(PREVIEW_SCROLL_ROWS);
-                }
-                MouseEventKind::ScrollDown => {
-                    self.preview_scroll = self.preview_scroll.saturating_sub(PREVIEW_SCROLL_ROWS);
-                }
-                _ => {}
-            }
-            return DashboardAction::None;
         }
         let hovered = self.pane_areas.and_then(|areas| {
             areas
@@ -615,6 +598,14 @@ impl DashboardState {
             (KeyCode::Char('s'), true) => {
                 self.cycle_session_order();
                 self.set_notice(format!("Sort by {}", self.session_order.label()));
+                DashboardAction::None
+            }
+            (KeyCode::Char(digit @ '1'..='9'), false) if self.focus == Focus::Active => {
+                self.expand_project_number(digit.to_digit(10).unwrap_or(0) as usize);
+                DashboardAction::None
+            }
+            (KeyCode::Char(' '), _) if self.focus == Focus::Active => {
+                self.expand_selected_project();
                 DashboardAction::None
             }
             (KeyCode::Char('n'), true) => self.begin_new(),
@@ -713,6 +704,10 @@ impl DashboardState {
     }
 
     fn open_or_resume(&mut self) -> DashboardAction {
+        if self.focus == Focus::Active && !self.selected_project_is_expanded() {
+            self.expand_selected_project();
+            return DashboardAction::None;
+        }
         let Some(session) = self.selected_session() else {
             return DashboardAction::None;
         };
@@ -755,12 +750,74 @@ impl DashboardState {
     /// The sessions the dashboard lists, in the current sort order. Only live
     /// sessions appear here; everything else belongs to the resume dialog.
     pub(crate) fn ordered_sessions(&self) -> Vec<&SessionRecord> {
-        partition_sessions(
+        let active = partition_sessions(
             self.state.sessions.values(),
             &self.session_details,
             self.session_order,
         )
-        .0
+        .0;
+        let mut groups = BTreeMap::<(String, String, String), Vec<&SessionRecord>>::new();
+        for session in active {
+            let source = session.project_source(&self.config);
+            groups
+                .entry((source.short.to_lowercase(), source.full, source.key))
+                .or_default()
+                .push(session);
+        }
+        groups.into_values().flatten().collect()
+    }
+
+    pub(crate) fn project_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        for session in self.ordered_sessions() {
+            let key = session.project_source(&self.config).key;
+            if keys.last() != Some(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    pub(crate) fn project_is_expanded(&self, session: &SessionRecord) -> bool {
+        let keys = self.project_keys();
+        keys.len() <= 1
+            || self.expanded_project_key.as_deref()
+                == Some(session.project_source(&self.config).key.as_str())
+    }
+
+    fn selected_project_is_expanded(&self) -> bool {
+        self.selected_session()
+            .is_none_or(|session| self.project_is_expanded(session))
+    }
+
+    fn expand_project(&mut self, project_key: &str) {
+        self.expanded_project_key = Some(project_key.to_owned());
+        if let Some(index) = self
+            .ordered_sessions()
+            .iter()
+            .position(|session| session.project_source(&self.config).key == project_key)
+        {
+            self.focus = Focus::Active;
+            self.session_index = index;
+        }
+    }
+
+    fn expand_selected_project(&mut self) {
+        let key = self
+            .selected_session()
+            .map(|session| session.project_source(&self.config).key);
+        if let Some(key) = key {
+            self.expand_project(&key);
+        }
+    }
+
+    fn expand_project_number(&mut self, number: usize) {
+        if number == 0 {
+            return;
+        }
+        if let Some(key) = self.project_keys().get(number - 1).cloned() {
+            self.expand_project(&key);
+        }
     }
 
     fn cycle_session_order(&mut self) {
@@ -893,6 +950,19 @@ impl DashboardState {
     pub(crate) fn clamp_selections(&mut self) {
         let active_len = self.ordered_sessions().len();
         self.session_index = self.session_index.min(active_len.saturating_sub(1));
+        let project_keys = self.project_keys();
+        if project_keys.len() == 1 {
+            self.expanded_project_key = project_keys.first().cloned();
+        } else if !self
+            .expanded_project_key
+            .as_ref()
+            .is_some_and(|key| project_keys.contains(key))
+        {
+            self.expanded_project_key = self
+                .selected_session()
+                .map(|session| session.project_source(&self.config).key)
+                .or_else(|| project_keys.first().cloned());
+        }
         self.quota_index = self
             .quota_index
             .min(self.config.profiles.len().saturating_sub(1));
@@ -1023,7 +1093,7 @@ mod tests {
     use crate::test_support::*;
 
     use crate::ingest::{SessionDetail, TranscriptHydration};
-    use crate::render::{SELECTED_TRANSCRIPT_LINES, render};
+    use crate::render::render;
 
     #[test]
     fn dashboard_actions_require_control_while_navigation_does_not() {
@@ -1745,156 +1815,6 @@ mod tests {
             );
         }
         dashboard
-    }
-
-    #[test]
-    fn wheel_over_the_selected_preview_scrolls_its_conversation_not_the_session_list() {
-        let mut dashboard = dashboard_with_conversations(3);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw previews");
-        let preview = dashboard
-            .selected_preview_area
-            .expect("the selected session exposes a preview hitbox");
-        assert!(
-            rect_shows(&terminal, preview, "answer 13"),
-            "opens on the tail"
-        );
-
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw scrolled preview");
-
-        assert!(
-            !rect_shows(&terminal, preview, "answer 13"),
-            "the wheel scrolled the preview above its live tail"
-        );
-        assert!(
-            rect_shows(&terminal, preview, "question 12"),
-            "older rows came into view"
-        );
-        assert_eq!(
-            dashboard.session_index, 0,
-            "scrolling a preview must not move the selection"
-        );
-        assert_eq!(dashboard.focus, Focus::Active);
-    }
-
-    #[test]
-    fn wheel_below_the_selected_preview_still_moves_the_session_selection() {
-        let mut dashboard = dashboard_with_conversations(3);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw previews");
-        let pane_areas = dashboard.pane_areas.expect("dashboard pane hitboxes");
-        assert!(dashboard.selected_preview_area.is_some());
-
-        // The Active pane's own header sits outside every preview hitbox.
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[0]));
-
-        assert_eq!(dashboard.session_index, 2);
-        assert_eq!(dashboard.preview_scroll, 0);
-    }
-
-    #[test]
-    fn selecting_another_session_snaps_the_previous_preview_back_to_its_tail() {
-        let mut dashboard = dashboard_with_conversations(3);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw previews");
-        let preview = dashboard.selected_preview_area.expect("preview hitbox");
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw scrolled preview");
-        assert!(dashboard.preview_scroll > 0, "the preview is scrolled back");
-
-        dashboard.move_selection(1);
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw after moving the selection");
-        assert_eq!(
-            dashboard.preview_scroll, 0,
-            "the new selection starts at its own tail"
-        );
-
-        dashboard.move_selection(-1);
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw after returning to the first session");
-
-        assert_eq!(dashboard.preview_scroll, 0);
-        let preview = dashboard.selected_preview_area.expect("preview hitbox");
-        assert!(
-            rect_shows(&terminal, preview, "answer 13"),
-            "the preview left behind snapped back to its live tail"
-        );
-    }
-
-    #[test]
-    fn preview_scroll_reaches_the_oldest_row_in_a_constrained_terminal() {
-        // A short pane gives the selected preview fewer lines than
-        // SELECTED_TRANSCRIPT_LINES, so the provisional sizing pass must not cap
-        // how far the preview can scroll.
-        let mut dashboard = dashboard_with_conversations(1);
-        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw previews");
-        let preview = dashboard
-            .selected_preview_area
-            .expect("preview hitbox in a short terminal");
-        assert!(
-            preview.height < SELECTED_TRANSCRIPT_LINES as u16,
-            "the preview must be line-constrained for this test to mean anything"
-        );
-
-        for _ in 0..60 {
-            dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
-            terminal
-                .draw(|frame| render(frame, &mut dashboard))
-                .expect("draw scrolled preview");
-        }
-
-        assert!(
-            rect_shows(&terminal, preview, "question 0"),
-            "a constrained preview still reaches the oldest message"
-        );
-    }
-
-    #[test]
-    fn preview_scroll_stops_at_the_oldest_row_of_the_conversation() {
-        let mut dashboard = dashboard_with_conversations(1);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw previews");
-        let preview = dashboard.selected_preview_area.expect("preview hitbox");
-
-        for _ in 0..40 {
-            dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
-            terminal
-                .draw(|frame| render(frame, &mut dashboard))
-                .expect("draw scrolled preview");
-        }
-        let clamped = dashboard.preview_scroll;
-
-        assert!(
-            rect_shows(&terminal, preview, "question 0"),
-            "reaches the oldest message"
-        );
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw at the top");
-        assert_eq!(
-            dashboard.preview_scroll, clamped,
-            "scrolling past the oldest row is clamped"
-        );
     }
 
     #[test]

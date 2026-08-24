@@ -11,7 +11,7 @@ macOS 26 or newer on Apple silicon. On these isolated targets, hel runs the
 selected harness in its unrestricted mode (`agent-full-access`,
 `bypassPermissions`, `auto`, Grok Build's `--always-approve` launch flag, or
 DeepSeek Harness's `danger-full-access` permission mode),
-instead of the raw-localhost approval flow. Every one of those approves every
+instead of the localhost approval flow. Every one of those approves every
 call. Note that Kimi Code's mode is named `auto` but is not a review policy
 that approves only low-risk calls.
 
