@@ -621,7 +621,7 @@ fn session_top_line(
     } else {
         target_id
     };
-    let status = if let Some(operation) = operation {
+    let status_columns = if let Some(operation) = operation {
         let (label, started_at) = match (operation.stage, operation.kind) {
             (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
                 stage.label(),
@@ -631,16 +631,16 @@ fn session_top_line(
             ),
             _ => (operation.kind.label(), operation.started_at_epoch_seconds),
         };
-        format!(
+        vec![format!(
             "{label} {}",
             format_elapsed(now_epoch_seconds.saturating_sub(started_at))
-        )
+        )]
     } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
-        format!(
+        vec![format!(
             "Launch {}",
             format_elapsed(now_epoch_seconds.saturating_sub(started_at))
-        )
+        )]
     } else if let Some(turn_started) = detail.and_then(|detail| detail.current_turn_started_at) {
         let turn = hel::usage_format::format_turn_clock(now_epoch_seconds, Some(turn_started));
         let step_started = detail
@@ -649,19 +649,24 @@ fn session_top_line(
             .unwrap_or(turn_started)
             .max(turn_started);
         let step = hel::usage_format::format_turn_clock(now_epoch_seconds, Some(step_started));
-        format!("Turn {turn} Step {step}")
+        vec![format!("Turn {turn}"), format!("Step {step}")]
     } else {
-        "[idle]".into()
+        vec!["[idle]".into()]
     };
     let queued = detail
         .map(|detail| detail.queued_prompts.len())
         .filter(|count| *count > 0)
         .map(|count| format!(" [{count} queued]"))
         .unwrap_or_default();
-    let content = format!(
-        "{prefix}{target} {status} {profile}{queued} {}",
-        recovery_warning_name(session, session_name(session).to_owned(), now_epoch_seconds)
-    );
+    let mut columns = vec![target];
+    columns.extend(status_columns);
+    columns.push(format!("{profile}{queued}"));
+    columns.push(recovery_warning_name(
+        session,
+        session_name(session).to_owned(),
+        now_epoch_seconds,
+    ));
+    let content = format!("{prefix}{}", columns.join("  "));
     Line::styled(content, Style::default().fg(session_band_color(detail)))
 }
 
@@ -1248,8 +1253,9 @@ mod tests {
         assert!(!rendered.contains("[1] hel"));
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
-        assert!(rendered.contains("Turn "));
-        assert!(rendered.contains(" Step "));
+        assert!(rendered.contains("podman  Turn "));
+        assert!(rendered.contains("  Step "));
+        assert!(rendered.contains("  codex-1 [1 queued]  ACP pretty name"));
         assert!(rendered.contains("[1 queued]"));
         assert!(rendered.contains("You: question 1"));
         assert!(rendered.contains("Agent: "));
