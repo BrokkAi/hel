@@ -981,6 +981,10 @@ fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
 
 const EMPTY_QUOTA_COLOR: Color = Color::DarkGray;
 
+fn empty_quota_style() -> Style {
+    Style::default().bg(EMPTY_QUOTA_COLOR)
+}
+
 fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
     const CELLS: usize = 10;
     const EIGHTHS_PER_CELL: usize = 8;
@@ -999,14 +1003,11 @@ fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
         21..=50 => Color::Yellow,
         _ => Color::Green,
     };
-    let bar_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let bar_style = empty_quota_style().fg(color).add_modifier(Modifier::BOLD);
     Line::from(vec![
         Span::styled("█".repeat(full_cells), bar_style),
         Span::styled(partial.to_string(), bar_style),
-        Span::styled(
-            "░".repeat(empty_cells),
-            Style::default().fg(EMPTY_QUOTA_COLOR),
-        ),
+        Span::styled(" ".repeat(empty_cells), empty_quota_style()),
         Span::styled(
             format!(" {remaining:>3}%"),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -1017,9 +1018,8 @@ fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
 fn api_quota_bar() -> Line<'static> {
     Line::from(Span::styled(
         format!("{:^10}", hel::hel_quota::API_LABEL),
-        Style::default()
+        empty_quota_style()
             .fg(Color::White)
-            .bg(EMPTY_QUOTA_COLOR)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -2350,18 +2350,26 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "███████▎░░  73%"
+            "███████▎    73%"
         );
         assert_eq!(bar.spans[0].style.fg, Some(Color::Green));
-        assert_eq!(bar.spans[2].style.fg, Some(Color::DarkGray));
+        assert_eq!(bar.spans[2].style.bg, Some(EMPTY_QUOTA_COLOR));
         assert!(quota_bar(None).spans.is_empty());
     }
 
     #[test]
-    fn api_quota_label_uses_the_empty_bar_background() {
-        let bar = api_quota_bar();
-        assert_eq!(bar.spans[0].content, "   API    ");
-        assert_eq!(bar.spans[0].style.bg, Some(EMPTY_QUOTA_COLOR));
+    fn api_quota_label_uses_the_depleted_bar_background() {
+        let api = api_quota_bar();
+        let depleted = quota_bar(Some(&QuotaWindow {
+            label: "Week".into(),
+            remaining_percent: Some(50),
+            used: None,
+            limit: None,
+            resets: None,
+            resets_at_epoch_seconds: None,
+        }));
+        assert_eq!(api.spans[0].content, "   API    ");
+        assert_eq!(api.spans[0].style.bg, depleted.spans[2].style.bg);
     }
 
     #[test]
