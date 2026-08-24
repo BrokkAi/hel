@@ -345,6 +345,15 @@ pub struct ClaimedRelayCommand {
     pub command_id: String,
     pub accepted_ordinal: u64,
     pub command: RelayCommand,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_prompt_context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingPromptContext {
+    pub(crate) text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attached_command_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +402,8 @@ pub(crate) struct RelaySnapshot {
     pub(crate) config: BTreeMap<String, String>,
     pub(crate) active_prompt: Option<StoredActiveRelayPrompt>,
     pub(crate) queued_prompts: Vec<StoredQueuedRelayCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_prompt_context: Option<PendingPromptContext>,
     pub(crate) checkpoint_barrier: Option<String>,
     pub(crate) checkpoint_ready_through: Option<u64>,
     pub(crate) checkpoint_ready_digest: Option<String>,
@@ -421,6 +432,7 @@ impl RelaySnapshot {
             config: BTreeMap::new(),
             active_prompt: None,
             queued_prompts: Vec::new(),
+            pending_prompt_context: None,
             checkpoint_barrier: None,
             checkpoint_ready_through: None,
             checkpoint_ready_digest: None,
@@ -920,6 +932,14 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
                     if snapshot.execution == RelayExecutionState::Running {
                         snapshot.execution = RelayExecutionState::Idle;
                     }
+                    if snapshot
+                        .pending_prompt_context
+                        .as_ref()
+                        .and_then(|context| context.attached_command_id.as_deref())
+                        == Some(command_id.as_str())
+                    {
+                        snapshot.pending_prompt_context = None;
+                    }
                 }
                 (
                     RelayCommand::RemoveQueuedPrompt { queued_command_id },
@@ -1080,6 +1100,18 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
             {
                 snapshot.active_prompt = None;
                 snapshot.execution = RelayExecutionState::Idle;
+            }
+            if snapshot
+                .pending_prompt_context
+                .as_ref()
+                .and_then(|context| context.attached_command_id.as_deref())
+                == Some(command_id.as_str())
+            {
+                snapshot
+                    .pending_prompt_context
+                    .as_mut()
+                    .expect("pending prompt context disappeared")
+                    .attached_command_id = None;
             }
             if matches!(command, RelayCommand::BeginCheckpoint { .. })
                 && snapshot.checkpoint_barrier.as_deref() == Some(command_id)

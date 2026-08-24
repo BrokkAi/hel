@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::hel_elicitation::ElicitationResponse;
+use crate::hel_project_memory::ProjectMemorySnapshot;
 
 use super::DurableRelay;
 use super::journal::read_bounded_line;
@@ -66,6 +67,20 @@ pub enum RelayRequest {
         command: RelayCommand,
     },
     Status,
+    /// Add hidden background context attached to the next real prompt.
+    /// This mutates only the relay-private snapshot and is never projected as
+    /// conversation history.
+    InstallPromptContext {
+        text: String,
+    },
+    /// Read the session-private memory replica and the baseline it was seeded
+    /// from. Connection-only: memory content never enters the relay journal.
+    ProjectMemorySnapshot,
+    /// Install a controller-reconciled tree into both the replica and its
+    /// baseline for the next three-way synchronization.
+    InstallProjectMemorySnapshot {
+        snapshot: ProjectMemorySnapshot,
+    },
     /// Report non-secret metadata for this session's harness credentials.
     /// The runtime handles credential requests on the connection and never
     /// passes them through the durable relay.
@@ -110,6 +125,9 @@ impl RelayRequest {
             Self::Acknowledge { .. } => "acknowledge",
             Self::Submit { .. } => "submit",
             Self::Status => "status",
+            Self::InstallPromptContext { .. } => "install_prompt_context",
+            Self::ProjectMemorySnapshot => "project_memory_snapshot",
+            Self::InstallProjectMemorySnapshot { .. } => "install_project_memory_snapshot",
             Self::CredentialState => "credential_state",
             Self::ReadCredentials => "read_credentials",
             Self::InstallCredentials { .. } => "install_credentials",
@@ -121,10 +139,13 @@ impl RelayRequest {
     }
 
     /// Oldest protocol that understands this method. Form answers landed in
-    /// protocol 2; every earlier durable method is still valid on protocol 1.
+    /// protocol 2, hidden context in 3, and project-memory sync in 4; every
+    /// earlier durable method is still valid on protocol 1.
     pub const fn minimum_protocol(&self) -> u32 {
         match self {
             Self::RespondElicitation { .. } => 2,
+            Self::InstallPromptContext { .. } => 3,
+            Self::ProjectMemorySnapshot | Self::InstallProjectMemorySnapshot { .. } => 4,
             _ => RELAY_MIN_PROTOCOL_VERSION,
         }
     }
@@ -207,6 +228,12 @@ pub enum RelayResponsePayload {
         ordinal: u64,
     },
     Status(RelayOperationalState),
+    PromptContextInstalled,
+    ProjectMemorySnapshot {
+        baseline: ProjectMemorySnapshot,
+        replica: ProjectMemorySnapshot,
+    },
+    ProjectMemorySnapshotInstalled,
     /// Fingerprint and freshness of a session's harness credentials. Neither
     /// value is secret.
     CredentialState {
@@ -398,8 +425,10 @@ mod tests {
         assert_eq!(v1.negotiate(v2), None);
         assert!(RelayVersionRange::CURRENT.contains(1));
         assert!(RelayVersionRange::CURRENT.contains(2));
+        assert!(RelayVersionRange::CURRENT.contains(3));
+        assert!(RelayVersionRange::CURRENT.contains(4));
         assert!(!RelayVersionRange::CURRENT.contains(0));
-        assert!(!RelayVersionRange::CURRENT.contains(3));
+        assert!(!RelayVersionRange::CURRENT.contains(5));
         assert!(RelayRequest::Status.supported_at(1));
         assert!(
             !RelayRequest::RespondElicitation {

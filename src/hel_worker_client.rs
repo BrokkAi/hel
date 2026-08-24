@@ -258,6 +258,10 @@ impl RelayClient {
         &self.session_id
     }
 
+    pub const fn supports_project_memory_sync(&self) -> bool {
+        self.protocol_version >= 4
+    }
+
     pub fn relay_version(&self) -> &str {
         &self.relay_version
     }
@@ -429,6 +433,63 @@ impl RelayClient {
     /// transferring the tree itself.
     pub async fn skills_state(&mut self) -> Result<crate::hel_skills::SkillsSyncState> {
         skills_sync_state(self.call(RelayRequest::SkillsState).await?)
+    }
+
+    /// Install background text that only the target harness sees, prepended
+    /// to the next real prompt without creating a synthetic transcript turn.
+    pub async fn install_prompt_context(&mut self, text: String) -> Result<()> {
+        let request = RelayRequest::InstallPromptContext { text };
+        if !request.supported_at(self.protocol_version) {
+            bail!(
+                "hidden prompt context requires relay protocol {}; this session negotiated {}",
+                request.minimum_protocol(),
+                self.protocol_version
+            );
+        }
+        match self.call(request).await? {
+            RelayResponsePayload::PromptContextInstalled => Ok(()),
+            _ => bail!("relay returned an unexpected prompt-context response"),
+        }
+    }
+
+    pub async fn project_memory_snapshot(
+        &mut self,
+    ) -> Result<(
+        crate::hel_project_memory::ProjectMemorySnapshot,
+        crate::hel_project_memory::ProjectMemorySnapshot,
+    )> {
+        let request = RelayRequest::ProjectMemorySnapshot;
+        if !request.supported_at(self.protocol_version) {
+            bail!(
+                "project memory synchronization requires relay protocol {}; this session negotiated {}",
+                request.minimum_protocol(),
+                self.protocol_version
+            );
+        }
+        match self.call(request).await? {
+            RelayResponsePayload::ProjectMemorySnapshot { baseline, replica } => {
+                Ok((baseline, replica))
+            }
+            _ => bail!("relay returned an unexpected project-memory response"),
+        }
+    }
+
+    pub async fn install_project_memory_snapshot(
+        &mut self,
+        snapshot: crate::hel_project_memory::ProjectMemorySnapshot,
+    ) -> Result<()> {
+        let request = RelayRequest::InstallProjectMemorySnapshot { snapshot };
+        if !request.supported_at(self.protocol_version) {
+            bail!(
+                "project memory synchronization requires relay protocol {}; this session negotiated {}",
+                request.minimum_protocol(),
+                self.protocol_version
+            );
+        }
+        match self.call(request).await? {
+            RelayResponsePayload::ProjectMemorySnapshotInstalled => Ok(()),
+            _ => bail!("relay returned an unexpected project-memory install response"),
+        }
     }
 
     /// Replace this session's synced skills trees with an encoded
@@ -1224,12 +1285,12 @@ session = {session:?}
 req = json.loads(sys.stdin.readline())
 print(json.dumps({{
     "request_id": req["request_id"],
-    "protocol_version": 3,
+    "protocol_version": 5,
     "result": "ok",
     "payload": {{
         "type": "hello",
         "data": {{
-            "negotiated": 3,
+            "negotiated": 5,
             "relay_version": "future",
             "session_id": session,
         }},
@@ -1243,11 +1304,11 @@ sys.stdin.read()
         let error = RelayClient::connect_with_timeout(&spec, SESSION_ID, Duration::from_secs(5))
             .await
             .err()
-            .expect("protocol 3 hello must be rejected");
+            .expect("protocol 5 hello must be rejected");
         assert!(
             error
                 .to_string()
-                .contains("negotiated unsupported protocol 3"),
+                .contains("negotiated unsupported protocol 5"),
             "{error:#}"
         );
         // The transport carried the answer perfectly well; restarting the

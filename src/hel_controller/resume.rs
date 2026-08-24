@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+use agent_client_protocol::schema::v1::ContentBlock;
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 
@@ -1026,14 +1026,7 @@ impl Controller {
                 )
                 .await
                 .context("compact the cross-harness handoff transcript")?;
-                relay
-                    .submit(
-                        new_command_id("cross-harness-handoff")?,
-                        RelayCommand::Prompt {
-                            prompt: vec![ContentBlock::Text(TextContent::new(context))],
-                        },
-                    )
-                    .await?;
+                relay.install_prompt_context(context).await?;
                 if !discard_queue {
                     for prompt in &canonical_session.queued_prompts {
                         // A queued configuration change is replayed as itself;

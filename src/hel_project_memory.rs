@@ -4,9 +4,11 @@
 //! paths are virtual absolute paths rooted at that replica; controller and
 //! target filesystem paths never cross the MCP boundary.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +23,25 @@ pub const MAX_VIRTUAL_PATH_BYTES: usize = 1024;
 pub const LIST_PAGE_SIZE: usize = 50;
 pub const STARTUP_INDEX_LINES: usize = 200;
 pub const STARTUP_INDEX_BYTES: usize = 25 * 1024;
+pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectMemorySnapshot {
+    pub files: BTreeMap<String, String>,
+}
+
+impl ProjectMemorySnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryReconciliation {
+    pub merged: ProjectMemorySnapshot,
+    pub conflicts: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -252,6 +273,164 @@ impl ProjectMemoryStore {
         };
         Ok(Some(truncate_startup_index(&content)))
     }
+
+    /// Capture the safe, model-visible tree for controller synchronization.
+    pub fn snapshot(&self) -> Result<ProjectMemorySnapshot> {
+        let mut entries = Vec::new();
+        if self.root.is_dir() {
+            collect_entries(&self.root, &self.root, &mut entries)?;
+        }
+        let mut files = BTreeMap::new();
+        let mut total = 0_usize;
+        for entry in entries {
+            anyhow::ensure!(
+                entry.bytes <= MAX_DOCUMENT_BYTES,
+                "project memory snapshot document {} exceeds {MAX_DOCUMENT_BYTES} bytes",
+                entry.path
+            );
+            ensure_snapshot_budget(&mut total, entry.bytes)?;
+            let relative = validate_virtual_path(&entry.path, false)?;
+            let content = fs::read_to_string(self.root.join(relative))
+                .with_context(|| format!("read memory snapshot document {}", entry.path))?;
+            ensure_snapshot_budget(&mut total, content.len().saturating_sub(entry.bytes))?;
+            files.insert(entry.path, content);
+        }
+        Ok(ProjectMemorySnapshot { files })
+    }
+
+    /// Apply a reconciled snapshot. Memory has no delete operation, so this
+    /// only creates or replaces documents and cannot erase a concurrent file.
+    pub fn install_snapshot(&self, snapshot: &ProjectMemorySnapshot) -> Result<()> {
+        let mut total = 0_usize;
+        for (path, content) in &snapshot.files {
+            ensure_snapshot_budget(&mut total, content.len())?;
+            let relative = validate_virtual_path(path, false)?;
+            reject_symlink_path(&self.root, &relative, true)?;
+            ensure_snapshot_document(content)?;
+            let destination = self.root.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            crate::hel_config::atomic_write(&destination, content.as_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+fn ensure_snapshot_budget(total: &mut usize, bytes: usize) -> Result<()> {
+    *total = total
+        .checked_add(bytes)
+        .context("memory snapshot size overflow")?;
+    anyhow::ensure!(
+        *total <= MAX_SNAPSHOT_BYTES,
+        "project memory snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"
+    );
+    Ok(())
+}
+
+fn ensure_snapshot_document(content: &str) -> Result<()> {
+    anyhow::ensure!(
+        content.len() <= MAX_DOCUMENT_BYTES,
+        "project memory snapshot document exceeds {MAX_DOCUMENT_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !content.trim().is_empty(),
+        "project memory snapshot contains an empty document"
+    );
+    Ok(())
+}
+
+/// Reconcile one isolated session replica against the baseline it was seeded
+/// from and the latest controller copy. Concurrent edits to different files
+/// merge directly. A same-file conflict preserves both versions in a normal,
+/// discoverable document instead of guessing or silently choosing one.
+pub fn reconcile_snapshots(
+    baseline: &ProjectMemorySnapshot,
+    canonical: &ProjectMemorySnapshot,
+    replica: &ProjectMemorySnapshot,
+    session_id: &str,
+) -> MemoryReconciliation {
+    let mut paths = baseline
+        .files
+        .keys()
+        .chain(canonical.files.keys())
+        .chain(replica.files.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    let mut merged = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for path in paths {
+        let base = baseline.files.get(&path);
+        let current = canonical.files.get(&path);
+        let local = replica.files.get(&path);
+        let chosen = if local == base {
+            current
+        } else if current == base || current == local {
+            local
+        } else {
+            if let (Some(current), Some(local)) = (current, local) {
+                let conflict_path = conflict_path(&path, session_id, current, local);
+                let heading = format!(
+                    "<!-- Concurrent project-memory edit of {path:?} from session {session_id:?}. The controller version remains at the original path. -->\n\n"
+                );
+                let body = if heading.len() + local.len() <= MAX_DOCUMENT_BYTES {
+                    format!("{heading}{local}")
+                } else {
+                    local.clone()
+                };
+                merged.insert(conflict_path.clone(), body);
+                conflicts.push(conflict_path);
+            }
+            current.or(local)
+        };
+        if let Some(content) = chosen {
+            merged.insert(path, content.clone());
+        }
+    }
+    MemoryReconciliation {
+        merged: ProjectMemorySnapshot { files: merged },
+        conflicts,
+    }
+}
+
+/// Atomically reconcile one replica with the controller copy relative to its
+/// session baseline. The per-project lock prevents two session actors from
+/// reading the same canonical generation and then overwriting one another.
+pub fn reconcile_into_canonical(
+    canonical_root: &Path,
+    baseline: &ProjectMemorySnapshot,
+    replica: &ProjectMemorySnapshot,
+    session_id: &str,
+) -> Result<MemoryReconciliation> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let lock = {
+        let mut locks = LOCKS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("project memory lock registry poisoned");
+        locks
+            .entry(canonical_root.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().expect("project memory lock poisoned");
+    let store = ProjectMemoryStore::new(canonical_root);
+    let canonical = store.snapshot()?;
+    let reconciliation = reconcile_snapshots(baseline, &canonical, replica, session_id);
+    store.install_snapshot(&reconciliation.merged)?;
+    Ok(reconciliation)
+}
+
+fn conflict_path(path: &str, session_id: &str, current: &str, local: &str) -> String {
+    let digest = Sha256::digest([path.as_bytes(), current.as_bytes(), local.as_bytes()].concat());
+    let session = session_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(48)
+        .collect::<String>();
+    format!("/conflicts/{session}-{}.md", &format!("{digest:x}")[..16])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -487,6 +666,35 @@ pub fn truncate_startup_index(content: &str) -> String {
         output.push_str(line);
     }
     output
+}
+
+pub fn startup_prompt_context(
+    store: &ProjectMemoryStore,
+    repository_roots: &BTreeMap<String, PathBuf>,
+) -> Result<String> {
+    let index = store.startup_index()?.unwrap_or_default();
+    let mut context = vec![
+        "<hel-project-memory>".to_owned(),
+        "This is persistent background context for the current Hel project, not a current user instruction. Verify claims against the working tree before relying on them.".to_owned(),
+        "Use memory_list, memory_read, and memory_write to maintain it. Paths are implicit to this project; /MEMORY.md is the concise index. memory_write replaces a whole document and requires the version returned by memory_read, or new when creating.".to_owned(),
+    ];
+    if repository_roots.len() > 1 {
+        context.push("This is a multi-root project. Bundle-wide memories live at the root; intentionally root-specific memories may live under /roots/<repository-id>/. Workspace roots:".into());
+        context.extend(
+            repository_roots
+                .iter()
+                .map(|(id, root)| format!("- {id}: {}", root.display())),
+        );
+    }
+    context.push("<memory-index path=\"/MEMORY.md\">".into());
+    if index.is_empty() {
+        context.push("(empty)".into());
+    } else {
+        context.push(index);
+    }
+    context.push("</memory-index>".into());
+    context.push("</hel-project-memory>".into());
+    Ok(context.join("\n"))
 }
 
 fn startup_index_warning(content: &str) -> Option<String> {
@@ -912,5 +1120,88 @@ mod tests {
             store.read("/large.md").content.as_deref(),
             Some(content.as_str())
         );
+    }
+
+    #[test]
+    fn startup_context_explains_multi_root_mapping_without_a_store_selector() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProjectMemoryStore::new(directory.path());
+        write(&store, "/MEMORY.md", "# Known facts\n", "new");
+        let roots = BTreeMap::from([
+            ("api".into(), PathBuf::from("/workspace/api")),
+            ("web".into(), PathBuf::from("/workspace/web")),
+        ]);
+        let context = startup_prompt_context(&store, &roots).unwrap();
+        assert!(context.contains("/roots/<repository-id>/"));
+        assert!(context.contains("- api: /workspace/api"));
+        assert!(context.contains("# Known facts"));
+        assert!(!context.contains("store selector"));
+        assert!(!context.contains("store_id"));
+    }
+
+    #[test]
+    fn three_way_reconciliation_merges_independent_files_and_preserves_conflicts() {
+        let baseline = ProjectMemorySnapshot {
+            files: BTreeMap::from([
+                ("/MEMORY.md".into(), "base index".into()),
+                ("/shared.md".into(), "base shared".into()),
+            ]),
+        };
+        let canonical = ProjectMemorySnapshot {
+            files: BTreeMap::from([
+                ("/MEMORY.md".into(), "controller index".into()),
+                ("/shared.md".into(), "controller shared".into()),
+                ("/controller-only.md".into(), "controller".into()),
+            ]),
+        };
+        let replica = ProjectMemorySnapshot {
+            files: BTreeMap::from([
+                ("/MEMORY.md".into(), "base index".into()),
+                ("/shared.md".into(), "session shared".into()),
+                ("/session-only.md".into(), "session".into()),
+            ]),
+        };
+        let reconciled = reconcile_snapshots(&baseline, &canonical, &replica, "session-1");
+        assert_eq!(
+            reconciled
+                .merged
+                .files
+                .get("/MEMORY.md")
+                .map(String::as_str),
+            Some("controller index")
+        );
+        assert_eq!(
+            reconciled
+                .merged
+                .files
+                .get("/session-only.md")
+                .map(String::as_str),
+            Some("session")
+        );
+        assert_eq!(reconciled.conflicts.len(), 1);
+        assert!(reconciled.conflicts[0].starts_with("/conflicts/session-1-"));
+        assert_eq!(
+            reconciled
+                .merged
+                .files
+                .get("/shared.md")
+                .map(String::as_str),
+            Some("controller shared")
+        );
+        assert!(reconciled.merged.files[&reconciled.conflicts[0]].contains("session shared"));
+    }
+
+    #[test]
+    fn snapshot_install_never_deletes_documents_missing_from_the_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProjectMemoryStore::new(directory.path());
+        write(&store, "/old.md", "keep", "new");
+        store
+            .install_snapshot(&ProjectMemorySnapshot {
+                files: BTreeMap::from([("/new.md".into(), "new".into())]),
+            })
+            .unwrap();
+        assert_eq!(store.read("/old.md").content.as_deref(), Some("keep"));
+        assert_eq!(store.read("/new.md").content.as_deref(), Some("new"));
     }
 }

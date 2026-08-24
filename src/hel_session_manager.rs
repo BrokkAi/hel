@@ -23,6 +23,7 @@ use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected, RelayTransportDead};
 
 const SESSION_SYNC_INTERVAL: Duration = Duration::from_millis(150);
+const PROJECT_MEMORY_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// Ceiling for reconnect backoff. A worker that exited stays gone until the
 /// user acts, so retrying it every second only burns process spawns.
@@ -48,6 +49,12 @@ pub struct RelaySessionTarget {
     /// relay clients omit recovery; controller-managed sessions self-heal
     /// without turning a shared transport outage into destructive restarts.
     pub worker_recovery: Option<WorkerRecoveryPlan>,
+    pub project_memory: Option<ProjectMemorySyncTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMemorySyncTarget {
+    pub canonical_root: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1213,9 +1220,16 @@ pub struct StandaloneSession {
     materialized: MaterializedSession,
     operational: RelayOperationalState,
     latest_credential_sync_signal: Option<CredentialSyncSignal>,
+    project_memory: Option<ProjectMemorySyncTarget>,
+    last_memory_sync: Option<tokio::time::Instant>,
 }
 
 impl StandaloneSession {
+    pub fn set_project_memory_target(&mut self, target: Option<ProjectMemorySyncTarget>) {
+        self.project_memory = target;
+        self.last_memory_sync = None;
+    }
+
     pub async fn connect(target: &RelaySessionTarget) -> Result<Self> {
         // Reach the worker before reading the projection. A stored session can
         // be tens of megabytes, and the reconnect loop would otherwise pay that
@@ -1228,6 +1242,8 @@ impl StandaloneSession {
             materialized,
             operational,
             latest_credential_sync_signal: None,
+            project_memory: target.project_memory.clone(),
+            last_memory_sync: None,
         };
         connection.sync_in_place().await?;
         Ok(connection)
@@ -1238,6 +1254,7 @@ impl StandaloneSession {
             session_id: session_id.to_owned(),
             spec: spec.clone(),
             worker_recovery: None,
+            project_memory: None,
         })
         .await
     }
@@ -1271,10 +1288,19 @@ impl StandaloneSession {
                 Err(error) => return Err(error),
             }
         }
-        Ok(repaired
+        let changed = repaired
             || self.materialized.applied_event_ordinal != original_ordinal
             || self.materialized.applied_event_digest != original_digest
-            || self.operational != original_operational)
+            || self.operational != original_operational;
+        if self.project_memory.is_some()
+            && self.operational.active_prompt.is_none()
+            && self
+                .last_memory_sync
+                .is_none_or(|last| last.elapsed() >= PROJECT_MEMORY_SYNC_INTERVAL)
+        {
+            self.sync_project_memory().await?;
+        }
+        Ok(changed)
     }
 
     /// Apply and acknowledge one relay page at a time through the exact
@@ -1408,11 +1434,29 @@ impl StandaloneSession {
         self.client.compact(prompt).await
     }
 
+    /// Persist relay-private context for the next real prompt. It never
+    /// contributes an event to the canonical projection.
+    pub async fn install_prompt_context(&mut self, text: String) -> Result<()> {
+        self.client.install_prompt_context(text).await
+    }
+
     /// Apply one relay page and acknowledge it. The whole page commits in a
     /// single projection transaction, so a failure part-way leaves both the
     /// durable and the in-memory projection at the previous frontier and the
     /// relay redelivers the page.
     async fn apply_event_page(&mut self, page: RelayEventPage) -> Result<RelayCursor> {
+        let completed_prompt = page.events.iter().any(|event| {
+            matches!(
+                &event.observation,
+                crate::hel_worker::RelayObservation::CommandCompleted {
+                    outcome: crate::hel_worker::RelayCommandOutcome::Prompt { .. },
+                    ..
+                }
+            )
+        });
+        if completed_prompt {
+            self.sync_project_memory().await?;
+        }
         if !page.events.is_empty() {
             // The in-memory projection advances on a working copy, so it is
             // published only once the page it belongs to is durable.
@@ -1483,6 +1527,67 @@ impl StandaloneSession {
             ordinal: delivered_through,
             digest: self.materialized.applied_event_digest.clone(),
         })
+    }
+
+    async fn sync_project_memory(&mut self) -> Result<()> {
+        let Some(target) = self.project_memory.clone() else {
+            return Ok(());
+        };
+        if !self.client.supports_project_memory_sync() {
+            tracing::warn!(
+                session_id = self.materialized.session_id,
+                "worker protocol predates project-memory synchronization; preserving memory through checkpoints only"
+            );
+            self.project_memory = None;
+            return Ok(());
+        }
+        let (baseline, replica) = match self.client.project_memory_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error)
+                if error
+                    .downcast_ref::<RelayRejected>()
+                    .is_some_and(|rejected| {
+                        rejected.0.code == crate::hel_worker::RelayErrorCode::InvalidState
+                    }) =>
+            {
+                tracing::warn!(
+                    session_id = self.materialized.session_id,
+                    "worker has no project-memory endpoint; preserving memory through checkpoints only"
+                );
+                self.project_memory = None;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let canonical_root = target.canonical_root;
+        let session_id = self.materialized.session_id.clone();
+        let reconciliation = tokio::task::spawn_blocking(move || {
+            crate::hel_project_memory::reconcile_into_canonical(
+                &canonical_root,
+                &baseline,
+                &replica,
+                &session_id,
+            )
+        })
+        .await
+        .context("project memory reconciliation task failed")??;
+        for conflict in &reconciliation.conflicts {
+            tracing::warn!(session_id = self.materialized.session_id, %conflict, "project memory conflict preserved");
+        }
+        let conflicts = reconciliation.conflicts;
+        self.client
+            .install_project_memory_snapshot(reconciliation.merged)
+            .await?;
+        if !conflicts.is_empty() {
+            self.client
+                .install_prompt_context(format!(
+                    "<hel-project-memory-conflicts>Concurrent project-memory edits were preserved in {}. Reconcile those documents with their original paths using the project memory tools; do not discard either version.</hel-project-memory-conflicts>",
+                    conflicts.join(", ")
+                ))
+                .await?;
+        }
+        self.last_memory_sync = Some(tokio::time::Instant::now());
+        Ok(())
     }
 }
 
@@ -1651,6 +1756,7 @@ mod tests {
             session_id: "session-1".to_owned(),
             spec: CommandSpec::new(program, std::iter::empty::<&str>()),
             worker_recovery: None,
+            project_memory: None,
         }
     }
 
@@ -2121,6 +2227,7 @@ mod tests {
             session_id: LEASED_RELAY_SESSION.to_owned(),
             spec,
             worker_recovery: Some(worker_recovery),
+            project_memory: None,
         };
         let (_commands_tx, commands_rx) = mpsc::channel(4);
         let (_releases_tx, releases_rx) = mpsc::unbounded_channel();
@@ -2191,6 +2298,7 @@ mod tests {
             session_id: LEASED_RELAY_SESSION.to_owned(),
             spec,
             worker_recovery: None,
+            project_memory: None,
         }
     }
 

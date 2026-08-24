@@ -897,14 +897,16 @@ impl Controller {
         worker_root: &str,
         reconnect: &hel_targets::CommandSpec,
     ) -> Result<(ControllerRelayLease, bool)> {
-        match connect_checkpoint_relay(session_id, manager, reconnect).await {
+        let project_memory = self.project_memory_sync_target(session_id).ok();
+        match connect_checkpoint_relay(session_id, manager, reconnect, project_memory.clone()).await
+        {
             Ok(relay) => Ok((relay, false)),
             Err(error) if worker_connect_needs_restart(&error) => {
                 tracing::warn!(
                     session_id,
                     "checkpoint could not reach the worker; restarting it: {error:#}"
                 );
-                let connection = self
+                let mut connection = self
                     .restart_worker_for_checkpoint(
                         session_id,
                         executor,
@@ -913,6 +915,7 @@ impl Controller {
                         reconnect,
                     )
                     .await?;
+                connection.set_project_memory_target(project_memory);
                 let relay =
                     adopt_restarted_checkpoint_relay(session_id, manager, connection).await?;
                 Ok((relay, true))
@@ -962,6 +965,7 @@ impl Controller {
                 );
             }
         };
+        connection.set_project_memory_target(self.project_memory_sync_target(session_id).ok());
         wait_for_native_session(&mut connection, executor)
             .await
             .context("wait for ACP session after restarting the worker for checkpoint")?;
@@ -976,6 +980,7 @@ async fn connect_checkpoint_relay(
     session_id: &str,
     manager: Option<&SessionManagerControl>,
     reconnect: &hel_targets::CommandSpec,
+    project_memory: Option<crate::hel_session_manager::ProjectMemorySyncTarget>,
 ) -> Result<ControllerRelayLease> {
     if let Some(manager) = manager {
         let handle = manager
@@ -987,8 +992,14 @@ async fn connect_checkpoint_relay(
             lease: Some(lease),
         })
     } else {
+        let target = crate::hel_session_manager::RelaySessionTarget {
+            session_id: session_id.to_owned(),
+            spec: reconnect.clone(),
+            worker_recovery: None,
+            project_memory,
+        };
         Ok(ControllerRelayLease::Standalone(
-            StandaloneSession::connect_command(reconnect, session_id).await?,
+            StandaloneSession::connect(&target).await?,
         ))
     }
 }
@@ -2269,6 +2280,7 @@ mod tests {
             session_id: LATCH_RELAY_SESSION.to_owned(),
             spec,
             worker_recovery: None,
+            project_memory: None,
         }
     }
     /// Start a session manager against a live relay and latch a checkpoint on

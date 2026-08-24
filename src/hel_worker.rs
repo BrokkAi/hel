@@ -54,8 +54,8 @@ use journal::{
 };
 use protocol::{incompatible_request_protocol, relay_error, relay_protocol_error};
 use snapshot::{
-    HandledRelayCommand, RelayDispatchRecord, RelayDispatchState, RelaySnapshot,
-    StoredQueuedRelayCommand, StoredQueuedRelayPayload, ensure_byte_budget,
+    HandledRelayCommand, PendingPromptContext, RelayDispatchRecord, RelayDispatchState,
+    RelaySnapshot, StoredQueuedRelayCommand, StoredQueuedRelayPayload, ensure_byte_budget,
     ensure_serialized_budget, releases_history, validate_relay_digest,
     validate_relay_snapshot_frontiers,
 };
@@ -89,7 +89,7 @@ const RELAY_SNAPSHOT_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 /// Current durable ACP relay protocol. Peers that only speak an older
 /// version in [`RELAY_MIN_PROTOCOL_VERSION`]..=this range still connect.
 /// Protocol 0 is the retired pre-relay worker protocol and is rejected.
-pub const RELAY_PROTOCOL_VERSION: u32 = 2;
+pub const RELAY_PROTOCOL_VERSION: u32 = 4;
 pub const RELAY_MIN_PROTOCOL_VERSION: u32 = 1;
 /// Digest for the empty relay event prefix (ordinal zero).
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
@@ -551,14 +551,20 @@ impl DurableRelay {
                 )?;
                 RelayResponsePayload::Status(state)
             }
+            RelayRequest::InstallPromptContext { text } => {
+                self.install_prompt_context(text.clone())?;
+                RelayResponsePayload::PromptContextInstalled
+            }
             RelayRequest::CredentialState
             | RelayRequest::ReadCredentials
             | RelayRequest::InstallCredentials { .. }
             | RelayRequest::SkillsState
-            | RelayRequest::InstallSkills { .. } => {
+            | RelayRequest::InstallSkills { .. }
+            | RelayRequest::ProjectMemorySnapshot
+            | RelayRequest::InstallProjectMemorySnapshot { .. } => {
                 return Ok(relay_error(
                     RelayErrorCode::InvalidState,
-                    "credential and skills requests must be handled by the live relay transport",
+                    "connection-only requests must be handled by the live relay transport",
                     false,
                     None,
                 ));
@@ -581,6 +587,41 @@ impl DurableRelay {
             }
         };
         Ok(RelayResponseBody::Ok { payload })
+    }
+
+    pub(crate) fn install_prompt_context(&mut self, text: String) -> Result<()> {
+        if text.trim().is_empty() {
+            bail!("pending prompt context is empty");
+        }
+        if self.snapshot.active_prompt.is_some()
+            || self
+                .snapshot
+                .pending_prompt_context
+                .as_ref()
+                .is_some_and(|context| context.attached_command_id.is_some())
+        {
+            bail!("cannot replace prompt context while its prompt is active");
+        }
+        let mut next = self.snapshot.clone();
+        match next.pending_prompt_context.as_mut() {
+            Some(context) if context.text != text => {
+                context.text.push_str("\n\n");
+                context.text.push_str(&text);
+            }
+            Some(_) => {}
+            None => {
+                next.pending_prompt_context = Some(PendingPromptContext {
+                    text,
+                    attached_command_id: None,
+                });
+            }
+        }
+        ensure_serialized_budget(
+            &next,
+            RELAY_SNAPSHOT_BYTE_BUDGET,
+            "relay snapshot with pending prompt context",
+        )?;
+        self.commit_snapshot(next)
     }
 
     fn attach(
@@ -1029,10 +1070,21 @@ impl DurableRelay {
                 .get_mut(&command_id)
                 .expect("claimable command disappeared");
             dispatch.state = RelayDispatchState::InFlight;
+            let hidden_prompt_context = matches!(dispatch.command, RelayCommand::Prompt { .. })
+                .then(|| {
+                    let context = next_snapshot.pending_prompt_context.as_mut()?;
+                    if context.attached_command_id.is_none() {
+                        context.attached_command_id = Some(command_id.clone());
+                    }
+                    (context.attached_command_id.as_deref() == Some(command_id.as_str()))
+                        .then(|| context.text.clone())
+                })
+                .flatten();
             claimed.push(ClaimedRelayCommand {
                 command_id,
                 accepted_ordinal,
                 command: dispatch.command.clone(),
+                hidden_prompt_context,
             });
         }
         if !claimed.is_empty() {
@@ -1834,6 +1886,69 @@ mod tests {
 
     use super::*;
     use test_support::*;
+
+    #[test]
+    fn hidden_context_waits_for_a_prompt_and_survives_an_interruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let installed = relay.handle(relay_request(
+            "install-context",
+            RelayRequest::InstallPromptContext {
+                text: "<hel-background>memory</hel-background>".into(),
+            },
+        ));
+        assert!(matches!(
+            installed.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::PromptContextInstalled
+            }
+        ));
+
+        submit_relay(
+            &mut relay,
+            "configure-first",
+            RelayCommand::SetConfig {
+                key: "model".into(),
+                value: "default".into(),
+            },
+        );
+        let config = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(config.len(), 1);
+        assert_eq!(config[0].hidden_prompt_context, None);
+        relay
+            .record_command_completed("configure-first", RelayCommandOutcome::Configured)
+            .unwrap();
+
+        submit_relay(&mut relay, "first-prompt", prompt("do it"));
+        let first = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(
+            first[0].hidden_prompt_context.as_deref(),
+            Some("<hel-background>memory</hel-background>")
+        );
+        assert_eq!(first[0].command, prompt("do it"));
+        relay
+            .record_command_interrupted("first-prompt", "restart")
+            .unwrap();
+
+        submit_relay(&mut relay, "second-prompt", prompt("continue"));
+        let second = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(
+            second[0].hidden_prompt_context.as_deref(),
+            Some("<hel-background>memory</hel-background>")
+        );
+        relay
+            .record_command_completed(
+                "second-prompt",
+                RelayCommandOutcome::Prompt {
+                    stop_reason: "end_turn".into(),
+                },
+            )
+            .unwrap();
+
+        submit_relay(&mut relay, "third-prompt", prompt("again"));
+        let third = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(third[0].hidden_prompt_context, None);
+    }
 
     /// A history large enough to seal several segments and to overflow one
     /// replay page, so an attach against it really does read and decompress.

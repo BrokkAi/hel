@@ -65,10 +65,28 @@ pub struct WorkerLaunchConfig {
     pub additional_directories: Vec<PathBuf>,
     #[serde(default)]
     pub native_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_memory: Option<ProjectMemoryLaunchConfig>,
     /// Isolated and remote targets deliberately run without harness approval
     /// prompts. Raw localhost instead honors the user's harness configuration.
     #[serde(default)]
     pub force_unrestricted_mode: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectMemoryLaunchConfig {
+    /// Stable controller-derived identity for this repository or bundle.
+    pub project_key: String,
+    /// Target-side replica used by native Claude and the MCP server.
+    pub root: PathBuf,
+    /// Session-private copy of the canonical tree from the last successful
+    /// synchronization, used as the three-way merge base.
+    #[serde(default)]
+    pub baseline_root: PathBuf,
+    /// Bundle repository IDs mapped to the roots presented over ACP.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub repository_roots: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl WorkerLaunchConfig {
@@ -107,6 +125,7 @@ mod unix {
 
     use super::{AcpSupervisorSpec, CredentialEndpoint, WorkerLaunchConfig};
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
+    use crate::hel_config::HarnessKind;
     use crate::hel_worker::{
         ClaimedRelayCommand, DeferredRelayAttach, DurableRelay, RelayCommand, RelayCommandOutcome,
         RelayErrorCode, RelayObservation, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
@@ -155,8 +174,22 @@ mod unix {
         }
         // Validate and recover durable state before publishing a socket. A
         // failed startup must never leave a fresh endpoint that looks live.
-        let durable_relay =
+        let mut durable_relay =
             DurableRelay::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
+        let resume_session = select_resume_session(&config, &durable_relay);
+        let project_memory = config.project_memory.clone();
+        if resume_session.is_none()
+            && config.harness != HarnessKind::Claude
+            && let Some(memory) = &config.project_memory
+        {
+            let store = crate::hel_project_memory::ProjectMemoryStore::new(&memory.root);
+            durable_relay.install_prompt_context(
+                crate::hel_project_memory::startup_prompt_context(
+                    &store,
+                    &memory.repository_roots,
+                )?,
+            )?;
+        }
         // Startup succeeded far enough to own this root, so claim it. A failed
         // open leaves any previous pidfile alone rather than pointing teardown
         // at a process that never took over.
@@ -203,14 +236,13 @@ mod unix {
                 relay,
                 dispatch_wake_tx,
                 credentials,
+                project_memory,
                 fatal_tx,
                 fatal_rx,
             )
             .await;
         }
 
-        let resume_session =
-            select_resume_session(&config, &relay.lock().expect("relay state lock poisoned"));
         let (acp_commands_tx, acp_commands_rx) = mpsc::channel(32);
         let (acp_events_tx, acp_events_rx) = mpsc::channel(ACP_EVENT_CHANNEL_CAPACITY);
         let (dispatch_wake_tx, dispatch_wake_rx) = mpsc::channel(1);
@@ -233,6 +265,7 @@ mod unix {
             environment: Default::default(),
             cwd: config.cwd,
             additional_directories: config.additional_directories,
+            project_memory: config.project_memory,
             resume_session,
             harness: config.harness,
             force_unrestricted_mode: config.force_unrestricted_mode,
@@ -256,12 +289,14 @@ mod unix {
                     let client_credentials = credentials.clone();
                     let client_fatal = fatal_tx.clone();
                     let client_commands = acp_commands_tx.clone();
+                    let client_project_memory = project_memory.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = serve_client(
+                        if let Err(error) = serve_client_with_memory(
                             stream,
                             client_relay,
                             client_dispatch_wake,
                             client_credentials,
+                            client_project_memory,
                             Some(client_commands),
                             client_fatal,
                         ).await {
@@ -337,6 +372,7 @@ mod unix {
             relay,
             dispatch_wake_tx,
             credentials,
+            project_memory,
             fatal_tx,
             fatal_rx,
         )
@@ -358,6 +394,7 @@ mod unix {
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
+        project_memory: Option<super::ProjectMemoryLaunchConfig>,
         fatal: mpsc::Sender<anyhow::Error>,
         mut fatal_reports: mpsc::Receiver<anyhow::Error>,
     ) -> Result<()> {
@@ -376,14 +413,16 @@ mod unix {
             let client_dispatch_wake = dispatch_wake.clone();
             let client_credentials = credentials.clone();
             let client_fatal = fatal.clone();
+            let client_project_memory = project_memory.clone();
             tokio::spawn(async move {
                 // A sealed session has no ACP runtime left, so compaction
                 // cannot be served here.
-                if let Err(error) = serve_client(
+                if let Err(error) = serve_client_with_memory(
                     stream,
                     client_relay,
                     client_dispatch_wake,
                     client_credentials,
+                    client_project_memory,
                     None,
                     client_fatal,
                 )
@@ -799,10 +838,18 @@ mod unix {
     fn acp_command(claimed: &ClaimedRelayCommand) -> Option<CommandRequest> {
         let request_id = claimed.command_id.clone();
         match &claimed.command {
-            RelayCommand::Prompt { prompt } => Some(CommandRequest::Prompt {
-                request_id,
-                prompt: prompt.clone(),
-            }),
+            RelayCommand::Prompt { prompt } => {
+                let mut prompt = prompt.clone();
+                if let Some(context) = &claimed.hidden_prompt_context {
+                    prompt.insert(
+                        0,
+                        agent_client_protocol::schema::v1::ContentBlock::Text(
+                            agent_client_protocol::schema::v1::TextContent::new(context.clone()),
+                        ),
+                    );
+                }
+                Some(CommandRequest::Prompt { request_id, prompt })
+            }
             RelayCommand::SetConfig { key, value } => Some(CommandRequest::SetConfig {
                 request_id,
                 key: key.clone(),
@@ -946,11 +993,33 @@ mod unix {
 
     /// `commands` is the ACP coordinator's command channel, or `None` once the
     /// session is sealed and no ACP runtime is left to serve scratch prompts.
+    #[cfg(test)]
     pub(super) async fn serve_client(
         stream: UnixStream,
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
+        commands: Option<mpsc::Sender<CommandRequest>>,
+        fatal: mpsc::Sender<anyhow::Error>,
+    ) -> Result<()> {
+        serve_client_with_memory(
+            stream,
+            relay,
+            dispatch_wake,
+            credentials,
+            None,
+            commands,
+            fatal,
+        )
+        .await
+    }
+
+    pub(super) async fn serve_client_with_memory(
+        stream: UnixStream,
+        relay: Arc<Mutex<DurableRelay>>,
+        dispatch_wake: mpsc::Sender<()>,
+        credentials: std::result::Result<CredentialEndpoint, String>,
+        project_memory: Option<super::ProjectMemoryLaunchConfig>,
         commands: Option<mpsc::Sender<CommandRequest>>,
         fatal: mpsc::Sender<anyhow::Error>,
     ) -> Result<()> {
@@ -1004,6 +1073,15 @@ mod unix {
                     // They never reach DurableRelay, its journal, or its
                     // command ledger.
                     let response = credential_response(envelope, &credentials).await;
+                    write_response(&mut writer, &response).await?;
+                    continue;
+                }
+                if matches!(
+                    &envelope.request,
+                    RelayRequest::ProjectMemorySnapshot
+                        | RelayRequest::InstallProjectMemorySnapshot { .. }
+                ) {
+                    let response = project_memory_response(envelope, project_memory.as_ref()).await;
                     write_response(&mut writer, &response).await?;
                     continue;
                 }
@@ -1266,6 +1344,84 @@ mod unix {
             request_id: envelope.request_id,
             protocol_version: envelope.protocol_version,
             body,
+        }
+    }
+
+    /// Snapshot and install project memory off the socket task. These payloads
+    /// are connection-only and are never journaled as conversation history.
+    async fn project_memory_response(
+        envelope: RelayRequestEnvelope,
+        memory: Option<&super::ProjectMemoryLaunchConfig>,
+    ) -> RelayResponseEnvelope {
+        if !envelope.request.supported_at(envelope.protocol_version) {
+            return incompatible_request_protocol_response(
+                envelope.request_id,
+                envelope.protocol_version,
+            );
+        }
+        let body = match memory {
+            None => RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidState,
+                    message: "this session has no project memory endpoint".into(),
+                    retryable: false,
+                    detail: None,
+                },
+            },
+            Some(memory) => {
+                let memory = memory.clone();
+                let request = envelope.request.clone();
+                match tokio::task::spawn_blocking(move || {
+                    apply_project_memory_request(&memory, &request)
+                })
+                .await
+                {
+                    Ok(Ok(payload)) => RelayResponseBody::Ok { payload },
+                    Ok(Err(error)) => RelayResponseBody::Error {
+                        error: RelayProtocolError {
+                            code: RelayErrorCode::InvalidRequest,
+                            message: format!("{error:#}"),
+                            retryable: false,
+                            detail: None,
+                        },
+                    },
+                    Err(error) => RelayResponseBody::Error {
+                        error: RelayProtocolError {
+                            code: RelayErrorCode::Internal,
+                            message: format!("project memory task stopped: {error}"),
+                            retryable: true,
+                            detail: None,
+                        },
+                    },
+                }
+            }
+        };
+        RelayResponseEnvelope {
+            request_id: envelope.request_id,
+            protocol_version: envelope.protocol_version,
+            body,
+        }
+    }
+
+    pub(super) fn apply_project_memory_request(
+        memory: &super::ProjectMemoryLaunchConfig,
+        request: &RelayRequest,
+    ) -> Result<RelayResponsePayload> {
+        let replica = crate::hel_project_memory::ProjectMemoryStore::new(&memory.root);
+        let baseline = crate::hel_project_memory::ProjectMemoryStore::new(&memory.baseline_root);
+        match request {
+            RelayRequest::ProjectMemorySnapshot => {
+                Ok(RelayResponsePayload::ProjectMemorySnapshot {
+                    baseline: baseline.snapshot()?,
+                    replica: replica.snapshot()?,
+                })
+            }
+            RelayRequest::InstallProjectMemorySnapshot { snapshot } => {
+                replica.install_snapshot(snapshot)?;
+                baseline.install_snapshot(snapshot)?;
+                Ok(RelayResponsePayload::ProjectMemorySnapshotInstalled)
+            }
+            other => bail!("{} is not a project memory request", other.method_name()),
         }
     }
 
@@ -1624,12 +1780,26 @@ fn credential_endpoint(
 #[cfg(unix)]
 fn resolve_relative_harness_home(config: &mut WorkerLaunchConfig, base: &Path) {
     let key = config.harness.home_env();
-    let Some(value) = config.environment.get_mut(key) else {
-        return;
-    };
-    let path = Path::new(value);
-    if path.is_relative() {
-        *value = base.join(path).to_string_lossy().into_owned();
+    if let Some(value) = config.environment.get_mut(key) {
+        let path = Path::new(value);
+        if path.is_relative() {
+            *value = base.join(path).to_string_lossy().into_owned();
+        }
+    }
+    if let Some(memory) = config.project_memory.as_mut() {
+        if memory.root.is_relative() {
+            memory.root = base.join(&memory.root);
+        }
+        if memory.baseline_root.as_os_str().is_empty() {
+            memory.baseline_root = memory
+                .root
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(".hel-memory-baseline");
+        }
+        if memory.baseline_root.is_relative() {
+            memory.baseline_root = base.join(&memory.baseline_root);
+        }
     }
 }
 
@@ -1718,6 +1888,7 @@ mod relay_tests {
             cwd: ".local/share/hel/workspaces/session/repo".into(),
             additional_directories: Vec::new(),
             native_session_id: None,
+            project_memory: None,
             force_unrestricted_mode: true,
         }
     }
@@ -4639,6 +4810,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx,
             test_credentials(),
+            None,
             fatal_tx,
             fatal_rx,
         ));
@@ -5286,5 +5458,50 @@ mod relay_tests {
             ),
             Path::new("/home/ubuntu/.local/share/hel/workers/session")
         );
+    }
+
+    #[test]
+    fn project_memory_connection_requests_round_trip_replica_and_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = ProjectMemoryLaunchConfig {
+            project_key: "project".into(),
+            root: directory.path().join("replica"),
+            baseline_root: directory.path().join("baseline"),
+            repository_roots: BTreeMap::new(),
+        };
+        let baseline = crate::hel_project_memory::ProjectMemoryStore::new(&memory.baseline_root);
+        baseline
+            .install_snapshot(&crate::hel_project_memory::ProjectMemorySnapshot {
+                files: BTreeMap::from([("/MEMORY.md".into(), "base".into())]),
+            })
+            .unwrap();
+        let replica = crate::hel_project_memory::ProjectMemoryStore::new(&memory.root);
+        replica
+            .install_snapshot(&crate::hel_project_memory::ProjectMemorySnapshot {
+                files: BTreeMap::from([("/MEMORY.md".into(), "changed".into())]),
+            })
+            .unwrap();
+
+        let payload =
+            unix::apply_project_memory_request(&memory, &RelayRequest::ProjectMemorySnapshot)
+                .unwrap();
+        let RelayResponsePayload::ProjectMemorySnapshot {
+            baseline: captured_baseline,
+            replica: captured_replica,
+        } = payload
+        else {
+            panic!("unexpected project-memory payload")
+        };
+        assert_eq!(captured_baseline.files["/MEMORY.md"], "base");
+        assert_eq!(captured_replica.files["/MEMORY.md"], "changed");
+
+        unix::apply_project_memory_request(
+            &memory,
+            &RelayRequest::InstallProjectMemorySnapshot {
+                snapshot: captured_replica.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(baseline.snapshot().unwrap(), captured_replica);
     }
 }

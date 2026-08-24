@@ -438,6 +438,7 @@ pub(crate) fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPol
                 session_id: session.id.clone(),
                 spec,
                 worker_recovery: controller.worker_recovery_plan(&session.id).ok(),
+                project_memory: controller.project_memory_sync_target(&session.id).ok(),
             })
         })
         .collect()

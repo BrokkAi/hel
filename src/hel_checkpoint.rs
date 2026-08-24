@@ -841,26 +841,54 @@ fn collect_export_native_artifacts(
     allow_empty: bool,
 ) -> Result<Vec<NativeArtifact>> {
     let session_id = &spec.session.native_session_id;
-    if spec.session.harness_kind != HarnessKind::Codex {
-        return collect_native_artifacts(
+    let mut artifacts = if spec.session.harness_kind != HarnessKind::Codex {
+        collect_native_artifacts(
             spec.session.harness_kind,
             &spec.harness_home,
             session_id,
             allow_empty,
-        );
+        )?
+    } else {
+        let mut cache = load_codex_scan_cache(&spec.relay_root, session_id);
+        let known = cache.not_ours.len();
+        let artifacts = collect_native_artifacts_cached(
+            HarnessKind::Codex,
+            &spec.harness_home,
+            session_id,
+            allow_empty,
+            Some(&mut cache),
+        )?;
+        if cache.not_ours.len() != known {
+            save_codex_scan_cache(&spec.relay_root, &cache)?;
+        }
+        artifacts
+    };
+    let launch_path = spec.relay_root.join("launch.json");
+    match crate::hel_worker_runtime::WorkerLaunchConfig::read(&launch_path) {
+        Ok(launch) => {
+            if let Some(memory) = launch.project_memory {
+                let root = resolve_target_path(&memory.root)?;
+                anyhow::ensure!(
+                    root.starts_with(&spec.harness_home),
+                    "project memory replica is outside the harness home"
+                );
+                if root.is_dir() {
+                    collect_claude_memory_tree(&spec.harness_home, &root, &mut artifacts)?;
+                }
+            }
+        }
+        Err(_error) if !launch_path.exists() => {}
+        Err(error) => return Err(error.context("read project memory checkpoint endpoint")),
     }
-    let mut cache = load_codex_scan_cache(&spec.relay_root, session_id);
-    let known = cache.not_ours.len();
-    let artifacts = collect_native_artifacts_cached(
-        HarnessKind::Codex,
-        &spec.harness_home,
-        session_id,
-        allow_empty,
-        Some(&mut cache),
-    )?;
-    if cache.not_ours.len() != known {
-        save_codex_scan_cache(&spec.relay_root, &cache)?;
-    }
+    artifacts.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    artifacts.dedup_by(|left, right| left.relative_path == right.relative_path);
+    let total = artifacts.iter().try_fold(0_u64, |total, artifact| {
+        total.checked_add(artifact.data.len() as u64)
+    });
+    anyhow::ensure!(
+        total.context("native artifact size overflow")? <= MAX_NATIVE_TOTAL,
+        "native session artifacts are too large"
+    );
     Ok(artifacts)
 }
 
@@ -2864,6 +2892,42 @@ mod tests {
             },
             output,
         )
+    }
+
+    #[test]
+    fn checkpoint_collects_the_configured_memory_replica_for_non_claude_harnesses() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        let memory_root = spec.harness_home.join("projects/replica/memory");
+        fs::create_dir_all(&memory_root).unwrap();
+        fs::write(memory_root.join("MEMORY.md"), "remember this").unwrap();
+        crate::hel_worker_runtime::WorkerLaunchConfig {
+            session_id: SESSION.into(),
+            harness: HarnessKind::Codex,
+            bridge_command: "codex-acp".into(),
+            bridge_args: Vec::new(),
+            environment: Default::default(),
+            cwd: spec.workspace_root.join("app"),
+            additional_directories: Vec::new(),
+            native_session_id: Some(NATIVE.into()),
+            project_memory: Some(crate::hel_worker_runtime::ProjectMemoryLaunchConfig {
+                project_key: "project".into(),
+                root: memory_root,
+                baseline_root: spec
+                    .harness_home
+                    .join("projects/replica/.hel-memory-baseline"),
+                repository_roots: Default::default(),
+            }),
+            force_unrestricted_mode: true,
+        }
+        .write(&spec.relay_root.join("launch.json"))
+        .unwrap();
+
+        let artifacts = collect_export_native_artifacts(&spec, false).unwrap();
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.relative_path == Path::new("projects/replica/memory/MEMORY.md")
+                && artifact.data == b"remember this"
+        }));
     }
 
     #[test]

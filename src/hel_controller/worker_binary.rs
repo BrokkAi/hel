@@ -7,12 +7,13 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use crate::hel_config::{ProjectBundle, data_dir};
-use crate::hel_session_manager::WorkerRecoveryPlan;
+use crate::hel_config::{ProjectBundle, ProjectRepository, data_dir};
+use crate::hel_project_memory::{ProjectMemoryIdentity, RepositoryMemoryIdentity};
+use crate::hel_session_manager::{ProjectMemorySyncTarget, WorkerRecoveryPlan};
 use crate::hel_targets::{
     self, CommandExecutor, CommandPlan, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
 };
-use crate::hel_worker_runtime::{WorkerLaunchConfig, WorkerOwnership};
+use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, WorkerLaunchConfig, WorkerOwnership};
 
 use super::backend::backend_locator;
 use super::provisioning::{force_unrestricted_mode, install_inherited_git_settings};
@@ -73,11 +74,7 @@ impl Controller {
                 session_id,
             )?
         };
-        let mut additional_directories = workspace
-            .1
-            .into_iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
+        let mut additional_directories = workspace.1.iter().map(PathBuf::from).collect::<Vec<_>>();
         additional_directories.extend(
             session
                 .additional_mounts
@@ -106,6 +103,14 @@ impl Controller {
         {
             environment.insert(key.to_owned(), value.to_owned());
         }
+        let project_memory =
+            project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
+        if profile.kind == crate::hel_config::HarnessKind::Claude {
+            environment.insert(
+                "CLAUDE_CODE_PROJECT_DIR_NAME".into(),
+                project_memory_replica_slug(&project_memory.project_key, session_id),
+            );
+        }
         let launch = WorkerLaunchConfig {
             session_id: session_id.to_string(),
             harness: profile.kind,
@@ -115,6 +120,7 @@ impl Controller {
             cwd: PathBuf::from(&workspace.0),
             additional_directories,
             native_session_id: session.native_session_id.clone(),
+            project_memory: Some(project_memory.clone()),
             force_unrestricted_mode: force_unrestricted,
         };
 
@@ -140,6 +146,13 @@ impl Controller {
                 "profile staging completed"
             );
             result?;
+            stage_memory_replica(
+                &project_memory,
+                Path::new(&target_profile_home),
+                &profile_stage,
+            )?;
+        } else {
+            seed_local_memory_replica(&project_memory)?;
         }
         let worker_binary = worker_binary_for(backend, executor)?;
 
@@ -192,6 +205,186 @@ impl Controller {
             },
         })
     }
+
+    pub fn project_memory_sync_target(&self, session_id: &str) -> Result<ProjectMemorySyncTarget> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let locator = session
+            .target
+            .as_ref()
+            .context("session target is missing")?;
+        let backend = backend_locator(locator, session, &self.config)?;
+        let profile = self
+            .config
+            .profiles
+            .get(&session.last_profile)
+            .context("session profile is missing")?;
+        let bundle = session
+            .project_directory
+            .is_none()
+            .then(|| self.config.bundles.get(&session.bundle_id))
+            .flatten();
+        let workspace = if let Some(project_directory) = &session.project_directory {
+            (project_directory.to_string_lossy().into_owned(), Vec::new())
+        } else {
+            workspace_paths(
+                &backend,
+                bundle.context("session bundle is missing")?,
+                session_id,
+            )?
+        };
+        let target_home = target_profile_home(&backend, session_id, profile);
+        let launch = project_memory_launch(session, bundle, &workspace, &target_home)?;
+        Ok(ProjectMemorySyncTarget {
+            canonical_root: canonical_memory_root(&launch.project_key),
+        })
+    }
+}
+
+fn project_memory_launch(
+    session: &crate::hel_state::SessionRecord,
+    bundle: Option<&ProjectBundle>,
+    workspace: &(String, Vec<String>),
+    target_profile_home: &str,
+) -> Result<ProjectMemoryLaunchConfig> {
+    let identity = if let Some(worktree) = &session.managed_worktree {
+        ProjectMemoryIdentity::Repository {
+            repository: RepositoryMemoryIdentity::Local {
+                canonical_root: std::fs::canonicalize(&worktree.source_repository)
+                    .unwrap_or_else(|_| worktree.source_repository.clone()),
+            },
+        }
+    } else if let Some(bundle) = bundle {
+        let primary =
+            configured_memory_identity(bundle.primary().context("bundle primary is missing")?)?;
+        let members = bundle
+            .repositories
+            .iter()
+            .map(configured_memory_identity)
+            .collect::<Result<Vec<_>>>()?;
+        ProjectMemoryIdentity::bundle(primary, members)
+    } else {
+        let project = session
+            .project_directory
+            .as_ref()
+            .context("raw session project directory is missing")?;
+        let repository = match session.target.as_ref() {
+            Some(crate::hel_state::TargetLocator::LocalBare { .. }) => {
+                RepositoryMemoryIdentity::Local {
+                    canonical_root: std::fs::canonicalize(project)
+                        .unwrap_or_else(|_| project.clone()),
+                }
+            }
+            _ => RepositoryMemoryIdentity::Remote {
+                target: session.target_template_id.clone(),
+                canonical_root: project.clone(),
+            },
+        };
+        ProjectMemoryIdentity::Repository { repository }
+    };
+    let project_key = identity.key()?;
+    let replica_slug = project_memory_replica_slug(&project_key, &session.id);
+    let project_root = PathBuf::from(target_profile_home)
+        .join("projects")
+        .join(replica_slug);
+    let root = project_root.join("memory");
+    let baseline_root = project_root.join(".hel-memory-baseline");
+    let mut repository_roots = std::collections::BTreeMap::new();
+    if let Some(bundle) = bundle {
+        let target_roots =
+            std::iter::once(workspace.0.as_str()).chain(workspace.1.iter().map(String::as_str));
+        let repositories = std::iter::once(bundle.primary().context("bundle primary is missing")?)
+            .chain(
+                bundle
+                    .repositories
+                    .iter()
+                    .filter(|repository| repository.id != bundle.primary_repo),
+            );
+        repository_roots.extend(
+            repositories
+                .zip(target_roots)
+                .map(|(repository, root)| (repository.id.clone(), PathBuf::from(root))),
+        );
+    }
+    Ok(ProjectMemoryLaunchConfig {
+        project_key,
+        root,
+        baseline_root,
+        repository_roots,
+    })
+}
+
+fn project_memory_replica_slug(project_key: &str, session_id: &str) -> String {
+    format!("hel-{}-{session_id}", &project_key[..16])
+}
+
+fn configured_memory_identity(repository: &ProjectRepository) -> Result<RepositoryMemoryIdentity> {
+    if let Some(source) = repository.github.as_deref() {
+        let github = crate::hel_setup::github_repository_from_origin(source)
+            .with_context(|| format!("parse repository source {source:?} for project memory"))?;
+        return Ok(RepositoryMemoryIdentity::Github {
+            owner: github.owner.to_ascii_lowercase(),
+            repository: github.repository.to_ascii_lowercase(),
+        });
+    }
+    let root = repository
+        .local
+        .as_ref()
+        .context("project repository has no source for memory identity")?;
+    Ok(RepositoryMemoryIdentity::Local {
+        canonical_root: crate::hel_local_git::main_worktree_root(root)
+            .or_else(|_| std::fs::canonicalize(root).map_err(anyhow::Error::from))
+            .unwrap_or_else(|_| root.clone()),
+    })
+}
+
+fn canonical_memory_root(project_key: &str) -> PathBuf {
+    data_dir().join("projects").join(project_key).join("memory")
+}
+
+fn stage_memory_replica(
+    memory: &ProjectMemoryLaunchConfig,
+    target_profile_home: &Path,
+    profile_stage: &Path,
+) -> Result<()> {
+    let canonical = canonical_memory_root(&memory.project_key);
+    std::fs::create_dir_all(&canonical)?;
+    let replica = memory.root.strip_prefix(target_profile_home)?;
+    let baseline = memory.baseline_root.strip_prefix(target_profile_home)?;
+    copy_profile_entry(&canonical, &profile_stage.join(replica))?;
+    copy_profile_entry(&canonical, &profile_stage.join(baseline))
+}
+
+fn seed_local_memory_replica(memory: &ProjectMemoryLaunchConfig) -> Result<()> {
+    let canonical = canonical_memory_root(&memory.project_key);
+    std::fs::create_dir_all(&canonical)?;
+    let canonical_has_files = directory_has_files(&canonical)?;
+    let replica_has_files = directory_has_files(&memory.root)?;
+    match (canonical_has_files, replica_has_files) {
+        (false, true) => copy_profile_entry(&memory.root, &canonical),
+        (true, false) => copy_profile_entry(&canonical, &memory.root),
+        _ => Ok(()),
+    }?;
+    copy_profile_entry(&canonical, &memory.baseline_root)
+}
+
+fn directory_has_files(path: &Path) -> Result<bool> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_file() || (metadata.is_dir() && directory_has_files(&entry.path())?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2033,5 +2226,18 @@ mod tests {
             HEL_CONTAINER_ENVIRONMENT
         );
         assert!(!home.path().join("SYSTEM.md").exists());
+    }
+
+    #[test]
+    fn project_memory_replicas_are_session_private() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            project_memory_replica_slug(key, "session-a"),
+            "hel-0123456789abcdef-session-a"
+        );
+        assert_ne!(
+            project_memory_replica_slug(key, "session-a"),
+            project_memory_replica_slug(key, "session-b")
+        );
     }
 }

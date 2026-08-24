@@ -15,14 +15,14 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
     CreateTerminalRequest, CreateTerminalResponse, ElicitationCapabilities,
     ElicitationFormCapabilities, Implementation, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigValueId, SessionId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalExitStatus,
-    TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    KillTerminalResponse, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigValueId, SessionId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TerminalExitStatus, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
+    TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -37,6 +37,7 @@ use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_terminal::{
     DEFAULT_TERMINAL_OUTPUT_BYTES, TerminalExit, TerminalRegistry, TerminalSpawn,
 };
+use crate::hel_worker_runtime::ProjectMemoryLaunchConfig;
 
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
@@ -45,9 +46,27 @@ pub struct LaunchSpec {
     pub environment: BTreeMap<String, String>,
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
+    pub project_memory: Option<ProjectMemoryLaunchConfig>,
     pub resume_session: Option<String>,
     pub harness: HarnessKind,
     pub force_unrestricted_mode: bool,
+}
+
+fn project_memory_mcp(spec: &LaunchSpec) -> Vec<McpServer> {
+    if spec.harness == HarnessKind::Claude {
+        return Vec::new();
+    }
+    let Some(memory) = &spec.project_memory else {
+        return Vec::new();
+    };
+    vec![McpServer::Stdio(
+        McpServerStdio::new("hel-project-memory", spec.command.clone()).args(vec![
+            "worker".into(),
+            "memory-mcp".into(),
+            "--root".into(),
+            memory.root.to_string_lossy().into_owned(),
+        ]),
+    )]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1321,7 +1340,8 @@ async fn serve_session(
         let loaded = connection
             .send_request(
                 LoadSessionRequest::new(SessionId::from(existing.clone()), spec.cwd.clone())
-                    .additional_directories(spec.additional_directories.clone()),
+                    .additional_directories(spec.additional_directories.clone())
+                    .mcp_servers(project_memory_mcp(spec)),
             )
             .block_task()
             .await
@@ -1341,7 +1361,8 @@ async fn serve_session(
             let created = connection
                 .send_request(
                     NewSessionRequest::new(spec.cwd.clone())
-                        .additional_directories(spec.additional_directories.clone()),
+                        .additional_directories(spec.additional_directories.clone())
+                        .mcp_servers(project_memory_mcp(spec)),
                 )
                 .block_task()
                 .await
@@ -2217,12 +2238,63 @@ pub(crate) fn select_contains(kind: &SessionConfigKind, desired: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
     use std::time::Duration;
 
     use super::*;
     use agent_client_protocol::schema::v1::{
         SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions,
     };
+
+    #[test]
+    fn project_memory_mcp_is_implicit_and_excluded_from_claude() {
+        let spec = LaunchSpec {
+            command: "/worker/hel".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: "/workspace/app".into(),
+            additional_directories: vec!["/workspace/api".into()],
+            project_memory: Some(ProjectMemoryLaunchConfig {
+                project_key: "abc".into(),
+                root: "/profile/projects/abc/memory".into(),
+                baseline_root: "/profile/projects/abc/.hel-memory-baseline".into(),
+                repository_roots: BTreeMap::from([
+                    ("app".into(), "/workspace/app".into()),
+                    ("api".into(), "/workspace/api".into()),
+                ]),
+            }),
+            resume_session: None,
+            harness: HarnessKind::Codex,
+            force_unrestricted_mode: false,
+        };
+        let servers = project_memory_mcp(&spec);
+        let [McpServer::Stdio(server)] = servers.as_slice() else {
+            panic!("non-Claude sessions receive exactly one memory MCP server");
+        };
+        assert_eq!(server.name, "hel-project-memory");
+        assert_eq!(server.command, Path::new("/worker/hel"));
+        assert_eq!(
+            server.args,
+            [
+                "worker",
+                "memory-mcp",
+                "--root",
+                "/profile/projects/abc/memory"
+            ]
+        );
+        assert!(
+            !server
+                .args
+                .iter()
+                .any(|argument| argument.contains("store")),
+            "the model-facing service must not expose store selection"
+        );
+
+        let mut claude = spec;
+        claude.harness = HarnessKind::Claude;
+        assert!(project_memory_mcp(&claude).is_empty());
+    }
 
     #[test]
     fn finds_modes_in_flat_and_grouped_options() {
@@ -2544,6 +2616,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Grok,
             force_unrestricted_mode,
@@ -2690,6 +2763,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
@@ -3082,6 +3156,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness,
             force_unrestricted_mode: false,
@@ -3215,6 +3290,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
@@ -3317,6 +3393,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
@@ -3483,6 +3560,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             // Kimi has no production compactor, so the scratch session goes
             // straight from `session/new` to the prompt that stalls.
@@ -3661,6 +3739,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
@@ -3748,6 +3827,7 @@ mod tests {
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
@@ -3987,6 +4067,7 @@ mod tests {
                 environment: BTreeMap::new(),
                 cwd: std::env::current_dir().unwrap(),
                 additional_directories: Vec::new(),
+                project_memory: None,
                 resume_session: None,
                 harness: HarnessKind::Kimi,
                 force_unrestricted_mode: false,
@@ -4473,6 +4554,7 @@ while True:
             environment: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
@@ -4534,6 +4616,7 @@ while True:
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: true,
@@ -4580,6 +4663,7 @@ while True:
             environment: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
             additional_directories: Vec::new(),
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: true,
