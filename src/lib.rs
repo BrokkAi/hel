@@ -24,6 +24,7 @@ pub mod hel_git_proxy;
 pub mod hel_greeting;
 pub mod hel_import;
 pub mod hel_local_git;
+pub mod hel_project_memory;
 pub mod hel_projection;
 pub mod hel_quota;
 pub mod hel_recovery;

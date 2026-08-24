@@ -205,6 +205,11 @@ enum WorkerCommand {
         #[arg(long)]
         destination: PathBuf,
     },
+    /// Serve project memory tools over MCP stdio.
+    MemoryMcp {
+        #[arg(long)]
+        root: PathBuf,
+    },
     /// Bridge controller Git services to this worker over stdio.
     GitBridge {
         #[arg(long)]
@@ -304,6 +309,7 @@ async fn main() -> Result<()> {
             WorkerCommand::InstallResource { destination } => {
                 hel::hel_resources::install_resource_stream(std::io::stdin(), &destination)
             }
+            WorkerCommand::MemoryMcp { root } => hel::hel_project_memory::run_mcp_stdio(&root),
             WorkerCommand::GitBridge { root } => hel::hel_git_proxy::run_worker_bridge(&root).await,
             WorkerCommand::GitProxy {
                 root,
