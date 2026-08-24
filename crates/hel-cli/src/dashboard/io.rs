@@ -25,7 +25,10 @@ use hel::hel_targets::{
     BoundedProcessExecutor, CancellableProcessExecutor, CommandExecutor, CommandOutput,
     CommandSpec, ProvisionStage,
 };
-use hel_tui::{DashboardAction, PreparedMaterializedSessionDetail, SessionOperationKind};
+use hel_tui::{
+    DashboardAction, PreparedMaterializedSessionDetail, PreparedMaterializedSessionSummary,
+    SessionOperationKind,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
@@ -48,6 +51,10 @@ pub(crate) enum DashboardIoUpdate {
     MaterializedSessionProjection {
         session_id: String,
         result: std::result::Result<Box<PreparedMaterializedSessionDetail>, String>,
+    },
+    StoredSessionSummary {
+        session_id: String,
+        result: std::result::Result<PreparedMaterializedSessionSummary, String>,
     },
     ProjectSource {
         session_id: String,
@@ -372,6 +379,29 @@ pub(crate) fn spawn_materialized_session_projection(
         let _ =
             updates.send(DashboardIoUpdate::MaterializedSessionProjection { session_id, result });
     });
+}
+
+pub(crate) fn spawn_stored_session_summary(
+    session_id: String,
+    viewed_through_event_ordinal: u64,
+    updates: UnboundedSender<DashboardIoUpdate>,
+) {
+    let reported_session_id = session_id.clone();
+    spawn_io(
+        updates,
+        move || {
+            let summary = hel::hel_database::load_materialized_session_summary(&session_id)?
+                .with_context(|| format!("session {session_id} has no stored projection"))?;
+            Ok(PreparedMaterializedSessionSummary::from_materialized(
+                summary,
+                viewed_through_event_ordinal,
+            ))
+        },
+        move |result| DashboardIoUpdate::StoredSessionSummary {
+            session_id: reported_session_id,
+            result,
+        },
+    );
 }
 
 pub(crate) fn spawn_lifecycle_reload(
@@ -800,6 +830,16 @@ impl DashboardContext {
             DashboardIoUpdate::MaterializedSessionProjection { session_id, result } => {
                 self.finish_materialized_projection(session_id, result);
             }
+            DashboardIoUpdate::StoredSessionSummary { session_id, result } => match result {
+                Ok(summary) => {
+                    self.dashboard
+                        .apply_prepared_materialized_session_summary(summary);
+                }
+                Err(error) => tracing::warn!(
+                    %session_id,
+                    "could not restore stored dashboard summary: {error}"
+                ),
+            },
             DashboardIoUpdate::ProjectSource { session_id, result } => {
                 self.project_sources_in_flight.remove(&session_id);
                 match result {

@@ -38,7 +38,10 @@ mod wizards;
 mod test_support;
 
 pub use crate::dialogs::{ImportProfileOption, ImportSessionOption};
-pub use crate::ingest::{MaterializedProjectionCache, PreparedMaterializedSessionDetail};
+pub use crate::ingest::{
+    MaterializedProjectionCache, PreparedMaterializedSessionDetail,
+    PreparedMaterializedSessionSummary,
+};
 pub use crate::render::render;
 pub use crate::resume::resume_profile_placeholders;
 

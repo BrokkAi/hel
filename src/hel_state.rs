@@ -116,6 +116,20 @@ pub struct MaterializedSession {
     pub pending_elicitations: Vec<crate::hel_elicitation::ElicitationRequest>,
 }
 
+/// The small portion of a durable projection needed to populate dashboard
+/// rows before the live session delivers its full transcript snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedSessionSummary {
+    pub session_id: String,
+    pub applied_event_ordinal: u64,
+    pub last_activity_at_ms: Option<i64>,
+    pub execution: MaterializedExecutionState,
+    pub session_title: Option<String>,
+    pub last_agent_message: Option<String>,
+    pub last_user_message: Option<String>,
+    pub agent_message_latest_content_ordinals: Vec<u64>,
+}
+
 impl MaterializedSession {
     pub fn empty(session_id: impl Into<String>) -> Self {
         Self {

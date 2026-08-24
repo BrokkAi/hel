@@ -186,10 +186,17 @@ fn render_adaptive_dashboard(
     let mut previous_project = None;
     let active_row_heights = active
         .iter()
-        .filter_map(|id| dashboard.state.sessions.get(id))
-        .map(|session| {
+        .enumerate()
+        .map(|(index, id)| {
+            let session = &dashboard.state.sessions[id];
             let source = dashboard.project_source(session);
             let heading = u16::from(previous_project.as_ref() != Some(&source.key));
+            let spacing = u16::from(
+                active
+                    .get(index + 1)
+                    .and_then(|next| dashboard.state.sessions.get(next))
+                    .is_some_and(|next| dashboard.project_source(next).key == source.key),
+            );
             previous_project = Some(source.key);
             heading
                 + if dashboard.project_is_expanded(session) {
@@ -197,6 +204,7 @@ fn render_adaptive_dashboard(
                 } else {
                     1
                 }
+                + spacing
         })
         .collect::<Vec<_>>();
     let full = PaneHeights {
@@ -474,9 +482,24 @@ fn render_sessions(
             ));
         }
         let heading = usize::from(first);
-        let height = lines.len() as u16;
-        row_meta.push((source.key, heading, height, selected));
-        Some(Row::new([Cell::from(Text::from(lines))]).height(height))
+        let content_height = lines.len() as u16;
+        let spacing = u16::from(
+            active
+                .get(index + 1)
+                .and_then(|next| dashboard.state.sessions.get(next))
+                .is_some_and(|next| dashboard.project_source(next).key == source.key),
+        );
+        row_meta.push((
+            source.key,
+            heading,
+            content_height,
+            content_height + spacing,
+        ));
+        Some(
+            Row::new([Cell::from(Text::from(lines))])
+                .height(content_height)
+                .bottom_margin(spacing),
+        )
     });
     let active_focused = dashboard.focus == Focus::Active;
     let active_table = Table::new(active_rows, [Constraint::Min(1)]).block(
@@ -493,7 +516,7 @@ fn render_sessions(
     let mut visible_sessions = 0;
     let mut active_row_areas = Vec::new();
     let mut project_heading_areas = Vec::new();
-    for (index, (project_key, heading, height, selected)) in
+    for (index, (project_key, heading, content_height, total_height)) in
         row_meta.iter().enumerate().skip(active_offset)
     {
         if row_y >= active_area.bottom().saturating_sub(1) {
@@ -512,7 +535,7 @@ fn render_sessions(
             ));
         }
         let session_y = row_y.saturating_add(*heading as u16);
-        let session_height = height.saturating_sub(*heading as u16);
+        let session_height = content_height.saturating_sub(*heading as u16);
         let row_rect = Rect::new(
             active_area.x.saturating_add(1),
             session_y,
@@ -525,12 +548,7 @@ fn render_sessions(
             ),
         );
         active_row_areas.push((index, row_rect));
-        if *selected && active_focused {
-            frame
-                .buffer_mut()
-                .set_style(row_rect, Style::default().bg(Color::DarkGray));
-        }
-        row_y = row_y.saturating_add(*height);
+        row_y = row_y.saturating_add(*total_height);
     }
     render_session_scrollbar(
         frame,
@@ -1236,6 +1254,45 @@ mod tests {
         assert!(rendered.contains("You: question 1"));
         assert!(rendered.contains("Agent: "));
         assert!(rendered.contains("answer 1"));
+    }
+
+    #[test]
+    fn sessions_in_one_project_have_a_blank_row_and_only_the_caret_marks_selection() {
+        let mut first = running_session();
+        first.id = "session-first".into();
+        first.project_directory = Some("/projects/shared".into());
+        first.session_title_override = Some("First session".into());
+        let mut second = running_session();
+        second.id = "session-second".into();
+        second.project_directory = Some("/projects/shared".into());
+        second.session_title_override = Some("Second session".into());
+        second.created_at = "2026-08-10T00:00:00Z".into();
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+
+        let first_area = dashboard.active_row_areas[0].1;
+        let buffer = terminal.backend().buffer();
+        assert!(
+            (first_area.y..first_area.bottom()).all(|y| {
+                (first_area.x..first_area.right()).all(|x| buffer[(x, y)].bg != Color::DarkGray)
+            }),
+            "selection must not paint a background"
+        );
+        assert_eq!(buffer[(first_area.x, first_area.y)].symbol(), "›");
+        assert!(
+            (first_area.x..first_area.right())
+                .all(|x| buffer[(x, first_area.bottom())].symbol().trim().is_empty()),
+            "the row after the first session is empty"
+        );
     }
 
     #[test]

@@ -10,8 +10,8 @@ use hel::hel_chat::{
 use hel::hel_config::HelConfig;
 use hel::hel_quota::ProfileQuota;
 use hel::hel_state::{
-    HelState, MaterializedExecutionState, MaterializedSession, SessionRecord,
-    SessionResourceAllocation, SessionState, TranscriptBody, TranscriptItem,
+    HelState, MaterializedExecutionState, MaterializedSession, MaterializedSessionSummary,
+    SessionRecord, SessionResourceAllocation, SessionState, TranscriptBody, TranscriptItem,
 };
 use hel::hel_targets::{
     DeploymentCapacityTarget, DeploymentCapacityUsage, ProvisionStage, SessionResourceUsage,
@@ -149,6 +149,54 @@ pub struct PreparedMaterializedSessionDetail {
     pub(crate) transcript: TranscriptSnapshot,
     pub(crate) queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
     pub(crate) projection: MaterializedProjectionCache,
+}
+
+/// Lightweight persisted fields used to restore dashboard rows at startup
+/// without constructing a full transcript snapshot.
+pub struct PreparedMaterializedSessionSummary {
+    session_id: String,
+    applied_event_ordinal: u64,
+    session_title: Option<String>,
+    current_turn_started_at: Option<u64>,
+    last_activity_at_ms: Option<u64>,
+    last_agent_message: Option<Arc<str>>,
+    last_user_message: Option<Arc<str>>,
+    agent_message_latest_content_ordinals: Vec<u64>,
+    unread_agent_messages: usize,
+}
+
+impl PreparedMaterializedSessionSummary {
+    pub fn from_materialized(
+        summary: MaterializedSessionSummary,
+        viewed_through_event_ordinal: u64,
+    ) -> Self {
+        let current_turn_started_at = match summary.execution {
+            MaterializedExecutionState::Running { started_at_ms } => {
+                u64::try_from(started_at_ms).ok().map(|value| value / 1_000)
+            }
+            MaterializedExecutionState::Idle
+            | MaterializedExecutionState::Closing
+            | MaterializedExecutionState::Closed => None,
+        };
+        let unread_agent_messages = summary
+            .agent_message_latest_content_ordinals
+            .iter()
+            .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
+            .count();
+        Self {
+            session_id: summary.session_id,
+            applied_event_ordinal: summary.applied_event_ordinal,
+            session_title: summary.session_title,
+            current_turn_started_at,
+            last_activity_at_ms: summary
+                .last_activity_at_ms
+                .and_then(|value| u64::try_from(value).ok()),
+            last_agent_message: summary.last_agent_message.map(Arc::from),
+            last_user_message: summary.last_user_message.map(Arc::from),
+            agent_message_latest_content_ordinals: summary.agent_message_latest_content_ordinals,
+            unread_agent_messages,
+        }
+    }
 }
 
 impl PreparedMaterializedSessionDetail {
@@ -585,6 +633,39 @@ impl DashboardState {
         true
     }
 
+    /// Apply the small startup projection while leaving transcript hydration
+    /// pending for the live session's complete snapshot.
+    pub fn apply_prepared_materialized_session_summary(
+        &mut self,
+        prepared: PreparedMaterializedSessionSummary,
+    ) -> bool {
+        let detail = self
+            .session_details
+            .entry(prepared.session_id.clone())
+            .or_default();
+        if detail
+            .materialized_applied_event_ordinal
+            .is_some_and(|current| prepared.applied_event_ordinal < current)
+        {
+            return false;
+        }
+        detail.materialized_applied_event_ordinal = Some(prepared.applied_event_ordinal);
+        detail.current_turn_started_at = prepared.current_turn_started_at;
+        detail.last_activity_at_ms = prepared.last_activity_at_ms;
+        detail.last_agent_message = prepared.last_agent_message;
+        detail.last_user_message = prepared.last_user_message;
+        detail.agent_message_latest_content_ordinals =
+            prepared.agent_message_latest_content_ordinals;
+        detail.unread_agent_messages = prepared.unread_agent_messages;
+        if let Some(title) = prepared.session_title.as_ref()
+            && let Some(record) = self.state.sessions.get_mut(&prepared.session_id)
+        {
+            record.acp_session_title = Some(title.clone());
+            self.rebuild_resume_rows();
+        }
+        true
+    }
+
     pub fn set_last_acp_activity(&mut self, session_id: &str, timestamp_ms: Option<i64>) {
         self.session_details
             .entry(session_id.to_owned())
@@ -857,6 +938,50 @@ mod tests {
                 .last_agent_message
                 .as_deref(),
             Some("latest")
+        );
+    }
+
+    #[test]
+    fn stored_summary_restores_dashboard_messages_without_marking_transcript_ready() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        session.viewed_through_event_ordinal = 3;
+        let mut dashboard = dashboard_with_session(session);
+        let summary = MaterializedSessionSummary {
+            session_id: "session-1".into(),
+            applied_event_ordinal: 7,
+            last_activity_at_ms: Some(8_000),
+            execution: MaterializedExecutionState::Running {
+                started_at_ms: 4_000,
+            },
+            session_title: Some("Persisted title".into()),
+            last_agent_message: Some("Persisted answer".into()),
+            last_user_message: Some("Persisted question".into()),
+            agent_message_latest_content_ordinals: vec![2, 5, 7],
+        };
+
+        assert!(dashboard.apply_prepared_materialized_session_summary(
+            PreparedMaterializedSessionSummary::from_materialized(summary, 3),
+        ));
+
+        let detail = &dashboard.session_details["session-1"];
+        assert_eq!(
+            detail.last_user_message.as_deref(),
+            Some("Persisted question")
+        );
+        assert_eq!(
+            detail.last_agent_message.as_deref(),
+            Some("Persisted answer")
+        );
+        assert_eq!(detail.unread_agent_messages, 2);
+        assert_eq!(detail.current_turn_started_at, Some(4));
+        assert_eq!(detail.transcript_hydration, TranscriptHydration::Loading);
+        assert!(detail.transcript.is_none());
+        assert_eq!(
+            dashboard.state.sessions["session-1"]
+                .acp_session_title
+                .as_deref(),
+            Some("Persisted title")
         );
     }
 

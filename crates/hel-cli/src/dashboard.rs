@@ -44,6 +44,7 @@ use crate::dashboard::io::{
     ActiveLifecycleOperation, DashboardIoUpdate, LifecycleReload, checkpoint_archive_targets,
     spawn_checkpoint_archive_size_refresh, spawn_lifecycle_reload,
     spawn_materialized_session_projection, spawn_project_source_resolution,
+    spawn_stored_session_summary,
 };
 use crate::import::{
     DashboardImportTaskResult, DashboardImportUpdate, PendingDashboardImport,
@@ -563,6 +564,7 @@ impl DashboardContext {
             checkpoint_archive_generation: 0,
         };
         context.resolve_project_sources();
+        context.hydrate_stored_session_summaries();
         context.request_quota_refresh();
         Ok(Some(context))
     }
@@ -593,6 +595,24 @@ impl DashboardContext {
             self.dashboard_io_tx.clone(),
             Arc::clone(&self.materialized_projection_permits),
         );
+    }
+
+    fn hydrate_stored_session_summaries(&mut self) {
+        let sessions = self
+            .controller
+            .state
+            .sessions
+            .values()
+            .filter(|session| session.state.is_active())
+            .map(|session| (session.id.clone(), session.viewed_through_event_ordinal))
+            .collect::<Vec<_>>();
+        for (session_id, viewed_through_event_ordinal) in sessions {
+            spawn_stored_session_summary(
+                session_id,
+                viewed_through_event_ordinal,
+                self.dashboard_io_tx.clone(),
+            );
+        }
     }
 
     pub(super) fn resolve_project_sources(&mut self) {
