@@ -16,7 +16,7 @@ use crate::hel_config::HarnessKind;
 use crate::hel_credentials::{MAX_CREDENTIAL_BYTES, credential_fingerprint};
 use crate::hel_setup::harness_authentication_marker;
 
-pub const API_PRICING_LABEL: &str = "API Pricing";
+pub const API_LABEL: &str = "API";
 
 #[derive(Debug, Clone)]
 pub struct QuotaRefreshRequest {
@@ -365,7 +365,7 @@ async fn refresh_profile(
             profile_id: profile_id.clone(),
             harness,
             windows: Vec::new(),
-            extra: Some(API_PRICING_LABEL.to_owned()),
+            extra: Some(API_LABEL.to_owned()),
             error: None,
             refreshed_at_epoch_seconds,
         }),
@@ -1455,7 +1455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepseek_reports_api_pricing_instead_of_inventing_quota() {
+    async fn deepseek_reports_api_instead_of_inventing_quota() {
         let directory = tempfile::tempdir().unwrap();
         let (outcome, _) = refresh_profile(
             QuotaRefreshRequest {
@@ -1472,8 +1472,8 @@ mod tests {
 
         assert!(outcome.report.windows.is_empty());
         assert_eq!(outcome.report.error, None);
-        assert_eq!(outcome.report.extra.as_deref(), Some(API_PRICING_LABEL));
-        assert_eq!(outcome.report.compact(), API_PRICING_LABEL);
+        assert_eq!(outcome.report.extra.as_deref(), Some(API_LABEL));
+        assert_eq!(outcome.report.compact(), API_LABEL);
     }
 
     #[tokio::test]

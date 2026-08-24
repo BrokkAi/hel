@@ -1003,6 +1003,8 @@ fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
         })
 }
 
+const EMPTY_QUOTA_COLOR: Color = Color::DarkGray;
+
 fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
     const CELLS: usize = 10;
     const EIGHTHS_PER_CELL: usize = 8;
@@ -1027,13 +1029,23 @@ fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
         Span::styled(partial.to_string(), bar_style),
         Span::styled(
             "░".repeat(empty_cells),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(EMPTY_QUOTA_COLOR),
         ),
         Span::styled(
             format!(" {remaining:>3}%"),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
     ])
+}
+
+fn api_quota_bar() -> Line<'static> {
+    Line::from(Span::styled(
+        format!("{:^10}", hel::hel_quota::API_LABEL),
+        Style::default()
+            .fg(Color::White)
+            .bg(EMPTY_QUOTA_COLOR)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
@@ -1080,11 +1092,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         .as_secs();
     let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
         let (weekly, five_hour, resets) = if profile.kind == HarnessKind::Deepseek {
-            (
-                Line::raw(hel::hel_quota::API_PRICING_LABEL),
-                Line::default(),
-                String::new(),
-            )
+            (api_quota_bar(), Line::default(), String::new())
         } else if dashboard.quota_refreshing.contains(id) {
             (Line::raw("refreshing…"), Line::default(), String::new())
         } else {
@@ -2598,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_quota_row_shows_api_pricing_without_bars_or_reset_dates() {
+    fn deepseek_quota_row_shows_api_without_bars_or_reset_dates() {
         let mut config = config();
         config.profiles.get_mut("codex-1").unwrap().kind = HarnessKind::Deepseek;
         let mut dashboard = DashboardState::new(config, HelState::default(), BTreeMap::new());
@@ -2615,7 +2623,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("API Pricing"));
+        assert!(rendered.contains("API"));
+        assert!(!rendered.contains("API Pricing"));
         assert!(rendered.contains("DSH"));
         assert!(!rendered.contains("DeepSeek Harness"));
         assert!(!rendered.contains("unavailable"));
@@ -2644,6 +2653,13 @@ mod tests {
         assert_eq!(bar.spans[0].style.fg, Some(Color::Green));
         assert_eq!(bar.spans[2].style.fg, Some(Color::DarkGray));
         assert!(quota_bar(None).spans.is_empty());
+    }
+
+    #[test]
+    fn api_quota_label_uses_the_empty_bar_background() {
+        let bar = api_quota_bar();
+        assert_eq!(bar.spans[0].content, "   API    ");
+        assert_eq!(bar.spans[0].style.bg, Some(EMPTY_QUOTA_COLOR));
     }
 
     #[test]
