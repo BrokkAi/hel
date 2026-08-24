@@ -117,8 +117,9 @@ authentication):
 podman pull ghcr.io/brokkai/hel/agent-dev:latest
 ```
 
-It includes Rust, Node, Git, GitHub CLI, the Codex and Claude ACP bridges, and
-pinned DeepSeek Harness plus `dsh-acp-server` packages.
+It includes Rust, cargo-nextest, Node, OpenJDK 25, Git, GitHub CLI, the Codex
+and Claude ACP bridges, and pinned DeepSeek Harness plus `dsh-acp-server`
+packages.
 See [docs/src/content/docs/custom-images.md](docs/src/content/docs/custom-images.md)
 to build your own.
 

@@ -37,8 +37,9 @@ architecture.
 ## Get the agent-dev image
 
 hel ships a reference container image with everything a session needs
-pre-installed: Rust, Node 24, Git, GitHub CLI, the Codex and Claude ACP
-bridges, and pinned DeepSeek Harness plus `dsh-acp-server`. It's published at
+pre-installed: Rust, cargo-nextest, Node 24, OpenJDK 25, Git, GitHub CLI, the
+Codex and Claude ACP bridges, and pinned DeepSeek Harness plus
+`dsh-acp-server`. It's published at
 `ghcr.io/brokkai/hel/agent-dev:latest`, public and
 multi-arch for both `linux/amd64` and `linux/arm64`, so the same image name
 works whether hel is running it through Podman, Apple's `container` runtime,
