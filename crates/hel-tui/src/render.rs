@@ -979,7 +979,9 @@ fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
         })
 }
 
-const EMPTY_QUOTA_COLOR: Color = Color::DarkGray;
+// ANSI "dark gray" is the bright-black slot in terminal palettes. The black
+// slot supplies the darker neutral used behind every quota bar instead.
+const EMPTY_QUOTA_COLOR: Color = Color::Black;
 
 fn empty_quota_style() -> Style {
     Style::default().bg(EMPTY_QUOTA_COLOR)
