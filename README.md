@@ -138,6 +138,13 @@ to build your own.
    queued prompts keep executing. Reattach from the dashboard, or run
    `hel server` and drive it from your phone.
 
+In an attached TUI or the phone viewer, start a message with `!` to run the
+rest as `bash -lc` inside that session's target. Shell commands run in the
+session workspace without blocking an active agent turn. Their bounded live
+output is saved in the transcript and included once as hidden context on the
+next prompt submitted after the command finishes. Press Escape in the TUI, or
+use the shell's Cancel button in the viewer, to stop it.
+
 Configuration lives at `~/.config/hel/config.toml` (the platform-equivalent
 directory elsewhere). The first-run dialog writes a working single-target
 setup; everything beyond that is edited in TOML. A minimal example:

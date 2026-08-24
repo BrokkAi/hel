@@ -138,14 +138,15 @@ impl RelayRequest {
         }
     }
 
-    /// Oldest protocol that understands this method. Form answers landed in
-    /// protocol 2, hidden context in 3, and project-memory sync in 4; every
-    /// earlier durable method is still valid on protocol 1.
+    /// Oldest protocol that understands this method or command payload. Form
+    /// answers landed in protocol 2, hidden context in 3, project-memory sync
+    /// in 4, and user shell commands in 5.
     pub const fn minimum_protocol(&self) -> u32 {
         match self {
             Self::RespondElicitation { .. } => 2,
             Self::InstallPromptContext { .. } => 3,
             Self::ProjectMemorySnapshot | Self::InstallProjectMemorySnapshot { .. } => 4,
+            Self::Submit { command, .. } => command.minimum_protocol(),
             _ => RELAY_MIN_PROTOCOL_VERSION,
         }
     }

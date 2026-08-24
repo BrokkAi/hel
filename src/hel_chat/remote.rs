@@ -21,6 +21,10 @@ pub(super) enum ChatRemoteOperation {
         session_id: String,
         bundle_id: String,
     },
+    RunShell {
+        command_id: String,
+        command: String,
+    },
     RemoveQueuedPrompt {
         command_id: String,
         id: String,
@@ -38,6 +42,8 @@ pub(super) enum ChatRemoteOperation {
     },
     Cancel {
         command_id: String,
+        cancel_agent: bool,
+        shell_command_ids: Vec<String>,
     },
     RespondElicitation {
         request: ElicitationRequest,
@@ -50,7 +56,12 @@ pub(super) enum ChatRemoteResult {
     Sync(std::result::Result<(), String>),
     Prompt {
         text: String,
-        result: std::result::Result<(u64, Option<String>), String>,
+        result: std::result::Result<u64, String>,
+    },
+    PromptHistoryWarning(String),
+    RunShell {
+        command: String,
+        result: std::result::Result<u64, String>,
     },
     RemoveQueuedPrompt {
         id: String,
@@ -82,6 +93,9 @@ impl ChatRemoteResult {
             | Self::Prompt {
                 result: Err(error), ..
             }
+            | Self::RunShell {
+                result: Err(error), ..
+            }
             | Self::RemoveQueuedPrompt {
                 result: Err(error), ..
             }
@@ -96,10 +110,7 @@ impl ChatRemoteResult {
                 result: Err(error), ..
             }
             | Self::WorkerFailed(error) => Some(error),
-            Self::Prompt {
-                result: Ok((_, Some(error))),
-                ..
-            } => Some(error),
+            Self::PromptHistoryWarning(error) => Some(error),
             _ => None,
         }
     }
@@ -303,33 +314,51 @@ async fn enqueue_chat_remote_operation(
                     let results = results.clone();
                     let attached = attached.clone();
                     pending.spawn(async move {
-                        let result = match response.wait().await {
-                            Ok(ordinal) => {
-                                let history_text = text.clone();
-                                let history = tokio::task::spawn_blocking(move || {
-                                    crate::hel_database::record_prompt(
-                                        &session_id,
-                                        &bundle_id,
-                                        ordinal,
-                                        None,
-                                        &history_text,
-                                    )
-                                })
-                                .await;
-                                let warning = match history {
-                                    Ok(Ok(())) => None,
-                                    Ok(Err(error)) => Some(format!("{error:#}")),
-                                    Err(error) => Some(format!("history task failed: {error}")),
-                                };
-                                Ok((ordinal, warning))
+                        let ordinal = match response.wait().await {
+                            Ok(ordinal) => ordinal,
+                            Err(error) => {
+                                publish_chat_remote_result(
+                                    &results,
+                                    &attached,
+                                    ChatRemoteResult::Prompt {
+                                        text,
+                                        result: Err(format!("{error:#}")),
+                                    },
+                                );
+                                return;
                             }
-                            Err(error) => Err(format!("{error:#}")),
                         };
                         publish_chat_remote_result(
                             &results,
                             &attached,
-                            ChatRemoteResult::Prompt { text, result },
+                            ChatRemoteResult::Prompt {
+                                text: text.clone(),
+                                result: Ok(ordinal),
+                            },
                         );
+                        let history_text = text;
+                        let history = tokio::task::spawn_blocking(move || {
+                            crate::hel_database::record_prompt(
+                                &session_id,
+                                &bundle_id,
+                                ordinal,
+                                None,
+                                &history_text,
+                            )
+                        })
+                        .await;
+                        let warning = match history {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(format!("{error:#}")),
+                            Err(error) => Some(format!("history task failed: {error}")),
+                        };
+                        if let Some(warning) = warning {
+                            publish_chat_remote_result(
+                                &results,
+                                &attached,
+                                ChatRemoteResult::PromptHistoryWarning(warning),
+                            );
+                        }
                     });
                 }
                 Err(error) => {
@@ -342,6 +371,41 @@ async fn enqueue_chat_remote_operation(
                         },
                     );
                 }
+            }
+        }
+        ChatRemoteOperation::RunShell {
+            command_id,
+            command,
+        } => {
+            let response = session
+                .enqueue_submit(
+                    command_id,
+                    RelayCommand::RunUserShell {
+                        command: command.clone(),
+                    },
+                )
+                .await;
+            match response {
+                Ok(response) => {
+                    let results = results.clone();
+                    let attached = attached.clone();
+                    pending.spawn(async move {
+                        let result = response.wait().await.map_err(|error| format!("{error:#}"));
+                        publish_chat_remote_result(
+                            &results,
+                            &attached,
+                            ChatRemoteResult::RunShell { command, result },
+                        );
+                    });
+                }
+                Err(error) => publish_chat_remote_result(
+                    results,
+                    attached,
+                    ChatRemoteResult::RunShell {
+                        command,
+                        result: Err(format!("{error:#}")),
+                    },
+                ),
             }
         }
         ChatRemoteOperation::RemoveQueuedPrompt {
@@ -479,35 +543,44 @@ async fn enqueue_chat_remote_operation(
                 }
             }
         }
-        ChatRemoteOperation::Cancel { command_id } => {
-            let response = session
-                .enqueue_submit(command_id, RelayCommand::Cancel)
-                .await;
-            match response {
-                Ok(response) => {
-                    let results = results.clone();
-                    let attached = attached.clone();
-                    pending.spawn(async move {
-                        let result = response
-                            .wait()
-                            .await
-                            .map(|_| ())
-                            .map_err(|error| format!("{error:#}"));
-                        publish_chat_remote_result(
-                            &results,
-                            &attached,
-                            ChatRemoteResult::Cancel(result),
-                        );
-                    });
+        ChatRemoteOperation::Cancel {
+            command_id,
+            cancel_agent,
+            shell_command_ids,
+        } => {
+            let session = session.clone();
+            let results = results.clone();
+            let attached = attached.clone();
+            pending.spawn(async move {
+                let mut failures = Vec::new();
+                if cancel_agent
+                    && let Err(error) = session
+                        .submit(command_id.clone(), RelayCommand::Cancel)
+                        .await
+                {
+                    failures.push(format!("agent: {error:#}"));
                 }
-                Err(error) => {
-                    publish_chat_remote_result(
-                        results,
-                        attached,
-                        ChatRemoteResult::Cancel(Err(format!("{error:#}"))),
-                    );
+                for (index, shell_command_id) in shell_command_ids.into_iter().enumerate() {
+                    if let Err(error) = session
+                        .submit(
+                            format!("{command_id}-shell-{index}"),
+                            RelayCommand::CancelUserShell { shell_command_id },
+                        )
+                        .await
+                    {
+                        failures.push(format!("shell: {error:#}"));
+                    }
                 }
-            }
+                publish_chat_remote_result(
+                    &results,
+                    &attached,
+                    ChatRemoteResult::Cancel(if failures.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(failures.join("; "))
+                    }),
+                );
+            });
         }
         ChatRemoteOperation::RespondElicitation { request, response } => {
             let session = session.clone();
@@ -539,20 +612,18 @@ pub(super) fn restore_unsent_input(chat: &mut ChatState, input: &str) {
 pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteResult) {
     match result {
         ChatRemoteResult::Sync(Ok(())) => chat.set_notice("Connected to session relay"),
-        ChatRemoteResult::Sync(Err(error)) => chat.set_notice(format!("Connection failed: {error}")),
+        ChatRemoteResult::Sync(Err(error)) => {
+            chat.set_notice(format!("Connection failed: {error}"))
+        }
         ChatRemoteResult::Prompt {
             text,
-            result: Ok((ordinal, None)),
+            result: Ok(ordinal),
         } => chat.set_notice(format!(
             "Prompt accepted by relay at {ordinal}: {}",
             queued_prompt_preview(&text)
         )),
-        ChatRemoteResult::Prompt {
-            text,
-            result: Ok((ordinal, Some(history_error))),
-        } => chat.set_notice(format!(
-            "Prompt accepted by relay at {ordinal} ({}), but history was not saved: {history_error}",
-            queued_prompt_preview(&text)
+        ChatRemoteResult::PromptHistoryWarning(history_error) => chat.set_notice(format!(
+            "Prompt was accepted, but history was not saved: {history_error}"
         )),
         ChatRemoteResult::Prompt {
             text,
@@ -561,9 +632,23 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             restore_unsent_input(chat, &text);
             chat.set_notice(format!("Prompt was not sent: {error}"));
         }
-        ChatRemoteResult::RemoveQueuedPrompt {
-            result: Ok(()), ..
-        } => chat.set_notice("Queued prompt removed"),
+        ChatRemoteResult::RunShell {
+            command,
+            result: Ok(ordinal),
+        } => chat.set_notice(format!(
+            "Shell command accepted by relay at {ordinal}: {}",
+            queued_prompt_preview(&command)
+        )),
+        ChatRemoteResult::RunShell {
+            command,
+            result: Err(error),
+        } => {
+            restore_unsent_input(chat, &format!("!{command}"));
+            chat.set_notice(format!("Shell command was not sent: {error}"));
+        }
+        ChatRemoteResult::RemoveQueuedPrompt { result: Ok(()), .. } => {
+            chat.set_notice("Queued prompt removed")
+        }
         ChatRemoteResult::RemoveQueuedPrompt {
             id,
             text,
@@ -576,9 +661,9 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             }
             chat.set_notice(format!("Queued prompt was not removed: {error}"));
         }
-        ChatRemoteResult::SetConfig {
-            result: Ok(()), ..
-        } => chat.set_notice("Configuration update accepted"),
+        ChatRemoteResult::SetConfig { result: Ok(()), .. } => {
+            chat.set_notice("Configuration update accepted")
+        }
         ChatRemoteResult::SetConfig {
             key,
             value,
@@ -587,9 +672,9 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             restore_unsent_input(chat, &config_command_text(&key, &value));
             chat.set_notice(format!("Configuration was not changed: {error}"));
         }
-        ChatRemoteResult::SetSessionMode {
-            result: Ok(()), ..
-        } => chat.set_notice("Session mode update accepted"),
+        ChatRemoteResult::SetSessionMode { result: Ok(()), .. } => {
+            chat.set_notice("Session mode update accepted")
+        }
         ChatRemoteResult::SetSessionMode {
             mode_id,
             result: Err(error),
@@ -597,7 +682,9 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             // The optimistic toggle never happened, so drop it rather than
             // leave the status line claiming a mode the agent is not in.
             chat.current_mode = None;
-            chat.set_notice(format!("Session mode was not changed to {mode_id}: {error}"));
+            chat.set_notice(format!(
+                "Session mode was not changed to {mode_id}: {error}"
+            ));
         }
         ChatRemoteResult::Cancel(Ok(())) => chat.set_notice("Cancellation requested"),
         ChatRemoteResult::Cancel(Err(error)) => {
@@ -626,6 +713,9 @@ pub(super) fn queue_chat_remote_operation(
         let operation = error.into_inner();
         match operation {
             ChatRemoteOperation::Prompt { text, .. } => restore_unsent_input(chat, &text),
+            ChatRemoteOperation::RunShell { command, .. } => {
+                restore_unsent_input(chat, &format!("!{command}"));
+            }
             ChatRemoteOperation::RemoveQueuedPrompt { id, text, kind, .. } => {
                 if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
                     chat.queued_prompts
@@ -674,5 +764,50 @@ mod tests {
                 .as_deref()
                 .is_some_and(|notice| notice.contains("queue is full"))
         );
+    }
+
+    #[test]
+    fn relay_acceptance_clears_sending_before_history_is_saved() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        apply_chat_remote_result(
+            &mut chat,
+            ChatRemoteResult::Prompt {
+                text: "ship it".into(),
+                result: Ok(42),
+            },
+        );
+        assert!(
+            chat.notice()
+                .as_deref()
+                .is_some_and(|notice| notice.contains("accepted by relay at 42"))
+        );
+
+        apply_chat_remote_result(
+            &mut chat,
+            ChatRemoteResult::PromptHistoryWarning("database busy".into()),
+        );
+        assert!(
+            chat.notice()
+                .as_deref()
+                .is_some_and(|notice| notice.contains("accepted, but history was not saved"))
+        );
+    }
+
+    #[test]
+    fn full_remote_queue_restores_a_shell_command_with_its_prefix() {
+        let (operations, _receiver) = tokio::sync::mpsc::channel(1);
+        operations.try_send(ChatRemoteOperation::Sync).unwrap();
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        queue_chat_remote_operation(
+            &operations,
+            ChatRemoteOperation::RunShell {
+                command_id: "shell-1".into(),
+                command: "cargo test".into(),
+            },
+            &mut chat,
+        );
+
+        assert_eq!(chat.input, "!cargo test");
     }
 }

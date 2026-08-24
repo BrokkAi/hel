@@ -13,7 +13,7 @@ use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions
 use hel::hel_quota::ProfileQuota;
 use hel::hel_server::{
     ActionOutcome, ControllerAction, ControllerRequest, ReadReceiptRequest, ResumeQueueDisposition,
-    ServerOptions, ViewerQueuedPrompt, ViewerQuota, ViewerSnapshot,
+    ServerOptions, ViewerQueuedPrompt, ViewerQuota, ViewerSnapshot, ViewerUserShell,
 };
 use hel::hel_session_manager::{SessionManagerControl, new_command_id};
 use hel::hel_state::{HelState, SessionRecord};
@@ -241,11 +241,13 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     let mut revision = 1;
     let mut conversations = std::collections::BTreeMap::new();
     let mut queued_prompts = projected_queued_prompts(&controller)?;
+    let mut active_user_shells = std::collections::BTreeMap::new();
     let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
         &controller,
         &quotas,
         &conversations,
         &queued_prompts,
+        &active_user_shells,
         revision,
     ));
     let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
@@ -340,6 +342,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                                 &quotas,
                                 &conversations,
                                 &queued_prompts,
+                                &active_user_shells,
                                 revision,
                             ));
                         }
@@ -376,6 +379,10 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                         tracing::warn!(session_id = %update.session_id, "could not persist relay session metadata: {error:#}");
                     }
                     if let Some(snapshot) = update.view.snapshot {
+                        active_user_shells.insert(
+                            update.session_id.clone(),
+                            snapshot.operational.active_user_shells.clone(),
+                        );
                         if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
                             recovery_observer.observe(hel::hel_state::RecoveryObservation {
                                 session,
@@ -405,6 +412,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             &quotas,
                             &conversations,
                             &queued_prompts,
+                            &active_user_shells,
                             revision,
                         ));
                     }
@@ -426,7 +434,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     if changed {
                         revision += 1;
-                        let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
+                        let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, &active_user_shells, revision));
                     }
                 }
                 completed = interrupted_close_rx.recv() => {
@@ -456,7 +464,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     });
                     revision += 1;
                     conversation_tx.send_replace(conversations.clone());
-                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
+                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, &active_user_shells, revision));
                 }
                 receipt = receipt_rx.recv() => {
                     let Some(ReadReceiptRequest { session_id, through, reply }) = receipt else {
@@ -508,6 +516,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                                     &quotas,
                                     &conversations,
                                     &queued_prompts,
+                                    &active_user_shells,
                                     revision,
                                 ));
                             }
@@ -568,6 +577,8 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             let result = (|| -> Result<()> {
                                 let _recovery_reservation = match &action {
                                     ControllerAction::Prompt { session_id, .. }
+                                    | ControllerAction::RunShell { session_id, .. }
+                                    | ControllerAction::CancelShell { session_id, .. }
                                     | ControllerAction::Close { session_id }
                                     | ControllerAction::Resume { session_id, .. }
                                     | ControllerAction::RemoveQueuedPrompt { session_id, .. } => {
@@ -629,6 +640,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             &quotas,
                             &conversations,
                             &queued_prompts,
+                            &active_user_shells,
                             revision,
                         ));
                     };
@@ -694,7 +706,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     });
                     revision += 1;
                     conversation_tx.send_replace(conversations.clone());
-                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
+                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, &active_user_shells, revision));
                 }
             }
         }
@@ -730,6 +742,8 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
     match action {
         ControllerAction::New { .. } => None,
         ControllerAction::Prompt { session_id, .. }
+        | ControllerAction::RunShell { session_id, .. }
+        | ControllerAction::CancelShell { session_id, .. }
         | ControllerAction::Close { session_id }
         | ControllerAction::Resume { session_id, .. }
         | ControllerAction::Open { session_id }
@@ -897,6 +911,34 @@ async fn apply_phone_action(
                 .await?;
             Ok(())
         }
+        ControllerAction::RunShell {
+            session_id,
+            command,
+        } => {
+            sessions
+                .session(&session_id)
+                .await?
+                .submit(
+                    new_command_id("phone-shell")?,
+                    RelayCommand::RunUserShell { command },
+                )
+                .await?;
+            Ok(())
+        }
+        ControllerAction::CancelShell {
+            session_id,
+            shell_command_id,
+        } => {
+            sessions
+                .session(&session_id)
+                .await?
+                .submit(
+                    new_command_id("phone-cancel-shell")?,
+                    RelayCommand::CancelUserShell { shell_command_id },
+                )
+                .await?;
+            Ok(())
+        }
         ControllerAction::Close { session_id } => {
             controller
                 .close_session_managed_controlled(&session_id, executor, sessions)
@@ -949,6 +991,7 @@ fn viewer_snapshot(
     quotas: &std::collections::BTreeMap<String, ProfileQuota>,
     conversations: &std::collections::BTreeMap<String, hel::hel_chat::BrowserTranscript>,
     queued_prompts: &std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>>,
+    active_user_shells: &std::collections::BTreeMap<String, Vec<hel::hel_worker::ActiveUserShell>>,
     revision: u64,
 ) -> ViewerSnapshot {
     let mut snapshot =
@@ -981,6 +1024,16 @@ fn viewer_snapshot(
                 id: prompt.id.clone(),
                 text: prompt.text.clone(),
                 created_at: prompt.created_at_ms.to_string(),
+            })
+            .collect();
+        session.active_user_shells = active_user_shells
+            .get(&session.id)
+            .into_iter()
+            .flatten()
+            .map(|shell| ViewerUserShell {
+                id: shell.command_id.clone(),
+                command: shell.command.clone(),
+                started_at_ms: shell.started_at_ms,
             })
             .collect();
         if let Some(transcript) = conversations.get(&session.id) {
@@ -1279,6 +1332,7 @@ mod tests {
             viewer_snapshot(
                 &controller,
                 &quotas,
+                &std::collections::BTreeMap::new(),
                 &std::collections::BTreeMap::new(),
                 &std::collections::BTreeMap::new(),
                 1,

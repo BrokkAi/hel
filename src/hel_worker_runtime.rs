@@ -246,6 +246,11 @@ mod unix {
         let (acp_commands_tx, acp_commands_rx) = mpsc::channel(32);
         let (acp_events_tx, acp_events_rx) = mpsc::channel(ACP_EVENT_CHANNEL_CAPACITY);
         let (dispatch_wake_tx, dispatch_wake_rx) = mpsc::channel(1);
+        let user_shells = crate::hel_user_shell::UserShellRegistry::new(
+            config.cwd.clone(),
+            config.environment.clone(),
+            acp_events_tx.clone(),
+        );
         let supervisor_path = root.join("acp-supervisor.json");
         AcpSupervisorSpec {
             command: config.bridge_command,
@@ -277,11 +282,12 @@ mod unix {
         let mut acp_task = tokio::spawn(hel_acp::run(acp_spec, acp_commands_rx, acp_events_tx));
 
         let event_relay = relay.clone();
-        let mut event_task = tokio::spawn(run_relay_coordinator(
+        let mut event_task = tokio::spawn(run_relay_coordinator_with_shells(
             event_relay,
             acp_events_rx,
             dispatch_wake_rx,
             acp_commands_tx.clone(),
+            user_shells,
         ));
 
         let acp_join = loop {
@@ -438,15 +444,22 @@ mod unix {
         }
     }
 
-    pub(super) async fn run_relay_coordinator(
+    async fn run_relay_coordinator_with_shells(
         relay: Arc<Mutex<DurableRelay>>,
         mut events: mpsc::Receiver<RuntimeEvent>,
         mut dispatch_wakes: mpsc::Receiver<()>,
         commands: mpsc::Sender<CommandRequest>,
+        mut user_shells: crate::hel_user_shell::UserShellRegistry,
     ) -> Result<()> {
         let mut in_flight = BTreeMap::new();
         let mut session_configured = false;
-        dispatch_pending(&relay, &commands, &mut in_flight, session_configured)?;
+        dispatch_pending(
+            &relay,
+            &commands,
+            &mut in_flight,
+            session_configured,
+            &mut user_shells,
+        )?;
         let mut wakes_open = true;
         loop {
             tokio::select! {
@@ -464,6 +477,7 @@ mod unix {
                             &mut in_flight,
                             &mut events,
                             &mut session_configured,
+                            &mut user_shells,
                             queued,
                         ).await? {
                             return Ok(());
@@ -473,6 +487,7 @@ mod unix {
                             &commands,
                             &mut in_flight,
                             session_configured,
+                            &mut user_shells,
                         )?;
                     }
                 }
@@ -491,6 +506,7 @@ mod unix {
                         event,
                         &mut events,
                         &mut session_configured,
+                        &mut user_shells,
                     ).await? {
                         return Ok(());
                     }
@@ -499,10 +515,28 @@ mod unix {
                         &commands,
                         &mut in_flight,
                         session_configured,
+                        &mut user_shells,
                     )?;
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn run_relay_coordinator(
+        relay: Arc<Mutex<DurableRelay>>,
+        events: mpsc::Receiver<RuntimeEvent>,
+        dispatch_wakes: mpsc::Receiver<()>,
+        commands: mpsc::Sender<CommandRequest>,
+    ) -> Result<()> {
+        let (shell_events, _shell_events_rx) = mpsc::channel(1);
+        let user_shells = crate::hel_user_shell::UserShellRegistry::new(
+            std::env::current_dir()?,
+            BTreeMap::new(),
+            shell_events,
+        );
+        run_relay_coordinator_with_shells(relay, events, dispatch_wakes, commands, user_shells)
+            .await
     }
 
     /// Record the complete batch already emitted by the ACP runtime before
@@ -515,7 +549,9 @@ mod unix {
         first: RuntimeEvent,
         events: &mut mpsc::Receiver<RuntimeEvent>,
         session_configured: &mut bool,
+        user_shells: &mut crate::hel_user_shell::UserShellRegistry,
     ) -> Result<bool> {
+        track_user_shell_completion(user_shells, &first);
         if record_runtime_event_and_track_configuration(
             relay,
             in_flight,
@@ -525,7 +561,15 @@ mod unix {
             return Ok(true);
         }
         let queued = events.len();
-        record_queued_runtime_events(relay, in_flight, events, session_configured, queued).await
+        record_queued_runtime_events(
+            relay,
+            in_flight,
+            events,
+            session_configured,
+            user_shells,
+            queued,
+        )
+        .await
     }
 
     async fn record_queued_runtime_events(
@@ -533,11 +577,13 @@ mod unix {
         in_flight: &mut BTreeMap<String, RelayCommand>,
         events: &mut mpsc::Receiver<RuntimeEvent>,
         session_configured: &mut bool,
+        user_shells: &mut crate::hel_user_shell::UserShellRegistry,
         maximum: usize,
     ) -> Result<bool> {
         for recorded in 0..maximum {
             match events.try_recv() {
                 Ok(event) => {
+                    track_user_shell_completion(user_shells, &event);
                     if record_runtime_event_and_track_configuration(
                         relay,
                         in_flight,
@@ -562,6 +608,15 @@ mod unix {
             }
         }
         Ok(false)
+    }
+
+    fn track_user_shell_completion(
+        user_shells: &mut crate::hel_user_shell::UserShellRegistry,
+        event: &RuntimeEvent,
+    ) {
+        if let RuntimeEvent::UserShellFinished { request_id, .. } = event {
+            user_shells.completed(request_id);
+        }
     }
 
     fn record_runtime_event_and_track_configuration(
@@ -744,6 +799,29 @@ mod unix {
                     signal,
                 })?;
             }
+            RuntimeEvent::UserShellOutput {
+                request_id,
+                command,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+            } => {
+                relay.record_observation(RelayObservation::UserShellOutput {
+                    command_id: request_id,
+                    command,
+                    stdout,
+                    stderr,
+                    stdout_truncated,
+                    stderr_truncated,
+                })?;
+            }
+            RuntimeEvent::UserShellFinished { request_id, result } => {
+                relay.record_command_completed(
+                    &request_id,
+                    RelayCommandOutcome::UserShell { result },
+                )?;
+            }
             RuntimeEvent::Stopped => {
                 relay.record_observation(RelayObservation::ElicitationsCleared)?;
                 if relay.operational_state().execution
@@ -794,7 +872,9 @@ mod unix {
         commands: &mpsc::Sender<CommandRequest>,
         in_flight: &mut BTreeMap<String, RelayCommand>,
         session_configured: bool,
+        user_shells: &mut crate::hel_user_shell::UserShellRegistry,
     ) -> Result<()> {
+        dispatch_user_shells(relay, user_shells)?;
         let mut permits = Vec::new();
         // `Full` means dispatch what fits now and reserve again on the next
         // runtime event or wake. `Closed` means the ACP runtime is gone, so
@@ -839,6 +919,68 @@ mod unix {
         Ok(())
     }
 
+    fn dispatch_user_shells(
+        relay: &Arc<Mutex<DurableRelay>>,
+        user_shells: &mut crate::hel_user_shell::UserShellRegistry,
+    ) -> Result<()> {
+        let claimed = relay
+            .lock()
+            .expect("relay state lock poisoned")
+            .claim_pending_user_shell_commands_up_to(user_shells.available_slots())?;
+        for claimed in claimed {
+            match claimed.command {
+                RelayCommand::RunUserShell { command } => {
+                    if let Err(error) =
+                        user_shells.start(claimed.command_id.clone(), command.clone())
+                    {
+                        relay
+                            .lock()
+                            .expect("relay state lock poisoned")
+                            .record_command_completed(
+                                &claimed.command_id,
+                                RelayCommandOutcome::UserShell {
+                                    result: crate::hel_worker::UserShellResult {
+                                        command,
+                                        stdout: String::new(),
+                                        stderr: String::new(),
+                                        stdout_truncated: false,
+                                        stderr_truncated: false,
+                                        exit_code: None,
+                                        signal: None,
+                                        duration_ms: 0,
+                                        status: crate::hel_worker::UserShellStatus::Failed,
+                                        error: Some(format!("{error:#}")),
+                                    },
+                                },
+                            )?;
+                    }
+                }
+                RelayCommand::CancelUserShell { shell_command_id } => {
+                    let cancellation = user_shells.cancel(&shell_command_id);
+                    let mut relay = relay.lock().expect("relay state lock poisoned");
+                    if cancellation == crate::hel_user_shell::UserShellCancelOutcome::NotRunning
+                        && relay
+                            .operational_state()
+                            .active_user_shells
+                            .iter()
+                            .any(|shell| shell.command_id == shell_command_id)
+                    {
+                        relay.record_command_interrupted(
+                            &shell_command_id,
+                            "shell command was cancelled before it started",
+                        )?;
+                    }
+                    relay.record_command_completed(
+                        &claimed.command_id,
+                        RelayCommandOutcome::UserShellCancelled,
+                    )?;
+                }
+                _ => unreachable!("only user shell commands are claimed here"),
+            }
+        }
+        Ok(())
+    }
+
     fn acp_command(claimed: &ClaimedRelayCommand) -> Option<CommandRequest> {
         let request_id = claimed.command_id.clone();
         match &claimed.command {
@@ -866,6 +1008,8 @@ mod unix {
             RelayCommand::Cancel => Some(CommandRequest::Cancel { request_id }),
             RelayCommand::Close { .. } => Some(CommandRequest::Close { request_id }),
             RelayCommand::BeginCheckpoint { .. }
+            | RelayCommand::RunUserShell { .. }
+            | RelayCommand::CancelUserShell { .. }
             | RelayCommand::RemoveQueuedPrompt { .. }
             | RelayCommand::ClearQueuedPrompts
             | RelayCommand::CompleteCheckpoint { .. }

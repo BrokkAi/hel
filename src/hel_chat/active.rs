@@ -575,6 +575,7 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
             &snapshot.operational.available_commands,
         );
         state.set_session_modes(snapshot.operational.modes.clone());
+        state.set_active_user_shells(&snapshot.operational.active_user_shells);
     }
     if let Some(error) = view.error {
         match error {
@@ -677,6 +678,9 @@ impl ActiveChat {
                     .as_ref()
                     .and_then(|snapshot| snapshot.operational.modes.clone()),
             );
+            if let Some(snapshot) = snapshot.as_ref() {
+                state.set_active_user_shells(&snapshot.operational.active_user_shells);
+            }
             let pending = PendingPrefix::of(materialized, state.unconverted_prefix());
             (state, pending)
         };
@@ -938,7 +942,7 @@ impl ActiveChat {
                     restore_unsent_input(&mut self.state, &text);
                     return ChatEventOutcome::Handled;
                 };
-                self.state.set_notice("Sending prompt…");
+                self.state.set_notice("Prompt queued for delivery…");
                 queue_chat_remote_operation(
                     self.remote.operations(),
                     ChatRemoteOperation::Prompt {
@@ -946,6 +950,21 @@ impl ActiveChat {
                         text,
                         session_id: self.session.session_id().to_owned(),
                         bundle_id: self.bundle_id.clone(),
+                    },
+                    &mut self.state,
+                );
+            }
+            ChatAction::RunShell(command) => {
+                let Some(command_id) = self.command_id("shell") else {
+                    restore_unsent_input(&mut self.state, &format!("!{command}"));
+                    return ChatEventOutcome::Handled;
+                };
+                self.state.set_notice("Shell command queued…");
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::RunShell {
+                        command_id,
+                        command,
                     },
                     &mut self.state,
                 );
@@ -1003,7 +1022,11 @@ impl ActiveChat {
                 self.state.set_notice("Sending cancellation request…");
                 queue_chat_remote_operation(
                     self.remote.operations(),
-                    ChatRemoteOperation::Cancel { command_id },
+                    ChatRemoteOperation::Cancel {
+                        command_id,
+                        cancel_agent: self.state.phase == crate::hel_worker::WorkerPhase::Running,
+                        shell_command_ids: self.state.active_user_shell_ids(),
+                    },
                     &mut self.state,
                 );
             }
@@ -1425,6 +1448,7 @@ mod tests {
                     config: BTreeMap::new(),
                     active_prompt: None,
                     queued_prompts: Vec::new(),
+                    active_user_shells: Vec::new(),
                     checkpoint_barrier: None,
                     checkpoint_ready: None,
                     last_acp_activity_at_ms: None,

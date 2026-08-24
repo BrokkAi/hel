@@ -97,6 +97,7 @@ pub enum ChatEventOutcome {
 pub enum ChatAction {
     None,
     Prompt(String),
+    RunShell(String),
     RemoveQueuedPrompt {
         id: String,
         text: String,
@@ -263,6 +264,7 @@ pub struct ChatState {
     next_history_search_generation: u64,
     pending_history_search: Option<HistorySearchRequest>,
     queued_prompts: VecDeque<QueuedPrompt>,
+    active_user_shells: Vec<String>,
     elicitation: Option<ElicitationDialog>,
     recovery_busy: bool,
     goal_prompt_active: bool,
@@ -327,6 +329,7 @@ impl ChatState {
             next_history_search_generation: 0,
             pending_history_search: None,
             queued_prompts: VecDeque::new(),
+            active_user_shells: Vec::new(),
             elicitation: None,
             recovery_busy: false,
             goal_prompt_active: snapshot
@@ -988,6 +991,19 @@ impl ChatState {
         if prompt.is_empty() {
             return ChatAction::None;
         }
+        if let Some(command) = prompt.strip_prefix('!') {
+            if command.trim().is_empty() {
+                self.set_notice("usage: !<bash command>");
+                return ChatAction::None;
+            }
+            if matches!(self.phase, WorkerPhase::Closing | WorkerPhase::Closed) {
+                self.set_notice("The worker is closing; this shell command was not sent");
+                return ChatAction::None;
+            }
+            self.record_prompt_history(&prompt);
+            self.clear_input();
+            return ChatAction::RunShell(command.to_owned());
+        }
         if let Some((command, args)) = parse_local_command(&prompt) {
             return match command {
                 LocalCommand::Help => {
@@ -1121,7 +1137,7 @@ impl ChatState {
         }
 
         if code == KeyCode::Esc {
-            return if self.phase == WorkerPhase::Running {
+            return if self.phase == WorkerPhase::Running || !self.active_user_shells.is_empty() {
                 ChatAction::Cancel
             } else {
                 ChatAction::None
@@ -1307,6 +1323,17 @@ impl ChatState {
             }
             _ => ChatAction::None,
         }
+    }
+
+    pub(super) fn set_active_user_shells(&mut self, shells: &[crate::hel_worker::ActiveUserShell]) {
+        self.active_user_shells = shells
+            .iter()
+            .map(|shell| shell.command_id.clone())
+            .collect();
+    }
+
+    pub(super) fn active_user_shell_ids(&self) -> Vec<String> {
+        self.active_user_shells.clone()
     }
 
     fn toggle_render_mode(&mut self) {
@@ -1872,6 +1899,32 @@ mod tests {
         );
         assert!(chat.queued_prompts.is_empty());
         assert!(chat.entries.is_empty());
+    }
+
+    #[test]
+    fn bang_prefix_submits_a_bash_command_without_starting_a_prompt() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("!printf '%s' hello | tr a-z A-Z".into());
+
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::RunShell("printf '%s' hello | tr a-z A-Z".into())
+        );
+        assert!(chat.input.is_empty());
+        assert_eq!(
+            chat.prompt_history.last().map(String::as_str),
+            Some("!printf '%s' hello | tr a-z A-Z")
+        );
+    }
+
+    #[test]
+    fn empty_bang_command_stays_in_the_composer_and_shows_usage() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("!   ".into());
+
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.input, "!   ");
+        assert_eq!(chat.notice().as_deref(), Some("usage: !<bash command>"));
     }
 
     #[test]

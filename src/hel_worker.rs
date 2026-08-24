@@ -28,9 +28,10 @@ pub use protocol::{
 #[cfg(unix)]
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
-    ActiveRelayPrompt, ClaimedRelayCommand, QueuedRelayPrompt, RelayCommand, RelayCommandKind,
-    RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState, RelayObservation,
-    RelayOperationalState, relay_event_digest, validate_relay_event,
+    ActiveRelayPrompt, ActiveUserShell, ClaimedRelayCommand, QueuedRelayPrompt, RelayCommand,
+    RelayCommandKind, RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState,
+    RelayObservation, RelayOperationalState, UserShellResult, UserShellStatus, relay_event_digest,
+    validate_relay_event,
 };
 pub use types::{
     ActivePrompt, Attachment, QueuedPrompt, SequencedEvent, WorkerEvent, WorkerPhase,
@@ -91,7 +92,7 @@ const RELAY_SNAPSHOT_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 /// Current durable ACP relay protocol. Peers that only speak an older
 /// version in [`RELAY_MIN_PROTOCOL_VERSION`]..=this range still connect.
 /// Protocol 0 is the retired pre-relay worker protocol and is rejected.
-pub const RELAY_PROTOCOL_VERSION: u32 = 4;
+pub const RELAY_PROTOCOL_VERSION: u32 = 5;
 pub const RELAY_MIN_PROTOCOL_VERSION: u32 = 1;
 /// Digest for the empty relay event prefix (ordinal zero).
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
@@ -762,6 +763,29 @@ impl DurableRelay {
                 None,
             )));
         }
+        if let RelayCommand::RunUserShell { command } = &command
+            && command.trim().is_empty()
+        {
+            return Ok(Err(relay_protocol_error(
+                RelayErrorCode::InvalidRequest,
+                "shell command is empty",
+                false,
+                None,
+            )));
+        }
+        if let RelayCommand::CancelUserShell { shell_command_id } = &command
+            && !self
+                .snapshot
+                .active_user_shells
+                .contains_key(shell_command_id)
+        {
+            return Ok(Err(relay_protocol_error(
+                RelayErrorCode::InvalidState,
+                "there is no active shell command with that ID",
+                false,
+                None,
+            )));
+        }
         if let RelayCommand::SetConfig { key, value } = &command
             && (key.trim().is_empty() || value.trim().is_empty())
         {
@@ -1082,12 +1106,27 @@ impl DurableRelay {
             dispatch.state = RelayDispatchState::InFlight;
             let hidden_prompt_context = matches!(dispatch.command, RelayCommand::Prompt { .. })
                 .then(|| {
-                    let context = next_snapshot.pending_prompt_context.as_mut()?;
-                    if context.attached_command_id.is_none() {
-                        context.attached_command_id = Some(command_id.clone());
+                    let mut contexts = Vec::new();
+                    if let Some(context) = next_snapshot.pending_prompt_context.as_mut() {
+                        if context.attached_command_id.is_none() {
+                            context.attached_command_id = Some(command_id.clone());
+                        }
+                        if context.attached_command_id.as_deref() == Some(command_id.as_str()) {
+                            contexts.push(context.text.clone());
+                        }
                     }
-                    (context.attached_command_id.as_deref() == Some(command_id.as_str()))
-                        .then(|| context.text.clone())
+                    for context in &mut next_snapshot.pending_user_shell_contexts {
+                        if context.accepted_ordinal >= accepted_ordinal {
+                            continue;
+                        }
+                        if context.attached_command_id.is_none() {
+                            context.attached_command_id = Some(command_id.clone());
+                        }
+                        if context.attached_command_id.as_deref() == Some(command_id.as_str()) {
+                            contexts.push(context.text.clone());
+                        }
+                    }
+                    (!contexts.is_empty()).then(|| contexts.join("\n\n"))
                 })
                 .flatten();
             claimed.push(ClaimedRelayCommand {
@@ -1100,6 +1139,89 @@ impl DurableRelay {
         if !claimed.is_empty() {
             // An in-flight claim is not in the journal, so it is only durable
             // once the snapshot itself is.
+            self.commit_snapshot(next_snapshot)?;
+        }
+        Ok(claimed)
+    }
+
+    /// Claim user shell work independently of ACP turns. Run commands honor
+    /// the caller's concurrency limit; cancellation controls bypass it so a
+    /// full shell pool can always be stopped.
+    pub fn claim_pending_user_shell_commands_up_to(
+        &mut self,
+        maximum_runs: usize,
+    ) -> Result<Vec<ClaimedRelayCommand>> {
+        if self.snapshot.checkpoint_barrier.is_some() {
+            return Ok(Vec::new());
+        }
+        let barrier_ordinal = self
+            .next_queued_checkpoint()
+            .map_or(u64::MAX, |(_, ordinal)| ordinal);
+        let mut cancels = Vec::new();
+        let cancelled_shells: std::collections::BTreeSet<String> = self
+            .snapshot
+            .dispatches
+            .values()
+            .filter(|dispatch| dispatch.state == RelayDispatchState::Queued)
+            .filter_map(|dispatch| match &dispatch.command {
+                RelayCommand::CancelUserShell { shell_command_id } => {
+                    Some(shell_command_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut runs = Vec::new();
+        for (command_id, dispatch) in &self.snapshot.dispatches {
+            if dispatch.state != RelayDispatchState::Queued {
+                continue;
+            }
+            let Some(handled) = self.snapshot.handled_commands.get(command_id) else {
+                continue;
+            };
+            match dispatch.command {
+                RelayCommand::CancelUserShell { .. } => {
+                    cancels.push((handled.accepted_ordinal, command_id.clone()));
+                }
+                RelayCommand::RunUserShell { .. }
+                    if handled.accepted_ordinal < barrier_ordinal
+                        && !cancelled_shells.contains(command_id) =>
+                {
+                    runs.push((handled.accepted_ordinal, command_id.clone()));
+                }
+                _ => {}
+            }
+        }
+        cancels.sort();
+        runs.sort();
+        runs.truncate(maximum_runs);
+        let mut selected = cancels;
+        selected.extend(runs);
+        selected.sort();
+        for (_, command_id) in &selected {
+            self.append_relay_event(
+                Some(command_id),
+                RelayObservation::CommandStarted {
+                    command_id: command_id.clone(),
+                    started_at_ms: epoch_millis(),
+                },
+            )?;
+        }
+        let mut next_snapshot = self.snapshot.clone();
+        let mut claimed = Vec::with_capacity(selected.len());
+        for (accepted_ordinal, command_id) in selected {
+            let dispatch = next_snapshot
+                .dispatches
+                .get_mut(&command_id)
+                .expect("claimed shell command disappeared");
+            dispatch.state = RelayDispatchState::InFlight;
+            claimed.push(ClaimedRelayCommand {
+                command_id,
+                accepted_ordinal,
+                command: dispatch.command.clone(),
+                hidden_prompt_context: None,
+            });
+        }
+        if !claimed.is_empty() {
             self.commit_snapshot(next_snapshot)?;
         }
         Ok(claimed)
@@ -1167,7 +1289,7 @@ impl DurableRelay {
     fn effectful_command_in_progress(&self) -> bool {
         self.snapshot.active_prompt.is_some()
             || self.snapshot.dispatches.values().any(|dispatch| {
-                dispatch.command.is_effectful_acp()
+                (dispatch.command.is_effectful_acp() || dispatch.command.is_effectful_user_shell())
                     && matches!(
                         dispatch.state,
                         RelayDispatchState::Pending | RelayDispatchState::InFlight
@@ -1383,6 +1505,19 @@ impl DurableRelay {
         let Some(queued) = self.snapshot.queued_prompts.first().cloned() else {
             return Ok(None);
         };
+        let queued_ordinal = self
+            .snapshot
+            .handled_commands
+            .get(&queued.command_id)
+            .map_or(u64::MAX, |handled| handled.accepted_ordinal);
+        if self.snapshot.active_user_shells.keys().any(|command_id| {
+            self.snapshot
+                .handled_commands
+                .get(command_id)
+                .is_some_and(|handled| handled.accepted_ordinal < queued_ordinal)
+        }) {
+            return Ok(None);
+        }
         let ordinal = self.append_relay_event(
             Some(&queued.command_id),
             RelayObservation::CommandStarted {
@@ -2227,6 +2362,145 @@ mod tests {
             RelayObservation::CommandInterrupted { command_id, .. }
                 if command_id == "command-two"
         )));
+    }
+
+    fn successful_shell(command: &str, stdout: &str) -> UserShellResult {
+        UserShellResult {
+            command: command.to_owned(),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            exit_code: Some(0),
+            signal: None,
+            duration_ms: 12,
+            status: UserShellStatus::Exited,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn shell_runs_during_an_active_turn_and_barriers_the_later_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "prompt-command-1", prompt("first"));
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "prompt-command-1"
+        );
+        submit_relay(
+            &mut relay,
+            "shell-command-01",
+            RelayCommand::RunUserShell {
+                command: "printf ready".into(),
+            },
+        );
+        submit_relay(&mut relay, "prompt-command-2", prompt("after shell"));
+
+        let shell = relay.claim_pending_user_shell_commands_up_to(4).unwrap();
+        assert_eq!(shell[0].command_id, "shell-command-01");
+        relay
+            .record_command_completed(
+                "prompt-command-1",
+                RelayCommandOutcome::Prompt {
+                    stop_reason: "end_turn".into(),
+                },
+            )
+            .unwrap();
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+
+        relay
+            .record_command_completed(
+                "shell-command-01",
+                RelayCommandOutcome::UserShell {
+                    result: successful_shell("printf ready", "ready"),
+                },
+            )
+            .unwrap();
+        let prompt = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(prompt[0].command_id, "prompt-command-2");
+        assert!(
+            prompt[0]
+                .hidden_prompt_context
+                .as_deref()
+                .is_some_and(
+                    |context| context.contains("<user_shell_command>") && context.contains("ready")
+                )
+        );
+    }
+
+    #[test]
+    fn a_prompt_accepted_before_a_shell_keeps_priority_and_does_not_consume_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "prompt-command-1", prompt("first"));
+        relay.claim_pending_commands(true).unwrap();
+        submit_relay(&mut relay, "prompt-command-2", prompt("already queued"));
+        submit_relay(
+            &mut relay,
+            "shell-command-01",
+            RelayCommand::RunUserShell {
+                command: "printf later".into(),
+            },
+        );
+        relay.claim_pending_user_shell_commands_up_to(4).unwrap();
+        relay
+            .record_command_completed(
+                "prompt-command-1",
+                RelayCommandOutcome::Prompt {
+                    stop_reason: "end_turn".into(),
+                },
+            )
+            .unwrap();
+
+        let prompt = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(prompt[0].command_id, "prompt-command-2");
+        assert!(prompt[0].hidden_prompt_context.is_none());
+    }
+
+    #[test]
+    fn a_shell_cancelled_before_launch_still_reaches_the_next_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(
+            &mut relay,
+            "shell-command-01",
+            RelayCommand::RunUserShell {
+                command: "sleep 60".into(),
+            },
+        );
+        submit_relay(
+            &mut relay,
+            "cancel-shell-01",
+            RelayCommand::CancelUserShell {
+                shell_command_id: "shell-command-01".into(),
+            },
+        );
+
+        let claimed = relay.claim_pending_user_shell_commands_up_to(4).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "cancel-shell-01");
+        relay
+            .record_command_interrupted(
+                "shell-command-01",
+                "shell command was cancelled before it started",
+            )
+            .unwrap();
+        relay
+            .record_command_completed("cancel-shell-01", RelayCommandOutcome::UserShellCancelled)
+            .unwrap();
+
+        submit_relay(&mut relay, "prompt-command-1", prompt("what happened?"));
+        let prompt = relay.claim_pending_commands(true).unwrap();
+        assert!(
+            prompt[0]
+                .hidden_prompt_context
+                .as_deref()
+                .is_some_and(|context| {
+                    context.contains("status: interrupted")
+                        && context.contains("cancelled before it started")
+                })
+        );
     }
 
     #[test]

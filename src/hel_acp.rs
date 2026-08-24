@@ -191,6 +191,18 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
     },
+    UserShellOutput {
+        request_id: String,
+        command: String,
+        stdout: String,
+        stderr: String,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    },
+    UserShellFinished {
+        request_id: String,
+        result: crate::hel_worker::UserShellResult,
+    },
     ConfigApplied {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         request_id: String,

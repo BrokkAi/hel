@@ -35,6 +35,12 @@ pub enum RelayCommand {
     Prompt {
         prompt: Vec<ContentBlock>,
     },
+    RunUserShell {
+        command: String,
+    },
+    CancelUserShell {
+        shell_command_id: String,
+    },
     RemoveQueuedPrompt {
         queued_command_id: String,
     },
@@ -80,6 +86,13 @@ pub enum RelayCommand {
 }
 
 impl RelayCommand {
+    pub const fn minimum_protocol(&self) -> u32 {
+        match self {
+            Self::RunUserShell { .. } | Self::CancelUserShell { .. } => 5,
+            _ => super::RELAY_MIN_PROTOCOL_VERSION,
+        }
+    }
+
     /// Whether this command waits its turn in the durable command queue.
     pub(crate) fn is_queue_entry(&self) -> bool {
         matches!(self, Self::Prompt { .. } | Self::SetConfig { .. })
@@ -108,9 +121,18 @@ impl RelayCommand {
         )
     }
 
+    pub(crate) fn is_effectful_user_shell(&self) -> bool {
+        matches!(
+            self,
+            Self::RunUserShell { .. } | Self::CancelUserShell { .. }
+        )
+    }
+
     pub const fn kind(&self) -> RelayCommandKind {
         match self {
             Self::Prompt { .. } => RelayCommandKind::Prompt,
+            Self::RunUserShell { .. } => RelayCommandKind::RunUserShell,
+            Self::CancelUserShell { .. } => RelayCommandKind::CancelUserShell,
             Self::RemoveQueuedPrompt { .. } => RelayCommandKind::RemoveQueuedPrompt,
             Self::ClearQueuedPrompts => RelayCommandKind::ClearQueuedPrompts,
             Self::SetConfig { .. } => RelayCommandKind::SetConfig,
@@ -130,6 +152,8 @@ impl RelayCommand {
 #[serde(rename_all = "snake_case")]
 pub enum RelayCommandKind {
     Prompt,
+    RunUserShell,
+    CancelUserShell,
     RemoveQueuedPrompt,
     ClearQueuedPrompts,
     SetConfig,
@@ -156,6 +180,85 @@ pub struct ActiveRelayPrompt {
     pub command_id: String,
     pub created_at_ms: i64,
     pub started_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveUserShell {
+    pub command_id: String,
+    pub command: String,
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserShellStatus {
+    Exited,
+    Signaled,
+    TimedOut,
+    Cancelled,
+    Interrupted,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserShellResult {
+    pub command: String,
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stderr_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    pub duration_ms: u64,
+    pub status: UserShellStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl UserShellResult {
+    pub fn prompt_context(&self) -> String {
+        fn escaped(text: &str) -> String {
+            text.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        }
+
+        let status = match self.status {
+            UserShellStatus::Exited => "exited",
+            UserShellStatus::Signaled => "signaled",
+            UserShellStatus::TimedOut => "timed_out",
+            UserShellStatus::Cancelled => "cancelled",
+            UserShellStatus::Interrupted => "interrupted",
+            UserShellStatus::Failed => "failed",
+        };
+        let mut result = format!("status: {status}\nduration_ms: {}", self.duration_ms);
+        if let Some(exit_code) = self.exit_code {
+            result.push_str(&format!("\nexit_code: {exit_code}"));
+        }
+        if let Some(signal) = &self.signal {
+            result.push_str(&format!("\nsignal: {}", escaped(signal)));
+        }
+        if let Some(error) = &self.error {
+            result.push_str(&format!("\nerror: {}", escaped(error)));
+        }
+        if !self.stdout.is_empty() {
+            result.push_str(&format!("\nstdout:\n{}", escaped(&self.stdout)));
+        }
+        if !self.stderr.is_empty() {
+            result.push_str(&format!("\nstderr:\n{}", escaped(&self.stderr)));
+        }
+        format!(
+            "<user_shell_command>\n<command>{}</command>\n<result>{result}</result>\n</user_shell_command>",
+            escaped(&self.command)
+        )
+    }
 }
 
 /// One entry of the durable command queue. Prompts and configuration changes
@@ -224,6 +327,8 @@ pub struct RelayOperationalState {
     pub config: BTreeMap<String, String>,
     pub active_prompt: Option<ActiveRelayPrompt>,
     pub queued_prompts: Vec<QueuedRelayPrompt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_user_shells: Vec<ActiveUserShell>,
     pub checkpoint_barrier: Option<String>,
     pub checkpoint_ready: Option<RelayCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,6 +402,14 @@ pub enum RelayObservation {
         command: RelayCommandKind,
         message: String,
     },
+    UserShellOutput {
+        command_id: String,
+        command: String,
+        stdout: String,
+        stderr: String,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    },
     ConfigurationUpdated {
         key: String,
         value: String,
@@ -331,6 +444,8 @@ pub enum RelayObservation {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RelayCommandOutcome {
     Prompt { stop_reason: String },
+    UserShell { result: UserShellResult },
+    UserShellCancelled,
     Configured,
     SessionModeSet,
     Cancelled,
@@ -353,6 +468,15 @@ pub struct ClaimedRelayCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingPromptContext {
+    pub(crate) text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attached_command_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingUserShellContext {
+    pub(crate) shell_command_id: String,
+    pub(crate) accepted_ordinal: u64,
     pub(crate) text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attached_command_id: Option<String>,
@@ -406,6 +530,10 @@ pub(crate) struct RelaySnapshot {
     pub(crate) queued_prompts: Vec<StoredQueuedRelayCommand>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_prompt_context: Option<PendingPromptContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pending_user_shell_contexts: Vec<PendingUserShellContext>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) active_user_shells: BTreeMap<String, ActiveUserShell>,
     pub(crate) checkpoint_barrier: Option<String>,
     pub(crate) checkpoint_ready_through: Option<u64>,
     pub(crate) checkpoint_ready_digest: Option<String>,
@@ -435,6 +563,8 @@ impl RelaySnapshot {
             active_prompt: None,
             queued_prompts: Vec::new(),
             pending_prompt_context: None,
+            pending_user_shell_contexts: Vec::new(),
+            active_user_shells: BTreeMap::new(),
             checkpoint_barrier: None,
             checkpoint_ready_through: None,
             checkpoint_ready_digest: None,
@@ -473,6 +603,7 @@ impl RelaySnapshot {
                     created_at_ms: prompt.created_at_ms,
                 })
                 .collect(),
+            active_user_shells: self.active_user_shells.values().cloned().collect(),
             checkpoint_barrier: self.checkpoint_barrier.clone(),
             checkpoint_ready: self
                 .checkpoint_ready_through
@@ -780,6 +911,7 @@ pub(crate) fn observation_changes_state(observation: &RelayObservation) -> bool 
         | RelayObservation::ElicitationResolved { .. }
         | RelayObservation::ElicitationsCleared
         | RelayObservation::Warning { .. }
+        | RelayObservation::UserShellOutput { .. }
         | RelayObservation::TerminalOutput { .. }
         | RelayObservation::Notice { .. } => false,
     }
@@ -846,6 +978,17 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
                     created_at_ms: *created_at_ms,
                 });
             }
+            if let RelayCommand::RunUserShell { command } = command {
+                snapshot.active_user_shells.insert(
+                    command_id.clone(),
+                    ActiveUserShell {
+                        command_id: command_id.clone(),
+                        command: command.clone(),
+                        created_at_ms: *created_at_ms,
+                        started_at_ms: None,
+                    },
+                );
+            }
             if matches!(command, RelayCommand::Close { .. }) {
                 snapshot.execution = RelayExecutionState::Closing;
             }
@@ -891,6 +1034,13 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
                     snapshot.queued_prompts.remove(index);
                 }
                 RelayCommand::Close { .. } => snapshot.execution = RelayExecutionState::Closing,
+                RelayCommand::RunUserShell { .. } => {
+                    let shell = snapshot
+                        .active_user_shells
+                        .get_mut(command_id)
+                        .ok_or_else(|| anyhow!("started unknown user shell {command_id}"))?;
+                    shell.started_at_ms = Some(*started_at_ms);
+                }
                 RelayCommand::BeginCheckpoint { .. } => {
                     if snapshot.checkpoint_barrier.is_some() {
                         bail!("checkpoint barrier started while another barrier was active");
@@ -943,6 +1093,27 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
                     {
                         snapshot.pending_prompt_context = None;
                     }
+                    snapshot.pending_user_shell_contexts.retain(|context| {
+                        context.attached_command_id.as_deref() != Some(command_id.as_str())
+                    });
+                }
+                (RelayCommand::RunUserShell { .. }, RelayCommandOutcome::UserShell { result }) => {
+                    snapshot.active_user_shells.remove(command_id);
+                    let accepted_ordinal = snapshot
+                        .handled_commands
+                        .get(command_id)
+                        .ok_or_else(|| anyhow!("completed user shell is not in the ledger"))?
+                        .accepted_ordinal;
+                    snapshot
+                        .pending_user_shell_contexts
+                        .push(PendingUserShellContext {
+                            shell_command_id: command_id.clone(),
+                            accepted_ordinal,
+                            text: result.prompt_context(),
+                            attached_command_id: None,
+                        });
+                }
+                (RelayCommand::CancelUserShell { .. }, RelayCommandOutcome::UserShellCancelled) => {
                 }
                 (
                     RelayCommand::RemoveQueuedPrompt { queued_command_id },
@@ -1061,12 +1232,12 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
         RelayObservation::CommandRejected {
             command_id,
             command: observed_command,
-            ..
+            message,
         }
         | RelayObservation::CommandInterrupted {
             command_id,
             command: observed_command,
-            ..
+            message,
         } => {
             let state = if matches!(event.observation, RelayObservation::CommandRejected { .. }) {
                 RelayDispatchState::Rejected
@@ -1095,6 +1266,38 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
             snapshot
                 .queued_prompts
                 .retain(|queued| queued.command_id != *command_id);
+            snapshot.active_user_shells.remove(command_id);
+            if let RelayCommand::RunUserShell { command } = &command {
+                let accepted_ordinal = snapshot
+                    .handled_commands
+                    .get(command_id)
+                    .expect("terminated shell command disappeared from the ledger")
+                    .accepted_ordinal;
+                let result = UserShellResult {
+                    command: command.clone(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    exit_code: None,
+                    signal: None,
+                    duration_ms: 0,
+                    status: if state == RelayDispatchState::Rejected {
+                        UserShellStatus::Failed
+                    } else {
+                        UserShellStatus::Interrupted
+                    },
+                    error: Some(message.clone()),
+                };
+                snapshot
+                    .pending_user_shell_contexts
+                    .push(PendingUserShellContext {
+                        shell_command_id: command_id.clone(),
+                        accepted_ordinal,
+                        text: result.prompt_context(),
+                        attached_command_id: None,
+                    });
+            }
             if snapshot
                 .active_prompt
                 .as_ref()
@@ -1115,6 +1318,11 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
                     .as_mut()
                     .expect("pending prompt context disappeared")
                     .attached_command_id = None;
+            }
+            for context in &mut snapshot.pending_user_shell_contexts {
+                if context.attached_command_id.as_deref() == Some(command_id.as_str()) {
+                    context.attached_command_id = None;
+                }
             }
             if matches!(command, RelayCommand::BeginCheckpoint { .. })
                 && snapshot.checkpoint_barrier.as_deref() == Some(command_id)
@@ -1178,6 +1386,7 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
         | RelayObservation::ElicitationResolved { .. }
         | RelayObservation::ElicitationsCleared
         | RelayObservation::Warning { .. }
+        | RelayObservation::UserShellOutput { .. }
         | RelayObservation::TerminalOutput { .. }
         | RelayObservation::Notice { .. } => {}
     }
