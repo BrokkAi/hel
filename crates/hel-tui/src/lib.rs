@@ -14,7 +14,9 @@ use ratatui::layout::Rect;
 use hel::hel_chat::{Notices, TranscriptSnapshot};
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate as HelTargetTemplate};
 use hel::hel_quota::ProfileQuota;
-use hel::hel_state::{HelState, SessionRecord, SessionResourceAllocation, SessionState};
+use hel::hel_state::{
+    HelState, ProjectSourceIdentity, SessionRecord, SessionResourceAllocation, SessionState,
+};
 use hel::hel_targets::AdditionalMount;
 
 use crate::dialogs::{
@@ -286,6 +288,7 @@ pub struct DashboardState {
     pub(crate) quotas: BTreeMap<String, ProfileQuota>,
     pub(crate) quota_refreshing: BTreeSet<String>,
     pub(crate) session_details: BTreeMap<String, SessionDetail>,
+    pub(crate) project_sources: BTreeMap<String, ProjectSourceIdentity>,
     pub(crate) checkpoint_archive_sizes: BTreeMap<String, Option<u64>>,
     pub(crate) session_operations: BTreeMap<String, SessionOperationDisplay>,
     pub(crate) capacity_details: BTreeMap<String, CapacityDetail>,
@@ -325,6 +328,7 @@ impl DashboardState {
             quotas,
             quota_refreshing: BTreeSet::new(),
             session_details: BTreeMap::new(),
+            project_sources: BTreeMap::new(),
             checkpoint_archive_sizes: BTreeMap::new(),
             session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
@@ -758,7 +762,7 @@ impl DashboardState {
         .0;
         let mut groups = BTreeMap::<(String, String, String), Vec<&SessionRecord>>::new();
         for session in active {
-            let source = session.project_source(&self.config);
+            let source = self.project_source(session);
             groups
                 .entry((source.short.to_lowercase(), source.full, source.key))
                 .or_default()
@@ -767,10 +771,28 @@ impl DashboardState {
         groups.into_values().flatten().collect()
     }
 
+    pub fn project_source(&self, session: &SessionRecord) -> ProjectSourceIdentity {
+        self.project_sources
+            .get(&session.id)
+            .cloned()
+            .unwrap_or_else(|| session.project_source(&self.config))
+    }
+
+    pub fn has_resolved_project_source(&self, session_id: &str) -> bool {
+        self.project_sources.contains_key(session_id)
+    }
+
+    pub fn set_project_source(&mut self, session_id: &str, source: ProjectSourceIdentity) {
+        if self.state.sessions.contains_key(session_id) {
+            self.project_sources.insert(session_id.to_owned(), source);
+            self.clamp_selections();
+        }
+    }
+
     pub(crate) fn project_keys(&self) -> Vec<String> {
         let mut keys = Vec::new();
         for session in self.ordered_sessions() {
-            let key = session.project_source(&self.config).key;
+            let key = self.project_source(session).key;
             if keys.last() != Some(&key) {
                 keys.push(key);
             }
@@ -781,8 +803,7 @@ impl DashboardState {
     pub(crate) fn project_is_expanded(&self, session: &SessionRecord) -> bool {
         let keys = self.project_keys();
         keys.len() <= 1
-            || self.expanded_project_key.as_deref()
-                == Some(session.project_source(&self.config).key.as_str())
+            || self.expanded_project_key.as_ref() == Some(&self.project_source(session).key)
     }
 
     fn selected_project_is_expanded(&self) -> bool {
@@ -795,7 +816,7 @@ impl DashboardState {
         if let Some(index) = self
             .ordered_sessions()
             .iter()
-            .position(|session| session.project_source(&self.config).key == project_key)
+            .position(|session| self.project_source(session).key == project_key)
         {
             self.focus = Focus::Active;
             self.session_index = index;
@@ -805,7 +826,7 @@ impl DashboardState {
     fn expand_selected_project(&mut self) {
         let key = self
             .selected_session()
-            .map(|session| session.project_source(&self.config).key);
+            .map(|session| self.project_source(session).key);
         if let Some(key) = key {
             self.expand_project(&key);
         }
@@ -960,7 +981,7 @@ impl DashboardState {
         {
             self.expanded_project_key = self
                 .selected_session()
-                .map(|session| session.project_source(&self.config).key)
+                .map(|session| self.project_source(session).key)
                 .or_else(|| project_keys.first().cloned());
         }
         self.quota_index = self
@@ -1308,6 +1329,40 @@ mod tests {
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
             ["session-z", "session-y", "session-a"]
+        );
+    }
+
+    #[test]
+    fn resolved_git_origin_groups_differently_named_raw_worktrees() {
+        let mut first = stopped_session();
+        first.id = "bifrost-fird".into();
+        first.state = SessionState::Running;
+        first.project_directory = Some("/mnt/optane/bifrost-fird".into());
+        let mut second = stopped_session();
+        second.id = "bifrost-fuzz".into();
+        second.state = SessionState::Running;
+        second.project_directory = Some("/home/dev/bifrost-fuzz".into());
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: [first, second]
+                .into_iter()
+                .map(|session| (session.id.clone(), session))
+                .collect(),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        let source =
+            ProjectSourceIdentity::git_remote("git@github.com:BrokkAi/bifrost-dev.git").unwrap();
+
+        dashboard.set_project_source("bifrost-fird", source.clone());
+        dashboard.set_project_source("bifrost-fuzz", source);
+
+        assert_eq!(dashboard.project_keys(), ["github:brokkai/bifrost-dev"]);
+        assert!(
+            dashboard
+                .ordered_sessions()
+                .iter()
+                .all(|session| dashboard.project_is_expanded(session))
         );
     }
 

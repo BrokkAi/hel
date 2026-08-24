@@ -188,7 +188,7 @@ fn render_adaptive_dashboard(
         .iter()
         .filter_map(|id| dashboard.state.sessions.get(id))
         .map(|session| {
-            let source = session.project_source(&dashboard.config);
+            let source = dashboard.project_source(session);
             let heading = u16::from(previous_project.as_ref() != Some(&source.key));
             previous_project = Some(source.key);
             heading
@@ -383,16 +383,16 @@ fn render_sessions(
         .filter_map(|id| dashboard.state.sessions.get(id))
     {
         short_projects
-            .entry(session.project_source(&dashboard.config).short)
+            .entry(dashboard.project_source(session).short)
             .or_default()
-            .insert(session.project_source(&dashboard.config).key);
+            .insert(dashboard.project_source(session).key);
     }
     let mut previous_project = None;
     let mut project_number = 0;
     let mut row_meta = Vec::new();
     let active_rows = active.iter().enumerate().filter_map(|(index, id)| {
         let session = dashboard.state.sessions.get(id)?;
-        let source = session.project_source(&dashboard.config);
+        let source = dashboard.project_source(session);
         let first = previous_project.as_ref() != Some(&source.key);
         if first {
             project_number += 1;

@@ -289,6 +289,8 @@ impl DashboardState {
         self.state = state;
         self.session_details
             .retain(|session_id, _| self.state.sessions.contains_key(session_id));
+        self.project_sources
+            .retain(|session_id, _| self.state.sessions.contains_key(session_id));
         for session_id in self.state.sessions.keys() {
             self.session_details.entry(session_id.clone()).or_default();
         }

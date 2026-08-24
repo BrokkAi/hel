@@ -798,17 +798,9 @@ impl SessionRecord {
             .and_then(|bundle| bundle.primary().or_else(|| bundle.repositories.first()))
         {
             if let Some(source) = repository.github.as_deref()
-                && let Some(normalized) = normalize_github_source(source)
+                && let Some(identity) = ProjectSourceIdentity::git_remote(source)
             {
-                let short = normalized
-                    .rsplit_once('/')
-                    .map_or(normalized.as_str(), |(_, repository)| repository)
-                    .to_owned();
-                return ProjectSourceIdentity {
-                    key: format!("github:{}", normalized.to_lowercase()),
-                    short,
-                    full: normalized,
-                };
+                return identity;
             }
             if let Some(path) = repository.local.as_deref() {
                 return ProjectSourceIdentity::path(path, None);
@@ -899,6 +891,36 @@ pub struct ProjectSourceIdentity {
 }
 
 impl ProjectSourceIdentity {
+    /// Canonicalizes a Git remote so raw checkouts and configured GitHub
+    /// bundles group as the same project even when their worktree paths differ.
+    pub fn git_remote(source: &str) -> Option<Self> {
+        if let Some(normalized) = normalize_github_source(source) {
+            let short = normalized
+                .rsplit_once('/')
+                .map_or(normalized.as_str(), |(_, repository)| repository)
+                .to_owned();
+            return Some(Self {
+                key: format!("github:{}", normalized.to_lowercase()),
+                short,
+                full: normalized,
+            });
+        }
+        let normalized = source.trim().trim_end_matches('/').trim_end_matches(".git");
+        if normalized.is_empty() {
+            return None;
+        }
+        let short = normalized
+            .rsplit(['/', ':'])
+            .find(|part| !part.is_empty())
+            .unwrap_or(normalized)
+            .to_owned();
+        Some(Self {
+            key: format!("git:{}", normalized.to_lowercase()),
+            short,
+            full: normalized.to_owned(),
+        })
+    }
+
     fn path(path: &Path, remote: Option<&str>) -> Self {
         let normalized = path.components().collect::<PathBuf>();
         let path_text = normalized.to_string_lossy().into_owned();
@@ -916,13 +938,16 @@ impl ProjectSourceIdentity {
 }
 
 fn normalize_github_source(source: &str) -> Option<String> {
+    let source = source.trim();
     let path = source
-        .trim()
         .strip_prefix("https://github.com/")
-        .or_else(|| source.trim().strip_prefix("http://github.com/"))
-        .or_else(|| source.trim().strip_prefix("git@github.com:"))
-        .or_else(|| source.trim().strip_prefix("ssh://git@github.com/"))
-        .unwrap_or(source.trim())
+        .or_else(|| source.strip_prefix("http://github.com/"))
+        .or_else(|| source.strip_prefix("git@github.com:"))
+        .or_else(|| source.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| {
+            (!source.contains("://") && !source.contains('@') && !source.contains(':'))
+                .then_some(source)
+        })?
         .trim_end_matches(".git");
     let mut parts = path.split('/');
     let owner = parts.next()?;
@@ -1325,6 +1350,10 @@ mod tests {
         let config = sample_config();
         let mut session = sample_session();
         assert_eq!(session.project_source(&config).full, "BrokkAi/hel");
+        assert_eq!(
+            ProjectSourceIdentity::git_remote("git@github.com:BrokkAi/bifrost-dev.git"),
+            ProjectSourceIdentity::git_remote("https://github.com/BrokkAi/bifrost-dev.git")
+        );
 
         session.project_directory = Some(PathBuf::from(
             "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",

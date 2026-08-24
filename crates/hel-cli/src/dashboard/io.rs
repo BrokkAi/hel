@@ -18,10 +18,12 @@ use hel::hel_controller::{Controller, SessionLaunchOptions};
 use hel::hel_import::{configured_bundle_for_local, configured_bundle_for_origin};
 use hel::hel_setup::github_repository_from_origin;
 use hel::hel_state::{
-    HelState, MaterializedSession, RecoveryObserver, SessionRecord, SessionState,
+    HelState, MaterializedSession, ProjectSourceIdentity, RecoveryObserver, SessionRecord,
+    SessionState,
 };
 use hel::hel_targets::{
-    CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec, ProvisionStage,
+    BoundedProcessExecutor, CancellableProcessExecutor, CommandExecutor, CommandOutput,
+    CommandSpec, ProvisionStage,
 };
 use hel_tui::{DashboardAction, PreparedMaterializedSessionDetail, SessionOperationKind};
 use tokio::sync::mpsc::UnboundedSender;
@@ -46,6 +48,10 @@ pub(crate) enum DashboardIoUpdate {
     MaterializedSessionProjection {
         session_id: String,
         result: std::result::Result<Box<PreparedMaterializedSessionDetail>, String>,
+    },
+    ProjectSource {
+        session_id: String,
+        result: std::result::Result<ProjectSourceIdentity, String>,
     },
     CreateSession(Box<DashboardCreateSessionUpdate>),
     RenameSession {
@@ -232,6 +238,41 @@ pub(crate) fn spawn_hidden_native_sessions_load(
         updates,
         hel::hel_database::hidden_native_sessions,
         |result| DashboardIoUpdate::HiddenNativeSessions { result },
+    )
+}
+
+/// Resolves one raw checkout's Git origin off the event loop. Each session is
+/// independent, so callers can launch these concurrently and redraw as the
+/// answers arrive.
+pub(crate) fn spawn_project_source_resolution(
+    controller: &Controller,
+    session_id: String,
+    updates: UnboundedSender<DashboardIoUpdate>,
+) -> JoinHandle<()> {
+    let config = controller.config.clone();
+    let session = controller.state.sessions.get(&session_id).cloned();
+    let source_controller = Controller {
+        config,
+        state: HelState {
+            sessions: session
+                .map(|session| [(session_id.clone(), session)].into_iter().collect())
+                .unwrap_or_default(),
+            ..HelState::default()
+        },
+    };
+    let reported_session_id = session_id.clone();
+    spawn_io(
+        updates,
+        move || {
+            source_controller.resolve_session_project_source(
+                &session_id,
+                &BoundedProcessExecutor::new(Duration::from_secs(8)),
+            )
+        },
+        move |result| DashboardIoUpdate::ProjectSource {
+            session_id: reported_session_id,
+            result,
+        },
     )
 }
 
@@ -759,6 +800,16 @@ impl DashboardContext {
             DashboardIoUpdate::MaterializedSessionProjection { session_id, result } => {
                 self.finish_materialized_projection(session_id, result);
             }
+            DashboardIoUpdate::ProjectSource { session_id, result } => {
+                self.project_sources_in_flight.remove(&session_id);
+                match result {
+                    Ok(source) => self.dashboard.set_project_source(&session_id, source),
+                    Err(error) => tracing::warn!(
+                        %session_id,
+                        "could not resolve canonical project source: {error}"
+                    ),
+                }
+            }
             DashboardIoUpdate::CreateSession(update) => self.apply_create_session_update(*update),
             DashboardIoUpdate::RenameSession {
                 session_id,
@@ -844,6 +895,7 @@ impl DashboardContext {
                         .insert(applied.session.id.clone(), applied.session);
                     self.dashboard.set_config(self.controller.config.clone());
                     self.dashboard.set_state(self.controller.state.clone());
+                    self.resolve_project_sources();
                     self.refresh_poll_targets();
                     self.dashboard.set_notice(format!(
                         "Imported {} session {}.",
@@ -974,6 +1026,7 @@ impl DashboardContext {
                     .sessions
                     .insert(session_id.clone(), registered.session);
                 self.dashboard.set_state(self.controller.state.clone());
+                self.resolve_project_sources();
                 self.dashboard.begin_session_operation(
                     session_id.clone(),
                     SessionOperationKind::Launching,
@@ -1009,6 +1062,7 @@ impl DashboardContext {
         };
         self.controller = loaded;
         self.dashboard.set_state(self.controller.state.clone());
+        self.resolve_project_sources();
         if update.result.is_ok() {
             self.drop_warm_chat_for(&session_id);
         }

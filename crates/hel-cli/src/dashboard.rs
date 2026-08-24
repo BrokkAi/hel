@@ -43,7 +43,7 @@ use tokio_stream::StreamExt as _;
 use crate::dashboard::io::{
     ActiveLifecycleOperation, DashboardIoUpdate, LifecycleReload, checkpoint_archive_targets,
     spawn_checkpoint_archive_size_refresh, spawn_lifecycle_reload,
-    spawn_materialized_session_projection,
+    spawn_materialized_session_projection, spawn_project_source_resolution,
 };
 use crate::import::{
     DashboardImportTaskResult, DashboardImportUpdate, PendingDashboardImport,
@@ -157,6 +157,7 @@ pub(crate) struct DashboardContext {
     materialized_projection_permits: Arc<tokio::sync::Semaphore>,
     materialized_projections_in_flight: BTreeSet<String>,
     pending_materialized_projections: BTreeMap<String, (MaterializedSession, u64)>,
+    project_sources_in_flight: BTreeSet<String>,
     read_receipt_in_flight: Option<String>,
     pending_read_receipts: BTreeMap<String, u64>,
 
@@ -555,11 +556,13 @@ impl DashboardContext {
             materialized_projection_permits: Arc::new(tokio::sync::Semaphore::new(2)),
             materialized_projections_in_flight: BTreeSet::new(),
             pending_materialized_projections: BTreeMap::new(),
+            project_sources_in_flight: BTreeSet::new(),
             read_receipt_in_flight: None,
             pending_read_receipts: BTreeMap::new(),
             checkpoint_archive_targets_seen: BTreeMap::new(),
             checkpoint_archive_generation: 0,
         };
+        context.resolve_project_sources();
         context.request_quota_refresh();
         Ok(Some(context))
     }
@@ -590,6 +593,29 @@ impl DashboardContext {
             self.dashboard_io_tx.clone(),
             Arc::clone(&self.materialized_projection_permits),
         );
+    }
+
+    pub(super) fn resolve_project_sources(&mut self) {
+        let session_ids = self
+            .controller
+            .state
+            .sessions
+            .values()
+            .filter(|session| session.state.is_active() && session.project_directory.is_some())
+            .filter(|session| {
+                !self.dashboard.has_resolved_project_source(&session.id)
+                    && !self.project_sources_in_flight.contains(&session.id)
+            })
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            self.project_sources_in_flight.insert(session_id.clone());
+            spawn_project_source_resolution(
+                &self.controller,
+                session_id,
+                self.dashboard_io_tx.clone(),
+            );
+        }
     }
 
     pub(super) fn finish_materialized_projection(
@@ -725,6 +751,7 @@ impl DashboardContext {
     pub(crate) async fn hold_chat_session(&mut self, session_id: &str) -> Result<(), ()> {
         match hold_chat_session(
             &self.controller,
+            &self.dashboard,
             &mut self.active_chat,
             session_id,
             &self.worker_commands_tx,
@@ -1192,6 +1219,7 @@ async fn next_terminal_event(
 /// reports activity for, and its recovery context.
 async fn open_chat_view(
     controller: &Controller,
+    dashboard: &DashboardState,
     session_id: &str,
     sessions: &SessionManagerControl,
     recovery_observer: &RecoveryObserver,
@@ -1210,13 +1238,13 @@ async fn open_chat_view(
     // Conversation switching stays inside the canonical source project. A
     // managed worktree and its source checkout therefore remain together,
     // while unrelated repositories never crowd this pane.
-    let project_key = session_record.project_source(&controller.config).key;
+    let project_key = dashboard.project_source(&session_record).key;
     let mut active = controller
         .state
         .sessions
         .values()
         .filter(|record| {
-            record.state.is_active() && record.project_source(&controller.config).key == project_key
+            record.state.is_active() && dashboard.project_source(record).key == project_key
         })
         .collect::<Vec<_>>();
     active.sort_by(|left, right| left.compare_by_creation(right));
@@ -1257,6 +1285,7 @@ async fn open_chat_view(
 /// Closing/Closed snapshot; reopening attaches to the worker resume started.
 async fn hold_chat_session(
     controller: &Controller,
+    dashboard: &DashboardState,
     active_chat: &mut Option<hel::hel_chat::ActiveChat>,
     session_id: &str,
     sessions: &SessionManagerControl,
@@ -1271,7 +1300,15 @@ async fn hold_chat_session(
         // showing it is only a redraw.
         return Ok(());
     }
-    let chat = open_chat_view(controller, session_id, sessions, recovery_observer, notices).await?;
+    let chat = open_chat_view(
+        controller,
+        dashboard,
+        session_id,
+        sessions,
+        recovery_observer,
+        notices,
+    )
+    .await?;
     // Only one chat stays warm, so the previous one is dropped here; its
     // supervisor detaches on drop.
     *active_chat = Some(chat);

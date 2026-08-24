@@ -7,7 +7,9 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::hel_config::{HelConfig, ProjectBundle, TargetTemplate, is_bare_project_target};
 use crate::hel_local_git::canonical_repository;
-use crate::hel_state::{ManagedWorktree, ManagedWorktreeTarget, SessionRecord};
+use crate::hel_state::{
+    ManagedWorktree, ManagedWorktreeTarget, ProjectSourceIdentity, SessionRecord,
+};
 use crate::hel_targets::{
     self, CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec, SshTarget,
 };
@@ -58,6 +60,58 @@ impl Controller {
                 hel_targets::validate_bare_project_directory(&backend_ssh(ssh), directory, executor)
             }
             _ => bail!("project directory validation requires a bare target"),
+        }
+    }
+
+    /// Resolves a session's canonical project without doing process work on a
+    /// UI loop. Raw checkouts use their Git origin, which joins sibling linked
+    /// worktrees to configured bundles from the same repository.
+    pub fn resolve_session_project_source(
+        &self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<ProjectSourceIdentity> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let Some(directory) = session.project_directory.as_deref() else {
+            return Ok(session.project_source(&self.config));
+        };
+        let target = match &session.managed_worktree {
+            Some(worktree) => worktree.target.clone(),
+            None => managed_worktree_target(
+                self.config
+                    .targets
+                    .get(&session.target_template_id)
+                    .with_context(|| {
+                        format!(
+                            "session {session_id} target {:?} is no longer configured",
+                            session.target_template_id
+                        )
+                    })?,
+            )?,
+        };
+        let output = executor.execute(&managed_git_command(
+            &target,
+            directory,
+            ["config", "--get", "remote.origin.url"],
+            "resolve project Git origin",
+        ))?;
+        match output.status {
+            0 => {
+                let origin =
+                    String::from_utf8(output.stdout).context("project Git origin was not UTF-8")?;
+                Ok(ProjectSourceIdentity::git_remote(origin.trim())
+                    .unwrap_or_else(|| session.project_source(&self.config)))
+            }
+            // Git uses 1 when the repository has no origin configured.
+            1 => Ok(session.project_source(&self.config)),
+            status => bail!(
+                "resolve project Git origin failed with status {status}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
         }
     }
 
@@ -1144,6 +1198,53 @@ mod tests {
         assert_eq!(commands[0].args[1], project.path().to_string_lossy());
         assert_eq!(commands[0].args[2..], ["rev-parse", "--verify", "HEAD"]);
     }
+
+    #[test]
+    fn raw_linked_worktree_origin_matches_the_configured_github_project() {
+        struct OriginExecutor;
+        impl CommandExecutor for OriginExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                assert_eq!(
+                    command.args,
+                    [
+                        "-C",
+                        "/mnt/optane/bifrost-fird",
+                        "config",
+                        "--get",
+                        "remote.origin.url",
+                    ]
+                );
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: b"git@github.com:BrokkAi/bifrost-dev.git\n".to_vec(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let mut config = HelConfig::default();
+        config
+            .targets
+            .insert("localhost".into(), TargetTemplate::LocalBare);
+        let session = raw_session_on("localhost", "/mnt/optane/bifrost-fird");
+        let session_id = session.id.clone();
+        let controller = Controller {
+            config,
+            state: HelState {
+                sessions: [(session_id.clone(), session)].into_iter().collect(),
+                ..HelState::default()
+            },
+        };
+
+        let source = controller
+            .resolve_session_project_source(&session_id, &OriginExecutor)
+            .unwrap();
+
+        assert_eq!(source.key, "github:brokkai/bifrost-dev");
+        assert_eq!(source.short, "bifrost-dev");
+        assert_eq!(source.full, "BrokkAi/bifrost-dev");
+    }
+
     /// Answers the two Git reads that locate a checkout, and nothing else.
     struct CheckoutPositionExecutor {
         head_commit: String,
