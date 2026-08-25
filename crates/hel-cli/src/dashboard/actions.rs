@@ -422,9 +422,13 @@ pub(crate) async fn apply_dashboard_action(
     Ok(())
 }
 
-fn resume_launch_session_id(action: &DashboardAction) -> Result<&str> {
+fn resume_launch_destination(action: &DashboardAction) -> Result<(&str, &str)> {
     match action {
-        DashboardAction::ResumeSession { session_id, .. } => Ok(session_id),
+        DashboardAction::ResumeSession {
+            session_id,
+            target_template_id,
+            ..
+        } => Ok((session_id, target_template_id)),
         _ => bail!("repository preflight did not receive a resume launch"),
     }
 }
@@ -433,7 +437,9 @@ pub(crate) fn start_resume_repository_preflight(
     context: &mut DashboardContext,
     launch: Box<DashboardAction>,
 ) -> Result<()> {
-    let session_id = resume_launch_session_id(&launch)?.to_owned();
+    let (session_id, target_id) = resume_launch_destination(&launch)?;
+    let session_id = session_id.to_owned();
+    let target_id = target_id.to_owned();
     context
         .dashboard
         .set_notice("Checking checkpoint repository history…");
@@ -446,8 +452,11 @@ pub(crate) fn start_resume_repository_preflight(
             let controller = Controller::load()?;
             Ok(ResumeRepositoryPreflightApply {
                 config: None,
-                preflight: controller
-                    .preflight_resume_repository_sources(&session_id, &executor)?,
+                preflight: controller.preflight_resume_repository_sources(
+                    &session_id,
+                    &target_id,
+                    &executor,
+                )?,
             })
         },
         move |result| DashboardIoUpdate::ResumeRepositoryPreflight {

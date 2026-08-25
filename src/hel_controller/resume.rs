@@ -75,6 +75,7 @@ impl Controller {
     pub fn preflight_resume_repository_sources(
         &self,
         session_id: &str,
+        target_id: &str,
         executor: &(impl CommandExecutor + Sync),
     ) -> Result<ResumeRepositorySourcePreflight> {
         let session = self
@@ -86,6 +87,26 @@ impl Controller {
             .checkpoint
             .as_ref()
             .context("session has no checkpoint")?;
+        let plan = resume_compatibility(session, &self.config, target_id)
+            .map_err(|reason| anyhow::anyhow!(reason))?;
+        if session.project_directory.is_some() {
+            debug_assert!(matches!(
+                plan,
+                ResumePlan::InPlace | ResumePlan::RawToWorkspace
+            ));
+            // A raw session resumes from its live checkout. Its synthetic
+            // bundle is only a grouping identity and may no longer be in the
+            // config; neither an in-place resume nor a raw-to-workspace
+            // conversion restores repository contents from that bundle.
+            return Ok(ResumeRepositorySourcePreflight::Ready(
+                ResumeRepositorySourceReceipt {
+                    session_id: session_id.to_owned(),
+                    bundle_id: session.bundle_id.clone(),
+                    checkpoint_sha256: checkpoint.sha256.clone(),
+                    repositories: Vec::new(),
+                },
+            ));
+        }
         let repositories = read_checkpoint_repository_bundles(&checkpoint.archive_path)?;
         self.preflight_verified_repository_sources(
             session_id,
@@ -590,7 +611,7 @@ impl Controller {
             .as_ref()
             .is_some_and(|receipt| self.repository_source_receipt_is_current(session_id, receipt))
             && let ResumeRepositorySourcePreflight::RepositoryMoved(mismatch) =
-                self.preflight_resume_repository_sources(session_id, executor)?
+                self.preflight_resume_repository_sources(session_id, target_id, executor)?
         {
             bail!(
                 "checkpoint base commit {} is missing from configured source {:?} for repository {:?}; the repository may have moved (archived origin: {:?})",
@@ -1326,6 +1347,50 @@ mod tests {
     use super::*;
 
     const RESUME_ROLLBACK_TEST_CHILD: &str = "HEL_RESUME_ROLLBACK_TEST_CHILD";
+
+    #[test]
+    fn raw_in_place_preflight_does_not_require_its_synthetic_bundle() {
+        struct UnusedExecutor;
+
+        impl CommandExecutor for UnusedExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                panic!("raw in-place preflight ran {}", command.purpose);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut session = checkpoint_test_session(session_id);
+        session.checkpoint = Some(write_checkpoint_gate_archive(
+            directory.path(),
+            session_id,
+            3,
+        ));
+        session.bundle_id = "remote-project-a66373eef659f856".into();
+        session.target_template_id = "localhost".into();
+        session.project_directory = Some("/mnt/optane/bifrost-fird".into());
+        let controller = Controller {
+            config: HelConfig {
+                targets: BTreeMap::from([("localhost".into(), TargetTemplate::LocalBare)]),
+                // The raw checkout is still usable even though its synthetic
+                // grouping bundle has disappeared from the config.
+                bundles: BTreeMap::new(),
+                ..HelConfig::default()
+            },
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+
+        let preflight = controller
+            .preflight_resume_repository_sources(session_id, "localhost", &UnusedExecutor)
+            .unwrap();
+        let ResumeRepositorySourcePreflight::Ready(receipt) = preflight else {
+            panic!("raw in-place resume unexpectedly needs a repository replacement");
+        };
+        assert!(controller.repository_source_receipt_is_current(session_id, &receipt));
+    }
 
     #[test]
     fn repository_preflight_distinguishes_the_original_source_from_a_reused_name() {
