@@ -14,7 +14,7 @@ use ratatui::widgets::{
 use hel::hel_chat::render_agent_message_head;
 #[cfg(test)]
 use hel::hel_chat::render_agent_message_tail;
-use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
+use hel::hel_config::{HarnessKind, HelConfig};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
 use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
@@ -195,7 +195,7 @@ fn render_adaptive_dashboard(
                 active
                     .get(index + 1)
                     .and_then(|next| dashboard.state.sessions.get(next))
-                    .is_some_and(|next| dashboard.project_source(next).key == source.key),
+                    .is_some_and(|next| dashboard.project_source(next).key != source.key),
             );
             previous_project = Some(source.key);
             heading
@@ -395,6 +395,20 @@ fn render_sessions(
             .or_default()
             .insert(dashboard.project_source(session).key);
     }
+    let mut target_counts = BTreeMap::<(String, String), usize>::new();
+    for id in active {
+        let Some(session) = dashboard.state.sessions.get(id) else {
+            continue;
+        };
+        let project_key = dashboard.project_source(session).key;
+        let target = session_target_label(
+            session,
+            dashboard.session_operations.get(id),
+            &dashboard.config,
+        );
+        *target_counts.entry((project_key, target)).or_default() += 1;
+    }
+    let mut target_occurrences = BTreeMap::<(String, String), usize>::new();
     let mut previous_project = None;
     let mut project_number = 0;
     let mut row_meta = Vec::new();
@@ -427,6 +441,19 @@ fn render_sessions(
             ));
         }
         let detail = dashboard.session_details.get(id);
+        let target = session_target_label(
+            session,
+            dashboard.session_operations.get(id),
+            &dashboard.config,
+        );
+        let target_key = (source.key.clone(), target.clone());
+        let occurrence = target_occurrences.entry(target_key.clone()).or_default();
+        *occurrence += 1;
+        let target = if target_counts.get(&target_key).copied().unwrap_or_default() > 1 {
+            format!("{target} [{}]", *occurrence)
+        } else {
+            target
+        };
         let expanded = dashboard.project_is_expanded(session);
         let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
         let prefix = if selected { "› " } else { "  " };
@@ -437,7 +464,7 @@ fn render_sessions(
                 detail,
                 dashboard.session_operations.get(id),
                 now_epoch_seconds,
-                &dashboard.config,
+                &target,
             ));
             lines.push(prefixed_summary_line(
                 "  ",
@@ -475,7 +502,7 @@ fn render_sessions(
         } else {
             lines.push(collapsed_session_line(
                 prefix,
-                session,
+                &target,
                 detail,
                 now_epoch_seconds,
                 usize::from(active_area.width.saturating_sub(4)),
@@ -487,7 +514,7 @@ fn render_sessions(
             active
                 .get(index + 1)
                 .and_then(|next| dashboard.state.sessions.get(next))
-                .is_some_and(|next| dashboard.project_source(next).key == source.key),
+                .is_some_and(|next| dashboard.project_source(next).key != source.key),
         );
         row_meta.push((
             source.key,
@@ -566,7 +593,7 @@ fn render_sessions(
 
 fn collapsed_session_line(
     prefix: &str,
-    _session: &SessionRecord,
+    target: &str,
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
     width: usize,
@@ -580,11 +607,14 @@ fn collapsed_session_line(
         .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("No messages yet")
         .trim();
-    let lead = format!("{prefix}{clock} ");
-    Line::raw(format!(
-        "{lead}{}",
-        crate::widgets::truncate_text(fragment, width.saturating_sub(lead.chars().count()))
-    ))
+    let lead = format!("{prefix}{target}  {clock} ");
+    Line::styled(
+        format!(
+            "{lead}{}",
+            crate::widgets::truncate_text(fragment, width.saturating_sub(lead.chars().count()))
+        ),
+        Style::default().fg(session_band_color(detail)),
+    )
 }
 
 fn session_top_line(
@@ -593,9 +623,9 @@ fn session_top_line(
     detail: Option<&SessionDetail>,
     operation: Option<&SessionOperationDisplay>,
     now_epoch_seconds: u64,
-    config: &HelConfig,
+    target: &str,
 ) -> Line<'static> {
-    let (profile, target_id) = operation
+    let (profile, _) = operation
         .and_then(|operation| operation.resume_destination.clone())
         .unwrap_or_else(|| {
             (
@@ -603,24 +633,6 @@ fn session_top_line(
                 session.target_template_id.clone(),
             )
         });
-    let bare = matches!(
-        config.targets.get(&target_id),
-        Some(TargetTemplate::LocalBare | TargetTemplate::SshBare { .. })
-    );
-    let target = if bare {
-        let directory = session
-            .managed_worktree
-            .as_ref()
-            .map(|worktree| &worktree.source_project_directory)
-            .or(session.project_directory.as_ref())
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned());
-        directory.map_or(target_id.clone(), |directory| {
-            format!("{target_id}/{directory}")
-        })
-    } else {
-        target_id
-    };
     let status_columns = if let Some(operation) = operation {
         let (label, started_at) = match (operation.stage, operation.kind) {
             (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
@@ -658,7 +670,7 @@ fn session_top_line(
         .filter(|count| *count > 0)
         .map(|count| format!(" [{count} queued]"))
         .unwrap_or_default();
-    let mut columns = vec![target];
+    let mut columns = vec![target.to_owned()];
     columns.extend(status_columns);
     columns.push(format!("{profile}{queued}"));
     columns.push(recovery_warning_name(
@@ -668,6 +680,18 @@ fn session_top_line(
     ));
     let content = format!("{prefix}{}", columns.join("  "));
     Line::styled(content, Style::default().fg(session_band_color(detail)))
+}
+
+fn session_target_label(
+    session: &SessionRecord,
+    operation: Option<&SessionOperationDisplay>,
+    config: &HelConfig,
+) -> String {
+    let target_id = operation
+        .and_then(|operation| operation.resume_destination.as_ref())
+        .map(|(_, target_id)| target_id)
+        .unwrap_or(&session.target_template_id);
+    session.project_target(config, target_id)
 }
 
 fn prefixed_summary_line(
@@ -1276,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_in_one_project_have_a_blank_row_and_only_the_caret_marks_selection() {
+    fn sessions_in_one_project_are_contiguous_and_only_the_caret_marks_selection() {
         let mut first = running_session();
         first.id = "session-first".into();
         first.project_directory = Some("/projects/shared".into());
@@ -1307,10 +1331,50 @@ mod tests {
             "selection must not paint a background"
         );
         assert_eq!(buffer[(first_area.x, first_area.y)].symbol(), "›");
+        let first_line = (first_area.x..first_area.right())
+            .map(|x| buffer[(x, first_area.y)].symbol())
+            .collect::<String>();
+        let second_area = dashboard.active_row_areas[1].1;
+        let second_line = (second_area.x..second_area.right())
+            .map(|x| buffer[(x, second_area.y)].symbol())
+            .collect::<String>();
+        assert!(first_line.contains("podman [1]"));
+        assert!(second_line.contains("podman [2]"));
+        assert_eq!(
+            second_area.y,
+            first_area.bottom(),
+            "sessions in one project have no blank row between them"
+        );
+    }
+
+    #[test]
+    fn project_groups_have_one_blank_row_between_them() {
+        let mut first = running_session();
+        first.id = "session-alpha".into();
+        first.project_directory = Some("/projects/alpha".into());
+        let mut second = running_session();
+        second.id = "session-beta".into();
+        second.project_directory = Some("/projects/beta".into());
+        second.created_at = "2026-08-10T00:00:00Z".into();
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+
+        let first_bottom = dashboard.active_row_areas[0].1.bottom();
+        let second_heading_y = dashboard.project_heading_areas[1].1.y;
+        assert_eq!(second_heading_y, first_bottom + 1);
+        let buffer = terminal.backend().buffer();
         assert!(
-            (first_area.x..first_area.right())
-                .all(|x| buffer[(x, first_area.bottom())].symbol().trim().is_empty()),
-            "the row after the first session is empty"
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .all(|x| buffer[(x, first_bottom)].symbol().trim().is_empty())
         );
     }
 
@@ -1354,6 +1418,12 @@ mod tests {
         assert!(first_draw.contains("[2] beta"));
         assert!(first_draw.contains("You: question 0"));
         assert!(!first_draw.contains("You: beta question"));
+        assert!(
+            first_draw
+                .lines()
+                .any(|line| line.contains("podman  ") && line.contains("beta answer")),
+            "{first_draw}"
+        );
 
         assert_eq!(
             dashboard.handle_key(crate::test_support::key(KeyCode::Char('2'))),
@@ -1366,6 +1436,56 @@ mod tests {
         assert!(!second_draw.contains("You: question 0"));
         assert!(second_draw.contains("You: beta question"));
         assert_eq!(dashboard.selected_session().unwrap().id, "session-beta");
+    }
+
+    #[test]
+    fn collapsed_duplicate_targets_are_numbered_within_their_project() {
+        let mut alpha = running_session();
+        alpha.id = "session-alpha".into();
+        alpha.project_directory = Some("/projects/alpha".into());
+        let mut beta_first = running_session();
+        beta_first.id = "session-beta-first".into();
+        beta_first.project_directory = Some("/projects/beta".into());
+        beta_first.created_at = "2026-08-10T00:00:00Z".into();
+        let mut beta_second = beta_first.clone();
+        beta_second.id = "session-beta-second".into();
+        beta_second.created_at = "2026-08-11T00:00:00Z".into();
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: [alpha, beta_first, beta_second]
+                .into_iter()
+                .map(|session| (session.id.clone(), session))
+                .collect(),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        dashboard.apply_materialized_session(&materialized_session_for(
+            "session-beta-first",
+            vec![agent_message(1, "first tail")],
+        ));
+        dashboard.apply_materialized_session(&materialized_session_for(
+            "session-beta-second",
+            vec![agent_message(1, "second tail")],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed duplicate targets");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains("podman [1]  ") && line.contains("first tail")),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains("podman [2]  ") && line.contains("second tail")),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1388,6 +1508,9 @@ mod tests {
             ..SessionDetail::default()
         };
         assert_eq!(session_band_color(Some(&unread_idle)), Color::LightBlue);
+
+        let collapsed = collapsed_session_line("› ", "podman", Some(&unread_idle), 1, 80);
+        assert_eq!(collapsed.style.fg, Some(Color::LightBlue));
     }
 
     #[test]

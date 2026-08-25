@@ -102,9 +102,10 @@ pub(crate) struct ResumeRow {
     pub(crate) key: ResumeRowKey,
     pub(crate) profile_id: String,
     pub(crate) title: String,
-    /// Where the session ran: the record's stored target template id, or
-    /// `local` for a native session Hel never provisioned. The stored string is
-    /// shown verbatim, even when config no longer defines that target.
+    /// Where the session ran and the project it opened directly, matching the
+    /// live one-line summary. Native sessions use `local/<project>` because Hel
+    /// has not chosen their import destination yet. A stored target missing
+    /// from config is shown verbatim because its kind is no longer known.
     pub(crate) origin: String,
     pub(crate) details: String,
     pub(crate) last_activity_ms: i64,
@@ -285,7 +286,7 @@ pub(crate) fn merged_resume_rows(
             key: ResumeRowKey::Hel(session.id.clone()),
             profile_id: session.last_profile.clone(),
             title: session.display_title().to_owned(),
-            origin: session.target_template_id.clone(),
+            origin: session.project_target(config, &session.target_template_id),
             details,
             last_activity_ms,
             status,
@@ -304,7 +305,7 @@ pub(crate) fn merged_resume_rows(
                 key: ResumeRowKey::Native(profile.harness_kind, native.native_session_id.clone()),
                 profile_id: profile.profile_id.clone(),
                 title: native.title.clone(),
-                origin: LOCAL_ORIGIN.to_owned(),
+                origin: native_project_target(&native.project_directory),
                 details: native.details.clone(),
                 last_activity_ms: native.last_activity_ms,
                 status: ResumeRowStatus::Importable,
@@ -710,7 +711,7 @@ struct RowLayout {
 fn row_layout(width: u16) -> RowLayout {
     let width = usize::from(width);
     let profile = 14.min(width / 5).max(6);
-    let origin = 14.min(width / 5).max(6);
+    let origin = 24.min(width / 3).max(8);
     let activity = 14.min(width / 4).max(8);
     RowLayout {
         title: width
@@ -720,6 +721,15 @@ fn row_layout(width: u16) -> RowLayout {
         origin,
         activity,
     }
+}
+
+fn native_project_target(project_directory: &str) -> String {
+    std::path::Path::new(project_directory)
+        .file_name()
+        .map_or_else(
+            || LOCAL_ORIGIN.to_owned(),
+            |project| format!("{LOCAL_ORIGIN}/{}", project.to_string_lossy()),
+        )
 }
 
 pub(crate) fn resume_sessions_pane(area: Rect) -> Rect {
@@ -1129,7 +1139,72 @@ mod tests {
             .iter()
             .find(|row| row.key == ResumeRowKey::Native(HarnessKind::Codex, "native-2".into()))
             .expect("the unadopted native session keeps its row");
-        assert_eq!(native_only.origin, LOCAL_ORIGIN);
+        assert_eq!(native_only.origin, "local/hel");
+    }
+
+    #[test]
+    fn resume_and_import_targets_include_the_project_like_live_summaries() {
+        let mut local = stopped_session();
+        local.id = "local-session".into();
+        local.native_session_id = None;
+        local.target_template_id = "localhost".into();
+        local.project_directory = Some("/mnt/optane/bifrost-fird".into());
+
+        let mut remote = stopped_session();
+        remote.id = "remote-session".into();
+        remote.native_session_id = None;
+        remote.target_template_id = "precision-3260".into();
+        remote.project_directory = Some("/home/jonathan/Projects/bifrost".into());
+
+        let mut config = config();
+        config.targets.insert(
+            "localhost".into(),
+            hel::hel_config::TargetTemplate::LocalBare,
+        );
+        config.targets.insert(
+            "precision-3260".into(),
+            hel::hel_config::TargetTemplate::SshBare {
+                ssh: hel::hel_config::SshConnection {
+                    host: "precision-3260".into(),
+                    user: None,
+                    identity_file: None,
+                    extra_args: Vec::new(),
+                },
+                workspace_prefix: ".local/share/hel/workspaces".into(),
+            },
+        );
+        let mut dashboard =
+            DashboardState::new(config, state_with(vec![local, remote]), BTreeMap::new());
+        dashboard.show_resume_dialog(
+            1,
+            vec![codex_profile(vec![native(
+                "native-only",
+                "Native project",
+                NEWER_THAN_THE_CHECKPOINT,
+            )])],
+        );
+
+        let targets = rows(&dashboard)
+            .into_iter()
+            .map(|row| row.origin)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            targets,
+            BTreeSet::from([
+                "local/hel".to_owned(),
+                "localhost/bifrost-fird".to_owned(),
+                "precision-3260/bifrost".to_owned(),
+            ])
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 34)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw the resume dialog");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        for target in ["localhost/bifrost-fird", "precision-3260/bifrost"] {
+            assert!(rendered.contains(target), "{rendered}");
+        }
     }
 
     /// The native session behind a live Hel session must not be offered as an
