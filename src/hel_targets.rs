@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1202,6 +1202,23 @@ pub enum TargetLocator {
     },
 }
 
+/// Commands and identity needed to bring a stopped managed target back online.
+/// Only runtimes whose stopped resources retain their durable files provide
+/// one; callers leave every other target kind alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetRecoveryPlan {
+    pub inspect: CommandSpec,
+    pub start: CommandSpec,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetRecoveryOutcome {
+    NotRequired,
+    AlreadyRunning,
+    Started,
+}
+
 pub fn resource_name(session_id: &str) -> Result<String> {
     validate_session_id(session_id)?;
     let readable: String = session_id
@@ -1568,6 +1585,112 @@ pub fn reconnect_plan(locator: &TargetLocator, session_id: &str) -> Result<Comma
         description: format!("reconnect Hel session {session_id}"),
         commands: vec![command],
     })
+}
+
+/// Describe safe recovery for a Podman container that belongs to an active
+/// session. The inspect command is deliberately separate from `exec`: a host
+/// crash can leave the container present but stopped, where `exec` cannot
+/// distinguish that state from other transport failures.
+pub fn target_recovery_plan(
+    locator: &TargetLocator,
+    session_id: &str,
+) -> Result<Option<TargetRecoveryPlan>> {
+    verify_locator(locator, session_id)?;
+    let (inspect, start) = match locator {
+        TargetLocator::LocalPodman { container_id } => (
+            CommandSpec::new("podman", ["container", "inspect", container_id])
+                .purpose("inspect Hel session container"),
+            CommandSpec::new("podman", ["start", container_id])
+                .purpose("start stopped Hel session container"),
+        ),
+        TargetLocator::SshPodman { ssh, container_id } => (
+            ssh_command(ssh, ["podman", "container", "inspect", container_id])
+                .purpose("inspect remote Hel session container"),
+            ssh_command(ssh, ["podman", "start", container_id])
+                .purpose("start stopped remote Hel session container"),
+        ),
+        TargetLocator::LocalBare { .. }
+        | TargetLocator::AppleContainer { .. }
+        | TargetLocator::AwsEc2 { .. }
+        | TargetLocator::SshBare { .. } => return Ok(None),
+    };
+    Ok(Some(TargetRecoveryPlan {
+        inspect,
+        start,
+        session_id: session_id.to_owned(),
+    }))
+}
+
+/// Start a confirmed stopped Podman target and verify it reached `running`.
+/// Missing or foreign containers, transport failures, and transitional states
+/// fail without running the start command.
+pub fn ensure_recovery_target_running(
+    executor: &impl CommandExecutor,
+    plan: Option<&TargetRecoveryPlan>,
+) -> Result<TargetRecoveryOutcome> {
+    let Some(plan) = plan else {
+        return Ok(TargetRecoveryOutcome::NotRequired);
+    };
+    let status = inspect_recovery_target(executor, plan)?;
+    match status.as_str() {
+        "running" => Ok(TargetRecoveryOutcome::AlreadyRunning),
+        "created" | "initialized" | "stopped" | "exited" => {
+            let output = executor.execute(&plan.start)?;
+            checked_command_output(&plan.start, output)
+                .context("start confirmed stopped Podman session target")?;
+            let after = inspect_recovery_target(executor, plan)
+                .context("verify Podman session target after starting it")?;
+            ensure!(
+                after == "running",
+                "Podman session target reported {after:?} after start"
+            );
+            Ok(TargetRecoveryOutcome::Started)
+        }
+        "paused" | "removing" | "stopping" | "unknown" => {
+            bail!("refusing to start Podman session target in {status:?} state")
+        }
+        _ => bail!("Podman session target reported unexpected state {status:?}"),
+    }
+}
+
+fn inspect_recovery_target(
+    executor: &impl CommandExecutor,
+    plan: &TargetRecoveryPlan,
+) -> Result<String> {
+    let output = executor.execute(&plan.inspect)?;
+    let output = checked_command_output(&plan.inspect, output)
+        .context("inspect Podman session target for recovery")?;
+    let values: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).context("parse Podman session target inspection")?;
+    ensure!(
+        values.len() == 1,
+        "Podman inspection returned {} targets instead of one",
+        values.len()
+    );
+    let target = &values[0];
+    let labels = target
+        .pointer("/Config/Labels")
+        .and_then(serde_json::Value::as_object)
+        .context("Podman session target has no ownership labels")?;
+    ensure!(
+        labels
+            .get(MANAGED_LABEL)
+            .and_then(serde_json::Value::as_str)
+            == Some("true"),
+        "refusing to start a Podman target Hel does not own"
+    );
+    ensure!(
+        labels
+            .get(SESSION_LABEL)
+            .and_then(serde_json::Value::as_str)
+            == Some(plan.session_id.as_str()),
+        "refusing to start a Podman target owned by another session"
+    );
+    target
+        .pointer("/State/Status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .context("Podman session target inspection has no state")
 }
 
 /// Run the target-side half of the local Git bridge over the same trusted
@@ -2913,6 +3036,22 @@ mod tests {
         }
     }
 
+    fn podman_inspection(status: &str, session_id: &str, managed: &str) -> CommandOutput {
+        podman_output(
+            serde_json::to_vec(&serde_json::json!([{
+                "Id": "0123456789abcdef",
+                "Config": {
+                    "Labels": {
+                        (MANAGED_LABEL): managed,
+                        (SESSION_LABEL): session_id,
+                    }
+                },
+                "State": { "Status": status },
+            }]))
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn podman_preflight_requires_supported_rootless_uid_mapped_runtime() {
         let executor = PodmanPreflightExecutor::with_outputs([
@@ -3115,6 +3254,159 @@ mod tests {
                 "ResourceType=instance,Tags=[{Key=dev.hel.session,Value=018f9dd2-a3b4-7c8d-9000-123456789abc},{Key=dev.hel.managed,Value=true}]",
             ]
         );
+    }
+
+    #[test]
+    fn podman_target_recovery_uses_the_exact_local_or_remote_container() {
+        let name = resource_name(SESSION).unwrap();
+        let local = target_recovery_plan(
+            &TargetLocator::LocalPodman {
+                container_id: name.clone(),
+            },
+            SESSION,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(local.inspect.args, ["container", "inspect", name.as_str()]);
+        assert_eq!(local.start.args, ["start", name.as_str()]);
+
+        let remote = target_recovery_plan(
+            &TargetLocator::SshPodman {
+                ssh: ssh(),
+                container_id: name.clone(),
+            },
+            SESSION,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(remote.inspect.program, "ssh");
+        assert_eq!(
+            remote.inspect.args.last().unwrap(),
+            &format!("'podman' 'container' 'inspect' '{name}'")
+        );
+        assert_eq!(
+            remote.start.args.last().unwrap(),
+            &format!("'podman' 'start' '{name}'")
+        );
+    }
+
+    #[test]
+    fn stopped_owned_podman_target_is_started_and_reinspected() {
+        let name = resource_name(SESSION).unwrap();
+        let plan =
+            target_recovery_plan(&TargetLocator::LocalPodman { container_id: name }, SESSION)
+                .unwrap();
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_inspection("exited", SESSION, "true"),
+            podman_output("container-id\n"),
+            podman_inspection("running", SESSION, "true"),
+        ]);
+
+        assert_eq!(
+            ensure_recovery_target_running(&executor, plan.as_ref()).unwrap(),
+            TargetRecoveryOutcome::Started
+        );
+        let seen = executor.seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].purpose, "inspect Hel session container");
+        assert_eq!(seen[1].purpose, "start stopped Hel session container");
+        assert_eq!(seen[2].purpose, "inspect Hel session container");
+    }
+
+    #[test]
+    fn running_podman_target_is_not_started() {
+        let plan = TargetRecoveryPlan {
+            inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
+            start: CommandSpec::new("start", std::iter::empty::<&str>()),
+            session_id: SESSION.into(),
+        };
+        let executor =
+            PodmanPreflightExecutor::with_outputs([podman_inspection("running", SESSION, "true")]);
+
+        assert_eq!(
+            ensure_recovery_target_running(&executor, Some(&plan)).unwrap(),
+            TargetRecoveryOutcome::AlreadyRunning
+        );
+        assert_eq!(executor.seen.borrow().len(), 1);
+    }
+
+    #[test]
+    fn unsafe_podman_target_states_and_ownership_never_start() {
+        for (status, session, managed, expected) in [
+            ("paused", SESSION, "true", "paused"),
+            ("stopping", SESSION, "true", "stopping"),
+            ("exited", "another-session", "true", "another session"),
+            ("exited", SESSION, "false", "does not own"),
+        ] {
+            let plan = TargetRecoveryPlan {
+                inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
+                start: CommandSpec::new("start", std::iter::empty::<&str>()),
+                session_id: SESSION.into(),
+            };
+            let executor = PodmanPreflightExecutor::with_outputs([podman_inspection(
+                status, session, managed,
+            )]);
+
+            let error = ensure_recovery_target_running(&executor, Some(&plan))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(executor.seen.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn podman_target_must_still_be_running_after_start() {
+        let plan = TargetRecoveryPlan {
+            inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
+            start: CommandSpec::new("start", std::iter::empty::<&str>()),
+            session_id: SESSION.into(),
+        };
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_inspection("exited", SESSION, "true"),
+            podman_output("container-id\n"),
+            podman_inspection("exited", SESSION, "true"),
+        ]);
+
+        let error = ensure_recovery_target_running(&executor, Some(&plan))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("after start"), "{error}");
+    }
+
+    #[test]
+    fn podman_inspect_or_start_failures_stop_recovery() {
+        let plan = TargetRecoveryPlan {
+            inspect: CommandSpec::new("inspect", std::iter::empty::<&str>())
+                .purpose("inspect test target"),
+            start: CommandSpec::new("start", std::iter::empty::<&str>())
+                .purpose("start test target"),
+            session_id: SESSION.into(),
+        };
+        let inspect_failed = PodmanPreflightExecutor::with_outputs([CommandOutput {
+            status: 1,
+            stdout: Vec::new(),
+            stderr: b"container missing".to_vec(),
+        }]);
+        let error = ensure_recovery_target_running(&inspect_failed, Some(&plan))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inspect Podman session target"), "{error}");
+        assert_eq!(inspect_failed.seen.borrow().len(), 1);
+
+        let start_failed = PodmanPreflightExecutor::with_outputs([
+            podman_inspection("exited", SESSION, "true"),
+            CommandOutput {
+                status: 1,
+                stdout: Vec::new(),
+                stderr: b"start refused".to_vec(),
+            },
+        ]);
+        let error = ensure_recovery_target_running(&start_failed, Some(&plan))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("start confirmed stopped"), "{error}");
+        assert_eq!(start_failed.seen.borrow().len(), 2);
     }
 
     #[test]

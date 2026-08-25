@@ -195,6 +195,7 @@ impl Controller {
     pub fn worker_recovery_plan(&self, session_id: &str) -> Result<WorkerRecoveryPlan> {
         let (backend, worker_root) = self.worker_placement(session_id)?;
         Ok(WorkerRecoveryPlan {
+            target: hel_targets::target_recovery_plan(&backend, session_id)?,
             liveness_probe: worker_liveness_command(&backend, &worker_root),
             restart: CommandPlan {
                 description: format!("restart Hel worker for session {session_id}"),
@@ -1384,6 +1385,20 @@ pub(super) fn stop_worker(
     Ok(())
 }
 
+/// Restore a stopped Podman target before signaling its worker. Checkpoint
+/// recovery uses this instead of assuming every persisted target is running.
+pub(super) fn stop_worker_after_target_recovery(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    worker_root: &str,
+) -> Result<()> {
+    let target = hel_targets::target_recovery_plan(locator, session_id)?;
+    hel_targets::ensure_recovery_target_running(executor, target.as_ref())
+        .context("restore Hel worker target")?;
+    stop_worker(executor, locator, worker_root)
+}
+
 fn stop_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) -> CommandSpec {
     let script = hel_targets::stop_worker_daemon_script(worker_root);
     match locator {
@@ -1739,6 +1754,71 @@ mod tests {
             "leftover detection must not grep the match string: {script}"
         );
     }
+    #[test]
+    fn checkpoint_worker_stop_restores_a_stopped_podman_target_first() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+            outputs: RefCell<Vec<CommandOutput>>,
+        }
+
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(self.outputs.borrow_mut().remove(0))
+            }
+        }
+
+        let session = "0123456789abcdef0123456789abcdef";
+        let container_id = hel_targets::resource_name(session).unwrap();
+        let inspection = |status: &str| CommandOutput {
+            status: 0,
+            stdout: serde_json::to_vec(&serde_json::json!([{
+                "Config": { "Labels": {
+                    (hel_targets::MANAGED_LABEL): "true",
+                    (hel_targets::SESSION_LABEL): session,
+                }},
+                "State": { "Status": status },
+            }]))
+            .unwrap(),
+            stderr: Vec::new(),
+        };
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+            outputs: RefCell::new(vec![
+                inspection("exited"),
+                CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                inspection("running"),
+                CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+            ]),
+        };
+        let locator = hel_targets::TargetLocator::LocalPodman { container_id };
+
+        stop_worker_after_target_recovery(&executor, &locator, session, "/worker/root").unwrap();
+
+        let commands = executor.commands.borrow();
+        let purposes = commands
+            .iter()
+            .map(|command| command.purpose.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            purposes,
+            [
+                "inspect Hel session container",
+                "start stopped Hel session container",
+                "inspect Hel session container",
+                "stop Hel worker daemon",
+            ]
+        );
+    }
+
     struct PodmanInstallExecutor {
         commands: RefCell<Vec<CommandSpec>>,
         worker_cached: bool,

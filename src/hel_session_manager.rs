@@ -18,7 +18,10 @@ use crate::hel_projection::{
     apply_committed_projection_event, materialized_session_from_canonical, project_relay_event,
 };
 use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
-use crate::hel_targets::{CancellableProcessExecutor, CommandExecutor, CommandPlan, CommandSpec};
+use crate::hel_targets::{
+    CancellableProcessExecutor, CommandExecutor, CommandPlan, CommandSpec, TargetRecoveryPlan,
+    ensure_recovery_target_running,
+};
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected, RelayTransportDead};
 
@@ -59,6 +62,7 @@ pub struct ProjectMemorySyncTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRecoveryPlan {
+    pub target: Option<TargetRecoveryPlan>,
     pub liveness_probe: CommandSpec,
     pub restart: CommandPlan,
 }
@@ -82,6 +86,8 @@ enum WorkerRecoveryOutcome {
 async fn recover_worker(plan: WorkerRecoveryPlan) -> Result<WorkerRecoveryOutcome> {
     tokio::task::spawn_blocking(move || {
         let executor = CancellableProcessExecutor::with_timeout(WORKER_RESTART_TIMEOUT);
+        ensure_recovery_target_running(&executor, plan.target.as_ref())
+            .context("restore relay worker target")?;
         let output = executor
             .execute(&plan.liveness_probe)
             .context("probe relay worker liveness")?;
@@ -1727,6 +1733,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let restarted = directory.path().join("restarted");
         let recovery = |liveness: &str| WorkerRecoveryPlan {
+            target: None,
             liveness_probe: CommandSpec::new("printf", [format!("{liveness}\n")])
                 .purpose("probe test worker liveness"),
             restart: CommandPlan {
@@ -1749,6 +1756,81 @@ mod tests {
             WorkerRecoveryOutcome::Restarted
         );
         assert!(restarted.exists(), "a confirmed dead worker is restarted");
+    }
+
+    #[tokio::test]
+    async fn recovery_starts_a_stopped_target_before_probing_its_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let target_started = directory.path().join("target-started");
+        let worker_restarted = directory.path().join("worker-restarted");
+        let inspection = |status: &str| {
+            serde_json::to_string(&serde_json::json!([{
+                "Config": { "Labels": {
+                    (crate::hel_targets::MANAGED_LABEL): "true",
+                    (crate::hel_targets::SESSION_LABEL): "session-1",
+                }},
+                "State": { "Status": status },
+            }]))
+            .unwrap()
+        };
+        let mut inspect = CommandSpec::new(
+            "sh",
+            [
+                "-c",
+                "if [ -f \"$HEL_TEST_TARGET_STARTED\" ]; then printf '%s\\n' \"$HEL_TEST_RUNNING\"; else printf '%s\\n' \"$HEL_TEST_EXITED\"; fi",
+            ],
+        )
+        .purpose("inspect test target");
+        inspect.env.insert(
+            "HEL_TEST_TARGET_STARTED".into(),
+            target_started.to_string_lossy().into_owned(),
+        );
+        inspect
+            .env
+            .insert("HEL_TEST_RUNNING".into(), inspection("running"));
+        inspect
+            .env
+            .insert("HEL_TEST_EXITED".into(), inspection("exited"));
+        let mut start = CommandSpec::new("sh", ["-c", "touch -- \"$HEL_TEST_TARGET_STARTED\""])
+            .purpose("start test target");
+        start.env.insert(
+            "HEL_TEST_TARGET_STARTED".into(),
+            target_started.to_string_lossy().into_owned(),
+        );
+        let mut liveness = CommandSpec::new(
+            "sh",
+            [
+                "-c",
+                "test -f \"$HEL_TEST_TARGET_STARTED\" && printf 'dead\\n'",
+            ],
+        )
+        .purpose("probe test worker after target start");
+        liveness.env.insert(
+            "HEL_TEST_TARGET_STARTED".into(),
+            target_started.to_string_lossy().into_owned(),
+        );
+
+        let outcome = recover_worker(WorkerRecoveryPlan {
+            target: Some(TargetRecoveryPlan {
+                inspect,
+                start,
+                session_id: "session-1".into(),
+            }),
+            liveness_probe: liveness,
+            restart: CommandPlan {
+                description: "restart test worker".into(),
+                commands: vec![
+                    CommandSpec::new("touch", [worker_restarted.to_string_lossy().into_owned()])
+                        .purpose("restart test worker"),
+                ],
+            },
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, WorkerRecoveryOutcome::Restarted);
+        assert!(target_started.exists());
+        assert!(worker_restarted.exists());
     }
 
     fn target(program: &str) -> RelaySessionTarget {
@@ -2215,6 +2297,7 @@ mod tests {
             restarted.to_string_lossy().into_owned(),
         );
         let worker_recovery = WorkerRecoveryPlan {
+            target: None,
             liveness_probe: CommandSpec::new("printf", ["dead\n"])
                 .purpose("probe test relay worker"),
             restart: CommandPlan {
