@@ -115,9 +115,10 @@ review seats to the reviewer, enables discrete review and subagent failover,
 and enables the required built-in ACP routes. **Claude coder + Codex reviewer**
 defaults review and subagents to `gpt-5-6-luna` at `xhigh` effort and selects
 the extended review tier. Every other team keeps model selection on Auto and
-preserves the selected review tier (Quick by default). After saving from
-**Shift+Tab**, start the offered new session to use the new team immediately.
-See [Teams and adversarial review](/teams/).
+preserves the selected review tier (Quick by default). When a team change
+replaces the primary agent, **Shift+Tab** offers to switch immediately;
+Mjolnir starts the new provider-native session with the complete durable
+session transcript as context. See [Teams and adversarial review](/teams/).
 
 ACP priority lists default to `codex-acp`, then `claude-acp`,
 preserving the automatic behavior of earlier configurations. When a source is

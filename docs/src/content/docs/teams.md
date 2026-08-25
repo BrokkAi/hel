@@ -38,8 +38,13 @@ a mixed team, only that provider's route for a single-provider team. All teams
 except **Claude coder + Codex reviewer** reset models to Auto and preserve the
 selected review tier (Quick by default). That team defaults its review and
 subagent seats to `gpt-5-6-luna` at extra-high effort and selects extended
-review. Team changes apply to a new session; after saving from **Shift+Tab**,
-start the offered session to use the new team immediately.
+review. Changes that keep the primary route apply live. When a team change
+replaces the primary agent, **Shift+Tab** offers to switch immediately:
+Mjolnir starts a fresh provider-native session and loads the complete durable
+session transcript into it, including agent activity, tool records, and review
+state. The original provider session remains available in the session picker.
+Keeping the current session leaves its existing primary route in place until
+you start a new one.
 
 A single-provider team still gets discrete review — the reviewer is an
 independent session with its own context, just not an independent provider.
