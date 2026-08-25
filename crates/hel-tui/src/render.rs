@@ -191,20 +191,10 @@ fn render_adaptive_dashboard(
             let session = &dashboard.state.sessions[id];
             let source = dashboard.project_source(session);
             let heading = u16::from(previous_project.as_ref() != Some(&source.key));
-            let spacing = u16::from(
-                active
-                    .get(index + 1)
-                    .and_then(|next| dashboard.state.sessions.get(next))
-                    .is_some_and(|next| dashboard.project_source(next).key != source.key),
-            );
+            let expanded = dashboard.project_is_expanded(session);
+            let spacing = session_row_spacing(dashboard, &active, index, &source.key, expanded);
             previous_project = Some(source.key);
-            heading
-                + if dashboard.project_is_expanded(session) {
-                    4
-                } else {
-                    1
-                }
-                + spacing
+            heading + if expanded { 4 } else { 1 } + spacing
         })
         .collect::<Vec<_>>();
     let full = PaneHeights {
@@ -372,6 +362,21 @@ struct SessionRowsRendered {
     project_heading_areas: Vec<(String, Rect)>,
 }
 
+fn session_row_spacing(
+    dashboard: &DashboardState,
+    active: &[String],
+    index: usize,
+    project_key: &str,
+    expanded: bool,
+) -> u16 {
+    u16::from(
+        active
+            .get(index + 1)
+            .and_then(|next| dashboard.state.sessions.get(next))
+            .is_some_and(|next| expanded || dashboard.project_source(next).key != project_key),
+    )
+}
+
 /// Draws the Active pane and reports the selected session's preview hitbox and
 /// the per-row mouse hitboxes.
 fn render_sessions(
@@ -510,12 +515,7 @@ fn render_sessions(
         }
         let heading = usize::from(first);
         let content_height = lines.len() as u16;
-        let spacing = u16::from(
-            active
-                .get(index + 1)
-                .and_then(|next| dashboard.state.sessions.get(next))
-                .is_some_and(|next| dashboard.project_source(next).key != source.key),
-        );
+        let spacing = session_row_spacing(dashboard, active, index, &source.key, expanded);
         row_meta.push((
             source.key,
             heading,
@@ -1300,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_in_one_project_are_contiguous_and_only_the_caret_marks_selection() {
+    fn sessions_in_an_expanded_project_have_a_blank_row_and_only_the_caret_marks_selection() {
         let mut first = running_session();
         first.id = "session-first".into();
         first.project_directory = Some("/projects/shared".into());
@@ -1342,8 +1342,12 @@ mod tests {
         assert!(second_line.contains("podman [2]"));
         assert_eq!(
             second_area.y,
-            first_area.bottom(),
-            "sessions in one project have no blank row between them"
+            first_area.bottom() + 1,
+            "sessions in an expanded project have one blank row between them"
+        );
+        assert!(
+            (first_area.x..first_area.right())
+                .all(|x| buffer[(x, first_area.bottom())].symbol().trim().is_empty())
         );
     }
 
