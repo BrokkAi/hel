@@ -1420,6 +1420,54 @@ pub(crate) fn configured_subagent_service(
         })
 }
 
+/// Preserve the resolver's original error when a review cannot construct its
+/// specialist fan-out. The orchestrator must never receive a bare `None` and
+/// invent an explanation later.
+pub(crate) fn review_fanout_error(
+    workers_available: bool,
+    supervisor_available: bool,
+    subagents_model: &str,
+    discrete_review: bool,
+    roster_warnings: &[String],
+) -> String {
+    let mut causes = Vec::new();
+    if !workers_available {
+        if matches!(subagents_model, config::DISABLED_MODEL | "none") {
+            causes.push("`subagents.model` is disabled in the active configuration".to_string());
+        } else if let Some(warning) = roster_warnings
+            .iter()
+            .find(|warning| warning.starts_with("subagent delegation is disabled:"))
+        {
+            causes.push(warning.clone());
+        }
+    }
+    if !supervisor_available {
+        if !discrete_review {
+            causes.push(
+                "`agent.discrete_review` is disabled in the active configuration".to_string(),
+            );
+        } else if let Some(warning) = roster_warnings
+            .iter()
+            .find(|warning| warning.starts_with("agentic review supervisor is disabled:"))
+        {
+            causes.push(warning.clone());
+        }
+    }
+    causes.extend(
+        roster_warnings
+            .iter()
+            .filter(|warning| warning.contains(" unavailable: "))
+            .cloned(),
+    );
+    causes.sort();
+    causes.dedup();
+    assert!(
+        !causes.is_empty(),
+        "roster resolution did not record why the review fan-out is unavailable"
+    );
+    causes.join("\n")
+}
+
 pub(crate) fn primary_route_matches(
     active: &roster::ResolvedAgent,
     candidate: &roster::ResolvedAgent,
@@ -2457,22 +2505,33 @@ async fn run_session(
             max_correction_rounds: agent_config.max_correction_rounds,
             primary_model: Some(roster.primary.model.model.clone()),
             review_root: cwd.clone(),
-            review_fanout: review_workers.zip(roster.review_supervisor.clone()).map(
-                |(workers, supervisor)| {
-                    discrete_review::live_spawner(discrete_review::FanoutConfig {
-                        workers,
-                        supervisor,
-                        cwd: cwd.clone(),
-                        additional_directories: runtime_options.additional_directories.clone(),
-                        session_tag: Some(session_tag.clone()),
-                        agent_stderr: runtime_options.agent_stderr.clone(),
-                        snapshot_exclusions: runtime_options.snapshot_exclusions.clone(),
-                        fs_max_text_bytes: runtime_options.fs_max_text_bytes,
-                        permission: review_config.permission,
-                        id_allocator: subagent_ids.clone(),
-                    })
-                },
-            ),
+            review_fanout: match (review_workers, roster.review_supervisor.clone()) {
+                (Some(workers), Some(supervisor)) => {
+                    mj_core::orchestrator::ReviewFanout::available(discrete_review::live_spawner(
+                        discrete_review::FanoutConfig {
+                            workers,
+                            supervisor,
+                            cwd: cwd.clone(),
+                            additional_directories: runtime_options.additional_directories.clone(),
+                            session_tag: Some(session_tag.clone()),
+                            agent_stderr: runtime_options.agent_stderr.clone(),
+                            snapshot_exclusions: runtime_options.snapshot_exclusions.clone(),
+                            fs_max_text_bytes: runtime_options.fs_max_text_bytes,
+                            permission: review_config.permission,
+                            id_allocator: subagent_ids.clone(),
+                        },
+                    ))
+                }
+                (workers, supervisor) => {
+                    mj_core::orchestrator::ReviewFanout::unavailable(review_fanout_error(
+                        workers.is_some(),
+                        supervisor.is_some(),
+                        &subagents_config.model,
+                        agent_config.discrete_review,
+                        &roster.warnings,
+                    ))
+                }
+            },
         },
     );
     let primary_orchestrator = orchestrated.handle.clone();
@@ -2712,24 +2771,37 @@ async fn run_session(
                 if let Some(home) = codex_home {
                     command_subagent_codex_homes.push(home);
                 }
-                let review_fanout = pool.zip(updated_roster.review_supervisor.clone()).map(
-                    |(workers, supervisor)| {
-                        discrete_review::live_spawner(discrete_review::FanoutConfig {
-                            workers,
-                            supervisor,
-                            cwd: side_cwd.clone(),
-                            additional_directories: side_additional_directories.clone(),
-                            session_tag: Some(command_live_subagent_options.session_tag.clone()),
-                            agent_stderr: side_agent_stderr.clone(),
-                            snapshot_exclusions: command_live_subagent_options
-                                .snapshot_exclusions
-                                .clone(),
-                            fs_max_text_bytes: side_fs_max_text_bytes,
-                            permission: updated_config.review.permission,
-                            id_allocator: command_live_subagent_options.id_allocator.clone(),
-                        })
-                    },
-                );
+                let review_fanout = match (pool, updated_roster.review_supervisor.clone()) {
+                    (Some(workers), Some(supervisor)) => {
+                        mj_core::orchestrator::ReviewFanout::available(
+                            discrete_review::live_spawner(discrete_review::FanoutConfig {
+                                workers,
+                                supervisor,
+                                cwd: side_cwd.clone(),
+                                additional_directories: side_additional_directories.clone(),
+                                session_tag: Some(
+                                    command_live_subagent_options.session_tag.clone(),
+                                ),
+                                agent_stderr: side_agent_stderr.clone(),
+                                snapshot_exclusions: command_live_subagent_options
+                                    .snapshot_exclusions
+                                    .clone(),
+                                fs_max_text_bytes: side_fs_max_text_bytes,
+                                permission: updated_config.review.permission,
+                                id_allocator: command_live_subagent_options.id_allocator.clone(),
+                            }),
+                        )
+                    }
+                    (workers, supervisor) => {
+                        mj_core::orchestrator::ReviewFanout::unavailable(review_fanout_error(
+                            workers.is_some(),
+                            supervisor.is_some(),
+                            &updated_config.subagents.model,
+                            updated_config.agent.discrete_review,
+                            &updated_roster.warnings,
+                        ))
+                    }
+                };
                 cmd_orchestrator.set_review_fanout(review_fanout);
                 cmd_orchestrator.set_review_enabled(updated_config.agent.discrete_review);
                 cmd_orchestrator.set_review_tier(updated_config.agent.review_tier);
@@ -5335,5 +5407,26 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(refreshes, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn unavailable_review_fanout_keeps_the_resolver_error_verbatim() {
+        let error = review_fanout_error(
+            false,
+            false,
+            "auto",
+            true,
+            &[
+                "subagent delegation is disabled: no launchable subagent model is available. Authenticate Claude ACP."
+                    .to_string(),
+                "agentic review supervisor is disabled: no distinct launchable review model is available. Authenticate Claude ACP."
+                    .to_string(),
+                "claude-acp unavailable: authentication expired".to_string(),
+            ],
+        );
+
+        assert!(error.contains("claude-acp unavailable: authentication expired"));
+        assert!(error.contains("subagent delegation is disabled"));
+        assert!(error.contains("review supervisor is disabled"));
     }
 }
