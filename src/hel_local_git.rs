@@ -148,7 +148,7 @@ fn reject_git_lfs(repository: &Path) -> Result<()> {
         bail!("could not inspect Git LFS attributes");
     }
     let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
-    for record in fields.chunks_exact(3) {
+    for record in fields.as_slice().as_chunks::<3>().0 {
         if record[2] == b"lfs" {
             bail!(
                 "local repository {} uses Git LFS for {}; local Git proxy repositories do not support Git LFS",

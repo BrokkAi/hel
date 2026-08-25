@@ -333,10 +333,12 @@ struct ProcessGroupGuard {
 
 impl ProcessGroupGuard {
     fn kill(&self) {
+        #[cfg(unix)]
         if let Some(pid) = self.pid {
-            #[cfg(unix)]
             crate::hel_worker_runtime::terminate_process_group(pid, libc::SIGKILL);
         }
+        #[cfg(not(unix))]
+        let _ = self.pid;
     }
 
     fn disarm(&mut self) {

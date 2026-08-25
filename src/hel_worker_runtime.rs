@@ -874,7 +874,6 @@ mod unix {
         session_configured: bool,
         user_shells: &mut crate::hel_user_shell::UserShellRegistry,
     ) -> Result<()> {
-        dispatch_user_shells(relay, user_shells)?;
         let mut permits = Vec::new();
         // `Full` means dispatch what fits now and reserve again on the next
         // runtime event or wake. `Closed` means the ACP runtime is gone, so
@@ -884,6 +883,7 @@ mod unix {
         while let Ok(permit) = commands.try_reserve() {
             permits.push(permit);
         }
+        dispatch_user_shells(relay, user_shells)?;
         let mut pending = relay
             .lock()
             .expect("relay state lock poisoned")

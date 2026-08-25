@@ -2170,6 +2170,7 @@ mod tests {
     /// broker. Holding the slot's lock is exactly what makes a process this
     /// session's broker, so a stand-in that holds it is indistinguishable from
     /// the real thing to everything that has to stop one.
+    #[cfg(unix)]
     const BROKER_STAND_IN_PID_PATH: &str = "HEL_TEST_BROKER_STAND_IN_PID_PATH";
 
     fn retirable_broker_files(directory: &Path) -> BrokerFiles {

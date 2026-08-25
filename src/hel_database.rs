@@ -2968,7 +2968,9 @@ fn path_to_blob(path: &Path) -> Vec<u8> {
 fn blob_to_path(bytes: &[u8]) -> PathBuf {
     use std::os::windows::ffi::OsStringExt;
     let wide = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect::<Vec<_>>();
     PathBuf::from(std::ffi::OsString::from_wide(&wide))

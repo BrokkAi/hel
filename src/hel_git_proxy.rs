@@ -30,6 +30,7 @@ const BRIDGE_EXIT_GRACE: Duration = Duration::from_secs(5);
 /// is still silent this much later is one that will never speak. Exchanges are
 /// served one at a time, so without this deadline such a client holds the
 /// session's whole bridge.
+#[cfg(unix)]
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 /// How long one exchange may move nothing in either direction before the
 /// bridge gives up on it.
@@ -814,6 +815,11 @@ pub async fn run_worker_bridge(_root: &Path) -> Result<()> {
     bail!("Git proxy workers require Unix")
 }
 
+#[cfg(not(unix))]
+pub async fn run_worker_proxy(_root: &Path, _repository: &str, _service: &str) -> Result<()> {
+    bail!("Git proxy workers require Unix")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,9 +1323,4 @@ mod tests {
         }
         assert_eq!(running_broker_pid(&pid_path), None);
     }
-}
-
-#[cfg(not(unix))]
-pub async fn run_worker_proxy(_root: &Path, _repository: &str, _service: &str) -> Result<()> {
-    bail!("Git proxy workers require Unix")
 }
