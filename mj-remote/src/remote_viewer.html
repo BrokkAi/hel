@@ -7654,6 +7654,9 @@
           const outcome = workflow.outcome ? ` · ${workflow.outcome}` : " · active";
           title.textContent = `⚖ Turn ${workflow.turn_id} · review${outcome} · ${reviewTallyText(workflow.issues)}`;
           group.appendChild(title);
+          if (typeof workflow.coverage_error === "string" && workflow.coverage_error) {
+            appendReviewDetail(group, "Verification could not complete", workflow.coverage_error);
+          }
 
           const issues = workflow.issues
             .slice()
@@ -7678,6 +7681,13 @@
             card.appendChild(head);
             appendReviewDetail(card, "Finding — validated review evidence", issue.summary || "Review finding");
             appendReviewDetail(card, "Status", status.explanation);
+            if (
+              issue.status === "corrected; verification pending" &&
+              typeof workflow.coverage_error === "string" &&
+              workflow.coverage_error
+            ) {
+              appendReviewDetail(card, "Verification could not complete", workflow.coverage_error);
+            }
             appendReviewDetail(card, "Recorded outcome", issue.resolution_reason);
             appendReviewDetail(card, "Correction evidence", issue.resolution_details, "mono");
             group.appendChild(card);

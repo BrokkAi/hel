@@ -7832,15 +7832,9 @@ fn draw_review_issue_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut AppS
     let mut issues = state
         .workflows
         .iter()
-        .flat_map(|workflow| {
-            workflow
-                .issues
-                .iter()
-                .map(move |issue| (workflow.id, issue))
-        })
+        .flat_map(|workflow| workflow.issues.iter().map(move |issue| (workflow, issue)))
         .collect::<Vec<_>>();
-    issues
-        .sort_by_key(|(workflow_id, issue)| (workflow_id.turn_id, workflow_id.operation, issue.id));
+    issues.sort_by_key(|(workflow, issue)| (workflow.id.turn_id, workflow.id.operation, issue.id));
     let all = issues
         .iter()
         .map(|(_, issue)| (*issue).clone())
@@ -7876,17 +7870,17 @@ fn draw_review_issue_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut AppS
         )));
     } else {
         let mut last_group = None;
-        for (workflow_id, issue) in issues {
+        for (workflow, issue) in issues {
             // A pass header per (workflow, pass) keeps multi-turn sessions
             // legible without re-reading ids.
-            let group = (workflow_id.turn_id, workflow_id.operation, issue.pass);
+            let group = (workflow.id.turn_id, workflow.id.operation, issue.pass);
             if last_group != Some(group) {
                 last_group = Some(group);
                 lines.push(Line::from(Span::styled(
                     format!(
                         " {} turn {} · review pass {}",
                         crate::app::REVIEW_GLYPH,
-                        workflow_id.turn_id,
+                        workflow.id.turn_id,
                         issue.pass + 1
                     ),
                     Style::default()
@@ -7894,7 +7888,11 @@ fn draw_review_issue_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut AppS
                         .add_modifier(Modifier::BOLD),
                 )));
             }
-            lines.extend(review_issue_detail_lines(issue, theme));
+            lines.extend(review_issue_detail_lines(
+                issue,
+                theme,
+                workflow.coverage_error().as_deref(),
+            ));
         }
     }
     let total = Paragraph::new(lines.clone())
@@ -7926,6 +7924,7 @@ fn draw_review_issue_viewer(f: &mut ratatui::Frame, area: Rect, state: &mut AppS
 fn review_issue_detail_lines(
     issue: &crate::workflow::ReviewIssue,
     theme: TerminalTheme,
+    coverage_error: Option<&str>,
 ) -> Vec<Line<'static>> {
     use crate::workflow::ReviewIssueStatus;
 
@@ -7987,6 +7986,22 @@ fn review_issue_detail_lines(
         format!("   {explanation}"),
         Style::default().ink(theme.text),
     )));
+    if issue.status == ReviewIssueStatus::Corrected
+        && let Some(error) = coverage_error
+    {
+        lines.push(Line::from(Span::styled(
+            " Verification could not complete",
+            Style::default()
+                .ink(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(error.lines().map(|line| {
+            Line::from(Span::styled(
+                format!("   {line}"),
+                Style::default().ink(theme.text),
+            ))
+        }));
+    }
     if let Some(reason) = issue.resolution_reason.as_deref() {
         lines.push(Line::from(Span::styled(
             " Recorded outcome",
@@ -13006,7 +13021,10 @@ fn workflow_progress_line(
     let failed = workflow.failed_count();
     let cancelled = workflow.cancelled_count();
     if workflow.coverage == WorkflowCoverage::Degraded {
-        details.push("degraded coverage".to_string());
+        details.push(match workflow.coverage_error() {
+            Some(error) => format!("verification: {error}"),
+            None => "degraded coverage".to_string(),
+        });
     }
     if failed > 0 {
         details.push(format!("{failed} failed"));
@@ -15303,6 +15321,14 @@ mod tests {
                 ),
             },
         );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::CoverageChanged {
+                coverage: WorkflowCoverage::Degraded,
+                error: Some("claude-acp: authentication expired".to_string()),
+            },
+        );
         state.open_review_issue_viewer();
 
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
@@ -15314,6 +15340,10 @@ mod tests {
         assert!(rendered.contains("caller reuses this entry"), "{rendered}");
         assert!(
             rendered.contains("corrected — verification pending"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("claude-acp: authentication expired"),
             "{rendered}"
         );
         assert!(
@@ -17090,6 +17120,7 @@ mod tests {
             workflow_id,
             WorkflowTransition::CoverageChanged {
                 coverage: WorkflowCoverage::Degraded,
+                error: Some("reviewer exited: authentication expired".to_string()),
             },
         );
 
@@ -17104,7 +17135,10 @@ mod tests {
         assert!(rendered.contains("reviewers 2/3"), "{rendered}");
         assert!(rendered.contains("1 waiting"), "{rendered}");
         assert!(rendered.contains("1 failed"), "{rendered}");
-        assert!(rendered.contains("degraded coverage"), "{rendered}");
+        assert!(
+            rendered.contains("verification: reviewer exited: authentication expired"),
+            "{rendered}"
+        );
 
         let backend = TestBackend::new(22, 1);
         let mut narrow = Terminal::new(backend).expect("terminal");
@@ -17144,7 +17178,7 @@ mod tests {
             state.visible_workflows().next().expect("workflow"),
             "⠋",
             Duration::ZERO,
-            120,
+            180,
             state.theme,
             true,
         );
@@ -17162,7 +17196,7 @@ mod tests {
             state.visible_workflows().next().expect("terminal workflow"),
             "⠋",
             Duration::ZERO,
-            120,
+            180,
             state.theme,
             true,
         );
