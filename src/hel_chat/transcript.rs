@@ -25,8 +25,8 @@ use crate::hel_transcript::{
 
 use super::ChatState;
 use super::rendering::{
-    LogicalLine, TranscriptRenderMode, markdown_lines, raw_lines, sanitize_terminal_text,
-    wrap_styled_line,
+    LogicalLine, TranscriptRenderMode, append_trimmed_ellipsis, markdown_lines, raw_lines,
+    sanitize_terminal_text, wrap_styled_line,
 };
 
 #[derive(Debug, Clone)]
@@ -1278,7 +1278,12 @@ pub fn render_agent_message_head(
     let truncated = lines.len() > maximum_lines;
     lines.truncate(maximum_lines);
     if truncated && let Some(last) = lines.last_mut() {
-        last.spans.push(Span::raw("…"));
+        let preserved_spans = usize::from(
+            last.spans
+                .first()
+                .is_some_and(|span| span.content == ROLE_GUTTER),
+        );
+        append_trimmed_ellipsis(last, preserved_spans);
     }
     lines
 }
@@ -2420,6 +2425,35 @@ mod tests {
         assert_eq!(
             render_agent_message_tail(text, 40, 2),
             body[body.len() - 2..].to_vec()
+        );
+    }
+
+    #[test]
+    fn agent_preview_head_removes_punctuation_before_its_ellipsis() {
+        let lines = render_agent_message_head(
+            "first line\n**late-corpus diagnostics,**\nthird line",
+            80,
+            2,
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, ["│ first line", "│ late-corpus diagnostics…"]);
+        assert!(
+            lines[1]
+                .spans
+                .last()
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
         );
     }
 

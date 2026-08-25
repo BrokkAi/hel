@@ -666,6 +666,37 @@ pub(super) fn display_width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
 }
 
+fn trim_before_ellipsis(character: char) -> bool {
+    character.is_whitespace()
+        || character.is_ascii_punctuation()
+        || matches!(
+            character,
+            '…' | '–' | '—' | '‘' | '’' | '“' | '”' | '•' | '·'
+        )
+}
+
+fn trim_spans_before_ellipsis(spans: &mut Vec<Span<'static>>, preserved_spans: usize) {
+    while spans.len() > preserved_spans {
+        let last = spans.last_mut().expect("nonempty ellipsis span tail");
+        let trimmed = last.content.trim_end_matches(trim_before_ellipsis);
+        if trimmed.is_empty() {
+            spans.pop();
+        } else {
+            last.content = trimmed.to_owned().into();
+            break;
+        }
+    }
+}
+
+pub(super) fn append_trimmed_ellipsis(line: &mut Line<'static>, preserved_spans: usize) {
+    let style = line
+        .spans
+        .last()
+        .map_or(Style::default(), |span| span.style);
+    trim_spans_before_ellipsis(&mut line.spans, preserved_spans);
+    line.spans.push(Span::styled("…", style));
+}
+
 /// Truncate a styled line to `width` characters, keeping each span's style and
 /// marking the cut with `…` in the style of the span it landed in.
 pub(super) fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
@@ -683,6 +714,7 @@ pub(super) fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<
     for span in line.spans {
         if used >= budget {
             if width > 0 {
+                trim_spans_before_ellipsis(&mut spans, 0);
                 spans.push(Span::styled("…", span.style));
             }
             return Line::from(spans);
@@ -698,6 +730,7 @@ pub(super) fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<
                 spans.push(Span::styled(kept, style));
             }
             if width > 0 {
+                trim_spans_before_ellipsis(&mut spans, 0);
                 spans.push(Span::styled("…", style));
             }
             return Line::from(spans);
@@ -714,6 +747,7 @@ pub(super) fn truncate_to_width(text: &str, width: usize) -> String {
         return "…".chars().take(width).collect();
     }
     let mut truncated = text.chars().take(width - 1).collect::<String>();
+    truncated.truncate(truncated.trim_end_matches(trim_before_ellipsis).len());
     truncated.push('…');
     truncated
 }
@@ -803,6 +837,22 @@ mod tests {
         assert_eq!(
             text(&rendered),
             ["Name: alpha", "Description: a long explanation"]
+        );
+    }
+
+    #[test]
+    fn ellipses_remove_cutoff_whitespace_and_punctuation() {
+        assert_eq!(truncate_to_width("alpha, beta", 7), "alpha…");
+
+        let line = Line::from(vec![
+            Span::styled("alpha,", Style::default().fg(Color::Red)),
+            Span::styled(" beta", Style::default().fg(Color::Blue)),
+        ]);
+        let truncated = truncate_line_to_width(line, 7);
+        assert_eq!(text(std::slice::from_ref(&truncated)), ["alpha…"]);
+        assert_eq!(
+            truncated.spans.last().and_then(|span| span.style.fg),
+            Some(Color::Blue)
         );
     }
 }

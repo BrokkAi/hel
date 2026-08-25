@@ -14,6 +14,18 @@ pub(crate) fn truncate_text(text: &str, width: usize) -> String {
         return "…".chars().take(width).collect();
     }
     let mut truncated = text.chars().take(width - 1).collect::<String>();
+    truncated.truncate(
+        truncated
+            .trim_end_matches(|character: char| {
+                character.is_whitespace()
+                    || character.is_ascii_punctuation()
+                    || matches!(
+                        character,
+                        '…' | '–' | '—' | '‘' | '’' | '“' | '”' | '•' | '·'
+                    )
+            })
+            .len(),
+    );
     truncated.push('…');
     truncated
 }
@@ -112,4 +124,16 @@ pub(crate) fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect
         ])
         .split(vertical[1]);
     horizontal[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_widget_text_removes_cutoff_whitespace_and_punctuation() {
+        assert_eq!(truncate_text("alpha, beta", 7), "alpha…");
+        assert_eq!(truncate_text("alpha - beta", 8), "alpha…");
+        assert_eq!(truncate_text("alpha beta", 20), "alpha beta");
+    }
 }
