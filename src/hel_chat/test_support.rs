@@ -144,8 +144,17 @@ pub(super) fn grok_chat() -> ChatState {
 }
 
 pub(super) fn mode_config_option(current: &str, values: &[&str]) -> SessionConfigOption {
+    select_config_option("interaction_mode", current, values)
+        .category(SessionConfigOptionCategory::Mode)
+}
+
+pub(super) fn select_config_option(
+    id: &str,
+    current: &str,
+    values: &[&str],
+) -> SessionConfigOption {
     SessionConfigOption::select(
-        "interaction_mode",
+        id.to_owned(),
         "Mode",
         current.to_owned(),
         SessionConfigSelectOptions::Ungrouped(
@@ -157,7 +166,6 @@ pub(super) fn mode_config_option(current: &str, values: &[&str]) -> SessionConfi
                 .collect(),
         ),
     )
-    .category(SessionConfigOptionCategory::Mode)
 }
 
 pub(super) fn advertise(chat: &mut ChatState, seq: u64, names: &[&str]) {

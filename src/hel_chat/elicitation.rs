@@ -408,10 +408,15 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let message_height = if dialog.request.id.starts_with("plan-review-") {
+        Constraint::Percentage(45)
+    } else {
+        Constraint::Length(3)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            message_height,
             Constraint::Min(4),
             Constraint::Length(2),
             Constraint::Length(1),

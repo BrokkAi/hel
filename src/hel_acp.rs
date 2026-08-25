@@ -33,7 +33,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::hel_config::{HarnessKind, UnrestrictedEnforcement};
-use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
+use crate::hel_elicitation::{
+    ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationRequest,
+    ElicitationResponse, ElicitationValue,
+};
 use crate::hel_terminal::{
     DEFAULT_TERMINAL_OUTPUT_BYTES, TerminalExit, TerminalRegistry, TerminalSpawn,
 };
@@ -106,8 +109,7 @@ pub enum CommandRequest {
         key: String,
         value: String,
     },
-    /// Select an ACP session mode. The runtime prefers the stabilized mode
-    /// config option and falls back to legacy `session/set_mode`.
+    /// Select an ACP session mode through `session/set_mode`.
     SetSessionMode {
         request_id: String,
         mode_id: String,
@@ -465,33 +467,198 @@ fn is_exit_plan_mode_method(method: &str) -> bool {
     method.strip_prefix('_').unwrap_or(method) == EXIT_PLAN_MODE_METHOD
 }
 
-/// Hel answers `exit_plan_mode` the way it answers a permission request: an
-/// unrestricted target approves, so the agent leaves plan mode and proceeds; a
-/// restricted target declines, so plan mode stays active and the person
-/// decides. `feedback` belongs with `cancelled` only, and Hel has none to
-/// give — nobody has read the plan yet.
-///
-/// The asymmetry with tool permissions on a bare target is deliberate. Grok
-/// Build always launches with `--always-approve`, so its writes never ask; but
-/// leaving plan mode is a decision about the plan, not a tool permission, so it
-/// stays with the person until the target itself is disposable.
-fn exit_plan_mode_outcome(auto_approve: bool) -> &'static str {
-    if auto_approve {
-        "approved"
-    } else {
-        "cancelled"
+const PLAN_REVIEW_ACTION: &str = "action";
+const PLAN_REVIEW_FEEDBACK: &str = "feedback";
+
+fn nested_string<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in keys {
+                if let Some(value) = object.get(*key).and_then(serde_json::Value::as_str) {
+                    return Some(value);
+                }
+            }
+            object.values().find_map(|value| nested_string(value, keys))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| nested_string(value, keys))
+        }
+        _ => None,
     }
 }
 
-fn exit_plan_mode_response(auto_approve: bool) -> serde_json::Value {
-    serde_json::json!({ "outcome": exit_plan_mode_outcome(auto_approve) })
+fn nested_string_matches(
+    value: &serde_json::Value,
+    keys: &[&str],
+    predicate: &impl Fn(&str) -> bool,
+) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            (keys.contains(&key.as_str()) && value.as_str().is_some_and(predicate))
+                || nested_string_matches(value, keys, predicate)
+        }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| nested_string_matches(value, keys, predicate)),
+        _ => false,
+    }
 }
 
-fn exit_plan_mode_report(auto_approve: bool) -> String {
-    if auto_approve {
-        "The agent asked to leave plan mode. Hel approved it, because this target runs unrestricted.".to_owned()
-    } else {
-        "The agent asked to leave plan mode. Hel declined, so plan mode stays active and the plan is yours to accept.".to_owned()
+fn is_plan_permission(request: &RequestPermissionRequest) -> bool {
+    let Ok(value) = serde_json::to_value(request) else {
+        return false;
+    };
+    nested_string_matches(&value, &["kind"], &|kind| kind == "plan_review")
+        || nested_string_matches(&value, &["title", "name"], &|name| {
+            let normalized = name.to_ascii_lowercase().replace([' ', '_'], "");
+            normalized.contains("implementthisplan") || normalized.contains("exitplanmode")
+        })
+        || request.options.iter().any(|option| {
+            let id = option.option_id.to_string().to_ascii_lowercase();
+            id.contains("plan_approve")
+                || id.contains("implement_plan")
+                || id.contains("plan_revise")
+                || id.contains("reject_and_exit")
+        })
+}
+
+fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationRequest {
+    let plan = nested_string(value, &["plan", "plan_content", "planContent"])
+        .unwrap_or("The agent did not provide plan text in its review request.");
+    ElicitationRequest {
+        id,
+        title: Some("Plan review".into()),
+        message: format!("Review the agent's plan:\n\n{plan}"),
+        description: Some("Choose what Hel should tell the planning harness.".into()),
+        fields: vec![
+            ElicitationField {
+                id: PLAN_REVIEW_ACTION.into(),
+                title: "Decision".into(),
+                description: Some(
+                    "Implement approves the plan; revise sends the feedback below.".into(),
+                ),
+                required: true,
+                secret: false,
+                custom_answer_for: None,
+                kind: ElicitationFieldKind::SingleSelect {
+                    options: vec![
+                        ElicitationOption {
+                            value: "implement".into(),
+                            title: "Implement".into(),
+                            description: Some("Approve and continue with implementation".into()),
+                            preview: None,
+                        },
+                        ElicitationOption {
+                            value: "revise".into(),
+                            title: "Revise".into(),
+                            description: Some("Keep planning and incorporate feedback".into()),
+                            preview: None,
+                        },
+                        ElicitationOption {
+                            value: "keep_planning".into(),
+                            title: "Keep planning".into(),
+                            description: Some("Decline this plan without leaving plan mode".into()),
+                            preview: None,
+                        },
+                        ElicitationOption {
+                            value: "exit".into(),
+                            title: "Exit plan mode".into(),
+                            description: Some(
+                                "Abandon this review and return to normal mode".into(),
+                            ),
+                            preview: None,
+                        },
+                    ],
+                    default: Some("keep_planning".into()),
+                },
+            },
+            ElicitationField {
+                id: PLAN_REVIEW_FEEDBACK.into(),
+                title: "Revision feedback".into(),
+                description: Some("Used only when Revise is selected".into()),
+                required: false,
+                secret: false,
+                custom_answer_for: None,
+                kind: ElicitationFieldKind::Text {
+                    default: None,
+                    min_length: None,
+                    max_length: Some(16 * 1024),
+                    pattern: None,
+                    format: None,
+                },
+            },
+        ],
+    }
+}
+
+fn plan_review_answer(response: ElicitationResponse) -> (String, Option<String>) {
+    let ElicitationResponse::Accept { content } = response else {
+        return ("keep_planning".into(), None);
+    };
+    let action = match content.get(PLAN_REVIEW_ACTION) {
+        Some(ElicitationValue::String(action)) => action.clone(),
+        _ => "keep_planning".into(),
+    };
+    let feedback = match content.get(PLAN_REVIEW_FEEDBACK) {
+        Some(ElicitationValue::String(feedback)) if !feedback.trim().is_empty() => {
+            Some(feedback.clone())
+        }
+        _ => None,
+    };
+    (action, feedback)
+}
+
+fn permission_plan_response(
+    request: &RequestPermissionRequest,
+    response: ElicitationResponse,
+) -> RequestPermissionResponse {
+    let (action, _) = plan_review_answer(response);
+    if action == "keep_planning" {
+        return RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
+    }
+    let needles: &[&str] = match action.as_str() {
+        "implement" => &["implement_plan", "plan_approve", "default", "approve"],
+        "revise" => &["plan_revise", "revise"],
+        "exit" => &["reject_and_exit", "exit"],
+        _ => &[],
+    };
+    let selected = request
+        .options
+        .iter()
+        .find(|option| {
+            let id = option.option_id.to_string().to_ascii_lowercase();
+            let name = option.name.to_ascii_lowercase();
+            needles
+                .iter()
+                .any(|needle| id.contains(needle) || name.contains(needle))
+        })
+        .or_else(|| {
+            (action == "implement")
+                .then(|| {
+                    request.options.iter().find(|option| {
+                        option.kind == PermissionOptionKind::AllowOnce
+                            || option.kind == PermissionOptionKind::AllowAlways
+                    })
+                })
+                .flatten()
+        });
+    selected.map_or_else(
+        || RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
+        |option| {
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new(option.option_id.clone()),
+            ))
+        },
+    )
+}
+
+fn grok_plan_response(response: ElicitationResponse) -> serde_json::Value {
+    let (action, feedback) = plan_review_answer(response);
+    match action.as_str() {
+        "implement" => serde_json::json!({ "outcome": "approved" }),
+        "exit" => serde_json::json!({ "outcome": "abandoned" }),
+        "revise" => serde_json::json!({ "outcome": "cancelled", "feedback": feedback }),
+        _ => serde_json::json!({ "outcome": "cancelled" }),
     }
 }
 
@@ -610,6 +777,9 @@ where
     let elicitation_events = events.clone();
     let pending_elicitations = PendingElicitations::default();
     let handler_elicitations = pending_elicitations.clone();
+    let permission_elicitations = pending_elicitations.clone();
+    let permission_review_ids = Arc::new(AtomicU64::new(1));
+    let ext_review_ids = Arc::new(AtomicU64::new(1));
     let session_elicitations = pending_elicitations.clone();
     let next_elicitation_id = Arc::new(AtomicU64::new(1));
     let auto_approve_permissions = spec.force_unrestricted_mode;
@@ -670,6 +840,61 @@ where
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _cx| {
                 permission_activity.mark();
+                if is_plan_permission(&request) {
+                    let id = format!(
+                        "plan-review-{}",
+                        permission_review_ids.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let value = serde_json::to_value(&request)
+                        .map_err(|_| agent_client_protocol::Error::internal_error())?;
+                    let review = normalized_plan_review(id.clone(), &value);
+                    let (answer, answer_rx) = oneshot::channel();
+                    permission_elicitations
+                        .lock()
+                        .expect("pending elicitation lock poisoned")
+                        .insert(id.clone(), answer);
+                    let pending = permission_elicitations.clone();
+                    let events = permission_events.clone();
+                    let cancellation = responder.cancellation();
+                    tokio::spawn(async move {
+                        if events
+                            .send(RuntimeEvent::ElicitationRequested { request: review })
+                            .await
+                            .is_err()
+                        {
+                            pending
+                                .lock()
+                                .expect("pending elicitation lock poisoned")
+                                .remove(&id);
+                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            return;
+                        }
+                        let response = tokio::select! {
+                            response = answer_rx => response.ok(),
+                            () = cancellation.cancelled() => None,
+                        };
+                        pending
+                            .lock()
+                            .expect("pending elicitation lock poisoned")
+                            .remove(&id);
+                        let action = response
+                            .as_ref()
+                            .map_or("cancel", ElicitationResponse::action_name)
+                            .to_owned();
+                        let _ = events
+                            .send(RuntimeEvent::ElicitationResolved {
+                                elicitation_id: id,
+                                action,
+                            })
+                            .await;
+                        let answer = response.map_or_else(
+                            || RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
+                            |response| permission_plan_response(&request, response),
+                        );
+                        let _ = responder.respond(answer);
+                    });
+                    return Ok(());
+                }
                 permission_events
                     .send(RuntimeEvent::Warning {
                         message: UNEXPECTED_PERMISSION_REQUEST_WARNING.to_owned(),
@@ -925,13 +1150,56 @@ where
                     return Ok(());
                 }
                 if is_exit_plan_mode_method(&method) {
-                    ext_events
-                        .send(RuntimeEvent::Warning {
-                            message: exit_plan_mode_report(auto_approve_permissions),
-                        })
-                        .await
-                        .map_err(|_| relay_event_channel_error())?;
-                    return responder.respond(exit_plan_mode_response(auto_approve_permissions));
+                    let id = format!(
+                        "plan-review-grok-{}",
+                        ext_review_ids.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let review = normalized_plan_review(id.clone(), request.params());
+                    let (answer, answer_rx) = oneshot::channel();
+                    handler_elicitations
+                        .lock()
+                        .expect("pending elicitation lock poisoned")
+                        .insert(id.clone(), answer);
+                    let pending = handler_elicitations.clone();
+                    let events = ext_events.clone();
+                    let cancellation = responder.cancellation();
+                    tokio::spawn(async move {
+                        if events
+                            .send(RuntimeEvent::ElicitationRequested { request: review })
+                            .await
+                            .is_err()
+                        {
+                            pending
+                                .lock()
+                                .expect("pending elicitation lock poisoned")
+                                .remove(&id);
+                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            return;
+                        }
+                        let response = tokio::select! {
+                            response = answer_rx => response.ok(),
+                            () = cancellation.cancelled() => None,
+                        };
+                        pending
+                            .lock()
+                            .expect("pending elicitation lock poisoned")
+                            .remove(&id);
+                        let action = response
+                            .as_ref()
+                            .map_or("cancel", ElicitationResponse::action_name)
+                            .to_owned();
+                        let _ = events
+                            .send(RuntimeEvent::ElicitationResolved {
+                                elicitation_id: id,
+                                action,
+                            })
+                            .await;
+                        let _ = responder.respond(response.map_or_else(
+                            || serde_json::json!({ "outcome": "cancelled" }),
+                            grok_plan_response,
+                        ));
+                    });
+                    return Ok(());
                 }
                 ext_events
                     .send(RuntimeEvent::Warning {
@@ -1740,21 +2008,15 @@ async fn serve_session(
                 request_id,
                 mode_id,
             } => {
-                let applied = if find_session_config_option(&config_options, "mode").is_some() {
-                    set_session_config(
-                        connection,
-                        &session_id,
-                        &mut config_options,
-                        "mode",
-                        &mode_id,
-                    )
-                    .await
-                } else if modes.as_ref().is_some_and(|state| {
+                let advertised = modes.as_ref().is_some_and(|state| {
                     state
                         .available_modes
                         .iter()
                         .any(|mode| mode.id.to_string() == mode_id)
-                }) {
+                });
+                let grok_plan_fallback = spec.harness == HarnessKind::Grok
+                    && matches!(mode_id.as_str(), "plan" | "default");
+                let applied = if advertised || grok_plan_fallback {
                     connection
                         .send_request(SetSessionModeRequest::new(
                             session_id.clone(),
@@ -2044,19 +2306,17 @@ pub(crate) fn find_session_config_option<'a>(
     options: &'a [SessionConfigOption],
     key: &str,
 ) -> Option<&'a SessionConfigOption> {
+    if let Some(option) = options.iter().find(|option| option.id.to_string() == key) {
+        return Some(option);
+    }
     match key {
-        "model" => options
-            .iter()
-            .find(|option| option.id.to_string() == "model")
-            .or_else(|| {
-                options.iter().find(|option| {
-                    option.category == Some(SessionConfigOptionCategory::Model)
-                        && !matches!(
-                            option.id.to_string().as_str(),
-                            "effort" | "reasoning_effort"
-                        )
-                })
-            }),
+        "model" => options.iter().find(|option| {
+            option.category == Some(SessionConfigOptionCategory::Model)
+                && !matches!(
+                    option.id.to_string().as_str(),
+                    "effort" | "reasoning_effort"
+                )
+        }),
         "effort" => options
             .iter()
             .find(|option| option.category == Some(SessionConfigOptionCategory::ThoughtLevel))
@@ -2070,12 +2330,7 @@ pub(crate) fn find_session_config_option<'a>(
             }),
         "mode" => options
             .iter()
-            .find(|option| option.category == Some(SessionConfigOptionCategory::Mode))
-            .or_else(|| {
-                options
-                    .iter()
-                    .find(|option| option.id.to_string() == "mode")
-            }),
+            .find(|option| option.category == Some(SessionConfigOptionCategory::Mode)),
         _ => None,
     }
 }
@@ -3063,32 +3318,75 @@ mod tests {
     }
 
     #[test]
-    fn exit_plan_mode_is_approved_when_unrestricted_and_cancelled_when_restricted() {
+    fn grok_plan_review_answers_are_user_selected() {
+        let review = normalized_plan_review(
+            "plan-review-grok-1".into(),
+            &serde_json::json!({"plan_content": "Do nothing"}),
+        );
+        let encoded = serde_json::to_value(&review).unwrap();
         assert_eq!(
-            exit_plan_mode_response(true),
+            serde_json::from_value::<ElicitationRequest>(encoded).unwrap(),
+            review,
+            "normalized reviews must survive the durable relay journal"
+        );
+        let mut content = BTreeMap::new();
+        content.insert(
+            PLAN_REVIEW_ACTION.into(),
+            ElicitationValue::String("implement".into()),
+        );
+        assert_eq!(
+            grok_plan_response(ElicitationResponse::Accept { content }),
             serde_json::json!({"outcome": "approved"})
         );
-        // No `feedback`: it is only meaningful with `cancelled`, and Hel has
-        // none — the plan has not been read by anyone yet.
-        assert_eq!(
-            exit_plan_mode_response(false),
-            serde_json::json!({"outcome": "cancelled"})
-        );
     }
 
-    #[tokio::test]
-    async fn an_unrestricted_session_approves_the_agents_exit_plan_mode_request() {
-        let answer = answer_to_ext_request("_x.ai/exit_plan_mode", true).await;
-        assert_eq!(answer["result"], serde_json::json!({"outcome": "approved"}));
-    }
+    #[test]
+    fn supported_permission_plan_reviews_are_detected_and_mapped_to_native_options() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, ToolCallUpdate, ToolCallUpdateFields,
+        };
 
-    #[tokio::test]
-    async fn a_restricted_session_cancels_the_agents_exit_plan_mode_request() {
-        let answer = answer_to_ext_request("_x.ai/exit_plan_mode", false).await;
-        assert_eq!(
-            answer["result"],
-            serde_json::json!({"outcome": "cancelled"})
-        );
+        let fixtures = [
+            ("Implement this plan?", "IMPLEMENT_PLAN_OPTION_ID"),
+            ("ExitPlanMode", "default"),
+            ("Review plan", "plan_approve"),
+        ];
+        for (title, approval_id) in fixtures {
+            let request = RequestPermissionRequest::new(
+                "session-1",
+                ToolCallUpdate::new(
+                    "tool-1",
+                    ToolCallUpdateFields::new()
+                        .title(title.to_owned())
+                        .raw_input(serde_json::json!({"plan": "Do the work"})),
+                ),
+                vec![
+                    PermissionOption::new(approval_id, "Approve", PermissionOptionKind::AllowOnce),
+                    PermissionOption::new(
+                        "plan_revise",
+                        "Revise",
+                        PermissionOptionKind::RejectOnce,
+                    ),
+                ],
+            );
+            assert!(is_plan_permission(&request), "fixture {title}");
+            let review = normalized_plan_review(
+                "plan-review-1".into(),
+                &serde_json::to_value(&request).unwrap(),
+            );
+            assert!(review.message.contains("Do the work"));
+            let mut content = BTreeMap::new();
+            content.insert(
+                PLAN_REVIEW_ACTION.into(),
+                ElicitationValue::String("implement".into()),
+            );
+            let response =
+                permission_plan_response(&request, ElicitationResponse::Accept { content });
+            assert_eq!(
+                serde_json::to_value(response).unwrap()["outcome"]["optionId"],
+                approval_id
+            );
+        }
     }
 
     #[tokio::test]
@@ -3232,7 +3530,6 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum ModeSurface {
-        Config,
         Legacy,
         Both,
     }
@@ -3279,7 +3576,7 @@ mod tests {
                 }),
                 "session/new" => {
                     let mut result = serde_json::json!({"sessionId": "scripted"});
-                    if matches!(surface, ModeSurface::Config | ModeSurface::Both) {
+                    if matches!(surface, ModeSurface::Both) {
                         result["configOptions"] = serde_json::json!([mode_option("default")]);
                     }
                     if matches!(surface, ModeSurface::Legacy | ModeSurface::Both) {
@@ -3363,15 +3660,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mode_config_option_uses_the_standard_config_request() {
-        let request = mode_change_request(ModeSurface::Config).await;
-
-        assert_eq!(request["method"], "session/set_config_option");
-        assert_eq!(request["params"]["configId"], "interaction_mode");
-        assert_eq!(request["params"]["value"], "plan");
-    }
-
-    #[tokio::test]
     async fn legacy_modes_use_session_set_mode() {
         let request = mode_change_request(ModeSurface::Legacy).await;
 
@@ -3380,10 +3668,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mode_config_option_takes_precedence_over_legacy_modes() {
+    async fn set_session_mode_uses_the_mode_protocol_even_when_config_is_available() {
         let request = mode_change_request(ModeSurface::Both).await;
 
-        assert_eq!(request["method"], "session/set_config_option");
+        assert_eq!(request["method"], "session/set_mode");
     }
 
     #[tokio::test]
