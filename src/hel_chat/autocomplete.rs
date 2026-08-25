@@ -219,7 +219,7 @@ impl ChatState {
         self.entries.push(ChatEntry::plain(
             self.latest_seq,
             ChatRole::System,
-            format!("Available commands:\n{commands}"),
+            format!("Available commands:\n!<command> — run a Bash command in this session [hel]\n{commands}"),
         ));
     }
 }

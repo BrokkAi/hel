@@ -226,6 +226,7 @@ impl ViewerSnapshot {
                 has_error: session.last_error.is_some(),
                 preview: Vec::new(),
                 queued_prompts: Vec::new(),
+                active_user_shells: Vec::new(),
                 conversation_available: false,
                 incompatible_resume_targets: config
                     .targets
@@ -304,6 +305,8 @@ pub struct ViewerSession {
     pub preview: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<ViewerQueuedPrompt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_user_shells: Vec<ViewerUserShell>,
     pub conversation_available: bool,
     /// Target ids this session cannot resume on. Only the ids travel: the
     /// controller's reasons name project paths and SSH hosts, which this
@@ -318,6 +321,14 @@ pub struct ViewerQueuedPrompt {
     pub id: String,
     pub text: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerUserShell {
+    pub id: String,
+    pub command: String,
+    pub started_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +402,14 @@ pub enum ControllerAction {
     Prompt {
         session_id: String,
         text: String,
+    },
+    RunShell {
+        session_id: String,
+        command: String,
+    },
+    CancelShell {
+        session_id: String,
+        shell_command_id: String,
     },
     Close {
         session_id: String,
@@ -830,10 +849,42 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
         ControllerAction::Prompt { session_id, text } => {
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
+            if text.starts_with('!') {
+                return Err(ApiError::bad_request(
+                    "leading ! is reserved for shell commands",
+                ));
+            }
             if text.trim().is_empty() || text.chars().count() > MAX_PROMPT_CHARS {
                 return Err(ApiError::bad_request(
                     "prompt must contain 1-65536 characters",
                 ));
+            }
+        }
+        ControllerAction::RunShell {
+            session_id,
+            command,
+        } => {
+            validate_public_id(session_id)?;
+            require_session_record(snapshot, session_id)?;
+            if command.trim().is_empty() || command.chars().count() > MAX_PROMPT_CHARS {
+                return Err(ApiError::bad_request(
+                    "shell command must contain 1-65536 characters",
+                ));
+            }
+        }
+        ControllerAction::CancelShell {
+            session_id,
+            shell_command_id,
+        } => {
+            validate_public_id(session_id)?;
+            validate_public_id(shell_command_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session
+                .active_user_shells
+                .iter()
+                .any(|shell| shell.id == *shell_command_id)
+            {
+                return Err(ApiError::bad_request("unknown active shell command"));
             }
         }
         ControllerAction::RemoveQueuedPrompt {
@@ -1146,14 +1197,14 @@ const VIEWER_HTML: &str = r##"<!doctype html>
 <style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel server</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
-<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
+<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent or use !command" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
 <script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue');let snapshot,currentSession,cursor=0,acknowledged=0,eventsStarted=false;
+const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells');let snapshot,currentSession,cursor=0,acknowledged=0,eventsStarted=false;
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}return response.status===204?null:response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
 function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
 async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventsStarted){eventsStarted=true;const source=new EventSource('/api/events');source.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
-function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>'}
+function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>';shells.innerHTML=(session.active_user_shells||[]).map(x=>`<div class="queue-item"><span>$ ${escapeHtml(x.command)}</span><button class="danger" data-shell-id="${escapeAttr(x.id)}">Cancel</button></div>`).join('')||'<p class="dim">No running shells.</p>'}
 function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
 async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;if(cursor>acknowledged){const through=cursor;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through})});acknowledged=through}}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
 async function openConversation(id){currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');const session=snapshot.sessions.find(x=>x.id===id);document.querySelector('#conversation-title').textContent=session?.title||'Conversation';document.querySelector('#conversation-state').textContent=session?.state||'';renderQueue(session||{});await loadConversation(false)}
@@ -1164,8 +1215,9 @@ newTarget.onchange=syncProjectDirectory;
 newForm.onsubmit=async e=>{e.preventDefault();const target=snapshot.targets.find(x=>x.id===newTarget.value);try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'new',title:document.querySelector('#new-title').value,profile_id:newProfile.value,bundle_id:newBundle.value,target_id:newTarget.value,project_directory:target?.requires_project_directory?newProjectDirectory.value:null})});document.querySelector('#new-title').value='';actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
 sessions.onclick=async e=>{const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='open')return openConversation(button.dataset.id);if(button.dataset.action==='close'&&!confirm('Save a recovery copy, stop, and destroy this session target? Queued prompts will be preserved.'))return;const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target;const session=snapshot.sessions.find(x=>x.id===button.dataset.id);body.queue='start';if(session?.queued_prompts?.length){const choice=prompt(`This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,'start');if(choice===null)return;if(!['start','discard'].includes(choice.toLowerCase()))return alert('Enter start or discard.');body.queue=choice.toLowerCase()}}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
 document.querySelector('#back').onclick=showDashboard;
-document.querySelector('#prompt-form').onsubmit=async e=>{e.preventDefault();const text=document.querySelector('#prompt-text');try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'prompt',session_id:currentSession,text:text.value})});text.value='';document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
+document.querySelector('#prompt-form').onsubmit=async e=>{e.preventDefault();const text=document.querySelector('#prompt-text'),value=text.value;const body=value.startsWith('!')?{action:'run-shell',session_id:currentSession,command:value.slice(1)}:{action:'prompt',session_id:currentSession,text:value};try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});text.value='';document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
 queue.onclick=async e=>{const button=e.target.closest('button[data-queue-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'remove-queued-prompt',session_id:currentSession,queue_id:button.dataset.queueId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
+shells.onclick=async e=>{const button=e.target.closest('button[data-shell-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'cancel-shell',session_id:currentSession,shell_command_id:button.dataset.shellId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
 function escapeHtml(value){const e=document.createElement('span');e.textContent=value;return e.innerHTML}function escapeAttr(value){return escapeHtml(value).replaceAll('"','&quot;')}
 if('serviceWorker'in navigator)navigator.serviceWorker.register('/service-worker.js');refresh().then(()=>{const match=location.hash.match(/^#conversation\/([A-Za-z0-9_-]+)$/);if(match)openConversation(match[1])});
 </script></body></html>"##;
@@ -1424,6 +1476,90 @@ mod tests {
         action.reply.send(ActionOutcome::Accepted).unwrap();
         let response = response.await.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn shell_action_is_typed_and_forwarded() {
+        let (app, mut actions, _) = app();
+        let cookie = login_cookie(&app).await;
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"run-shell","session_id":"session-1","command":"cargo test"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let action = actions.recv().await.unwrap();
+        assert_eq!(
+            action.action,
+            ControllerAction::RunShell {
+                session_id: "session-1".into(),
+                command: "cargo test".into(),
+            }
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[test]
+    fn shell_action_validation_reserves_bang_prompts_and_checks_cancellation_ids() {
+        let (config, state) = sample_config_state();
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        assert!(
+            validate_action(
+                &ControllerAction::Prompt {
+                    session_id: "session-1".into(),
+                    text: "!cargo test".into(),
+                },
+                &snapshot,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_action(
+                &ControllerAction::RunShell {
+                    session_id: "session-1".into(),
+                    command: "cargo test".into(),
+                },
+                &snapshot,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_action(
+                &ControllerAction::CancelShell {
+                    session_id: "session-1".into(),
+                    shell_command_id: "shell-1".into(),
+                },
+                &snapshot,
+            )
+            .is_err()
+        );
+
+        snapshot.sessions[0]
+            .active_user_shells
+            .push(ViewerUserShell {
+                id: "shell-1".into(),
+                command: "cargo test".into(),
+                started_at_ms: Some(10),
+            });
+        assert!(
+            validate_action(
+                &ControllerAction::CancelShell {
+                    session_id: "session-1".into(),
+                    shell_command_id: "shell-1".into(),
+                },
+                &snapshot,
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

@@ -19,9 +19,10 @@ use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedPrompt;
 
 use super::snapshot::{
-    RelayCommand, RelayDispatchState, RelayEvent, RelayObservation, RelaySnapshot,
-    apply_relay_event, clamp_observation, ensure_byte_budget, ensure_serialized_budget,
-    observation_changes_state, relay_event_digest, validate_relay_digest, validate_relay_event,
+    RelayCommand, RelayCommandOutcome, RelayDispatchState, RelayEvent, RelayObservation,
+    RelaySnapshot, apply_relay_event, clamp_observation, ensure_byte_budget,
+    ensure_serialized_budget, observation_changes_state, relay_event_digest, validate_relay_digest,
+    validate_relay_event,
 };
 use super::{
     DurableRelay, RELAY_ACTIVE_SEGMENT, RELAY_EVENT_BYTE_BUDGET, RELAY_EVENT_ENVELOPE_RESERVE,
@@ -874,6 +875,31 @@ impl DurableRelay {
                     .expect("in-flight close disappeared")
                     .state = RelayDispatchState::Pending;
                 restored_close = true;
+                continue;
+            }
+            if let RelayCommand::RunUserShell { command } =
+                self.snapshot.dispatches[&command_id].command.clone()
+            {
+                self.record_command_completed(
+                    &command_id,
+                    RelayCommandOutcome::UserShell {
+                        result: crate::hel_worker::UserShellResult {
+                            command,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                            exit_code: None,
+                            signal: None,
+                            duration_ms: 0,
+                            status: crate::hel_worker::UserShellStatus::Interrupted,
+                            error: Some(
+                                "worker restarted while the shell command was running; it was not replayed"
+                                    .to_owned(),
+                            ),
+                        },
+                    },
+                )?;
                 continue;
             }
             self.record_command_interrupted(

@@ -27,6 +27,7 @@ RUN apt-get update \
         less \
         libssl-dev \
         musl-tools \
+        openjdk-25-jdk-headless \
         openssh-client \
         patch \
         pkg-config \
@@ -53,14 +54,39 @@ RUN npm install --global --no-audit --no-fund \
 # Buildx sets TARGETARCH per platform; the dpkg fallback keeps a plain
 # single-arch `podman build` working.
 ARG TARGETARCH
+ARG CARGO_NEXTEST_VERSION=0.9.143
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && case "$ARCH" in \
-        amd64) MUSL=x86_64-unknown-linux-musl ;; \
-        arm64) MUSL=aarch64-unknown-linux-musl ;; \
+        amd64) \
+            MUSL=x86_64-unknown-linux-musl; \
+            NEXTEST_SHA256=6d891c18105ec2d33f6e441a4f92b7ccab47ba263e22055c8bb66884243f3389 \
+            ;; \
+        arm64) \
+            MUSL=aarch64-unknown-linux-musl; \
+            NEXTEST_SHA256=0560ce0ce017f368c54b5db86588370fc03b470985490fa81200e62a657dda05 \
+            ;; \
         *) echo "unsupported arch $ARCH" >&2; exit 1 ;; \
     esac \
     && rustup component add clippy rustfmt \
-    && rustup target add "$MUSL"
+    && rustup target add "$MUSL" \
+    && NEXTEST_ARCHIVE="cargo-nextest-${CARGO_NEXTEST_VERSION}-${MUSL}.tar.gz" \
+    && NEXTEST_URL="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${CARGO_NEXTEST_VERSION}/${NEXTEST_ARCHIVE}" \
+    && curl --fail --location --silent --show-error "$NEXTEST_URL" --output /tmp/cargo-nextest.tar.gz \
+    && echo "$NEXTEST_SHA256  /tmp/cargo-nextest.tar.gz" | sha256sum --check --strict \
+    && tar -xzf /tmp/cargo-nextest.tar.gz -C /usr/local/cargo/bin cargo-nextest \
+    && rm /tmp/cargo-nextest.tar.gz \
+    && install -d /usr/share/doc/cargo-nextest \
+    && curl --fail --location --silent --show-error \
+        "https://raw.githubusercontent.com/nextest-rs/nextest/cargo-nextest-${CARGO_NEXTEST_VERSION}/LICENSE-APACHE" \
+        --output /usr/share/doc/cargo-nextest/LICENSE-APACHE \
+    && curl --fail --location --silent --show-error \
+        "https://raw.githubusercontent.com/nextest-rs/nextest/cargo-nextest-${CARGO_NEXTEST_VERSION}/LICENSE-MIT" \
+        --output /usr/share/doc/cargo-nextest/LICENSE-MIT \
+    && echo "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2  /usr/share/doc/cargo-nextest/LICENSE-APACHE" | sha256sum --check --strict \
+    && echo "79e1e84378f5cbb0fd3f7314e80d0a02cbb8454247cecee3326c512ed7234797  /usr/share/doc/cargo-nextest/LICENSE-MIT" | sha256sum --check --strict \
+    && cargo nextest --version \
+    && java --version \
+    && javac --version
 
 RUN useradd --create-home --shell /bin/bash hel \
     && mkdir -p /workspace /var/lib/hel \

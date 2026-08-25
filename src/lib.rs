@@ -38,6 +38,7 @@ pub mod hel_subprocess;
 pub mod hel_targets;
 pub mod hel_terminal;
 pub mod hel_transcript;
+pub mod hel_user_shell;
 pub mod hel_worker;
 pub mod hel_worker_client;
 pub mod hel_worker_protocol;

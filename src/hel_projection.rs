@@ -236,6 +236,19 @@ fn project_observation(
                 });
                 mutation.queued_prompts = Some(queue);
             }
+            RelayCommand::RunUserShell { command } => upsert(
+                mutation,
+                TranscriptItem {
+                    stable_id: user_shell_item_id(command_id),
+                    position: event.ordinal,
+                    latest_content_event_ordinal: None,
+                    created_at_ms: *created_at_ms,
+                    last_changed_at_ms: *created_at_ms,
+                    body: TranscriptBody::System {
+                        text: user_shell_text(command, "queued", "", "", false, false),
+                    },
+                },
+            ),
             RelayCommand::RemoveQueuedPrompt { .. } | RelayCommand::ClearQueuedPrompts => {}
             RelayCommand::Close { .. } => {
                 close_streams(current, mutation, event.recorded_at_ms);
@@ -277,6 +290,18 @@ fn project_observation(
                     });
                 }
             }
+            if let Some(existing) = current
+                .transcript
+                .iter()
+                .find(|item| item.stable_id == user_shell_item_id(command_id))
+            {
+                let mut item = TranscriptItem::clone(existing);
+                if let TranscriptBody::System { text } = &mut item.body {
+                    *text = text.replacen("Shell · queued", "Shell · running", 1);
+                }
+                item.last_changed_at_ms = item.last_changed_at_ms.max(*started_at_ms);
+                upsert(mutation, item);
+            }
         }
         RelayObservation::CommandCompleted {
             command_id,
@@ -288,6 +313,20 @@ fn project_observation(
                 crate::hel_worker::RelayCommandOutcome::Prompt { .. } => {
                     close_streams(current, mutation, event.recorded_at_ms);
                     mutation.execution = Some(MaterializedExecutionState::Idle);
+                }
+                crate::hel_worker::RelayCommandOutcome::UserShell { result } => {
+                    if let Some(existing) = current
+                        .transcript
+                        .iter()
+                        .find(|item| item.stable_id == user_shell_item_id(command_id))
+                    {
+                        let mut item = TranscriptItem::clone(existing);
+                        item.body = TranscriptBody::System {
+                            text: user_shell_result_text(result),
+                        };
+                        item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                        upsert(mutation, item);
+                    }
                 }
                 crate::hel_worker::RelayCommandOutcome::Closed => {
                     close_streams(current, mutation, event.recorded_at_ms);
@@ -306,7 +345,8 @@ fn project_observation(
                 | crate::hel_worker::RelayCommandOutcome::CheckpointCompleted
                 | crate::hel_worker::RelayCommandOutcome::CheckpointReleased
                 | crate::hel_worker::RelayCommandOutcome::RecoveryFloorAdvanced
-                | crate::hel_worker::RelayCommandOutcome::NoticeRecorded => {}
+                | crate::hel_worker::RelayCommandOutcome::NoticeRecorded
+                | crate::hel_worker::RelayCommandOutcome::UserShellCancelled => {}
             }
             if queue != current.queued_prompts {
                 mutation.queued_prompts = Some(queue);
@@ -340,7 +380,26 @@ fn project_observation(
             {
                 mutation.execution = Some(MaterializedExecutionState::Idle);
             }
-            push_system(mutation, event, format!("command {command_id}: {message}"));
+            if matches!(command, RelayCommandKind::RunUserShell) {
+                if let Some(existing) = current
+                    .transcript
+                    .iter()
+                    .find(|item| item.stable_id == user_shell_item_id(command_id))
+                {
+                    let mut item = TranscriptItem::clone(existing);
+                    if let TranscriptBody::System { text } = &mut item.body {
+                        *text = format!(
+                            "{}\nerror: {message}",
+                            text.replacen("Shell · queued", "Shell · interrupted", 1)
+                                .replacen("Shell · running", "Shell · interrupted", 1)
+                        );
+                    }
+                    item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                    upsert(mutation, item);
+                }
+            } else {
+                push_system(mutation, event, format!("command {command_id}: {message}"));
+            }
         }
         RelayObservation::ConfigurationUpdated { key, value } => {
             let mut configuration = current.configuration.clone();
@@ -348,6 +407,34 @@ fn project_observation(
             mutation.configuration = Some(configuration);
         }
         RelayObservation::CheckpointReady { .. } => {}
+        RelayObservation::UserShellOutput {
+            command_id,
+            command,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        } => {
+            if let Some(existing) = current
+                .transcript
+                .iter()
+                .find(|item| item.stable_id == user_shell_item_id(command_id))
+            {
+                let mut item = TranscriptItem::clone(existing);
+                item.body = TranscriptBody::System {
+                    text: user_shell_text(
+                        command,
+                        "running",
+                        stdout,
+                        stderr,
+                        *stdout_truncated,
+                        *stderr_truncated,
+                    ),
+                };
+                item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                upsert(mutation, item);
+            }
+        }
         // Terminal output can land before or after the tool call that names the
         // terminal, so both orderings have to end in the same place: attached to
         // every referencing tool item, or parked in a standalone item that the
@@ -439,6 +526,67 @@ fn project_observation(
         }
     }
     Ok(())
+}
+
+fn user_shell_item_id(command_id: &str) -> String {
+    format!("shell:{command_id}")
+}
+
+fn user_shell_text(
+    command: &str,
+    status: &str,
+    stdout: &str,
+    stderr: &str,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> String {
+    let mut text = format!("Shell · {status}\n$ {command}");
+    if !stdout.is_empty() {
+        text.push_str("\n\nstdout:\n");
+        text.push_str(stdout);
+        if stdout_truncated {
+            text.push_str("\n[output continues; final tail will be shown on completion]");
+        }
+    }
+    if !stderr.is_empty() {
+        text.push_str("\n\nstderr:\n");
+        text.push_str(stderr);
+        if stderr_truncated {
+            text.push_str("\n[output continues; final tail will be shown on completion]");
+        }
+    }
+    text
+}
+
+fn user_shell_result_text(result: &crate::hel_worker::UserShellResult) -> String {
+    let status = match result.status {
+        crate::hel_worker::UserShellStatus::Exited => match result.exit_code {
+            Some(0) => "done".to_owned(),
+            Some(code) => format!("failed (exit {code})"),
+            None => "finished".to_owned(),
+        },
+        crate::hel_worker::UserShellStatus::Signaled => format!(
+            "signaled ({})",
+            result.signal.as_deref().unwrap_or("unknown signal")
+        ),
+        crate::hel_worker::UserShellStatus::TimedOut => "timed out".to_owned(),
+        crate::hel_worker::UserShellStatus::Cancelled => "cancelled".to_owned(),
+        crate::hel_worker::UserShellStatus::Interrupted => "interrupted".to_owned(),
+        crate::hel_worker::UserShellStatus::Failed => "failed".to_owned(),
+    };
+    let mut text = user_shell_text(
+        &result.command,
+        &format!("{status} · {} ms", result.duration_ms),
+        &result.stdout,
+        &result.stderr,
+        result.stdout_truncated,
+        result.stderr_truncated,
+    );
+    if let Some(error) = &result.error {
+        text.push_str("\n\nerror: ");
+        text.push_str(error);
+    }
+    text
 }
 
 fn project_session_update(
@@ -1138,7 +1286,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::hel_worker::{RelayCommandOutcome, RelayObservation, relay_event_digest};
+    use crate::hel_worker::{
+        RelayCommand, RelayCommandOutcome, RelayObservation, UserShellResult, UserShellStatus,
+        relay_event_digest,
+    };
     use serde_json::json;
 
     fn event(previous: &MaterializedSession, observation: RelayObservation) -> RelayEvent {
@@ -1163,6 +1314,73 @@ mod tests {
     fn apply_observation(session: &mut MaterializedSession, observation: RelayObservation) {
         let next = event(session, observation);
         apply(session, next);
+    }
+
+    #[test]
+    fn shell_output_updates_one_durable_transcript_item() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "shell-1".into(),
+                command: RelayCommand::RunUserShell {
+                    command: "cargo test".into(),
+                },
+                created_at_ms: 100,
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandStarted {
+                command_id: "shell-1".into(),
+                started_at_ms: 200,
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::UserShellOutput {
+                command_id: "shell-1".into(),
+                command: "cargo test".into(),
+                stdout: "running tests".into(),
+                stderr: String::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            },
+        );
+        assert_eq!(session.transcript.len(), 1);
+        assert!(matches!(
+            &session.transcript[0].body,
+            TranscriptBody::System { text }
+                if text.contains("Shell · running") && text.contains("running tests")
+        ));
+
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandCompleted {
+                command_id: "shell-1".into(),
+                outcome: RelayCommandOutcome::UserShell {
+                    result: UserShellResult {
+                        command: "cargo test".into(),
+                        stdout: "all green".into(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        exit_code: Some(0),
+                        signal: None,
+                        duration_ms: 321,
+                        status: UserShellStatus::Exited,
+                        error: None,
+                    },
+                },
+            },
+        );
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "shell:shell-1");
+        assert!(matches!(
+            &session.transcript[0].body,
+            TranscriptBody::System { text }
+                if text.contains("Shell · done · 321 ms") && text.contains("all green")
+        ));
     }
 
     #[test]

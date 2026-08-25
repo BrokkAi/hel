@@ -1802,6 +1802,7 @@ mod tests {
                     config: BTreeMap::new(),
                     active_prompt: None,
                     queued_prompts: Vec::new(),
+                    active_user_shells: Vec::new(),
                     checkpoint_barrier: None,
                     checkpoint_ready: None,
                     last_acp_activity_at_ms: None,

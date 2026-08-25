@@ -117,8 +117,9 @@ authentication):
 podman pull ghcr.io/brokkai/hel/agent-dev:latest
 ```
 
-It includes Rust, Node, Git, GitHub CLI, the Codex and Claude ACP bridges, and
-pinned DeepSeek Harness plus `dsh-acp-server` packages.
+It includes Rust, cargo-nextest, Node, OpenJDK 25, Git, GitHub CLI, the Codex
+and Claude ACP bridges, and pinned DeepSeek Harness plus `dsh-acp-server`
+packages.
 See [docs/src/content/docs/custom-images.md](docs/src/content/docs/custom-images.md)
 to build your own.
 
@@ -136,6 +137,13 @@ to build your own.
 4. Detach whenever you like (`Ctrl+Q`). The session keeps running and your
    queued prompts keep executing. Reattach from the dashboard, or run
    `hel server` and drive it from your phone.
+
+In an attached TUI or the phone viewer, start a message with `!` to run the
+rest as `bash -lc` inside that session's target. Shell commands run in the
+session workspace without blocking an active agent turn. Their bounded live
+output is saved in the transcript and included once as hidden context on the
+next prompt submitted after the command finishes. Press Escape in the TUI, or
+use the shell's Cancel button in the viewer, to stop it.
 
 Configuration lives at `~/.config/hel/config.toml` (the platform-equivalent
 directory elsewhere). The first-run dialog writes a working single-target
