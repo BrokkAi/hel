@@ -465,12 +465,13 @@ fn materialized_chat_entry_with_diffstats(
 }
 
 pub fn materialized_content_text(content: &[serde_json::Value]) -> String {
-    content
+    let text = content
         .iter()
         .map(materialized_value_text)
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    crate::hel_worker::strip_hidden_prompt_context(&text).to_owned()
 }
 
 pub fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {

@@ -26,7 +26,9 @@ use hel::hel_session_manager::{
     RelaySessionTarget, SessionManagerControl, SessionManagerUpdate, SessionManagerUpdates,
     ViewError, spawn_session_manager,
 };
-use hel::hel_state::{HelState, MaterializedSession, SessionResourceAllocation, SessionState};
+use hel::hel_state::{
+    HelState, MaterializedSession, SessionResourceAllocation, SessionState, normalize_session_title,
+};
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
     DeploymentCapacityTarget, DeploymentCapacityUsage, SessionResourceProbe, SessionResourceUsage,
@@ -1090,8 +1092,13 @@ pub(crate) fn apply_worker_record_update(
     let Some(session) = controller.state.sessions.get(&update.session_id) else {
         return Ok(false);
     };
-    let changed_title = (session.acp_session_title != snapshot.materialized.session_title)
-        .then(|| snapshot.materialized.session_title.clone());
+    let projected_title = snapshot
+        .materialized
+        .session_title
+        .as_deref()
+        .and_then(normalize_session_title);
+    let changed_title =
+        (session.acp_session_title != projected_title).then(|| projected_title.clone());
     let mut changed = false;
     if let Some(title) = changed_title {
         if dashboard_io.is_none() {
@@ -1107,7 +1114,7 @@ pub(crate) fn apply_worker_record_update(
             spawn_worker_record_persistence(
                 update.session_id.clone(),
                 WorkerRecordPersistence::AcpTitle {
-                    title: snapshot.materialized.session_title.clone(),
+                    title: projected_title,
                 },
                 dashboard_io_tx.clone(),
                 tracker.clone(),

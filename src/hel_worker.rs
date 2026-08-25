@@ -119,6 +119,48 @@ const RELAY_SNAPSHOT_LAG_BYTE_LIMIT: usize = 1024 * 1024;
 const RELAY_HOT_EVENT_CAPACITY: usize = 32;
 const NATIVE_SESSION_IDENTITY_FILE: &str = "native-session.json";
 
+/// Remove controller-only context that an ACP harness copied into a user-facing
+/// prompt or title. Hidden context is prepended as reserved XML-like blocks;
+/// an unterminated reserved block is treated as a truncated hidden value, not
+/// as text safe to display.
+pub fn strip_hidden_prompt_context(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start();
+        let Some(after_open) = text.strip_prefix('<') else {
+            return text;
+        };
+        let Some(open_end) = after_open.find('>') else {
+            return if reserved_hidden_context_prefix(after_open) {
+                ""
+            } else {
+                text
+            };
+        };
+        let tag = &after_open[..open_end];
+        if !reserved_hidden_context_tag(tag) {
+            return text;
+        }
+        let close = format!("</{tag}>");
+        let after_open = &after_open[open_end + 1..];
+        let Some(close_start) = after_open.rfind(&close) else {
+            return "";
+        };
+        text = &after_open[close_start + close.len()..];
+    }
+}
+
+fn reserved_hidden_context_prefix(text: &str) -> bool {
+    text.starts_with("hel-") || text.starts_with("user_shell_command")
+}
+
+fn reserved_hidden_context_tag(tag: &str) -> bool {
+    (tag.starts_with("hel-")
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+        || tag == "user_shell_command"
+}
+
 /// Durable, session-side ACP store-and-forward relay.
 ///
 /// `RelaySnapshot` is the canonical operational state. Journal spans retain
@@ -2048,6 +2090,25 @@ mod tests {
 
     use super::*;
     use test_support::*;
+
+    #[test]
+    fn hidden_prompt_context_is_removed_from_harness_visible_text() {
+        let text = concat!(
+            "<hel-project-memory>private memory</hel-project-memory>\n\n",
+            "<user_shell_command>private output</user_shell_command>\n",
+            "ship the visible change"
+        );
+
+        assert_eq!(strip_hidden_prompt_context(text), "ship the visible change");
+        assert_eq!(
+            strip_hidden_prompt_context("<hel-project-memory>truncated"),
+            ""
+        );
+        assert_eq!(
+            strip_hidden_prompt_context("<user-request>keep me</user-request>"),
+            "<user-request>keep me</user-request>"
+        );
+    }
 
     #[test]
     fn acp_activity_clock_is_shared_with_operational_status_but_not_persisted() {

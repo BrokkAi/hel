@@ -932,7 +932,10 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             state: parse_session_state(&row.get::<_, String>(6)?),
             target: None,
             native_session_id: row.get(7)?,
-            acp_session_title: row.get(8)?,
+            acp_session_title: row
+                .get::<_, Option<String>>(8)?
+                .as_deref()
+                .and_then(crate::hel_state::normalize_session_title),
             session_title_override: row.get(9)?,
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
@@ -1183,6 +1186,7 @@ fn set_session_acp_title_to(path: &Path, session_id: &str, title: Option<&str>) 
     if title.is_some_and(|title| title.trim().is_empty()) {
         bail!("ACP session title is empty");
     }
+    let title = title.and_then(crate::hel_state::normalize_session_title);
     let connection = open(path)?;
     let changed = connection.execute(
         "UPDATE sessions SET acp_session_title = ?2 WHERE session_id = ?1",
@@ -3183,6 +3187,22 @@ mod tests {
                 .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
                 .optional()
                 .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn loading_state_does_not_restore_a_hidden_context_session_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let mut state = HelState::default();
+        let mut record = session("session-1", "project-1");
+        record.acp_session_title = Some("<hel-project-memory>private and truncated".into());
+        state.sessions.insert(record.id.clone(), record);
+        save_state_to(&database, &state).unwrap();
+
+        assert_eq!(
+            load_state_from(&database).unwrap().sessions["session-1"].acp_session_title,
             None
         );
     }
