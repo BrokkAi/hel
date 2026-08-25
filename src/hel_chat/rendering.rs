@@ -1,6 +1,6 @@
 //! Markdown and width-aware transcript rendering.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use textwrap::WordSplitter;
@@ -34,6 +34,7 @@ struct ListState {
 
 #[derive(Debug, Default)]
 struct TableState {
+    alignments: Vec<Alignment>,
     rows: Vec<Vec<String>>,
     row: Vec<String>,
     cell: String,
@@ -138,31 +139,72 @@ impl MarkdownWriter {
         let Some(header) = table.rows.first().cloned() else {
             return;
         };
-        let columns = header.len().max(1);
-        let grid_width = table
-            .rows
-            .iter()
-            .map(|row| {
-                row.iter().map(|cell| display_width(cell)).sum::<usize>()
-                    + columns.saturating_sub(1) * 3
-                    + 4
+        let columns = table.alignments.len().max(header.len()).max(1);
+        for row in &mut table.rows {
+            row.truncate(columns);
+            row.resize(columns, String::new());
+        }
+        table.alignments.resize(columns, Alignment::None);
+
+        const CELL_PADDING: usize = 1;
+        const COLUMN_GAP: usize = 2;
+        const MIN_COLUMN_WIDTH: usize = 3;
+        let reserved = columns * CELL_PADDING * 2 + columns.saturating_sub(1) * COLUMN_GAP;
+        let available = self.width.saturating_sub(reserved);
+        let mut column_widths = (0..columns)
+            .map(|column| {
+                table
+                    .rows
+                    .iter()
+                    .map(|row| display_width(&row[column]))
+                    .max()
+                    .unwrap_or(0)
+                    .max(MIN_COLUMN_WIDTH)
             })
-            .max()
-            .unwrap_or(0);
-        if grid_width <= self.width {
-            for (index, row) in table.rows.into_iter().enumerate() {
-                let text = format!("│ {} │", row.join(" │ "));
-                self.lines.push(LogicalLine {
-                    line: if index == 0 {
-                        Line::from(Span::styled(
-                            text,
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ))
-                    } else {
-                        Line::from(text)
-                    },
-                    continuation_indent: 2,
-                });
+            .collect::<Vec<_>>();
+
+        while column_widths.iter().sum::<usize>() > available {
+            let Some((column, _)) = column_widths
+                .iter()
+                .enumerate()
+                .filter(|(_, width)| **width > MIN_COLUMN_WIDTH)
+                .max_by_key(|(_, width)| **width)
+            else {
+                break;
+            };
+            column_widths[column] -= 1;
+        }
+        let grid_fits = column_widths.iter().sum::<usize>() <= available;
+        let fragments_tokens = table.rows.iter().skip(1).any(|row| {
+            row.iter().zip(&column_widths).any(|(cell, width)| {
+                *width < 12
+                    && cell
+                        .split_whitespace()
+                        .any(|token| display_width(token) > *width)
+            })
+        });
+        if grid_fits && !fragments_tokens {
+            let rows = std::mem::take(&mut table.rows);
+            self.render_table_row(
+                &rows[0],
+                &column_widths,
+                &table.alignments,
+                Style::default().add_modifier(Modifier::BOLD),
+            );
+            let separator = column_widths
+                .iter()
+                .map(|width| "─".repeat(width + CELL_PADDING * 2))
+                .collect::<Vec<_>>()
+                .join(&" ".repeat(COLUMN_GAP));
+            self.lines.push(LogicalLine {
+                line: Line::from(Span::styled(
+                    separator,
+                    Style::default().fg(Color::DarkGray),
+                )),
+                continuation_indent: 0,
+            });
+            for row in rows.iter().skip(1) {
+                self.render_table_row(row, &column_widths, &table.alignments, Style::default());
             }
         } else {
             for (row_index, row) in table.rows.into_iter().skip(1).enumerate() {
@@ -193,6 +235,55 @@ impl MarkdownWriter {
                     });
                 }
             }
+        }
+    }
+
+    fn render_table_row(
+        &mut self,
+        row: &[String],
+        column_widths: &[usize],
+        alignments: &[Alignment],
+        style: Style,
+    ) {
+        const CELL_PADDING: usize = 1;
+        const COLUMN_GAP: usize = 2;
+        let cells = row
+            .iter()
+            .zip(column_widths)
+            .map(|(cell, width)| {
+                wrap_styled_line(Line::from(cell.clone()), *width, 0)
+                    .into_iter()
+                    .map(|line| {
+                        line.spans
+                            .into_iter()
+                            .map(|span| span.content.into_owned())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        for line_index in 0..height {
+            let mut spans = Vec::new();
+            for (column, width) in column_widths.iter().copied().enumerate() {
+                if column > 0 {
+                    spans.push(Span::raw(" ".repeat(COLUMN_GAP)));
+                }
+                let value = cells[column].get(line_index).map_or("", String::as_str);
+                let remaining = width.saturating_sub(display_width(value));
+                let (left, right) = match alignments[column] {
+                    Alignment::Left | Alignment::None => (0, remaining),
+                    Alignment::Center => (remaining / 2, remaining - remaining / 2),
+                    Alignment::Right => (remaining, 0),
+                };
+                spans.push(Span::raw(" ".repeat(CELL_PADDING + left)));
+                spans.push(Span::styled(value.to_owned(), style));
+                spans.push(Span::raw(" ".repeat(right + CELL_PADDING)));
+            }
+            self.lines.push(LogicalLine {
+                line: Line::from(spans),
+                continuation_indent: 0,
+            });
         }
     }
 }
@@ -357,7 +448,12 @@ pub(super) fn markdown_lines(
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::UNDERLINED);
                 }
-                Tag::Table(_) => writer.table = Some(TableState::default()),
+                Tag::Table(alignments) => {
+                    writer.table = Some(TableState {
+                        alignments,
+                        ..TableState::default()
+                    });
+                }
                 Tag::TableHead | Tag::TableRow | Tag::TableCell | Tag::Image { .. } => {}
                 _ => {}
             },
@@ -837,6 +933,28 @@ mod tests {
         assert_eq!(
             text(&rendered),
             ["Name: alpha", "Description: a long explanation"]
+        );
+    }
+
+    #[test]
+    fn markdown_table_aligns_columns_and_draws_a_header_rule() {
+        let lines = markdown_lines(
+            "| Name | Score |\n| :--- | ---: |\n| alpha | 7 |",
+            Style::default(),
+            Style::default(),
+            40,
+        );
+        let rendered = lines.into_iter().map(|line| line.line).collect::<Vec<_>>();
+
+        assert_eq!(
+            text(&rendered),
+            [" Name     Score ", "───────  ───────", " alpha        7 ",]
+        );
+        assert!(
+            rendered[0]
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
         );
     }
 

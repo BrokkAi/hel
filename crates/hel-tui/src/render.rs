@@ -195,7 +195,7 @@ fn render_adaptive_dashboard(
                 active
                     .get(index + 1)
                     .and_then(|next| dashboard.state.sessions.get(next))
-                    .is_some_and(|next| dashboard.project_source(next).key == source.key),
+                    .is_some_and(|next| dashboard.project_source(next).key != source.key),
             );
             previous_project = Some(source.key);
             heading
@@ -487,7 +487,7 @@ fn render_sessions(
             active
                 .get(index + 1)
                 .and_then(|next| dashboard.state.sessions.get(next))
-                .is_some_and(|next| dashboard.project_source(next).key == source.key),
+                .is_some_and(|next| dashboard.project_source(next).key != source.key),
         );
         row_meta.push((
             source.key,
@@ -581,10 +581,13 @@ fn collapsed_session_line(
         .unwrap_or("No messages yet")
         .trim();
     let lead = format!("{prefix}{clock} ");
-    Line::raw(format!(
-        "{lead}{}",
-        crate::widgets::truncate_text(fragment, width.saturating_sub(lead.chars().count()))
-    ))
+    Line::styled(
+        format!(
+            "{lead}{}",
+            crate::widgets::truncate_text(fragment, width.saturating_sub(lead.chars().count()))
+        ),
+        Style::default().fg(session_band_color(detail)),
+    )
 }
 
 fn session_top_line(
@@ -1276,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_in_one_project_have_a_blank_row_and_only_the_caret_marks_selection() {
+    fn sessions_in_one_project_are_contiguous_and_only_the_caret_marks_selection() {
         let mut first = running_session();
         first.id = "session-first".into();
         first.project_directory = Some("/projects/shared".into());
@@ -1307,10 +1310,41 @@ mod tests {
             "selection must not paint a background"
         );
         assert_eq!(buffer[(first_area.x, first_area.y)].symbol(), "›");
+        assert_eq!(
+            dashboard.active_row_areas[1].1.y,
+            first_area.bottom(),
+            "sessions in one project have no blank row between them"
+        );
+    }
+
+    #[test]
+    fn project_groups_have_one_blank_row_between_them() {
+        let mut first = running_session();
+        first.id = "session-alpha".into();
+        first.project_directory = Some("/projects/alpha".into());
+        let mut second = running_session();
+        second.id = "session-beta".into();
+        second.project_directory = Some("/projects/beta".into());
+        second.created_at = "2026-08-10T00:00:00Z".into();
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+
+        let first_bottom = dashboard.active_row_areas[0].1.bottom();
+        let second_heading_y = dashboard.project_heading_areas[1].1.y;
+        assert_eq!(second_heading_y, first_bottom + 1);
+        let buffer = terminal.backend().buffer();
         assert!(
-            (first_area.x..first_area.right())
-                .all(|x| buffer[(x, first_area.bottom())].symbol().trim().is_empty()),
-            "the row after the first session is empty"
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .all(|x| buffer[(x, first_bottom)].symbol().trim().is_empty())
         );
     }
 
@@ -1388,6 +1422,9 @@ mod tests {
             ..SessionDetail::default()
         };
         assert_eq!(session_band_color(Some(&unread_idle)), Color::LightBlue);
+
+        let collapsed = collapsed_session_line("› ", &running_session(), Some(&unread_idle), 1, 80);
+        assert_eq!(collapsed.style.fg, Some(Color::LightBlue));
     }
 
     #[test]

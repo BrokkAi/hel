@@ -1183,28 +1183,6 @@ pub(super) fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<Strin
         .collect()
 }
 
-/// Width used when rendering a one-line agent tail through the markdown
-/// pipeline. Wide enough that no terminal line wraps before truncation.
-const HEADER_TAIL_RENDER_WIDTH: usize = 4096;
-
-/// Style a single line of agent text the way the conversation view does.
-pub(super) fn agent_text_spans(text: &str) -> Vec<Span<'static>> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let visual = entry_visual(&ChatEntry::plain(0, ChatRole::Agent, text));
-    markdown_lines(
-        text,
-        visual.body_style,
-        visual.header_style,
-        HEADER_TAIL_RENDER_WIDTH,
-    )
-    .into_iter()
-    .next()
-    .map(|logical| logical.line.spans)
-    .unwrap_or_default()
-}
-
 pub(super) fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
     let viewport_height = usize::from(area.height.saturating_sub(2));
     chat.last_viewport_height = viewport_height;

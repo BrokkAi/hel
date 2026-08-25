@@ -33,8 +33,8 @@ use super::remote::{
 };
 use super::rendering::{display_width, truncate_line_to_width, truncate_to_width};
 use super::transcript::{
-    ToolDiffstatRequest, TranscriptAnchor, agent_text_spans, materialized_chunks_text,
-    materialized_prefix_entries, render_transcript,
+    ToolDiffstatRequest, TranscriptAnchor, materialized_chunks_text, materialized_prefix_entries,
+    render_transcript,
 };
 use super::{
     ChatAction, ChatEventOutcome, ChatFocus, ChatState, Notices, OtherSessionActivity,
@@ -457,10 +457,7 @@ fn conversation_line(row: &ConversationRow, now_epoch_seconds: u64, width: usize
     } else {
         format!("{caret}{clock} ")
     };
-    let mut spans = vec![Span::styled(prefix, band)];
-    // The tail is agent text, so style it the way the conversation does.
-    spans.extend(agent_text_spans(last_line));
-    truncate_line_to_width(Line::from(spans), width)
+    truncate_line_to_width(Line::styled(format!("{prefix}{last_line}"), band), width)
 }
 
 fn other_session_activity(
@@ -1407,6 +1404,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(text, "› 01:02:05 most recent answer");
         assert!(!text.contains("project"));
+        assert_eq!(line.style.fg, Some(Color::Yellow));
     }
     use crate::hel_chat::test_support::{
         agent_message_item, agent_transcript_item, ctrl, drawn_transcript, key, mouse_at_row,
@@ -1510,7 +1508,7 @@ mod tests {
         conversations_pane(chat, now_epoch_seconds, 80, 10)
             .lines
             .iter()
-            .map(|line| line.spans.first().and_then(|span| span.style.fg))
+            .map(|line| line.style.fg)
             .collect()
     }
 
@@ -2232,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn session_header_styles_the_last_line_like_agent_text_not_the_band() {
+    fn session_header_applies_the_turn_band_to_the_whole_collapsed_line() {
         let chat = header_chat(
             "current",
             0,
@@ -2241,10 +2239,8 @@ mod tests {
 
         let lines = conversations_pane(&chat, 1_125, 80, 10).lines;
         let tail = &lines[1];
-        assert_eq!(tail.spans[0].content.as_ref(), "  00:02:05 ");
-        assert_eq!(tail.spans[0].style.fg, Some(Color::Yellow));
-        assert_eq!(tail.spans[1].content.as_ref(), "still going");
-        assert_eq!(tail.spans[1].style.fg, None);
+        assert_eq!(tail.spans[0].content.as_ref(), "  00:02:05 still going");
+        assert_eq!(tail.style.fg, Some(Color::Yellow));
     }
 
     #[test]
