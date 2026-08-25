@@ -30,8 +30,8 @@ use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
 use super::backend::backend_locator;
 use super::readiness::{connect_started_worker_with_timeout, wait_for_native_session};
 use super::worker_binary::{
-    replace_installed_worker_binary, start_worker, stop_worker, worker_binary_for,
-    worker_probe_diagnosis,
+    replace_installed_worker_binary, start_worker, stop_worker_after_target_recovery,
+    worker_binary_for, worker_probe_diagnosis,
 };
 use super::{
     Controller, execute_checked, now, persist_session_record_transition_or_restore,
@@ -935,7 +935,7 @@ impl Controller {
         worker_root: &str,
         reconnect: &hel_targets::CommandSpec,
     ) -> Result<StandaloneSession> {
-        stop_worker(executor, backend, worker_root)
+        stop_worker_after_target_recovery(executor, backend, session_id, worker_root)
             .context("stop wedged Hel worker before retrying checkpoint")?;
         // Copy through hel.next and rename. scp/cp onto a still-mapped hel
         // fails with ETXTBSY ("dest open ... Failure") even after SIGKILL,

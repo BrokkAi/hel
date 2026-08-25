@@ -12,6 +12,7 @@ use hel::hel_quota::ProfileQuota;
 use hel::hel_state::{
     HelState, MaterializedExecutionState, MaterializedSession, MaterializedSessionSummary,
     SessionRecord, SessionResourceAllocation, SessionState, TranscriptBody, TranscriptItem,
+    normalize_session_title,
 };
 use hel::hel_targets::{
     DeploymentCapacityTarget, DeploymentCapacityUsage, ProvisionStage, SessionResourceUsage,
@@ -186,13 +187,19 @@ impl PreparedMaterializedSessionSummary {
         Self {
             session_id: summary.session_id,
             applied_event_ordinal: summary.applied_event_ordinal,
-            session_title: summary.session_title,
+            session_title: summary
+                .session_title
+                .as_deref()
+                .and_then(normalize_session_title),
             current_turn_started_at,
             last_activity_at_ms: summary
                 .last_activity_at_ms
                 .and_then(|value| u64::try_from(value).ok()),
             last_agent_message: summary.last_agent_message.map(Arc::from),
-            last_user_message: summary.last_user_message.map(Arc::from),
+            last_user_message: summary.last_user_message.and_then(|message| {
+                let visible = hel::hel_worker::strip_hidden_prompt_context(&message);
+                (!visible.trim().is_empty()).then(|| Arc::from(visible.to_owned()))
+            }),
             agent_message_latest_content_ordinals: summary.agent_message_latest_content_ordinals,
             unread_agent_messages,
         }
@@ -270,7 +277,10 @@ impl PreparedMaterializedSessionDetail {
             .collect();
         let session_id = session.session_id.clone();
         let applied_event_ordinal = session.applied_event_ordinal;
-        let session_title = session.session_title.clone();
+        let session_title = session
+            .session_title
+            .as_deref()
+            .and_then(normalize_session_title);
         let last_activity_at_ms = session
             .last_activity_at_ms()
             .and_then(|value| u64::try_from(value).ok());
@@ -982,6 +992,44 @@ mod tests {
                 .acp_session_title
                 .as_deref(),
             Some("Persisted title")
+        );
+    }
+
+    #[test]
+    fn stored_summary_elides_hidden_context_from_the_name_and_user_preview() {
+        let mut session = stopped_session();
+        session.acp_session_title = None;
+        let mut dashboard = dashboard_with_session(session);
+        let summary = MaterializedSessionSummary {
+            session_id: "session-1".into(),
+            applied_event_ordinal: 2,
+            last_activity_at_ms: Some(2_000),
+            execution: MaterializedExecutionState::Idle,
+            session_title: Some("<hel-project-memory>private and truncated".into()),
+            last_agent_message: None,
+            last_user_message: Some(
+                concat!(
+                    "<hel-project-memory>private</hel-project-memory>\n",
+                    "Visible question"
+                )
+                .into(),
+            ),
+            agent_message_latest_content_ordinals: vec![],
+        };
+
+        assert!(dashboard.apply_prepared_materialized_session_summary(
+            PreparedMaterializedSessionSummary::from_materialized(summary, 0),
+        ));
+
+        assert_eq!(
+            dashboard.session_details["session-1"]
+                .last_user_message
+                .as_deref(),
+            Some("Visible question")
+        );
+        assert_eq!(
+            dashboard.state.sessions["session-1"].acp_session_title,
+            None
         );
     }
 

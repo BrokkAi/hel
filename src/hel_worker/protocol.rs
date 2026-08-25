@@ -429,7 +429,7 @@ mod tests {
         assert!(RelayVersionRange::CURRENT.contains(3));
         assert!(RelayVersionRange::CURRENT.contains(4));
         assert!(!RelayVersionRange::CURRENT.contains(0));
-        assert!(!RelayVersionRange::CURRENT.contains(5));
+        assert!(!RelayVersionRange::CURRENT.contains(RELAY_PROTOCOL_VERSION + 1));
         assert!(RelayRequest::Status.supported_at(1));
         assert!(
             !RelayRequest::RespondElicitation {

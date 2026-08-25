@@ -44,7 +44,7 @@ pub(super) struct TranscriptRenderCache {
 }
 
 /// Whether an entry renders on its own, renders nothing, or heads a collapsed
-/// run of completed tools.
+/// streak of completed tools and thoughts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryCollapse {
     None,
@@ -52,7 +52,7 @@ enum EntryCollapse {
     Hidden,
     /// Detail the decluttered feed leaves out.
     Omitted,
-    /// Head of a collapsed run spanning `self..end` (end exclusive).
+    /// Head of a collapsed streak spanning `self..end` (end exclusive).
     Summary {
         end: usize,
         fingerprint: u64,
@@ -465,12 +465,13 @@ fn materialized_chat_entry_with_diffstats(
 }
 
 pub fn materialized_content_text(content: &[serde_json::Value]) -> String {
-    content
+    let text = content
         .iter()
         .map(materialized_value_text)
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    crate::hel_worker::strip_hidden_prompt_context(&text).to_owned()
 }
 
 pub fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
@@ -604,24 +605,31 @@ fn is_completed_tool(entry: &ChatEntry) -> bool {
     entry.role == ChatRole::Tool && entry.tool_status == Some(ToolStatus::Completed)
 }
 
-/// The newest completed tool keeps its full detail until the next request
-/// starts. Scanning backwards, the first `User` entry ends protection and the
-/// first completed tool claims it; every other entry is transparent.
+/// The newest completed tool keeps its full detail until a later user request,
+/// thought, or tool appears. Agent, plan, and system entries stay transparent
+/// so the existing protection behavior across those entries does not change.
 fn protected_tool_index(entries: &[ChatEntry]) -> Option<usize> {
     entries
         .iter()
-        .rposition(|entry| entry.role == ChatRole::User || is_completed_tool(entry))
+        .rposition(|entry| {
+            matches!(
+                entry.role,
+                ChatRole::User | ChatRole::Thought | ChatRole::Tool
+            )
+        })
         .filter(|&index| is_completed_tool(&entries[index]))
 }
 
 /// What every entry renders as, which is the one place the decluttered feed is
-/// decided. In rich mode a maximal run of two or more consecutive completed
-/// tools renders as one summary cell; every other entry, including a pending,
-/// running, or failed tool, breaks the run. The protected newest result breaks
-/// runs too and never joins one. A `raw_only` entry renders nothing at all and
-/// is transparent to a run rather than breaking it, since nothing of it is on
-/// screen to separate the tools around it. Raw mode neither collapses nor
-/// omits, so the full commands stay inspectable.
+/// decided. In rich mode a maximal streak of completed tools and thoughts
+/// renders its newest thought followed by its tools. Earlier thoughts are
+/// hidden, and two or more tools use the existing first-word summary. Every
+/// other entry, including a pending, running, or failed tool, breaks the
+/// streak. The protected newest result breaks streaks too and never joins one.
+/// A `raw_only` entry renders nothing at all and is transparent to a streak
+/// rather than breaking it, since nothing of it is on screen to separate the
+/// surrounding entries. Raw mode neither collapses nor omits, so the complete
+/// source stays inspectable.
 fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Vec<EntryCollapse> {
     let mut states = vec![EntryCollapse::None; entries.len()];
     if mode != TranscriptRenderMode::Rich {
@@ -633,21 +641,22 @@ fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> V
         }
     }
     let protected = protected_tool_index(entries);
-    let collapsible = |index: usize| is_completed_tool(&entries[index]) && Some(index) != protected;
+    let streak_member = |index: usize| {
+        entries[index].role == ChatRole::Thought
+            || (is_completed_tool(&entries[index]) && Some(index) != protected)
+    };
     let mut start = 0;
     while start < entries.len() {
-        if !collapsible(start) {
+        if !streak_member(start) {
             start += 1;
             continue;
         }
-        // `end` stops at the last collapsible member, so an omitted entry the
-        // run reached across is only inside the run when a tool follows it.
+        // `end` stops at the last visible member, so an omitted entry the
+        // streak reached across is only inside it when another member follows.
         let mut end = start + 1;
-        let mut members = 1;
         let mut cursor = start + 1;
         while cursor < entries.len() {
-            if collapsible(cursor) {
-                members += 1;
+            if streak_member(cursor) {
                 cursor += 1;
                 end = cursor;
             } else if entries[cursor].raw_only {
@@ -656,11 +665,25 @@ fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> V
                 break;
             }
         }
-        if members > 1 {
+        let members = &entries[start..end];
+        let thoughts = members
+            .iter()
+            .filter(|entry| entry.role == ChatRole::Thought)
+            .count();
+        let tools = members
+            .iter()
+            .filter(|entry| is_completed_tool(entry))
+            .count();
+        let tool_precedes_thought = members
+            .iter()
+            .find(|entry| !entry.raw_only)
+            .is_some_and(|entry| entry.role == ChatRole::Tool)
+            && thoughts > 0;
+        if thoughts > 1 || tools > 1 || tool_precedes_thought {
             // A member's update does not bump the head's revision, so fold the
-            // members' revisions into the head's state: the summary's cached
-            // rows then drop whenever any member changes.
-            let fingerprint = entries[start..end].iter().fold(0u64, |accumulated, entry| {
+            // streak's revisions into the head's state: its cached rows then
+            // drop whenever any member changes.
+            let fingerprint = members.iter().fold(0u64, |accumulated, entry| {
                 accumulated.wrapping_mul(31).wrapping_add(entry.revision)
             });
             states[start] = EntryCollapse::Summary { end, fingerprint };
@@ -673,17 +696,49 @@ fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> V
     states
 }
 
-/// The single cell that stands in for a run of completed tools: the first word
-/// of each member's title, in order. Entries the run reached across contribute
-/// no title, having no row of their own to stand in for.
+/// The single cell that stands in for a streak of completed tools: the first
+/// word of each member's title, in order. Non-tool entries contribute no title.
 fn collapsed_tool_entry(members: &[ChatEntry]) -> ChatEntry {
-    let titles = members
+    let tools = members
         .iter()
         .filter(|member| is_completed_tool(member))
+        .collect::<Vec<_>>();
+    let titles = tools
+        .iter()
         .map(|member| member.text.split_whitespace().next().unwrap_or("tool"))
         .collect::<Vec<_>>()
         .join(", ");
-    ChatEntry::tool(members[0].seq, titles, None, ToolStatus::Completed)
+    ChatEntry::tool(tools[0].seq, titles, None, ToolStatus::Completed)
+}
+
+/// Render one collapsed streak in the requested fixed order: newest thought,
+/// then the tools. A lone tool keeps its detail; only a real tool run uses CDL.
+fn collapsed_streak_lines(
+    members: &[ChatEntry],
+    width: usize,
+    mode: TranscriptRenderMode,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(thought) = members
+        .iter()
+        .rev()
+        .find(|member| member.role == ChatRole::Thought)
+    {
+        lines.extend(render_transcript_entry(thought, width, mode));
+    }
+    let tools = members
+        .iter()
+        .filter(|member| is_completed_tool(member))
+        .collect::<Vec<_>>();
+    match tools.as_slice() {
+        [] => {}
+        [tool] => lines.extend(render_transcript_entry(tool, width, mode)),
+        _ => {
+            let summary = collapsed_tool_entry(members);
+            lines.extend(render_transcript_entry(&summary, width, mode));
+        }
+    }
+    lines
 }
 
 /// Rendered rows for one entry, rendering and caching it on first use.
@@ -703,8 +758,7 @@ fn cached_entry_lines<'cache>(
             EntryCollapse::None => render_transcript_entry(entry, width, cache.mode),
             EntryCollapse::Hidden | EntryCollapse::Omitted => Vec::new(),
             EntryCollapse::Summary { end, .. } => {
-                let summary = collapsed_tool_entry(&entries[index..end]);
-                render_transcript_entry(&summary, width, cache.mode)
+                collapsed_streak_lines(&entries[index..end], width, cache.mode)
             }
         };
         cache.entries[index] = Some(CachedEntry {
@@ -1529,6 +1583,10 @@ mod tests {
         ChatEntry::tool(seq, title, None, ToolStatus::Completed)
     }
 
+    fn thought(seq: u64, text: &str) -> ChatEntry {
+        ChatEntry::plain(seq, ChatRole::Thought, text)
+    }
+
     /// A chat with `count` single-line user messages, each naming its index so
     /// scroll assertions can name the row they expect to see.
     fn numbered_chat(count: usize) -> ChatState {
@@ -2112,6 +2170,141 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_tools_and_thoughts_render_latest_thinking_then_tool_cdl() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.extend([
+            completed_tool(1, "sed -n 1,260p .agents/PLANS.md"),
+            thought(2, "Planning coverage analysis with cargo llvm-cov"),
+            completed_tool(3, "cargo llvm-cov nextest --help"),
+            thought(4, "Requesting full main help information"),
+            completed_tool(5, "cargo llvm-cov --help"),
+            thought(6, "Planning durable coverage storage"),
+            completed_tool(7, "cargo llvm-cov report --help"),
+            thought(8, "Planning optimized coverage reporting"),
+            completed_tool(9, "Editing files"),
+            thought(10, "Preparing coverage environment cleanup"),
+        ]);
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "○ Thinking",
+                "│ Preparing coverage environment cleanup",
+                "",
+                "✓ Tool · done",
+                "│ sed, cargo, cargo, cargo, Editing",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn thought_only_streak_keeps_only_the_most_recent_block() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.extend([
+            thought(1, "first approach"),
+            thought(2, "second approach"),
+            thought(3, "final approach"),
+        ]);
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            ["○ Thinking", "│ final approach", ""]
+        );
+    }
+
+    #[test]
+    fn visible_nonmembers_break_tool_thought_streaks() {
+        let separators = [
+            ChatEntry::plain(3, ChatRole::User, "user boundary"),
+            ChatEntry::plain(3, ChatRole::Agent, "agent boundary"),
+            ChatEntry::plan(3, Vec::new()),
+            ChatEntry::plain(3, ChatRole::System, "system boundary"),
+            ChatEntry::tool(3, "waiting tool", None, ToolStatus::Pending),
+            ChatEntry::tool(3, "running tool", None, ToolStatus::Running),
+            ChatEntry::tool(3, "failed tool", None, ToolStatus::Failed),
+        ];
+
+        for separator in separators {
+            let mut chat = ChatState::new(&snapshot(), &[]);
+            chat.entries.extend([
+                thought(1, "thought before boundary"),
+                completed_tool(2, "grep -rn alpha src"),
+                separator,
+                thought(4, "thought after boundary"),
+                completed_tool(5, "cat notes.md"),
+                ChatEntry::plain(6, ChatRole::User, "release trailing tool"),
+            ]);
+
+            let rendered = transcript_text(&mut chat, 80);
+            assert!(rendered.contains(&"│ thought before boundary".to_owned()));
+            assert!(rendered.contains(&"│ thought after boundary".to_owned()));
+            assert!(rendered.contains(&"│ grep -rn alpha src".to_owned()));
+            assert!(rendered.contains(&"│ cat notes.md".to_owned()));
+            assert!(!rendered.contains(&"│ grep, cat".to_owned()));
+        }
+    }
+
+    #[test]
+    fn trailing_tool_stays_detailed_until_a_later_thought_appears() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.extend([
+            completed_tool(1, "grep -rn alpha src"),
+            thought(2, "checking the first result"),
+            completed_tool(3, "cat notes.md"),
+        ]);
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "○ Thinking",
+                "│ checking the first result",
+                "",
+                "✓ Tool · done",
+                "│ grep -rn alpha src",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
+        );
+
+        chat.entries
+            .push(thought(4, "checking the combined result"));
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "○ Thinking",
+                "│ checking the combined result",
+                "",
+                "✓ Tool · done",
+                "│ grep, cat",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn updating_the_latest_collapsed_thought_invalidates_the_summary_cache() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.extend([
+            completed_tool(1, "grep -rn alpha src"),
+            thought(2, "old thought"),
+            completed_tool(3, "cat notes.md"),
+            thought(4, "latest thought"),
+        ]);
+        assert!(transcript_text(&mut chat, 80).contains(&"│ latest thought".to_owned()));
+
+        chat.entries[3].text = "revised latest thought".into();
+        chat.entries[3].touch(5);
+
+        let rendered = transcript_text(&mut chat, 80);
+        assert!(rendered.contains(&"│ revised latest thought".to_owned()));
+        assert!(!rendered.contains(&"│ latest thought".to_owned()));
+    }
+
+    #[test]
     fn completed_tool_run_collapses_fully_once_a_new_request_starts() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.entries.push(completed_tool(1, "grep -rn alpha src"));
@@ -2295,7 +2488,37 @@ mod tests {
     }
 
     #[test]
-    fn completing_a_running_tool_moves_protection_and_collapses_the_earlier_run() {
+    fn raw_mode_preserves_interleaved_tools_and_thoughts_in_source_order() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.render_mode = TranscriptRenderMode::Raw;
+        chat.entries.extend([
+            completed_tool(1, "grep -rn alpha src"),
+            thought(2, "first thought"),
+            completed_tool(3, "cat notes.md"),
+            thought(4, "latest thought"),
+        ]);
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "✓ Tool · done",
+                "│ grep -rn alpha src",
+                "",
+                "○ Thinking",
+                "│ first thought",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+                "○ Thinking",
+                "│ latest thought",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_running_tool_releases_earlier_results_and_stays_expanded_when_completed() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.entries.push(completed_tool(1, "grep -rn alpha src"));
         chat.entries.push(completed_tool(2, "grep -rn beta src"));
@@ -2310,10 +2533,7 @@ mod tests {
             transcript_text(&mut chat, 80),
             [
                 "✓ Tool · done",
-                "│ grep -rn alpha src",
-                "",
-                "✓ Tool · done",
-                "│ grep -rn beta src",
+                "│ grep, grep",
                 "",
                 "● Tool · running",
                 "│ cat notes.md",
@@ -2324,8 +2544,7 @@ mod tests {
         chat.entries[2].touch(4);
         chat.entries[2].tool_status = Some(ToolStatus::Completed);
 
-        // Protection moved to the newly completed tool, so the two entries
-        // above must re-render even though neither revision changed.
+        // Once completed, the trailing tool protects its own full result.
         assert_eq!(
             transcript_text(&mut chat, 80),
             [

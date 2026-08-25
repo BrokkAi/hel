@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::hel_config::{AwsAddressSource, SshConnection, TargetTemplate};
 use crate::hel_session_manager::StandaloneSession;
-use crate::hel_state::{SessionRecord, SessionState, TargetLocator};
+use crate::hel_state::{SessionRecord, SessionState, TargetLocator, normalize_session_title};
 use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, SshTarget};
 use crate::hel_worker_runtime::WorkerOwnership;
 
@@ -173,7 +173,13 @@ impl Controller {
             .context("orphan relay did not complete the v1 handshake")?;
         let native_session_id = wait_for_native_session(&mut relay, executor).await?;
         self.mark_worker_connected(session_id, Some(native_session_id))?;
-        if let Some(title) = relay.snapshot().materialized.session_title {
+        if let Some(title) = relay
+            .snapshot()
+            .materialized
+            .session_title
+            .as_deref()
+            .and_then(normalize_session_title)
+        {
             crate::hel_database::set_session_acp_title(session_id, Some(&title))?;
             self.state
                 .sessions

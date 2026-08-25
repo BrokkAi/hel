@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -72,6 +72,15 @@ impl ProvisionStage {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct SensitiveCommandInput(Vec<u8>);
+
+impl std::fmt::Debug for SensitiveCommandInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
     pub program: String,
@@ -92,6 +101,10 @@ pub struct CommandSpec {
     /// already exists, so a later failure owes that target's teardown.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub creates_target: bool,
+    /// Input that must reach the child without becoming part of its arguments,
+    /// environment, serialized plan, or debug representation.
+    #[serde(skip)]
+    sensitive_stdin: Option<SensitiveCommandInput>,
 }
 
 impl CommandSpec {
@@ -107,6 +120,7 @@ impl CommandSpec {
             stage: None,
             parallel_group: None,
             creates_target: false,
+            sensitive_stdin: None,
         }
     }
 
@@ -406,6 +420,10 @@ fn trace_command_duration(command: &CommandSpec, started: Instant, status: i32) 
 
 impl CommandExecutor for ProcessExecutor {
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        if let Some(input) = &command.sensitive_stdin {
+            let mut input = std::io::Cursor::new(input.0.as_slice());
+            return self.execute_with_stdin(command, &mut input);
+        }
         let started = Instant::now();
         let output = Command::new(&command.program)
             .args(&command.args)
@@ -624,6 +642,10 @@ impl CommandExecutor for CancellableProcessExecutor {
     }
 
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        if let Some(input) = &command.sensitive_stdin {
+            let mut input = std::io::Cursor::new(input.0.as_slice());
+            return self.execute_with_stdin(command, &mut input);
+        }
         let started = Instant::now();
         self.check_cancelled()?;
         let mut child = cancellable_command(command)
@@ -959,6 +981,63 @@ pub struct CommandPlan {
 }
 
 impl CommandPlan {
+    /// Supply one container environment value without placing it in the
+    /// Podman/SSH argument vector. The target launcher reads the value from
+    /// stdin, exports it, and asks the container engine to inherit it by name.
+    pub fn provide_target_environment_secret(
+        &mut self,
+        target: &TargetTemplate,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        ensure!(
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(index, byte)| byte == b'_'
+                    || byte.is_ascii_alphabetic()
+                    || (index > 0 && byte.is_ascii_digit())),
+            "invalid secret environment variable name"
+        );
+        ensure!(
+            !value.as_bytes().contains(&b'\n') && !value.as_bytes().contains(&b'\r'),
+            "secret environment value cannot contain a newline"
+        );
+        let command = self
+            .commands
+            .iter_mut()
+            .find(|command| command.creates_target)
+            .context("provisioning plan has no target creation command")?;
+        let read_and_export = format!("IFS= read -r {name} || exit 1; export {name};");
+        match target {
+            TargetTemplate::LocalPodman(_) | TargetTemplate::AppleContainer(_) => {
+                let program = std::mem::replace(&mut command.program, "sh".to_owned());
+                let args = std::mem::take(&mut command.args);
+                command.args = vec![
+                    "-c".to_owned(),
+                    format!("{read_and_export} exec \"$@\""),
+                    "hel-secret-env".to_owned(),
+                    program,
+                ];
+                command.args.extend(args);
+            }
+            TargetTemplate::SshPodman { .. } => {
+                let remote = command
+                    .args
+                    .last_mut()
+                    .context("remote Podman command has no SSH command argument")?;
+                *remote = format!("{read_and_export} exec {remote}");
+            }
+            TargetTemplate::LocalBare
+            | TargetTemplate::AwsEc2(_)
+            | TargetTemplate::SshBare { .. } => {
+                bail!("target does not support inherited container environment")
+            }
+        }
+        let mut input = value.as_bytes().to_vec();
+        input.push(b'\n');
+        command.sensitive_stdin = Some(SensitiveCommandInput(input));
+        Ok(())
+    }
+
     pub fn execute(&self, executor: &impl CommandExecutor) -> Result<Vec<CommandOutput>> {
         let mut outputs = Vec::with_capacity(self.commands.len());
         for command in &self.commands {
@@ -1200,6 +1279,23 @@ pub enum TargetLocator {
         ssh: SshTarget,
         container_id: String,
     },
+}
+
+/// Commands and identity needed to bring a stopped managed target back online.
+/// Only runtimes whose stopped resources retain their durable files provide
+/// one; callers leave every other target kind alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetRecoveryPlan {
+    pub inspect: CommandSpec,
+    pub start: CommandSpec,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetRecoveryOutcome {
+    NotRequired,
+    AlreadyRunning,
+    Started,
 }
 
 pub fn resource_name(session_id: &str) -> Result<String> {
@@ -1568,6 +1664,112 @@ pub fn reconnect_plan(locator: &TargetLocator, session_id: &str) -> Result<Comma
         description: format!("reconnect Hel session {session_id}"),
         commands: vec![command],
     })
+}
+
+/// Describe safe recovery for a Podman container that belongs to an active
+/// session. The inspect command is deliberately separate from `exec`: a host
+/// crash can leave the container present but stopped, where `exec` cannot
+/// distinguish that state from other transport failures.
+pub fn target_recovery_plan(
+    locator: &TargetLocator,
+    session_id: &str,
+) -> Result<Option<TargetRecoveryPlan>> {
+    verify_locator(locator, session_id)?;
+    let (inspect, start) = match locator {
+        TargetLocator::LocalPodman { container_id } => (
+            CommandSpec::new("podman", ["container", "inspect", container_id])
+                .purpose("inspect Hel session container"),
+            CommandSpec::new("podman", ["start", container_id])
+                .purpose("start stopped Hel session container"),
+        ),
+        TargetLocator::SshPodman { ssh, container_id } => (
+            ssh_command(ssh, ["podman", "container", "inspect", container_id])
+                .purpose("inspect remote Hel session container"),
+            ssh_command(ssh, ["podman", "start", container_id])
+                .purpose("start stopped remote Hel session container"),
+        ),
+        TargetLocator::LocalBare { .. }
+        | TargetLocator::AppleContainer { .. }
+        | TargetLocator::AwsEc2 { .. }
+        | TargetLocator::SshBare { .. } => return Ok(None),
+    };
+    Ok(Some(TargetRecoveryPlan {
+        inspect,
+        start,
+        session_id: session_id.to_owned(),
+    }))
+}
+
+/// Start a confirmed stopped Podman target and verify it reached `running`.
+/// Missing or foreign containers, transport failures, and transitional states
+/// fail without running the start command.
+pub fn ensure_recovery_target_running(
+    executor: &impl CommandExecutor,
+    plan: Option<&TargetRecoveryPlan>,
+) -> Result<TargetRecoveryOutcome> {
+    let Some(plan) = plan else {
+        return Ok(TargetRecoveryOutcome::NotRequired);
+    };
+    let status = inspect_recovery_target(executor, plan)?;
+    match status.as_str() {
+        "running" => Ok(TargetRecoveryOutcome::AlreadyRunning),
+        "created" | "initialized" | "stopped" | "exited" => {
+            let output = executor.execute(&plan.start)?;
+            checked_command_output(&plan.start, output)
+                .context("start confirmed stopped Podman session target")?;
+            let after = inspect_recovery_target(executor, plan)
+                .context("verify Podman session target after starting it")?;
+            ensure!(
+                after == "running",
+                "Podman session target reported {after:?} after start"
+            );
+            Ok(TargetRecoveryOutcome::Started)
+        }
+        "paused" | "removing" | "stopping" | "unknown" => {
+            bail!("refusing to start Podman session target in {status:?} state")
+        }
+        _ => bail!("Podman session target reported unexpected state {status:?}"),
+    }
+}
+
+fn inspect_recovery_target(
+    executor: &impl CommandExecutor,
+    plan: &TargetRecoveryPlan,
+) -> Result<String> {
+    let output = executor.execute(&plan.inspect)?;
+    let output = checked_command_output(&plan.inspect, output)
+        .context("inspect Podman session target for recovery")?;
+    let values: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).context("parse Podman session target inspection")?;
+    ensure!(
+        values.len() == 1,
+        "Podman inspection returned {} targets instead of one",
+        values.len()
+    );
+    let target = &values[0];
+    let labels = target
+        .pointer("/Config/Labels")
+        .and_then(serde_json::Value::as_object)
+        .context("Podman session target has no ownership labels")?;
+    ensure!(
+        labels
+            .get(MANAGED_LABEL)
+            .and_then(serde_json::Value::as_str)
+            == Some("true"),
+        "refusing to start a Podman target Hel does not own"
+    );
+    ensure!(
+        labels
+            .get(SESSION_LABEL)
+            .and_then(serde_json::Value::as_str)
+            == Some(plan.session_id.as_str()),
+        "refusing to start a Podman target owned by another session"
+    );
+    target
+        .pointer("/State/Status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .context("Podman session target inspection has no state")
 }
 
 /// Run the target-side half of the local Git bridge over the same trusted
@@ -2913,6 +3115,22 @@ mod tests {
         }
     }
 
+    fn podman_inspection(status: &str, session_id: &str, managed: &str) -> CommandOutput {
+        podman_output(
+            serde_json::to_vec(&serde_json::json!([{
+                "Id": "0123456789abcdef",
+                "Config": {
+                    "Labels": {
+                        (MANAGED_LABEL): managed,
+                        (SESSION_LABEL): session_id,
+                    }
+                },
+                "State": { "Status": status },
+            }]))
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn podman_preflight_requires_supported_rootless_uid_mapped_runtime() {
         let executor = PodmanPreflightExecutor::with_outputs([
@@ -3118,6 +3336,159 @@ mod tests {
     }
 
     #[test]
+    fn podman_target_recovery_uses_the_exact_local_or_remote_container() {
+        let name = resource_name(SESSION).unwrap();
+        let local = target_recovery_plan(
+            &TargetLocator::LocalPodman {
+                container_id: name.clone(),
+            },
+            SESSION,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(local.inspect.args, ["container", "inspect", name.as_str()]);
+        assert_eq!(local.start.args, ["start", name.as_str()]);
+
+        let remote = target_recovery_plan(
+            &TargetLocator::SshPodman {
+                ssh: ssh(),
+                container_id: name.clone(),
+            },
+            SESSION,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(remote.inspect.program, "ssh");
+        assert_eq!(
+            remote.inspect.args.last().unwrap(),
+            &format!("'podman' 'container' 'inspect' '{name}'")
+        );
+        assert_eq!(
+            remote.start.args.last().unwrap(),
+            &format!("'podman' 'start' '{name}'")
+        );
+    }
+
+    #[test]
+    fn stopped_owned_podman_target_is_started_and_reinspected() {
+        let name = resource_name(SESSION).unwrap();
+        let plan =
+            target_recovery_plan(&TargetLocator::LocalPodman { container_id: name }, SESSION)
+                .unwrap();
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_inspection("exited", SESSION, "true"),
+            podman_output("container-id\n"),
+            podman_inspection("running", SESSION, "true"),
+        ]);
+
+        assert_eq!(
+            ensure_recovery_target_running(&executor, plan.as_ref()).unwrap(),
+            TargetRecoveryOutcome::Started
+        );
+        let seen = executor.seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].purpose, "inspect Hel session container");
+        assert_eq!(seen[1].purpose, "start stopped Hel session container");
+        assert_eq!(seen[2].purpose, "inspect Hel session container");
+    }
+
+    #[test]
+    fn running_podman_target_is_not_started() {
+        let plan = TargetRecoveryPlan {
+            inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
+            start: CommandSpec::new("start", std::iter::empty::<&str>()),
+            session_id: SESSION.into(),
+        };
+        let executor =
+            PodmanPreflightExecutor::with_outputs([podman_inspection("running", SESSION, "true")]);
+
+        assert_eq!(
+            ensure_recovery_target_running(&executor, Some(&plan)).unwrap(),
+            TargetRecoveryOutcome::AlreadyRunning
+        );
+        assert_eq!(executor.seen.borrow().len(), 1);
+    }
+
+    #[test]
+    fn unsafe_podman_target_states_and_ownership_never_start() {
+        for (status, session, managed, expected) in [
+            ("paused", SESSION, "true", "paused"),
+            ("stopping", SESSION, "true", "stopping"),
+            ("exited", "another-session", "true", "another session"),
+            ("exited", SESSION, "false", "does not own"),
+        ] {
+            let plan = TargetRecoveryPlan {
+                inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
+                start: CommandSpec::new("start", std::iter::empty::<&str>()),
+                session_id: SESSION.into(),
+            };
+            let executor = PodmanPreflightExecutor::with_outputs([podman_inspection(
+                status, session, managed,
+            )]);
+
+            let error = ensure_recovery_target_running(&executor, Some(&plan))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(executor.seen.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn podman_target_must_still_be_running_after_start() {
+        let plan = TargetRecoveryPlan {
+            inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
+            start: CommandSpec::new("start", std::iter::empty::<&str>()),
+            session_id: SESSION.into(),
+        };
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_inspection("exited", SESSION, "true"),
+            podman_output("container-id\n"),
+            podman_inspection("exited", SESSION, "true"),
+        ]);
+
+        let error = ensure_recovery_target_running(&executor, Some(&plan))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("after start"), "{error}");
+    }
+
+    #[test]
+    fn podman_inspect_or_start_failures_stop_recovery() {
+        let plan = TargetRecoveryPlan {
+            inspect: CommandSpec::new("inspect", std::iter::empty::<&str>())
+                .purpose("inspect test target"),
+            start: CommandSpec::new("start", std::iter::empty::<&str>())
+                .purpose("start test target"),
+            session_id: SESSION.into(),
+        };
+        let inspect_failed = PodmanPreflightExecutor::with_outputs([CommandOutput {
+            status: 1,
+            stdout: Vec::new(),
+            stderr: b"container missing".to_vec(),
+        }]);
+        let error = ensure_recovery_target_running(&inspect_failed, Some(&plan))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inspect Podman session target"), "{error}");
+        assert_eq!(inspect_failed.seen.borrow().len(), 1);
+
+        let start_failed = PodmanPreflightExecutor::with_outputs([
+            podman_inspection("exited", SESSION, "true"),
+            CommandOutput {
+                status: 1,
+                stdout: Vec::new(),
+                stderr: b"start refused".to_vec(),
+            },
+        ]);
+        let error = ensure_recovery_target_running(&start_failed, Some(&plan))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("start confirmed stopped"), "{error}");
+        assert_eq!(start_failed.seen.borrow().len(), 2);
+    }
+
+    #[test]
     fn podman_plan_uses_owned_name_label_and_argv_clones() {
         let plan = provision_plan(
             &TargetTemplate::LocalPodman(ContainerTemplate {
@@ -3163,6 +3534,74 @@ mod tests {
                 .unwrap()
                 .contains("gh auth git-credential")
         );
+    }
+
+    #[test]
+    fn container_secret_is_streamed_without_entering_local_command_arguments() {
+        let secret = "github-token-that-must-not-reach-argv";
+        let target = TargetTemplate::LocalPodman(ContainerTemplate {
+            image: "ubuntu:24.04".to_owned(),
+            extra_run_args: vec!["--env".to_owned(), "GH_TOKEN".to_owned()],
+        });
+        let mut plan = CommandPlan {
+            description: "exercise secret launcher".to_owned(),
+            commands: vec![
+                CommandSpec::new("sh", ["-c", "printf %s \"$GH_TOKEN\""])
+                    .purpose("read inherited secret")
+                    .creates_target(),
+            ],
+        };
+
+        plan.provide_target_environment_secret(&target, "GH_TOKEN", secret)
+            .unwrap();
+
+        let command = &plan.commands[0];
+        assert_eq!(command.program, "sh");
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|argument| argument.contains(secret))
+        );
+        assert!(!format!("{command:?}").contains(secret));
+        assert!(format!("{command:?}").contains("<redacted>"));
+        assert!(!serde_json::to_string(command).unwrap().contains(secret));
+        let output = plan.execute(&ProcessExecutor).unwrap();
+        assert_eq!(output[0].stdout, secret.as_bytes());
+    }
+
+    #[test]
+    fn container_secret_is_streamed_without_entering_remote_ssh_arguments() {
+        let secret = "remote-github-token-that-must-not-reach-argv";
+        let target = TargetTemplate::SshPodman {
+            ssh: ssh(),
+            container: ContainerTemplate {
+                image: "ubuntu:24.04".to_owned(),
+                extra_run_args: vec!["--env".to_owned(), "GH_TOKEN".to_owned()],
+            },
+        };
+        let mut plan = provision_plan(&target, SESSION, &bundle(), &[]).unwrap();
+
+        plan.provide_target_environment_secret(&target, "GH_TOKEN", secret)
+            .unwrap();
+
+        let command = plan
+            .commands
+            .iter()
+            .find(|command| command.creates_target)
+            .unwrap();
+        assert_eq!(command.program, "ssh");
+        assert!(command.args.last().unwrap().contains("read -r GH_TOKEN"));
+        assert!(command.args.last().unwrap().contains("'--env' 'GH_TOKEN'"));
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|argument| argument.contains(secret))
+        );
+        assert!(!format!("{command:?}").contains(secret));
+        assert!(format!("{command:?}").contains("<redacted>"));
+        assert!(!serde_json::to_string(command).unwrap().contains(secret));
     }
 
     #[test]

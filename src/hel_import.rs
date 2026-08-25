@@ -28,9 +28,11 @@ use crate::hel_projection::canonical_session_from_materialized;
 use crate::hel_setup::{GithubRepository, github_repository_from_origin};
 use crate::hel_state::{
     CheckpointMetadata, HelState, SessionRecord, SessionState, harness_session_title,
-    new_session_id,
+    new_session_id, normalize_session_title,
 };
-use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
+use crate::hel_worker::{
+    SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot, strip_hidden_prompt_context,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeSessionSelection {
@@ -697,11 +699,7 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
             native_session_id: session_id.clone(),
             jsonl_path: path,
             modified_at: SystemTime::UNIX_EPOCH + Duration::from_secs(updated_at as u64),
-            title: if title.trim().is_empty() {
-                session_id
-            } else {
-                single_line_title(&title)
-            },
+            title: normalize_session_title(&title).unwrap_or(session_id),
             cwd: PathBuf::from(cwd),
             git_branch,
             size_bytes: metadata.len(),
@@ -844,6 +842,9 @@ fn codex_source_is_interactive(source: Option<&Value>) -> bool {
 
 fn codex_native_titles(home: &Path) -> Result<BTreeMap<String, String>> {
     let mut titles = BTreeMap::new();
+    // Older Codex stores use history only as their compact interactive-session
+    // index. Keep those IDs discoverable, but do not turn prompt text into a
+    // session name.
     let history = home.join("history.jsonl");
     if history.is_file() {
         for line in BufReader::new(fs::File::open(&history)?).lines() {
@@ -855,7 +856,7 @@ fn codex_native_titles(home: &Path) -> Result<BTreeMap<String, String>> {
             {
                 titles
                     .entry(session_id.to_owned())
-                    .or_insert_with(|| single_line_title(text));
+                    .or_insert_with(|| session_id.to_owned());
             }
         }
     }
@@ -866,17 +867,13 @@ fn codex_native_titles(home: &Path) -> Result<BTreeMap<String, String>> {
             if let (Some(session_id), Some(title)) = (
                 record.get("id").and_then(Value::as_str),
                 record.get("thread_name").and_then(Value::as_str),
-            ) && !title.trim().is_empty()
+            ) && let Some(title) = normalize_session_title(title)
             {
-                titles.insert(session_id.to_owned(), single_line_title(title));
+                titles.insert(session_id.to_owned(), title);
             }
         }
     }
     Ok(titles)
-}
-
-fn single_line_title(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Locate a Kimi session directory. Its on-disk `session_<uuid>` name is the
@@ -1115,9 +1112,8 @@ fn url_decode(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// Listing title and cwd from `summary.json`, falling back to the first real
-/// user message for the title. Never fails the whole scan: an unreadable
-/// session is listed with what could be recovered.
+/// Listing title and cwd from `summary.json`. Never fails the whole scan: an
+/// unreadable session is listed with what could be recovered.
 fn grok_listing_metadata(session_path: &Path) -> (Option<String>, Option<PathBuf>) {
     let summary = fs::read(session_path.join("summary.json"))
         .ok()
@@ -1126,37 +1122,13 @@ fn grok_listing_metadata(session_path: &Path) -> (Option<String>, Option<PathBuf
     let title = summary
         .get("session_summary")
         .and_then(Value::as_str)
-        .filter(|title| !title.trim().is_empty())
-        .map(single_line_title)
-        .or_else(|| grok_first_user_text(session_path).map(|text| single_line_title(&text)));
+        .and_then(normalize_session_title);
     let cwd = summary
         .pointer("/info/cwd")
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .filter(|cwd| cwd.is_absolute());
     (title, cwd)
-}
-
-/// First message a person actually typed, used as a listing title. Bounded so
-/// a long session does not make the scan read a whole transcript per entry.
-fn grok_first_user_text(session_path: &Path) -> Option<String> {
-    use std::io::BufRead;
-
-    const MAX_SCANNED_LINES: usize = 64;
-    let file = fs::File::open(session_path.join(CHAT_HISTORY)).ok()?;
-    for line in std::io::BufReader::new(file)
-        .lines()
-        .take(MAX_SCANNED_LINES)
-    {
-        let record: Value = serde_json::from_str(&line.ok()?).ok()?;
-        if grok_real_user_item(&record) {
-            let text = grok_user_text(&record);
-            if !text.trim().is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    None
 }
 
 fn grok_session_modified_at(session_path: &Path, metadata: &fs::Metadata) -> SystemTime {
@@ -1271,7 +1243,7 @@ fn kimi_state_listing_metadata(
     } else {
         string("customTitle").or_else(|| string("title"))
     }
-    .map(single_line_title);
+    .and_then(normalize_session_title);
     let cwd = string("workDir")
         .or_else(|| string("cwd"))
         .map(PathBuf::from)
@@ -1538,7 +1510,6 @@ fn claude_native_metadata(path: &Path) -> Result<Option<(String, PathBuf, String
     let mut custom_title = None;
     let mut agent_name = None;
     let mut ai_title = None;
-    let mut fallback_title = None;
     let mut cwd = None;
     let mut git_branch = None;
     let mut entrypoint = None;
@@ -1585,7 +1556,7 @@ fn claude_native_metadata(path: &Path) -> Result<Option<(String, PathBuf, String
                     .and_then(Value::as_str)
                     .filter(|title| !title.trim().is_empty())
                 {
-                    custom_title = Some(single_line_title(native_title));
+                    custom_title = normalize_session_title(native_title);
                 }
             }
             Some("ai-title") => {
@@ -1594,7 +1565,7 @@ fn claude_native_metadata(path: &Path) -> Result<Option<(String, PathBuf, String
                     .and_then(Value::as_str)
                     .filter(|title| !title.trim().is_empty())
                 {
-                    ai_title = Some(single_line_title(native_title));
+                    ai_title = normalize_session_title(native_title);
                 }
             }
             Some("agent-name") => {
@@ -1602,18 +1573,15 @@ fn claude_native_metadata(path: &Path) -> Result<Option<(String, PathBuf, String
                     .get("agentName")
                     .and_then(Value::as_str)
                     .filter(|title| !title.trim().is_empty())
-                    .map(single_line_title);
+                    .and_then(normalize_session_title);
             }
-            Some("user") if fallback_title.is_none() => {
+            Some("user") => {
                 let content = record.pointer("/message/content").and_then(Value::as_str);
                 if content
                     .is_some_and(|content| content.contains("<command-name>/loop</command-name>"))
                 {
                     filtered = true;
                 }
-                fallback_title = content
-                    .filter(|title| !title.trim().is_empty())
-                    .map(single_line_title);
             }
             _ => {}
         }
@@ -1629,7 +1597,6 @@ fn claude_native_metadata(path: &Path) -> Result<Option<(String, PathBuf, String
         custom_title
             .or(agent_name)
             .or(ai_title)
-            .or(fallback_title)
             .unwrap_or_else(|| "Untitled session".into()),
         cwd,
         git_branch.unwrap_or_else(|| "HEAD".into()),
@@ -1713,6 +1680,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
                 let Some(text) = record
                     .pointer("/message/content")
                     .and_then(Value::as_str)
+                    .map(strip_hidden_prompt_context)
                     .filter(|text| !text.trim().is_empty())
                 else {
                     continue;
@@ -1851,6 +1819,10 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                 let Some(text) = codex_completed_item_text(&record) else {
                     continue;
                 };
+                let text = strip_hidden_prompt_context(&text);
+                if text.trim().is_empty() {
+                    continue;
+                }
                 finish_imported_turn(&mut events, None);
                 let request_id = format!("import-{}", events.len() + 1);
                 push_event(
@@ -1986,14 +1958,15 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
                     .filter(|text| !text.trim().is_empty())
                     .collect::<Vec<_>>()
                     .join("\n");
-                if !text.is_empty() {
+                let text = strip_hidden_prompt_context(&text);
+                if !text.trim().is_empty() {
                     let request_id = format!("import-{}", events.len() + 1);
                     push_event(
                         &mut events,
                         recorded_at_ms,
                         WorkerEvent::PromptAccepted {
                             request_id,
-                            text,
+                            text: text.to_owned(),
                             attachments: Vec::new(),
                         },
                     );
@@ -2167,7 +2140,7 @@ fn grok_real_user_item(record: &Value) -> bool {
 }
 
 fn grok_user_text(record: &Value) -> String {
-    record
+    let text = record
         .get("content")
         .and_then(Value::as_array)
         .into_iter()
@@ -2176,7 +2149,8 @@ fn grok_user_text(record: &Value) -> String {
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    strip_hidden_prompt_context(&text).to_owned()
 }
 
 fn push_grok_chunk(
@@ -4057,7 +4031,7 @@ mod tests {
         fs::write(
             &path,
             concat!(
-                r#"{"type":"user","cwd":"/work/app","message":{"content":"first prompt"}}"#,
+                r#"{"type":"user","cwd":"/work/app","message":{"content":"<hel-project-memory>private</hel-project-memory>\nfirst prompt"}}"#,
                 "\n",
                 r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"first reply"}]}}"#,
                 "\n",
@@ -4234,7 +4208,7 @@ mod tests {
             concat!(
                 r#"{"type":"session_meta","payload":{"session_id":"019feb6c-5ffc-7c12-ad99-bdeaeb6be79d","cwd":"/work/app","history_mode":"paginated"}}"#,
                 "\n",
-                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"first prompt","text_elements":[]}]}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"<hel-project-memory>private</hel-project-memory>","text_elements":[]},{"type":"text","text":"first prompt","text_elements":[]}]}}}"#,
                 "\n",
                 r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"agent-1","content":[{"type":"Text","text":"first reply"}],"phase":"final_answer"}}}"#,
                 "\n",
@@ -4808,8 +4782,8 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            directory.path().join("history.jsonl"),
-            format!(r#"{{"session_id":"{session_id}","text":"native title\ncontinued"}}"#),
+            directory.path().join("session_index.jsonl"),
+            format!(r#"{{"id":"{session_id}","thread_name":"native title\ncontinued"}}"#),
         )
         .unwrap();
 
@@ -4819,6 +4793,21 @@ mod tests {
         assert_eq!(sessions[0].git_branch, "feature");
         assert!(sessions[0].size_bytes > 0);
         assert_eq!(sessions[0].history_mode, CodexHistoryMode::Legacy);
+    }
+
+    #[test]
+    fn codex_history_text_does_not_become_the_session_name() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("history.jsonl"),
+            r#"{"session_id":"session-1","text":"first user message"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_native_titles(directory.path()).unwrap()["session-1"],
+            "session-1"
+        );
     }
 
     #[test]
@@ -5140,6 +5129,20 @@ mod tests {
     }
 
     #[test]
+    fn claude_first_user_message_is_not_used_as_a_session_name_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let rollout = directory.path().join("session.jsonl");
+        fs::write(
+            &rollout,
+            r#"{"type":"user","entrypoint":"cli","cwd":"/work/app","message":{"content":"first user message"}}"#,
+        )
+        .unwrap();
+
+        let (title, _, _) = claude_native_metadata(&rollout).unwrap().unwrap();
+        assert_eq!(title, "Untitled session");
+    }
+
+    #[test]
     fn claude_listing_uses_native_all_projects_limit() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("projects/work");
@@ -5176,7 +5179,7 @@ mod tests {
         fs::write(
             &wire_path,
             concat!(
-                r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"first prompt"}]}"#,
+                r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"<hel-project-memory>private</hel-project-memory>"},{"type":"text","text":"first prompt"}]}"#,
                 "\n",
                 r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"think","think":"hidden"}}}"#,
                 "\n",
@@ -5258,7 +5261,7 @@ mod tests {
             "\n",
             r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>ignore me</system-reminder>"}],"synthetic_reason":"system_reminder"}"#,
             "\n",
-            r#"{"type":"user","content":[{"type":"text","text":"first prompt"}],"prompt_index":0}"#,
+            r#"{"type":"user","content":[{"type":"text","text":"<hel-project-memory>private</hel-project-memory>"},{"type":"text","text":"first prompt"}],"prompt_index":0}"#,
             "\n",
             r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking it over"}],"encrypted_content":"opaque"}"#,
             "\n",
@@ -5417,9 +5420,8 @@ mod tests {
             "01a00c3a-553f-71e0-95ab-aa04396d3ad7"
         );
         assert_eq!(listed[0].cwd, PathBuf::from("/work/app"));
-        // No stored summary yet, so the first thing the person typed names it,
-        // flattened to a single line.
-        assert_eq!(listed[0].title, "the very first thing and a second line");
+        // A user message is conversation content, not a session-name fallback.
+        assert_eq!(listed[0].title, listed[0].native_session_id);
 
         let located = locate_grok_session(directory.path(), &GrokSessionSelection::Latest).unwrap();
         assert_eq!(located.native_session_id, listed[0].native_session_id);

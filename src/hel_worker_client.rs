@@ -112,11 +112,14 @@ impl RelayRejected {
 /// such as worker auto-restart downcast for it. Nothing reads the message text,
 /// so rewording a diagnostic can never silently disable recovery.
 #[derive(Debug)]
-pub struct RelayTransportDead(String);
+pub struct RelayTransportDead {
+    message: String,
+    handshake_failed: bool,
+}
 
 impl std::fmt::Display for RelayTransportDead {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -124,18 +127,38 @@ impl std::error::Error for RelayTransportDead {}
 
 impl RelayTransportDead {
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            handshake_failed: false,
+        }
     }
 
     /// Mark an I/O failure on the relay's pipes. The marker reports exactly
     /// what the I/O error reported, so it adds a type without adding text.
-    fn from_io(error: std::io::Error) -> Self {
-        Self(error.to_string())
+    fn from_io(error: std::io::Error, kind: ExchangeKind) -> Self {
+        Self::during_exchange(error.to_string(), kind)
+    }
+
+    fn during_exchange(message: impl Into<String>, kind: ExchangeKind) -> Self {
+        Self {
+            message: message.into(),
+            handshake_failed: kind == ExchangeKind::Handshake,
+        }
     }
 
     /// Whether this error, or any cause behind it, is a dead relay transport.
     pub fn marks(error: &anyhow::Error) -> bool {
         error.downcast_ref::<Self>().is_some()
+    }
+
+    /// Whether the worker was reachable enough to run its liveness probe but
+    /// still failed to serve a fresh relay handshake. After repeated failures,
+    /// restarting that exact managed worker is safe: a shared target outage
+    /// cannot pass the liveness probe, while merely slow calls are not marked.
+    pub fn marks_failed_handshake(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<Self>()
+            .is_some_and(|failure| failure.handshake_failed)
     }
 }
 
@@ -157,8 +180,8 @@ enum ExchangeKind {
 /// history. Callers persist each attachment page, then acknowledge its
 /// `through` frontier only after committing it locally.
 pub struct RelayClient {
-    child: Child,
-    input: ChildStdin,
+    child: Option<Child>,
+    input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
     request_timeout: Duration,
     /// Why this connection can no longer be used, once a call gave up on a
@@ -211,8 +234,8 @@ impl RelayClient {
         getrandom::fill(&mut nonce_bytes)
             .map_err(|error| anyhow!("generate relay request nonce: {error}"))?;
         let mut client = Self {
-            child,
-            input,
+            child: Some(child),
+            input: Some(input),
             output: BufReader::new(output),
             request_timeout,
             abandoned: None,
@@ -576,16 +599,19 @@ impl RelayClient {
 
     pub async fn detach(mut self) -> Result<()> {
         self.input
+            .take()
+            .expect("connected relay owns proxy stdin")
             .shutdown()
             .await
             .context("close relay proxy stdin")?;
-        match tokio::time::timeout(std::time::Duration::from_millis(500), self.child.wait()).await {
+        let mut child = self.child.take().expect("connected relay owns proxy child");
+        match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await {
             Ok(status) => {
                 status.context("wait for relay proxy")?;
             }
             Err(_) => {
-                self.child.start_kill().context("stop relay proxy")?;
-                let _ = self.child.wait().await;
+                child.start_kill().context("stop relay proxy")?;
+                let _ = child.wait().await;
             }
         }
         Ok(())
@@ -655,22 +681,27 @@ impl RelayClient {
         frame.push(b'\n');
         let exchanged = tokio::time::timeout(timeout, async {
             self.input
+                .as_mut()
+                .expect("connected relay owns proxy stdin")
                 .write_all(&frame)
                 .await
-                .map_err(RelayTransportDead::from_io)
+                .map_err(|error| RelayTransportDead::from_io(error, kind))
                 .with_context(|| format!("write relay {operation} request"))?;
             self.input
+                .as_mut()
+                .expect("connected relay owns proxy stdin")
                 .flush()
                 .await
-                .map_err(RelayTransportDead::from_io)
+                .map_err(|error| RelayTransportDead::from_io(error, kind))
                 .with_context(|| format!("flush relay {operation} request"))?;
-            read_bounded_frame(&mut self.output)
+            read_bounded_frame(&mut self.output, kind)
                 .await
                 .with_context(|| format!("read relay {operation} response"))?
                 .ok_or_else(|| {
-                    anyhow::Error::new(RelayTransportDead::new(format!(
-                        "relay proxy disconnected during {operation}"
-                    )))
+                    anyhow::Error::new(RelayTransportDead::during_exchange(
+                        format!("relay proxy disconnected during {operation}"),
+                        kind,
+                    ))
                 })
         })
         .await;
@@ -683,9 +714,9 @@ impl RelayClient {
                 ));
                 let timed_out = format!("relay {operation} timed out after {seconds} seconds");
                 match kind {
-                    ExchangeKind::Handshake => {
-                        Err(anyhow::Error::new(RelayTransportDead::new(timed_out)))
-                    }
+                    ExchangeKind::Handshake => Err(anyhow::Error::new(
+                        RelayTransportDead::during_exchange(timed_out, kind),
+                    )),
                     ExchangeKind::Call => Err(anyhow!(timed_out)),
                 }
             }
@@ -696,6 +727,45 @@ impl RelayClient {
         let id = format!("relay-{:016x}-{}", self.connection_nonce, self.next_request);
         self.next_request = self.next_request.wrapping_add(1);
         id
+    }
+}
+
+impl Drop for RelayClient {
+    fn drop(&mut self) {
+        // Closing stdin while the proxy launcher is still alive lets `podman
+        // exec -i` and ssh forward EOF to the target-side proxy. Killing the
+        // launcher first can strand that proxy (and its worker socket) after a
+        // controller-side connection is replaced.
+        drop(self.input.take());
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            if let Err(error) = child.start_kill() {
+                tracing::warn!(%error, "could not stop dropped relay proxy without a runtime");
+            }
+            return;
+        };
+        let session_id = self.session_id.clone();
+        runtime.spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await {
+                Ok(Ok(status)) if status.success() => {}
+                Ok(Ok(status)) => {
+                    tracing::warn!(%session_id, %status, "dropped relay proxy exited unsuccessfully");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%session_id, %error, "could not reap dropped relay proxy");
+                }
+                Err(_) => {
+                    if let Err(error) = child.start_kill() {
+                        tracing::warn!(%session_id, %error, "could not stop dropped relay proxy");
+                    }
+                    if let Err(error) = child.wait().await {
+                        tracing::warn!(%session_id, %error, "could not reap stopped relay proxy");
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -727,13 +797,17 @@ fn skills_sync_state(payload: RelayResponsePayload) -> Result<crate::hel_skills:
     }
 }
 
-async fn read_bounded_frame(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<String>> {
-    read_bounded_frame_with_limit(reader, MAX_FRAME_BYTES).await
+async fn read_bounded_frame(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    kind: ExchangeKind,
+) -> Result<Option<String>> {
+    read_bounded_frame_with_limit(reader, MAX_FRAME_BYTES, kind).await
 }
 
 async fn read_bounded_frame_with_limit(
     reader: &mut (impl AsyncBufRead + Unpin),
     maximum_bytes: usize,
+    kind: ExchangeKind,
 ) -> Result<Option<String>> {
     let mut frame = Vec::new();
     loop {
@@ -743,13 +817,14 @@ async fn read_bounded_frame_with_limit(
         let available = reader
             .fill_buf()
             .await
-            .map_err(RelayTransportDead::from_io)?;
+            .map_err(|error| RelayTransportDead::from_io(error, kind))?;
         if available.is_empty() {
             if frame.is_empty() {
                 return Ok(None);
             }
-            return Err(anyhow::Error::new(RelayTransportDead::new(
+            return Err(anyhow::Error::new(RelayTransportDead::during_exchange(
                 "relay proxy disconnected in the middle of a response frame",
+                kind,
             )));
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
@@ -1277,7 +1352,45 @@ sys.stdin.read()
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn dropping_a_client_delivers_eof_before_stopping_its_proxy_launcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let eof = directory.path().join("proxy-saw-eof");
+        let script = r#"
+IFS= read -r hello
+id=$(printf '%s' "$hello" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{"request_id":"%s","protocol_version":1,"result":"ok","payload":{"type":"hello","data":{"negotiated":1,"relay_version":"eof-fixture","session_id":"%s"}}}\n' "$id" "$1"
+if IFS= read -r _; then exit 9; fi
+: > "$2"
+"#;
+        let spec = CommandSpec::new(
+            "sh",
+            [
+                "-c".to_owned(),
+                script.to_owned(),
+                "hel-relay-eof-fixture".to_owned(),
+                SESSION_ID.to_owned(),
+                eof.to_string_lossy().into_owned(),
+            ],
+        )
+        .purpose("relay proxy EOF fixture");
+        let client = RelayClient::connect_with_timeout(&spec, SESSION_ID, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !eof.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("proxy launcher was killed before it observed stdin EOF");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn controller_rejects_negotiated_protocol_outside_supported_range() {
+        let future_protocol = RELAY_PROTOCOL_VERSION + 1;
         let script = format!(
             r#"python3 -c '
 import json, sys
@@ -1285,12 +1398,12 @@ session = {session:?}
 req = json.loads(sys.stdin.readline())
 print(json.dumps({{
     "request_id": req["request_id"],
-    "protocol_version": 5,
+    "protocol_version": {future_protocol},
     "result": "ok",
     "payload": {{
         "type": "hello",
         "data": {{
-            "negotiated": 5,
+            "negotiated": {future_protocol},
             "relay_version": "future",
             "session_id": session,
         }},
@@ -1298,17 +1411,18 @@ print(json.dumps({{
 }}), flush=True)
 sys.stdin.read()
 '"#,
-            session = SESSION_ID
+            session = SESSION_ID,
+            future_protocol = future_protocol,
         );
         let spec = CommandSpec::new("sh", ["-c", &script]).purpose("future relay fixture");
         let error = RelayClient::connect_with_timeout(&spec, SESSION_ID, Duration::from_secs(5))
             .await
             .err()
-            .expect("protocol 5 hello must be rejected");
+            .expect("a future protocol hello must be rejected");
         assert!(
-            error
-                .to_string()
-                .contains("negotiated unsupported protocol 5"),
+            error.to_string().contains(&format!(
+                "negotiated unsupported protocol {future_protocol}"
+            )),
             "{error:#}"
         );
         // The transport carried the answer perfectly well; restarting the
@@ -1329,6 +1443,7 @@ sys.stdin.read()
             .expect("a proxy that exits cannot complete hello");
 
         assert!(RelayTransportDead::marks(&error), "{error:#}");
+        assert!(RelayTransportDead::marks_failed_handshake(&error));
     }
 
     #[cfg(unix)]
@@ -1345,6 +1460,7 @@ sys.stdin.read()
         assert!(error.to_string().contains("relay hello timed out"));
         // A handshake that never answers means the transport carries nothing.
         assert!(RelayTransportDead::marks(&error), "{error:#}");
+        assert!(RelayTransportDead::marks_failed_handshake(&error));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -1439,7 +1555,7 @@ cat > /dev/null
         });
         let mut reader = BufReader::new(reader);
 
-        let error = read_bounded_frame_with_limit(&mut reader, 8)
+        let error = read_bounded_frame_with_limit(&mut reader, 8, ExchangeKind::Call)
             .await
             .unwrap_err();
 
@@ -1457,9 +1573,12 @@ cat > /dev/null
         drop(writer);
         let mut reader = BufReader::new(reader);
 
-        let error = read_bounded_frame(&mut reader).await.unwrap_err();
+        let error = read_bounded_frame(&mut reader, ExchangeKind::Call)
+            .await
+            .unwrap_err();
 
         assert!(RelayTransportDead::marks(&error), "{error:#}");
+        assert!(!RelayTransportDead::marks_failed_handshake(&error));
     }
 
     #[test]

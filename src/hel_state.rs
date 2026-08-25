@@ -1213,8 +1213,11 @@ pub fn harness_session_title(events: &[SequencedEvent]) -> Option<String> {
     })
 }
 
-pub(crate) fn normalize_session_title(title: &str) -> Option<String> {
-    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
+pub fn normalize_session_title(title: &str) -> Option<String> {
+    let normalized = crate::hel_worker::strip_hidden_prompt_context(title)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     (!normalized.is_empty()).then_some(normalized)
 }
 
@@ -1841,6 +1844,38 @@ mod tests {
         }];
 
         assert_eq!(harness_session_title(&events), None);
+    }
+
+    #[test]
+    fn harness_title_elides_hidden_context_instead_of_naming_the_session_from_it() {
+        let titled = |title: &str| SequencedEvent {
+            seq: 1,
+            recorded_at_ms: None,
+            request_id: None,
+            event: WorkerEvent::Adapter {
+                kind: "session_update".into(),
+                payload: serde_json::json!({
+                    "type": "session_update",
+                    "update": {
+                        "sessionUpdate": "session_title",
+                        "title": title
+                    }
+                }),
+            },
+        };
+
+        assert_eq!(
+            harness_session_title(&[titled(concat!(
+                "<hel-project-memory>private</hel-project-memory> ",
+                "Visible session name"
+            ))])
+            .as_deref(),
+            Some("Visible session name")
+        );
+        assert_eq!(
+            harness_session_title(&[titled("<hel-project-memory>truncated")]),
+            None
+        );
     }
 
     #[test]
