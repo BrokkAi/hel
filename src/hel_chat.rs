@@ -36,6 +36,8 @@ use sha2::{Digest, Sha256};
 
 use crate::clock::epoch_seconds;
 use crate::hel_acp::{RuntimeEvent, find_session_config_option, select_contains};
+use crate::hel_config::HarnessKind;
+use crate::hel_elicitation::ElicitationValue;
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
@@ -110,6 +112,12 @@ pub enum ChatAction {
     SetSessionMode {
         mode_id: String,
     },
+    PlanCommand {
+        original: String,
+        control: PlanControl,
+        requested_active: bool,
+        prompt: Option<String>,
+    },
     Cancel,
     RespondElicitation {
         request: ElicitationRequest,
@@ -125,10 +133,23 @@ pub enum ChatAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanControl {
+    SetConfig { key: String, value: String },
+    SetSessionMode { mode_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedPrompt {
     id: String,
     text: String,
     kind: QueuedCommandKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanReviewFollowup {
+    desired_active: bool,
+    control: Option<PlanControl>,
+    prompt: Option<String>,
 }
 
 impl QueuedPrompt {
@@ -273,6 +294,8 @@ pub struct ChatState {
     /// Latest ACP session mode, from `current_mode_update` by way of the
     /// projection, or set optimistically when Hel asks for a change.
     current_mode: Option<String>,
+    harness_kind: Option<HarnessKind>,
+    plan_command_pending: bool,
     agent_commands: Vec<AvailableCommand>,
     command_choices: Vec<CommandChoice>,
     model_values: Vec<ConfigValueChoice>,
@@ -343,6 +366,8 @@ impl ChatState {
                 .get("mode")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            harness_kind: None,
+            plan_command_pending: false,
             agent_commands: Vec::new(),
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
@@ -508,9 +533,14 @@ impl ChatState {
         // `current_mode_update` lands in the projected configuration. Only
         // overwrite when it is there, so an optimistic toggle survives until
         // the agent confirms it.
+        let plan_mode_key = if self.harness_kind == Some(HarnessKind::Codex) {
+            "collaboration_mode"
+        } else {
+            "mode"
+        };
         if let Some(mode) = session
             .configuration
-            .get("mode")
+            .get(plan_mode_key)
             .and_then(serde_json::Value::as_str)
         {
             self.current_mode = Some(mode.to_owned());
@@ -618,31 +648,39 @@ impl ChatState {
     pub fn set_session_modes(&mut self, modes: Option<SessionModeState>) {
         let changed = self.session_modes != modes;
         self.session_modes = modes;
-        if find_session_config_option(&self.config_options, "mode").is_none()
-            && (changed || self.current_mode.is_none())
-        {
+        if changed || self.current_mode.is_none() {
+            self.set_plan_mode_from_surfaces();
+        }
+        self.rebuild_command_choices();
+    }
+
+    pub fn set_harness_kind(&mut self, harness_kind: HarnessKind) {
+        self.harness_kind = Some(harness_kind);
+        self.set_plan_mode_from_surfaces();
+        self.rebuild_command_choices();
+    }
+
+    fn set_plan_mode_from_surfaces(&mut self) {
+        let config_key = match self.harness_kind {
+            Some(HarnessKind::Codex) => "collaboration_mode",
+            Some(HarnessKind::Claude | HarnessKind::Kimi) => "mode",
+            _ => "mode",
+        };
+        if let Some(value) = config_current_value(&self.config_options, config_key) {
+            self.current_mode = Some(value);
+        } else if self.harness_kind != Some(HarnessKind::Codex) {
             self.current_mode = self
                 .session_modes
                 .as_ref()
                 .map(|modes| modes.current_mode_id.to_string());
         }
-        self.rebuild_command_choices();
     }
 
-    /// Whether Hel should synthesize `/plan`. An agent command wins; otherwise
-    /// stabilized config options win over the legacy session mode catalogue.
     fn supports_plan_mode(&self) -> bool {
-        if self
-            .agent_commands
-            .iter()
-            .any(|command| command.name.trim().eq_ignore_ascii_case("plan"))
-        {
-            return false;
-        }
-        if let Some(option) = find_session_config_option(&self.config_options, "mode") {
-            return select_contains(&option.kind, "plan")
-                && select_contains(&option.kind, "default");
-        }
+        self.plan_control(true).is_ok()
+    }
+
+    fn advertised_plan_modes(&self) -> bool {
         self.session_modes.as_ref().is_some_and(|modes| {
             ["plan", "default"].into_iter().all(|desired| {
                 modes
@@ -653,8 +691,116 @@ impl ChatState {
         })
     }
 
+    fn config_has_plan_pair(&self, key: &str) -> bool {
+        find_session_config_option(&self.config_options, key).is_some_and(|option| {
+            select_contains(&option.kind, "plan") && select_contains(&option.kind, "default")
+        })
+    }
+
+    fn exact_config_has_plan_pair(&self, key: &str) -> bool {
+        self.config_options.iter().any(|option| {
+            option.id.to_string() == key
+                && select_contains(&option.kind, "plan")
+                && select_contains(&option.kind, "default")
+        })
+    }
+
+    fn plan_control(&self, active: bool) -> Result<PlanControl, &'static str> {
+        let value = if active { "plan" } else { "default" };
+        match self.harness_kind {
+            Some(HarnessKind::Deepseek) => Err("Plan mode is unsupported in DSH."),
+            Some(HarnessKind::Codex) => self
+                .exact_config_has_plan_pair("collaboration_mode")
+                .then(|| PlanControl::SetConfig {
+                    key: "collaboration_mode".into(),
+                    value: value.into(),
+                })
+                .ok_or("This Codex ACP version does not expose collaboration_mode with plan/default values."),
+            Some(HarnessKind::Claude | HarnessKind::Kimi) => {
+                if self.exact_config_has_plan_pair("mode") {
+                    Ok(PlanControl::SetConfig {
+                        key: "mode".into(),
+                        value: value.into(),
+                    })
+                } else if self.advertised_plan_modes() {
+                    Ok(PlanControl::SetSessionMode { mode_id: value.into() })
+                } else {
+                    Err("This ACP harness does not expose compatible plan/default modes.")
+                }
+            }
+            Some(HarnessKind::Grok) => Ok(PlanControl::SetSessionMode {
+                mode_id: value.into(),
+            }),
+            None => {
+                if self.config_has_plan_pair("mode") {
+                    Ok(PlanControl::SetConfig {
+                        key: "mode".into(),
+                        value: value.into(),
+                    })
+                } else if self.advertised_plan_modes() {
+                    Ok(PlanControl::SetSessionMode { mode_id: value.into() })
+                } else {
+                    Err("This ACP harness does not expose compatible plan/default modes.")
+                }
+            }
+        }
+    }
+
     fn plan_mode_active(&self) -> bool {
         self.supports_plan_mode() && self.current_mode.as_deref() == Some("plan")
+    }
+
+    fn plan_review_followup(
+        &self,
+        request: &ElicitationRequest,
+        response: &ElicitationResponse,
+    ) -> Option<PlanReviewFollowup> {
+        if !request.id.starts_with("plan-review-") {
+            return None;
+        }
+        let ElicitationResponse::Accept { content } = response else {
+            return Some(PlanReviewFollowup {
+                desired_active: true,
+                control: None,
+                prompt: None,
+            });
+        };
+        let action = match content.get("action") {
+            Some(ElicitationValue::String(action)) => action.as_str(),
+            _ => "keep_planning",
+        };
+        let feedback = match content.get("feedback") {
+            Some(ElicitationValue::String(feedback)) if !feedback.trim().is_empty() => {
+                Some(feedback.clone())
+            }
+            _ => None,
+        };
+        Some(match action {
+            "implement" => PlanReviewFollowup {
+                desired_active: false,
+                control: None,
+                prompt: None,
+            },
+            "exit" => PlanReviewFollowup {
+                desired_active: false,
+                control: self.plan_control(false).ok(),
+                prompt: None,
+            },
+            "revise" => PlanReviewFollowup {
+                desired_active: true,
+                control: None,
+                // Grok carries feedback in its native response. Standard ACP
+                // permission responses cannot, so send it as the next planning turn.
+                prompt: (!request.id.starts_with("plan-review-grok-"))
+                    .then_some(feedback)
+                    .flatten(),
+            },
+            _ => PlanReviewFollowup {
+                desired_active: true,
+                control: None,
+                prompt: None,
+            },
+        })
     }
 
     /// Names this session in the header and places its line among the other
@@ -991,6 +1137,10 @@ impl ChatState {
         if prompt.is_empty() {
             return ChatAction::None;
         }
+        if self.plan_command_pending {
+            self.set_notice("A plan-mode transition is still in progress");
+            return ChatAction::None;
+        }
         if let Some(command) = prompt.strip_prefix('!') {
             if command.trim().is_empty() {
                 self.set_notice("usage: !<bash command>");
@@ -1040,32 +1190,87 @@ impl ChatState {
                     }
                 }
                 LocalCommand::Plan => {
-                    if !self.supports_plan_mode() {
-                        return self.submit_prompt(prompt);
-                    }
-                    let requested = match args.to_ascii_lowercase().as_str() {
-                        "" => !self.plan_mode_active(),
-                        "on" => true,
-                        "off" => false,
-                        _ => {
-                            self.set_notice("usage: /plan [on|off]");
-                            return ChatAction::None;
-                        }
+                    let (requested, followup) = match args.to_ascii_lowercase().as_str() {
+                        "" => (!self.plan_mode_active(), None),
+                        "on" => (true, None),
+                        "off" => (false, None),
+                        _ => (true, Some(args.to_owned())),
                     };
                     if self.phase != WorkerPhase::Idle {
                         self.set_notice("/plan is only available while the agent is idle");
                         return ChatAction::None;
                     }
+                    if requested && self.plan_mode_active() {
+                        if let Some(followup) = followup {
+                            return self.submit_prompt_with_history(followup, prompt);
+                        }
+                        self.record_prompt_history(&prompt);
+                        self.clear_input();
+                        self.set_notice("Plan mode is already on");
+                        return ChatAction::None;
+                    }
+                    if !requested && !self.plan_mode_active() && args.eq_ignore_ascii_case("off") {
+                        self.record_prompt_history(&prompt);
+                        self.clear_input();
+                        self.set_notice("Plan mode is already off");
+                        return ChatAction::None;
+                    }
+                    let control = match self.plan_control(requested) {
+                        Ok(control) => control,
+                        Err(message) => {
+                            self.set_notice(message);
+                            return ChatAction::None;
+                        }
+                    };
+                    self.record_prompt_history(&prompt);
                     self.clear_input();
-                    let mode_id = if requested { "plan" } else { "default" };
-                    self.current_mode = Some(mode_id.to_owned());
+                    self.current_mode = Some(if requested { "plan" } else { "default" }.into());
+                    self.plan_command_pending = true;
                     self.set_notice(if requested {
                         "Plan mode on"
                     } else {
                         "Plan mode off"
                     });
-                    ChatAction::SetSessionMode {
-                        mode_id: mode_id.to_owned(),
+                    ChatAction::PlanCommand {
+                        original: prompt,
+                        control,
+                        requested_active: requested,
+                        prompt: followup,
+                    }
+                }
+                LocalCommand::Implement => {
+                    if let Err(message) = self.plan_control(false) {
+                        self.set_notice(message);
+                        return ChatAction::None;
+                    }
+                    let instruction = if args.is_empty() {
+                        "Implement the approved plan.".to_owned()
+                    } else {
+                        args.to_owned()
+                    };
+                    if !self.plan_mode_active() {
+                        return self.submit_prompt_with_history(instruction, prompt);
+                    }
+                    if self.phase != WorkerPhase::Idle {
+                        self.set_notice("/implement is only available while the agent is idle");
+                        return ChatAction::None;
+                    }
+                    let control = match self.plan_control(false) {
+                        Ok(control) => control,
+                        Err(message) => {
+                            self.set_notice(message);
+                            return ChatAction::None;
+                        }
+                    };
+                    self.record_prompt_history(&prompt);
+                    self.clear_input();
+                    self.current_mode = Some("default".into());
+                    self.plan_command_pending = true;
+                    ChatAction::PlanCommand {
+                        original: prompt,
+                        control,
+                        requested_active: false,
+                        prompt: Some(instruction),
                     }
                 }
             };
@@ -1074,11 +1279,15 @@ impl ChatState {
     }
 
     fn submit_prompt(&mut self, prompt: String) -> ChatAction {
+        self.submit_prompt_with_history(prompt.clone(), prompt)
+    }
+
+    fn submit_prompt_with_history(&mut self, prompt: String, history: String) -> ChatAction {
         if matches!(self.phase, WorkerPhase::Closing | WorkerPhase::Closed) {
             self.set_notice("The worker is closing; this prompt was not sent");
             return ChatAction::None;
         }
-        self.record_prompt_history(&prompt);
+        self.record_prompt_history(&history);
         self.clear_input();
         ChatAction::Prompt(prompt)
     }
@@ -1564,7 +1773,9 @@ impl ChatState {
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.set_config_options(&update.config_options);
             }
-            SessionUpdate::CurrentModeUpdate(update) => {
+            SessionUpdate::CurrentModeUpdate(update)
+                if self.harness_kind != Some(HarnessKind::Codex) =>
+            {
                 self.current_mode = Some(update.current_mode_id.to_string());
                 if let Some(modes) = self.session_modes.as_mut() {
                     modes.current_mode_id = update.current_mode_id;
@@ -1805,7 +2016,7 @@ fn last_nonempty_line(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::hel_chat::test_support::{
-        advertise, ctrl, grok_chat, key, mode_config_option, queued, snapshot,
+        advertise, ctrl, grok_chat, key, mode_config_option, queued, select_config_option, snapshot,
     };
     use crate::hel_worker::ActivePrompt;
 
@@ -2305,18 +2516,29 @@ mod tests {
 
         assert_eq!(
             chat.submit_input(),
-            ChatAction::SetSessionMode {
-                mode_id: "plan".into()
+            ChatAction::PlanCommand {
+                original: "/plan".into(),
+                control: PlanControl::SetSessionMode {
+                    mode_id: "plan".into()
+                },
+                requested_active: true,
+                prompt: None,
             }
         );
         assert!(chat.input.is_empty());
         assert!(chat.notices.current().unwrap().contains("Plan mode on"));
 
+        chat.plan_command_pending = false;
         chat.set_input("/plan".into());
         assert_eq!(
             chat.submit_input(),
-            ChatAction::SetSessionMode {
-                mode_id: "default".into()
+            ChatAction::PlanCommand {
+                original: "/plan".into(),
+                control: PlanControl::SetSessionMode {
+                    mode_id: "default".into()
+                },
+                requested_active: false,
+                prompt: None,
             }
         );
         assert!(chat.notices.current().unwrap().contains("Plan mode off"));
@@ -2326,25 +2548,24 @@ mod tests {
     fn plan_accepts_explicit_on_and_off_arguments() {
         let mut chat = grok_chat();
         chat.set_input("/plan off".into());
-        assert_eq!(
-            chat.submit_input(),
-            ChatAction::SetSessionMode {
-                mode_id: "default".into()
-            }
-        );
+        assert_eq!(chat.submit_input(), ChatAction::None);
 
         chat.set_input("/plan ON".into());
         assert_eq!(
             chat.submit_input(),
-            ChatAction::SetSessionMode {
-                mode_id: "plan".into()
+            ChatAction::PlanCommand {
+                original: "/plan ON".into(),
+                control: PlanControl::SetSessionMode {
+                    mode_id: "plan".into()
+                },
+                requested_active: true,
+                prompt: None,
             }
         );
 
+        chat.plan_command_pending = false;
         chat.set_input("/plan sideways".into());
-        assert_eq!(chat.submit_input(), ChatAction::None);
-        assert!(chat.notices.current().unwrap().contains("usage: /plan"));
-        assert_eq!(chat.input, "/plan sideways", "a misuse keeps the input");
+        assert_eq!(chat.submit_input(), ChatAction::Prompt("sideways".into()));
     }
 
     #[test]
@@ -2355,19 +2576,31 @@ mod tests {
 
         assert_eq!(
             chat.submit_input(),
-            ChatAction::SetSessionMode {
-                mode_id: "plan".into()
+            ChatAction::PlanCommand {
+                original: "/plan".into(),
+                control: PlanControl::SetConfig {
+                    key: "mode".into(),
+                    value: "plan".into()
+                },
+                requested_active: true,
+                prompt: None,
             }
         );
     }
 
     #[test]
-    fn a_mode_config_option_without_the_plan_pair_disables_the_legacy_shim() {
+    fn grok_uses_its_trusted_set_mode_fallback_even_with_an_unrelated_mode_config() {
         let mut chat = grok_chat();
         chat.set_config_options(&[mode_config_option("default", &["default", "act"])]);
         chat.set_input("/plan".into());
 
-        assert_eq!(chat.submit_input(), ChatAction::Prompt("/plan".into()));
+        assert!(matches!(
+            chat.submit_input(),
+            ChatAction::PlanCommand {
+                control: PlanControl::SetSessionMode { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2378,7 +2611,7 @@ mod tests {
         chat.set_input("/plan".into());
         assert!(matches!(
             chat.submit_input(),
-            ChatAction::SetSessionMode { .. }
+            ChatAction::PlanCommand { .. }
         ));
 
         chat.set_config_options(&options);
@@ -2387,23 +2620,176 @@ mod tests {
     }
 
     #[test]
-    fn plan_falls_back_to_a_prompt_when_the_agent_advertises_its_own_command() {
+    fn an_agent_plan_command_does_not_override_hels_unified_command() {
         let mut chat = grok_chat();
         advertise(&mut chat, 1, &["plan"]);
         chat.set_input("/plan the migration".into());
 
         assert_eq!(
             chat.submit_input(),
-            ChatAction::Prompt("/plan the migration".into())
+            ChatAction::PlanCommand {
+                original: "/plan the migration".into(),
+                control: PlanControl::SetSessionMode {
+                    mode_id: "plan".into()
+                },
+                requested_active: true,
+                prompt: Some("the migration".into()),
+            }
         );
     }
 
     #[test]
-    fn plan_stays_a_prompt_without_an_advertised_mode_surface() {
+    fn plan_is_kept_local_without_a_compatible_mode_surface() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.set_input("/plan".into());
 
-        assert_eq!(chat.submit_input(), ChatAction::Prompt("/plan".into()));
+        assert_eq!(chat.submit_input(), ChatAction::None);
+        assert_eq!(chat.input, "/plan");
+        assert!(chat.notices.current().unwrap().contains("does not expose"));
+    }
+
+    #[test]
+    fn codex_plan_uses_collaboration_mode_not_the_permission_mode() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_harness_kind(HarnessKind::Codex);
+        chat.set_config_options(&[
+            select_config_option("mode", "read-only", &["read-only", "full-access"]),
+            select_config_option("collaboration_mode", "default", &["default", "plan"]),
+        ]);
+        chat.set_input("/plan inspect the migration".into());
+
+        assert_eq!(
+            chat.submit_input(),
+            ChatAction::PlanCommand {
+                original: "/plan inspect the migration".into(),
+                control: PlanControl::SetConfig {
+                    key: "collaboration_mode".into(),
+                    value: "plan".into(),
+                },
+                requested_active: true,
+                prompt: Some("inspect the migration".into()),
+            }
+        );
+        assert_eq!(
+            chat.prompt_history.last().map(String::as_str),
+            Some("/plan inspect the migration")
+        );
+    }
+
+    #[test]
+    fn claude_and_kimi_prefer_the_exact_mode_config() {
+        for harness in [HarnessKind::Claude, HarnessKind::Kimi] {
+            let mut chat = ChatState::new(&snapshot(), &[]);
+            chat.set_harness_kind(harness);
+            chat.set_config_options(&[select_config_option(
+                "mode",
+                "default",
+                &["default", "plan"],
+            )]);
+            chat.set_input("/plan".into());
+            assert!(matches!(
+                chat.submit_input(),
+                ChatAction::PlanCommand {
+                    control: PlanControl::SetConfig { ref key, .. },
+                    ..
+                } if key == "mode"
+            ));
+        }
+    }
+
+    #[test]
+    fn grok_uses_set_mode_without_advertising_modes() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_harness_kind(HarnessKind::Grok);
+        chat.set_input("/plan".into());
+        assert!(matches!(
+            chat.submit_input(),
+            ChatAction::PlanCommand {
+                control: PlanControl::SetSessionMode { ref mode_id },
+                ..
+            } if mode_id == "plan"
+        ));
+    }
+
+    #[test]
+    fn deepseek_rejects_plan_and_implement_locally() {
+        let mut chat = grok_chat();
+        chat.set_harness_kind(HarnessKind::Deepseek);
+        for command in ["/plan design it", "/implement"] {
+            chat.set_input(command.into());
+            assert_eq!(chat.submit_input(), ChatAction::None);
+            assert_eq!(chat.input, command);
+            assert!(
+                chat.notices
+                    .current()
+                    .unwrap()
+                    .contains("unsupported in DSH")
+            );
+        }
+    }
+
+    #[test]
+    fn implement_exits_plan_mode_before_submitting_the_instruction() {
+        let mut chat = grok_chat();
+        chat.current_mode = Some("plan".into());
+        chat.set_input("/implement start with the parser".into());
+        assert_eq!(
+            chat.submit_input(),
+            ChatAction::PlanCommand {
+                original: "/implement start with the parser".into(),
+                control: PlanControl::SetSessionMode {
+                    mode_id: "default".into()
+                },
+                requested_active: false,
+                prompt: Some("start with the parser".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_review_choices_have_distinct_followup_directions() {
+        let mut chat = grok_chat();
+        chat.current_mode = Some("plan".into());
+        let standard = ElicitationRequest {
+            id: "plan-review-1".into(),
+            message: "review".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+        };
+        let response = |action: &str, feedback: Option<&str>| {
+            let mut content = BTreeMap::new();
+            content.insert("action".into(), ElicitationValue::String(action.into()));
+            if let Some(feedback) = feedback {
+                content.insert("feedback".into(), ElicitationValue::String(feedback.into()));
+            }
+            ElicitationResponse::Accept { content }
+        };
+
+        assert_eq!(
+            chat.plan_review_followup(&standard, &response("implement", None)),
+            Some(PlanReviewFollowup {
+                desired_active: false,
+                control: None,
+                prompt: None,
+            })
+        );
+        assert_eq!(
+            chat.plan_review_followup(&standard, &response("revise", Some("add tests"))),
+            Some(PlanReviewFollowup {
+                desired_active: true,
+                control: None,
+                prompt: Some("add tests".into()),
+            })
+        );
+        assert!(matches!(
+            chat.plan_review_followup(&standard, &response("exit", None)),
+            Some(PlanReviewFollowup {
+                desired_active: false,
+                control: Some(PlanControl::SetSessionMode { .. }),
+                prompt: None,
+            })
+        ));
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub(super) enum LocalCommand {
     Model,
     Effort,
     Plan,
+    Implement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,13 +150,20 @@ impl ChatState {
             commands.push(CommandChoice {
                 name: "plan".to_owned(),
                 description: "toggle plan mode".to_owned(),
-                input_hint: Some("on|off".to_owned()),
+                input_hint: Some("message".to_owned()),
+                source: CommandSource::Hel,
+            });
+            commands.push(CommandChoice {
+                name: "implement".to_owned(),
+                description: "leave plan mode and implement".to_owned(),
+                input_hint: Some("instruction".to_owned()),
                 source: CommandSource::Hel,
             });
         }
         for command in &self.agent_commands {
             let name = command.name.trim();
             if name.is_empty()
+                || matches!(name.to_ascii_lowercase().as_str(), "plan" | "implement")
                 || commands
                     .iter()
                     .any(|existing| existing.name.eq_ignore_ascii_case(name))
@@ -183,11 +191,7 @@ impl ChatState {
         self.current_model = config_current_value(options, "model");
         self.current_effort = config_current_value(options, "effort");
         if changed || self.current_mode.is_none() {
-            self.current_mode = config_current_value(options, "mode").or_else(|| {
-                self.session_modes
-                    .as_ref()
-                    .map(|modes| modes.current_mode_id.to_string())
-            });
+            self.set_plan_mode_from_surfaces();
         }
         self.model_values = config_values(options, "model");
         self.effort_values = config_values(options, "effort");
@@ -296,6 +300,7 @@ pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> 
         "model" => LocalCommand::Model,
         "effort" => LocalCommand::Effort,
         "plan" => LocalCommand::Plan,
+        "implement" => LocalCommand::Implement,
         _ => return None,
     };
     Some((command, args))
@@ -501,7 +506,8 @@ mod tests {
         }
 
         assert!(
-            chat.command_choices
+            !chat
+                .command_choices
                 .iter()
                 .any(|command| command.name == "plan")
         );
@@ -514,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_plan_and_goal_commands_are_forwarded_unchanged() {
+    fn advertised_plan_is_owned_by_hel_while_other_agent_commands_are_forwarded() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.apply_session_update(
             1,
@@ -527,7 +533,8 @@ mod tests {
             }),
         );
         assert!(
-            chat.command_choices
+            !chat
+                .command_choices
                 .iter()
                 .any(|command| command.name == "plan")
         );
@@ -538,10 +545,8 @@ mod tests {
         );
 
         chat.input = "/plan".into();
-        assert_eq!(
-            chat.handle_key(key(KeyCode::Enter)),
-            ChatAction::Prompt("/plan".into())
-        );
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.input, "/plan");
 
         chat.input = "/goal ship the release".into();
         assert_eq!(
@@ -577,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_is_listed_as_a_hel_command_only_where_it_is_a_shim() {
+    fn plan_is_listed_as_a_hel_command_for_supported_surfaces() {
         let lists_plan = |chat: &ChatState| {
             chat.command_choices
                 .iter()
@@ -587,14 +592,25 @@ mod tests {
         let mut chat = grok_chat();
         assert!(lists_plan(&chat));
 
-        // Once the agent advertises `plan`, Hel steps out of the way.
+        // The adapter's command never replaces Hel's cross-profile contract.
         advertise(&mut chat, 1, &["plan"]);
-        assert!(!lists_plan(&chat));
+        assert!(lists_plan(&chat));
 
         assert!(!lists_plan(&ChatState::new(&snapshot(), &[])));
 
         let mut config_mode = ChatState::new(&snapshot(), &[]);
         config_mode.set_config_options(&[mode_config_option("default", &["default", "plan"])]);
         assert!(lists_plan(&config_mode));
+
+        let mut deepseek = grok_chat();
+        deepseek.set_harness_kind(crate::hel_config::HarnessKind::Deepseek);
+        advertise(&mut deepseek, 2, &["plan", "implement"]);
+        assert!(!lists_plan(&deepseek));
+        assert!(
+            !deepseek
+                .command_choices
+                .iter()
+                .any(|command| { matches!(command.name.as_str(), "plan" | "implement") })
+        );
     }
 }

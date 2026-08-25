@@ -8,7 +8,7 @@ use crate::hel_session_manager::ManagedSessionHandle;
 use crate::hel_state::{QueuedCommandKind, config_command_text};
 use crate::hel_worker::RelayCommand;
 
-use super::{ChatState, QueuedPrompt, queued_prompt_preview};
+use super::{ChatState, PlanControl, PlanReviewFollowup, QueuedPrompt, queued_prompt_preview};
 
 const CHAT_REMOTE_QUEUE_CAPACITY: usize = 32;
 
@@ -40,6 +40,15 @@ pub(super) enum ChatRemoteOperation {
         command_id: String,
         mode_id: String,
     },
+    PlanCommand {
+        command_id: String,
+        original: String,
+        control: PlanControl,
+        requested_active: bool,
+        prompt: Option<String>,
+        session_id: String,
+        bundle_id: String,
+    },
     Cancel {
         command_id: String,
         cancel_agent: bool,
@@ -48,6 +57,9 @@ pub(super) enum ChatRemoteOperation {
     RespondElicitation {
         request: ElicitationRequest,
         response: ElicitationResponse,
+        plan_followup: Option<PlanReviewFollowup>,
+        session_id: String,
+        bundle_id: String,
     },
 }
 
@@ -78,9 +90,17 @@ pub(super) enum ChatRemoteResult {
         mode_id: String,
         result: std::result::Result<(), String>,
     },
+    PlanCommand {
+        original: String,
+        requested_active: bool,
+        control_applied: bool,
+        result: std::result::Result<Option<u64>, String>,
+    },
     Cancel(std::result::Result<(), String>),
     RespondElicitation {
         request: ElicitationRequest,
+        desired_plan_active: Option<bool>,
+        answered: bool,
         result: std::result::Result<(), String>,
     },
     WorkerFailed(String),
@@ -103,6 +123,9 @@ impl ChatRemoteResult {
                 result: Err(error), ..
             }
             | Self::SetSessionMode {
+                result: Err(error), ..
+            }
+            | Self::PlanCommand {
                 result: Err(error), ..
             }
             | Self::Cancel(Err(error))
@@ -543,6 +566,89 @@ async fn enqueue_chat_remote_operation(
                 }
             }
         }
+        ChatRemoteOperation::PlanCommand {
+            command_id,
+            original,
+            control,
+            requested_active,
+            prompt,
+            session_id,
+            bundle_id,
+        } => {
+            let session = session.clone();
+            let results = results.clone();
+            let attached = attached.clone();
+            pending.spawn(async move {
+                let mut control_applied = false;
+                let control_command = match control {
+                    PlanControl::SetConfig { key, value } => RelayCommand::SetConfig { key, value },
+                    PlanControl::SetSessionMode { mode_id } => {
+                        RelayCommand::SetSessionMode { mode_id }
+                    }
+                };
+                let result = async {
+                    session
+                        .enqueue_submit(command_id.clone(), control_command)
+                        .await
+                        .map_err(|error| format!("{error:#}"))?
+                        .wait()
+                        .await
+                        .map_err(|error| format!("{error:#}"))?;
+                    control_applied = true;
+                    let Some(text) = prompt else {
+                        return Ok(None);
+                    };
+                    let ordinal = session
+                        .enqueue_submit(
+                            format!("{command_id}-prompt"),
+                            RelayCommand::Prompt {
+                                prompt: vec![ContentBlock::Text(TextContent::new(text.clone()))],
+                            },
+                        )
+                        .await
+                        .map_err(|error| {
+                            format!("mode changed, but prompt was not queued: {error:#}")
+                        })?
+                        .wait()
+                        .await
+                        .map_err(|error| format!("mode changed, but prompt failed: {error:#}"))?;
+                    let history_text = text;
+                    let history = tokio::task::spawn_blocking(move || {
+                        crate::hel_database::record_prompt(
+                            &session_id,
+                            &bundle_id,
+                            ordinal,
+                            None,
+                            &history_text,
+                        )
+                    })
+                    .await
+                    .map_err(|error| format!("history task failed: {error}"))?
+                    .map_err(|error| {
+                        format!("prompt was sent, but history was not saved: {error:#}")
+                    });
+                    if let Err(error) = history {
+                        publish_chat_remote_result(
+                            &results,
+                            &attached,
+                            ChatRemoteResult::PromptHistoryWarning(error),
+                        );
+                    }
+                    Ok(Some(ordinal))
+                }
+                .await;
+                publish_chat_remote_result(
+                    &results,
+                    &attached,
+                    ChatRemoteResult::PlanCommand {
+                        original,
+                        requested_active,
+                        control_applied,
+                        result,
+                    },
+                );
+            });
+        }
         ChatRemoteOperation::Cancel {
             command_id,
             cancel_agent,
@@ -582,19 +688,93 @@ async fn enqueue_chat_remote_operation(
                 );
             });
         }
-        ChatRemoteOperation::RespondElicitation { request, response } => {
+        ChatRemoteOperation::RespondElicitation {
+            request,
+            response,
+            plan_followup,
+            session_id,
+            bundle_id,
+        } => {
             let session = session.clone();
             let results = results.clone();
             let attached = attached.clone();
             pending.spawn(async move {
-                let result = session
-                    .respond_elicitation(request.id.clone(), response)
-                    .await
-                    .map_err(|error| format!("{error:#}"));
+                let mut answered = false;
+                let desired_plan_active = plan_followup
+                    .as_ref()
+                    .map(|followup| followup.desired_active);
+                let result = async {
+                    session
+                        .respond_elicitation(request.id.clone(), response)
+                        .await
+                        .map_err(|error| format!("{error:#}"))?;
+                    answered = true;
+                    let Some(followup) = plan_followup else {
+                        return Ok(());
+                    };
+                    if let Some(control) = followup.control {
+                        let command = match control {
+                            PlanControl::SetConfig { key, value } => {
+                                RelayCommand::SetConfig { key, value }
+                            }
+                            PlanControl::SetSessionMode { mode_id } => {
+                                RelayCommand::SetSessionMode { mode_id }
+                            }
+                        };
+                        session
+                            .submit(format!("plan-review-{}-mode", request.id), command)
+                            .await
+                            .map_err(|error| {
+                                format!("review answered, but plan mode was not changed: {error:#}")
+                            })?;
+                    }
+                    if let Some(prompt) = followup.prompt {
+                        let ordinal = session
+                            .submit(
+                                format!("plan-review-{}-feedback", request.id),
+                                RelayCommand::Prompt {
+                                    prompt: vec![ContentBlock::Text(TextContent::new(
+                                        prompt.clone(),
+                                    ))],
+                                },
+                            )
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "review answered, but revision feedback was not sent: {error:#}"
+                                )
+                            })?;
+                        let history = tokio::task::spawn_blocking(move || {
+                            crate::hel_database::record_prompt(
+                                &session_id,
+                                &bundle_id,
+                                ordinal,
+                                None,
+                                &prompt,
+                            )
+                        })
+                        .await
+                        .map_err(|error| format!("history task failed: {error}"))?;
+                        if let Err(error) = history {
+                            publish_chat_remote_result(
+                                &results,
+                                &attached,
+                                ChatRemoteResult::PromptHistoryWarning(format!("{error:#}")),
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
                 publish_chat_remote_result(
                     &results,
                     &attached,
-                    ChatRemoteResult::RespondElicitation { request, result },
+                    ChatRemoteResult::RespondElicitation {
+                        request,
+                        desired_plan_active,
+                        answered,
+                        result,
+                    },
                 );
             });
         }
@@ -686,18 +866,60 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
                 "Session mode was not changed to {mode_id}: {error}"
             ));
         }
+        ChatRemoteResult::PlanCommand {
+            requested_active,
+            result: Ok(ordinal),
+            ..
+        } => {
+            chat.plan_command_pending = false;
+            chat.current_mode = Some(if requested_active { "plan" } else { "default" }.into());
+            chat.set_notice(match ordinal {
+                Some(ordinal) => format!("Prompt accepted by relay at {ordinal}"),
+                None if requested_active => "Plan mode on".to_owned(),
+                None => "Plan mode off".to_owned(),
+            });
+        }
+        ChatRemoteResult::PlanCommand {
+            original,
+            requested_active,
+            control_applied,
+            result: Err(error),
+        } => {
+            chat.plan_command_pending = false;
+            chat.current_mode = Some(
+                if control_applied == requested_active {
+                    "plan"
+                } else {
+                    "default"
+                }
+                .into(),
+            );
+            restore_unsent_input(chat, &original);
+            chat.set_notice(format!("Plan command was not completed: {error}"));
+        }
         ChatRemoteResult::Cancel(Ok(())) => chat.set_notice("Cancellation requested"),
         ChatRemoteResult::Cancel(Err(error)) => {
             chat.set_notice(format!("Cancellation failed: {error}"))
         }
-        ChatRemoteResult::RespondElicitation { result: Ok(()), .. } => {
+        ChatRemoteResult::RespondElicitation {
+            desired_plan_active,
+            result: Ok(()),
+            ..
+        } => {
+            if let Some(active) = desired_plan_active {
+                chat.current_mode = Some(if active { "plan" } else { "default" }.into());
+            }
             chat.set_notice("Answer sent")
         }
         ChatRemoteResult::RespondElicitation {
             request,
+            answered,
             result: Err(error),
+            ..
         } => {
-            chat.restore_elicitation(request);
+            if !answered {
+                chat.restore_elicitation(request);
+            }
             chat.set_notice(format!("Answer was not sent: {error}"));
         }
         ChatRemoteResult::WorkerFailed(error) => chat.set_notice(error),
@@ -726,6 +948,15 @@ pub(super) fn queue_chat_remote_operation(
                 restore_unsent_input(chat, &config_command_text(&key, &value));
             }
             ChatRemoteOperation::SetSessionMode { .. } => chat.current_mode = None,
+            ChatRemoteOperation::PlanCommand {
+                original,
+                requested_active,
+                ..
+            } => {
+                chat.plan_command_pending = false;
+                chat.current_mode = Some(if requested_active { "default" } else { "plan" }.into());
+                restore_unsent_input(chat, &original);
+            }
             ChatRemoteOperation::RespondElicitation { request, .. } => {
                 chat.restore_elicitation(request)
             }
@@ -764,6 +995,46 @@ mod tests {
                 .as_deref()
                 .is_some_and(|notice| notice.contains("queue is full"))
         );
+    }
+
+    #[test]
+    fn failed_plan_control_restores_the_full_command_and_rolls_back_mode() {
+        let mut chat = crate::hel_chat::test_support::grok_chat();
+        chat.current_mode = Some("plan".into());
+        chat.plan_command_pending = true;
+
+        apply_chat_remote_result(
+            &mut chat,
+            ChatRemoteResult::PlanCommand {
+                original: "/plan inspect this".into(),
+                requested_active: true,
+                control_applied: false,
+                result: Err("rejected".into()),
+            },
+        );
+
+        assert_eq!(chat.current_mode.as_deref(), Some("default"));
+        assert_eq!(chat.input, "/plan inspect this");
+        assert!(!chat.plan_command_pending);
+    }
+
+    #[test]
+    fn prompt_failure_after_plan_control_keeps_the_requested_mode() {
+        let mut chat = crate::hel_chat::test_support::grok_chat();
+        chat.plan_command_pending = true;
+
+        apply_chat_remote_result(
+            &mut chat,
+            ChatRemoteResult::PlanCommand {
+                original: "/plan inspect this".into(),
+                requested_active: true,
+                control_applied: true,
+                result: Err("mode changed, but prompt failed".into()),
+            },
+        );
+
+        assert_eq!(chat.current_mode.as_deref(), Some("plan"));
+        assert_eq!(chat.input, "/plan inspect this");
     }
 
     #[test]

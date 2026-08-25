@@ -670,6 +670,12 @@ impl ActiveChat {
                     .as_ref()
                     .map_or(&[][..], |snapshot| &snapshot.operational.available_commands),
             );
+            if let Some(harness_kind) = recovery
+                .as_ref()
+                .map(|recovery| recovery.session.harness_kind)
+            {
+                state.set_harness_kind(harness_kind);
+            }
             state.set_session_modes(
                 snapshot
                     .as_ref()
@@ -1012,6 +1018,31 @@ impl ActiveChat {
                     &mut self.state,
                 );
             }
+            ChatAction::PlanCommand {
+                original,
+                control,
+                requested_active,
+                prompt,
+            } => {
+                let Some(command_id) = self.command_id("plan-mode") else {
+                    self.state.plan_command_pending = false;
+                    restore_unsent_input(&mut self.state, &original);
+                    return ChatEventOutcome::Handled;
+                };
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::PlanCommand {
+                        command_id,
+                        original,
+                        control,
+                        requested_active,
+                        prompt,
+                        session_id: self.session.session_id().to_owned(),
+                        bundle_id: self.bundle_id.clone(),
+                    },
+                    &mut self.state,
+                );
+            }
             ChatAction::Cancel => {
                 let Some(command_id) = self.command_id("cancel") else {
                     return ChatEventOutcome::Handled;
@@ -1028,10 +1059,17 @@ impl ActiveChat {
                 );
             }
             ChatAction::RespondElicitation { request, response } => {
+                let plan_followup = self.state.plan_review_followup(&request, &response);
                 self.state.set_notice("Sending answer…");
                 queue_chat_remote_operation(
                     self.remote.operations(),
-                    ChatRemoteOperation::RespondElicitation { request, response },
+                    ChatRemoteOperation::RespondElicitation {
+                        request,
+                        response,
+                        plan_followup,
+                        session_id: self.session.session_id().to_owned(),
+                        bundle_id: self.bundle_id.clone(),
+                    },
                     &mut self.state,
                 );
             }
@@ -1331,12 +1369,16 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
         parts.push("Saving checkpoint…".into());
         parts.push(format!("{queued} queued"));
     } else {
-        match chat.phase {
-            WorkerPhase::Idle => parts.push("Prompt".into()),
-            WorkerPhase::Running if chat.pursuing_goal() => parts.push("Pursuing goal".into()),
-            WorkerPhase::Running => parts.push("Running".into()),
-            WorkerPhase::Closing => parts.push("Closing".into()),
-            WorkerPhase::Closed => parts.push("Closed".into()),
+        if chat.plan_mode_active() {
+            parts.push("Prompt — PLAN MODE".into());
+        } else {
+            match chat.phase {
+                WorkerPhase::Idle => parts.push("Prompt".into()),
+                WorkerPhase::Running if chat.pursuing_goal() => parts.push("Pursuing goal".into()),
+                WorkerPhase::Running => parts.push("Running".into()),
+                WorkerPhase::Closing => parts.push("Closing".into()),
+                WorkerPhase::Closed => parts.push("Closed".into()),
+            }
         }
         if queued > 0 {
             parts.push(format!("{queued} queued"));
@@ -1718,6 +1760,15 @@ mod tests {
         // not a re-introduced session title bar).
         assert!(!rendered.contains("HEL /"));
         assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
+    }
+
+    #[test]
+    fn composer_title_names_plan_mode_even_during_a_turn() {
+        let mut chat = crate::hel_chat::test_support::grok_chat();
+        chat.current_mode = Some("plan".into());
+        chat.phase = WorkerPhase::Running;
+
+        assert!(prompt_title(&chat, 0).contains("Prompt — PLAN MODE"));
     }
 
     #[test]
