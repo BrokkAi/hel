@@ -979,13 +979,7 @@ fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
         })
 }
 
-// ANSI "dark gray" is the bright-black slot in terminal palettes. The black
-// slot supplies the darker neutral used behind every quota bar instead.
-const EMPTY_QUOTA_COLOR: Color = Color::Black;
-
-fn empty_quota_style() -> Style {
-    Style::default().bg(EMPTY_QUOTA_COLOR)
-}
+const EMPTY_QUOTA_COLOR: Color = Color::DarkGray;
 
 fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
     const CELLS: usize = 10;
@@ -1005,11 +999,14 @@ fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
         21..=50 => Color::Yellow,
         _ => Color::Green,
     };
-    let bar_style = empty_quota_style().fg(color).add_modifier(Modifier::BOLD);
+    let bar_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     Line::from(vec![
         Span::styled("█".repeat(full_cells), bar_style),
         Span::styled(partial.to_string(), bar_style),
-        Span::styled(" ".repeat(empty_cells), empty_quota_style()),
+        Span::styled(
+            "░".repeat(empty_cells),
+            Style::default().fg(EMPTY_QUOTA_COLOR),
+        ),
         Span::styled(
             format!(" {remaining:>3}%"),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -1020,8 +1017,9 @@ fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
 fn api_quota_bar() -> Line<'static> {
     Line::from(Span::styled(
         format!("{:^10}", hel::hel_quota::API_LABEL),
-        empty_quota_style()
+        Style::default()
             .fg(Color::White)
+            .bg(EMPTY_QUOTA_COLOR)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -2352,10 +2350,11 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "███████▎    73%"
+            "███████▎░░  73%"
         );
         assert_eq!(bar.spans[0].style.fg, Some(Color::Green));
-        assert_eq!(bar.spans[2].style.bg, Some(EMPTY_QUOTA_COLOR));
+        assert_eq!(bar.spans[2].style.fg, Some(Color::DarkGray));
+        assert_eq!(bar.spans[2].style.bg, None);
         assert!(quota_bar(None).spans.is_empty());
     }
 
@@ -2371,7 +2370,8 @@ mod tests {
             resets_at_epoch_seconds: None,
         }));
         assert_eq!(api.spans[0].content, "   API    ");
-        assert_eq!(api.spans[0].style.bg, depleted.spans[2].style.bg);
+        assert_eq!(api.spans[0].style.bg, depleted.spans[2].style.fg);
+        assert_eq!(depleted.spans[2].style.bg, None);
     }
 
     #[test]
