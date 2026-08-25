@@ -980,6 +980,13 @@ fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
 }
 
 const EMPTY_QUOTA_COLOR: Color = Color::DarkGray;
+// A solid ANSI DarkGray background is much brighter than the same color drawn
+// through the 25%-coverage `░` glyph used for depleted quota. Sampling a
+// terminal screenshot gives DarkGray as (118, 118, 118) over a (12, 12, 12)
+// background, and the glyph covers ~25% of each cell, so the depleted bar
+// reads as 0.25 * 118 + 0.75 * 12 = 38. Match that blend directly.
+#[allow(clippy::disallowed_methods)]
+const API_DEPLETED_BACKGROUND: Color = Color::Rgb(38, 38, 38);
 
 fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
     const CELLS: usize = 10;
@@ -1019,7 +1026,7 @@ fn api_quota_bar() -> Line<'static> {
         format!("{:^10}", hel::hel_quota::API_LABEL),
         Style::default()
             .fg(Color::White)
-            .bg(EMPTY_QUOTA_COLOR)
+            .bg(API_DEPLETED_BACKGROUND)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -2359,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn api_quota_label_uses_the_depleted_bar_background() {
+    fn api_quota_label_uses_the_perceived_depleted_bar_background() {
         let api = api_quota_bar();
         let depleted = quota_bar(Some(&QuotaWindow {
             label: "Week".into(),
@@ -2370,7 +2377,8 @@ mod tests {
             resets_at_epoch_seconds: None,
         }));
         assert_eq!(api.spans[0].content, "   API    ");
-        assert_eq!(api.spans[0].style.bg, depleted.spans[2].style.fg);
+        assert_eq!(api.spans[0].style.bg, Some(API_DEPLETED_BACKGROUND));
+        assert_eq!(depleted.spans[2].style.fg, Some(EMPTY_QUOTA_COLOR));
         assert_eq!(depleted.spans[2].style.bg, None);
     }
 
