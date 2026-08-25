@@ -564,11 +564,17 @@ pub(crate) fn render_new_wizard(
             dashboard,
             ReviewWizardView {
                 profile_id: &nth_key(&dashboard.config.profiles, wizard.profile),
-                bundle_id: if raw_project {
+                project_label: if raw_project {
+                    "Project directory"
+                } else {
+                    "Project"
+                },
+                project: if raw_project {
                     wizard.project_directory.trim()
                 } else {
                     bundle_id.as_deref().expect("bundle selected")
                 },
+                project_note: "",
                 target_id: &target_id,
                 allocation: wizard.resource_allocation.as_ref(),
                 mounts: &wizard.mounts,
@@ -766,7 +772,9 @@ pub(crate) fn render_new_wizard(
 
 struct ReviewWizardView<'a> {
     pub(crate) profile_id: &'a str,
-    pub(crate) bundle_id: &'a str,
+    pub(crate) project_label: &'a str,
+    pub(crate) project: &'a str,
+    pub(crate) project_note: &'a str,
     pub(crate) target_id: &'a str,
     pub(crate) allocation: Option<&'a SessionResourceAllocation>,
     pub(crate) mounts: &'a MountWizard,
@@ -784,7 +792,9 @@ fn render_review_wizard(
 ) {
     let ReviewWizardView {
         profile_id,
-        bundle_id,
+        project_label,
+        project,
+        project_note,
         target_id,
         allocation,
         mounts,
@@ -797,7 +807,7 @@ fn render_review_wizard(
     let can_attach = mount_history_host(target).is_some();
     let mut lines = vec![
         Line::raw(format!("Profile: {profile_id}")),
-        Line::raw(format!("Project: {bundle_id}")),
+        Line::raw(format!("{project_label}: {project}{project_note}")),
         Line::raw(format!("Target: {target_id} ({})", target_label(target))),
         Line::raw(format!(
             "Compute:{}",
@@ -1096,20 +1106,34 @@ pub(crate) fn render_resume_wizard(
             .get(wizard.profile)
             .map(|(id, _)| id.as_str())
             .unwrap_or("unknown");
-        let bundle_id = dashboard
-            .state
-            .sessions
-            .get(&wizard.session_id)
+        let session = dashboard.state.sessions.get(&wizard.session_id);
+        let bundle_id = session
             .map(|session| session.bundle_id.as_str())
             .unwrap_or("unknown");
+        let target_id = nth_key(&dashboard.config.targets, wizard.target);
+        let reused_project_directory = session
+            .filter(|session| {
+                hel::hel_controller::resume_compatibility(session, &dashboard.config, &target_id)
+                    == Ok(hel::hel_controller::ResumePlan::InPlace)
+            })
+            .and_then(|session| session.project_directory.as_deref())
+            .map(|directory| directory.display().to_string());
+        let (project_label, project, project_note) =
+            if let Some(directory) = reused_project_directory.as_deref() {
+                ("Project directory", directory, " (reused)")
+            } else {
+                ("Project", bundle_id, "")
+            };
         render_review_wizard(
             frame,
             area,
             dashboard,
             ReviewWizardView {
                 profile_id,
-                bundle_id,
-                target_id: &nth_key(&dashboard.config.targets, wizard.target),
+                project_label,
+                project,
+                project_note,
+                target_id: &target_id,
                 allocation: wizard.resource_allocation.as_ref(),
                 mounts: &wizard.mounts,
                 focus: wizard.review_focus,
@@ -3144,7 +3168,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Project: /srv/project"));
+        assert!(rendered.contains("Project directory: /srv/project"));
         assert!(!rendered.contains("Attached directories"));
 
         assert_eq!(
@@ -3942,6 +3966,48 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Resume · 3/3"));
+    }
+
+    #[test]
+    fn raw_resume_review_names_the_exact_reused_project_directory() {
+        let mut session = stopped_session();
+        session.target_template_id = "localhost".into();
+        session.project_directory = Some("/mnt/optane/bifrost-fird".into());
+        session.bundle_id = "remote-project-a66373eef659f856".into();
+        let mut config = config();
+        config
+            .targets
+            .insert("localhost".into(), TargetTemplate::LocalBare);
+        let mut dashboard = DashboardState::new(
+            config,
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([(session.id.clone(), session)]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        open_resume_wizard(&mut dashboard);
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw resume review");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("Project directory: /mnt/optane/bifrost-fird (reused)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Project: remote-project-a66373eef659f856"));
     }
 
     #[test]
