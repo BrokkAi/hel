@@ -867,7 +867,7 @@ fn collect_export_native_artifacts(
     match crate::hel_worker_runtime::WorkerLaunchConfig::read(&launch_path) {
         Ok(launch) => {
             if let Some(memory) = launch.project_memory {
-                let root = resolve_target_path(&memory.root)?;
+                let root = resolve_home_relative_target_path(&memory.root)?;
                 anyhow::ensure!(
                     root.starts_with(&spec.harness_home),
                     "project memory replica is outside the harness home"
@@ -1894,6 +1894,21 @@ fn resolve_target_path(path: &Path) -> Result<PathBuf> {
     }
     ensure!(false, "target path must be absolute or start with '~'");
     unreachable!()
+}
+
+/// SSH and EC2 worker launch files use login-home-relative paths, matching the
+/// working directory of their remote commands. Checkpoint collection runs in
+/// the same account but resolves paths explicitly instead of relying on cwd.
+fn resolve_home_relative_target_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute()
+        || path
+            .components()
+            .next()
+            .is_some_and(|part| part.as_os_str() == "~")
+    {
+        return resolve_target_path(path);
+    }
+    resolve_target_path(&Path::new("~").join(path))
 }
 
 #[cfg(unix)]
@@ -2928,6 +2943,18 @@ mod tests {
             artifact.relative_path == Path::new("projects/replica/memory/MEMORY.md")
                 && artifact.data == b"remember this"
         }));
+    }
+
+    #[test]
+    fn project_memory_replica_accepts_an_ssh_home_relative_path() {
+        let relative = Path::new(".local/share/hel/profiles/session/projects/replica/memory");
+        let home = PathBuf::from(std::env::var_os("HOME").expect("test HOME is missing"));
+
+        assert_eq!(
+            resolve_home_relative_target_path(relative).unwrap(),
+            home.join(relative)
+        );
+        assert!(resolve_home_relative_target_path(Path::new("../memory")).is_err());
     }
 
     #[test]
