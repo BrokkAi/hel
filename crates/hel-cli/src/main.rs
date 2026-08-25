@@ -37,7 +37,7 @@ use hel::hel_worker_runtime::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::dashboard::run_dashboard;
+use crate::dashboard::{DashboardExit, run_dashboard};
 use crate::import::{ImportArgs, import};
 use crate::server::{ServerArgs, run_server};
 
@@ -256,8 +256,7 @@ fn install_worker_last_words(root: &std::path::Path) {
     }));
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let is_controller_process = matches!(
         &cli.command,
@@ -279,9 +278,40 @@ async fn main() -> Result<()> {
         )?;
         hel::hel_controller::reconcile_managed_checkpoint_archives()?;
     }
-    match cli.command {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build Tokio runtime")?;
+    let result = runtime.block_on(run_command(cli.command));
+    if matches!(
+        result,
+        Ok(DashboardExit::Detached | DashboardExit::Interrupted)
+    ) {
+        // A dashboard has already drained durable mutations and restored its
+        // terminal. Do not let disposable blocking reads delay process exit.
+        shutdown_dashboard_runtime(runtime);
+        if matches!(result, Ok(DashboardExit::Detached)) {
+            println!(
+                "Active sessions will continue working; Hel will reattach to them on your next invocation."
+            );
+        }
+    } else {
+        drop(runtime);
+    }
+    result.map(|_| ())
+}
+
+fn shutdown_dashboard_runtime(runtime: tokio::runtime::Runtime) {
+    runtime.shutdown_background();
+}
+
+async fn run_command(command: Option<Command>) -> Result<DashboardExit> {
+    match command {
         None => run_dashboard().await,
-        Some(Command::Server(args)) => run_server(args).await,
+        Some(Command::Server(args)) => {
+            run_server(args).await?;
+            Ok(DashboardExit::Normal)
+        }
         Some(Command::Worker(args)) => match args.command {
             WorkerCommand::Run { root, config } => {
                 lead_process_group();
@@ -317,12 +347,15 @@ async fn main() -> Result<()> {
                 repository,
                 service,
             } => hel::hel_git_proxy::run_worker_proxy(&root, &repository, &service).await,
-        },
-        Some(Command::Broker(args)) => hel::hel_git_proxy::run_broker(&args.spec).await,
-        Some(Command::Doctor(args)) => doctor(args),
-        Some(Command::Setup(args)) => setup(args),
-        Some(Command::Import(args)) => import(args),
-        Some(Command::Recover(args)) => recover(args).await,
+        }
+        .map(|()| DashboardExit::Normal),
+        Some(Command::Broker(args)) => hel::hel_git_proxy::run_broker(&args.spec)
+            .await
+            .map(|()| DashboardExit::Normal),
+        Some(Command::Doctor(args)) => doctor(args).map(|()| DashboardExit::Normal),
+        Some(Command::Setup(args)) => setup(args).map(|()| DashboardExit::Normal),
+        Some(Command::Import(args)) => import(args).map(|()| DashboardExit::Normal),
+        Some(Command::Recover(args)) => recover(args).await.map(|()| DashboardExit::Normal),
         Some(Command::Checkpoint(args)) => {
             let mut controller = Controller::load()?;
             let checkpoint = controller.checkpoint_session(&args.session).await?;
@@ -330,9 +363,9 @@ async fn main() -> Result<()> {
                 "saved recovery copy for {} at event {}",
                 args.session, checkpoint.event_frontier
             );
-            Ok(())
+            Ok(DashboardExit::Normal)
         }
-        Some(Command::Login(args)) => login(args).await,
+        Some(Command::Login(args)) => login(args).await.map(|()| DashboardExit::Normal),
     }
 }
 
@@ -691,6 +724,30 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use hel::hel_state::{HelState, SessionRecord};
+
+    #[test]
+    fn dashboard_runtime_does_not_wait_for_disposable_blocking_work() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        shutdown_dashboard_runtime(runtime);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "fast dashboard shutdown waited {:?}",
+            started.elapsed()
+        );
+        release_tx.send(()).unwrap();
+    }
 
     /// The controller streams a checkpoint spec by asking the worker to read
     /// `--spec -`, so that dash has to survive argument parsing as a value.

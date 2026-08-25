@@ -22,8 +22,7 @@ use hel::hel_state::{
     SessionState,
 };
 use hel::hel_targets::{
-    BoundedProcessExecutor, CancellableProcessExecutor, CommandExecutor, CommandOutput,
-    CommandSpec, ProvisionStage,
+    CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec, ProvisionStage,
 };
 use hel_tui::{
     DashboardAction, PreparedMaterializedSessionDetail, PreparedMaterializedSessionSummary,
@@ -32,15 +31,12 @@ use hel_tui::{
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::dashboard::DashboardContext;
+use crate::dashboard::{CriticalOperationTracker, DashboardContext};
 use crate::import::{DashboardImportSuccess, PendingDashboardImport, persist_imported_session};
 use crate::pollers::{
     LifecycleSuccess, LifecycleUpdate, WorkerRecordPersistence, reserve_recovery_or_cancel,
 };
 use crate::short_id;
-
-/// Longest the quit path waits for the detach write before giving up.
-pub(crate) const DETACH_PERSIST_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Everything the dashboard learns from a background job.
 pub(crate) enum DashboardIoUpdate {
@@ -236,6 +232,47 @@ where
     })
 }
 
+/// Runs a user-authored mutation off the event loop and keeps dashboard exit
+/// pending until the mutation has reached its durable boundary.
+pub(crate) fn spawn_critical_io<T>(
+    tracker: CriticalOperationTracker,
+    label: impl Into<String>,
+    updates: UnboundedSender<DashboardIoUpdate>,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+    report: impl FnOnce(std::result::Result<T, String>) -> DashboardIoUpdate + Send + 'static,
+) -> JoinHandle<()>
+where
+    T: Send + 'static,
+{
+    let guard = tracker.begin(label);
+    tokio::task::spawn_blocking(move || {
+        let result = work().map_err(|error| format!("{error:#}"));
+        let _ = updates.send(report(result));
+        drop(guard);
+    })
+}
+
+/// Like [`spawn_critical_io`], with a cooperative cancellation flag for work
+/// that can own a subprocess while the dashboard is shutting down.
+pub(crate) fn spawn_cancellable_io<T>(
+    tracker: CriticalOperationTracker,
+    label: impl Into<String>,
+    updates: UnboundedSender<DashboardIoUpdate>,
+    work: impl FnOnce(Arc<AtomicBool>) -> Result<T> + Send + 'static,
+    report: impl FnOnce(std::result::Result<T, String>) -> DashboardIoUpdate + Send + 'static,
+) -> JoinHandle<()>
+where
+    T: Send + 'static,
+{
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = tracker.begin_cancellable(label, cancelled.clone());
+    tokio::task::spawn_blocking(move || {
+        let result = work(cancelled).map_err(|error| format!("{error:#}"));
+        let _ = updates.send(report(result));
+        drop(guard);
+    })
+}
+
 /// Reads the hidden-session set out of Hel's own database. Called when the
 /// resume dialog opens and again whenever a hide or reveal fails to commit.
 pub(crate) fn spawn_hidden_native_sessions_load(
@@ -255,6 +292,7 @@ pub(crate) fn spawn_project_source_resolution(
     controller: &Controller,
     session_id: String,
     updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
 ) -> JoinHandle<()> {
     let config = controller.config.clone();
     let session = controller.state.sessions.get(&session_id).cloned();
@@ -268,19 +306,23 @@ pub(crate) fn spawn_project_source_resolution(
         },
     };
     let reported_session_id = session_id.clone();
-    spawn_io(
-        updates,
-        move || {
-            source_controller.resolve_session_project_source(
-                &session_id,
-                &BoundedProcessExecutor::new(Duration::from_secs(8)),
-            )
-        },
-        move |result| DashboardIoUpdate::ProjectSource {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = tracker.begin_cancellable(
+        format!("resolving project for {}", short_id(&session_id)),
+        cancelled.clone(),
+    );
+    tokio::task::spawn_blocking(move || {
+        let executor =
+            CancellableProcessExecutor::new(cancelled).with_deadline(Duration::from_secs(8));
+        let result = source_controller
+            .resolve_session_project_source(&session_id, &executor)
+            .map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::ProjectSource {
             session_id: reported_session_id,
             result,
-        },
-    )
+        });
+        drop(guard);
+    })
 }
 
 /// Persists one archive or unarchive. The dashboard already moved the row, so
@@ -290,8 +332,9 @@ pub(crate) fn spawn_archive_write(
     target: ArchiveWriteTarget,
     write: impl FnOnce() -> Result<()> + Send + 'static,
     updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
 ) -> JoinHandle<()> {
-    spawn_io(updates, write, move |result| {
+    spawn_critical_io(tracker, what.clone(), updates, write, move |result| {
         DashboardIoUpdate::ArchiveWrite {
             what,
             target,
@@ -312,6 +355,7 @@ pub(crate) fn config_only_controller(config: HelConfig) -> Controller {
 /// What every session lifecycle operation needs to run off the loop.
 pub(crate) struct LifecycleOperationRequest {
     pub(crate) session_id: String,
+    pub(crate) kind: SessionOperationKind,
     pub(crate) cancelled: Arc<AtomicBool>,
     /// Set when the operation must preempt a recovery copy already running for
     /// the session.
@@ -326,15 +370,25 @@ pub(crate) struct LifecycleOperationRequest {
 /// durable state, and answer on the lifecycle channel whatever happens.
 pub(crate) fn spawn_lifecycle_operation(
     request: LifecycleOperationRequest,
+    tracker: CriticalOperationTracker,
     work: impl FnOnce(&mut Controller, Arc<AtomicBool>) -> Result<LifecycleSuccess> + Send + 'static,
 ) {
     let LifecycleOperationRequest {
         session_id,
+        kind,
         cancelled,
         recovery,
         updates,
     } = request;
     let operation_session_id = session_id.clone();
+    let guard = tracker.begin_cancellable(
+        format!(
+            "{} session {}",
+            kind.label().to_ascii_lowercase(),
+            short_id(&session_id)
+        ),
+        cancelled.clone(),
+    );
     tokio::task::spawn_blocking(move || {
         let result = (|| -> Result<LifecycleSuccess> {
             let _recovery_reservation = recovery
@@ -347,6 +401,7 @@ pub(crate) fn spawn_lifecycle_operation(
         })()
         .map_err(|error| format!("{error:#}"));
         let _ = updates.send(LifecycleUpdate { session_id, result });
+        drop(guard);
     });
 }
 
@@ -417,10 +472,13 @@ pub(crate) fn spawn_dashboard_rename(
     session_id: String,
     title: String,
     updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
 ) {
     let renamed_session_id = session_id.clone();
     let requested_title = title.clone();
-    spawn_io(
+    spawn_critical_io(
+        tracker,
+        format!("renaming session {}", short_id(&session_id)),
         updates,
         move || Controller::load()?.rename_session(&renamed_session_id, &requested_title),
         move |result| DashboardIoUpdate::RenameSession {
@@ -443,9 +501,12 @@ pub(crate) struct ContainerSettingsRequest {
 pub(crate) fn spawn_dashboard_container_settings(
     request: ContainerSettingsRequest,
     updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
 ) {
     let session_id = request.session_id.clone();
-    spawn_io(
+    spawn_critical_io(
+        tracker,
+        format!("saving container settings for {}", short_id(&session_id)),
         updates,
         move || {
             Controller::load()?.update_session_container_settings(
@@ -468,9 +529,12 @@ pub(crate) fn spawn_detached_session_state_persist(
     event_ordinal: u64,
     draft: String,
     updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
 ) -> JoinHandle<()> {
     let persisted_session_id = session_id.clone();
-    spawn_io(
+    spawn_critical_io(
+        tracker,
+        format!("saving draft for {}", short_id(&session_id)),
         updates,
         move || {
             let receipt = hel::hel_database::advance_viewed_through_event_ordinal(
@@ -492,9 +556,12 @@ pub(crate) fn spawn_read_receipt_persist(
     session_id: String,
     through: u64,
     updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
 ) {
     let persisted_session_id = session_id.clone();
-    spawn_io(
+    spawn_critical_io(
+        tracker,
+        format!("saving read status for {}", short_id(&session_id)),
         updates,
         move || {
             hel::hel_database::advance_viewed_through_event_ordinal(&persisted_session_id, through)
@@ -503,8 +570,14 @@ pub(crate) fn spawn_read_receipt_persist(
     );
 }
 
-pub(crate) fn spawn_create_bundle(source: String, updates: UnboundedSender<DashboardIoUpdate>) {
-    spawn_io(
+pub(crate) fn spawn_create_bundle(
+    source: String,
+    updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
+) {
+    spawn_critical_io(
+        tracker,
+        "creating bundle",
         updates,
         move || {
             // Load fresh so a concurrent background save (e.g. an import
@@ -524,8 +597,11 @@ pub(crate) fn spawn_imported_session_apply(
     mut imported: DashboardImportSuccess,
     pending: PendingDashboardImport,
     updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
 ) {
-    spawn_io(
+    spawn_critical_io(
+        tracker,
+        "saving imported session",
         updates,
         move || {
             let session = imported
@@ -601,7 +677,10 @@ pub(crate) fn spawn_dashboard_create_session(
     updates: UnboundedSender<DashboardIoUpdate>,
     lifecycle_updates: UnboundedSender<LifecycleUpdate>,
     runtime: tokio::runtime::Handle,
+    tracker: CriticalOperationTracker,
 ) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = tracker.begin_cancellable("creating session", cancelled.clone());
     tokio::task::spawn_blocking(move || {
         let DashboardAction::CreateSession {
             profile_id,
@@ -640,6 +719,9 @@ pub(crate) fn spawn_dashboard_create_session(
                     return Ok(None);
                 }
             }
+            if cancelled.load(Ordering::Acquire) {
+                bail!("operation cancelled");
+            }
             let title = format!(
                 "{} via {profile_id}",
                 project_directory
@@ -666,8 +748,10 @@ pub(crate) fn spawn_dashboard_create_session(
                 .get(&session_id)
                 .expect("newly registered session exists")
                 .clone();
-            let cancelled = Arc::new(AtomicBool::new(false));
-            Ok(Some(RegisteredDashboardSession { session, cancelled }))
+            Ok(Some(RegisteredDashboardSession {
+                session,
+                cancelled: cancelled.clone(),
+            }))
         })();
         let Some(registered) = (match registered {
             Ok(registered) => registered,
@@ -702,6 +786,7 @@ pub(crate) fn spawn_dashboard_create_session(
         .map(|()| LifecycleSuccess::Created)
         .map_err(|error| format!("{error:#}"));
         let _ = lifecycle_updates.send(LifecycleUpdate { session_id, result });
+        drop(guard);
     });
 }
 
@@ -1199,6 +1284,7 @@ impl DashboardContext {
                 session_id,
                 restart_episode,
                 self.dashboard_io_tx.clone(),
+                self.critical_operations.clone(),
             );
         }
     }

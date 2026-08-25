@@ -269,6 +269,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
             recovery_observer.clone(),
             cancelled,
             interrupted_close_tx.clone(),
+            None,
         );
     }
     let mut credential_sync = CredentialSyncCoordinator::spawn();

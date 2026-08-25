@@ -501,7 +501,9 @@ pub(crate) fn spawn_dashboard_import(
     task_id: u64,
     cancelled: Arc<AtomicBool>,
     updates: tokio::sync::mpsc::Sender<DashboardImportUpdate>,
+    tracker: crate::dashboard::CriticalOperationTracker,
 ) {
+    let guard = tracker.begin_cancellable("importing session", cancelled.clone());
     let worker_controller = Controller {
         config: controller.config.clone(),
         state: controller.state.clone(),
@@ -566,6 +568,7 @@ pub(crate) fn spawn_dashboard_import(
             pending,
             result,
         });
+        drop(guard);
     });
 }
 

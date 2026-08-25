@@ -29,8 +29,7 @@ use hel::hel_session_manager::{
 use hel::hel_state::{HelState, MaterializedSession, SessionResourceAllocation, SessionState};
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
-    DeploymentCapacityTarget, DeploymentCapacityUsage, ProcessExecutor, SessionResourceProbe,
-    SessionResourceUsage,
+    DeploymentCapacityTarget, DeploymentCapacityUsage, SessionResourceProbe, SessionResourceUsage,
 };
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::DashboardState;
@@ -729,16 +728,23 @@ pub(crate) fn spawn_aws_resource_options_resolution(
         String,
         std::result::Result<Vec<SessionResourceAllocation>, String>,
     )>,
+    tracker: crate::dashboard::CriticalOperationTracker,
 ) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = tracker.begin_cancellable(
+        format!("resolving resources for {target_id}"),
+        cancelled.clone(),
+    );
     let _task = tokio::task::spawn_blocking(move || {
         let controller = Controller {
             config,
             state: HelState::default(),
         };
         let result = controller
-            .resolve_aws_resource_options(&target_id, &ProcessExecutor)
+            .resolve_aws_resource_options(&target_id, &CancellableProcessExecutor::new(cancelled))
             .map_err(|error| format!("{error:#}"));
         let _ = updates.send((target_id, result));
+        drop(guard);
     });
 }
 
@@ -1042,8 +1048,9 @@ pub(crate) fn apply_worker_poll_update(
     dashboard: &mut DashboardState,
     update: WorkerPollUpdate,
     dashboard_io_tx: &tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+    tracker: &crate::dashboard::CriticalOperationTracker,
 ) -> Result<bool> {
-    if apply_worker_record_update(controller, &update, Some(dashboard_io_tx))? {
+    if apply_worker_record_update(controller, &update, Some((dashboard_io_tx, tracker)))? {
         dashboard.set_state(controller.state.clone());
     }
     match update.view.error {
@@ -1072,7 +1079,10 @@ pub(crate) fn apply_worker_poll_update(
 pub(crate) fn apply_worker_record_update(
     controller: &mut Controller,
     update: &WorkerPollUpdate,
-    dashboard_io_tx: Option<&tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>>,
+    dashboard_io: Option<(
+        &tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+        &crate::dashboard::CriticalOperationTracker,
+    )>,
 ) -> Result<bool> {
     let Some(snapshot) = update.view.snapshot.as_ref() else {
         return Ok(false);
@@ -1084,7 +1094,7 @@ pub(crate) fn apply_worker_record_update(
         .then(|| snapshot.materialized.session_title.clone());
     let mut changed = false;
     if let Some(title) = changed_title {
-        if dashboard_io_tx.is_none() {
+        if dashboard_io.is_none() {
             hel::hel_database::set_session_acp_title(&update.session_id, title.as_deref())?;
         }
         controller
@@ -1093,13 +1103,14 @@ pub(crate) fn apply_worker_record_update(
             .get_mut(&update.session_id)
             .expect("session disappeared while updating its ACP title")
             .acp_session_title = title;
-        if let Some(dashboard_io_tx) = dashboard_io_tx {
+        if let Some((dashboard_io_tx, tracker)) = dashboard_io {
             spawn_worker_record_persistence(
                 update.session_id.clone(),
                 WorkerRecordPersistence::AcpTitle {
                     title: snapshot.materialized.session_title.clone(),
                 },
                 dashboard_io_tx.clone(),
+                tracker.clone(),
             );
         }
         changed = true;
@@ -1115,7 +1126,12 @@ fn spawn_worker_record_persistence(
     session_id: String,
     operation: WorkerRecordPersistence,
     updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+    tracker: crate::dashboard::CriticalOperationTracker,
 ) {
+    let guard = tracker.begin(format!(
+        "saving agent title for {}",
+        crate::short_id(&session_id)
+    ));
     tokio::task::spawn_blocking(move || {
         let result = match &operation {
             WorkerRecordPersistence::AcpTitle { title } => {
@@ -1124,6 +1140,7 @@ fn spawn_worker_record_persistence(
         }
         .map_err(|error| format!("{error:#}"));
         let _ = updates.send(DashboardIoUpdate::WorkerRecordPersistence { operation, result });
+        drop(guard);
     });
 }
 
@@ -1132,7 +1149,13 @@ pub(crate) fn spawn_worker_diagnosis(
     session_id: String,
     episode_id: u64,
     updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+    tracker: crate::dashboard::CriticalOperationTracker,
 ) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = tracker.begin_cancellable(
+        format!("diagnosing session {}", crate::short_id(&session_id)),
+        cancelled.clone(),
+    );
     let diagnostic_controller = Controller {
         config: controller.config.clone(),
         state: controller.state.clone(),
@@ -1140,7 +1163,8 @@ pub(crate) fn spawn_worker_diagnosis(
     tokio::spawn(async move {
         let task_session_id = session_id.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            let executor = CancellableProcessExecutor::with_timeout(WORKER_DIAGNOSIS_TIMEOUT);
+            let executor =
+                CancellableProcessExecutor::new(cancelled).with_deadline(WORKER_DIAGNOSIS_TIMEOUT);
             diagnostic_controller.diagnose_worker_controlled(&task_session_id, &executor)
         })
         .await;
@@ -1155,6 +1179,7 @@ pub(crate) fn spawn_worker_diagnosis(
         {
             tracing::debug!(%session_id, "worker diagnosis finished after the dashboard stopped");
         }
+        drop(guard);
     });
 }
 
@@ -1262,7 +1287,14 @@ pub(crate) fn spawn_interrupted_close_recovery(
     recovery_observer: hel::hel_state::RecoveryObserver,
     cancelled: Arc<AtomicBool>,
     updates: tokio::sync::mpsc::UnboundedSender<LifecycleUpdate>,
+    tracker: Option<crate::dashboard::CriticalOperationTracker>,
 ) {
+    let guard = tracker.map(|tracker| {
+        tracker.begin_cancellable(
+            format!("recovering session {}", crate::short_id(&session_id)),
+            cancelled.clone(),
+        )
+    });
     let runtime = tokio::runtime::Handle::current();
     tokio::spawn(async move {
         let operation_session_id = session_id.clone();
@@ -1298,6 +1330,7 @@ pub(crate) fn spawn_interrupted_close_recovery(
         {
             tracing::debug!(%session_id, "interrupted close finished after its controller stopped");
         }
+        drop(guard);
     });
 }
 

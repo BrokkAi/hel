@@ -1,39 +1,38 @@
 //! What the dashboard does with the work its key handling asks for.
 //!
 //! Every arm here either updates UI state directly or starts a background job;
-//! none of them block the loop. `ControlFlow::Break` means the run is over.
+//! none of them block the loop.
 
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
 use hel::hel_controller::{Controller, ResumeRepositorySourceReceipt, SessionResumeOptions};
 use hel::hel_setup::SetupOutcome;
-use hel::hel_targets::{CancellableProcessExecutor, ProcessExecutor};
+use hel::hel_targets::CancellableProcessExecutor;
 use hel_tui::{DashboardAction, SessionOperationKind};
 
 use crate::dashboard::io::{
     ArchiveWriteTarget, ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest,
     ResumeRepositoryPreflightApply, StageReportingExecutor, config_only_controller,
-    spawn_archive_write, spawn_create_bundle, spawn_dashboard_container_settings,
-    spawn_dashboard_create_session, spawn_dashboard_rename, spawn_io, spawn_lifecycle_operation,
+    spawn_archive_write, spawn_cancellable_io, spawn_create_bundle,
+    spawn_dashboard_container_settings, spawn_dashboard_create_session, spawn_dashboard_rename,
+    spawn_lifecycle_operation,
 };
 use crate::dashboard::{DashboardContext, QUOTA_REFRESH_NOTICE, View, resume_progress_notice};
 use crate::import::{DashboardImportSafety, PendingDashboardImport};
 use crate::pollers::{LifecycleSuccess, spawn_aws_resource_options_resolution};
 use crate::short_id;
 
-/// Carries out one dashboard action. Breaking ends the run.
+/// Carries out one dashboard action.
 pub(crate) async fn apply_dashboard_action(
     context: &mut DashboardContext,
     action: DashboardAction,
-) -> Result<ControlFlow<()>> {
+) -> Result<()> {
     match action {
         DashboardAction::None => {}
         DashboardAction::QuitDetach => {
-            context.quit_detached = true;
-            return Ok(ControlFlow::Break(()));
+            context.request_shutdown();
         }
         DashboardAction::OpenConfig => match context.run_setup_dialog()? {
             SetupOutcome::Written => {
@@ -71,6 +70,7 @@ pub(crate) async fn apply_dashboard_action(
                 },
                 move || hel::hel_database::set_session_archived(&id, archived),
                 context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
             );
             // The in-memory record the dashboard already updated is the one a
             // later reload compares against, so keep the controller in step.
@@ -95,6 +95,7 @@ pub(crate) async fn apply_dashboard_action(
                     )
                 },
                 context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
             );
         }
         DashboardAction::ImportSession {
@@ -128,7 +129,7 @@ pub(crate) async fn apply_dashboard_action(
             let Some(pending) = context.pending_import.take() else {
                 context.dashboard.finish_import();
                 context.dashboard.set_notice("Import confirmation expired.");
-                return Ok(ControlFlow::Continue(()));
+                return Ok(());
             };
             if accepted {
                 context.start_import(
@@ -147,7 +148,12 @@ pub(crate) async fn apply_dashboard_action(
         }
         DashboardAction::RenameSession { session_id, title } => {
             context.dashboard.set_notice("Renaming session…");
-            spawn_dashboard_rename(session_id, title, context.dashboard_io_tx.clone());
+            spawn_dashboard_rename(
+                session_id,
+                title,
+                context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
+            );
         }
         DashboardAction::SaveContainerSettings {
             session_id,
@@ -168,6 +174,7 @@ pub(crate) async fn apply_dashboard_action(
                     mount_history,
                 },
                 context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
             );
         }
         DashboardAction::CompleteMountSource {
@@ -176,13 +183,16 @@ pub(crate) async fn apply_dashboard_action(
         } => {
             let config = context.controller.config.clone();
             let requested = prefix.clone();
-            spawn_io(
+            spawn_cancellable_io(
+                context.critical_operations.clone(),
+                "completing attached directory",
                 context.dashboard_io_tx.clone(),
-                move || {
+                move |cancelled| {
+                    let executor = CancellableProcessExecutor::new(cancelled);
                     config_only_controller(config).complete_mount_source(
                         &target_template_id,
                         &requested,
-                        &ProcessExecutor,
+                        &executor,
                     )
                 },
                 move |result| DashboardIoUpdate::MountCompletions { prefix, result },
@@ -194,13 +204,16 @@ pub(crate) async fn apply_dashboard_action(
         } => {
             let config = context.controller.config.clone();
             let requested = source.clone();
-            spawn_io(
+            spawn_cancellable_io(
+                context.critical_operations.clone(),
+                "validating attached directory",
                 context.dashboard_io_tx.clone(),
-                move || {
+                move |cancelled| {
+                    let executor = CancellableProcessExecutor::new(cancelled);
                     config_only_controller(config).validate_mount_source(
                         &target_template_id,
                         std::path::Path::new(&requested),
-                        &ProcessExecutor,
+                        &executor,
                     )
                 },
                 move |result| DashboardIoUpdate::MountValidation { source, result },
@@ -215,15 +228,18 @@ pub(crate) async fn apply_dashboard_action(
                 .dashboard
                 .set_notice("Checking attached directories…");
             let config = context.controller.config.clone();
-            spawn_io(
+            spawn_cancellable_io(
+                context.critical_operations.clone(),
+                "validating session directories",
                 context.dashboard_io_tx.clone(),
-                move || {
+                move |cancelled| {
                     let controller = config_only_controller(config);
+                    let executor = CancellableProcessExecutor::new(cancelled);
                     for mount in mounts {
                         if let Err(error) = controller.validate_mount_source(
                             &target_template_id,
                             std::path::Path::new(&mount.source),
-                            &ProcessExecutor,
+                            &executor,
                         ) {
                             return Ok(Some((
                                 mount.source.to_string_lossy().into_owned(),
@@ -247,15 +263,18 @@ pub(crate) async fn apply_dashboard_action(
         } => {
             context.dashboard.set_notice("Checking replacement origin…");
             let submitted_repository_id = repository_id.clone();
-            spawn_io(
+            spawn_cancellable_io(
+                context.critical_operations.clone(),
+                format!("updating repository for {}", short_id(&session_id)),
                 context.dashboard_io_tx.clone(),
-                move || {
+                move |cancelled| {
+                    let executor = CancellableProcessExecutor::new(cancelled);
                     let mut controller = Controller::load()?;
                     let preflight = controller.replace_resume_repository_origin(
                         &session_id,
                         &repository_id,
                         &replacement,
-                        &ProcessExecutor,
+                        &executor,
                     )?;
                     Ok(ResumeRepositoryPreflightApply {
                         config: Some(controller.config),
@@ -275,13 +294,16 @@ pub(crate) async fn apply_dashboard_action(
         } => {
             let config = context.controller.config.clone();
             let requested = directory.clone();
-            spawn_io(
+            spawn_cancellable_io(
+                context.critical_operations.clone(),
+                "validating project directory",
                 context.dashboard_io_tx.clone(),
-                move || {
+                move |cancelled| {
+                    let executor = CancellableProcessExecutor::new(cancelled);
                     config_only_controller(config).validate_project_directory(
                         &target_template_id,
                         std::path::Path::new(&requested),
-                        &ProcessExecutor,
+                        &executor,
                     )
                 },
                 move |result| DashboardIoUpdate::ProjectValidation { directory, result },
@@ -307,22 +329,30 @@ pub(crate) async fn apply_dashboard_action(
             );
             let session_manager = context.worker_commands_tx.clone();
             let runtime = tokio::runtime::Handle::current();
-            spawn_lifecycle_operation(request, move |controller, cancelled| {
-                let executor = CancellableProcessExecutor::new(cancelled);
-                runtime.block_on(controller.close_session_managed_controlled(
-                    &session_id,
-                    &executor,
-                    &session_manager,
-                ))?;
-                Ok(LifecycleSuccess::Closed)
-            });
+            spawn_lifecycle_operation(
+                request,
+                context.critical_operations.clone(),
+                move |controller, cancelled| {
+                    let executor = CancellableProcessExecutor::new(cancelled);
+                    runtime.block_on(controller.close_session_managed_controlled(
+                        &session_id,
+                        &executor,
+                        &session_manager,
+                    ))?;
+                    Ok(LifecycleSuccess::Closed)
+                },
+            );
         }
         DashboardAction::ResolveAwsResourceOptions {
             target_template_ids,
         } => context.resolve_aws_resource_options(target_template_ids),
         DashboardAction::CreateBundle { source } => {
             context.dashboard.set_notice("Creating bundle…");
-            spawn_create_bundle(source, context.dashboard_io_tx.clone());
+            spawn_create_bundle(
+                source,
+                context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
+            );
         }
         DashboardAction::ForceDestroy { session_id } => {
             let request = context.begin_lifecycle_operation(
@@ -330,11 +360,15 @@ pub(crate) async fn apply_dashboard_action(
                 SessionOperationKind::Destroying,
                 true,
             );
-            spawn_lifecycle_operation(request, move |controller, cancelled| {
-                let executor = CancellableProcessExecutor::new(cancelled);
-                controller.force_destroy(&session_id, &executor)?;
-                Ok(LifecycleSuccess::Destroyed)
-            });
+            spawn_lifecycle_operation(
+                request,
+                context.critical_operations.clone(),
+                move |controller, cancelled| {
+                    let executor = CancellableProcessExecutor::new(cancelled);
+                    controller.force_destroy(&session_id, &executor)?;
+                    Ok(LifecycleSuccess::Destroyed)
+                },
+            );
         }
         DashboardAction::DeleteActive { session_id } => {
             let request = context.begin_lifecycle_operation(
@@ -342,12 +376,16 @@ pub(crate) async fn apply_dashboard_action(
                 SessionOperationKind::Deleting,
                 true,
             );
-            spawn_lifecycle_operation(request, move |controller, cancelled| {
-                let executor = CancellableProcessExecutor::new(cancelled);
-                controller.force_destroy(&session_id, &executor)?;
-                controller.delete_session_controlled(&session_id, &executor)?;
-                Ok(LifecycleSuccess::DeletedActive)
-            });
+            spawn_lifecycle_operation(
+                request,
+                context.critical_operations.clone(),
+                move |controller, cancelled| {
+                    let executor = CancellableProcessExecutor::new(cancelled);
+                    controller.force_destroy(&session_id, &executor)?;
+                    controller.delete_session_controlled(&session_id, &executor)?;
+                    Ok(LifecycleSuccess::DeletedActive)
+                },
+            );
         }
         DashboardAction::DeleteStopped { session_id } => {
             // A stopped session has no worker, so nothing is copying it and
@@ -357,14 +395,18 @@ pub(crate) async fn apply_dashboard_action(
                 SessionOperationKind::Deleting,
                 false,
             );
-            spawn_lifecycle_operation(request, move |controller, cancelled| {
-                if cancelled.load(Ordering::Acquire) {
-                    bail!("operation cancelled");
-                }
-                let executor = CancellableProcessExecutor::new(cancelled);
-                controller.delete_session_controlled(&session_id, &executor)?;
-                Ok(LifecycleSuccess::DeletedStopped)
-            });
+            spawn_lifecycle_operation(
+                request,
+                context.critical_operations.clone(),
+                move |controller, cancelled| {
+                    if cancelled.load(Ordering::Acquire) {
+                        bail!("operation cancelled");
+                    }
+                    let executor = CancellableProcessExecutor::new(cancelled);
+                    controller.delete_session_controlled(&session_id, &executor)?;
+                    Ok(LifecycleSuccess::DeletedStopped)
+                },
+            );
         }
         DashboardAction::CancelOperation { session_id } => {
             if let Some(operation) = context.lifecycle_operations.get(&session_id) {
@@ -377,7 +419,7 @@ pub(crate) async fn apply_dashboard_action(
             }
         }
     }
-    Ok(ControlFlow::Continue(()))
+    Ok(())
 }
 
 fn resume_launch_session_id(action: &DashboardAction) -> Result<&str> {
@@ -395,14 +437,17 @@ pub(crate) fn start_resume_repository_preflight(
     context
         .dashboard
         .set_notice("Checking checkpoint repository history…");
-    spawn_io(
+    spawn_cancellable_io(
+        context.critical_operations.clone(),
+        format!("checking repositories for {}", short_id(&session_id)),
         context.dashboard_io_tx.clone(),
-        move || {
+        move |cancelled| {
+            let executor = CancellableProcessExecutor::new(cancelled);
             let controller = Controller::load()?;
             Ok(ResumeRepositoryPreflightApply {
                 config: None,
                 preflight: controller
-                    .preflight_resume_repository_sources(&session_id, &ProcessExecutor)?,
+                    .preflight_resume_repository_sources(&session_id, &executor)?,
             })
         },
         move |result| DashboardIoUpdate::ResumeRepositoryPreflight {
@@ -440,6 +485,7 @@ fn start_session_launch_with_repository_preflight(
                 context.dashboard_io_tx.clone(),
                 context.lifecycle_updates_tx.clone(),
                 tokio::runtime::Handle::current(),
+                context.critical_operations.clone(),
             );
         }
         DashboardAction::ResumeSession {
@@ -467,32 +513,36 @@ fn start_session_launch_with_repository_preflight(
             );
             let stage_updates = context.dashboard_io_tx.clone();
             let runtime = tokio::runtime::Handle::current();
-            spawn_lifecycle_operation(request, move |controller, cancelled| {
-                let executor = StageReportingExecutor::new(
-                    CancellableProcessExecutor::new(cancelled),
-                    session_id.clone(),
-                    stage_updates,
-                );
-                let materialized = runtime.block_on(
-                    controller.resume_session_controlled_with_repository_preflight(
-                        &session_id,
-                        &profile_id,
-                        &target_template_id,
-                        SessionResumeOptions {
-                            additional_mounts: Some(additional_mounts),
-                            resource_allocation,
-                            discard_queue,
-                        },
-                        repository_preflight,
-                        &executor,
-                    ),
-                )?;
-                Ok(LifecycleSuccess::Resumed {
-                    profile_id,
-                    target_id: target_template_id,
-                    materialized: Box::new(materialized),
-                })
-            });
+            spawn_lifecycle_operation(
+                request,
+                context.critical_operations.clone(),
+                move |controller, cancelled| {
+                    let executor = StageReportingExecutor::new(
+                        CancellableProcessExecutor::new(cancelled),
+                        session_id.clone(),
+                        stage_updates,
+                    );
+                    let materialized = runtime.block_on(
+                        controller.resume_session_controlled_with_repository_preflight(
+                            &session_id,
+                            &profile_id,
+                            &target_template_id,
+                            SessionResumeOptions {
+                                additional_mounts: Some(additional_mounts),
+                                resource_allocation,
+                                discard_queue,
+                            },
+                            repository_preflight,
+                            &executor,
+                        ),
+                    )?;
+                    Ok(LifecycleSuccess::Resumed {
+                        profile_id,
+                        target_id: target_template_id,
+                        materialized: Box::new(materialized),
+                    })
+                },
+            );
         }
         _ => unreachable!("mount preflight only carries create or resume actions"),
     }
@@ -520,6 +570,7 @@ impl DashboardContext {
         );
         LifecycleOperationRequest {
             session_id: session_id.to_owned(),
+            kind,
             cancelled,
             recovery: reserve_recovery.then(|| self.recovery_observer.clone()),
             updates: self.lifecycle_updates_tx.clone(),
@@ -537,6 +588,7 @@ impl DashboardContext {
                     self.controller.config.clone(),
                     target_template_id,
                     self.aws_resource_options_tx.clone(),
+                    self.critical_operations.clone(),
                 );
             }
         }

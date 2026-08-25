@@ -3,7 +3,7 @@
 use std::{
     fs,
     fs::File,
-    io::{self, ErrorKind, Read},
+    io::{self, ErrorKind, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::process::CommandExt,
@@ -93,7 +93,12 @@ fn wait_for_output(master: &mut File, output: &mut Vec<u8>, marker: &[u8], deadl
     }
 }
 
-fn wait_for_exit(child: &mut Child, master: &mut File, output: &mut Vec<u8>) -> ExitStatus {
+fn wait_for_exit(
+    child: &mut Child,
+    master: &mut File,
+    output: &mut Vec<u8>,
+    reason: &str,
+) -> ExitStatus {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         drain(master, output);
@@ -102,7 +107,7 @@ fn wait_for_exit(child: &mut Child, master: &mut File, output: &mut Vec<u8>) -> 
         }
         if Instant::now() >= deadline {
             panic!(
-                "PTY child did not exit after SIGTERM; output: {:?}",
+                "PTY child did not exit after {reason}; output: {:?}",
                 String::from_utf8_lossy(output)
             );
         }
@@ -110,8 +115,14 @@ fn wait_for_exit(child: &mut Child, master: &mut File, output: &mut Vec<u8>) -> 
     }
 }
 
-#[test]
-fn sigterm_restores_real_pty_terminal() {
+struct DashboardPty {
+    _storage: tempfile::TempDir,
+    master: File,
+    slave: File,
+    child: ReapChild,
+}
+
+fn spawn_dashboard_pty() -> DashboardPty {
     let storage = tempfile::tempdir().expect("create Hel test storage");
     let config_root = storage.path().join("config");
     fs::create_dir_all(config_root.join("hel")).expect("create Hel config directory");
@@ -160,9 +171,8 @@ image = "ubuntu:24.04"
         0,
         "create PTY"
     );
-    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
-    let before = termios(slave.as_raw_fd());
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "read PTY master flags");
     assert_eq!(
@@ -197,7 +207,23 @@ image = "ubuntu:24.04"
         });
     }
     let child = command.spawn().expect("spawn hel PTY helper");
-    let mut child = ReapChild(Some(child));
+    DashboardPty {
+        _storage: storage,
+        master,
+        slave,
+        child: ReapChild(Some(child)),
+    }
+}
+
+#[test]
+fn sigterm_restores_real_pty_terminal() {
+    let DashboardPty {
+        _storage,
+        mut master,
+        slave,
+        mut child,
+    } = spawn_dashboard_pty();
+    let before = termios(slave.as_raw_fd());
 
     let mut output = Vec::new();
     wait_for_output(
@@ -211,7 +237,7 @@ image = "ubuntu:24.04"
         0,
         "send SIGTERM to PTY child"
     );
-    let status = wait_for_exit(child.child_mut(), &mut master, &mut output);
+    let status = wait_for_exit(child.child_mut(), &mut master, &mut output, "SIGTERM");
     drain(&mut master, &mut output);
     drop(child.take());
 
@@ -237,5 +263,68 @@ image = "ubuntu:24.04"
     assert!(
         output.contains("\x1b[?25h"),
         "missing cursor restoration: {output:?}"
+    );
+}
+
+#[test]
+fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
+    const REATTACH_MESSAGE: &str =
+        "Active sessions will continue working; Hel will reattach to them on your next invocation.";
+    let DashboardPty {
+        _storage,
+        mut master,
+        slave,
+        mut child,
+    } = spawn_dashboard_pty();
+    let before = termios(slave.as_raw_fd());
+    let mut output = Vec::new();
+    wait_for_output(
+        &mut master,
+        &mut output,
+        READY_MARKER,
+        Instant::now() + TIMEOUT,
+    );
+
+    let quit_started = Instant::now();
+    master.write_all(b"\x1b").expect("send dashboard quit key");
+    let status = wait_for_exit(
+        child.child_mut(),
+        &mut master,
+        &mut output,
+        "dashboard quit",
+    );
+    let quit_elapsed = quit_started.elapsed();
+    drain(&mut master, &mut output);
+    drop(child.take());
+
+    assert!(status.success(), "PTY child exit: {status}");
+    assert!(
+        quit_elapsed < Duration::from_secs(1),
+        "dashboard detach took {quit_elapsed:?}"
+    );
+    let after = termios(slave.as_raw_fd());
+    assert_eq!(after.c_iflag, before.c_iflag, "restore input flags");
+    assert_eq!(after.c_oflag, before.c_oflag, "restore output flags");
+    assert_eq!(
+        stable_local_flags(after.c_lflag),
+        stable_local_flags(before.c_lflag),
+        "restore local flags"
+    );
+
+    let output = String::from_utf8_lossy(&output);
+    let leave_screen = output
+        .rfind("\x1b[?1049l")
+        .unwrap_or_else(|| panic!("missing alternate-screen leave: {output:?}"));
+    let message = output
+        .find(REATTACH_MESSAGE)
+        .unwrap_or_else(|| panic!("missing reattachment message: {output:?}"));
+    assert!(
+        leave_screen < message,
+        "reattachment message appeared before terminal restoration: {output:?}"
+    );
+    assert_eq!(
+        output[message..].trim_end_matches(['\r', '\n']),
+        REATTACH_MESSAGE,
+        "reattachment message was not the final output"
     );
 }

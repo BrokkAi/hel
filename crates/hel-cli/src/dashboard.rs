@@ -14,9 +14,9 @@ pub(crate) mod actions;
 pub(crate) mod io;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -70,6 +70,131 @@ const IMPORT_PROGRESS_TICK: Duration = Duration::from_millis(125);
 pub(crate) const QUOTA_REFRESH_NOTICE: &str = "Refreshing profile quotas…";
 pub(crate) const QUOTA_REFRESHED_NOTICE: &str = "Profile quotas refreshed.";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DashboardExit {
+    Normal,
+    Detached,
+    Interrupted,
+}
+
+#[derive(Clone)]
+pub(crate) struct CriticalOperationTracker {
+    inner: Arc<CriticalOperationTrackerInner>,
+}
+
+struct CriticalOperationTrackerInner {
+    next_id: AtomicU64,
+    operations: Mutex<BTreeMap<u64, CriticalOperation>>,
+    changed: watch::Sender<u64>,
+}
+
+struct CriticalOperation {
+    label: String,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+pub(crate) struct CriticalOperationGuard {
+    id: u64,
+    tracker: CriticalOperationTracker,
+}
+
+impl CriticalOperationTracker {
+    fn new() -> (Self, watch::Receiver<u64>) {
+        let (changed, receiver) = watch::channel(0);
+        (
+            Self {
+                inner: Arc::new(CriticalOperationTrackerInner {
+                    next_id: AtomicU64::new(1),
+                    operations: Mutex::new(BTreeMap::new()),
+                    changed,
+                }),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn begin(&self, label: impl Into<String>) -> CriticalOperationGuard {
+        self.begin_inner(label.into(), None)
+    }
+
+    pub(crate) fn begin_cancellable(
+        &self,
+        label: impl Into<String>,
+        cancelled: Arc<AtomicBool>,
+    ) -> CriticalOperationGuard {
+        self.begin_inner(label.into(), Some(cancelled))
+    }
+
+    fn begin_inner(
+        &self,
+        label: String,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> CriticalOperationGuard {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .operations
+            .lock()
+            .expect("critical operation tracker lock")
+            .insert(id, CriticalOperation { label, cancelled });
+        self.inner.changed.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+        CriticalOperationGuard {
+            id,
+            tracker: self.clone(),
+        }
+    }
+
+    fn blockers(&self) -> Vec<String> {
+        self.inner
+            .operations
+            .lock()
+            .expect("critical operation tracker lock")
+            .values()
+            .map(|operation| operation.label.clone())
+            .collect()
+    }
+
+    fn cancel_all(&self) {
+        for operation in self
+            .inner
+            .operations
+            .lock()
+            .expect("critical operation tracker lock")
+            .values()
+        {
+            if let Some(cancelled) = operation.cancelled.as_ref() {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+impl Drop for CriticalOperationGuard {
+    fn drop(&mut self) {
+        self.tracker
+            .inner
+            .operations
+            .lock()
+            .expect("critical operation tracker lock")
+            .remove(&self.id);
+        self.tracker.inner.changed.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+}
+
+fn shutdown_wait_notice(blockers: &[String]) -> Option<String> {
+    match blockers {
+        [] => None,
+        [blocker] => Some(format!("Waiting for {blocker} to complete before exiting")),
+        blockers => Some(format!(
+            "Waiting for {} operations to complete before exiting",
+            blockers.len()
+        )),
+    }
+}
+
 /// Which view the one loop is drawing. The chat view is data rather than a
 /// nested loop, so its background feeds stay live while the session list is on
 /// screen and returning to a session is only a redraw.
@@ -111,6 +236,9 @@ pub(crate) struct DashboardContext {
     /// changed.
     pub(crate) controller_changed: bool,
     pub(crate) quit_detached: bool,
+    shutdown_requested: bool,
+    pub(crate) critical_operations: CriticalOperationTracker,
+    critical_operations_changed: watch::Receiver<u64>,
 
     quota_profiles_tx: watch::Sender<QuotaRefreshBatch>,
     quota: Feed<Receiver<QuotaUpdate>>,
@@ -193,17 +321,17 @@ fn enqueue_materialized_projection(
     Some((materialized, viewed_through_event_ordinal))
 }
 
-pub(crate) async fn run_dashboard() -> Result<()> {
+pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin())
         || !std::io::IsTerminal::is_terminal(&std::io::stdout())
     {
         println!("Welcome to Hel");
         println!("Run `hel doctor` for non-interactive validation.");
-        return Ok(());
+        return Ok(DashboardExit::Normal);
     }
 
     let Some(mut context) = DashboardContext::open()? else {
-        return Ok(());
+        return Ok(DashboardExit::Normal);
     };
     let termination = hel::termination::Coordinator::install().token();
     // `interval_at` so the first tick is a period away rather than immediate,
@@ -221,16 +349,24 @@ pub(crate) async fn run_dashboard() -> Result<()> {
     import_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        context.refresh_controller_derived_state();
+        if !context.shutdown_requested {
+            context.refresh_controller_derived_state();
+        }
         context.draw()?;
         let mut action = DashboardAction::None;
         let mut chat_outcome = hel::hel_chat::ChatEventOutcome::None;
         // The winning arm takes the message that woke the loop; the drains
         // below batch whatever is queued behind it, so one wakeup is one draw.
         tokio::select! {
-            _ = termination.cancelled() => break,
+            _ = termination.cancelled(), if !context.shutdown_requested => {
+                context.begin_shutdown(false);
+            }
             event = next_terminal_event(&mut context.events) => {
                 let Some(event) = event else { break };
+                if context.shutdown_requested {
+                    context.dirty = true;
+                    continue;
+                }
                 let mut event = event?;
                 // Key repeats and pastes arrive as several ready events. The
                 // buffered ones are handled before drawing, but the first event
@@ -320,6 +456,11 @@ pub(crate) async fn run_dashboard() -> Result<()> {
                 let woke = context.dashboard_io.accept(update);
                 context.dirty |= woke;
             }
+            _ = context.critical_operations_changed.changed(),
+                if context.shutdown_requested =>
+            {
+                context.dirty = true;
+            }
             // Turn clocks, countdowns, and credential-sync backoffs move on
             // their own, so the dashboard redraws once a second regardless.
             // The chat redraws only when its own time-driven text has moved:
@@ -344,14 +485,15 @@ pub(crate) async fn run_dashboard() -> Result<()> {
             }
         }
         context.drain_feeds();
-        if context.apply_chat_outcome(chat_outcome).await.is_break() {
-            break;
+        if !context.shutdown_requested {
+            context.apply_chat_outcome(chat_outcome).await;
+            actions::apply_dashboard_action(&mut context, action).await?;
         }
-        if actions::apply_dashboard_action(&mut context, action)
-            .await?
-            .is_break()
-        {
-            break;
+        if context.shutdown_requested {
+            if context.refresh_shutdown_notice() {
+                break;
+            }
+            context.dirty = true;
         }
     }
     context.cancel_background_work();
@@ -360,15 +502,43 @@ pub(crate) async fn run_dashboard() -> Result<()> {
     // the background feeds are torn down after, as the rest of the context
     // drops.
     drop(context.terminal);
-    if quit_detached {
-        println!(
-            "Active sessions will continue working; Hel will reattach to them on your next invocation."
-        );
-    }
-    Ok(())
+    Ok(if quit_detached {
+        DashboardExit::Detached
+    } else if context.shutdown_requested {
+        DashboardExit::Interrupted
+    } else {
+        DashboardExit::Normal
+    })
 }
 
 impl DashboardContext {
+    pub(crate) fn request_shutdown(&mut self) {
+        self.begin_shutdown(true);
+    }
+
+    fn begin_shutdown(&mut self, detached: bool) {
+        if self.shutdown_requested {
+            return;
+        }
+        self.shutdown_requested = true;
+        self.quit_detached = detached;
+        self.cancel_background_work();
+        self.refresh_shutdown_notice();
+        self.dirty = true;
+    }
+
+    /// Returns true once every user-authored mutation has reached a durable
+    /// boundary. Pure reads and projections are deliberately not blockers.
+    fn refresh_shutdown_notice(&mut self) -> bool {
+        let blockers = self.critical_operations.blockers();
+        if let Some(notice) = shutdown_wait_notice(&blockers) {
+            self.dashboard.set_notice(notice);
+            false
+        } else {
+            true
+        }
+    }
+
     pub(super) fn acknowledge_visible_chat(&mut self) {
         let Some((session_id, through)) = self
             .active_chat
@@ -397,7 +567,12 @@ impl DashboardContext {
 
     fn spawn_read_receipt(&mut self, session_id: String, through: u64) {
         self.read_receipt_in_flight = Some(session_id.clone());
-        io::spawn_read_receipt_persist(session_id, through, self.dashboard_io_tx.clone());
+        io::spawn_read_receipt_persist(
+            session_id,
+            through,
+            self.dashboard_io_tx.clone(),
+            self.critical_operations.clone(),
+        );
     }
 
     pub(super) fn finish_read_receipt(
@@ -459,6 +634,7 @@ impl DashboardContext {
         let recovery_observer = recovery.observer();
         let (lifecycle_updates_tx, lifecycle_updates_rx) =
             tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
+        let (critical_operations, critical_operations_changed) = CriticalOperationTracker::new();
         let mut lifecycle_operations = BTreeMap::<String, ActiveLifecycleOperation>::new();
         for session_id in interrupted_close_session_ids(&controller) {
             let state = controller.state.sessions[&session_id].state;
@@ -482,6 +658,7 @@ impl DashboardContext {
                 recovery_observer.clone(),
                 cancelled,
                 lifecycle_updates_tx.clone(),
+                Some(critical_operations.clone()),
             );
         }
         let credential_sync = CredentialSyncCoordinator::spawn();
@@ -520,6 +697,9 @@ impl DashboardContext {
             drawn_notice_generation: 0,
             controller_changed: true,
             quit_detached: false,
+            shutdown_requested: false,
+            critical_operations,
+            critical_operations_changed,
             quota_profiles_tx,
             quota: Feed::new(quota_updates_rx),
             manual_quota_refresh_generation: None,
@@ -634,6 +814,7 @@ impl DashboardContext {
                 &self.controller,
                 session_id,
                 self.dashboard_io_tx.clone(),
+                self.critical_operations.clone(),
             );
         }
     }
@@ -809,6 +990,7 @@ impl DashboardContext {
     /// Tells every operation still in flight to stop. Cancellation is
     /// cooperative, so this only requests it.
     fn cancel_background_work(&self) {
+        self.critical_operations.cancel_all();
         for operation in self.lifecycle_operations.values() {
             operation.cancelled.store(true, Ordering::Release);
         }
@@ -912,6 +1094,7 @@ impl DashboardContext {
                 &mut self.dashboard,
                 update,
                 &self.dashboard_io_tx,
+                &self.critical_operations,
             ) {
                 Ok(true) => {
                     let _ = self.resource_triggers_tx.try_send(session_id.clone());
@@ -943,6 +1126,7 @@ impl DashboardContext {
                     session_id,
                     episode_id,
                     self.dashboard_io_tx.clone(),
+                    self.critical_operations.clone(),
                 );
             }
         }
@@ -1041,6 +1225,7 @@ impl DashboardContext {
                                 imported,
                                 pending,
                                 self.dashboard_io_tx.clone(),
+                                self.critical_operations.clone(),
                             );
                         }
                         Ok(DashboardImportTaskResult::Cancelled) => {
@@ -1136,15 +1321,12 @@ impl DashboardContext {
             self.next_import_task_id,
             cancelled,
             self.import_task_tx.clone(),
+            self.critical_operations.clone(),
         );
     }
 
     /// Applies what the chat view asked for after handling its own input.
-    /// Breaking means the user quit from the chat.
-    async fn apply_chat_outcome(
-        &mut self,
-        outcome: hel::hel_chat::ChatEventOutcome,
-    ) -> ControlFlow<()> {
+    async fn apply_chat_outcome(&mut self, outcome: hel::hel_chat::ChatEventOutcome) {
         match outcome {
             hel::hel_chat::ChatEventOutcome::None | hel::hel_chat::ChatEventOutcome::Handled => {}
             hel::hel_chat::ChatEventOutcome::SwitchSession {
@@ -1179,17 +1361,13 @@ impl DashboardContext {
                 last_seen_event_ordinal,
             } => {
                 let persist = self.leave_chat(last_seen_event_ordinal);
-                // Quitting leaves this loop for process exit, so the detach
-                // write has to land first. Bounded so a stuck database cannot
-                // hang the quit.
-                if let Some(persist) = persist {
-                    let _ = tokio::time::timeout(io::DETACH_PERSIST_QUIT_TIMEOUT, persist).await;
-                }
-                self.quit_detached = true;
-                return ControlFlow::Break(());
+                // The critical-operation guard keeps the TUI alive until this
+                // durable write finishes, while unrelated reads remain free
+                // to be abandoned.
+                drop(persist);
+                self.request_shutdown();
             }
         }
-        ControlFlow::Continue(())
     }
 
     /// Returns to the session list. The chat stays warm behind it, so its feeds
@@ -1219,6 +1397,7 @@ impl DashboardContext {
             last_seen_event_ordinal,
             &draft,
             &self.dashboard_io_tx,
+            self.critical_operations.clone(),
         )
     }
 }
@@ -1348,6 +1527,7 @@ fn record_chat_detach_state(
     event_ordinal: u64,
     draft: &str,
     updates: &UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let Some(session) = controller.state.sessions.get_mut(session_id) else {
         dashboard.set_notice(format!(
@@ -1365,6 +1545,7 @@ fn record_chat_detach_state(
         event_ordinal,
         draft.to_owned(),
         updates.clone(),
+        tracker,
     ))
 }
 
@@ -1505,5 +1686,38 @@ mod tests {
         assert_eq!(queued.applied_event_ordinal, 3);
         assert_eq!(receipt, 2);
         assert_eq!(in_flight, BTreeSet::from(["session-1".to_owned()]));
+    }
+
+    #[test]
+    fn critical_operations_hold_shutdown_until_their_guards_drop() {
+        let (tracker, changed) = CriticalOperationTracker::new();
+        let first = tracker.begin("saving draft for 01234567");
+        let second = tracker.begin("stopping session 89abcdef");
+
+        assert_eq!(tracker.blockers().len(), 2);
+        assert_eq!(
+            shutdown_wait_notice(&tracker.blockers()).as_deref(),
+            Some("Waiting for 2 operations to complete before exiting")
+        );
+        assert!(changed.has_changed().unwrap());
+
+        drop(first);
+        assert_eq!(
+            shutdown_wait_notice(&tracker.blockers()).as_deref(),
+            Some("Waiting for stopping session 89abcdef to complete before exiting")
+        );
+        drop(second);
+        assert_eq!(shutdown_wait_notice(&tracker.blockers()), None);
+    }
+
+    #[test]
+    fn shutdown_cancels_process_owning_critical_operations() {
+        let (tracker, _changed) = CriticalOperationTracker::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _guard = tracker.begin_cancellable("checking repository", cancelled.clone());
+
+        tracker.cancel_all();
+
+        assert!(cancelled.load(Ordering::Acquire));
     }
 }
