@@ -14,7 +14,7 @@ use ratatui::widgets::{
 use hel::hel_chat::render_agent_message_head;
 #[cfg(test)]
 use hel::hel_chat::render_agent_message_tail;
-use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
+use hel::hel_config::{HarnessKind, HelConfig};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
 use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
@@ -603,24 +603,7 @@ fn session_top_line(
                 session.target_template_id.clone(),
             )
         });
-    let bare = matches!(
-        config.targets.get(&target_id),
-        Some(TargetTemplate::LocalBare | TargetTemplate::SshBare { .. })
-    );
-    let target = if bare {
-        let directory = session
-            .managed_worktree
-            .as_ref()
-            .map(|worktree| &worktree.source_project_directory)
-            .or(session.project_directory.as_ref())
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned());
-        directory.map_or(target_id.clone(), |directory| {
-            format!("{target_id}/{directory}")
-        })
-    } else {
-        target_id
-    };
+    let target = session.project_target(config, &target_id);
     let status_columns = if let Some(operation) = operation {
         let (label, started_at) = match (operation.stage, operation.kind) {
             (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (

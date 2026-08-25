@@ -10,7 +10,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
-use crate::hel_config::{HarnessKind, HelConfig, atomic_write, data_dir, validate_id};
+use crate::hel_config::{
+    HarnessKind, HelConfig, TargetTemplate, atomic_write, data_dir, validate_id,
+};
 use crate::hel_credentials::CredentialSyncSignal;
 use crate::hel_targets::{AdditionalMount, validate_additional_mounts};
 use crate::hel_worker::{
@@ -792,6 +794,27 @@ impl SessionRecord {
             .unwrap_or_else(|| path_leaf(Path::new(&self.bundle_id)))
     }
 
+    /// Target label used by the live session summary. Bare targets identify
+    /// the project directory they open directly; workspace targets already
+    /// identify the provisioned environment on their own.
+    pub fn project_target(&self, config: &HelConfig, target_id: &str) -> String {
+        if !matches!(
+            config.targets.get(target_id),
+            Some(TargetTemplate::LocalBare | TargetTemplate::SshBare { .. })
+        ) {
+            return target_id.to_owned();
+        }
+        self.managed_worktree
+            .as_ref()
+            .map(|worktree| &worktree.source_project_directory)
+            .or(self.project_directory.as_ref())
+            .and_then(|path| path.file_name())
+            .map_or_else(
+                || target_id.to_owned(),
+                |directory| format!("{target_id}/{}", directory.to_string_lossy()),
+            )
+    }
+
     /// Stable source identity used to group sessions. Managed worktrees point
     /// back at their source repository, and bundles use only their primary
     /// repository, so temporary destinations never split one project.
@@ -1357,6 +1380,26 @@ mod tests {
             target: ManagedWorktreeTarget::Local,
         });
         assert_eq!(session.project_name(&config), "source");
+    }
+
+    #[test]
+    fn project_target_adds_the_raw_project_name_only_for_bare_targets() {
+        let mut config = sample_config();
+        config
+            .targets
+            .insert("localhost".into(), TargetTemplate::LocalBare);
+        let mut session = sample_session();
+        session.project_directory = Some(PathBuf::from("/mnt/optane/bifrost-fird"));
+
+        assert_eq!(session.project_target(&config, "podman"), "podman");
+        assert_eq!(
+            session.project_target(&config, "localhost"),
+            "localhost/bifrost-fird"
+        );
+        assert_eq!(
+            session.project_target(&config, "retired-target"),
+            "retired-target"
+        );
     }
 
     #[test]
