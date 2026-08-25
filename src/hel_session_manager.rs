@@ -19,8 +19,8 @@ use crate::hel_projection::{
 };
 use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
 use crate::hel_targets::{
-    CancellableProcessExecutor, CommandExecutor, CommandPlan, CommandSpec, TargetRecoveryPlan,
-    ensure_recovery_target_running,
+    CancellableProcessExecutor, CommandExecutor, CommandPlan, CommandSpec, TargetRecoveryOutcome,
+    TargetRecoveryPlan, ensure_recovery_target_running,
 };
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected, RelayTransportDead};
@@ -84,6 +84,7 @@ fn worker_connect_allows_live_restart(error: &anyhow::Error) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerRecoveryOutcome {
     Alive,
+    TargetMissing,
     RestartedDead,
     RestartedUnresponsive,
 }
@@ -94,8 +95,12 @@ async fn recover_worker(
 ) -> Result<WorkerRecoveryOutcome> {
     tokio::task::spawn_blocking(move || {
         let executor = CancellableProcessExecutor::with_timeout(WORKER_RESTART_TIMEOUT);
-        ensure_recovery_target_running(&executor, plan.target.as_ref())
-            .context("restore relay worker target")?;
+        if ensure_recovery_target_running(&executor, plan.target.as_ref())
+            .context("restore relay worker target")?
+            == TargetRecoveryOutcome::Missing
+        {
+            return Ok(WorkerRecoveryOutcome::TargetMissing);
+        }
         let output = executor
             .execute(&plan.liveness_probe)
             .context("probe relay worker liveness")?;
@@ -130,13 +135,16 @@ async fn recover_worker(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewError {
     Unreachable(String),
+    TargetMissing(String),
     ProjectionIntegrity(String),
 }
 
 impl ViewError {
     pub fn detail(&self) -> &str {
         match self {
-            Self::Unreachable(detail) | Self::ProjectionIntegrity(detail) => detail,
+            Self::Unreachable(detail)
+            | Self::TargetMissing(detail)
+            | Self::ProjectionIntegrity(detail) => detail,
         }
     }
 }
@@ -848,7 +856,8 @@ async fn run_session_actor(
                                         WorkerRecoveryOutcome::RestartedUnresponsive => {
                                             "the relay worker was alive but not serving handshakes, so it was restarted"
                                         }
-                                        WorkerRecoveryOutcome::Alive => unreachable!(),
+                                        WorkerRecoveryOutcome::Alive
+                                        | WorkerRecoveryOutcome::TargetMissing => unreachable!(),
                                     };
                                     publish_view(&target.session_id, ManagedSessionView {
                                         snapshot,
@@ -873,6 +882,18 @@ async fn run_session_actor(
                                         ))),
                                     }, &view_tx, &updates);
                                     interval.reset_after(reconnect_delay(failures));
+                                }
+                                Ok(WorkerRecoveryOutcome::TargetMissing) => {
+                                    let snapshot = view_tx.borrow().snapshot.clone();
+                                    publish_view(&target.session_id, ManagedSessionView {
+                                        snapshot,
+                                        connected: false,
+                                        error: Some(ViewError::TargetMissing(
+                                            "the managed Podman session container no longer exists"
+                                                .into(),
+                                        )),
+                                    }, &view_tx, &updates);
+                                    interval.reset_after(RECONNECT_BACKOFF_CEILING);
                                 }
                                 Err(recovery_error) => {
                                     tracing::warn!(
@@ -1851,6 +1872,8 @@ mod tests {
         let outcome = recover_worker(
             WorkerRecoveryPlan {
                 target: Some(TargetRecoveryPlan {
+                    exists: CommandSpec::new("true", std::iter::empty::<&str>())
+                        .purpose("check test target"),
                     inspect,
                     start,
                     session_id: "session-1".into(),
@@ -1875,6 +1898,31 @@ mod tests {
         assert_eq!(outcome, WorkerRecoveryOutcome::RestartedDead);
         assert!(target_started.exists());
         assert!(worker_restarted.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_reports_a_missing_target_without_running_worker_commands() {
+        let unreachable = CommandSpec::new("false", std::iter::empty::<&str>());
+        let outcome = recover_worker(
+            WorkerRecoveryPlan {
+                target: Some(TargetRecoveryPlan {
+                    exists: unreachable,
+                    inspect: CommandSpec::new("false", std::iter::empty::<&str>()),
+                    start: CommandSpec::new("false", std::iter::empty::<&str>()),
+                    session_id: "session-1".into(),
+                }),
+                liveness_probe: CommandSpec::new("false", std::iter::empty::<&str>()),
+                restart: CommandPlan {
+                    description: "must not restart".into(),
+                    commands: vec![CommandSpec::new("false", std::iter::empty::<&str>())],
+                },
+            },
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, WorkerRecoveryOutcome::TargetMissing);
     }
 
     fn target(program: &str) -> RelaySessionTarget {

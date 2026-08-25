@@ -218,7 +218,7 @@ impl WorkerDiagnosisTracker {
         connected: bool,
         error: Option<String>,
     ) -> Option<u64> {
-        if connected {
+        if connected || error.is_none() {
             self.current.remove(session_id);
         }
         let error = error?;
@@ -1063,6 +1063,39 @@ pub(crate) fn apply_worker_poll_update(
                 &update.session_id[..update.session_id.len().min(8)]
             ));
         }
+        Some(ViewError::TargetMissing(detail)) => {
+            dashboard.mark_transcript_unavailable(&update.session_id);
+            dashboard.set_notice(format!(
+                "Session {}: {detail}; recording the session as lost…",
+                &update.session_id[..update.session_id.len().min(8)]
+            ));
+            if controller
+                .state
+                .sessions
+                .get(&update.session_id)
+                .is_some_and(|session| {
+                    matches!(
+                        session.state,
+                        SessionState::Provisioning
+                            | SessionState::Running
+                            | SessionState::Disconnected
+                            | SessionState::Error
+                    )
+                })
+            {
+                spawn_worker_record_persistence(
+                    update.session_id.clone(),
+                    WorkerRecordPersistence::TargetLost {
+                        session_id: update.session_id.clone(),
+                        detail,
+                        updated_at: chrono::Utc::now()
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    },
+                    dashboard_io_tx.clone(),
+                    tracker.clone(),
+                );
+            }
+        }
         Some(ViewError::ProjectionIntegrity(detail)) => {
             // Deterministic failure: no worker diagnostics. Like an
             // unreachable relay, it is a live poll fact and is never
@@ -1126,7 +1159,14 @@ pub(crate) fn apply_worker_record_update(
 }
 
 pub(crate) enum WorkerRecordPersistence {
-    AcpTitle { title: Option<String> },
+    AcpTitle {
+        title: Option<String>,
+    },
+    TargetLost {
+        session_id: String,
+        detail: String,
+        updated_at: String,
+    },
 }
 
 fn spawn_worker_record_persistence(
@@ -1143,7 +1183,13 @@ fn spawn_worker_record_persistence(
         let result = match &operation {
             WorkerRecordPersistence::AcpTitle { title } => {
                 hel::hel_database::set_session_acp_title(&session_id, title.as_deref())
+                    .map(|()| true)
             }
+            WorkerRecordPersistence::TargetLost {
+                session_id,
+                detail,
+                updated_at,
+            } => hel::hel_database::mark_session_target_lost(session_id, detail, updated_at),
         }
         .map_err(|error| format!("{error:#}"));
         let _ = updates.send(DashboardIoUpdate::WorkerRecordPersistence { operation, result });
@@ -1406,6 +1452,20 @@ mod tests {
         assert_eq!(
             tracker.finish("session-1", second).display_error.as_deref(),
             Some("new outage")
+        );
+    }
+
+    #[test]
+    fn stale_worker_diagnosis_is_not_published_after_a_terminal_poll_error() {
+        let mut tracker = WorkerDiagnosisTracker::default();
+        let episode = tracker
+            .observe("session-1", false, Some("relay failed".into()))
+            .unwrap();
+
+        assert_eq!(tracker.observe("session-1", false, None), None);
+        assert_eq!(
+            tracker.finish("session-1", episode),
+            WorkerDiagnosisCompletion::default()
         );
     }
 

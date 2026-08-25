@@ -576,8 +576,11 @@ impl Controller {
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?
             .clone();
-        if !matches!(previous.state, SessionState::Stopped | SessionState::Error) {
-            bail!("session {session_id} is not stopped or retryable");
+        if !matches!(
+            previous.state,
+            SessionState::Stopped | SessionState::Lost | SessionState::Error
+        ) {
+            bail!("session {session_id} is not stopped, lost, or retryable");
         }
         let checkpoint = previous
             .checkpoint
@@ -1635,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_sessions_refuse_a_local_bare_resume_before_the_record_changes() {
+    fn lost_bundle_sessions_reach_resume_compatibility_before_the_record_changes() {
         struct UnusedExecutor;
 
         impl CommandExecutor for UnusedExecutor {
@@ -1648,7 +1651,7 @@ mod tests {
         let session_id = "0123456789abcdef0123456789abcdef";
         let checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 3);
         let mut session = checkpoint_test_session(session_id);
-        session.state = SessionState::Stopped;
+        session.state = SessionState::Lost;
         session.checkpoint = Some(checkpoint);
         let previous = session.clone();
         let profile_home = directory.path().join("profile");

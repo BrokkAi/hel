@@ -42,7 +42,7 @@ use crate::short_id;
 pub(crate) enum DashboardIoUpdate {
     WorkerRecordPersistence {
         operation: WorkerRecordPersistence,
-        result: std::result::Result<(), String>,
+        result: std::result::Result<bool, String>,
     },
     MaterializedSessionProjection {
         session_id: String,
@@ -873,12 +873,58 @@ impl DashboardContext {
     pub(super) fn apply_dashboard_io_update(&mut self, update: DashboardIoUpdate) {
         match update {
             DashboardIoUpdate::WorkerRecordPersistence { operation, result } => {
-                if let Err(error) = result {
-                    match operation {
-                        WorkerRecordPersistence::AcpTitle { .. } => self
-                            .dashboard
-                            .set_notice(format!("Could not save harness title: {error}")),
+                match (operation, result) {
+                    (WorkerRecordPersistence::AcpTitle { .. }, Err(error)) => self
+                        .dashboard
+                        .set_notice(format!("Could not save harness title: {error}")),
+                    (
+                        WorkerRecordPersistence::TargetLost {
+                            session_id,
+                            detail,
+                            updated_at,
+                        },
+                        Ok(true),
+                    ) => {
+                        let checkpoint_available = self
+                            .controller
+                            .state
+                            .sessions
+                            .get(&session_id)
+                            .is_some_and(|session| session.checkpoint.is_some());
+                        if let Some(session) = self.controller.state.sessions.get_mut(&session_id)
+                            && matches!(
+                                session.state,
+                                SessionState::Provisioning
+                                    | SessionState::Running
+                                    | SessionState::Disconnected
+                                    | SessionState::Error
+                            )
+                        {
+                            session.state = SessionState::Lost;
+                            session.last_error = Some(detail);
+                            session.updated_at = updated_at;
+                            self.dashboard.set_state(self.controller.state.clone());
+                            self.drop_warm_chat_for(&session_id);
+                            self.refresh_poll_targets();
+                            let recovery = if checkpoint_available {
+                                "; its last verified checkpoint remains available from Resume"
+                            } else {
+                                ""
+                            };
+                            self.dashboard.set_notice(format!(
+                                "Session {} is lost because its managed target no longer exists{recovery}",
+                                short_id(&session_id)
+                            ));
+                        }
                     }
+                    (WorkerRecordPersistence::TargetLost { session_id, .. }, Err(error)) => {
+                        self.dashboard.set_notice(format!(
+                            "Could not record missing target for {}: {error}",
+                            short_id(&session_id)
+                        ))
+                    }
+                    (WorkerRecordPersistence::AcpTitle { .. }, Ok(_))
+                    | (WorkerRecordPersistence::TargetLost { .. }, Ok(false)) => {}
                 }
             }
             DashboardIoUpdate::LifecycleStage { session_id, stage } => {

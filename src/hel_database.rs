@@ -1013,6 +1013,31 @@ pub fn set_session_archived(session_id: &str, archived: bool) -> Result<()> {
     set_session_archived_to(&database_path(), session_id, archived)
 }
 
+/// Record that the managed target of an otherwise live session is definitively
+/// gone. The state predicate keeps a late poll result from overwriting a
+/// concurrent checkpoint or teardown transition.
+pub fn mark_session_target_lost(session_id: &str, detail: &str, updated_at: &str) -> Result<bool> {
+    mark_session_target_lost_to(&database_path(), session_id, detail, updated_at)
+}
+
+fn mark_session_target_lost_to(
+    path: &Path,
+    session_id: &str,
+    detail: &str,
+    updated_at: &str,
+) -> Result<bool> {
+    let connection = open(path)?;
+    let changed = connection.execute(
+        "UPDATE sessions
+         SET state = 'lost', last_error = ?2, updated_at = ?3
+         WHERE session_id = ?1
+           AND state IN ('provisioning', 'running', 'disconnected', 'error')",
+        params![session_id, detail, updated_at],
+    )?;
+    ensure!(changed <= 1, "updated {changed} sessions for {session_id}");
+    Ok(changed == 1)
+}
+
 fn set_session_archived_to(path: &Path, session_id: &str, archived: bool) -> Result<()> {
     let connection = open(path)?;
     let changed = connection.execute(
@@ -3336,6 +3361,47 @@ mod tests {
         assert_eq!(session.additional_mounts, vec![attached]);
         assert_eq!(session.container_cpus.as_deref(), Some("6"));
         assert_eq!(session.container_memory.as_deref(), Some("12g"));
+    }
+
+    #[test]
+    fn missing_target_marks_only_a_live_session_lost() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let mut live = session("session-1", "project-1");
+        live.state = SessionState::Running;
+        save_session_to(&database, &live).unwrap();
+
+        assert!(
+            mark_session_target_lost_to(
+                &database,
+                "session-1",
+                "managed container is missing",
+                "2026-08-25T16:00:00Z",
+            )
+            .unwrap()
+        );
+        let loaded = load_state_from(&database).unwrap();
+        let lost = &loaded.sessions["session-1"];
+        assert_eq!(lost.state, SessionState::Lost);
+        assert_eq!(
+            lost.last_error.as_deref(),
+            Some("managed container is missing")
+        );
+
+        assert!(
+            !mark_session_target_lost_to(
+                &database,
+                "session-1",
+                "late duplicate",
+                "2026-08-25T16:01:00Z",
+            )
+            .unwrap()
+        );
+        let loaded = load_state_from(&database).unwrap();
+        assert_eq!(
+            loaded.sessions["session-1"].last_error.as_deref(),
+            Some("managed container is missing")
+        );
     }
 
     #[test]

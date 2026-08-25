@@ -1054,7 +1054,9 @@ impl DashboardContext {
             // Only unreachable relays drive the worker diagnostics flow.
             let connection_error = match update.view.error.as_ref() {
                 Some(ViewError::Unreachable(detail)) => Some(detail.clone()),
-                Some(ViewError::ProjectionIntegrity(_)) | None => None,
+                Some(ViewError::TargetMissing(_) | ViewError::ProjectionIntegrity(_)) | None => {
+                    None
+                }
             };
             if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = self.controller.state.sessions.get(&session_id).cloned()

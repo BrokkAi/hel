@@ -1331,6 +1331,7 @@ pub enum TargetLocator {
 /// one; callers leave every other target kind alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetRecoveryPlan {
+    pub exists: CommandSpec,
     pub inspect: CommandSpec,
     pub start: CommandSpec,
     pub session_id: String,
@@ -1339,6 +1340,7 @@ pub struct TargetRecoveryPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetRecoveryOutcome {
     NotRequired,
+    Missing,
     AlreadyRunning,
     Started,
 }
@@ -1721,14 +1723,18 @@ pub fn target_recovery_plan(
     session_id: &str,
 ) -> Result<Option<TargetRecoveryPlan>> {
     verify_locator(locator, session_id)?;
-    let (inspect, start) = match locator {
+    let (exists, inspect, start) = match locator {
         TargetLocator::LocalPodman { container_id } => (
+            CommandSpec::new("podman", ["container", "exists", container_id])
+                .purpose("check for Hel session container"),
             CommandSpec::new("podman", ["container", "inspect", container_id])
                 .purpose("inspect Hel session container"),
             CommandSpec::new("podman", ["start", container_id])
                 .purpose("start stopped Hel session container"),
         ),
         TargetLocator::SshPodman { ssh, container_id } => (
+            ssh_command(ssh, ["podman", "container", "exists", container_id])
+                .purpose("check for remote Hel session container"),
             ssh_command(ssh, ["podman", "container", "inspect", container_id])
                 .purpose("inspect remote Hel session container"),
             ssh_command(ssh, ["podman", "start", container_id])
@@ -1740,6 +1746,7 @@ pub fn target_recovery_plan(
         | TargetLocator::SshBare { .. } => return Ok(None),
     };
     Ok(Some(TargetRecoveryPlan {
+        exists,
         inspect,
         start,
         session_id: session_id.to_owned(),
@@ -1756,6 +1763,21 @@ pub fn ensure_recovery_target_running(
     let Some(plan) = plan else {
         return Ok(TargetRecoveryOutcome::NotRequired);
     };
+    let existence = executor
+        .execute(&plan.exists)
+        .context("check whether Podman session target exists")?;
+    match existence.status {
+        0 => {}
+        // `podman container exists` deliberately reserves 1 for absence and
+        // uses 125 for invocation or storage failures. SSH preserves the
+        // remote exit status, so this contract also covers remote Podman.
+        1 => return Ok(TargetRecoveryOutcome::Missing),
+        _ => {
+            checked_command_output(&plan.exists, existence)
+                .context("check whether Podman session target exists")?;
+            unreachable!("a successful checked command has status zero");
+        }
+    }
     let status = inspect_recovery_target(executor, plan)?;
     match status.as_str() {
         "running" => Ok(TargetRecoveryOutcome::AlreadyRunning),
@@ -3416,6 +3438,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(local.exists.args, ["container", "exists", name.as_str()]);
         assert_eq!(local.inspect.args, ["container", "inspect", name.as_str()]);
         assert_eq!(local.start.args, ["start", name.as_str()]);
 
@@ -3428,6 +3451,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(remote.exists.program, "ssh");
+        assert_eq!(
+            remote.exists.args.last().unwrap(),
+            &format!("'podman' 'container' 'exists' '{name}'")
+        );
         assert_eq!(remote.inspect.program, "ssh");
         assert_eq!(
             remote.inspect.args.last().unwrap(),
@@ -3446,6 +3474,7 @@ mod tests {
             target_recovery_plan(&TargetLocator::LocalPodman { container_id: name }, SESSION)
                 .unwrap();
         let executor = PodmanPreflightExecutor::with_outputs([
+            podman_output(""),
             podman_inspection("exited", SESSION, "true"),
             podman_output("container-id\n"),
             podman_inspection("running", SESSION, "true"),
@@ -3456,25 +3485,50 @@ mod tests {
             TargetRecoveryOutcome::Started
         );
         let seen = executor.seen.borrow();
-        assert_eq!(seen.len(), 3);
-        assert_eq!(seen[0].purpose, "inspect Hel session container");
-        assert_eq!(seen[1].purpose, "start stopped Hel session container");
-        assert_eq!(seen[2].purpose, "inspect Hel session container");
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0].purpose, "check for Hel session container");
+        assert_eq!(seen[1].purpose, "inspect Hel session container");
+        assert_eq!(seen[2].purpose, "start stopped Hel session container");
+        assert_eq!(seen[3].purpose, "inspect Hel session container");
     }
 
     #[test]
     fn running_podman_target_is_not_started() {
         let plan = TargetRecoveryPlan {
+            exists: CommandSpec::new("exists", std::iter::empty::<&str>()),
             inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
             start: CommandSpec::new("start", std::iter::empty::<&str>()),
             session_id: SESSION.into(),
         };
-        let executor =
-            PodmanPreflightExecutor::with_outputs([podman_inspection("running", SESSION, "true")]);
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_output(""),
+            podman_inspection("running", SESSION, "true"),
+        ]);
 
         assert_eq!(
             ensure_recovery_target_running(&executor, Some(&plan)).unwrap(),
             TargetRecoveryOutcome::AlreadyRunning
+        );
+        assert_eq!(executor.seen.borrow().len(), 2);
+    }
+
+    #[test]
+    fn missing_podman_target_is_reported_without_inspection_or_start() {
+        let plan = TargetRecoveryPlan {
+            exists: CommandSpec::new("exists", std::iter::empty::<&str>()),
+            inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
+            start: CommandSpec::new("start", std::iter::empty::<&str>()),
+            session_id: SESSION.into(),
+        };
+        let executor = PodmanPreflightExecutor::with_outputs([CommandOutput {
+            status: 1,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }]);
+
+        assert_eq!(
+            ensure_recovery_target_running(&executor, Some(&plan)).unwrap(),
+            TargetRecoveryOutcome::Missing
         );
         assert_eq!(executor.seen.borrow().len(), 1);
     }
@@ -3488,30 +3542,34 @@ mod tests {
             ("exited", SESSION, "false", "does not own"),
         ] {
             let plan = TargetRecoveryPlan {
+                exists: CommandSpec::new("exists", std::iter::empty::<&str>()),
                 inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
                 start: CommandSpec::new("start", std::iter::empty::<&str>()),
                 session_id: SESSION.into(),
             };
-            let executor = PodmanPreflightExecutor::with_outputs([podman_inspection(
-                status, session, managed,
-            )]);
+            let executor = PodmanPreflightExecutor::with_outputs([
+                podman_output(""),
+                podman_inspection(status, session, managed),
+            ]);
 
             let error = ensure_recovery_target_running(&executor, Some(&plan))
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected), "{error}");
-            assert_eq!(executor.seen.borrow().len(), 1);
+            assert_eq!(executor.seen.borrow().len(), 2);
         }
     }
 
     #[test]
     fn podman_target_must_still_be_running_after_start() {
         let plan = TargetRecoveryPlan {
+            exists: CommandSpec::new("exists", std::iter::empty::<&str>()),
             inspect: CommandSpec::new("inspect", std::iter::empty::<&str>()),
             start: CommandSpec::new("start", std::iter::empty::<&str>()),
             session_id: SESSION.into(),
         };
         let executor = PodmanPreflightExecutor::with_outputs([
+            podman_output(""),
             podman_inspection("exited", SESSION, "true"),
             podman_output("container-id\n"),
             podman_inspection("exited", SESSION, "true"),
@@ -3526,24 +3584,30 @@ mod tests {
     #[test]
     fn podman_inspect_or_start_failures_stop_recovery() {
         let plan = TargetRecoveryPlan {
+            exists: CommandSpec::new("exists", std::iter::empty::<&str>())
+                .purpose("check test target"),
             inspect: CommandSpec::new("inspect", std::iter::empty::<&str>())
                 .purpose("inspect test target"),
             start: CommandSpec::new("start", std::iter::empty::<&str>())
                 .purpose("start test target"),
             session_id: SESSION.into(),
         };
-        let inspect_failed = PodmanPreflightExecutor::with_outputs([CommandOutput {
-            status: 1,
-            stdout: Vec::new(),
-            stderr: b"container missing".to_vec(),
-        }]);
+        let inspect_failed = PodmanPreflightExecutor::with_outputs([
+            podman_output(""),
+            CommandOutput {
+                status: 125,
+                stdout: Vec::new(),
+                stderr: b"storage unavailable".to_vec(),
+            },
+        ]);
         let error = ensure_recovery_target_running(&inspect_failed, Some(&plan))
             .unwrap_err()
             .to_string();
         assert!(error.contains("inspect Podman session target"), "{error}");
-        assert_eq!(inspect_failed.seen.borrow().len(), 1);
+        assert_eq!(inspect_failed.seen.borrow().len(), 2);
 
         let start_failed = PodmanPreflightExecutor::with_outputs([
+            podman_output(""),
             podman_inspection("exited", SESSION, "true"),
             CommandOutput {
                 status: 1,
@@ -3555,7 +3619,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("start confirmed stopped"), "{error}");
-        assert_eq!(start_failed.seen.borrow().len(), 2);
+        assert_eq!(start_failed.seen.borrow().len(), 3);
     }
 
     #[test]

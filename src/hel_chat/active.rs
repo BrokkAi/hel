@@ -579,6 +579,9 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
             ViewError::Unreachable(detail) => {
                 state.set_notice(format!("connection lost: {detail}"))
             }
+            ViewError::TargetMissing(detail) => {
+                state.set_notice(format!("managed target lost: {detail}"))
+            }
             ViewError::ProjectionIntegrity(detail) => {
                 state.set_notice(format!("transcript projection failed: {detail}"))
             }

@@ -1785,6 +1785,11 @@ mod tests {
         let executor = RecordingExecutor {
             commands: RefCell::new(Vec::new()),
             outputs: RefCell::new(vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
                 inspection("exited"),
                 CommandOutput {
                     status: 0,
@@ -1811,6 +1816,7 @@ mod tests {
         assert_eq!(
             purposes,
             [
+                "check for Hel session container",
                 "inspect Hel session container",
                 "start stopped Hel session container",
                 "inspect Hel session container",
