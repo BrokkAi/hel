@@ -980,20 +980,12 @@ fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
 }
 
 const EMPTY_QUOTA_COLOR: Color = Color::DarkGray;
-// The depleted bar is not a background color at all: it is DarkGray drawn
-// through the 25%-coverage `░` glyph, so the eye averages the light the cell
-// emits. No ANSI 16 entry sits a quarter of the way from the background to
-// DarkGray, so the solid fill behind the API label has to be spelled out.
-//
-// Screenshot sampling gives DarkGray as (118, 118, 118) over a (12, 12, 12)
-// background at exactly 25% coverage. Averaging must happen in linear light,
-// not in gamma-encoded sRGB: srgb(0.25 * lin(118) + 0.75 * lin(12)) = 62.
-// Averaging the encoded values instead yields 38, which reads far too dark.
-#[allow(clippy::disallowed_methods)]
-const API_DEPLETED_BACKGROUND: Color = Color::Rgb(62, 62, 62);
+const EMPTY_QUOTA_CELL: &str = "░";
+// Both bar kinds occupy the same column, so they must agree on the cell count.
+const QUOTA_BAR_CELLS: usize = 10;
 
 fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
-    const CELLS: usize = 10;
+    const CELLS: usize = QUOTA_BAR_CELLS;
     const EIGHTHS_PER_CELL: usize = 8;
     let Some(remaining) = window.and_then(quota_remaining_percent) else {
         return Line::default();
@@ -1015,7 +1007,7 @@ fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
         Span::styled("█".repeat(full_cells), bar_style),
         Span::styled(partial.to_string(), bar_style),
         Span::styled(
-            "░".repeat(empty_cells),
+            EMPTY_QUOTA_CELL.repeat(empty_cells),
             Style::default().fg(EMPTY_QUOTA_COLOR),
         ),
         Span::styled(
@@ -1025,14 +1017,24 @@ fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
     ])
 }
 
+/// Renders the API label centered in a field of the same depleted-quota
+/// shading the bars use, with the label cells left unshaded.
+///
+/// The depleted bar has no background color to copy: it is `EMPTY_QUOTA_COLOR`
+/// seen through a glyph that covers about a quarter of each cell, so its
+/// apparent shade exists only in the eye. Reusing the glyph reproduces that
+/// shade exactly under any terminal theme or font, which a fixed color cannot.
 fn api_quota_bar() -> Line<'static> {
-    Line::from(Span::styled(
-        format!("{:^10}", hel::hel_quota::API_LABEL),
-        Style::default()
-            .fg(Color::White)
-            .bg(API_DEPLETED_BACKGROUND)
-            .add_modifier(Modifier::BOLD),
-    ))
+    let label = hel::hel_quota::API_LABEL;
+    let label_cells = label.chars().count().min(QUOTA_BAR_CELLS);
+    let left = (QUOTA_BAR_CELLS - label_cells) / 2;
+    let right = QUOTA_BAR_CELLS - label_cells - left;
+    let shading = Style::default().fg(EMPTY_QUOTA_COLOR);
+    Line::from(vec![
+        Span::styled(EMPTY_QUOTA_CELL.repeat(left), shading),
+        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(EMPTY_QUOTA_CELL.repeat(right), shading),
+    ])
 }
 
 fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
@@ -2370,20 +2372,29 @@ mod tests {
     }
 
     #[test]
-    fn api_quota_label_uses_the_perceived_depleted_bar_background() {
+    fn api_quota_label_is_punched_into_the_depleted_bar_shading() {
         let api = api_quota_bar();
-        let depleted = quota_bar(Some(&QuotaWindow {
+        let exhausted = quota_bar(Some(&QuotaWindow {
             label: "Week".into(),
-            remaining_percent: Some(50),
+            remaining_percent: Some(0),
             used: None,
             limit: None,
             resets: None,
             resets_at_epoch_seconds: None,
         }));
-        assert_eq!(api.spans[0].content, "   API    ");
-        assert_eq!(api.spans[0].style.bg, Some(API_DEPLETED_BACKGROUND));
-        assert_eq!(depleted.spans[2].style.fg, Some(EMPTY_QUOTA_COLOR));
-        assert_eq!(depleted.spans[2].style.bg, None);
+        let shading = &exhausted.spans[2];
+        assert_eq!(shading.content, "░░░░░░░░░░");
+
+        let rendered: String = api.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(rendered, "░░░API░░░░");
+        // The padding must be the bar's own glyph and color, so the two match
+        // whatever the terminal maps them to.
+        for padding in [&api.spans[0], &api.spans[2]] {
+            assert_eq!(padding.style.fg, shading.style.fg);
+            assert_eq!(padding.style.bg, shading.style.bg);
+        }
+        // A painted background would not match a glyph-shaded cell.
+        assert!(api.spans.iter().all(|span| span.style.bg.is_none()));
     }
 
     #[test]
