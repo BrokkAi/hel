@@ -3484,6 +3484,7 @@ mod tests {
     fn container_template() -> crate::hel_config::ContainerTemplate {
         crate::hel_config::ContainerTemplate {
             image: "agent-dev:latest".into(),
+            pull_policy: Default::default(),
             platform: None,
             cpus: None,
             memory: None,

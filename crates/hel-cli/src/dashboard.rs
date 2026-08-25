@@ -1652,6 +1652,7 @@ mod tests {
             hel::hel_config::TargetTemplate::LocalPodman {
                 container: hel::hel_config::ContainerTemplate {
                     image: "ubuntu:24.04".into(),
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,

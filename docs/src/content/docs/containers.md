@@ -81,6 +81,13 @@ auto-installs Git, GitHub CLI, and Node the first time a session needs them.
 But that installation runs inside every new container, which slows down the
 start of each session. The default agent-dev image avoids that cost.
 
+Container targets default to `pull_policy = "auto"`. Remote images tagged
+`:latest` are checked for a changed registry digest before each new session;
+versioned tags remain cached, digest references stay pinned, and
+`localhost/...` images remain local. Set `pull_policy` beside `image` to
+`always`, `newer`, `missing`, or `never` when a target needs an explicit
+policy. Existing running containers are never replaced in place.
+
 It then shows a summary of what it's about to write and asks you to confirm
 before writing `config.toml`. After you confirm, it runs a smoke test: it
 creates a disposable container from the configured image, runs a trivial

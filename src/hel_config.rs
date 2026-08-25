@@ -401,6 +401,8 @@ impl ProjectRepository {
 #[serde(deny_unknown_fields)]
 pub struct ContainerTemplate {
     pub image: String,
+    #[serde(default, skip_serializing_if = "ImagePullPolicy::is_auto")]
+    pub pull_policy: ImagePullPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,6 +411,23 @@ pub struct ContainerTemplate {
     pub memory: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImagePullPolicy {
+    #[default]
+    Auto,
+    Always,
+    Newer,
+    Missing,
+    Never,
+}
+
+impl ImagePullPolicy {
+    fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
 }
 
 impl ContainerTemplate {
@@ -905,6 +924,7 @@ mod tests {
                 TargetTemplate::LocalPodman {
                     container: ContainerTemplate {
                         image: "ubuntu:24.04".into(),
+                        pull_policy: ImagePullPolicy::Auto,
                         platform: None,
                         cpus: None,
                         memory: None,
@@ -949,6 +969,7 @@ mod tests {
             TargetTemplate::LocalPodman {
                 container: ContainerTemplate {
                     image: "different".into(),
+                    pull_policy: ImagePullPolicy::Auto,
                     platform: None,
                     cpus: None,
                     memory: None,
@@ -1202,6 +1223,7 @@ mod tests {
         let config = sample_config();
         config.save_to(&path).unwrap();
         assert_eq!(HelConfig::load_from(&path).unwrap(), config);
+        assert!(!fs::read_to_string(&path).unwrap().contains("pull_policy"));
         assert_eq!(
             fs::read_to_string(path)
                 .unwrap()
@@ -1220,6 +1242,28 @@ mod tests {
                         .ends_with(".tmp")
                 })
         );
+    }
+
+    #[test]
+    fn explicit_image_pull_policy_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = sample_config();
+        let TargetTemplate::LocalPodman { container } =
+            config.targets.get_mut("podman-default").unwrap()
+        else {
+            unreachable!()
+        };
+        container.pull_policy = ImagePullPolicy::Never;
+
+        config.save_to(&path).unwrap();
+
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("pull_policy = \"never\"")
+        );
+        assert_eq!(HelConfig::load_from(&path).unwrap(), config);
     }
 
     #[test]

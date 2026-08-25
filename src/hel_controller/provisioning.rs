@@ -1575,6 +1575,7 @@ mod tests {
     fn podman_target() -> hel_targets::TargetTemplate {
         hel_targets::TargetTemplate::LocalPodman(ContainerTemplate {
             image: "ubuntu:24.04".into(),
+            pull_policy: Default::default(),
             extra_run_args: Vec::new(),
         })
     }
@@ -1678,6 +1679,7 @@ mod tests {
         for target in [
             hel_targets::TargetTemplate::AppleContainer(ContainerTemplate {
                 image: "ubuntu:24.04".into(),
+                pull_policy: Default::default(),
                 extra_run_args: Vec::new(),
             }),
             hel_targets::TargetTemplate::AwsEc2(hel_targets::AwsTemplate {
@@ -1987,6 +1989,7 @@ mod tests {
     fn container_targets() -> Vec<hel_targets::TargetTemplate> {
         let container = ContainerTemplate {
             image: "ubuntu:24.04".into(),
+            pull_policy: Default::default(),
             extra_run_args: Vec::new(),
         };
         vec![

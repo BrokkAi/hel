@@ -695,6 +695,7 @@ mod tests {
             TargetTemplate::LocalPodman {
                 container: ConfigContainer {
                     image: "example.invalid/hel-test:latest".into(),
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,
@@ -940,6 +941,7 @@ mod tests {
             TargetTemplate::LocalPodman {
                 container: ConfigContainer {
                     image: "ubuntu:24.04".into(),
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,

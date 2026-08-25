@@ -450,6 +450,7 @@ fn build_config_with_runtime(
     if let Some((runtime, image)) = runtime {
         let container = ContainerTemplate {
             image: image.trim().to_owned(),
+            pull_policy: Default::default(),
             platform: None,
             cpus: None,
             memory: None,
@@ -497,6 +498,7 @@ fn build_config_with_runtime(
                 ssh: connection,
                 container: ContainerTemplate {
                     image: image.clone(),
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,
@@ -1052,6 +1054,7 @@ fn write_summary(
 fn smoke_target(runtime: RuntimeKind, image: &str) -> RuntimeTargetTemplate {
     let container = RuntimeContainerTemplate {
         image: image.to_owned(),
+        pull_policy: Default::default(),
         extra_run_args: vec![],
     };
     match runtime {

@@ -523,6 +523,7 @@ fn podman_image_check(
     if smoke {
         let target = RuntimeTargetTemplate::LocalPodman(RuntimeContainerTemplate {
             image: image.to_owned(),
+            pull_policy: Default::default(),
             extra_run_args: vec![],
         });
         return match run_setup_smoke_test(&target, &doctor_smoke_id(), executor) {
@@ -767,6 +768,7 @@ fn ssh_podman_check(
         ssh: ssh.clone(),
         container: RuntimeContainerTemplate {
             image: image.to_owned(),
+            pull_policy: Default::default(),
             extra_run_args: vec![],
         },
     };
@@ -1142,6 +1144,7 @@ pub fn apple_container_check(
 
     let target = RuntimeTargetTemplate::AppleContainer(RuntimeContainerTemplate {
         image,
+        pull_policy: Default::default(),
         extra_run_args: vec![],
     });
     match run_setup_smoke_test(&target, &doctor_smoke_id(), executor) {
@@ -1311,6 +1314,7 @@ mod tests {
     fn container(image: &str) -> ContainerTemplate {
         ContainerTemplate {
             image: image.to_owned(),
+            pull_policy: Default::default(),
             platform: None,
             cpus: None,
             memory: None,

@@ -171,6 +171,9 @@ destination = "myapp"
 [targets.podman]
 kind = "local-podman"
 image = "ghcr.io/brokkai/hel/agent-dev:latest"
+# Optional: auto (default), always, newer, missing, or never. Auto refreshes
+# remote latest tags, keeps versioned tags cached, and pins digest references.
+# pull_policy = "auto"
 ```
 
 Profiles point at harness home directories on your machine — run as many

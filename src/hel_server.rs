@@ -1269,6 +1269,7 @@ mod tests {
                     TargetTemplate::LocalPodman {
                         container: ContainerTemplate {
                             image: "secret.registry/image".into(),
+                            pull_policy: Default::default(),
                             platform: None,
                             cpus: None,
                             memory: None,

@@ -25,7 +25,7 @@ image = "localhost/hel/agent-dev:latest"
 Hel invokes the local `podman` CLI as the user running Hel; it does not use
 `sudo`, a shared Podman socket, or a remote Podman connection. Before each
 `local-podman` session and while `hel setup` evaluates Podman, Hel performs
-these fast checks without pulling an image:
+these fast runtime checks:
 
 ```console
 podman --version
@@ -36,9 +36,15 @@ podman unshare cat /proc/self/uid_map
 For a session, Hel starts a detached, labeled container from the configured
 image, uses `podman exec` for the worker, Git, harness, and clone commands, and
 removes that exact container with `podman rm --force` only after checkpointing.
+The default `pull_policy = "auto"` checks the registry for a changed digest when
+the image is a remote `:latest` tag, uses the cached image for versioned or
+local tags, and refuses to replace a digest-pinned image. Set `pull_policy` to
+`always`, `newer`, `missing`, or `never` to override that inference. Podman's
+`newer` policy retains a cached image when its registry is temporarily
+unavailable.
 `hel setup` additionally creates, executes `true` in, and removes a disposable
-container from the configured image. The setup smoke test may pull that image;
-the normal preflight deliberately does not.
+container from the configured image. The fast runtime probes themselves never
+pull an image; image refresh happens in the supervised provisioning task.
 
 `hel doctor --json` runs those three checks only when a `local-podman` target
 exists, and then checks `podman image exists` for each configured

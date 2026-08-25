@@ -85,6 +85,7 @@ async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> 
             TargetTemplate::LocalPodman {
                 container: ContainerTemplate {
                     image,
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,
@@ -203,6 +204,7 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
             TargetTemplate::LocalPodman {
                 container: ContainerTemplate {
                     image,
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,
@@ -316,6 +318,7 @@ async fn imported_grok_session_resumes_natively_async() -> anyhow::Result<()> {
             TargetTemplate::LocalPodman {
                 container: ContainerTemplate {
                     image,
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,
@@ -536,6 +539,7 @@ async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
             TargetTemplate::LocalPodman {
                 container: ContainerTemplate {
                     image,
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,

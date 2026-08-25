@@ -467,6 +467,7 @@ fn backend_container(
     }
     ContainerTemplate {
         image: container.image.clone(),
+        pull_policy: container.pull_policy,
         extra_run_args,
     }
 }
@@ -1030,6 +1031,7 @@ mod tests {
         let template = TargetTemplate::LocalPodman {
             container: ConfigContainer {
                 image: "dev:1".into(),
+                pull_policy: crate::hel_config::ImagePullPolicy::Never,
                 platform: Some("linux/arm64".into()),
                 cpus: Some("4".into()),
                 memory: Some("8g".into()),
@@ -1043,12 +1045,17 @@ mod tests {
         };
         assert!(container.extra_run_args.contains(&"--cpus=4".into()));
         assert!(container.extra_run_args.contains(&"A=b c".into()));
+        assert_eq!(
+            container.pull_policy,
+            crate::hel_config::ImagePullPolicy::Never
+        );
     }
     #[test]
     fn session_size_overrides_beat_the_target_template_and_its_allocation() {
         let template = TargetTemplate::LocalPodman {
             container: ConfigContainer {
                 image: "dev:1".into(),
+                pull_policy: Default::default(),
                 platform: None,
                 cpus: Some("4".into()),
                 memory: Some("8g".into()),
@@ -1083,6 +1090,7 @@ mod tests {
     fn github_token_is_inherited_only_by_managed_containers() {
         let mut podman = hel_targets::TargetTemplate::LocalPodman(ContainerTemplate {
             image: "dev:1".into(),
+            pull_policy: Default::default(),
             extra_run_args: vec![],
         });
         assert!(configure_github_token_environment(&mut podman));
@@ -1169,6 +1177,7 @@ mod tests {
     fn deployment_capacity_groups_local_and_same_host_targets() {
         let container = || ConfigContainer {
             image: "dev:1".into(),
+            pull_policy: Default::default(),
             platform: None,
             cpus: None,
             memory: None,
@@ -1255,6 +1264,7 @@ mod tests {
         let template = TargetTemplate::LocalPodman {
             container: ConfigContainer {
                 image: "ubuntu:24.04".into(),
+                pull_policy: Default::default(),
                 platform: None,
                 cpus: None,
                 memory: None,
@@ -1286,6 +1296,7 @@ mod tests {
             },
             container: ConfigContainer {
                 image: "ubuntu:24.04".into(),
+                pull_policy: Default::default(),
                 platform: None,
                 cpus: None,
                 memory: None,
@@ -1312,6 +1323,7 @@ mod tests {
         let template = TargetTemplate::AppleContainer {
             container: ConfigContainer {
                 image: "ubuntu:24.04".into(),
+                pull_policy: Default::default(),
                 platform: None,
                 cpus: None,
                 memory: None,

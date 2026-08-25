@@ -17,6 +17,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::hel_config::ImagePullPolicy;
+
 pub const SESSION_LABEL: &str = "dev.hel.session";
 pub const MANAGED_LABEL: &str = "dev.hel.managed";
 pub const SESSION_TAG: &str = "dev.hel.session";
@@ -1210,7 +1212,50 @@ impl ProjectBundleSpec {
 pub struct ContainerTemplate {
     pub image: String,
     #[serde(default)]
+    pub pull_policy: ImagePullPolicy,
+    #[serde(default)]
     pub extra_run_args: Vec<String>,
+}
+
+impl ImagePullPolicy {
+    fn resolve(self, image: &str) -> Self {
+        if self != Self::Auto {
+            return self;
+        }
+        if image_is_digest_pinned(image) {
+            Self::Missing
+        } else if image_is_remote(image) && image_uses_latest_tag(image) {
+            Self::Newer
+        } else {
+            Self::Missing
+        }
+    }
+
+    fn podman_value(self, image: &str) -> &'static str {
+        match self.resolve(image) {
+            Self::Always => "always",
+            Self::Newer => "newer",
+            Self::Missing => "missing",
+            Self::Never => "never",
+            Self::Auto => unreachable!("auto pull policy must resolve"),
+        }
+    }
+}
+
+fn image_is_digest_pinned(image: &str) -> bool {
+    image
+        .rsplit_once('@')
+        .is_some_and(|(_, digest)| !digest.is_empty())
+}
+
+fn image_is_remote(image: &str) -> bool {
+    !image.starts_with("localhost/") && !image.starts_with("local/")
+}
+
+fn image_uses_latest_tag(image: &str) -> bool {
+    let name = image.split_once('@').map_or(image, |(name, _)| name);
+    let final_component = name.rsplit('/').next().unwrap_or(name);
+    !final_component.contains(':') || final_component.ends_with(":latest")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1389,6 +1434,7 @@ pub fn provision_plan(
                     .purpose("check Apple container service")
                     .stage(ProvisionStage::Provisioning),
             );
+            commands.extend(apple_image_prepare_commands(container));
             commands.push(container_run(
                 "container",
                 container,
@@ -2567,6 +2613,13 @@ fn container_run_args(
     validate_additional_mounts(additional_mounts)?;
     let mut args = vec!["run".to_owned()];
     if engine == "podman" {
+        let pull_policy = template.pull_policy.resolve(&template.image);
+        if pull_policy != ImagePullPolicy::Missing {
+            args.push(format!(
+                "--pull={}",
+                template.pull_policy.podman_value(&template.image)
+            ));
+        }
         // PID 1 is `sleep infinity`, which reaps nothing, so every exec that
         // outlives its parent leaves a zombie behind. Apple's `container`
         // engine is left alone: its support for the flag is unverified.
@@ -2602,6 +2655,22 @@ fn container_run_args(
         "infinity".to_owned(),
     ]);
     Ok(args)
+}
+
+fn apple_image_prepare_commands(template: &ContainerTemplate) -> Vec<CommandSpec> {
+    let command = match template.pull_policy.resolve(&template.image) {
+        ImagePullPolicy::Always | ImagePullPolicy::Newer => {
+            CommandSpec::new("container", ["image", "pull", template.image.as_str()])
+                .purpose(format!("refresh container image {}", template.image))
+        }
+        ImagePullPolicy::Never => {
+            CommandSpec::new("container", ["image", "inspect", template.image.as_str()])
+                .purpose(format!("find pinned container image {}", template.image))
+        }
+        ImagePullPolicy::Missing => return Vec::new(),
+        ImagePullPolicy::Auto => unreachable!("auto pull policy must resolve"),
+    };
+    vec![command.stage(ProvisionStage::Provisioning)]
 }
 
 fn container_exec(
@@ -3281,6 +3350,7 @@ mod tests {
                 ssh: ssh(),
                 container: ContainerTemplate {
                     image: "ubuntu:24.04".to_owned(),
+                    pull_policy: ImagePullPolicy::Auto,
                     extra_run_args: vec![],
                 },
             },
@@ -3493,6 +3563,7 @@ mod tests {
         let plan = provision_plan(
             &TargetTemplate::LocalPodman(ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec!["--cpus=4".to_owned()],
             }),
             SESSION,
@@ -3541,6 +3612,7 @@ mod tests {
         let secret = "github-token-that-must-not-reach-argv";
         let target = TargetTemplate::LocalPodman(ContainerTemplate {
             image: "ubuntu:24.04".to_owned(),
+            pull_policy: ImagePullPolicy::Auto,
             extra_run_args: vec!["--env".to_owned(), "GH_TOKEN".to_owned()],
         });
         let mut plan = CommandPlan {
@@ -3577,6 +3649,7 @@ mod tests {
             ssh: ssh(),
             container: ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec!["--env".to_owned(), "GH_TOKEN".to_owned()],
             },
         };
@@ -3609,6 +3682,7 @@ mod tests {
         let plan = provision_plan(
             &TargetTemplate::LocalPodman(ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec![],
             }),
             SESSION,
@@ -3650,6 +3724,7 @@ mod tests {
         let podman = provision_plan(
             &TargetTemplate::LocalPodman(ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec![],
             }),
             SESSION,
@@ -3665,6 +3740,7 @@ mod tests {
                 ssh: ssh(),
                 container: ContainerTemplate {
                     image: "dev:1".to_owned(),
+                    pull_policy: ImagePullPolicy::Auto,
                     extra_run_args: vec![],
                 },
             },
@@ -3684,6 +3760,7 @@ mod tests {
         let apple = provision_plan(
             &TargetTemplate::AppleContainer(ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec![],
             }),
             SESSION,
@@ -3693,6 +3770,71 @@ mod tests {
         .unwrap();
         assert_eq!(apple.commands[1].args[0], "run");
         assert!(!apple.commands[1].args.contains(&"--init".to_owned()));
+    }
+
+    #[test]
+    fn automatic_pull_policy_refreshes_only_remote_latest_images() {
+        for (image, expected) in [
+            ("ghcr.io/example/dev:latest", Some("--pull=newer")),
+            ("ghcr.io/example/dev", Some("--pull=newer")),
+            ("ghcr.io/example/dev:1.2.3", None),
+            ("localhost/example/dev:latest", None),
+            ("local/example:latest", None),
+            (
+                "ghcr.io/example/dev@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                None,
+            ),
+        ] {
+            let args = container_run_args(
+                "podman",
+                &ContainerTemplate {
+                    image: image.to_owned(),
+                    pull_policy: ImagePullPolicy::Auto,
+                    extra_run_args: vec![],
+                },
+                "container-name",
+                SESSION,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                args.iter()
+                    .find(|argument| argument.starts_with("--pull="))
+                    .map(String::as_str),
+                expected,
+                "unexpected pull policy for {image}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_podman_pull_policy_overrides_image_tag_defaults() {
+        for (policy, expected) in [
+            (ImagePullPolicy::Always, "--pull=always"),
+            (ImagePullPolicy::Newer, "--pull=newer"),
+            (ImagePullPolicy::Missing, ""),
+            (ImagePullPolicy::Never, "--pull=never"),
+        ] {
+            let args = container_run_args(
+                "podman",
+                &ContainerTemplate {
+                    image: "ghcr.io/example/dev:1.2.3".to_owned(),
+                    pull_policy: policy,
+                    extra_run_args: vec![],
+                },
+                "container-name",
+                SESSION,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                args.iter()
+                    .find(|argument| argument.starts_with("--pull="))
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3712,6 +3854,7 @@ mod tests {
         let plan = provision_plan(
             &TargetTemplate::LocalPodman(ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec![],
             }),
             SESSION,
@@ -3836,6 +3979,7 @@ mod tests {
         let plan = provision_plan(
             &TargetTemplate::AppleContainer(ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec![],
             }),
             SESSION,
@@ -3857,6 +4001,7 @@ mod tests {
         let plan = provision_plan(
             &TargetTemplate::AppleContainer(ContainerTemplate {
                 image: "ghcr.io/example/dev:latest".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec![],
             }),
             SESSION,
@@ -3870,17 +4015,51 @@ mod tests {
                 .purpose("check Apple container service")
                 .stage(ProvisionStage::Provisioning)
         );
-        assert_eq!(plan.commands[1].program, "container");
+        assert_eq!(
+            plan.commands[1].args,
+            ["image", "pull", "ghcr.io/example/dev:latest"]
+        );
         let name = resource_name(SESSION).unwrap();
         assert!(
-            plan.commands[1]
+            plan.commands[2]
                 .args
                 .windows(2)
                 .any(|args| args == ["--name", &name])
         );
-        assert!(plan.commands[1].args.windows(4).any(|args| {
+        assert!(plan.commands[2].args.windows(4).any(|args| {
             args == managed_resource_identity_args(ManagedResourceKind::Container, SESSION)
         }));
+    }
+
+    #[test]
+    fn apple_pull_policy_prepares_mutable_and_pinned_images() {
+        for (policy, expected_args) in [
+            (
+                ImagePullPolicy::Always,
+                Some(vec!["image", "pull", "ghcr.io/example/dev:1"]),
+            ),
+            (
+                ImagePullPolicy::Newer,
+                Some(vec!["image", "pull", "ghcr.io/example/dev:1"]),
+            ),
+            (
+                ImagePullPolicy::Never,
+                Some(vec!["image", "inspect", "ghcr.io/example/dev:1"]),
+            ),
+            (ImagePullPolicy::Missing, None),
+        ] {
+            let commands = apple_image_prepare_commands(&ContainerTemplate {
+                image: "ghcr.io/example/dev:1".to_owned(),
+                pull_policy: policy,
+                extra_run_args: vec![],
+            });
+            assert_eq!(
+                commands
+                    .first()
+                    .map(|command| { command.args.iter().map(String::as_str).collect::<Vec<_>>() }),
+                expected_args
+            );
+        }
     }
 
     #[test]
@@ -3915,6 +4094,7 @@ mod tests {
         let plan = setup_smoke_plan(
             &TargetTemplate::LocalPodman(ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
+                pull_policy: ImagePullPolicy::Auto,
                 extra_run_args: vec![],
             }),
             "setup-123",
@@ -3943,6 +4123,7 @@ mod tests {
             run_setup_smoke_test(
                 &TargetTemplate::AppleContainer(ContainerTemplate {
                     image: "ubuntu:24.04".to_owned(),
+                    pull_policy: ImagePullPolicy::Auto,
                     extra_run_args: vec![],
                 }),
                 "setup-123",
@@ -3960,7 +4141,8 @@ mod tests {
             &TargetTemplate::SshPodman {
                 ssh: ssh(),
                 container: ContainerTemplate {
-                    image: "dev:1".to_owned(),
+                    image: "ghcr.io/example/dev:latest".to_owned(),
+                    pull_policy: ImagePullPolicy::Auto,
                     extra_run_args: vec![],
                 },
             },
@@ -3975,7 +4157,7 @@ mod tests {
                 .args
                 .last()
                 .unwrap()
-                .contains("'podman' 'run'")
+                .contains("'podman' 'run' '--pull=newer' '--init'")
         );
         assert!(plan.commands[0].args.last().unwrap().contains(&format!(
             "'--label' '{SESSION_LABEL}={SESSION}' '--label' '{MANAGED_LABEL}=true'"
@@ -4265,6 +4447,7 @@ mod tests {
     fn every_provisioning_plan_names_the_command_that_creates_its_target() {
         let container = ContainerTemplate {
             image: "ubuntu:24.04".to_owned(),
+            pull_policy: ImagePullPolicy::Auto,
             extra_run_args: vec![],
         };
         let creating = [

@@ -589,6 +589,7 @@ mod tests {
             TargetTemplate::AppleContainer {
                 container: ConfigContainer {
                     image: "test:latest".into(),
+                    pull_policy: Default::default(),
                     platform: None,
                     cpus: None,
                     memory: None,

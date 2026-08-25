@@ -830,6 +830,7 @@ mod tests {
         let template = TargetTemplate::LocalPodman {
             container: ConfigContainer {
                 image: "ignored".into(),
+                pull_policy: Default::default(),
                 platform: None,
                 cpus: None,
                 memory: None,
