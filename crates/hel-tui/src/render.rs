@@ -980,13 +980,17 @@ fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
 }
 
 const EMPTY_QUOTA_COLOR: Color = Color::DarkGray;
-// A solid ANSI DarkGray background is much brighter than the same color drawn
-// through the 25%-coverage `░` glyph used for depleted quota. Sampling a
-// terminal screenshot gives DarkGray as (118, 118, 118) over a (12, 12, 12)
-// background, and the glyph covers ~25% of each cell, so the depleted bar
-// reads as 0.25 * 118 + 0.75 * 12 = 38. Match that blend directly.
+// The depleted bar is not a background color at all: it is DarkGray drawn
+// through the 25%-coverage `░` glyph, so the eye averages the light the cell
+// emits. No ANSI 16 entry sits a quarter of the way from the background to
+// DarkGray, so the solid fill behind the API label has to be spelled out.
+//
+// Screenshot sampling gives DarkGray as (118, 118, 118) over a (12, 12, 12)
+// background at exactly 25% coverage. Averaging must happen in linear light,
+// not in gamma-encoded sRGB: srgb(0.25 * lin(118) + 0.75 * lin(12)) = 62.
+// Averaging the encoded values instead yields 38, which reads far too dark.
 #[allow(clippy::disallowed_methods)]
-const API_DEPLETED_BACKGROUND: Color = Color::Rgb(38, 38, 38);
+const API_DEPLETED_BACKGROUND: Color = Color::Rgb(62, 62, 62);
 
 fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
     const CELLS: usize = 10;
