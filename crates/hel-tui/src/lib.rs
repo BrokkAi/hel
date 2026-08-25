@@ -831,7 +831,7 @@ impl DashboardState {
             .selected_session()
             .map(|session| self.project_source(session).key);
         if let Some(key) = key {
-            self.expand_project(&key);
+            self.expanded_project_key = Some(key);
         }
     }
 
@@ -1680,6 +1680,53 @@ mod tests {
         assert_eq!(dashboard.session_index, 2);
         dashboard.handle_key(key(KeyCode::Down));
         assert_eq!(dashboard.session_index, 2, "Down at the last row stays put");
+    }
+
+    #[test]
+    fn opening_the_selected_project_group_preserves_the_selected_session() {
+        let sessions = (0..3)
+            .map(|index| {
+                let mut session = stopped_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                session.project_directory = Some(if index < 2 {
+                    "/projects/shared".into()
+                } else {
+                    "/projects/other".into()
+                });
+                session.created_at = format!("2026-08-1{}T00:00:00Z", index + 1);
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        let other_key = dashboard
+            .project_source(&dashboard.state.sessions["session-2"])
+            .key;
+        dashboard.expand_project(&other_key);
+        dashboard.session_index = dashboard
+            .ordered_sessions()
+            .iter()
+            .position(|session| session.id == "session-1")
+            .unwrap();
+        let selected_index = dashboard.session_index;
+        assert!(!dashboard.selected_project_is_expanded());
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+
+        assert_eq!(dashboard.session_index, selected_index);
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
+        assert!(dashboard.selected_project_is_expanded());
     }
 
     #[test]
