@@ -77,13 +77,21 @@ pub(crate) fn worker_connect_needs_restart(error: &anyhow::Error) -> bool {
     RelayTransportDead::marks(error)
 }
 
+fn worker_connect_allows_live_restart(error: &anyhow::Error) -> bool {
+    RelayTransportDead::marks_failed_handshake(error)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerRecoveryOutcome {
     Alive,
-    Restarted,
+    RestartedDead,
+    RestartedUnresponsive,
 }
 
-async fn recover_worker(plan: WorkerRecoveryPlan) -> Result<WorkerRecoveryOutcome> {
+async fn recover_worker(
+    plan: WorkerRecoveryPlan,
+    restart_unresponsive: bool,
+) -> Result<WorkerRecoveryOutcome> {
     tokio::task::spawn_blocking(move || {
         let executor = CancellableProcessExecutor::with_timeout(WORKER_RESTART_TIMEOUT);
         ensure_recovery_target_running(&executor, plan.target.as_ref())
@@ -100,10 +108,14 @@ async fn recover_worker(plan: WorkerRecoveryPlan) -> Result<WorkerRecoveryOutcom
             );
         }
         match String::from_utf8_lossy(&output.stdout).trim() {
-            "alive" => Ok(WorkerRecoveryOutcome::Alive),
+            "alive" if !restart_unresponsive => Ok(WorkerRecoveryOutcome::Alive),
+            "alive" => {
+                plan.restart.execute(&executor)?;
+                Ok(WorkerRecoveryOutcome::RestartedUnresponsive)
+            }
             "dead" => {
                 plan.restart.execute(&executor)?;
-                Ok(WorkerRecoveryOutcome::Restarted)
+                Ok(WorkerRecoveryOutcome::RestartedDead)
             }
             output => bail!("worker liveness probe returned unexpected output {output:?}"),
         }
@@ -816,19 +828,33 @@ async fn run_session_actor(
                                 .worker_recovery
                                 .clone()
                                 .expect("recovery eligibility requires a plan");
+                            let restart_unresponsive =
+                                worker_connect_allows_live_restart(&error);
                             tracing::warn!(
                                 session_id = target.session_id,
                                 "relay worker is unreachable; probing it before recovery: {error:#}"
                             );
-                            match recover_worker(plan).await {
-                                Ok(WorkerRecoveryOutcome::Restarted) => {
+                            match recover_worker(plan, restart_unresponsive).await {
+                                Ok(
+                                    outcome @ (WorkerRecoveryOutcome::RestartedDead
+                                    | WorkerRecoveryOutcome::RestartedUnresponsive),
+                                ) => {
                                     failures = 0;
                                     let snapshot = view_tx.borrow().snapshot.clone();
+                                    let recovery = match outcome {
+                                        WorkerRecoveryOutcome::RestartedDead => {
+                                            "confirmed the relay worker was dead and restarted it"
+                                        }
+                                        WorkerRecoveryOutcome::RestartedUnresponsive => {
+                                            "the relay worker was alive but not serving handshakes, so it was restarted"
+                                        }
+                                        WorkerRecoveryOutcome::Alive => unreachable!(),
+                                    };
                                     publish_view(&target.session_id, ManagedSessionView {
                                         snapshot,
                                         connected: false,
                                         error: Some(ViewError::Unreachable(format!(
-                                            "{error:#}; confirmed the relay worker was dead and restarted it"
+                                            "{error:#}; {recovery}"
                                         ))),
                                     }, &view_tx, &updates);
                                     interval.reset_after(RECONNECT_INTERVAL);
@@ -1662,6 +1688,7 @@ mod tests {
         ))
         .context("connect to the session worker for checkpoint");
         assert!(worker_connect_needs_restart(&reworded), "{reworded:#}");
+        assert!(!worker_connect_allows_live_restart(&reworded));
 
         // Text alone proves nothing now, not even the exact text the producing
         // sites still use: an unmarked failure must never restart a worker.
@@ -1690,6 +1717,7 @@ mod tests {
             .expect("a proxy that exits cannot serve a session");
 
         assert!(worker_connect_needs_restart(&error), "{error:#}");
+        assert!(worker_connect_allows_live_restart(&error));
     }
 
     /// A lease answer crosses a channel. Formatting the failure into a string
@@ -1729,7 +1757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_never_restarts_a_worker_the_probe_reports_alive() {
+    async fn recovery_restarts_a_live_worker_only_after_a_failed_handshake() {
         let directory = tempfile::tempdir().unwrap();
         let restarted = directory.path().join("restarted");
         let recovery = |liveness: &str| WorkerRecoveryPlan {
@@ -1746,14 +1774,24 @@ mod tests {
         };
 
         assert_eq!(
-            recover_worker(recovery("alive")).await.unwrap(),
+            recover_worker(recovery("alive"), false).await.unwrap(),
             WorkerRecoveryOutcome::Alive
         );
         assert!(!restarted.exists(), "a live worker must not be restarted");
 
         assert_eq!(
-            recover_worker(recovery("dead")).await.unwrap(),
-            WorkerRecoveryOutcome::Restarted
+            recover_worker(recovery("alive"), true).await.unwrap(),
+            WorkerRecoveryOutcome::RestartedUnresponsive
+        );
+        assert!(
+            restarted.exists(),
+            "a worker that cannot serve a fresh handshake is restarted"
+        );
+        std::fs::remove_file(&restarted).unwrap();
+
+        assert_eq!(
+            recover_worker(recovery("dead"), false).await.unwrap(),
+            WorkerRecoveryOutcome::RestartedDead
         );
         assert!(restarted.exists(), "a confirmed dead worker is restarted");
     }
@@ -1810,25 +1848,31 @@ mod tests {
             target_started.to_string_lossy().into_owned(),
         );
 
-        let outcome = recover_worker(WorkerRecoveryPlan {
-            target: Some(TargetRecoveryPlan {
-                inspect,
-                start,
-                session_id: "session-1".into(),
-            }),
-            liveness_probe: liveness,
-            restart: CommandPlan {
-                description: "restart test worker".into(),
-                commands: vec![
-                    CommandSpec::new("touch", [worker_restarted.to_string_lossy().into_owned()])
+        let outcome = recover_worker(
+            WorkerRecoveryPlan {
+                target: Some(TargetRecoveryPlan {
+                    inspect,
+                    start,
+                    session_id: "session-1".into(),
+                }),
+                liveness_probe: liveness,
+                restart: CommandPlan {
+                    description: "restart test worker".into(),
+                    commands: vec![
+                        CommandSpec::new(
+                            "touch",
+                            [worker_restarted.to_string_lossy().into_owned()],
+                        )
                         .purpose("restart test worker"),
-                ],
+                    ],
+                },
             },
-        })
+            false,
+        )
         .await
         .unwrap();
 
-        assert_eq!(outcome, WorkerRecoveryOutcome::Restarted);
+        assert_eq!(outcome, WorkerRecoveryOutcome::RestartedDead);
         assert!(target_started.exists());
         assert!(worker_restarted.exists());
     }
@@ -2259,15 +2303,15 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn dead_relay_worker_is_restarted_and_reconnected() {
+    async fn unresponsive_live_relay_worker_is_restarted_and_reconnected() {
         if std::env::var_os(AUTO_RESTART_TEST_CHILD).is_none() {
             run_in_isolated_child(
                 AUTO_RESTART_TEST_CHILD,
-                "dead_relay_worker_is_restarted_and_reconnected",
+                "unresponsive_live_relay_worker_is_restarted_and_reconnected",
             );
             return;
         }
-        fail_if_the_actor_stalls("dead relay worker was never restarted");
+        fail_if_the_actor_stalls("unresponsive live relay worker was never restarted");
         register_leased_relay_session();
         let relay_root = tempfile::tempdir().unwrap();
         let restarted = relay_root.path().join("worker-restarted");
@@ -2298,7 +2342,7 @@ mod tests {
         );
         let worker_recovery = WorkerRecoveryPlan {
             target: None,
-            liveness_probe: CommandSpec::new("printf", ["dead\n"])
+            liveness_probe: CommandSpec::new("printf", ["alive\n"])
                 .purpose("probe test relay worker"),
             restart: CommandPlan {
                 description: "restart test relay worker".into(),
