@@ -72,6 +72,15 @@ impl ProvisionStage {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct SensitiveCommandInput(Vec<u8>);
+
+impl std::fmt::Debug for SensitiveCommandInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
     pub program: String,
@@ -92,6 +101,10 @@ pub struct CommandSpec {
     /// already exists, so a later failure owes that target's teardown.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub creates_target: bool,
+    /// Input that must reach the child without becoming part of its arguments,
+    /// environment, serialized plan, or debug representation.
+    #[serde(skip)]
+    sensitive_stdin: Option<SensitiveCommandInput>,
 }
 
 impl CommandSpec {
@@ -107,6 +120,7 @@ impl CommandSpec {
             stage: None,
             parallel_group: None,
             creates_target: false,
+            sensitive_stdin: None,
         }
     }
 
@@ -406,6 +420,10 @@ fn trace_command_duration(command: &CommandSpec, started: Instant, status: i32) 
 
 impl CommandExecutor for ProcessExecutor {
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        if let Some(input) = &command.sensitive_stdin {
+            let mut input = std::io::Cursor::new(input.0.as_slice());
+            return self.execute_with_stdin(command, &mut input);
+        }
         let started = Instant::now();
         let output = Command::new(&command.program)
             .args(&command.args)
@@ -624,6 +642,10 @@ impl CommandExecutor for CancellableProcessExecutor {
     }
 
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        if let Some(input) = &command.sensitive_stdin {
+            let mut input = std::io::Cursor::new(input.0.as_slice());
+            return self.execute_with_stdin(command, &mut input);
+        }
         let started = Instant::now();
         self.check_cancelled()?;
         let mut child = cancellable_command(command)
@@ -959,6 +981,63 @@ pub struct CommandPlan {
 }
 
 impl CommandPlan {
+    /// Supply one container environment value without placing it in the
+    /// Podman/SSH argument vector. The target launcher reads the value from
+    /// stdin, exports it, and asks the container engine to inherit it by name.
+    pub fn provide_target_environment_secret(
+        &mut self,
+        target: &TargetTemplate,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        ensure!(
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(index, byte)| byte == b'_'
+                    || byte.is_ascii_alphabetic()
+                    || (index > 0 && byte.is_ascii_digit())),
+            "invalid secret environment variable name"
+        );
+        ensure!(
+            !value.as_bytes().contains(&b'\n') && !value.as_bytes().contains(&b'\r'),
+            "secret environment value cannot contain a newline"
+        );
+        let command = self
+            .commands
+            .iter_mut()
+            .find(|command| command.creates_target)
+            .context("provisioning plan has no target creation command")?;
+        let read_and_export = format!("IFS= read -r {name} || exit 1; export {name};");
+        match target {
+            TargetTemplate::LocalPodman(_) | TargetTemplate::AppleContainer(_) => {
+                let program = std::mem::replace(&mut command.program, "sh".to_owned());
+                let args = std::mem::take(&mut command.args);
+                command.args = vec![
+                    "-c".to_owned(),
+                    format!("{read_and_export} exec \"$@\""),
+                    "hel-secret-env".to_owned(),
+                    program,
+                ];
+                command.args.extend(args);
+            }
+            TargetTemplate::SshPodman { .. } => {
+                let remote = command
+                    .args
+                    .last_mut()
+                    .context("remote Podman command has no SSH command argument")?;
+                *remote = format!("{read_and_export} exec {remote}");
+            }
+            TargetTemplate::LocalBare
+            | TargetTemplate::AwsEc2(_)
+            | TargetTemplate::SshBare { .. } => {
+                bail!("target does not support inherited container environment")
+            }
+        }
+        let mut input = value.as_bytes().to_vec();
+        input.push(b'\n');
+        command.sensitive_stdin = Some(SensitiveCommandInput(input));
+        Ok(())
+    }
+
     pub fn execute(&self, executor: &impl CommandExecutor) -> Result<Vec<CommandOutput>> {
         let mut outputs = Vec::with_capacity(self.commands.len());
         for command in &self.commands {
@@ -3455,6 +3534,74 @@ mod tests {
                 .unwrap()
                 .contains("gh auth git-credential")
         );
+    }
+
+    #[test]
+    fn container_secret_is_streamed_without_entering_local_command_arguments() {
+        let secret = "github-token-that-must-not-reach-argv";
+        let target = TargetTemplate::LocalPodman(ContainerTemplate {
+            image: "ubuntu:24.04".to_owned(),
+            extra_run_args: vec!["--env".to_owned(), "GH_TOKEN".to_owned()],
+        });
+        let mut plan = CommandPlan {
+            description: "exercise secret launcher".to_owned(),
+            commands: vec![
+                CommandSpec::new("sh", ["-c", "printf %s \"$GH_TOKEN\""])
+                    .purpose("read inherited secret")
+                    .creates_target(),
+            ],
+        };
+
+        plan.provide_target_environment_secret(&target, "GH_TOKEN", secret)
+            .unwrap();
+
+        let command = &plan.commands[0];
+        assert_eq!(command.program, "sh");
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|argument| argument.contains(secret))
+        );
+        assert!(!format!("{command:?}").contains(secret));
+        assert!(format!("{command:?}").contains("<redacted>"));
+        assert!(!serde_json::to_string(command).unwrap().contains(secret));
+        let output = plan.execute(&ProcessExecutor).unwrap();
+        assert_eq!(output[0].stdout, secret.as_bytes());
+    }
+
+    #[test]
+    fn container_secret_is_streamed_without_entering_remote_ssh_arguments() {
+        let secret = "remote-github-token-that-must-not-reach-argv";
+        let target = TargetTemplate::SshPodman {
+            ssh: ssh(),
+            container: ContainerTemplate {
+                image: "ubuntu:24.04".to_owned(),
+                extra_run_args: vec!["--env".to_owned(), "GH_TOKEN".to_owned()],
+            },
+        };
+        let mut plan = provision_plan(&target, SESSION, &bundle(), &[]).unwrap();
+
+        plan.provide_target_environment_secret(&target, "GH_TOKEN", secret)
+            .unwrap();
+
+        let command = plan
+            .commands
+            .iter()
+            .find(|command| command.creates_target)
+            .unwrap();
+        assert_eq!(command.program, "ssh");
+        assert!(command.args.last().unwrap().contains("read -r GH_TOKEN"));
+        assert!(command.args.last().unwrap().contains("'--env' 'GH_TOKEN'"));
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|argument| argument.contains(secret))
+        );
+        assert!(!format!("{command:?}").contains(secret));
+        assert!(format!("{command:?}").contains("<redacted>"));
+        assert!(!serde_json::to_string(command).unwrap().contains(secret));
     }
 
     #[test]

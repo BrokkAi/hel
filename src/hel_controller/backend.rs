@@ -408,7 +408,7 @@ fn usable_github_token(token: &str) -> Option<&str> {
     (!token.is_empty() && !token.chars().any(char::is_whitespace)).then_some(token)
 }
 
-pub(super) fn inject_github_token(target: &mut hel_targets::TargetTemplate, token: &str) -> bool {
+pub(super) fn configure_github_token_environment(target: &mut hel_targets::TargetTemplate) -> bool {
     let container = match target {
         hel_targets::TargetTemplate::LocalPodman(container)
         | hel_targets::TargetTemplate::AppleContainer(container)
@@ -419,7 +419,7 @@ pub(super) fn inject_github_token(target: &mut hel_targets::TargetTemplate, toke
     };
     container
         .extra_run_args
-        .extend(["--env".to_owned(), format!("GH_TOKEN={token}")]);
+        .extend(["--env".to_owned(), "GH_TOKEN".to_owned()]);
     true
 }
 
@@ -1080,12 +1080,12 @@ mod tests {
         }));
     }
     #[test]
-    fn github_token_is_injected_only_into_managed_containers() {
+    fn github_token_is_inherited_only_by_managed_containers() {
         let mut podman = hel_targets::TargetTemplate::LocalPodman(ContainerTemplate {
             image: "dev:1".into(),
             extra_run_args: vec![],
         });
-        assert!(inject_github_token(&mut podman, "github-token"));
+        assert!(configure_github_token_environment(&mut podman));
         let hel_targets::TargetTemplate::LocalPodman(container) = podman else {
             unreachable!()
         };
@@ -1093,11 +1093,17 @@ mod tests {
             container
                 .extra_run_args
                 .windows(2)
-                .any(|arguments| arguments == ["--env", "GH_TOKEN=github-token"])
+                .any(|arguments| arguments == ["--env", "GH_TOKEN"])
+        );
+        assert!(
+            !container
+                .extra_run_args
+                .iter()
+                .any(|argument| argument.contains("github-token"))
         );
 
         let mut bare = hel_targets::TargetTemplate::LocalBare;
-        assert!(!inject_github_token(&mut bare, "github-token"));
+        assert!(!configure_github_token_environment(&mut bare));
         assert_eq!(bare, hel_targets::TargetTemplate::LocalBare);
         assert_eq!(usable_github_token("  token-value\n"), Some("token-value"));
         assert_eq!(usable_github_token("not a token"), None);

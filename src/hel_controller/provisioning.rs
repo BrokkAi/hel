@@ -23,8 +23,8 @@ use crate::hel_targets::{
 
 use super::backend::{
     ContainerOverrides, absolute_target_path, backend_bundle, backend_locator, backend_target,
-    controller_github_token, inject_github_token, locator_after_provision, preflight_target,
-    use_github_https_urls,
+    configure_github_token_environment, controller_github_token, locator_after_provision,
+    preflight_target, use_github_https_urls,
 };
 use super::checkpoint::upload_checkpoint_spec;
 use super::readiness::{connect_started_worker, wait_for_native_session};
@@ -250,13 +250,14 @@ impl Controller {
                 .flatten()
                 .map(backend_bundle)
                 .transpose()?;
-            if let Some(token) = github_token
-                && inject_github_token(&mut target, token)
+            let container_github_token =
+                github_token.filter(|_| configure_github_token_environment(&mut target));
+            if container_github_token.is_some()
                 && let Some(bundle) = bundle.as_mut()
             {
                 use_github_https_urls(bundle);
             }
-            let provision = if let Some(project_directory) = &session.project_directory {
+            let mut provision = if let Some(project_directory) = &session.project_directory {
                 hel_targets::provision_bare_project_plan(
                     &target,
                     session_id,
@@ -272,6 +273,9 @@ impl Controller {
                     &runtime_mounts,
                 )?
             };
+            if let Some(token) = container_github_token {
+                provision.provide_target_environment_secret(&target, "GH_TOKEN", token)?;
+            }
 
             preflight_target(template, executor)?;
             let started = Instant::now();
