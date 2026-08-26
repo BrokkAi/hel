@@ -100,7 +100,9 @@ impl Controller {
         );
         let mut environment = profile.environment.clone();
         environment.insert(profile.home_env().into(), target_profile_home.clone());
-        configure_execution_environment(profile.kind, execution_policy, &mut environment);
+        profile
+            .kind
+            .configure_execution_environment(execution_policy, &mut environment);
         let mut project_memory =
             project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
         project_memory.mcp_delivery = project_memory_mcp_delivery(profile.kind, backend);
@@ -745,19 +747,6 @@ const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
 const DEEPSEEK_HARNESS_FALLBACK_VERSION: &str = "0.1.1-rc.2";
 
 const DEEPSEEK_ACP_FALLBACK_VERSION: &str = "0.10.0";
-
-fn configure_execution_environment(
-    harness: crate::hel_config::HarnessKind,
-    policy: crate::hel_config::ExecutionPolicy,
-    environment: &mut std::collections::BTreeMap<String, String>,
-) {
-    if let Some((key, value)) = harness
-        .execution_enforcement(policy)
-        .and_then(crate::hel_config::ExecutionEnforcement::launch_environment)
-    {
-        environment.insert(key.to_owned(), value.to_owned());
-    }
-}
 
 fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
@@ -2169,8 +2158,7 @@ mod tests {
     fn codex_execution_environment_follows_the_target_policy() {
         let mut podman_environment =
             BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Codex,
+        crate::hel_config::HarnessKind::Codex.configure_execution_environment(
             ExecutionPolicy::Unconstrained,
             &mut podman_environment,
         );
@@ -2183,8 +2171,7 @@ mod tests {
 
         let mut bare_environment =
             BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Codex,
+        crate::hel_config::HarnessKind::Codex.configure_execution_environment(
             ExecutionPolicy::ConfiguredApprovals,
             &mut bare_environment,
         );
@@ -2199,22 +2186,16 @@ mod tests {
     #[test]
     fn grok_sandbox_environment_follows_the_target_policy() {
         let mut isolated = BTreeMap::from([("GROK_SANDBOX".to_owned(), "strict".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Grok,
-            ExecutionPolicy::Unconstrained,
-            &mut isolated,
-        );
+        crate::hel_config::HarnessKind::Grok
+            .configure_execution_environment(ExecutionPolicy::Unconstrained, &mut isolated);
         assert_eq!(
             isolated.get("GROK_SANDBOX").map(String::as_str),
             Some("off")
         );
 
         let mut local = BTreeMap::from([("GROK_SANDBOX".to_owned(), "strict".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Grok,
-            ExecutionPolicy::ConfiguredApprovals,
-            &mut local,
-        );
+        crate::hel_config::HarnessKind::Grok
+            .configure_execution_environment(ExecutionPolicy::ConfiguredApprovals, &mut local);
         assert_eq!(
             local.get("GROK_SANDBOX").map(String::as_str),
             Some("strict"),

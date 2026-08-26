@@ -170,6 +170,23 @@ impl HarnessKind {
         }
     }
 
+    /// Apply the launch environment required to realize `policy`. The
+    /// controller writes this into new launch configs, and the worker repeats
+    /// it so persisted configs from older Hel versions acquire the same
+    /// enforcement after an upgrade.
+    pub fn configure_execution_environment(
+        self,
+        policy: ExecutionPolicy,
+        environment: &mut BTreeMap<String, String>,
+    ) {
+        if let Some((key, value)) = self
+            .execution_enforcement(policy)
+            .and_then(ExecutionEnforcement::launch_environment)
+        {
+            environment.insert(key.to_owned(), value.to_owned());
+        }
+    }
+
     pub const fn supports_guardian_approvals(self) -> bool {
         matches!(self, Self::Codex | Self::Claude | Self::Grok)
     }

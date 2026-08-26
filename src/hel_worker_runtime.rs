@@ -132,6 +132,11 @@ impl ProjectMemoryMcpDelivery {
 }
 
 impl WorkerLaunchConfig {
+    fn enforce_execution_policy(&mut self) {
+        self.harness
+            .configure_execution_environment(self.execution_policy, &mut self.environment);
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         let body = std::fs::read(path)
             .with_context(|| format!("read worker launch config {}", path.display()))?;
@@ -205,6 +210,7 @@ mod unix {
         let startup_directory = std::env::current_dir()?;
         let root = super::resolve_relative_worker_root(root, &startup_directory);
         super::resolve_relative_harness_home(&mut config, &startup_directory);
+        config.enforce_execution_policy();
         // Resolve this before the launch config's environment is consumed by
         // the ACP supervisor specification below.
         let credentials = super::credential_endpoint(&config);
@@ -2977,11 +2983,20 @@ mod relay_tests {
         let legacy_policy_object = legacy_policy.as_object_mut().unwrap();
         legacy_policy_object.remove("execution_policy");
         legacy_policy_object.insert("force_unrestricted_mode".into(), serde_json::json!(true));
+        let mut legacy_policy =
+            serde_json::from_value::<WorkerLaunchConfig>(legacy_policy).unwrap();
         assert_eq!(
-            serde_json::from_value::<WorkerLaunchConfig>(legacy_policy)
-                .unwrap()
-                .execution_policy,
+            legacy_policy.execution_policy,
             ExecutionPolicy::Unconstrained
+        );
+        assert!(!legacy_policy.environment.contains_key("INITIAL_AGENT_MODE"));
+        legacy_policy.enforce_execution_policy();
+        assert_eq!(
+            legacy_policy
+                .environment
+                .get("INITIAL_AGENT_MODE")
+                .map(String::as_str),
+            Some("agent-full-access")
         );
 
         let mut legacy = serde_json::to_value(&launch).unwrap();
