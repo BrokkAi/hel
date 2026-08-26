@@ -673,11 +673,11 @@ fn session_top_line(
     let queued = detail
         .map(|detail| detail.queued_prompts.len())
         .filter(|count| *count > 0)
-        .map(|count| format!(" [{count} queued]"))
-        .unwrap_or_default();
+        .map(|count| format!("[Q {count}]"));
     let mut columns = vec![target.to_owned()];
+    columns.extend(queued);
     columns.extend(status_columns);
-    columns.push(format!("{profile}{queued}"));
+    columns.push(profile);
     columns.push(recovery_warning_name(
         session,
         session_name(session).to_owned(),
@@ -1295,10 +1295,10 @@ mod tests {
         assert!(!rendered.contains("[1] hel"));
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
-        assert!(rendered.contains("podman  Turn "));
+        assert!(rendered.contains("podman  [Q 1]  Turn "));
         assert!(rendered.contains("  Step "));
-        assert!(rendered.contains("  codex-1 [1 queued]  ACP pretty name"));
-        assert!(rendered.contains("[1 queued]"));
+        assert!(rendered.contains("  codex-1  ACP pretty name"));
+        assert!(!rendered.contains("queued]"));
         assert!(rendered.contains("You: question 1"));
         assert!(rendered.contains("Agent: "));
         assert!(rendered.contains("answer 1"));
