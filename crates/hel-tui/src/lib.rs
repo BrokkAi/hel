@@ -11,7 +11,7 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 
-use hel::hel_chat::{Notices, TranscriptSnapshot};
+use hel::hel_chat::Notices;
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate as HelTargetTemplate};
 use hel::hel_quota::ProfileQuota;
 use hel::hel_state::{
@@ -23,7 +23,7 @@ use crate::dialogs::{
     ConfirmDialog, Confirmation, ContainerEditor, FORCE_CONFIRMATION, ImportBundleConfirmation,
     ImportProgress, RenameEditor, RenameFocus, RepositoryOriginDialog,
 };
-use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay, TranscriptHydration};
+use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::ResumeDialog;
 use crate::wizards::{MountFocus, NewWizard, ResumeWizard, WizardStep};
 
@@ -131,6 +131,9 @@ pub enum DashboardAction {
         title: String,
     },
     RefreshQuotas,
+    MarkAllRead {
+        receipts: Vec<(String, u64)>,
+    },
     OpenResumeDialog,
     /// Hide or reveal one Hel session record in the resume dialog.
     SetSessionArchived {
@@ -197,31 +200,6 @@ pub(crate) enum Focus {
     Active,
     Capacity,
     Quotas,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionOrder {
-    Sequence,
-    RecentActivity,
-    Profile,
-}
-
-impl SessionOrder {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Sequence => "sequence",
-            Self::RecentActivity => "recent activity",
-            Self::Profile => "profile, then sequence",
-        }
-    }
-
-    pub(crate) fn next(self) -> Self {
-        match self {
-            Self::Sequence => Self::RecentActivity,
-            Self::RecentActivity => Self::Profile,
-            Self::Profile => Self::Sequence,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,7 +274,6 @@ pub struct DashboardState {
     pub(crate) session_operations: BTreeMap<String, SessionOperationDisplay>,
     pub(crate) capacity_details: BTreeMap<String, CapacityDetail>,
     pub(crate) session_index: usize,
-    pub(crate) session_order: SessionOrder,
     pub(crate) capacity_index: usize,
     pub(crate) quota_index: usize,
     pub(crate) focus: Focus,
@@ -336,7 +313,6 @@ impl DashboardState {
             session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
             session_index: 0,
-            session_order: SessionOrder::Sequence,
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Active,
@@ -363,11 +339,7 @@ impl DashboardState {
     }
 
     pub fn select_active_session(&mut self, session_id: &str) {
-        let (active, _) = partition_sessions(
-            self.state.sessions.values(),
-            &self.session_details,
-            self.session_order,
-        );
+        let (active, _) = partition_sessions(self.state.sessions.values());
         if let Some(index) = active.iter().position(|session| session.id == session_id) {
             self.focus = Focus::Active;
             self.session_index = index;
@@ -602,11 +574,7 @@ impl DashboardState {
                 self.set_selection(len.saturating_sub(1));
                 DashboardAction::None
             }
-            (KeyCode::Char('s'), true) => {
-                self.cycle_session_order();
-                self.set_notice(format!("Sort by {}", self.session_order.label()));
-                DashboardAction::None
-            }
+            (KeyCode::Char('a'), true) => self.mark_all_read(),
             (KeyCode::Char(digit @ '1'..='9'), false) if self.focus == Focus::Active => {
                 self.expand_project_number(digit.to_digit(10).unwrap_or(0) as usize);
                 DashboardAction::None
@@ -655,35 +623,6 @@ impl DashboardState {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
                         session_id: session.id.clone(),
-                    }));
-                }
-                DashboardAction::None
-            }
-            (KeyCode::Char('d'), true) | (KeyCode::Delete, _) if self.focus == Focus::Active => {
-                if self.reject_selected_operation() {
-                    return DashboardAction::None;
-                }
-                if let Some(session) = self.selected_session() {
-                    let session_id = session.id.clone();
-                    // Deleting without the typed confirmation needs Hel to
-                    // KNOW there is no agent work to lose. A transcript that
-                    // has not hydrated yet reads exactly like an empty one, so
-                    // only a hydrated, empty transcript takes the fast path.
-                    let known_to_have_no_assistant_messages =
-                        self.session_details.get(&session_id).is_some_and(|detail| {
-                            detail.transcript_hydration == TranscriptHydration::Ready
-                                && detail.last_agent_message.is_none()
-                                && !detail
-                                    .transcript
-                                    .as_ref()
-                                    .is_some_and(TranscriptSnapshot::has_assistant_messages)
-                        });
-                    if known_to_have_no_assistant_messages {
-                        return DashboardAction::DeleteActive { session_id };
-                    }
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
-                        session_id,
-                        typed: String::new(),
                     }));
                 }
                 DashboardAction::None
@@ -754,15 +693,10 @@ impl DashboardState {
         self.ordered_sessions().get(self.session_index).copied()
     }
 
-    /// The sessions the dashboard lists, in the current sort order. Only live
+    /// The sessions the dashboard lists, in creation order. Only live
     /// sessions appear here; everything else belongs to the resume dialog.
     pub(crate) fn ordered_sessions(&self) -> Vec<&SessionRecord> {
-        let active = partition_sessions(
-            self.state.sessions.values(),
-            &self.session_details,
-            self.session_order,
-        )
-        .0;
+        let active = partition_sessions(self.state.sessions.values()).0;
         let mut groups = BTreeMap::<(String, String, String), Vec<&SessionRecord>>::new();
         for session in active {
             let source = self.project_source(session);
@@ -844,16 +778,30 @@ impl DashboardState {
         }
     }
 
-    fn cycle_session_order(&mut self) {
-        let selected_id = self.selected_session().map(|session| session.id.clone());
-        self.session_order = self.session_order.next();
-        if let Some(selected_id) = selected_id
-            && let Some(index) = self
-                .ordered_sessions()
-                .iter()
-                .position(|session| session.id == selected_id)
-        {
-            self.session_index = index;
+    fn mark_all_read(&mut self) -> DashboardAction {
+        let mut receipts = Vec::new();
+        for (session_id, detail) in &mut self.session_details {
+            if detail.unread_agent_messages == 0 {
+                continue;
+            }
+            let Some(through) = detail.materialized_applied_event_ordinal else {
+                continue;
+            };
+            let Some(session) = self.state.sessions.get_mut(session_id) else {
+                continue;
+            };
+            if through > session.viewed_through_event_ordinal {
+                session.viewed_through_event_ordinal = through;
+                detail.unread_agent_messages = 0;
+                receipts.push((session_id.clone(), through));
+            }
+        }
+        if receipts.is_empty() {
+            self.set_notice("No unread sessions.");
+            DashboardAction::None
+        } else {
+            self.set_notice("Marked all sessions read.");
+            DashboardAction::MarkAllRead { receipts }
         }
     }
 
@@ -1001,8 +949,6 @@ impl DashboardState {
 /// belongs to the dialog, and nothing appears in both.
 pub(crate) fn partition_sessions<'a>(
     sessions: impl IntoIterator<Item = &'a SessionRecord>,
-    session_details: &BTreeMap<String, SessionDetail>,
-    order: SessionOrder,
 ) -> (Vec<&'a SessionRecord>, Vec<&'a SessionRecord>) {
     let mut active = Vec::new();
     let mut terminal = Vec::new();
@@ -1013,34 +959,10 @@ pub(crate) fn partition_sessions<'a>(
             terminal.push(session);
         }
     }
-    let activity_timestamp = |session: &SessionRecord| match session_details.get(&session.id) {
-        Some(detail) if detail.last_activity_at_ms.is_some() => detail
-            .last_activity_at_ms
-            .and_then(|timestamp| i64::try_from(timestamp).ok()),
-        Some(detail) if detail.transcript_hydration == TranscriptHydration::Ready => None,
-        Some(_) | None => session_timestamp(&session.updated_at)
-            .and_then(|timestamp| timestamp.checked_mul(1_000)),
-    };
     let sequence = |left: &&SessionRecord, right: &&SessionRecord| left.compare_by_creation(right);
-    let sort = |left: &&SessionRecord, right: &&SessionRecord| match order {
-        SessionOrder::Sequence => sequence(left, right),
-        SessionOrder::RecentActivity => activity_timestamp(right)
-            .cmp(&activity_timestamp(left))
-            .then_with(|| sequence(left, right)),
-        SessionOrder::Profile => left
-            .last_profile
-            .cmp(&right.last_profile)
-            .then_with(|| sequence(left, right)),
-    };
-    active.sort_by(sort);
-    terminal.sort_by(sort);
+    active.sort_by(sequence);
+    terminal.sort_by(sequence);
     (active, terminal)
-}
-
-fn session_timestamp(timestamp: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(timestamp)
-        .ok()
-        .map(|timestamp| timestamp.timestamp())
 }
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -1105,18 +1027,16 @@ fn single_line_paste(pasted: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
 
     use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use hel::hel_state::{HelState, STATE_VERSION, SessionState, TranscriptBody};
+    use hel::hel_state::{HelState, STATE_VERSION, SessionState};
 
     use super::*;
     use crate::test_support::*;
 
-    use crate::ingest::{SessionDetail, TranscriptHydration};
     use crate::render::render;
 
     #[test]
@@ -1199,13 +1119,10 @@ mod tests {
         let shown_at = Instant::now();
 
         assert_eq!(
-            dashboard.handle_key_at(ctrl_key('s'), shown_at),
+            dashboard.handle_key_at(ctrl_key('a'), shown_at),
             DashboardAction::None
         );
-        assert_eq!(
-            dashboard.notice().as_deref(),
-            Some("Sort by recent activity")
-        );
+        assert_eq!(dashboard.notice().as_deref(), Some("No unread sessions."));
     }
 
     #[test]
@@ -1273,11 +1190,7 @@ mod tests {
             ]),
             mount_history: BTreeMap::new(),
         };
-        let (active, terminal) = partition_sessions(
-            state.sessions.values(),
-            &BTreeMap::new(),
-            SessionOrder::Sequence,
-        );
+        let (active, terminal) = partition_sessions(state.sessions.values());
         assert_eq!(
             active
                 .iter()
@@ -1309,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_ordered_by_creation_sequence_ascending_by_default() {
+    fn sessions_are_ordered_by_creation_sequence_ascending() {
         let mut oldest = stopped_session();
         oldest.id = "session-z".into();
         oldest.created_at = "2026-08-09T01:00:00Z".into();
@@ -1320,11 +1233,7 @@ mod tests {
         invalid_timestamp.id = "session-a".into();
         invalid_timestamp.created_at = "unknown".into();
 
-        let (_, terminal) = partition_sessions(
-            [&invalid_timestamp, &oldest, &newest],
-            &BTreeMap::new(),
-            SessionOrder::Sequence,
-        );
+        let (_, terminal) = partition_sessions([&invalid_timestamp, &oldest, &newest]);
 
         assert_eq!(
             terminal
@@ -1370,223 +1279,27 @@ mod tests {
     }
 
     #[test]
-    fn recent_activity_uses_projection_milliseconds_without_metadata_override() {
-        let mut first = stopped_session();
-        first.id = "first".into();
-        first.state = SessionState::Running;
-        first.updated_at = "2099-01-01T00:00:00Z".into();
-        let mut second = stopped_session();
-        second.id = "second".into();
-        second.state = SessionState::Running;
-        second.updated_at = "1970-01-01T00:00:00Z".into();
-        let details = BTreeMap::from([
-            (
-                first.id.clone(),
-                SessionDetail {
-                    last_activity_at_ms: Some(10_001),
-                    transcript_hydration: TranscriptHydration::Ready,
-                    ..SessionDetail::default()
-                },
-            ),
-            (
-                second.id.clone(),
-                SessionDetail {
-                    last_activity_at_ms: Some(10_002),
-                    transcript_hydration: TranscriptHydration::Ready,
-                    ..SessionDetail::default()
-                },
-            ),
-        ]);
-
-        let (active, _) =
-            partition_sessions([&first, &second], &details, SessionOrder::RecentActivity);
+    fn mark_all_read_advances_a_materialized_session_and_returns_its_receipt() {
+        let mut dashboard = dashboard_with_session(running_session());
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(4, "unread response")]);
+        assert_eq!(
+            dashboard.session_details["session-1"].unread_agent_messages,
+            1
+        );
 
         assert_eq!(
-            active
-                .iter()
-                .map(|session| session.id.as_str())
-                .collect::<Vec<_>>(),
-            ["second", "first"]
-        );
-    }
-
-    #[test]
-    fn hydrated_session_without_activity_does_not_sort_by_lifecycle_timestamp() {
-        let mut hydrated = stopped_session();
-        hydrated.id = "hydrated".into();
-        hydrated.state = SessionState::Running;
-        hydrated.updated_at = "2099-01-01T00:00:00Z".into();
-        let mut loading = stopped_session();
-        loading.id = "loading".into();
-        loading.state = SessionState::Running;
-        loading.updated_at = "2026-01-01T00:00:00Z".into();
-        let details = BTreeMap::from([
-            (
-                hydrated.id.clone(),
-                SessionDetail {
-                    transcript_hydration: TranscriptHydration::Ready,
-                    ..SessionDetail::default()
-                },
-            ),
-            (loading.id.clone(), SessionDetail::default()),
-        ]);
-
-        let (active, _) = partition_sessions(
-            [&hydrated, &loading],
-            &details,
-            SessionOrder::RecentActivity,
-        );
-
-        assert_eq!(active[0].id, "loading");
-    }
-
-    #[test]
-    fn unavailable_session_keeps_its_committed_activity_watermark() {
-        let mut disconnected = stopped_session();
-        disconnected.id = "disconnected".into();
-        disconnected.state = SessionState::Disconnected;
-        disconnected.updated_at = "2099-01-01T00:00:00Z".into();
-        let mut connected = stopped_session();
-        connected.id = "connected".into();
-        connected.state = SessionState::Running;
-        connected.updated_at = "1970-01-01T00:00:00Z".into();
-        let details = BTreeMap::from([
-            (
-                disconnected.id.clone(),
-                SessionDetail {
-                    last_activity_at_ms: Some(10_001),
-                    transcript_hydration: TranscriptHydration::Unavailable,
-                    ..SessionDetail::default()
-                },
-            ),
-            (
-                connected.id.clone(),
-                SessionDetail {
-                    last_activity_at_ms: Some(10_002),
-                    transcript_hydration: TranscriptHydration::Ready,
-                    ..SessionDetail::default()
-                },
-            ),
-        ]);
-
-        let (active, _) = partition_sessions(
-            [&disconnected, &connected],
-            &details,
-            SessionOrder::RecentActivity,
-        );
-
-        assert_eq!(active[0].id, "connected");
-    }
-
-    #[test]
-    fn sort_hotkey_round_robins_sequence_activity_and_profile() {
-        let active_session = |id: &str| {
-            let mut session = stopped_session();
-            session.id = id.into();
-            session.state = SessionState::Running;
-            session
-        };
-        let mut sessions = [
-            active_session("session-a"),
-            active_session("session-b"),
-            active_session("session-c"),
-        ];
-        sessions[0].last_profile = "z-profile".into();
-        sessions[1].last_profile = "a-profile".into();
-        sessions[2].last_profile = "a-profile".into();
-        let state = HelState {
-            version: STATE_VERSION,
-            sessions: sessions
-                .into_iter()
-                .map(|session| (session.id.clone(), session))
-                .collect(),
-            mount_history: BTreeMap::new(),
-        };
-        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
-        let ordered_ids = |dashboard: &DashboardState| {
-            dashboard
-                .ordered_sessions()
-                .into_iter()
-                .map(|session| session.id.clone())
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(dashboard.session_order, SessionOrder::Sequence);
-        assert_eq!(
-            ordered_ids(&dashboard),
-            ["session-a", "session-b", "session-c"]
-        );
-        dashboard.handle_key(key(KeyCode::Down));
-        assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
-
-        let mut second = agent_message(1, "second");
-        Arc::make_mut(&mut second).last_changed_at_ms = 2_000_000_100_000;
-        apply_materialized_transcript_for(&mut dashboard, "session-b", vec![second]);
-        dashboard.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(dashboard.session_order, SessionOrder::Sequence);
-        assert_eq!(dashboard.notices.current(), None);
-
-        dashboard.handle_key(ctrl_key('s'));
-        assert_eq!(dashboard.session_order, SessionOrder::RecentActivity);
-        assert_eq!(
-            dashboard.notices.current().as_deref(),
-            Some("Sort by recent activity")
+            dashboard.handle_key(ctrl_key('a')),
+            DashboardAction::MarkAllRead {
+                receipts: vec![("session-1".into(), 4)]
+            }
         );
         assert_eq!(
-            ordered_ids(&dashboard),
-            ["session-b", "session-a", "session-c"]
+            dashboard.session_details["session-1"].unread_agent_messages,
+            0
         );
-        assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
-
-        let mut later_thought = thought(1, "later thought");
-        Arc::make_mut(&mut later_thought).last_changed_at_ms = 2_000_000_200_000;
-        apply_materialized_transcript_for(&mut dashboard, "session-c", vec![later_thought]);
         assert_eq!(
-            ordered_ids(&dashboard),
-            ["session-c", "session-b", "session-a"]
-        );
-
-        let mut newest = agent_message(1, "newest");
-        Arc::make_mut(&mut newest).last_changed_at_ms = 2_000_000_300_000;
-        apply_materialized_transcript_for(&mut dashboard, "session-a", vec![newest]);
-        assert_eq!(
-            ordered_ids(&dashboard),
-            ["session-a", "session-c", "session-b"]
-        );
-
-        dashboard.handle_key(ctrl_key('s'));
-        assert_eq!(dashboard.session_order, SessionOrder::Profile);
-        assert_eq!(
-            ordered_ids(&dashboard),
-            ["session-b", "session-c", "session-a"]
-        );
-        assert_eq!(dashboard.selected_session().unwrap().id, "session-a");
-
-        dashboard.handle_key(ctrl_key('s'));
-        assert_eq!(dashboard.session_order, SessionOrder::Sequence);
-        assert_eq!(
-            ordered_ids(&dashboard),
-            ["session-a", "session-b", "session-c"]
-        );
-        assert_eq!(dashboard.selected_session().unwrap().id, "session-a");
-
-        let mut later_tool = transcript_item(
-            2,
-            TranscriptBody::Tool {
-                call: serde_json::json!({
-                    "toolCallId": "later-tool",
-                    "title": "later tool",
-                    "status": "in_progress"
-                }),
-                terminal_outputs: Vec::new(),
-                terminal_refs: Vec::new(),
-            },
-        );
-        Arc::make_mut(&mut later_tool).last_changed_at_ms = 2_000_000_400_000;
-        apply_materialized_transcript_for(&mut dashboard, "session-b", vec![later_tool]);
-        assert_eq!(
-            ordered_ids(&dashboard),
-            ["session-a", "session-b", "session-c"]
+            dashboard.state.sessions["session-1"].viewed_through_event_ordinal,
+            4
         );
     }
 

@@ -1211,11 +1211,13 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · [T] Resume · [R]ename · [E]dit container · [S]ort · sto[P] · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [T] Resume · [R]ename · [E]dit container · sto[P] · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
         }
-        Focus::Capacity => "[N]ew · [T] Resume · [S]ort · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Capacity => {
+            "[N]ew · [T] Resume · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
+        }
         Focus::Quotas => {
-            "[N]ew · [T] Resume · [R]efresh · [S]ort · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [T] Resume · [R]efresh · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
         }
     };
     frame.render_widget(
@@ -1763,9 +1765,9 @@ mod tests {
         };
         let hotkeys = line(buffer.area.bottom() - 2);
         assert!(hotkeys.contains(&format!("{accelerator} for: [N]ew")));
-        // Sort is a Ctrl command now, so no order is displayed permanently.
-        assert!(hotkeys.contains("[S]ort"));
-        assert!(!hotkeys.contains("sort: "));
+        assert!(hotkeys.contains("mark [A]ll read"));
+        assert!(!hotkeys.contains("[S]ort"));
+        assert!(!hotkeys.contains("[D]elete"));
         assert!(line(buffer.area.bottom() - 1).contains("Transient dashboard message"));
     }
 
