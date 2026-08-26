@@ -15,7 +15,7 @@ use crate::hel_controller::{
 };
 use crate::hel_credentials::login_command;
 use crate::hel_setup::{
-    DiscoveredHome, discover_harness_homes, harness_authentication_marker, harness_is_authenticated,
+    DiscoveredHome, discover_harness_homes_with_executor, harness_is_authenticated_with_executor,
 };
 use crate::hel_targets::{
     BoundedProcessExecutor, CommandExecutor, CommandSpec,
@@ -170,8 +170,8 @@ pub fn run_with_config_path(
     options: DoctorOptions,
 ) -> Vec<DoctorCheck> {
     let (config, mut checks) = configuration_checks(config_path);
-    checks.push(harness_discovery_check(config.as_ref()));
-    checks.extend(harness_checks(config.as_ref()));
+    checks.push(harness_discovery_check(config.as_ref(), executor));
+    checks.extend(harness_checks(config.as_ref(), executor));
     checks.extend(podman_checks(config.as_ref(), executor, options.smoke));
     checks.extend(ssh_bare_checks(config.as_ref(), executor));
     checks.extend(ssh_podman_checks(config.as_ref(), executor, options.smoke));
@@ -186,12 +186,15 @@ pub fn run_with_config_path(
     checks
 }
 
-fn harness_discovery_check(config: Option<&HelConfig>) -> DoctorCheck {
+fn harness_discovery_check(
+    config: Option<&HelConfig>,
+    executor: &impl CommandExecutor,
+) -> DoctorCheck {
     let home = dirs::home_dir();
     let overrides = HarnessKind::ALL
         .into_iter()
         .filter_map(|kind| std::env::var_os(kind.home_env()).map(|path| (kind, path.into())));
-    let discovered = discover_harness_homes(home.as_deref(), overrides);
+    let discovered = discover_harness_homes_with_executor(home.as_deref(), overrides, executor);
     harness_discovery_check_from(
         &discovered,
         config.is_some_and(|config| !config.profiles.is_empty()),
@@ -225,7 +228,7 @@ fn harness_discovery_check_from(
             let authentication = if home.authenticated {
                 "authenticated"
             } else {
-                "authentication marker missing"
+                "not authenticated"
             };
             format!(
                 "{} at {} ({authentication})",
@@ -356,7 +359,7 @@ fn configuration_checks(path: &Path) -> (Option<HelConfig>, Vec<DoctorCheck>) {
     }
 }
 
-fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
+fn harness_checks(config: Option<&HelConfig>, executor: &impl CommandExecutor) -> Vec<DoctorCheck> {
     let Some(config) = config else {
         return vec![DoctorCheck::fixable(
             "harness.profiles",
@@ -377,7 +380,6 @@ fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
         .profiles
         .iter()
         .map(|(id, profile)| {
-            let marker = harness_authentication_marker(profile.kind, &profile.home);
             let title = format!("Harness profile {id}");
             if !profile.home.is_dir() {
                 return DoctorCheck::fixable(
@@ -390,11 +392,14 @@ fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
                     ),
                 );
             }
-            if !harness_is_authenticated(profile.kind, &profile.home) {
+            if !harness_is_authenticated_with_executor(profile.kind, &profile.home, executor) {
                 return DoctorCheck::fixable(
                     format!("harness.{id}"),
                     title,
-                    format!("Authentication marker {} is missing", marker.display()),
+                    format!(
+                        "No usable authentication was detected for {}",
+                        profile.home.display()
+                    ),
                     harness_login_remediation(id, profile),
                 );
             }
@@ -402,9 +407,8 @@ fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
                 format!("harness.{id}"),
                 title,
                 format!(
-                    "{} is present and {} exists",
-                    profile.home.display(),
-                    marker.display()
+                    "{} is present and authentication is available",
+                    profile.home.display()
                 ),
             )
         })
@@ -1780,7 +1784,8 @@ mod tests {
             ..HelConfig::default()
         };
 
-        let checks = harness_checks(Some(&config));
+        let executor = FakeExecutor::new([Ok(output(br#"{"loggedIn":false}"#))]);
+        let checks = harness_checks(Some(&config), &executor);
 
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, CheckStatus::Fixable);
@@ -1799,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_discovery_reports_each_authentication_marker_state() {
+    fn harness_discovery_reports_each_authentication_state() {
         let check = harness_discovery_check_from(
             &[
                 DiscoveredHome {
@@ -1825,7 +1830,7 @@ mod tests {
         assert!(
             check
                 .detail
-                .contains("Kimi Code at /agents/kimi (authentication marker missing)")
+                .contains("Kimi Code at /agents/kimi (not authenticated)")
         );
     }
 
