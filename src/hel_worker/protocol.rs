@@ -103,6 +103,16 @@ pub enum RelayRequest {
     InstallSkills {
         data: String,
     },
+    /// Report whether this worker has a synchronized GitHub CLI token and its
+    /// non-secret fingerprint. This request is connection-only.
+    GithubTokenState,
+    /// Install the controller's current GitHub CLI token into worker-private
+    /// runtime storage. The token never enters durable relay state.
+    InstallGithubToken {
+        data: String,
+    },
+    /// Remove the worker's synchronized GitHub CLI token.
+    RemoveGithubToken,
     /// Run a prompt in a disposable ACP session and return its text. The
     /// runtime answers this on the connection: a scratch prompt is not session
     /// history, so it never reaches the durable relay, its journal, or its
@@ -133,6 +143,9 @@ impl RelayRequest {
             Self::InstallCredentials { .. } => "install_credentials",
             Self::SkillsState => "skills_state",
             Self::InstallSkills { .. } => "install_skills",
+            Self::GithubTokenState => "github_token_state",
+            Self::InstallGithubToken { .. } => "install_github_token",
+            Self::RemoveGithubToken => "remove_github_token",
             Self::Compact { .. } => "compact",
             Self::RespondElicitation { .. } => "respond_elicitation",
         }
@@ -249,6 +262,11 @@ pub enum RelayResponsePayload {
     },
     /// Fingerprint of a session's synced skills trees. Not secret.
     SkillsState {
+        present: bool,
+        fingerprint: String,
+    },
+    /// Presence and fingerprint of the worker-private GitHub CLI token.
+    GithubTokenState {
         present: bool,
         fingerprint: String,
     },

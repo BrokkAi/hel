@@ -380,7 +380,7 @@ pub(super) fn backend_target(
     })
 }
 
-pub(super) fn controller_github_token() -> Option<String> {
+pub(crate) fn controller_github_token() -> Option<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)
             && let Some(token) = usable_github_token(&token)

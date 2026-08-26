@@ -185,6 +185,7 @@ mod unix {
         let credentials = super::credential_endpoint(&config);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create worker root {}", root.display()))?;
+        configure_github_cli(&root, &mut config.environment)?;
         let socket = root.join("control.sock");
         // Refuse a second daemon before touching durable state: opening the
         // relay recovers the journal in place, so getting that far would
@@ -1241,11 +1242,14 @@ mod unix {
                         | RelayRequest::InstallCredentials { .. }
                         | RelayRequest::SkillsState
                         | RelayRequest::InstallSkills { .. }
+                        | RelayRequest::GithubTokenState
+                        | RelayRequest::InstallGithubToken { .. }
+                        | RelayRequest::RemoveGithubToken
                 ) {
-                    // Credential and skills bytes stay on this connection.
+                    // Credential, token, and skills bytes stay on this connection.
                     // They never reach DurableRelay, its journal, or its
                     // command ledger.
-                    let response = credential_response(envelope, &credentials).await;
+                    let response = credential_response(envelope, &credentials, &relay_root).await;
                     write_response(&mut writer, &response).await?;
                     continue;
                 }
@@ -1469,6 +1473,7 @@ mod unix {
     async fn credential_response(
         envelope: RelayRequestEnvelope,
         credentials: &std::result::Result<CredentialEndpoint, String>,
+        relay_root: &std::path::Path,
     ) -> RelayResponseEnvelope {
         if !envelope.request.supported_at(envelope.protocol_version) {
             return incompatible_request_protocol_response(
@@ -1487,9 +1492,10 @@ mod unix {
             },
             Ok(endpoint) => {
                 let endpoint = endpoint.clone();
+                let github_token_path = relay_root.join("github-token");
                 let request = envelope.request.clone();
                 match tokio::task::spawn_blocking(move || {
-                    apply_credential_request(&endpoint, &request)
+                    apply_credential_request_at(&endpoint, &github_token_path, &request)
                 })
                 .await
                 {
@@ -1598,12 +1604,22 @@ mod unix {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn apply_credential_request(
         endpoint: &CredentialEndpoint,
         request: &RelayRequest,
     ) -> Result<RelayResponsePayload> {
+        apply_credential_request_at(endpoint, &endpoint.home.join("github-token"), request)
+    }
+
+    fn apply_credential_request_at(
+        endpoint: &CredentialEndpoint,
+        github_token_path: &std::path::Path,
+        request: &RelayRequest,
+    ) -> Result<RelayResponsePayload> {
         use crate::hel_credentials::{
-            CredentialSnapshot, MAX_CREDENTIAL_BYTES, read_credential_file, write_credential_file,
+            CredentialSnapshot, MAX_CREDENTIAL_BYTES, MAX_GITHUB_TOKEN_BYTES, read_credential_file,
+            read_github_token, remove_github_token, write_credential_file, write_github_token,
         };
         use crate::hel_skills::{
             MAX_SKILLS_ARCHIVE_BYTES, SkillsArchive, collect_skills, install_skills,
@@ -1658,8 +1674,28 @@ mod unix {
                 let installed = collect_skills(endpoint.harness, &endpoint.home)?;
                 Ok(skills_state_payload(&installed.state()))
             }
+            RelayRequest::GithubTokenState => {
+                let (snapshot, _) = read_github_token(github_token_path)?;
+                Ok(github_token_state_payload(&snapshot))
+            }
+            RelayRequest::InstallGithubToken { data } => {
+                if data.len() > MAX_GITHUB_TOKEN_BYTES * 2 {
+                    bail!("GitHub token is above the {MAX_GITHUB_TOKEN_BYTES} byte limit");
+                }
+                let bytes = BASE64
+                    .decode(data.as_bytes())
+                    .context("decode GitHub token payload")?;
+                let snapshot = write_github_token(github_token_path, &bytes)?;
+                Ok(github_token_state_payload(&snapshot))
+            }
+            RelayRequest::RemoveGithubToken => {
+                remove_github_token(github_token_path)?;
+                Ok(github_token_state_payload(
+                    &crate::hel_credentials::GithubTokenSnapshot::absent(),
+                ))
+            }
             other => bail!(
-                "{} is not a credential or skills request",
+                "{} is not a credential, GitHub token, or skills request",
                 other.method_name()
             ),
         }
@@ -1680,6 +1716,96 @@ mod unix {
             fingerprint: snapshot.fingerprint.clone(),
             freshness_epoch_ms: snapshot.freshness_epoch_ms,
         }
+    }
+
+    fn github_token_state_payload(
+        snapshot: &crate::hel_credentials::GithubTokenSnapshot,
+    ) -> RelayResponsePayload {
+        RelayResponsePayload::GithubTokenState {
+            present: snapshot.present,
+            fingerprint: snapshot.fingerprint.clone(),
+        }
+    }
+
+    pub(super) fn configure_github_cli(
+        root: &std::path::Path,
+        environment: &mut BTreeMap<String, String>,
+    ) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = root.join("bin");
+        if std::fs::symlink_metadata(&bin).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            bail!(
+                "GitHub CLI wrapper directory {} is a symbolic link",
+                bin.display()
+            );
+        }
+        std::fs::create_dir_all(&bin)
+            .with_context(|| format!("create GitHub CLI wrapper directory {}", bin.display()))?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+
+        let wrapper = bin.join("gh");
+        if std::fs::symlink_metadata(&wrapper)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            bail!(
+                "GitHub CLI wrapper {} is a symbolic link",
+                wrapper.display()
+            );
+        }
+        const WRAPPER: &str = r#"#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+clean_path=
+old_ifs=$IFS
+IFS=:
+for entry in $PATH; do
+    if [ "$entry" != "$script_dir" ]; then
+        if [ -z "$clean_path" ]; then clean_path=$entry; else clean_path=$clean_path:$entry; fi
+    fi
+done
+IFS=$old_ifs
+PATH=$clean_path
+export PATH
+token_file=$script_dir/../github-token
+if [ -f "$token_file" ]; then
+    IFS= read -r GH_TOKEN < "$token_file"
+    export GH_TOKEN
+    unset GITHUB_TOKEN
+else
+    unset GH_TOKEN GITHUB_TOKEN
+fi
+exec gh "$@"
+"#;
+        crate::hel_config::atomic_write_existing(&wrapper, WRAPPER.as_bytes())?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+
+        let inherited_path = environment
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
+        environment.insert(
+            "PATH".into(),
+            if inherited_path.is_empty() {
+                bin.to_string_lossy().into_owned()
+            } else {
+                format!("{}:{inherited_path}", bin.to_string_lossy())
+            },
+        );
+
+        let inherited_token = std::env::var("GH_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+        if let Some(token) = inherited_token
+            && crate::hel_credentials::validate_github_token(token.as_bytes()).is_ok()
+        {
+            crate::hel_credentials::write_github_token(
+                &root.join("github-token"),
+                token.as_bytes(),
+            )?;
+        }
+        Ok(())
     }
 
     enum CheckpointChange {
@@ -2107,6 +2233,104 @@ mod relay_tests {
         }
     }
 
+    fn github_token_state_of(
+        payload: RelayResponsePayload,
+    ) -> crate::hel_credentials::GithubTokenSnapshot {
+        let RelayResponsePayload::GithubTokenState {
+            present,
+            fingerprint,
+        } = payload
+        else {
+            panic!("expected a GitHub token state payload, got {payload:?}");
+        };
+        crate::hel_credentials::GithubTokenSnapshot {
+            present,
+            fingerprint,
+        }
+    }
+
+    #[test]
+    fn github_token_requests_install_and_remove_connection_only_state() {
+        use base64::Engine as _;
+
+        let home = tempfile::tempdir().unwrap();
+        let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
+        let absent = github_token_state_of(
+            unix::apply_credential_request(&endpoint, &RelayRequest::GithubTokenState).unwrap(),
+        );
+        assert!(!absent.present);
+
+        let installed = github_token_state_of(
+            unix::apply_credential_request(
+                &endpoint,
+                &RelayRequest::InstallGithubToken {
+                    data: base64::engine::general_purpose::STANDARD.encode(b"fresh-token"),
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            installed,
+            crate::hel_credentials::GithubTokenSnapshot::of("fresh-token")
+        );
+        let removed = github_token_state_of(
+            unix::apply_credential_request(&endpoint, &RelayRequest::RemoveGithubToken).unwrap(),
+        );
+        assert!(!removed.present);
+    }
+
+    #[test]
+    fn github_cli_wrapper_reads_each_live_token_and_clears_stale_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let worker = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        let real_bin = real.path().join("bin");
+        std::fs::create_dir(&real_bin).unwrap();
+        let real_gh = real_bin.join("gh");
+        std::fs::write(
+            &real_gh,
+            b"#!/bin/sh\nprintf '%s|%s\\n' \"${GH_TOKEN-unset}\" \"${GITHUB_TOKEN-unset}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&real_gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut environment = BTreeMap::from([(
+            "PATH".into(),
+            format!("{}:/usr/bin:/bin", real_bin.display()),
+        )]);
+        unix::configure_github_cli(worker.path(), &mut environment).unwrap();
+        let token_path = worker.path().join("github-token");
+        crate::hel_credentials::remove_github_token(&token_path).unwrap();
+
+        let invoke = |expected_token: Option<&str>| {
+            match expected_token {
+                Some(token) => {
+                    crate::hel_credentials::write_github_token(&token_path, token.as_bytes())
+                        .unwrap();
+                }
+                None => crate::hel_credentials::remove_github_token(&token_path).unwrap(),
+            }
+            let mut command = std::process::Command::new(worker.path().join("bin/gh"));
+            command
+                .env_clear()
+                .env("PATH", environment.get("PATH").unwrap())
+                .env("GH_TOKEN", "stale-token")
+                .env("GITHUB_TOKEN", "also-stale");
+            let output = crate::hel_subprocess::run_with_input(&mut command, &[]).unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+
+        assert_eq!(invoke(Some("first-token")), "first-token|unset\n");
+        assert_eq!(invoke(Some("rotated-token")), "rotated-token|unset\n");
+        assert_eq!(invoke(None), "unset|unset\n");
+    }
+
     #[test]
     fn skills_state_reports_an_empty_home_then_a_synced_tree() {
         let home = tempfile::tempdir().unwrap();
@@ -2185,7 +2409,7 @@ mod relay_tests {
             unix::apply_credential_request(&test_credentials().unwrap(), &RelayRequest::Status)
                 .unwrap_err();
         assert!(
-            format!("{error:#}").contains("credential or skills"),
+            format!("{error:#}").contains("credential, GitHub token, or skills"),
             "{error:#}"
         );
     }

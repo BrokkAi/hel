@@ -27,8 +27,8 @@ passwordless `sudo` inside the container, plus one of those package managers.
 
 If your image runs as a non-root user with no `sudo`, or uses a different
 package manager, bake `git` and `gh` into the image yourself. Either way,
-`gh` is what lets HTTPS Git pushes work using the `GH_TOKEN` hel injects into
-the container (see [Container targets](/containers/)).
+`gh` is what lets HTTPS Git pushes work using the GitHub token hel syncs into
+the session (see [Container targets](/containers/)).
 
 ## ACP bridges
 

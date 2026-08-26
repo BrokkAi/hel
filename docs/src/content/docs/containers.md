@@ -153,10 +153,12 @@ launches.
 
 ## Two useful facts
 
-If the `gh` CLI on the machine running hel is authenticated, hel passes its
-active GitHub token into every freshly provisioned container as `GH_TOKEN`.
-That's what lets `gh` and HTTPS Git pushes work inside the container without
-copying any SSH keys. The token never goes into a recovery archive.
+If the `gh` CLI on the machine running hel is authenticated, hel continuously
+syncs its active GitHub token into every live non-local session. That includes
+managed containers, EC2, SSH Podman, and raw SSH targets, and lets `gh` and
+HTTPS Git pushes work without copying SSH keys. The token never goes into a
+recovery archive. Raw SSH targets are therefore inside the token's trust
+boundary; raw localhost sessions are deliberately excluded.
 
 If hel or the host crashes, containers it was managing can be orphaned —
 still running, but no longer tracked in hel's state. Use `hel recover` to

@@ -33,11 +33,100 @@ use crate::hel_worker::{RelayEvent, RelayObservation};
 /// corrupt worker from making the controller buffer an arbitrary payload.
 pub const MAX_CREDENTIAL_BYTES: usize = 1024 * 1024;
 
+/// GitHub tokens are opaque but small. Keeping a separate, tight bound avoids
+/// treating the live CLI credential as a general-purpose secret transport.
+pub const MAX_GITHUB_TOKEN_BYTES: usize = 4 * 1024;
+
 /// How often the coordinator reconciles every profile with its live sessions.
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 pub fn credential_fingerprint(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubTokenSnapshot {
+    pub present: bool,
+    pub fingerprint: String,
+}
+
+impl GithubTokenSnapshot {
+    pub fn absent() -> Self {
+        Self {
+            present: false,
+            fingerprint: String::new(),
+        }
+    }
+
+    pub fn of(token: &str) -> Self {
+        Self {
+            present: true,
+            fingerprint: credential_fingerprint(token.as_bytes()),
+        }
+    }
+}
+
+pub fn validate_github_token(bytes: &[u8]) -> Result<&str> {
+    if bytes.is_empty() {
+        bail!("GitHub token is empty");
+    }
+    if bytes.len() > MAX_GITHUB_TOKEN_BYTES {
+        bail!("GitHub token is above the {MAX_GITHUB_TOKEN_BYTES} byte limit");
+    }
+    let token = std::str::from_utf8(bytes)
+        .context("GitHub token is not valid UTF-8")?
+        .trim();
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        bail!("GitHub token must be non-empty and contain no whitespace");
+    }
+    Ok(token)
+}
+
+pub fn read_github_token(path: &Path) -> Result<(GithubTokenSnapshot, Option<String>)> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!(
+            "GitHub token destination {} is a symbolic link",
+            path.display()
+        );
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let token = validate_github_token(&bytes)?.to_owned();
+            Ok((GithubTokenSnapshot::of(&token), Some(token)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((GithubTokenSnapshot::absent(), None))
+        }
+        Err(error) => Err(error).with_context(|| format!("read GitHub token {}", path.display())),
+    }
+}
+
+pub fn write_github_token(path: &Path, bytes: &[u8]) -> Result<GithubTokenSnapshot> {
+    let token = validate_github_token(bytes)?;
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!(
+            "GitHub token destination {} is a symbolic link",
+            path.display()
+        );
+    }
+    let mut body = token.as_bytes().to_vec();
+    body.push(b'\n');
+    crate::hel_config::atomic_write_existing(path, &body)?;
+    Ok(GithubTokenSnapshot::of(token))
+}
+
+pub fn remove_github_token(path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!(
+            "GitHub token destination {} is a symbolic link",
+            path.display()
+        );
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove GitHub token {}", path.display())),
+    }
 }
 
 /// Epoch milliseconds describing how current a credential copy is. Higher wins
@@ -478,6 +567,8 @@ pub struct CredentialSyncTarget {
     pub harness: HarnessKind,
     /// Controller-side canonical home for the profile.
     pub profile_home: PathBuf,
+    /// GitHub CLI credentials are pushed to every target except raw localhost.
+    pub sync_github_token: bool,
     /// Reconnect command for the session's worker proxy.
     pub spec: CommandSpec,
 }
@@ -491,6 +582,10 @@ pub enum CredentialSyncAction {
     /// The canonical skills trees replaced the session's trees. Skills sync
     /// is push-only: the controller-side profile home stays authoritative.
     SkillsPushed,
+    /// The controller's current GitHub token replaced the session copy.
+    GithubTokenPushed,
+    /// A stale session token was removed because the controller has none.
+    GithubTokenRemoved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -560,6 +655,14 @@ impl CredentialSyncResult {
     /// Sessions whose skills trees were replaced.
     pub fn skills_sessions(&self) -> usize {
         self.count_actions(|action| action == CredentialSyncAction::SkillsPushed)
+    }
+
+    pub fn github_token_pushed_sessions(&self) -> usize {
+        self.count_actions(|action| action == CredentialSyncAction::GithubTokenPushed)
+    }
+
+    pub fn github_token_removed_sessions(&self) -> usize {
+        self.count_actions(|action| action == CredentialSyncAction::GithubTokenRemoved)
     }
 
     fn count_actions(&self, wanted: impl Fn(CredentialSyncAction) -> bool) -> usize {
@@ -1168,5 +1271,48 @@ mod tests {
                 .map(|cause| cause.session_id.as_str()),
             Some("session")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_tokens_are_validated_fingerprinted_and_removed_safely() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(validate_github_token(b"").is_err());
+        assert!(validate_github_token(b"contains whitespace").is_err());
+        assert!(validate_github_token(&vec![b'x'; MAX_GITHUB_TOKEN_BYTES + 1]).is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("github-token");
+        let installed = write_github_token(&path, b"controller-token").unwrap();
+        assert_eq!(installed, GithubTokenSnapshot::of("controller-token"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let (state, token) = read_github_token(&path).unwrap();
+        assert_eq!(state, installed);
+        assert_eq!(token.as_deref(), Some("controller-token"));
+
+        remove_github_token(&path).unwrap();
+        remove_github_token(&path).unwrap();
+        assert_eq!(
+            read_github_token(&path).unwrap().0,
+            GithubTokenSnapshot::absent()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_token_install_and_remove_refuse_symlink_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"keep").unwrap();
+        let path = root.path().join("github-token");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+        assert!(write_github_token(&path, b"controller-token").is_err());
+        assert!(remove_github_token(&path).is_err());
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"keep");
     }
 }
