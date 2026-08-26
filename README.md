@@ -201,8 +201,9 @@ Target prerequisites and full option lists are covered in
   propagate to live sessions within about a minute.
 - Credentials travel only between the controller and a session's worker. They
   are never written to the event journal or recovery archives. When the
-  controller's `gh` is authenticated, fresh containers receive its GitHub
-  token as `GH_TOKEN`; the token is not stored in archives.
+  controller's `gh` is authenticated, Hel continuously pushes its active
+  GitHub token to every live non-local session, including raw SSH targets.
+  The token is not stored in archives.
 - A repository configured with `local` is served to workers through a
   per-session Git protocol bridge over the session's own transport: `git
   fetch` and fast-forward `git push origin` operate on your checkout with no

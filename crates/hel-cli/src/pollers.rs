@@ -462,15 +462,25 @@ pub(crate) fn credential_sync_targets(controller: &Controller) -> Vec<Credential
         .filter_map(|session| {
             let profile = controller.config.profiles.get(&session.last_profile)?;
             let spec = controller.reconnect_command(&session.id).ok()?;
+            let sync_github_token = target_syncs_github_token(session.target.as_ref());
             Some(CredentialSyncTarget {
                 session_id: session.id.clone(),
                 profile_id: session.last_profile.clone(),
                 harness: profile.kind,
                 profile_home: profile.home.clone(),
+                sync_github_token,
                 spec,
             })
         })
         .collect()
+}
+
+fn target_syncs_github_token(target: Option<&hel::hel_state::TargetLocator>) -> bool {
+    target.is_some()
+        && !matches!(
+            target,
+            Some(hel::hel_state::TargetLocator::LocalBare { .. })
+        )
 }
 
 /// One immediate sync and notice per session per cooldown, so a harness that
@@ -681,6 +691,18 @@ impl CredentialSyncNotices {
             parts.push(format!(
                 "Synced skills for profile {} to {skills} session(s).",
                 result.profile_id
+            ));
+        }
+        let github_pushed = result.github_token_pushed_sessions();
+        if github_pushed > 0 {
+            parts.push(format!(
+                "Synced the GitHub CLI token to {github_pushed} session(s)."
+            ));
+        }
+        let github_removed = result.github_token_removed_sessions();
+        if github_removed > 0 {
+            parts.push(format!(
+                "Removed the GitHub CLI token from {github_removed} session(s)."
             ));
         }
         (!parts.is_empty()).then(|| parts.join(" "))
@@ -1595,6 +1617,42 @@ mod tests {
     }
 
     #[test]
+    fn github_tokens_sync_to_every_remote_target_but_raw_localhost() {
+        use hel::hel_state::TargetLocator;
+
+        let remotes = [
+            TargetLocator::LocalPodman {
+                container_id: "podman".into(),
+            },
+            TargetLocator::AppleContainer {
+                container_id: "apple".into(),
+            },
+            TargetLocator::AwsEc2 {
+                instance_id: "i-123".into(),
+                address: Some("example.invalid".into()),
+            },
+            TargetLocator::SshBare {
+                host: "ssh.example".into(),
+                workspace: "/workspace".into(),
+                worker_id: None,
+            },
+            TargetLocator::SshPodman {
+                host: "ssh.example".into(),
+                container_id: "remote-podman".into(),
+            },
+        ];
+        for target in &remotes {
+            assert!(target_syncs_github_token(Some(target)), "{target:?}");
+        }
+        assert!(!target_syncs_github_token(Some(
+            &TargetLocator::LocalBare {
+                worker_root: "/tmp/worker".into(),
+            }
+        )));
+        assert!(!target_syncs_github_token(None));
+    }
+
+    #[test]
     fn an_authentication_failure_notice_says_whether_anything_was_pushed() {
         use hel::hel_credentials::{
             CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
@@ -1759,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_and_credential_syncs_each_speak_in_the_notice() {
+    fn skills_credentials_and_github_syncs_each_speak_in_the_notice() {
         use hel::hel_credentials::{
             CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
         };
@@ -1774,11 +1832,15 @@ mod tests {
                     outcome: Ok(vec![
                         CredentialSyncAction::Pushed,
                         CredentialSyncAction::SkillsPushed,
+                        CredentialSyncAction::GithubTokenPushed,
                     ]),
                 },
                 CredentialSyncOutcome {
                     session_id: "018f9dd2-bbbb".into(),
-                    outcome: Ok(vec![CredentialSyncAction::SkillsPushed]),
+                    outcome: Ok(vec![
+                        CredentialSyncAction::SkillsPushed,
+                        CredentialSyncAction::GithubTokenRemoved,
+                    ]),
                 },
             ],
         };
@@ -1789,6 +1851,14 @@ mod tests {
         );
         assert!(
             notice.contains("Synced skills for profile work to 2 session(s)."),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("Synced the GitHub CLI token to 1 session(s)."),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("Removed the GitHub CLI token from 1 session(s)."),
             "{notice}"
         );
     }

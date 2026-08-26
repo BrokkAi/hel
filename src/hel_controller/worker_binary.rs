@@ -2208,6 +2208,31 @@ mod tests {
         );
     }
     #[test]
+    fn grok_sandbox_environment_follows_the_target_policy() {
+        let mut isolated = BTreeMap::from([("GROK_SANDBOX".to_owned(), "strict".to_owned())]);
+        configure_execution_environment(
+            crate::hel_config::HarnessKind::Grok,
+            ExecutionPolicy::Unconstrained,
+            &mut isolated,
+        );
+        assert_eq!(
+            isolated.get("GROK_SANDBOX").map(String::as_str),
+            Some("off")
+        );
+
+        let mut local = BTreeMap::from([("GROK_SANDBOX".to_owned(), "strict".to_owned())]);
+        configure_execution_environment(
+            crate::hel_config::HarnessKind::Grok,
+            ExecutionPolicy::ConfiguredApprovals,
+            &mut local,
+        );
+        assert_eq!(
+            local.get("GROK_SANDBOX").map(String::as_str),
+            Some("strict"),
+            "raw localhost must preserve the profile's configured sandbox"
+        );
+    }
+    #[test]
     fn bridge_fallback_pins_match_the_agent_dev_containerfile() {
         const CONTAINERFILE: &str = include_str!("../../containers/Containerfile.agent-dev");
 

@@ -641,6 +641,9 @@ impl DurableRelay {
             | RelayRequest::InstallCredentials { .. }
             | RelayRequest::SkillsState
             | RelayRequest::InstallSkills { .. }
+            | RelayRequest::GithubTokenState
+            | RelayRequest::InstallGithubToken { .. }
+            | RelayRequest::RemoveGithubToken
             | RelayRequest::ProjectMemorySnapshot
             | RelayRequest::InstallProjectMemorySnapshot { .. } => {
                 return Ok(relay_error(

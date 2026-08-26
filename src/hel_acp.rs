@@ -79,6 +79,41 @@ fn project_memory_mcp(spec: &LaunchSpec) -> Vec<McpServer> {
     )]
 }
 
+fn session_request_meta(spec: &LaunchSpec) -> Option<serde_json::Map<String, serde_json::Value>> {
+    (spec.harness == HarnessKind::Claude && spec.execution_policy.is_unconstrained()).then(|| {
+        let serde_json::Value::Object(meta) = serde_json::json!({
+            "claudeCode": {
+                "options": {
+                    "sandbox": {
+                        "enabled": false
+                    }
+                }
+            }
+        }) else {
+            unreachable!("Claude session metadata is an object")
+        };
+        meta
+    })
+}
+
+fn new_session_request(spec: &LaunchSpec, include_project_memory: bool) -> NewSessionRequest {
+    let request = NewSessionRequest::new(spec.cwd.clone())
+        .additional_directories(spec.additional_directories.clone())
+        .meta(session_request_meta(spec));
+    if include_project_memory {
+        request.mcp_servers(project_memory_mcp(spec))
+    } else {
+        request
+    }
+}
+
+fn load_session_request(spec: &LaunchSpec, session_id: SessionId) -> LoadSessionRequest {
+    LoadSessionRequest::new(session_id, spec.cwd.clone())
+        .additional_directories(spec.additional_directories.clone())
+        .mcp_servers(project_memory_mcp(spec))
+        .meta(session_request_meta(spec))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProductionCompactionConfig {
     model: &'static str,
@@ -1640,11 +1675,10 @@ async fn serve_session(
 
     let loaded_session = if let Some(existing) = &spec.resume_session {
         let loaded = connection
-            .send_request(
-                LoadSessionRequest::new(SessionId::from(existing.clone()), spec.cwd.clone())
-                    .additional_directories(spec.additional_directories.clone())
-                    .mcp_servers(project_memory_mcp(spec)),
-            )
+            .send_request(load_session_request(
+                spec,
+                SessionId::from(existing.clone()),
+            ))
             .block_task()
             .await;
         spec.acp_activity.mark();
@@ -1662,11 +1696,7 @@ async fn serve_session(
             (id, options, modes, true)
         } else {
             let created = connection
-                .send_request(
-                    NewSessionRequest::new(spec.cwd.clone())
-                        .additional_directories(spec.additional_directories.clone())
-                        .mcp_servers(project_memory_mcp(spec)),
-                )
+                .send_request(new_session_request(spec, true))
                 .block_task()
                 .await;
             spec.acp_activity.mark();
@@ -2333,10 +2363,7 @@ async fn compact_in_scratch_session(
     scratch_outputs: &Arc<Mutex<BTreeMap<String, String>>>,
 ) -> Result<String> {
     let created = connection
-        .send_request(
-            NewSessionRequest::new(spec.cwd.clone())
-                .additional_directories(spec.additional_directories.clone()),
-        )
+        .send_request(new_session_request(spec, false))
         .block_task()
         .await
         .context("create scratch ACP session")?;
@@ -2581,6 +2608,55 @@ mod tests {
         let mut claude = spec;
         claude.harness = HarnessKind::Claude;
         assert!(project_memory_mcp(&claude).is_empty());
+    }
+
+    #[test]
+    fn claude_session_metadata_disables_sandbox_only_for_unconstrained_targets() {
+        let mut spec = LaunchSpec {
+            command: "claude-agent-acp".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: "/workspace/app".into(),
+            additional_directories: vec!["/workspace/api".into()],
+            project_memory: None,
+            resume_session: None,
+            harness: HarnessKind::Claude,
+            execution_policy: ExecutionPolicy::Unconstrained,
+            acp_activity: AcpActivityClock::default(),
+        };
+        let meta = serde_json::Value::Object(session_request_meta(&spec).unwrap());
+        assert_eq!(
+            meta.pointer("/claudeCode/options/sandbox/enabled"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        for request in [
+            serde_json::to_value(new_session_request(&spec, true)).unwrap(),
+            serde_json::to_value(new_session_request(&spec, false)).unwrap(),
+            serde_json::to_value(load_session_request(&spec, SessionId::from("native"))).unwrap(),
+        ] {
+            assert_eq!(
+                request.pointer("/_meta/claudeCode/options/sandbox/enabled"),
+                Some(&serde_json::Value::Bool(false)),
+                "{request}"
+            );
+            assert_eq!(
+                request["additionalDirectories"],
+                serde_json::json!(["/workspace/api"]),
+                "{request}"
+            );
+        }
+
+        spec.execution_policy = ExecutionPolicy::ConfiguredApprovals;
+        assert_eq!(session_request_meta(&spec), None);
+        assert!(
+            serde_json::to_value(new_session_request(&spec, true))
+                .unwrap()
+                .get("_meta")
+                .is_none()
+        );
+        spec.execution_policy = ExecutionPolicy::Unconstrained;
+        spec.harness = HarnessKind::Codex;
+        assert_eq!(session_request_meta(&spec), None);
     }
 
     #[test]
