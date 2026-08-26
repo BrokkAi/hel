@@ -88,6 +88,43 @@ impl TerminalOutputRecord {
     pub(crate) fn exited_cleanly(&self) -> bool {
         self.exit_code == Some(0) && self.signal.is_none()
     }
+
+    /// Whether a completed ACP tool's provider-specific raw result is this
+    /// child result. Kimi reports shell output as a byte array beside its exit
+    /// status but omits the ACP terminal reference, so the exact result is the
+    /// only ownership information it publishes.
+    pub(crate) fn matches_tool_raw_result(&self, call: &serde_json::Value) -> bool {
+        if !matches!(
+            call.get("status").and_then(serde_json::Value::as_str),
+            Some("completed" | "failed")
+        ) {
+            return false;
+        }
+        let Some(raw) = call.get("rawOutput") else {
+            return false;
+        };
+        let Some(exit_code) = raw
+            .get("exit_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|code| u32::try_from(code).ok())
+        else {
+            return false;
+        };
+        if self.exit_code != Some(exit_code) || self.signal.is_some() {
+            return false;
+        }
+        match raw.get("output") {
+            Some(serde_json::Value::Array(bytes)) => {
+                bytes.len() == self.output.len()
+                    && bytes
+                        .iter()
+                        .zip(self.output.as_bytes())
+                        .all(|(value, byte)| value.as_u64() == Some(u64::from(*byte)))
+            }
+            Some(serde_json::Value::String(output)) => output == &self.output,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

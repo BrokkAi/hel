@@ -253,7 +253,7 @@ fn materialized_chat_entries_with_diffstats(
     session: &MaterializedSession,
     diffstats: &BTreeMap<String, Vec<String>>,
 ) -> Vec<ChatEntry> {
-    session
+    let mut entries = session
         .transcript
         .iter()
         .map(|item| {
@@ -263,7 +263,9 @@ fn materialized_chat_entries_with_diffstats(
                 diffstats.get(&item.stable_id),
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    suppress_duplicate_standalone_terminal_output(&mut entries);
+    entries
 }
 
 /// How many transcript items a freshly opened chat converts on the caller's
@@ -279,10 +281,12 @@ pub(super) fn materialized_prefix_entries(
     items: &[Arc<TranscriptItem>],
     frontier: u64,
 ) -> Vec<ChatEntry> {
-    items
+    let mut entries = items
         .iter()
         .map(|item| materialized_chat_entry(item, frontier))
-        .collect()
+        .collect::<Vec<_>>();
+    suppress_duplicate_standalone_terminal_output(&mut entries);
+    entries
 }
 
 /// Rebuilds the entry list, keeping the entries whose transcript item did not
@@ -300,7 +304,7 @@ pub(super) fn materialized_chat_entries_reusing(
     previous: Vec<ChatEntry>,
 ) -> Vec<ChatEntry> {
     let mut previous = previous.into_iter();
-    session
+    let mut entries = session
         .transcript
         .iter()
         .skip(skip)
@@ -319,7 +323,46 @@ pub(super) fn materialized_chat_entries_reusing(
             }
             materialized_chat_entry(item, session.applied_event_ordinal)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    suppress_duplicate_standalone_terminal_output(&mut entries);
+    entries
+}
+
+/// Hide a legacy standalone result from Rich surfaces when a completed tool
+/// already carries the exact same raw result. New projections attach and
+/// remove this duplicate at the source; this pass keeps transcripts projected
+/// by an older Hel release equally quiet after an upgrade.
+fn suppress_duplicate_standalone_terminal_output(entries: &mut [ChatEntry]) {
+    if !entries.iter().any(|entry| {
+        entry
+            .source
+            .0
+            .as_ref()
+            .is_some_and(|item| matches!(&item.body, TranscriptBody::TerminalOutput { .. }))
+    }) {
+        return;
+    }
+    let tools = entries
+        .iter()
+        .filter_map(|entry| entry.source.0.as_ref())
+        .filter(|item| matches!(&item.body, TranscriptBody::Tool { .. }))
+        .cloned()
+        .collect::<Vec<_>>();
+    for entry in entries {
+        let Some(item) = entry.source.0.as_ref() else {
+            continue;
+        };
+        let TranscriptBody::TerminalOutput { record } = &item.body else {
+            continue;
+        };
+        entry.raw_only = record.exited_cleanly()
+            || tools.iter().any(|tool| {
+                let TranscriptBody::Tool { call, .. } = &tool.body else {
+                    unreachable!("filtered to tool transcript items above");
+                };
+                record.matches_tool_raw_result(call)
+            });
+    }
 }
 
 fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bool {
@@ -869,6 +912,7 @@ impl ChatState {
         let shift = prefix.len();
         let tail = std::mem::replace(&mut self.entries, prefix);
         self.entries.extend(tail);
+        suppress_duplicate_standalone_terminal_output(&mut self.entries);
         self.unconverted_prefix = 0;
         self.prefix_seam = None;
         if let TranscriptAnchor::Row { entry, row } = self.anchor {
@@ -3450,6 +3494,75 @@ mod tests {
                 .flat_map(|entry| &entry.lines)
                 .all(|line| !line.contains(OUTPUT)),
             "the remote Rich feed suppresses the duplicate output"
+        );
+    }
+
+    #[test]
+    fn legacy_kimi_duplicate_is_suppressed_without_reprojecting_history() {
+        const OUTPUT: &str = "legacy failed output";
+        let mut session = MaterializedSession::empty("session-legacy-kimi-terminal");
+        session.applied_event_ordinal = 2;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![
+            Arc::new(TranscriptItem {
+                stable_id: "tool:kimi-shell".into(),
+                position: 1,
+                latest_content_event_ordinal: None,
+                created_at_ms: 1,
+                last_changed_at_ms: 2,
+                body: TranscriptBody::Tool {
+                    call: serde_json::json!({
+                        "toolCallId": "kimi-shell",
+                        "title": "Execute `inspect toolchain`",
+                        "status": "completed",
+                        "content": [{
+                            "type": "content",
+                            "content": {"type": "text", "text": OUTPUT}
+                        }],
+                        "rawOutput": {
+                            "type": "Bash",
+                            "output": OUTPUT.as_bytes(),
+                            "exit_code": 1,
+                            "command": "inspect toolchain"
+                        }
+                    }),
+                    terminal_outputs: Vec::new(),
+                    terminal_refs: Vec::new(),
+                },
+            }),
+            Arc::new(TranscriptItem {
+                stable_id: "terminal:term-1".into(),
+                position: 2,
+                latest_content_event_ordinal: None,
+                created_at_ms: 2,
+                last_changed_at_ms: 2,
+                body: TranscriptBody::TerminalOutput {
+                    record: TerminalOutputRecord {
+                        terminal_id: "term-1".into(),
+                        output: OUTPUT.into(),
+                        truncated: false,
+                        exit_code: Some(1),
+                        signal: None,
+                    },
+                },
+            }),
+        ];
+
+        let entries = materialized_chat_entries(&session);
+        assert!(entries[1].raw_only);
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        let rich = transcript_text(&mut chat, 80);
+        assert!(
+            !rich.iter().any(|line| line.contains(OUTPUT)),
+            "an existing duplicate becomes quiet after upgrading: {rich:?}"
+        );
+        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        assert!(
+            browser
+                .entries
+                .iter()
+                .flat_map(|entry| &entry.lines)
+                .all(|line| !line.contains(OUTPUT))
         );
     }
 

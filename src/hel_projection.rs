@@ -941,43 +941,6 @@ fn replace_or_push_terminal_record(
     }
 }
 
-/// Whether a completed ACP tool's provider-specific raw result is the same
-/// child result Hel captured. Kimi reports shell output as a byte array beside
-/// its exit status but omits the ACP terminal reference, so the exact result
-/// is the only ownership information it publishes.
-fn raw_tool_result_matches_terminal(call: &Value, record: &TerminalOutputRecord) -> bool {
-    if !matches!(
-        call.get("status").and_then(Value::as_str),
-        Some("completed" | "failed")
-    ) {
-        return false;
-    }
-    let Some(raw) = call.get("rawOutput") else {
-        return false;
-    };
-    let Some(exit_code) = raw
-        .get("exit_code")
-        .and_then(Value::as_u64)
-        .and_then(|code| u32::try_from(code).ok())
-    else {
-        return false;
-    };
-    if record.exit_code != Some(exit_code) || record.signal.is_some() {
-        return false;
-    }
-    match raw.get("output") {
-        Some(Value::Array(bytes)) => {
-            bytes.len() == record.output.len()
-                && bytes
-                    .iter()
-                    .zip(record.output.as_bytes())
-                    .all(|(value, byte)| value.as_u64() == Some(u64::from(*byte)))
-        }
-        Some(Value::String(output)) => output == &record.output,
-        _ => false,
-    }
-}
-
 /// The one parked terminal result an ACP tool demonstrably owns through its
 /// raw result. Ambiguous identical results stay standalone rather than being
 /// assigned to an arbitrary concurrent tool.
@@ -986,7 +949,9 @@ fn uniquely_matching_raw_terminal(current: &MaterializedSession, call: &Value) -
         let TranscriptBody::TerminalOutput { record } = &item.body else {
             return None;
         };
-        raw_tool_result_matches_terminal(call, record).then(|| record.terminal_id.clone())
+        record
+            .matches_tool_raw_result(call)
+            .then(|| record.terminal_id.clone())
     });
     let terminal_id = matching.next()?;
     matching.next().is_none().then_some(terminal_id)
