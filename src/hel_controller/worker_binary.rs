@@ -98,11 +98,7 @@ impl Controller {
         );
         let mut environment = profile.environment.clone();
         environment.insert(profile.home_env().into(), target_profile_home.clone());
-        if force_unrestricted
-            && let Some((key, value)) = profile.kind.unrestricted_enforcement().launch_environment()
-        {
-            environment.insert(key.to_owned(), value.to_owned());
-        }
+        configure_unrestricted_environment(profile.kind, force_unrestricted, &mut environment);
         let project_memory =
             project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
         if profile.kind == crate::hel_config::HarnessKind::Claude {
@@ -661,6 +657,18 @@ const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
 const DEEPSEEK_HARNESS_FALLBACK_VERSION: &str = "0.1.1-rc.2";
 
 const DEEPSEEK_ACP_FALLBACK_VERSION: &str = "0.10.0";
+
+fn configure_unrestricted_environment(
+    harness: crate::hel_config::HarnessKind,
+    unrestricted: bool,
+    environment: &mut std::collections::BTreeMap<String, String>,
+) {
+    if unrestricted
+        && let Some((key, value)) = harness.unrestricted_enforcement().launch_environment()
+    {
+        environment.insert(key.to_owned(), value.to_owned());
+    }
+}
 
 fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
@@ -2051,6 +2059,36 @@ mod tests {
         assert!(deepseek_arguments[1].contains("dsh-acp-server@0.10.0"));
         assert!(!deepseek_arguments[1].contains("npx -y -p @deepseek-ai/dsh"));
         assert!(deepseek_arguments[1].contains("exec dsh-acp-server"));
+    }
+    #[test]
+    fn unrestricted_codex_starts_the_bridge_in_full_access_mode() {
+        let mut podman_environment =
+            BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
+        configure_unrestricted_environment(
+            crate::hel_config::HarnessKind::Codex,
+            true,
+            &mut podman_environment,
+        );
+        assert_eq!(
+            podman_environment
+                .get("INITIAL_AGENT_MODE")
+                .map(String::as_str),
+            Some("agent-full-access")
+        );
+
+        let mut bare_environment =
+            BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
+        configure_unrestricted_environment(
+            crate::hel_config::HarnessKind::Codex,
+            false,
+            &mut bare_environment,
+        );
+        assert_eq!(
+            bare_environment
+                .get("INITIAL_AGENT_MODE")
+                .map(String::as_str),
+            Some("read-only")
+        );
     }
     #[test]
     fn bridge_fallback_pins_match_the_agent_dev_containerfile() {

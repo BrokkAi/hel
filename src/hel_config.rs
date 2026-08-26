@@ -30,6 +30,14 @@ pub enum HarnessKind {
 pub enum UnrestrictedEnforcement {
     /// Selected over ACP once the session exists.
     AcpMode(&'static str),
+    /// Selected at bridge launch and enforced again over ACP once the session
+    /// exists. Initializing the bridge in the desired mode prevents it from
+    /// creating or restoring a session with a transient restrictive policy.
+    AcpModeWithLaunchEnvironment {
+        mode: &'static str,
+        key: &'static str,
+        value: &'static str,
+    },
     /// Applied to the bridge command line at launch. The harness exposes no
     /// ACP equivalent, so there is nothing to enforce after the session opens.
     LaunchFlag {
@@ -49,6 +57,7 @@ impl UnrestrictedEnforcement {
     pub const fn label(self) -> &'static str {
         match self {
             Self::AcpMode(mode) => mode,
+            Self::AcpModeWithLaunchEnvironment { mode, .. } => mode,
             Self::LaunchFlag { label, .. } => label,
             Self::LaunchEnvironment { label, .. } => label,
         }
@@ -58,6 +67,7 @@ impl UnrestrictedEnforcement {
     pub const fn acp_mode(self) -> Option<&'static str> {
         match self {
             Self::AcpMode(mode) => Some(mode),
+            Self::AcpModeWithLaunchEnvironment { mode, .. } => Some(mode),
             Self::LaunchFlag { .. } | Self::LaunchEnvironment { .. } => None,
         }
     }
@@ -65,7 +75,7 @@ impl UnrestrictedEnforcement {
     /// The launch flag to add to the bridge command line, when there is one.
     pub const fn launch_flag(self) -> Option<&'static str> {
         match self {
-            Self::AcpMode(_) => None,
+            Self::AcpMode(_) | Self::AcpModeWithLaunchEnvironment { .. } => None,
             Self::LaunchFlag { flag, .. } => Some(flag),
             Self::LaunchEnvironment { .. } => None,
         }
@@ -74,6 +84,7 @@ impl UnrestrictedEnforcement {
     pub const fn launch_environment(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::LaunchEnvironment { key, value, .. } => Some((key, value)),
+            Self::AcpModeWithLaunchEnvironment { key, value, .. } => Some((key, value)),
             Self::AcpMode(_) | Self::LaunchFlag { .. } => None,
         }
     }
@@ -136,7 +147,11 @@ impl HarnessKind {
     /// How Hel forces this harness into its unrestricted mode.
     pub const fn unrestricted_enforcement(self) -> UnrestrictedEnforcement {
         match self {
-            Self::Codex => UnrestrictedEnforcement::AcpMode("agent-full-access"),
+            Self::Codex => UnrestrictedEnforcement::AcpModeWithLaunchEnvironment {
+                mode: "agent-full-access",
+                key: "INITIAL_AGENT_MODE",
+                value: "agent-full-access",
+            },
             Self::Claude => UnrestrictedEnforcement::AcpMode("bypassPermissions"),
             Self::Kimi => UnrestrictedEnforcement::AcpMode("auto"),
             Self::Grok => UnrestrictedEnforcement::LaunchFlag {
@@ -992,7 +1007,11 @@ mod tests {
         assert_eq!(HarnessKind::Grok.home_env(), "GROK_HOME");
         assert_eq!(
             HarnessKind::Codex.unrestricted_enforcement(),
-            UnrestrictedEnforcement::AcpMode("agent-full-access")
+            UnrestrictedEnforcement::AcpModeWithLaunchEnvironment {
+                mode: "agent-full-access",
+                key: "INITIAL_AGENT_MODE",
+                value: "agent-full-access",
+            }
         );
         assert_eq!(
             HarnessKind::Claude.unrestricted_enforcement(),
@@ -1018,6 +1037,12 @@ mod tests {
             assert_eq!(enforcement.acp_mode(), Some(enforcement.label()));
             assert_eq!(enforcement.launch_flag(), None);
         }
+        assert_eq!(
+            HarnessKind::Codex
+                .unrestricted_enforcement()
+                .launch_environment(),
+            Some(("INITIAL_AGENT_MODE", "agent-full-access"))
+        );
         let grok = HarnessKind::Grok.unrestricted_enforcement();
         assert_eq!(grok.acp_mode(), None);
         assert_eq!(grok.launch_flag(), Some("--always-approve"));
