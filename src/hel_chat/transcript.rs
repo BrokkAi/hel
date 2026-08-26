@@ -696,8 +696,22 @@ fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> V
     states
 }
 
-/// The single cell that stands in for a streak of completed tools: the first
-/// word of each member's title, in order. Non-tool entries contribute no title.
+/// The compact label for one completed tool. Kimi describes shell calls as
+/// `Running: <command>` (or `Starting background: <command>`); the lifecycle
+/// verb says nothing once the call is complete, so summarize those by command.
+fn collapsed_tool_label(title: &str) -> &str {
+    let title = title.trim();
+    let subject = title
+        .strip_prefix("Running:")
+        .or_else(|| title.strip_prefix("Starting background:"))
+        .map(str::trim_start)
+        .filter(|subject| !subject.is_empty())
+        .unwrap_or(title);
+    subject.split_whitespace().next().unwrap_or("tool")
+}
+
+/// The single cell that stands in for a streak of completed tools: the compact
+/// label of each member's title, in order. Non-tool entries contribute none.
 fn collapsed_tool_entry(members: &[ChatEntry]) -> ChatEntry {
     let tools = members
         .iter()
@@ -705,7 +719,7 @@ fn collapsed_tool_entry(members: &[ChatEntry]) -> ChatEntry {
         .collect::<Vec<_>>();
     let titles = tools
         .iter()
-        .map(|member| member.text.split_whitespace().next().unwrap_or("tool"))
+        .map(|member| collapsed_tool_label(&member.text))
         .collect::<Vec<_>>()
         .join(", ");
     ChatEntry::tool(tools[0].seq, titles, None, ToolStatus::Completed)
@@ -2164,6 +2178,31 @@ mod tests {
                 "",
                 "✓ Tool · done",
                 "│ cat notes.md",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn kimi_shell_tool_run_collapses_to_command_names() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries
+            .push(completed_tool(1, "Running: rg -n project_memory src"));
+        chat.entries
+            .push(completed_tool(2, "Running: cargo test --lib"));
+        chat.entries
+            .push(completed_tool(3, "Starting background: npm run preview"));
+        chat.entries
+            .push(ChatEntry::plain(4, ChatRole::User, "continue"));
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "✓ Tool · done",
+                "│ rg, cargo, npm",
+                "",
+                "❯ You",
+                "│ continue",
                 "",
             ]
         );
