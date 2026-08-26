@@ -351,6 +351,26 @@ impl TerminalRegistry {
     }
 }
 
+impl TerminalSpawn {
+    /// The concise command a client can show while this terminal is live.
+    /// Kimi normally sends an interpreter plus `-c <script>`; showing the
+    /// script itself matches the tool title it would have published.
+    #[must_use]
+    pub fn display_command(&self) -> String {
+        let interpreter = PathBuf::from(&self.command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "sh" | "bash" | "dash" | "zsh"));
+        if interpreter
+            && let Some(index) = self.args.iter().position(|arg| arg == "-c")
+            && let Some(script) = self.args.get(index + 1)
+        {
+            return script.clone();
+        }
+        shell_line(&self.command, &self.args)
+    }
+}
+
 /// Await a terminal's exit on a receiver cloned out of the registry.
 pub async fn wait_for_exit(mut exit: watch::Receiver<Option<TerminalExit>>) -> TerminalExit {
     loop {
@@ -620,6 +640,35 @@ mod tests {
         assert_eq!(
             shell_line("/bin/bash -lc 'echo hi'", &[]),
             "/bin/bash -lc 'echo hi'"
+        );
+    }
+
+    #[test]
+    fn display_command_unwraps_an_interpreter_script() {
+        let spawn = TerminalSpawn {
+            command: "/bin/bash".into(),
+            args: vec!["-c".into(), "cargo mutants --in-diff diff".into()],
+            env: Vec::new(),
+            cwd: PathBuf::from("/workspace"),
+            output_byte_limit: 1024,
+        };
+
+        assert_eq!(spawn.display_command(), "cargo mutants --in-diff diff");
+    }
+
+    #[test]
+    fn display_command_preserves_a_non_interpreter_invocation() {
+        let spawn = TerminalSpawn {
+            command: "/usr/bin/cargo".into(),
+            args: vec!["test".into(), "--workspace".into()],
+            env: Vec::new(),
+            cwd: PathBuf::from("/workspace"),
+            output_byte_limit: 1024,
+        };
+
+        assert_eq!(
+            spawn.display_command(),
+            "/usr/bin/cargo 'test' '--workspace'"
         );
     }
 

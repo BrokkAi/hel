@@ -28,17 +28,17 @@ pub use protocol::{
 #[cfg(unix)]
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
-    ActiveRelayPrompt, ActiveUserShell, ClaimedRelayCommand, QueuedRelayPrompt, RelayCommand,
-    RelayCommandKind, RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState,
-    RelayObservation, RelayOperationalState, UserShellResult, UserShellStatus, relay_event_digest,
-    validate_relay_event,
+    ActiveAgentTerminal, ActiveRelayPrompt, ActiveUserShell, ClaimedRelayCommand,
+    QueuedRelayPrompt, RelayCommand, RelayCommandKind, RelayCommandOutcome, RelayCursor,
+    RelayEvent, RelayExecutionState, RelayObservation, RelayOperationalState, UserShellResult,
+    UserShellStatus, relay_event_digest, validate_relay_event,
 };
 pub use types::{
     ActivePrompt, Attachment, QueuedPrompt, SequencedEvent, WorkerEvent, WorkerPhase,
     WorkerSessionSummary, WorkerSnapshot,
 };
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 #[cfg(unix)]
 use std::fs::File;
@@ -187,6 +187,13 @@ pub struct DurableRelay {
     /// lock-free reader already tolerates.
     journal_generation: u64,
     acp_activity: AcpActivityClock,
+    /// ACP terminals are connection-owned and disappear when that connection
+    /// is torn down, so they belong in memory rather than the durable relay
+    /// snapshot or transcript journal.
+    active_agent_terminals: BTreeMap<String, ActiveAgentTerminal>,
+    /// A short-lived guard against a fast child reporting close before the
+    /// create handler publishes its started event on the shared channel.
+    closed_agent_terminals: BTreeSet<String>,
     /// Benchmark aid: stage and persist a snapshot on every append, the way
     /// the relay did before transcript appends were amortized, so both
     /// policies can be timed in one process.
@@ -326,6 +333,8 @@ impl DurableRelay {
             unpersisted_journal_bytes: 0,
             journal_generation: 0,
             acp_activity: AcpActivityClock::default(),
+            active_agent_terminals: BTreeMap::new(),
+            closed_agent_terminals: BTreeSet::new(),
             #[cfg(test)]
             stage_snapshot_every_append: false,
         };
@@ -401,7 +410,26 @@ impl DurableRelay {
     pub fn operational_state(&self) -> RelayOperationalState {
         let mut state = self.snapshot.operational_state();
         state.last_acp_activity_at_ms = self.acp_activity.last_at_ms();
+        state.active_agent_terminals = self.active_agent_terminals.values().cloned().collect();
         state
+    }
+
+    pub fn agent_terminal_started(&mut self, terminal: ActiveAgentTerminal) {
+        if self.closed_agent_terminals.remove(&terminal.terminal_id) {
+            return;
+        }
+        self.active_agent_terminals
+            .insert(terminal.terminal_id.clone(), terminal);
+    }
+
+    pub fn agent_terminal_closed(&mut self, terminal_id: &str) {
+        self.active_agent_terminals.remove(terminal_id);
+        self.closed_agent_terminals.insert(terminal_id.to_owned());
+    }
+
+    pub fn clear_agent_terminals(&mut self) {
+        self.active_agent_terminals.clear();
+        self.closed_agent_terminals.clear();
     }
 
     pub fn acp_activity_clock(&self) -> AcpActivityClock {

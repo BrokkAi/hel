@@ -47,7 +47,8 @@ use crate::hel_transcript::{
     ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
 };
 use crate::hel_worker::{
-    RELAY_EVENT_GENESIS_DIGEST, SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot,
+    ActiveAgentTerminal, RELAY_EVENT_GENESIS_DIGEST, SequencedEvent, WorkerEvent, WorkerPhase,
+    WorkerSnapshot,
 };
 
 use autocomplete::{
@@ -286,6 +287,8 @@ pub struct ChatState {
     pending_history_search: Option<HistorySearchRequest>,
     queued_prompts: VecDeque<QueuedPrompt>,
     active_user_shells: Vec<String>,
+    active_agent_terminals: Vec<ActiveAgentTerminal>,
+    claimed_agent_terminals: BTreeMap<String, i64>,
     elicitation: Option<ElicitationDialog>,
     recovery_busy: bool,
     goal_prompt_active: bool,
@@ -353,6 +356,8 @@ impl ChatState {
             pending_history_search: None,
             queued_prompts: VecDeque::new(),
             active_user_shells: Vec::new(),
+            active_agent_terminals: Vec::new(),
+            claimed_agent_terminals: BTreeMap::new(),
             elicitation: None,
             recovery_busy: false,
             goal_prompt_active: snapshot
@@ -1539,6 +1544,40 @@ impl ChatState {
             .iter()
             .map(|shell| shell.command_id.clone())
             .collect();
+    }
+
+    pub(super) fn set_active_agent_terminals(
+        &mut self,
+        terminals: &[ActiveAgentTerminal],
+        session: &MaterializedSession,
+    ) {
+        self.active_agent_terminals = terminals.to_vec();
+        self.claimed_agent_terminals.clear();
+        let mut unresolved = terminals
+            .iter()
+            .map(|terminal| (terminal.terminal_id.as_str(), terminal.started_at_ms))
+            .collect::<BTreeMap<_, _>>();
+        // Claims are normally on the newest item, so walking backward stops
+        // immediately. The full-history path is reserved for the uncommon
+        // unclaimed fallback this state exists to cover.
+        for item in session.transcript.iter().rev() {
+            let TranscriptBody::Tool { terminal_refs, .. } = &item.body else {
+                continue;
+            };
+            for terminal_id in terminal_refs {
+                let Some(started_at_ms) = unresolved.get(terminal_id.as_str()) else {
+                    continue;
+                };
+                if item.last_changed_at_ms >= *started_at_ms {
+                    self.claimed_agent_terminals
+                        .insert(terminal_id.clone(), item.last_changed_at_ms);
+                    unresolved.remove(terminal_id.as_str());
+                }
+            }
+            if unresolved.is_empty() {
+                break;
+            }
+        }
     }
 
     pub(super) fn active_user_shell_ids(&self) -> Vec<String> {

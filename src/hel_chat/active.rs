@@ -573,6 +573,10 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
         );
         state.set_session_modes(snapshot.operational.modes.clone());
         state.set_active_user_shells(&snapshot.operational.active_user_shells);
+        state.set_active_agent_terminals(
+            &snapshot.operational.active_agent_terminals,
+            &snapshot.materialized,
+        );
     }
     if let Some(error) = view.error {
         match error {
@@ -686,6 +690,10 @@ impl ActiveChat {
             );
             if let Some(snapshot) = snapshot.as_ref() {
                 state.set_active_user_shells(&snapshot.operational.active_user_shells);
+                state.set_active_agent_terminals(
+                    &snapshot.operational.active_agent_terminals,
+                    &snapshot.materialized,
+                );
             }
             let pending = PendingPrefix::of(materialized, state.unconverted_prefix());
             (state, pending)
@@ -1170,6 +1178,7 @@ impl ActiveChat {
     pub fn needs_clock_tick(&self) -> bool {
         self.recovery_title_is_stale()
             || self.state.turn_started_at_epoch_seconds.is_some()
+            || !self.state.active_agent_terminals.is_empty()
             || self
                 .state
                 .other_sessions
@@ -1492,6 +1501,7 @@ mod tests {
                     active_prompt: None,
                     queued_prompts: Vec::new(),
                     active_user_shells: Vec::new(),
+                    active_agent_terminals: Vec::new(),
                     checkpoint_barrier: None,
                     checkpoint_ready: None,
                     last_acp_activity_at_ms: None,
