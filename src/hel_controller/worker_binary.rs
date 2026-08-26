@@ -7,13 +7,15 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use crate::hel_config::{ProjectBundle, ProjectRepository, data_dir};
+use crate::hel_config::{ProjectBundle, ProjectRepository, atomic_write, data_dir};
 use crate::hel_project_memory::{ProjectMemoryIdentity, RepositoryMemoryIdentity};
 use crate::hel_session_manager::{ProjectMemorySyncTarget, WorkerRecoveryPlan};
 use crate::hel_targets::{
     self, CommandExecutor, CommandPlan, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
 };
-use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, WorkerLaunchConfig, WorkerOwnership};
+use crate::hel_worker_runtime::{
+    ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery, WorkerLaunchConfig, WorkerOwnership,
+};
 
 use super::backend::backend_locator;
 use super::provisioning::{execution_policy, install_inherited_git_settings};
@@ -99,8 +101,9 @@ impl Controller {
         let mut environment = profile.environment.clone();
         environment.insert(profile.home_env().into(), target_profile_home.clone());
         configure_execution_environment(profile.kind, execution_policy, &mut environment);
-        let project_memory =
+        let mut project_memory =
             project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
+        project_memory.mcp_delivery = project_memory_mcp_delivery(profile.kind, backend);
         if profile.kind == crate::hel_config::HarnessKind::Claude {
             environment.insert(
                 "CLAUDE_CODE_PROJECT_DIR_NAME".into(),
@@ -147,6 +150,9 @@ impl Controller {
                 Path::new(&target_profile_home),
                 &profile_stage,
             )?;
+            if project_memory.mcp_delivery == ProjectMemoryMcpDelivery::HarnessProfile {
+                configure_kimi_project_memory_mcp(&profile_stage, worker_root, &project_memory)?;
+            }
         } else {
             seed_local_memory_replica(&project_memory)?;
         }
@@ -311,11 +317,25 @@ fn project_memory_launch(
         root,
         baseline_root,
         repository_roots,
+        mcp_delivery: ProjectMemoryMcpDelivery::Acp,
     })
 }
 
 fn project_memory_replica_slug(project_key: &str, session_id: &str) -> String {
     format!("hel-{}-{session_id}", &project_key[..16])
+}
+
+fn project_memory_mcp_delivery(
+    harness: crate::hel_config::HarnessKind,
+    target: &hel_targets::TargetLocator,
+) -> ProjectMemoryMcpDelivery {
+    if harness == crate::hel_config::HarnessKind::Kimi
+        && !matches!(target, hel_targets::TargetLocator::LocalBare { .. })
+    {
+        ProjectMemoryMcpDelivery::HarnessProfile
+    } else {
+        ProjectMemoryMcpDelivery::Acp
+    }
 }
 
 fn configured_memory_identity(repository: &ProjectRepository) -> Result<RepositoryMemoryIdentity> {
@@ -366,6 +386,74 @@ fn seed_local_memory_replica(memory: &ProjectMemoryLaunchConfig) -> Result<()> {
         _ => Ok(()),
     }?;
     copy_profile_entry(&canonical, &memory.baseline_root)
+}
+
+/// Kimi's runtime-aware engine cannot infer a runtime identity from an ACP
+/// stdio server. Add Hel's server to the session-private profile instead,
+/// where Kimi's native schema can bind it to the target's local runtime.
+fn configure_kimi_project_memory_mcp(
+    profile_stage: &Path,
+    worker_root: &str,
+    memory: &ProjectMemoryLaunchConfig,
+) -> Result<()> {
+    let path = profile_stage.join("mcp.json");
+    let mut document = match std::fs::read(&path) {
+        Ok(body) => serde_json::from_slice::<serde_json::Value>(&body)
+            .with_context(|| format!("parse staged Kimi MCP configuration {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read staged Kimi MCP configuration {}", path.display()));
+        }
+    };
+    let root = document.as_object_mut().with_context(|| {
+        format!(
+            "staged Kimi MCP configuration {} must contain a JSON object",
+            path.display()
+        )
+    })?;
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .with_context(|| {
+            format!(
+                "mcpServers in staged Kimi MCP configuration {} must be a JSON object",
+                path.display()
+            )
+        })?;
+
+    let worker = Path::new(worker_root).join("hel");
+    let server = if worker.is_absolute() && memory.root.is_absolute() {
+        serde_json::json!({
+            "transport": "stdio",
+            "command": worker,
+            "args": ["worker", "memory-mcp", "--root", memory.root],
+            "runtime_id": "local"
+        })
+    } else {
+        let worker = worker.to_string_lossy();
+        let memory_root = memory.root.to_string_lossy();
+        serde_json::json!({
+            "transport": "stdio",
+            "command": "sh",
+            "args": [
+                "-c",
+                "exec \"$HOME/$1\" worker memory-mcp --root \"$HOME/$2\"",
+                "hel-project-memory",
+                worker,
+                memory_root
+            ],
+            "runtime_id": "local"
+        })
+    };
+    servers.insert("hel-project-memory".into(), server);
+    let mut body = serde_json::to_vec_pretty(&document)?;
+    body.push(b'\n');
+    atomic_write(&path, &body)
+        .with_context(|| format!("write staged Kimi MCP configuration {}", path.display()))
 }
 
 fn directory_has_files(path: &Path) -> Result<bool> {
@@ -2203,6 +2291,28 @@ mod tests {
         }
     }
     #[test]
+    fn kimi_uses_runtime_aware_memory_delivery_only_on_staged_targets() {
+        let local = hel_targets::TargetLocator::LocalBare {
+            worker_root: "/worker".into(),
+        };
+        let podman = hel_targets::TargetLocator::LocalPodman {
+            container_id: "container".into(),
+        };
+
+        assert_eq!(
+            project_memory_mcp_delivery(crate::hel_config::HarnessKind::Kimi, &local),
+            ProjectMemoryMcpDelivery::Acp
+        );
+        assert_eq!(
+            project_memory_mcp_delivery(crate::hel_config::HarnessKind::Kimi, &podman),
+            ProjectMemoryMcpDelivery::HarnessProfile
+        );
+        assert_eq!(
+            project_memory_mcp_delivery(crate::hel_config::HarnessKind::Codex, &podman),
+            ProjectMemoryMcpDelivery::Acp
+        );
+    }
+    #[test]
     fn stage_grok_profile_copies_authentication_and_agent_identity() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2288,6 +2398,104 @@ mod tests {
             "stable-device-id"
         );
         assert!(staged.path().join("credentials/kimi-code.json").is_file());
+    }
+    #[test]
+    fn staged_kimi_profile_binds_project_memory_to_the_target_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        let original = serde_json::json!({
+            "mcpServers": {
+                "user-server": {
+                    "command": "user-mcp",
+                    "args": ["serve"]
+                }
+            },
+            "userSetting": true
+        });
+        let original_body = serde_json::to_vec_pretty(&original).unwrap();
+        std::fs::write(home.path().join("mcp.json"), &original_body).unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let profile = crate::hel_config::HarnessProfile {
+            kind: crate::hel_config::HarnessKind::Kimi,
+            home: home.path().to_path_buf(),
+            executable: None,
+            environment: BTreeMap::new(),
+            context_window_bytes: None,
+        };
+        stage_profile(&profile, staged.path()).unwrap();
+        let memory = ProjectMemoryLaunchConfig {
+            project_key: "project".into(),
+            root: "/var/lib/hel/profiles/session/projects/project/memory".into(),
+            baseline_root: PathBuf::new(),
+            repository_roots: BTreeMap::new(),
+            mcp_delivery: ProjectMemoryMcpDelivery::HarnessProfile,
+        };
+
+        configure_kimi_project_memory_mcp(staged.path(), "/var/lib/hel/workers/session", &memory)
+            .unwrap();
+
+        let configured: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.path().join("mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(configured["userSetting"], true);
+        assert_eq!(
+            configured["mcpServers"]["user-server"]["command"],
+            "user-mcp"
+        );
+        assert_eq!(
+            configured["mcpServers"]["hel-project-memory"],
+            serde_json::json!({
+                "transport": "stdio",
+                "command": "/var/lib/hel/workers/session/hel",
+                "args": [
+                    "worker",
+                    "memory-mcp",
+                    "--root",
+                    "/var/lib/hel/profiles/session/projects/project/memory"
+                ],
+                "runtime_id": "local"
+            })
+        );
+        assert_eq!(
+            std::fs::read(home.path().join("mcp.json")).unwrap(),
+            original_body,
+            "the controller-side Kimi profile must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn staged_kimi_project_memory_resolves_ssh_paths_from_target_home() {
+        let staged = tempfile::tempdir().unwrap();
+        let memory = ProjectMemoryLaunchConfig {
+            project_key: "project".into(),
+            root: ".local/share/hel/profiles/session/projects/project/memory".into(),
+            baseline_root: PathBuf::new(),
+            repository_roots: BTreeMap::new(),
+            mcp_delivery: ProjectMemoryMcpDelivery::HarnessProfile,
+        };
+
+        configure_kimi_project_memory_mcp(
+            staged.path(),
+            ".local/share/hel/workers/session",
+            &memory,
+        )
+        .unwrap();
+
+        let configured: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.path().join("mcp.json")).unwrap())
+                .unwrap();
+        let server = &configured["mcpServers"]["hel-project-memory"];
+        assert_eq!(server["command"], "sh");
+        assert_eq!(server["runtime_id"], "local");
+        assert_eq!(
+            server["args"],
+            serde_json::json!([
+                "-c",
+                "exec \"$HOME/$1\" worker memory-mcp --root \"$HOME/$2\"",
+                "hel-project-memory",
+                ".local/share/hel/workers/session/hel",
+                ".local/share/hel/profiles/session/projects/project/memory"
+            ])
+        );
     }
     #[test]
     fn stage_deepseek_profile_copies_only_portable_configuration() {

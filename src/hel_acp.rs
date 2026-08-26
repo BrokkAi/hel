@@ -41,7 +41,7 @@ use crate::hel_terminal::{
     DEFAULT_TERMINAL_OUTPUT_BYTES, TerminalExit, TerminalRegistry, TerminalSpawn,
 };
 use crate::hel_worker::AcpActivityClock;
-use crate::hel_worker_runtime::ProjectMemoryLaunchConfig;
+use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery};
 
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
@@ -58,7 +58,12 @@ pub struct LaunchSpec {
 }
 
 fn project_memory_mcp(spec: &LaunchSpec) -> Vec<McpServer> {
-    if spec.harness == HarnessKind::Claude {
+    if spec.harness == HarnessKind::Claude
+        || spec
+            .project_memory
+            .as_ref()
+            .is_some_and(|memory| memory.mcp_delivery == ProjectMemoryMcpDelivery::HarnessProfile)
+    {
         return Vec::new();
     }
     let Some(memory) = &spec.project_memory else {
@@ -452,6 +457,9 @@ const UNEXPECTED_PERMISSION_REQUEST_WARNING: &str = "The agent made a permission
 /// `Unexpected case: {"type":"vcs_state_changed"}`. It arrives often enough to
 /// fill the whole stderr tail and bury the real failure in worker exit records.
 const ADAPTER_CHATTER_PREFIX: &str = "Unexpected case: ";
+/// Kimi 0.37.x logs this for response-shaped startup frames with a null id.
+/// It is adapter routing noise and commonly precedes a useful ACP error.
+const KIMI_NULL_RESPONSE_CHATTER: &str = "Got response to unknown request null";
 
 /// Grok Build's `exit_plan_mode` tool asks the client whether the agent may
 /// leave plan mode. It is an ACP ext method, so it reaches Hel untyped, and
@@ -671,7 +679,10 @@ fn unsupported_client_request_report(method: &str) -> String {
 fn actionable_stderr_tail(tail: &str) -> Option<String> {
     let kept = tail
         .lines()
-        .filter(|line| !line.trim_start().starts_with(ADAPTER_CHATTER_PREFIX))
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with(ADAPTER_CHATTER_PREFIX) && line != KIMI_NULL_RESPONSE_CHATTER
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let kept = kept.trim();
@@ -2498,8 +2509,8 @@ mod tests {
     };
 
     #[test]
-    fn project_memory_mcp_is_implicit_and_excluded_from_claude() {
-        let spec = LaunchSpec {
+    fn project_memory_mcp_honors_harness_delivery_and_claude_native_memory() {
+        let mut spec = LaunchSpec {
             command: "/worker/hel".into(),
             args: Vec::new(),
             environment: BTreeMap::new(),
@@ -2513,6 +2524,7 @@ mod tests {
                     ("app".into(), "/workspace/app".into()),
                     ("api".into(), "/workspace/api".into()),
                 ]),
+                mcp_delivery: ProjectMemoryMcpDelivery::Acp,
             }),
             resume_session: None,
             harness: HarnessKind::Codex,
@@ -2541,6 +2553,11 @@ mod tests {
                 .any(|argument| argument.contains("store")),
             "the model-facing service must not expose store selection"
         );
+
+        spec.project_memory.as_mut().unwrap().mcp_delivery =
+            ProjectMemoryMcpDelivery::HarnessProfile;
+        assert!(project_memory_mcp(&spec).is_empty());
+        spec.project_memory.as_mut().unwrap().mcp_delivery = ProjectMemoryMcpDelivery::Acp;
 
         let mut claude = spec;
         claude.harness = HarnessKind::Claude;
@@ -2685,6 +2702,18 @@ mod tests {
                 "Unexpected case: {\"type\":\"vcs_state_changed\"}\nnode: out of memory\nUnexpected case: {\"type\":\"other\"}"
             ),
             Some("node: out of memory".to_owned())
+        );
+        assert_eq!(
+            actionable_stderr_tail(
+                "Got response to unknown request null\nGot response to unknown request null"
+            ),
+            None
+        );
+        assert_eq!(
+            actionable_stderr_tail(
+                "Got response to unknown request null\nACP protocol failed: runtime identity missing"
+            ),
+            Some("ACP protocol failed: runtime identity missing".to_owned())
         );
         assert_eq!(actionable_stderr_tail("   "), None);
     }

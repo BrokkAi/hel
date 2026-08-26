@@ -87,6 +87,26 @@ pub struct ProjectMemoryLaunchConfig {
     /// Bundle repository IDs mapped to the roots presented over ACP.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub repository_roots: std::collections::BTreeMap<String, PathBuf>,
+    /// How the harness learns about the project-memory MCP server. Most ACP
+    /// adapters accept a stdio server in `session/new`; adapters that need
+    /// harness-specific runtime metadata receive it through their staged
+    /// profile instead.
+    #[serde(default, skip_serializing_if = "ProjectMemoryMcpDelivery::is_acp")]
+    pub mcp_delivery: ProjectMemoryMcpDelivery,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectMemoryMcpDelivery {
+    #[default]
+    Acp,
+    HarnessProfile,
+}
+
+impl ProjectMemoryMcpDelivery {
+    fn is_acp(&self) -> bool {
+        *self == Self::Acp
+    }
 }
 
 impl WorkerLaunchConfig {
@@ -5597,6 +5617,7 @@ mod relay_tests {
             root: directory.path().join("replica"),
             baseline_root: directory.path().join("baseline"),
             repository_roots: BTreeMap::new(),
+            mcp_delivery: ProjectMemoryMcpDelivery::Acp,
         };
         let baseline = crate::hel_project_memory::ProjectMemoryStore::new(&memory.baseline_root);
         baseline

@@ -2932,6 +2932,7 @@ mod tests {
                     .harness_home
                     .join("projects/replica/.hel-memory-baseline"),
                 repository_roots: Default::default(),
+                mcp_delivery: crate::hel_worker_runtime::ProjectMemoryMcpDelivery::Acp,
             }),
             execution_policy: crate::hel_config::ExecutionPolicy::Unconstrained,
         }
