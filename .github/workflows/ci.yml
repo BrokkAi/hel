@@ -62,7 +62,7 @@ jobs:
       matrix:
         include:
         - os: ubuntu-latest
-          target: x86_64-unknown-linux-gnu
+          target: x86_64-unknown-linux-musl
         - os: macos-latest
           target: aarch64-apple-darwin
         - os: windows-latest
@@ -79,12 +79,13 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
+        targets: ${{ matrix.target }}
 
-    - name: Install Linux audio dependencies
+    - name: Install Linux musl tools
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install --no-install-recommends --assume-yes libasound2-dev
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
 
     - name: Cache cargo registry and build
       uses: actions/cache@v5

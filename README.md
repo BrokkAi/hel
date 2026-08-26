@@ -100,15 +100,18 @@ curl -fsSL https://raw.githubusercontent.com/BrokkAi/hel/master/install.sh | sh
 ```
 
 This downloads a verified release into `~/.local/bin` — no Rust toolchain
-needed. Run `hel doctor` next. The installer also supports `--prefix` and
-`--version`; see `--help`.
+needed. Linux releases are static musl binaries. Run `hel doctor` next. The
+installer also supports `--prefix` and `--version`; see `--help`.
 
 Building from source works too:
 
 ```console
 cargo build --release
-./target/release/hel
+./target/x86_64-unknown-linux-musl/release/hel
 ```
+
+On Apple silicon, pass `--target aarch64-apple-darwin` and run the binary from
+that target's release directory.
 
 For container targets, pull the published multi-arch agent image (public, no
 authentication):
