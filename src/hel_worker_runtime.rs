@@ -70,7 +70,29 @@ pub struct WorkerLaunchConfig {
     /// Target-level policy translated into harness-specific controls by the
     /// worker. Raw localhost preserves configured approvals; isolated and
     /// remote targets run unconstrained.
+    #[serde(
+        alias = "force_unrestricted_mode",
+        deserialize_with = "deserialize_execution_policy"
+    )]
     pub execution_policy: ExecutionPolicy,
+}
+
+fn deserialize_execution_policy<'de, D>(deserializer: D) -> Result<ExecutionPolicy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WirePolicy {
+        Current(ExecutionPolicy),
+        Legacy(bool),
+    }
+
+    Ok(match WirePolicy::deserialize(deserializer)? {
+        WirePolicy::Current(policy) => policy,
+        WirePolicy::Legacy(true) => ExecutionPolicy::Unconstrained,
+        WirePolicy::Legacy(false) => ExecutionPolicy::ConfiguredApprovals,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2926,6 +2948,17 @@ mod relay_tests {
             .unwrap()
             .remove("execution_policy");
         assert!(serde_json::from_value::<WorkerLaunchConfig>(missing_policy).is_err());
+
+        let mut legacy_policy = serde_json::to_value(&launch).unwrap();
+        let legacy_policy_object = legacy_policy.as_object_mut().unwrap();
+        legacy_policy_object.remove("execution_policy");
+        legacy_policy_object.insert("force_unrestricted_mode".into(), serde_json::json!(true));
+        assert_eq!(
+            serde_json::from_value::<WorkerLaunchConfig>(legacy_policy)
+                .unwrap()
+                .execution_policy,
+            ExecutionPolicy::Unconstrained
+        );
 
         let mut legacy = serde_json::to_value(&launch).unwrap();
         for field in ["additional_directories", "native_session_id"] {
