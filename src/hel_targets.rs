@@ -2254,8 +2254,15 @@ pub(crate) fn worker_daemon_liveness_script(worker_root: &str) -> String {
     let mut script = worker_daemon_identity_script(worker_root);
     script.push_str(
         r#"
+hel_report_worker_state() {
+    if [ -S "$hel_root/control.sock" ]; then
+        printf 'alive\n'
+    else
+        printf 'starting\n'
+    fi
+}
 if hel_recorded_worker >/dev/null; then
-    printf 'alive\n'
+    hel_report_worker_state
     exit 0
 fi
 while read -r hel_pid hel_args; do
@@ -2264,7 +2271,7 @@ while read -r hel_pid hel_args; do
     esac
     [ "$hel_pid" -eq $$ ] && continue
     case "$hel_args" in
-        *"$hel_match"*|*"$hel_match_home"*) printf 'alive\n'; exit 0 ;;
+        *"$hel_match"*|*"$hel_match_home"*) hel_report_worker_state; exit 0 ;;
     esac
 done <<HEL_PS
 $(hel_ps -eo pid=,args=)
@@ -4810,6 +4817,15 @@ mod tests {
             .expect("start fake worker");
         std::fs::write(worker_root.join("worker.pid"), format!("{}\n", child.id())).unwrap();
 
+        let liveness = std::process::Command::new("sh")
+            .args(["-c", &worker_daemon_liveness_script(root)])
+            .output()
+            .expect("probe starting fake worker");
+        assert!(liveness.status.success());
+        assert_eq!(liveness.stdout, b"starting\n");
+
+        let _relay = std::os::unix::net::UnixListener::bind(worker_root.join("control.sock"))
+            .expect("publish fake worker relay socket");
         let liveness = std::process::Command::new("sh")
             .args(["-c", &worker_daemon_liveness_script(root)])
             .output()

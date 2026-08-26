@@ -100,7 +100,9 @@ impl Controller {
         );
         let mut environment = profile.environment.clone();
         environment.insert(profile.home_env().into(), target_profile_home.clone());
-        configure_execution_environment(profile.kind, execution_policy, &mut environment);
+        profile
+            .kind
+            .configure_execution_environment(execution_policy, &mut environment);
         let mut project_memory =
             project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
         project_memory.mcp_delivery = project_memory_mcp_delivery(profile.kind, backend);
@@ -761,19 +763,6 @@ const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
 const DEEPSEEK_HARNESS_FALLBACK_VERSION: &str = "0.1.1-rc.2";
 
 const DEEPSEEK_ACP_FALLBACK_VERSION: &str = "0.10.0";
-
-fn configure_execution_environment(
-    harness: crate::hel_config::HarnessKind,
-    policy: crate::hel_config::ExecutionPolicy,
-    environment: &mut std::collections::BTreeMap<String, String>,
-) {
-    if let Some((key, value)) = harness
-        .execution_enforcement(policy)
-        .and_then(crate::hel_config::ExecutionEnforcement::launch_environment)
-    {
-        environment.insert(key.to_owned(), value.to_owned());
-    }
-}
 
 fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
@@ -1566,16 +1555,17 @@ pub(super) fn start_worker(
 fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) -> CommandSpec {
     let binary = format!("{worker_root}/hel");
     let config = format!("{worker_root}/launch.json");
-    // The exit record describes the worker's previous life. Clear it as part
-    // of the launch, before the new daemon can be probed: the startup connect
-    // loop treats that file as proof the worker it just started has died, so
-    // a stale record would abort every restart.
-    let clear_exit_record = format!(
-        "rm -f {}; ",
+    // These files describe the worker's previous life. Clear them as part of
+    // the launch, before the new daemon can be probed: a stale exit record
+    // aborts startup, while a stale socket makes a recovering daemon look
+    // ready and invites the reconnect actor to kill it as unresponsive.
+    let clear_stale_runtime = format!(
+        "rm -f {} {}; ",
         hel_targets::join_remote_command(&[format!("{worker_root}/worker-exit.json")]),
+        hel_targets::join_remote_command(&[format!("{worker_root}/control.sock")]),
     );
     let detached_script = format!(
-        "{clear_exit_record}nohup {} >{} 2>&1 </dev/null &",
+        "{clear_stale_runtime}nohup {} >{} 2>&1 </dev/null &",
         hel_targets::join_remote_command(&[
             binary.clone(),
             "worker".into(),
@@ -1590,7 +1580,7 @@ fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str)
     // Redirect daemon output to worker.log in every launch mode; an
     // unexplained dead worker is undebuggable without it.
     let exec_script = format!(
-        "{clear_exit_record}exec {} >{} 2>&1",
+        "{clear_stale_runtime}exec {} >{} 2>&1",
         hel_targets::join_remote_command(&[
             binary.clone(),
             "worker".into(),
@@ -1773,7 +1763,7 @@ mod tests {
     /// must clear it first, or the startup connect loop reads the previous
     /// death as this worker's and gives up on a healthy daemon.
     #[test]
-    fn starting_a_worker_clears_the_previous_exit_record_before_launching() {
+    fn starting_a_worker_clears_stale_runtime_files_before_launching() {
         struct RecordingExecutor {
             commands: RefCell<Vec<CommandSpec>>,
         }
@@ -1813,8 +1803,12 @@ mod tests {
             let cleared = script.find("rm -f").expect("the exit record is removed");
             let launched = script.find("worker").expect("the daemon is launched");
             assert!(
+                script.contains("control.sock"),
+                "the stale relay endpoint must be cleared before startup: {script}"
+            );
+            assert!(
                 cleared < launched,
-                "the exit record must be cleared before the daemon starts: {script}"
+                "stale runtime files must be cleared before the daemon starts: {script}"
             );
         }
     }
@@ -2180,8 +2174,7 @@ mod tests {
     fn codex_execution_environment_follows_the_target_policy() {
         let mut podman_environment =
             BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Codex,
+        crate::hel_config::HarnessKind::Codex.configure_execution_environment(
             ExecutionPolicy::Unconstrained,
             &mut podman_environment,
         );
@@ -2194,8 +2187,7 @@ mod tests {
 
         let mut bare_environment =
             BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Codex,
+        crate::hel_config::HarnessKind::Codex.configure_execution_environment(
             ExecutionPolicy::ConfiguredApprovals,
             &mut bare_environment,
         );
@@ -2210,22 +2202,16 @@ mod tests {
     #[test]
     fn grok_sandbox_environment_follows_the_target_policy() {
         let mut isolated = BTreeMap::from([("GROK_SANDBOX".to_owned(), "strict".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Grok,
-            ExecutionPolicy::Unconstrained,
-            &mut isolated,
-        );
+        crate::hel_config::HarnessKind::Grok
+            .configure_execution_environment(ExecutionPolicy::Unconstrained, &mut isolated);
         assert_eq!(
             isolated.get("GROK_SANDBOX").map(String::as_str),
             Some("off")
         );
 
         let mut local = BTreeMap::from([("GROK_SANDBOX".to_owned(), "strict".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Grok,
-            ExecutionPolicy::ConfiguredApprovals,
-            &mut local,
-        );
+        crate::hel_config::HarnessKind::Grok
+            .configure_execution_environment(ExecutionPolicy::ConfiguredApprovals, &mut local);
         assert_eq!(
             local.get("GROK_SANDBOX").map(String::as_str),
             Some("strict"),

@@ -70,7 +70,29 @@ pub struct WorkerLaunchConfig {
     /// Target-level policy translated into harness-specific controls by the
     /// worker. Raw localhost preserves configured approvals; isolated and
     /// remote targets run unconstrained.
+    #[serde(
+        alias = "force_unrestricted_mode",
+        deserialize_with = "deserialize_execution_policy"
+    )]
     pub execution_policy: ExecutionPolicy,
+}
+
+fn deserialize_execution_policy<'de, D>(deserializer: D) -> Result<ExecutionPolicy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WirePolicy {
+        Current(ExecutionPolicy),
+        Legacy(bool),
+    }
+
+    Ok(match WirePolicy::deserialize(deserializer)? {
+        WirePolicy::Current(policy) => policy,
+        WirePolicy::Legacy(true) => ExecutionPolicy::Unconstrained,
+        WirePolicy::Legacy(false) => ExecutionPolicy::ConfiguredApprovals,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +132,11 @@ impl ProjectMemoryMcpDelivery {
 }
 
 impl WorkerLaunchConfig {
+    fn enforce_execution_policy(&mut self) {
+        self.harness
+            .configure_execution_environment(self.execution_policy, &mut self.environment);
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         let body = std::fs::read(path)
             .with_context(|| format!("read worker launch config {}", path.display()))?;
@@ -144,6 +171,9 @@ mod unix {
     use tokio::sync::mpsc;
 
     use super::{AcpSupervisorSpec, CredentialEndpoint, WorkerLaunchConfig};
+
+    pub(super) const PROXY_INITIAL_INPUT_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_config::HarnessKind;
     use crate::hel_worker::{
@@ -180,6 +210,7 @@ mod unix {
         let startup_directory = std::env::current_dir()?;
         let root = super::resolve_relative_worker_root(root, &startup_directory);
         super::resolve_relative_harness_home(&mut config, &startup_directory);
+        config.enforce_execution_policy();
         // Resolve this before the launch config's environment is consumed by
         // the ACP supervisor specification below.
         let credentials = super::credential_endpoint(&config);
@@ -192,6 +223,13 @@ mod unix {
         // corrupt the files a live worker is still writing.
         if socket.exists() && UnixStream::connect(&socket).await.is_ok() {
             bail!("a worker is already running at {}", socket.display());
+        }
+        // A dead daemon can leave its socket inode behind. Remove it before
+        // journal recovery so controller liveness can distinguish a worker
+        // that is still starting from one that has published its endpoint.
+        if socket.exists() {
+            std::fs::remove_file(&socket)
+                .with_context(|| format!("remove stale socket {}", socket.display()))?;
         }
         // Validate and recover durable state before publishing a socket. A
         // failed startup must never leave a fresh endpoint that looks live.
@@ -222,10 +260,6 @@ mod unix {
         if exit_record.exists() {
             std::fs::remove_file(&exit_record)
                 .with_context(|| format!("clear stale exit record {}", exit_record.display()))?;
-        }
-        if socket.exists() {
-            std::fs::remove_file(&socket)
-                .with_context(|| format!("remove stale socket {}", socket.display()))?;
         }
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("bind worker socket {}", socket.display()))?;
@@ -1906,9 +1940,30 @@ exec gh "$@"
         // exec` client), leaking one thread-heavy process per poll inside the
         // container. Exit as soon as either side closes. An idle connection
         // is intentional: it may own a checkpoint barrier while the
-        // controller transfers a large archive.
+        // controller transfers a large archive. Before the first request,
+        // however, a bounded deadline prevents a detached Podman conmon from
+        // holding the target-side proxy forever after the controller kills a
+        // launcher whose handshake timed out.
         let mut client_buf = [0_u8; 64 * 1024];
         let mut relay_buf = [0_u8; 64 * 1024];
+        let first_count = match tokio::time::timeout(
+            PROXY_INITIAL_INPUT_TIMEOUT,
+            client_read.read(&mut client_buf),
+        )
+        .await
+        {
+            Ok(read) => read.context("read initial proxy stdin")?,
+            Err(_) => return Ok(()),
+        };
+        if first_count == 0 {
+            let _ = relay_write.shutdown().await;
+            return Ok(());
+        }
+        relay_write
+            .write_all(&client_buf[..first_count])
+            .await
+            .context("forward initial request to worker")?;
+
         loop {
             tokio::select! {
                 read = client_read.read(&mut client_buf) => {
@@ -2924,6 +2979,26 @@ mod relay_tests {
             .remove("execution_policy");
         assert!(serde_json::from_value::<WorkerLaunchConfig>(missing_policy).is_err());
 
+        let mut legacy_policy = serde_json::to_value(&launch).unwrap();
+        let legacy_policy_object = legacy_policy.as_object_mut().unwrap();
+        legacy_policy_object.remove("execution_policy");
+        legacy_policy_object.insert("force_unrestricted_mode".into(), serde_json::json!(true));
+        let mut legacy_policy =
+            serde_json::from_value::<WorkerLaunchConfig>(legacy_policy).unwrap();
+        assert_eq!(
+            legacy_policy.execution_policy,
+            ExecutionPolicy::Unconstrained
+        );
+        assert!(!legacy_policy.environment.contains_key("INITIAL_AGENT_MODE"));
+        legacy_policy.enforce_execution_policy();
+        assert_eq!(
+            legacy_policy
+                .environment
+                .get("INITIAL_AGENT_MODE")
+                .map(String::as_str),
+            Some("agent-full-access")
+        );
+
         let mut legacy = serde_json::to_value(&launch).unwrap();
         for field in ["additional_directories", "native_session_id"] {
             legacy.as_object_mut().unwrap().remove(field);
@@ -3190,10 +3265,6 @@ mod relay_tests {
             relay_write,
         ));
 
-        tokio::time::advance(std::time::Duration::from_secs(16 * 60)).await;
-        tokio::task::yield_now().await;
-        assert!(!proxy.is_finished(), "idle proxy connection expired");
-
         controller.write_all(b"request").await.unwrap();
         let mut request = [0_u8; 7];
         relay_peer.read_exact(&mut request).await.unwrap();
@@ -3203,9 +3274,42 @@ mod relay_tests {
         controller.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"response");
 
+        tokio::time::advance(std::time::Duration::from_secs(16 * 60)).await;
+        tokio::task::yield_now().await;
+        assert!(!proxy.is_finished(), "idle proxy connection expired");
+
+        controller.write_all(b"another").await.unwrap();
+        let mut request = [0_u8; 7];
+        relay_peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"another");
+        relay_peer.write_all(b"answer!!").await.unwrap();
+        let mut response = [0_u8; 8];
+        controller.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"answer!!");
+
         drop(relay_peer);
         drop(controller);
         proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_transport_expires_while_waiting_for_its_first_request() {
+        let (_controller, proxy_client) = tokio::io::duplex(1024);
+        let (proxy_relay, _relay_peer) = tokio::io::duplex(1024);
+        let (client_read, client_write) = tokio::io::split(proxy_client);
+        let (relay_read, relay_write) = tokio::io::split(proxy_relay);
+        let proxy = tokio::spawn(unix::forward_proxy_streams(
+            client_read,
+            client_write,
+            relay_read,
+            relay_write,
+        ));
+
+        tokio::time::advance(unix::PROXY_INITIAL_INPUT_TIMEOUT).await;
+        proxy
+            .await
+            .expect("proxy task stopped cleanly")
+            .expect("pre-handshake proxy timeout is clean shutdown");
     }
 
     #[tokio::test]
