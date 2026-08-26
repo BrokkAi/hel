@@ -1187,6 +1187,8 @@ pub enum ConnectionState {
     Cancelling,
     /// A `session/fork` request is in flight.
     Forking,
+    /// User-initiated quit in progress; the runtime is tearing down.
+    ShuttingDown,
     /// Runtime shut down cleanly (UI quit or agent EOF).
     Closed,
     /// Runtime ended with a fatal error.
@@ -8930,6 +8932,17 @@ mod tests {
         let status = s.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Fatal);
         assert_eq!(status.text, "boom");
+    }
+
+    #[test]
+    fn runtime_close_transitions_shutting_down_to_closed() {
+        let mut s = AppState::new();
+        s.set_connection_state(ConnectionState::ShuttingDown);
+
+        s.mark_runtime_closed();
+
+        assert!(s.runtime_closed);
+        assert_eq!(s.connection_state, ConnectionState::Closed);
     }
 
     #[test]
