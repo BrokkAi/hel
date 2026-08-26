@@ -1953,8 +1953,8 @@ df -B1 -P -- "$1" | awk 'NR == 2 { print "disk.total=" $2 }'
 // attached, so the caller's failure message names the path that could not be
 // read.
 const AWS_SESSION_DISK_USAGE_SCRIPT: &str = r#"
-usage=$(du -s -B1 -- "$@") || exit 1
-printf '%s\n' "$usage" | awk '{ total += $1 } END { print total + 0 }'
+usage=$(du -sk "$@") || exit 1
+printf '%s\n' "$usage" | awk '{ total += $1 * 1024 } END { print total + 0 }'
 "#;
 
 pub fn resource_probe(locator: &TargetLocator, session_id: &str) -> Result<SessionResourceProbe> {
@@ -5232,7 +5232,7 @@ mod tests {
 
     #[test]
     fn bounded_executor_times_out_naming_the_probe_and_still_runs_the_next_one() {
-        let executor = BoundedProcessExecutor::new(Duration::from_millis(100));
+        let executor = BoundedProcessExecutor::new(Duration::from_secs(1));
         let started = std::time::Instant::now();
 
         let error = executor

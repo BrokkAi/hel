@@ -393,7 +393,7 @@ mod tests {
         shells
             .start(
                 "shell-large-output".into(),
-                r#"head -c 70000 /dev/zero | tr '\0' x; printf '\nPWD=%s\n' "$PWD"; head -c 70000 /dev/zero | tr '\0' y >&2"#
+                r#"awk 'BEGIN { for (i = 0; i < 70000; i++) printf "x" }'; printf '\nCWD_MARKER\n'; : > user-shell-cwd-marker; awk 'BEGIN { for (i = 0; i < 70000; i++) printf "y" }' >&2"#
                     .into(),
             )
             .unwrap();
@@ -412,11 +412,8 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout_truncated);
         assert!(result.stderr_truncated);
-        assert!(
-            result
-                .stdout
-                .contains(&format!("PWD={}", cwd.path().display()))
-        );
+        assert!(result.stdout.contains("CWD_MARKER"));
+        assert!(cwd.path().join("user-shell-cwd-marker").is_file());
         assert!(result.stdout.starts_with(&"x".repeat(OUTPUT_HEAD_BYTES)));
         assert!(result.stderr.starts_with(&"y".repeat(OUTPUT_HEAD_BYTES)));
     }
