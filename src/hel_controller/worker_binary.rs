@@ -1550,16 +1550,17 @@ pub(super) fn start_worker(
 fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) -> CommandSpec {
     let binary = format!("{worker_root}/hel");
     let config = format!("{worker_root}/launch.json");
-    // The exit record describes the worker's previous life. Clear it as part
-    // of the launch, before the new daemon can be probed: the startup connect
-    // loop treats that file as proof the worker it just started has died, so
-    // a stale record would abort every restart.
-    let clear_exit_record = format!(
-        "rm -f {}; ",
+    // These files describe the worker's previous life. Clear them as part of
+    // the launch, before the new daemon can be probed: a stale exit record
+    // aborts startup, while a stale socket makes a recovering daemon look
+    // ready and invites the reconnect actor to kill it as unresponsive.
+    let clear_stale_runtime = format!(
+        "rm -f {} {}; ",
         hel_targets::join_remote_command(&[format!("{worker_root}/worker-exit.json")]),
+        hel_targets::join_remote_command(&[format!("{worker_root}/control.sock")]),
     );
     let detached_script = format!(
-        "{clear_exit_record}nohup {} >{} 2>&1 </dev/null &",
+        "{clear_stale_runtime}nohup {} >{} 2>&1 </dev/null &",
         hel_targets::join_remote_command(&[
             binary.clone(),
             "worker".into(),
@@ -1574,7 +1575,7 @@ fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str)
     // Redirect daemon output to worker.log in every launch mode; an
     // unexplained dead worker is undebuggable without it.
     let exec_script = format!(
-        "{clear_exit_record}exec {} >{} 2>&1",
+        "{clear_stale_runtime}exec {} >{} 2>&1",
         hel_targets::join_remote_command(&[
             binary.clone(),
             "worker".into(),
@@ -1757,7 +1758,7 @@ mod tests {
     /// must clear it first, or the startup connect loop reads the previous
     /// death as this worker's and gives up on a healthy daemon.
     #[test]
-    fn starting_a_worker_clears_the_previous_exit_record_before_launching() {
+    fn starting_a_worker_clears_stale_runtime_files_before_launching() {
         struct RecordingExecutor {
             commands: RefCell<Vec<CommandSpec>>,
         }
@@ -1797,8 +1798,12 @@ mod tests {
             let cleared = script.find("rm -f").expect("the exit record is removed");
             let launched = script.find("worker").expect("the daemon is launched");
             assert!(
+                script.contains("control.sock"),
+                "the stale relay endpoint must be cleared before startup: {script}"
+            );
+            assert!(
                 cleared < launched,
-                "the exit record must be cleared before the daemon starts: {script}"
+                "stale runtime files must be cleared before the daemon starts: {script}"
             );
         }
     }

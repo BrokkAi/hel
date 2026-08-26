@@ -84,6 +84,7 @@ fn worker_connect_allows_live_restart(error: &anyhow::Error) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerRecoveryOutcome {
     Alive,
+    Starting,
     TargetMissing,
     RestartedDead,
     RestartedUnresponsive,
@@ -113,6 +114,7 @@ async fn recover_worker(
             );
         }
         match String::from_utf8_lossy(&output.stdout).trim() {
+            "starting" => Ok(WorkerRecoveryOutcome::Starting),
             "alive" if !restart_unresponsive => Ok(WorkerRecoveryOutcome::Alive),
             "alive" => {
                 plan.restart.execute(&executor)?;
@@ -857,6 +859,7 @@ async fn run_session_actor(
                                             "the relay worker was alive but not serving handshakes, so it was restarted"
                                         }
                                         WorkerRecoveryOutcome::Alive
+                                        | WorkerRecoveryOutcome::Starting
                                         | WorkerRecoveryOutcome::TargetMissing => unreachable!(),
                                     };
                                     publish_view(&target.session_id, ManagedSessionView {
@@ -879,6 +882,21 @@ async fn run_session_actor(
                                         connected: false,
                                         error: Some(ViewError::Unreachable(format!(
                                             "{error:#}; relay worker is still alive, so it was not restarted"
+                                        ))),
+                                    }, &view_tx, &updates);
+                                    interval.reset_after(reconnect_delay(failures));
+                                }
+                                Ok(WorkerRecoveryOutcome::Starting) => {
+                                    tracing::warn!(
+                                        session_id = target.session_id,
+                                        "relay worker is still starting; leaving it running"
+                                    );
+                                    let snapshot = view_tx.borrow().snapshot.clone();
+                                    publish_view(&target.session_id, ManagedSessionView {
+                                        snapshot,
+                                        connected: false,
+                                        error: Some(ViewError::Unreachable(format!(
+                                            "{error:#}; relay worker is still recovering its durable state, so it was not restarted"
                                         ))),
                                     }, &view_tx, &updates);
                                     interval.reset_after(reconnect_delay(failures));
@@ -1799,6 +1817,15 @@ mod tests {
             WorkerRecoveryOutcome::Alive
         );
         assert!(!restarted.exists(), "a live worker must not be restarted");
+
+        assert_eq!(
+            recover_worker(recovery("starting"), true).await.unwrap(),
+            WorkerRecoveryOutcome::Starting
+        );
+        assert!(
+            !restarted.exists(),
+            "a worker recovering its journal must not be restarted"
+        );
 
         assert_eq!(
             recover_worker(recovery("alive"), true).await.unwrap(),

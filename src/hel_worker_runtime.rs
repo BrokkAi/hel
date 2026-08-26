@@ -193,6 +193,13 @@ mod unix {
         if socket.exists() && UnixStream::connect(&socket).await.is_ok() {
             bail!("a worker is already running at {}", socket.display());
         }
+        // A dead daemon can leave its socket inode behind. Remove it before
+        // journal recovery so controller liveness can distinguish a worker
+        // that is still starting from one that has published its endpoint.
+        if socket.exists() {
+            std::fs::remove_file(&socket)
+                .with_context(|| format!("remove stale socket {}", socket.display()))?;
+        }
         // Validate and recover durable state before publishing a socket. A
         // failed startup must never leave a fresh endpoint that looks live.
         let mut durable_relay =
@@ -222,10 +229,6 @@ mod unix {
         if exit_record.exists() {
             std::fs::remove_file(&exit_record)
                 .with_context(|| format!("clear stale exit record {}", exit_record.display()))?;
-        }
-        if socket.exists() {
-            std::fs::remove_file(&socket)
-                .with_context(|| format!("remove stale socket {}", socket.display()))?;
         }
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("bind worker socket {}", socket.display()))?;
