@@ -11,9 +11,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use std::path::PathBuf;
 
+use hel::hel_chat::TranscriptSnapshot;
 use hel::hel_config::{HarnessKind, mount_history_host};
 use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_additional_mounts};
 
+use crate::ingest::TranscriptHydration;
 use crate::widgets::{action_buttons, centered_rect, focused_buttons, popup_height, truncate_text};
 use crate::wizards::read_only_marker;
 use crate::{
@@ -184,7 +186,7 @@ const IMPORT_PROGRESS_BUTTONS: &[&str] = &["Cancel"];
 fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] {
     match confirmation {
         Confirmation::DirtyLocal { .. } => &["Cancel", "Continue"],
-        Confirmation::Close { .. } => &["Cancel", "Stop"],
+        Confirmation::Close { .. } => &["Cancel", "Delete", "Stop"],
         Confirmation::DeleteStopped { .. } => &["Cancel", "Delete"],
         Confirmation::CloseFailed { .. } => &["Cancel", "Force destroy", "Retry stop"],
         Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => &[],
@@ -713,6 +715,7 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify a recovery copy before destroying the target."),
+                Line::raw("Delete permanently removes it without creating a recovery copy."),
             ],
         ),
         Confirmation::DeleteStopped { session_id, .. } => (
@@ -1242,7 +1245,8 @@ impl DashboardState {
                 self.cancel_modal();
                 action
             }
-            (Confirmation::Close { session_id }, 1) => {
+            (Confirmation::Close { session_id }, 1) => self.begin_delete_active(session_id),
+            (Confirmation::Close { session_id }, 2) => {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
             }
@@ -1269,6 +1273,30 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::None
             }
+        }
+    }
+
+    fn begin_delete_active(&mut self, session_id: String) -> DashboardAction {
+        // Deleting without the typed confirmation needs Hel to know there is
+        // no agent work to lose. An unhydrated transcript can look empty.
+        let known_to_have_no_assistant_messages =
+            self.session_details.get(&session_id).is_some_and(|detail| {
+                detail.transcript_hydration == TranscriptHydration::Ready
+                    && detail.last_agent_message.is_none()
+                    && !detail
+                        .transcript
+                        .as_ref()
+                        .is_some_and(TranscriptSnapshot::has_assistant_messages)
+            });
+        if known_to_have_no_assistant_messages {
+            self.cancel_modal();
+            DashboardAction::DeleteActive { session_id }
+        } else {
+            self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
+                session_id,
+                typed: String::new(),
+            }));
+            DashboardAction::None
         }
     }
 
@@ -1409,10 +1437,20 @@ mod tests {
         session.checkpoint = None;
         let mut dashboard = dashboard_with_session(session);
 
-        // Nothing has hydrated yet, so a session that looks empty may simply
-        // be one Hel has not read.
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Delete)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+
+        // Nothing has hydrated yet, so a session that looks empty may simply
+        // be one Hel has not read.
+        dashboard.handle_key(ctrl_key('p'));
+        dashboard.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::None
         );
         assert!(asks_to_type_destroy(&dashboard));
@@ -1420,21 +1458,33 @@ mod tests {
 
         // A transcript that could not be read is no better evidence.
         dashboard.mark_transcript_unavailable("session-1");
-        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
+        dashboard.handle_key(ctrl_key('p'));
+        dashboard.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
         assert!(asks_to_type_destroy(&dashboard));
         dashboard.handle_key(key(KeyCode::Esc));
 
         // Hydrated and empty: there is no agent work to lose.
         apply_materialized_transcript(&mut dashboard, Vec::new());
+        dashboard.handle_key(ctrl_key('p'));
+        dashboard.handle_key(key(KeyCode::Left));
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Delete)),
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::DeleteActive {
                 session_id: "session-1".into()
             }
         );
 
         apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "hello")]);
-        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
+        dashboard.handle_key(ctrl_key('p'));
+        dashboard.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
         assert!(asks_to_type_destroy(&dashboard));
     }
 
@@ -2147,9 +2197,9 @@ mod tests {
         };
         assert_eq!(
             confirmation_buttons(&dialog.confirmation),
-            &["Cancel", "Stop"]
+            &["Cancel", "Delete", "Stop"]
         );
-        assert_eq!(dialog.focus, 1);
+        assert_eq!(dialog.focus, 2);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
@@ -2161,30 +2211,36 @@ mod tests {
 
     #[test]
     fn stop_confirmation_cycles_focus_and_cancels_from_the_cancel_button() {
-        for cycle_key in [
-            KeyCode::Tab,
-            KeyCode::Left,
-            KeyCode::Right,
-            KeyCode::BackTab,
+        for cycle_keys in [
+            vec![KeyCode::Tab],
+            vec![KeyCode::Right],
+            vec![KeyCode::Left, KeyCode::Left],
+            vec![KeyCode::BackTab, KeyCode::BackTab],
         ] {
             let mut dashboard = running_dashboard_with_stop_dialog();
-            assert_eq!(dashboard.handle_key(key(cycle_key)), DashboardAction::None);
+            for cycle_key in &cycle_keys {
+                assert_eq!(dashboard.handle_key(key(*cycle_key)), DashboardAction::None);
+            }
             let Mode::Confirm(dialog) = &dashboard.mode else {
-                panic!("expected stop confirmation to stay open for {cycle_key:?}");
+                panic!("expected stop confirmation to stay open for {cycle_keys:?}");
             };
-            assert_eq!(dialog.focus, 0, "{cycle_key:?}");
+            assert_eq!(dialog.focus, 0, "{cycle_keys:?}");
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Enter)),
                 DashboardAction::None,
-                "{cycle_key:?}"
+                "{cycle_keys:?}"
             );
-            assert!(matches!(dashboard.mode, Mode::Dashboard), "{cycle_key:?}");
+            assert!(matches!(dashboard.mode, Mode::Dashboard), "{cycle_keys:?}");
         }
     }
 
     #[test]
     fn stop_confirmation_wraps_focus_back_to_the_primary_button() {
         let mut dashboard = running_dashboard_with_stop_dialog();
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Tab)),
             DashboardAction::None
@@ -2240,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_confirmation_renders_cancel_and_stop_buttons_with_stop_focused() {
+    fn stop_confirmation_renders_cancel_delete_and_stop_with_stop_focused() {
         let mut dashboard = running_dashboard_with_stop_dialog();
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
         terminal
@@ -2250,13 +2306,17 @@ mod tests {
         let lines = buffer_lines(buffer);
         let row = lines
             .iter()
-            .position(|line| line.contains(" Cancel ") && line.contains(" Stop "))
+            .position(|line| {
+                line.contains(" Cancel ") && line.contains(" Delete ") && line.contains(" Stop ")
+            })
             .expect("button row");
         let button_y = buffer.area.y + row as u16;
         let cancel_x = buffer.area.x + cell_column(&lines[row], "Cancel");
+        let delete_x = buffer.area.x + cell_column(&lines[row], "Delete");
         let stop_x = buffer.area.x + cell_column(&lines[row], "Stop");
         assert_eq!(buffer[(stop_x, button_y)].bg, Color::Cyan);
         assert_eq!(buffer[(cancel_x, button_y)].bg, Color::DarkGray);
+        assert_eq!(buffer[(delete_x, button_y)].bg, Color::DarkGray);
         // Each label keeps its one-cell padding inside the button background.
         assert_eq!(buffer[(cancel_x - 1, button_y)].bg, Color::DarkGray);
         assert_eq!(buffer[(stop_x - 1, button_y)].bg, Color::Cyan);

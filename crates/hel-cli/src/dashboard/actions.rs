@@ -55,6 +55,9 @@ pub(crate) async fn apply_dashboard_action(
             context.manual_quota_refresh_generation = Some(context.request_quota_refresh());
             context.dashboard.set_notice(QUOTA_REFRESH_NOTICE);
         }
+        DashboardAction::MarkAllRead { receipts } => {
+            context.acknowledge_dashboard_sessions(receipts);
+        }
         DashboardAction::OpenResumeDialog => context.start_resume_discovery(),
         DashboardAction::SetSessionArchived {
             session_id,

@@ -12,8 +12,8 @@ use crate::hel_archive::{
     verify_archive_streaming,
 };
 use crate::hel_checkpoint::{
-    CheckpointExportSpec, CheckpointRepositoryCapture, CheckpointRepositorySpec,
-    CheckpointTransfer, export_command, export_stdin_command,
+    CHECKPOINT_EXPORT_PROTOCOL_VERSION, CheckpointExportSpec, CheckpointRepositoryCapture,
+    CheckpointRepositorySpec, CheckpointTransfer, export_command, export_stdin_command,
 };
 use crate::hel_config::sessions_dir;
 use crate::hel_projection::canonical_session_from_materialized;
@@ -733,6 +733,7 @@ impl Controller {
             let remote_archive = format!("{worker_root}/checkpoint.hel.zip");
             let checkpointed_at = now();
             let spec = CheckpointExportSpec {
+                protocol_version: CHECKPOINT_EXPORT_PROTOCOL_VERSION,
                 session: SessionManifest {
                     id: session.id.clone(),
                     title: session.title.clone(),
@@ -1305,9 +1306,10 @@ fn export_uploaded_spec(
     executor.execute(&export_command(locator, session_id, remote_spec)?)
 }
 
-/// When the installed worker cannot parse this spec, replace its `hel` with the
-/// controller's current binary and tell the caller to retry. The live daemon
-/// keeps the previous inode; only the next `export-checkpoint` process changes.
+/// When the installed worker cannot execute this export protocol, replace its
+/// `hel` with the controller's current binary and tell the caller to retry. The
+/// live daemon keeps the previous inode; only the next `export-checkpoint`
+/// process changes.
 fn replace_stale_export_worker(
     executor: &impl CommandExecutor,
     locator: &hel_targets::TargetLocator,
@@ -1316,12 +1318,12 @@ fn replace_stale_export_worker(
     failure: &str,
     replaced_worker: &mut bool,
 ) -> Result<bool> {
-    if *replaced_worker || !export_spec_schema_unsupported(failure) {
+    if *replaced_worker || !export_protocol_unsupported(failure) {
         return Ok(false);
     }
     tracing::debug!(
         session_id,
-        "target worker cannot parse this checkpoint spec; replacing the installed Hel binary and retrying"
+        "target worker does not support this checkpoint export protocol; replacing the installed Hel binary and retrying"
     );
     let owned_binary;
     let binary = if let Some(path) = worker_binary {
@@ -1355,6 +1357,11 @@ fn export_spec_stdin_unsupported(failure: &str) -> bool {
 fn export_spec_schema_unsupported(failure: &str) -> bool {
     failure.contains("parse checkpoint export spec")
         && (failure.contains("unknown field") || failure.contains("unknown variant"))
+}
+
+fn export_protocol_unsupported(failure: &str) -> bool {
+    export_spec_schema_unsupported(failure)
+        || failure.contains("unsupported checkpoint export protocol version")
 }
 
 pub(super) fn upload_checkpoint_spec(
@@ -1769,6 +1776,7 @@ mod tests {
     }
     fn export_spec_fixture() -> CheckpointExportSpec {
         CheckpointExportSpec {
+            protocol_version: CHECKPOINT_EXPORT_PROTOCOL_VERSION,
             session: crate::hel_archive::SessionManifest {
                 id: LATCH_RELAY_SESSION.into(),
                 title: "streamed spec".into(),
@@ -1951,11 +1959,10 @@ mod tests {
             vec!["export target checkpoint".to_owned()]
         );
     }
-    /// A worker copied into the target before `terminal_refs` existed rejects
-    /// the current spec. Replacing its `hel` binary lets export keep the full
-    /// latched snapshot instead of stripping fields the old parser forbids.
+    /// The explicit export protocol field makes every older worker reject the
+    /// current spec before it can apply obsolete path or collection behavior.
     #[test]
-    fn an_export_that_rejects_unknown_spec_fields_replaces_the_worker_binary() {
+    fn a_legacy_export_worker_is_replaced_before_it_runs_obsolete_behavior() {
         let locator = hel_targets::TargetLocator::LocalPodman {
             container_id: hel_targets::resource_name(LATCH_RELAY_SESSION).unwrap(),
         };
@@ -1963,7 +1970,7 @@ mod tests {
         let executor = ExportExecutor::new(
             1,
             "Error: parse checkpoint export spec from standard input\n\nCaused by:\n    \
-                 unknown field `terminal_refs`, expected `call` at line 1 column 7276552\n",
+                 unknown field `protocol_version`, expected `session` at line 1 column 20\n",
         )
         .retry_stdin_after_failure();
         let worker_binary = Path::new("/hel-test-worker");
@@ -2129,6 +2136,9 @@ mod tests {
         assert!(!export_spec_schema_unsupported(
             "Error: parse checkpoint export spec from standard input\n\nCaused by:\n    \
                  missing field `relay_root`\n"
+        ));
+        assert!(export_protocol_unsupported(
+            "Error: unsupported checkpoint export protocol version 2; worker supports 1\n"
         ));
     }
     const LATCH_RELAY_ROOT: &str = "HEL_TEST_LATCH_RELAY_ROOT";

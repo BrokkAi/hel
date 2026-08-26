@@ -565,6 +565,28 @@ impl DashboardContext {
         self.spawn_read_receipt(session_id, through);
     }
 
+    fn acknowledge_dashboard_sessions(&mut self, receipts: Vec<(String, u64)>) {
+        for (session_id, through) in receipts {
+            let Some(session) = self.controller.state.sessions.get_mut(&session_id) else {
+                continue;
+            };
+            if through <= session.viewed_through_event_ordinal {
+                continue;
+            }
+            session.viewed_through_event_ordinal = through;
+            self.pending_read_receipts
+                .entry(session_id)
+                .and_modify(|pending| *pending = (*pending).max(through))
+                .or_insert(through);
+        }
+        self.dashboard.set_state(self.controller.state.clone());
+        if self.read_receipt_in_flight.is_none()
+            && let Some((session_id, through)) = self.pending_read_receipts.pop_first()
+        {
+            self.spawn_read_receipt(session_id, through);
+        }
+    }
+
     fn spawn_read_receipt(&mut self, session_id: String, through: u64) {
         self.read_receipt_in_flight = Some(session_id.clone());
         io::spawn_read_receipt_persist(

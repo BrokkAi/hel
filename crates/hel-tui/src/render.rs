@@ -673,11 +673,11 @@ fn session_top_line(
     let queued = detail
         .map(|detail| detail.queued_prompts.len())
         .filter(|count| *count > 0)
-        .map(|count| format!(" [{count} queued]"))
-        .unwrap_or_default();
+        .map(|count| format!("[Q {count}]"));
     let mut columns = vec![target.to_owned()];
+    columns.extend(queued);
     columns.extend(status_columns);
-    columns.push(format!("{profile}{queued}"));
+    columns.push(profile);
     columns.push(recovery_warning_name(
         session,
         session_name(session).to_owned(),
@@ -1211,11 +1211,13 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · [T] Resume · [R]ename · [E]dit container · [S]ort · sto[P] · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [T] Resume · [R]ename · [E]dit container · sto[P] · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
         }
-        Focus::Capacity => "[N]ew · [T] Resume · [S]ort · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Capacity => {
+            "[N]ew · [T] Resume · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
+        }
         Focus::Quotas => {
-            "[N]ew · [T] Resume · [R]efresh · [S]ort · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [T] Resume · [R]efresh · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
         }
     };
     frame.render_widget(
@@ -1295,10 +1297,10 @@ mod tests {
         assert!(!rendered.contains("[1] hel"));
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
-        assert!(rendered.contains("podman  Turn "));
+        assert!(rendered.contains("podman  [Q 1]  Turn "));
         assert!(rendered.contains("  Step "));
-        assert!(rendered.contains("  codex-1 [1 queued]  ACP pretty name"));
-        assert!(rendered.contains("[1 queued]"));
+        assert!(rendered.contains("  codex-1  ACP pretty name"));
+        assert!(!rendered.contains("queued]"));
         assert!(rendered.contains("You: question 1"));
         assert!(rendered.contains("Agent: "));
         assert!(rendered.contains("answer 1"));
@@ -1763,9 +1765,9 @@ mod tests {
         };
         let hotkeys = line(buffer.area.bottom() - 2);
         assert!(hotkeys.contains(&format!("{accelerator} for: [N]ew")));
-        // Sort is a Ctrl command now, so no order is displayed permanently.
-        assert!(hotkeys.contains("[S]ort"));
-        assert!(!hotkeys.contains("sort: "));
+        assert!(hotkeys.contains("mark [A]ll read"));
+        assert!(!hotkeys.contains("[S]ort"));
+        assert!(!hotkeys.contains("[D]elete"));
         assert!(line(buffer.area.bottom() - 1).contains("Transient dashboard message"));
     }
 
