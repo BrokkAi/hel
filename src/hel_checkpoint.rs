@@ -32,6 +32,8 @@ use crate::hel_targets::{
 };
 const MAX_NATIVE_FILE: u64 = 1024 * 1024 * 1024;
 const MAX_NATIVE_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
+/// Version of the controller-to-exporter checkpoint specification contract.
+pub const CHECKPOINT_EXPORT_PROTOCOL_VERSION: u32 = 1;
 /// Clock-skew slack subtracted from a Codex session's own creation time before
 /// it is used as an mtime floor for content probes.
 const CODEX_PROBE_FLOOR_SLACK_MS: i64 = 48 * 3600 * 1000;
@@ -62,6 +64,7 @@ pub enum CheckpointRepositoryCapture {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointExportSpec {
+    pub protocol_version: u32,
     pub session: SessionManifest,
     pub target: TargetManifest,
     pub bundle: BundleManifest,
@@ -752,6 +755,12 @@ pub fn export_checkpoint_with_git(
     spec: &CheckpointExportSpec,
     git: &dyn GitCommandRunner,
 ) -> Result<TargetCheckpoint> {
+    ensure!(
+        spec.protocol_version == CHECKPOINT_EXPORT_PROTOCOL_VERSION,
+        "unsupported checkpoint export protocol version {}; worker supports {}",
+        spec.protocol_version,
+        CHECKPOINT_EXPORT_PROTOCOL_VERSION
+    );
     let mut resolved = spec.clone();
     resolved.relay_root = resolve_target_path(&resolved.relay_root)?;
     resolved.harness_home = resolve_target_path(&resolved.harness_home)?;
@@ -2847,6 +2856,7 @@ mod tests {
         let output = worker_root.join("source.hel.zip");
         (
             CheckpointExportSpec {
+                protocol_version: CHECKPOINT_EXPORT_PROTOCOL_VERSION,
                 session: SessionManifest {
                     id: SESSION.into(),
                     title: "test".into(),
@@ -3451,14 +3461,40 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (spec, _) = fixture(temp.path());
         let mut value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            value["protocol_version"],
+            CHECKPOINT_EXPORT_PROTOCOL_VERSION
+        );
         assert!(value.get("relay_root").is_some());
         assert!(value.get("worker_root").is_none());
+
+        let mut unversioned = value.clone();
+        unversioned
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
+        assert!(serde_json::from_value::<CheckpointExportSpec>(unversioned).is_err());
 
         value
             .as_object_mut()
             .unwrap()
             .insert("worker_root".into(), json!("/legacy"));
         assert!(serde_json::from_value::<CheckpointExportSpec>(value).is_err());
+    }
+
+    #[test]
+    fn checkpoint_export_rejects_an_unsupported_protocol_before_interpreting_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        spec.protocol_version = CHECKPOINT_EXPORT_PROTOCOL_VERSION + 1;
+        spec.relay_root = PathBuf::from("relative/worker");
+
+        let error = export_checkpoint(&spec).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported checkpoint export protocol version 2; worker supports 1"
+        );
     }
 
     #[test]
