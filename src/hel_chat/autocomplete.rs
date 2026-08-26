@@ -115,6 +115,14 @@ impl ChatState {
             ("/effort ", "effort", &self.effort_values),
         ] {
             if let Some(query) = self.input.strip_prefix(prefix) {
+                // An advertised value is already a complete command. Leaving
+                // its popup open makes Enter accept the text without
+                // submitting it, and a concurrent session refresh can reopen
+                // the popup immediately after acceptance.
+                if values.iter().any(|choice| choice.value == query) {
+                    self.autocomplete = None;
+                    return;
+                }
                 let matches = matching_indices(values, query, |choice| {
                     (&choice.value, Some(choice.name.as_str()))
                 });
@@ -579,6 +587,46 @@ mod tests {
 
         assert!(chat.accept_autocomplete());
         assert_eq!(chat.input, "/model gpt-5.6-luna");
+        assert!(chat.autocomplete.is_none());
+    }
+
+    #[test]
+    fn exact_config_value_is_ready_to_submit_during_session_refreshes() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
+        };
+
+        let options = vec![
+            SessionConfigOption::select(
+                "effort",
+                "Effort",
+                "high",
+                SessionConfigSelectOptions::Ungrouped(vec![
+                    SessionConfigSelectOption::new("high", "Thinking High"),
+                    SessionConfigSelectOption::new("max", "Thinking Max"),
+                ]),
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ];
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&options);
+        chat.set_input("/effort ma".into());
+
+        assert!(chat.autocomplete.is_some());
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.input, "/effort max");
+        assert!(chat.autocomplete.is_none());
+
+        // A running session can publish another snapshot between key presses.
+        chat.set_config_options(&options);
+        assert!(chat.autocomplete.is_none());
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "effort".into(),
+                value: "max".into(),
+            }
+        );
     }
 
     #[test]
