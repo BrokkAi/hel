@@ -1740,7 +1740,21 @@ impl RelayReplayPlan {
         if let Some(span) = self.spans.iter().find(|span| {
             span.file_first_ordinal.checked_sub(1) == Some(ordinal) && ordinal >= span.after_ordinal
         }) {
-            return Ok(Some(span.file_first_previous_digest.clone()));
+            if let Some(digest) = &span.file_first_previous_digest {
+                return Ok(Some(digest.clone()));
+            }
+            let mut digest = None;
+            visit_relay_journal_file(&span.path, false, |event, _| {
+                let previous_ordinal = event
+                    .ordinal
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("relay event ordinal zero is invalid"))?;
+                validate_relay_event(previous_ordinal, &event.previous_digest, &event)
+                    .with_context(|| format!("validate relay journal {}", span.path.display()))?;
+                digest = Some(event.previous_digest);
+                Ok(ControlFlow::Break(()))
+            })?;
+            return Ok(digest);
         }
         if let Some((_, digest)) = self.hot_digests.iter().find(|(hot, _)| *hot == ordinal) {
             return Ok(Some(digest.clone()));
@@ -1753,11 +1767,24 @@ impl RelayReplayPlan {
             return Ok(None);
         };
         let mut digest = None;
+        let mut previous: Option<RelayEvent> = None;
         visit_relay_journal_file(&span.path, false, |event, _| {
+            if let Some(previous) = &previous {
+                validate_relay_event(previous.ordinal, &previous.digest, &event)
+                    .with_context(|| format!("validate relay journal {}", span.path.display()))?;
+            } else {
+                let previous_ordinal = event
+                    .ordinal
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("relay event ordinal zero is invalid"))?;
+                validate_relay_event(previous_ordinal, &event.previous_digest, &event)
+                    .with_context(|| format!("validate relay journal {}", span.path.display()))?;
+            }
             if event.ordinal == ordinal {
                 digest = Some(event.digest.clone());
                 return Ok(ControlFlow::Break(()));
             }
+            previous = Some(event);
             Ok(ControlFlow::Continue(()))
         })?;
         Ok(digest)
@@ -1805,6 +1832,8 @@ impl RelayReplayPlan {
                         event.ordinal
                     );
                 }
+                validate_relay_event(through_ordinal, &through_digest, &event)
+                    .context("validate relay journal page event")?;
                 if !events.is_empty() && used.saturating_add(encoded_len) > byte_budget {
                     page_full = true;
                     return Ok(ControlFlow::Break(()));
