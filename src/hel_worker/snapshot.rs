@@ -191,6 +191,18 @@ pub struct ActiveUserShell {
     pub started_at_ms: Option<i64>,
 }
 
+/// A terminal the ACP agent asked Hel to run on its behalf.
+///
+/// Unlike a transcript tool call, this is live operational state: it exists
+/// only while the child process is alive and lets clients show truthful
+/// activity when an agent fails to publish the matching ACP tool update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveAgentTerminal {
+    pub terminal_id: String,
+    pub command: String,
+    pub started_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserShellStatus {
@@ -329,6 +341,8 @@ pub struct RelayOperationalState {
     pub queued_prompts: Vec<QueuedRelayPrompt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_user_shells: Vec<ActiveUserShell>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_agent_terminals: Vec<ActiveAgentTerminal>,
     pub checkpoint_barrier: Option<String>,
     pub checkpoint_ready: Option<RelayCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -604,6 +618,7 @@ impl RelaySnapshot {
                 })
                 .collect(),
             active_user_shells: self.active_user_shells.values().cloned().collect(),
+            active_agent_terminals: Vec::new(),
             checkpoint_barrier: self.checkpoint_barrier.clone(),
             checkpoint_ready: self
                 .checkpoint_ready_through

@@ -781,6 +781,7 @@ mod unix {
                 relay.record_observation(RelayObservation::Warning { message })?;
             }
             RuntimeEvent::HarnessRestarting { message } => {
+                relay.clear_agent_terminals();
                 relay.record_observation(RelayObservation::Warning {
                     message: message.clone(),
                 })?;
@@ -795,6 +796,7 @@ mod unix {
                 exit_code,
                 signal,
             } => {
+                relay.agent_terminal_closed(&terminal_id);
                 // Cap here rather than letting `clamp_observation` fire: that
                 // keeps the head of a string, and a terminal's tail is what
                 // says how the command ended.
@@ -809,6 +811,17 @@ mod unix {
                     exit_code,
                     signal,
                 })?;
+            }
+            RuntimeEvent::TerminalStarted {
+                terminal_id,
+                command,
+                started_at_ms,
+            } => {
+                relay.agent_terminal_started(crate::hel_worker::ActiveAgentTerminal {
+                    terminal_id,
+                    command,
+                    started_at_ms,
+                });
             }
             RuntimeEvent::UserShellOutput {
                 request_id,
@@ -834,6 +847,7 @@ mod unix {
                 )?;
             }
             RuntimeEvent::Stopped => {
+                relay.clear_agent_terminals();
                 relay.record_observation(RelayObservation::ElicitationsCleared)?;
                 if relay.operational_state().execution
                     != crate::hel_worker::RelayExecutionState::Closed
@@ -3846,6 +3860,29 @@ mod relay_tests {
         ));
         let mut in_flight = BTreeMap::new();
 
+        let ordinal_before_start = relay.lock().unwrap().operational_state().latest_ordinal;
+        unix::record_runtime_event(
+            &relay,
+            &mut in_flight,
+            RuntimeEvent::TerminalStarted {
+                terminal_id: "term-1".into(),
+                command: "cargo test".into(),
+                started_at_ms: 1_000,
+            },
+        )
+        .unwrap();
+        let operational = relay.lock().unwrap().operational_state();
+        assert_eq!(operational.latest_ordinal, ordinal_before_start);
+        assert_eq!(
+            operational.active_agent_terminals,
+            [crate::hel_worker::ActiveAgentTerminal {
+                terminal_id: "term-1".into(),
+                command: "cargo test".into(),
+                started_at_ms: 1_000,
+            }],
+            "starting a terminal is visible but never journaled"
+        );
+
         // A build log the size of a real one: far past both the pipe buffer and
         // the journal cap, so only the tail can survive.
         let mut output = String::from("first line of the build log\n");
@@ -3867,6 +3904,16 @@ mod relay_tests {
             },
         )
         .unwrap();
+
+        assert!(
+            relay
+                .lock()
+                .unwrap()
+                .operational_state()
+                .active_agent_terminals
+                .is_empty(),
+            "the provisional activity disappears as soon as the child exits"
+        );
 
         let events = relay
             .lock()
@@ -3908,6 +3955,47 @@ mod relay_tests {
         assert!(
             serde_json::to_vec(event).unwrap().len() <= crate::hel_worker::RELAY_EVENT_BYTE_BUDGET,
             "the capped event fits a replay page without further clamping"
+        );
+    }
+
+    #[test]
+    fn a_fast_terminal_cannot_be_resurrected_by_a_late_start_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let mut in_flight = BTreeMap::new();
+
+        unix::record_runtime_event(
+            &relay,
+            &mut in_flight,
+            RuntimeEvent::TerminalClosed {
+                terminal_id: "term-1".into(),
+                output: String::new(),
+                truncated: false,
+                exit_code: Some(0),
+                signal: None,
+            },
+        )
+        .unwrap();
+        unix::record_runtime_event(
+            &relay,
+            &mut in_flight,
+            RuntimeEvent::TerminalStarted {
+                terminal_id: "term-1".into(),
+                command: "true".into(),
+                started_at_ms: 1_000,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            relay
+                .lock()
+                .unwrap()
+                .operational_state()
+                .active_agent_terminals
+                .is_empty()
         );
     }
 

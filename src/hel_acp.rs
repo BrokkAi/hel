@@ -181,6 +181,13 @@ pub enum RuntimeEvent {
     Warning {
         message: String,
     },
+    /// A client terminal started successfully. This is operational activity,
+    /// not a durable transcript item: a later ACP tool call may claim it.
+    TerminalStarted {
+        terminal_id: String,
+        command: String,
+        started_at_ms: i64,
+    },
     /// A client-run terminal was reaped. Exactly one of these is emitted per
     /// terminal, by the supervisor that waits on the child, so kill and
     /// release flow through the same report.
@@ -923,6 +930,7 @@ where
         .on_receive_request(
             async move |request: CreateTerminalRequest, responder, _cx| {
                 create_activity.mark();
+                let started_at_ms = crate::clock::epoch_millis();
                 let spawn = TerminalSpawn {
                     command: request.command.clone(),
                     args: request.args.clone(),
@@ -939,9 +947,20 @@ where
                         .and_then(|limit| usize::try_from(limit).ok())
                         .unwrap_or(DEFAULT_TERMINAL_OUTPUT_BYTES),
                 };
+                let command = spawn.display_command();
                 match create_terminals.create(spawn, create_events.clone()) {
-                    Ok(terminal_id) => responder
-                        .respond(CreateTerminalResponse::new(TerminalId::from(terminal_id))),
+                    Ok(terminal_id) => {
+                        create_events
+                            .send(RuntimeEvent::TerminalStarted {
+                                terminal_id: terminal_id.clone(),
+                                command,
+                                started_at_ms,
+                            })
+                            .await
+                            .map_err(|_| relay_event_channel_error())?;
+                        responder
+                            .respond(CreateTerminalResponse::new(TerminalId::from(terminal_id)))
+                    }
                     Err(error) => {
                         create_events
                             .send(RuntimeEvent::Warning {

@@ -882,6 +882,7 @@ impl ChatState {
     }
 
     fn viewport(&mut self, width: u16, height: usize) -> TranscriptViewport {
+        let fallback = self.active_terminal_fallback();
         prepare_render_cache(
             &self.entries,
             &mut self.render_cache,
@@ -889,7 +890,7 @@ impl ChatState {
             self.render_mode,
         );
         let top = TranscriptAnchor::Row { entry: 0, row: 0 };
-        if self.entries.is_empty() {
+        if self.entries.is_empty() && fallback.is_none() {
             return TranscriptViewport {
                 rows: vec![empty_transcript_row()],
                 anchor: TranscriptAnchor::Bottom,
@@ -912,6 +913,15 @@ impl ChatState {
                 skip = 0;
                 if rows.len() == height {
                     break;
+                }
+            }
+            if let Some(fallback) = fallback.as_ref() {
+                for line in render_transcript_entry(fallback, usize::from(width), self.render_mode)
+                {
+                    if rows.len() == height {
+                        break;
+                    }
+                    rows.push(line);
                 }
             }
             // Anchors inside the final screenful cannot fill the viewport; those
@@ -941,7 +951,21 @@ impl ChatState {
                 top,
             };
         }
+        if let Some(fallback) = self.active_terminal_fallback() {
+            let lines = render_transcript_entry(
+                &fallback,
+                usize::from(self.render_cache.width),
+                self.render_mode,
+            );
+            let start = lines.len().saturating_sub(height);
+            for line in lines[start..].iter().rev() {
+                rows.push_front(line.clone());
+            }
+        }
         for index in (0..self.entries.len()).rev() {
+            if rows.len() >= height {
+                break;
+            }
             let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
             let take = height.saturating_sub(rows.len());
             let start = lines.len().saturating_sub(take);
@@ -961,6 +985,42 @@ impl ChatState {
             anchor: TranscriptAnchor::Bottom,
             top,
         }
+    }
+
+    /// A live, non-durable tool card for ACP terminals whose agent omitted the
+    /// matching tool-call update. It disappears on exit and yields immediately
+    /// when a real transcript tool claims an active terminal.
+    fn active_terminal_fallback(&self) -> Option<ChatEntry> {
+        let mut unclaimed = self
+            .active_agent_terminals
+            .iter()
+            .filter(|terminal| {
+                self.claimed_agent_terminals
+                    .get(&terminal.terminal_id)
+                    .is_none_or(|claimed_at_ms| *claimed_at_ms < terminal.started_at_ms)
+            })
+            .collect::<Vec<_>>();
+        unclaimed.sort_by_key(|terminal| terminal.started_at_ms);
+        let oldest = unclaimed.first()?;
+        let elapsed = crate::usage_format::format_turn_clock(
+            crate::clock::epoch_seconds(),
+            u64::try_from(oldest.started_at_ms / 1_000).ok(),
+        );
+        let command = compact_terminal_command(&oldest.command);
+        let text = if unclaimed.len() == 1 {
+            format!("{command}\nRunning · {elapsed}")
+        } else {
+            format!(
+                "{} shell commands active\nOldest: {command}\nRunning · {elapsed}",
+                unclaimed.len()
+            )
+        };
+        Some(ChatEntry::tool(
+            self.latest_seq,
+            text,
+            None,
+            ToolStatus::Running,
+        ))
     }
 
     /// Rendered row count for one entry, filling the cache on demand.
@@ -1035,6 +1095,24 @@ impl ChatState {
         }
         self.anchor = TranscriptAnchor::Row { entry, row };
     }
+}
+
+const TERMINAL_COMMAND_PREVIEW_CHARACTERS: usize = 160;
+
+fn compact_terminal_command(command: &str) -> String {
+    let command = sanitize_terminal_text(command)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if command.chars().count() <= TERMINAL_COMMAND_PREVIEW_CHARACTERS {
+        return command;
+    }
+    let mut preview = command
+        .chars()
+        .take(TERMINAL_COMMAND_PREVIEW_CHARACTERS - 1)
+        .collect::<String>();
+    preview.push('…');
+    preview
 }
 
 pub(super) fn tool_status(status: &ToolCallStatus) -> ToolStatus {
@@ -1352,6 +1430,13 @@ pub(super) fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'st
             index,
         ));
     }
+    if let Some(fallback) = chat.active_terminal_fallback() {
+        lines.extend(render_transcript_entry(
+            &fallback,
+            usize::from(width),
+            chat.render_mode,
+        ));
+    }
     if lines.is_empty() {
         lines.push(empty_transcript_row());
     }
@@ -1595,6 +1680,102 @@ mod tests {
 
     fn completed_tool(seq: u64, title: &str) -> ChatEntry {
         ChatEntry::tool(seq, title, None, ToolStatus::Completed)
+    }
+
+    #[test]
+    fn live_unclaimed_terminal_renders_a_quiet_running_card() {
+        let started_at_ms = crate::clock::epoch_millis();
+        let terminal = crate::hel_worker::ActiveAgentTerminal {
+            terminal_id: "term-1".into(),
+            command: "cargo mutants --in-diff diff".into(),
+            started_at_ms,
+        };
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let session = MaterializedSession::empty("session-live-terminal");
+        chat.set_active_agent_terminals(std::slice::from_ref(&terminal), &session);
+
+        let rendered = transcript_text(&mut chat, 80);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("cargo mutants --in-diff diff")),
+            "the command identifies useful live work: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("Running ·")),
+            "the card says that the command is still running: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("No messages yet")),
+            "live work replaces the misleading empty state: {rendered:?}"
+        );
+
+        chat.set_active_agent_terminals(&[], &session);
+        let after_exit = transcript_text(&mut chat, 80);
+        assert!(
+            after_exit
+                .iter()
+                .any(|line| line.contains("No messages yet")),
+            "a successful exit removes the provisional card: {after_exit:?}"
+        );
+    }
+
+    #[test]
+    fn real_tool_claim_suppresses_only_the_matching_terminal_incarnation() {
+        let claimed_at_ms = crate::clock::epoch_millis();
+        let mut session = MaterializedSession::empty("session-terminal-claim");
+        session.applied_event_ordinal = 1;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![Arc::new(TranscriptItem {
+            stable_id: "tool:shell".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: claimed_at_ms,
+            last_changed_at_ms: claimed_at_ms,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "shell",
+                    "title": "Shell",
+                    "status": "in_progress",
+                    "content": [{"type": "terminal", "terminalId": "term-1"}]
+                }),
+                terminal_outputs: Vec::new(),
+                terminal_refs: vec!["term-1".into()],
+            },
+        })];
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        chat.set_active_agent_terminals(
+            &[crate::hel_worker::ActiveAgentTerminal {
+                terminal_id: "term-1".into(),
+                command: "hidden fallback command".into(),
+                started_at_ms: claimed_at_ms,
+            }],
+            &session,
+        );
+
+        let claimed = transcript_text(&mut chat, 80);
+        assert!(
+            !claimed
+                .iter()
+                .any(|line| line.contains("hidden fallback command")),
+            "the ACP tool card owns its live terminal: {claimed:?}"
+        );
+
+        chat.set_active_agent_terminals(
+            &[crate::hel_worker::ActiveAgentTerminal {
+                terminal_id: "term-1".into(),
+                command: "new bridge command".into(),
+                started_at_ms: claimed_at_ms + 1,
+            }],
+            &session,
+        );
+        let reused = transcript_text(&mut chat, 80);
+        assert!(
+            reused
+                .iter()
+                .any(|line| line.contains("new bridge command")),
+            "an old claim cannot hide a reused id after restart: {reused:?}"
+        );
     }
 
     fn thought(seq: u64, text: &str) -> ChatEntry {
