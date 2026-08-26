@@ -5078,6 +5078,52 @@ struct MjTeamPresetEntry {
     id: String,
     label: String,
     description: String,
+    primary: MjTeamRoleEntry,
+    review: MjTeamRoleEntry,
+    subagents: MjTeamRoleEntry,
+    discrete_review: bool,
+    review_tier: String,
+    auto_failover: bool,
+}
+
+impl MjTeamPresetEntry {
+    /// The panel-visible settings a Team selection decides, read from a
+    /// config the team has been applied to. The viewer previews these while
+    /// the selection is staged, so every field the save will overwrite has
+    /// to ship here.
+    fn from_team_config(
+        id: String,
+        label: String,
+        description: String,
+        config: &config::Config,
+    ) -> Self {
+        Self {
+            id,
+            label,
+            description,
+            primary: MjTeamRoleEntry {
+                model: config.agent.model.clone(),
+                source: config.agent.acp_source.clone(),
+            },
+            review: MjTeamRoleEntry {
+                model: config.review.model.clone(),
+                source: config.review.acp_source.clone(),
+            },
+            subagents: MjTeamRoleEntry {
+                model: config.subagents.model.clone(),
+                source: config.subagents.acp_source.clone(),
+            },
+            discrete_review: config.agent.discrete_review,
+            review_tier: config.agent.review_tier.as_str().to_string(),
+            auto_failover: config.subagents.auto_failover,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MjTeamRoleEntry {
+    model: String,
+    source: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5680,21 +5726,26 @@ fn mjconfig_snapshot_response(state: &ServerState, notice: Option<String>) -> Mj
     let team = match roster::external_adapter() {
         Some(external) => MjTeamPanel {
             selected: Some(external.id.clone()),
-            presets: vec![MjTeamPresetEntry {
-                id: external.id.clone(),
-                label: external.label.clone(),
-                description: "Provided by this platform; other teams are unavailable here."
-                    .to_string(),
-            }],
+            presets: vec![MjTeamPresetEntry::from_team_config(
+                external.id.clone(),
+                external.label.clone(),
+                "Provided by this platform; other teams are unavailable here.".to_string(),
+                config,
+            )],
         },
         None => MjTeamPanel {
             selected: config::TeamPreset::from_config(config).map(|preset| preset.id().to_string()),
             presets: config::TeamPreset::ALL
                 .into_iter()
-                .map(|preset| MjTeamPresetEntry {
-                    id: preset.id().to_string(),
-                    label: preset.label().to_string(),
-                    description: preset.description().to_string(),
+                .map(|preset| {
+                    let mut staged = config.clone();
+                    preset.apply(&mut staged);
+                    MjTeamPresetEntry::from_team_config(
+                        preset.id().to_string(),
+                        preset.label().to_string(),
+                        preset.description().to_string(),
+                        &staged,
+                    )
                 })
                 .collect(),
         },
@@ -5877,7 +5928,9 @@ fn mjconfig_apply_edits(
     config: &mut config::Config,
     request: MjConfigApplyRequest,
     inventory: &roster::AcpInventory,
-) -> std::result::Result<(), (StatusCode, String)> {
+    choices: &[roster::ModelChoice],
+    active_models: Option<&config::ModelsConfig>,
+) -> std::result::Result<Vec<String>, (StatusCode, String)> {
     let bad_request = |message: String| (StatusCode::UNPROCESSABLE_ENTITY, message);
     if let Some(team) = request.team {
         if let Some(external) = roster::external_adapter() {
@@ -5980,6 +6033,14 @@ fn mjconfig_apply_edits(
             config.set_acp_server_policy(&id, policy);
         }
     }
+    // A policy edit may invalidate an explicit model before provider-scoped
+    // defaults are applied. Resolve that fallback first so reasoning effort is
+    // synchronized from the provider the seat will actually use after save.
+    let reroute_notices = crate::settings::reset_unroutable_models(config, choices);
+    // Discovery reflects the configuration before this request. Rebuild the
+    // inventory selection from the staged policies/Team while retaining its
+    // probed models and session options.
+    let effective_inventory = roster::rediscover_inventory(config, inventory);
     for (defaults, seat) in [
         (
             request.primary_session_defaults,
@@ -5995,11 +6056,33 @@ fn mjconfig_apply_edits(
         ),
     ] {
         let Some(defaults) = defaults else { continue };
+        // The same resolver that bound the seat's option panel in the
+        // snapshot, on the staged config: the panel the user edited and the
+        // save that interprets the edit must agree on the seat's provider.
+        let selected_source = mj_core::settings::selected_seat_session_source(
+            config,
+            seat,
+            active_models,
+            choices,
+            &effective_inventory,
+        );
         for (server_id, options) in defaults {
             for (option_key, value) in options {
                 // Mirror the TUI's role panels: a thought-level
-                // option also updates the seat's reasoning-effort default.
-                if mjconfig_option_controls_reasoning_effort(inventory, &server_id, &option_key) {
+                // option from the final seat provider also updates the
+                // seat-wide reasoning-effort default. Defaults staged for a
+                // provider the user switched away from remain provider-scoped,
+                // while an indeterminate resolution (nothing probed yet) keeps
+                // the pre-gate behavior of syncing rather than dropping.
+                if selected_source
+                    .as_deref()
+                    .is_none_or(|source| source == server_id.as_str())
+                    && mjconfig_option_controls_reasoning_effort(
+                        &effective_inventory,
+                        &server_id,
+                        &option_key,
+                    )
+                {
                     match seat {
                         crate::settings::SessionDefaultsSeat::Primary => {
                             config.agent.reasoning_effort = Some(value.clone());
@@ -6030,7 +6113,7 @@ fn mjconfig_apply_edits(
             }
         }
     }
-    Ok(())
+    Ok(reroute_notices)
 }
 
 fn mjconfig_option_controls_reasoning_effort(
@@ -6062,18 +6145,27 @@ async fn mjconfig_apply(
         return Err((StatusCode::CONFLICT, warning));
     }
     // Scoped so the guard is provably dead before the refresh await below.
-    let (inventory, choices) = {
+    let (inventory, choices, active_models) = {
         let discovery = state
             .mjconfig
             .discovery
             .lock()
             .expect("mjconfig discovery lock");
-        (discovery.inventory.clone(), discovery.choices.clone())
+        (
+            discovery.inventory.clone(),
+            discovery.choices.clone(),
+            discovery.active_models.clone(),
+        )
     };
-    mjconfig_apply_edits(&mut config, request, &inventory)?;
     // Same guard as the TUI's save: a policy edit that strands a pinned seat
     // model flips that seat to auto, with a notice instead of a later failure.
-    let reroute_notices = crate::settings::reset_unroutable_models(&mut config, &choices);
+    let reroute_notices = mjconfig_apply_edits(
+        &mut config,
+        request,
+        &inventory,
+        &choices,
+        active_models.as_ref(),
+    )?;
     config::save_user_config_preserving_session_routes(&state.mjconfig.config_path, &mut config)
         .map_err(|error| internal_error(format!("save config: {error:#}")))?;
     let notice = if reroute_notices.is_empty() {
@@ -11177,6 +11269,34 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let snapshot = json_body(response).await;
 
+        let teams = snapshot["team"]["presets"]
+            .as_array()
+            .expect("team presets");
+        let codex_team = teams
+            .iter()
+            .find(|team| team["id"] == "codex")
+            .expect("Codex team");
+        for seat in ["primary", "review", "subagents"] {
+            assert_eq!(codex_team[seat]["model"], "auto", "{seat} model");
+            assert_eq!(codex_team[seat]["source"], "codex-acp", "{seat} source");
+        }
+        let featured_team = teams
+            .iter()
+            .find(|team| team["id"] == "claude_codex")
+            .expect("Claude coder and Codex reviewer team");
+        assert_eq!(featured_team["primary"]["model"], "auto");
+        assert_eq!(featured_team["primary"]["source"], "claude-acp");
+        for seat in ["review", "subagents"] {
+            assert_eq!(featured_team[seat]["model"], "gpt-5-6-luna");
+            assert_eq!(featured_team[seat]["source"], "codex-acp");
+        }
+        // A staged Team also decides these panel settings, so the snapshot
+        // ships them for the viewer's preview.
+        assert_eq!(codex_team["discrete_review"], true);
+        assert_eq!(codex_team["auto_failover"], true);
+        assert_eq!(codex_team["review_tier"], "quick");
+        assert_eq!(featured_team["review_tier"], "extended");
+
         for role in snapshot["agents"]["roles"]
             .as_array()
             .expect("role entries")
@@ -11220,7 +11340,8 @@ mod tests {
     async fn mjconfig_apply_syncs_custom_thought_level_with_reviewer_effort() {
         let runtime = test_mjconfig_runtime();
         let config_path = runtime.config_path.clone();
-        let config = roster::config_with_a_visible_builtin();
+        let mut config = roster::config_with_a_visible_builtin();
+        config::TeamPreset::Codex.apply(&mut config);
         config.save(&config_path).expect("seed config");
         let mut inventory = roster::discover_inventory(&config);
         let server = inventory.servers.first_mut().expect("visible ACP server");
@@ -11261,6 +11382,212 @@ mod tests {
             saved.review.session_defaults[&server_id]["config:thinking"],
             "high"
         );
+    }
+
+    #[tokio::test]
+    async fn mjconfig_apply_syncs_reasoning_effort_only_from_the_selected_provider() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+
+        let runtime = test_mjconfig_runtime();
+        let config_path = runtime.config_path.clone();
+        let mut config = roster::config_with_a_visible_builtin();
+        config.set_acp_server_policy("claude-acp", config::AcpServerPolicy::Enabled);
+        config::TeamPreset::Codex.apply(&mut config);
+        config.save(&config_path).expect("seed config");
+
+        let mut inventory = roster::discover_inventory(&config);
+        for (server_id, option) in [
+            (
+                "claude-acp",
+                SessionConfigOption::select(
+                    "thinking",
+                    "Thinking",
+                    "medium",
+                    vec![
+                        SessionConfigSelectOption::new("medium", "Medium"),
+                        SessionConfigSelectOption::new("high", "High"),
+                    ],
+                )
+                .category(SessionConfigOptionCategory::ThoughtLevel),
+            ),
+            (
+                "codex-acp",
+                SessionConfigOption::select(
+                    acp::REASONING_EFFORT_CONFIG_ID,
+                    "Reasoning effort",
+                    "medium",
+                    vec![
+                        SessionConfigSelectOption::new("medium", "Medium"),
+                        SessionConfigSelectOption::new("high", "High"),
+                    ],
+                ),
+            ),
+        ] {
+            inventory
+                .servers
+                .iter_mut()
+                .find(|server| server.id == server_id)
+                .expect("built-in ACP server")
+                .session_config = vec![option];
+        }
+        let choices = vec![
+            roster::ModelChoice {
+                model: "gpt-provider-model".to_string(),
+                pass_at_1: 0.5,
+                mean_cost_usd: 1.0,
+                available: true,
+                disabled_reason: None,
+                adapter: Some("codex-acp".to_string()),
+                ranked: true,
+            },
+            roster::ModelChoice {
+                model: "claude-provider-model".to_string(),
+                pass_at_1: 0.5,
+                mean_cost_usd: 1.0,
+                available: true,
+                disabled_reason: None,
+                adapter: Some("claude-acp".to_string()),
+                ranked: true,
+            },
+        ];
+        {
+            let mut discovery = runtime.discovery.lock().expect("discovery lock");
+            discovery.inventory = inventory;
+            discovery.choices = choices;
+        }
+
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(runtime, token);
+        let response = app
+            .oneshot(mjconfig_request(
+                "POST",
+                Some(token),
+                Some(serde_json::json!({
+                    "primary_model": "claude-provider-model",
+                    "primary_session_defaults": {
+                        "claude-acp": { "config:thinking": "medium" },
+                        "codex-acp": { "config:reasoning_effort": "high" }
+                    }
+                })),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let saved = config::Config::load(&config_path).expect("reload saved config");
+        assert_eq!(saved.agent.model, "claude-provider-model");
+        assert_eq!(saved.agent.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            saved.agent.session_defaults["claude-acp"]["config:thinking"],
+            "medium"
+        );
+        assert_eq!(
+            saved.agent.session_defaults["codex-acp"]["config:reasoning_effort"],
+            "high"
+        );
+    }
+
+    #[tokio::test]
+    async fn mjconfig_apply_syncs_reasoning_effort_from_the_active_session_provider() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+
+        let runtime = test_mjconfig_runtime();
+        let config_path = runtime.config_path.clone();
+        // Team-less auto seat: no source pin survives a load, so the seat's
+        // provider comes from the live session, not the priority fallback.
+        let mut config = roster::config_with_a_visible_builtin();
+        config.set_acp_server_policy("claude-acp", config::AcpServerPolicy::Enabled);
+        config.save(&config_path).expect("seed config");
+
+        let mut inventory = roster::discover_inventory(&config);
+        for server in &mut inventory.servers {
+            server.session_config = vec![
+                SessionConfigOption::select(
+                    "thinking",
+                    "Thinking",
+                    "medium",
+                    vec![
+                        SessionConfigSelectOption::new("medium", "Medium"),
+                        SessionConfigSelectOption::new("high", "High"),
+                    ],
+                )
+                .category(SessionConfigOptionCategory::ThoughtLevel),
+            ];
+        }
+        {
+            let mut discovery = runtime.discovery.lock().expect("discovery lock");
+            discovery.inventory = inventory;
+            // The default priority would resolve codex-acp; the live session
+            // the panel was rendered against runs on claude-acp.
+            discovery.active_models = Some(config::ModelsConfig {
+                primary: "auto".to_string(),
+                primary_source: Some("claude-acp".to_string()),
+                ..config::ModelsConfig::default()
+            });
+        }
+
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(runtime, token);
+        let response = app
+            .oneshot(mjconfig_request(
+                "POST",
+                Some(token),
+                Some(serde_json::json!({
+                    "primary_session_defaults": {
+                        "claude-acp": { "config:thinking": "medium" },
+                        "codex-acp": { "config:thinking": "high" }
+                    }
+                })),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let saved = config::Config::load(&config_path).expect("reload saved config");
+        assert_eq!(saved.agent.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            saved.agent.session_defaults["codex-acp"]["config:thinking"],
+            "high"
+        );
+    }
+
+    #[tokio::test]
+    async fn mjconfig_apply_syncs_literal_reasoning_effort_when_no_provider_resolves() {
+        let runtime = test_mjconfig_runtime();
+        let config_path = runtime.config_path.clone();
+        // Both builtins disabled keeps default-team adoption from pinning a
+        // source on load regardless of the host's credentials, so the fresh
+        // machine's genuinely indeterminate resolution is what this covers.
+        let mut config = config::Config::default();
+        config.set_acp_server_policy("codex-acp", config::AcpServerPolicy::Disabled);
+        config.set_acp_server_policy("claude-acp", config::AcpServerPolicy::Disabled);
+        config.save(&config_path).expect("seed config");
+
+        // Nothing probed and no live session: seat resolution is
+        // indeterminate, which must not withhold the seat-wide sync the
+        // literal reasoning-effort key always carried.
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(runtime, token);
+        let response = app
+            .oneshot(mjconfig_request(
+                "POST",
+                Some(token),
+                Some(serde_json::json!({
+                    "primary_session_defaults": {
+                        "codex-acp": { "config:reasoning_effort": "high" }
+                    }
+                })),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let saved = config::Config::load(&config_path).expect("reload saved config");
+        assert_eq!(saved.agent.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[tokio::test]
@@ -12206,6 +12533,12 @@ if (permissionsEl.children.length !== 0 || permissionCards.size !== 0) {
         assert!(viewer.contains("Discovering ACP session options"));
         assert!(viewer.contains("openMjConfig(\"agents\")"));
         assert!(viewer.contains("function renderMjTeam()"));
+        // Re-choosing the persisted team unstages the destructive re-apply.
+        assert!(viewer.contains("delete mjcfg.edits.team;"));
+        // A staged Team previews the panel settings its save will overwrite.
+        assert!(viewer.contains("mjStagedTeamPreset()?.discrete_review ?? panel.discrete_review"));
+        assert!(viewer.contains("mjStagedTeamPreset()?.review_tier ?? panel.review_tier"));
+        assert!(viewer.contains("mjStagedTeamPreset()?.auto_failover ?? panel.auto_failover"));
         assert!(viewer.contains("function renderMjInput()"));
         assert!(viewer.contains("function mjRolePermissionRow(role, field)"));
         assert!(viewer.contains("review_permission"));
@@ -12221,7 +12554,7 @@ if (permissionsEl.children.length !== 0 || permissionCards.size !== 0) {
     fn embedded_viewer_switches_staged_model_session_options_immediately() {
         let viewer = include_str!("remote_viewer.html");
         let start = viewer
-            .find("      function mjSeatOptionGroup")
+            .find("      function mjStagedTeamRole")
             .expect("provider option-group helper");
         let end = viewer[start..]
             .find("      // Session options for one seat's bound ACP source")
@@ -12235,6 +12568,23 @@ const claude = {{ server_id: "claude-acp", options: ["claude"] }};
 const mjcfg = {{
   edits: {{}},
   snapshot: {{
+    team: {{
+      selected: "codex",
+      presets: [
+        {{
+          id: "codex",
+          primary: {{ model: "gpt-provider-model", source: "codex-acp" }},
+          review: {{ model: "gpt-provider-model", source: "codex-acp" }},
+          subagents: {{ model: "gpt-provider-model", source: "codex-acp" }},
+        }},
+        {{
+          id: "claude",
+          primary: {{ model: "auto", source: "claude-acp" }},
+          review: {{ model: "auto", source: "claude-acp" }},
+          subagents: {{ model: "auto", source: "claude-acp" }},
+        }},
+      ],
+    }},
     session_options: {{
       primary: [codex, claude],
       review: [codex, claude],
@@ -12251,6 +12601,7 @@ const role = {{
   choices: [
     {{ model: "gpt-provider-model", source: "codex-acp" }},
     {{ model: "claude-provider-model", source: "claude-acp" }},
+    {{ model: "auto", source: "codex-acp" }},
     {{ model: "disabled", source: null }},
   ],
 }};
@@ -12263,6 +12614,22 @@ for (const [field, seat] of [
   if (mjSeatOptionGroup(role, field, seat, codex) !== codex) {{
     throw new Error(`${{seat}} did not retain its saved provider options`);
   }}
+  mjcfg.edits.team = "claude";
+  if (mjEffectiveRoleModel(role, field, seat) !== "auto") {{
+    throw new Error(`${{seat}} did not preview the staged Team model`);
+  }}
+  if (mjSeatOptionGroup(role, field, seat, codex) !== claude) {{
+    throw new Error(`${{seat}} did not preview the staged Team provider options`);
+  }}
+  mjcfg.edits[field] = "auto";
+  if (mjSeatOptionGroup(role, field, seat, codex) !== claude) {{
+    throw new Error(`${{seat}} dropped the staged Team's source pin for an explicit auto edit`);
+  }}
+  mjcfg.edits[field] = "gpt-provider-model";
+  if (mjSeatOptionGroup(role, field, seat, codex) !== codex) {{
+    throw new Error(`${{seat}} ignored a staged model edit under a staged Team`);
+  }}
+  mjcfg.edits = {{}};
   mjcfg.edits[field] = "claude-provider-model";
   if (mjSeatOptionGroup(role, field, seat, codex) !== claude) {{
     throw new Error(`${{seat}} did not switch to the staged model's provider options`);
