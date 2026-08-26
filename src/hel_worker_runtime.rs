@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::hel_config::HarnessKind;
+use crate::hel_config::{ExecutionPolicy, HarnessKind};
 
 pub use crate::hel_worker::WORKER_PID_FILE;
 
@@ -67,10 +67,10 @@ pub struct WorkerLaunchConfig {
     pub native_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_memory: Option<ProjectMemoryLaunchConfig>,
-    /// Isolated and remote targets deliberately run without harness approval
-    /// prompts. Raw localhost instead honors the user's harness configuration.
-    #[serde(default)]
-    pub force_unrestricted_mode: bool,
+    /// Target-level policy translated into harness-specific controls by the
+    /// worker. Raw localhost preserves configured approvals; isolated and
+    /// remote targets run unconstrained.
+    pub execution_policy: ExecutionPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,7 +273,7 @@ mod unix {
             project_memory: config.project_memory,
             resume_session,
             harness: config.harness,
-            force_unrestricted_mode: config.force_unrestricted_mode,
+            execution_policy: config.execution_policy,
             acp_activity: relay
                 .lock()
                 .expect("relay lock poisoned")
@@ -685,15 +685,6 @@ mod unix {
                         return Err(error);
                     }
                 }
-            }
-            RuntimeEvent::PermissionAutoApproved {
-                option_id,
-                option_name,
-            } => {
-                relay.record_observation(RelayObservation::PermissionAutoApproved {
-                    option_id,
-                    option_name,
-                })?;
             }
             RuntimeEvent::ElicitationRequested { request } => {
                 relay.record_observation(RelayObservation::ElicitationRequested { request })?;
@@ -2037,7 +2028,7 @@ mod relay_tests {
             additional_directories: Vec::new(),
             native_session_id: None,
             project_memory: None,
-            force_unrestricted_mode: true,
+            execution_policy: ExecutionPolicy::Unconstrained,
         }
     }
 
@@ -2668,18 +2659,21 @@ mod relay_tests {
         incomplete.as_object_mut().unwrap().remove("bridge_args");
         assert!(serde_json::from_value::<WorkerLaunchConfig>(incomplete).is_err());
 
+        let mut missing_policy = serde_json::to_value(&launch).unwrap();
+        missing_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_policy");
+        assert!(serde_json::from_value::<WorkerLaunchConfig>(missing_policy).is_err());
+
         let mut legacy = serde_json::to_value(&launch).unwrap();
-        for field in [
-            "additional_directories",
-            "native_session_id",
-            "force_unrestricted_mode",
-        ] {
+        for field in ["additional_directories", "native_session_id"] {
             legacy.as_object_mut().unwrap().remove(field);
         }
         let parsed = serde_json::from_value::<WorkerLaunchConfig>(legacy).unwrap();
         assert!(parsed.additional_directories.is_empty());
         assert!(parsed.native_session_id.is_none());
-        assert!(!parsed.force_unrestricted_mode);
+        assert_eq!(parsed.execution_policy, ExecutionPolicy::Unconstrained);
 
         let supervisor = AcpSupervisorSpec {
             command: "codex-acp".into(),
@@ -3738,7 +3732,7 @@ mod relay_tests {
     }
 
     #[test]
-    fn typed_acp_observations_and_permission_decisions_are_journaled() {
+    fn typed_acp_observations_are_journaled() {
         let temp = tempfile::tempdir().unwrap();
         let relay = Arc::new(Mutex::new(
             DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
@@ -3753,15 +3747,6 @@ mod relay_tests {
                 protocol_version: Some(ProtocolVersion::V1),
                 capabilities: Some(Box::new(AgentCapabilities::default())),
                 agent_info: Some(Implementation::new("test-agent", "1")),
-            },
-        )
-        .unwrap();
-        unix::record_runtime_event(
-            &relay,
-            &mut in_flight,
-            RuntimeEvent::PermissionAutoApproved {
-                option_id: "allow-always".into(),
-                option_name: "Allow always".into(),
             },
         )
         .unwrap();
@@ -3789,10 +3774,6 @@ mod relay_tests {
                 RelayObservation::AgentInitialized { .. }
             ))
         );
-        assert!(events.iter().any(|event| matches!(
-            event.observation,
-            RelayObservation::PermissionAutoApproved { .. }
-        )));
         assert!(
             events
                 .iter()

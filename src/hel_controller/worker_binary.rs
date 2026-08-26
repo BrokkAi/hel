@@ -16,7 +16,7 @@ use crate::hel_targets::{
 use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, WorkerLaunchConfig, WorkerOwnership};
 
 use super::backend::backend_locator;
-use super::provisioning::{force_unrestricted_mode, install_inherited_git_settings};
+use super::provisioning::{execution_policy, install_inherited_git_settings};
 use super::readiness::WORKER_EXIT_RECORD_MARKER;
 use super::{Controller, execute_checked, scp_command_spec, ssh_command_spec, target_profile_home};
 
@@ -88,17 +88,17 @@ impl Controller {
                 "DeepSeek Harness ACP does not support multiple workspace roots; use a single-repository bundle"
             );
         }
-        // The flag-enforced harnesses need the unrestricted decision on the
-        // bridge command line, so it is taken before the launch config.
-        let force_unrestricted = force_unrestricted_mode(backend);
+        // Some harnesses need the policy on their command line or in their
+        // environment, so resolve it before constructing the launch config.
+        let execution_policy = execution_policy(backend);
         let (bridge_command, bridge_args) = bridge_launch(
             profile.kind,
             profile.executable.as_deref(),
-            force_unrestricted,
+            execution_policy,
         );
         let mut environment = profile.environment.clone();
         environment.insert(profile.home_env().into(), target_profile_home.clone());
-        configure_unrestricted_environment(profile.kind, force_unrestricted, &mut environment);
+        configure_execution_environment(profile.kind, execution_policy, &mut environment);
         let project_memory =
             project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
         if profile.kind == crate::hel_config::HarnessKind::Claude {
@@ -117,7 +117,7 @@ impl Controller {
             additional_directories,
             native_session_id: session.native_session_id.clone(),
             project_memory: Some(project_memory.clone()),
-            force_unrestricted_mode: force_unrestricted,
+            execution_policy,
         };
 
         let staging = tempfile::tempdir().context("create worker staging directory")?;
@@ -658,13 +658,14 @@ const DEEPSEEK_HARNESS_FALLBACK_VERSION: &str = "0.1.1-rc.2";
 
 const DEEPSEEK_ACP_FALLBACK_VERSION: &str = "0.10.0";
 
-fn configure_unrestricted_environment(
+fn configure_execution_environment(
     harness: crate::hel_config::HarnessKind,
-    unrestricted: bool,
+    policy: crate::hel_config::ExecutionPolicy,
     environment: &mut std::collections::BTreeMap<String, String>,
 ) {
-    if unrestricted
-        && let Some((key, value)) = harness.unrestricted_enforcement().launch_environment()
+    if let Some((key, value)) = harness
+        .execution_enforcement(policy)
+        .and_then(crate::hel_config::ExecutionEnforcement::launch_environment)
     {
         environment.insert(key.to_owned(), value.to_owned());
     }
@@ -673,11 +674,11 @@ fn configure_unrestricted_environment(
 fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
     executable: Option<&Path>,
-    unrestricted: bool,
+    policy: crate::hel_config::ExecutionPolicy,
 ) -> (String, Vec<String>) {
     if let Some(executable) = executable {
         let args = harness
-            .bridge_override_args(unrestricted)
+            .bridge_override_args(policy)
             .into_iter()
             .map(str::to_owned)
             .collect();
@@ -707,7 +708,7 @@ fn bridge_launch(
         ),
         crate::hel_config::HarnessKind::Grok => {
             let acp = crate::hel_config::HarnessKind::Grok
-                .bridge_override_args(unrestricted)
+                .bridge_override_args(policy)
                 .join(" ");
             (
                 "sh".into(),
@@ -1622,6 +1623,7 @@ mod tests {
 
     use anyhow::Result;
 
+    use crate::hel_config::ExecutionPolicy;
     use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, SshTarget};
 
     use sha2::{Digest, Sha256};
@@ -2046,27 +2048,37 @@ mod tests {
     }
     #[test]
     fn default_bridges_pin_command_capable_adapter_versions() {
-        let (_, codex_arguments) = bridge_launch(crate::hel_config::HarnessKind::Codex, None, true);
+        let (_, codex_arguments) = bridge_launch(
+            crate::hel_config::HarnessKind::Codex,
+            None,
+            ExecutionPolicy::Unconstrained,
+        );
         assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.1.14"));
 
-        let (_, claude_arguments) =
-            bridge_launch(crate::hel_config::HarnessKind::Claude, None, true);
+        let (_, claude_arguments) = bridge_launch(
+            crate::hel_config::HarnessKind::Claude,
+            None,
+            ExecutionPolicy::Unconstrained,
+        );
         assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.68.0"));
 
-        let (_, deepseek_arguments) =
-            bridge_launch(crate::hel_config::HarnessKind::Deepseek, None, true);
+        let (_, deepseek_arguments) = bridge_launch(
+            crate::hel_config::HarnessKind::Deepseek,
+            None,
+            ExecutionPolicy::Unconstrained,
+        );
         assert!(deepseek_arguments[1].contains("@deepseek-ai/dsh@0.1.1-rc.2"));
         assert!(deepseek_arguments[1].contains("dsh-acp-server@0.10.0"));
         assert!(!deepseek_arguments[1].contains("npx -y -p @deepseek-ai/dsh"));
         assert!(deepseek_arguments[1].contains("exec dsh-acp-server"));
     }
     #[test]
-    fn unrestricted_codex_starts_the_bridge_in_full_access_mode() {
+    fn codex_execution_environment_follows_the_target_policy() {
         let mut podman_environment =
             BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
-        configure_unrestricted_environment(
+        configure_execution_environment(
             crate::hel_config::HarnessKind::Codex,
-            true,
+            ExecutionPolicy::Unconstrained,
             &mut podman_environment,
         );
         assert_eq!(
@@ -2078,16 +2090,17 @@ mod tests {
 
         let mut bare_environment =
             BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
-        configure_unrestricted_environment(
+        configure_execution_environment(
             crate::hel_config::HarnessKind::Codex,
-            false,
+            ExecutionPolicy::ConfiguredApprovals,
             &mut bare_environment,
         );
         assert_eq!(
             bare_environment
                 .get("INITIAL_AGENT_MODE")
                 .map(String::as_str),
-            Some("read-only")
+            Some("read-only"),
+            "raw localhost must preserve the profile's configured mode"
         );
     }
     #[test]
@@ -2122,7 +2135,11 @@ mod tests {
     }
     #[test]
     fn kimi_default_bridge_uses_bash_for_the_official_installer() {
-        let (command, arguments) = bridge_launch(crate::hel_config::HarnessKind::Kimi, None, true);
+        let (command, arguments) = bridge_launch(
+            crate::hel_config::HarnessKind::Kimi,
+            None,
+            ExecutionPolicy::Unconstrained,
+        );
         assert_eq!(command, "sh");
         assert_eq!(arguments[0], "-lc");
         assert!(arguments[1].contains("install.sh | bash &&"));
@@ -2130,7 +2147,11 @@ mod tests {
     }
     #[test]
     fn grok_default_bridge_uses_bash_for_the_official_installer() {
-        let (command, arguments) = bridge_launch(crate::hel_config::HarnessKind::Grok, None, false);
+        let (command, arguments) = bridge_launch(
+            crate::hel_config::HarnessKind::Grok,
+            None,
+            ExecutionPolicy::ConfiguredApprovals,
+        );
         assert_eq!(command, "sh");
         assert_eq!(arguments[0], "-lc");
         let script = &arguments[1];
@@ -2139,14 +2160,16 @@ mod tests {
         assert!(script.contains("[ -x \"$GROK_HOME/bin/grok\" ]"));
         assert!(script.contains("[ -x \"$HOME/.grok/bin/grok\" ]"));
         assert!(script.contains("exit 127"));
-        // Grok Build asks by default and Hel answers by cancelling, so the
-        // flag rides along even on a target that does not force unrestricted
-        // mode. Without it a bare session could not write anything.
-        assert!(script.contains("exec grok agent --always-approve stdio"));
+        assert!(script.contains("exec grok agent stdio"));
+        assert!(!script.contains("--always-approve"));
     }
     #[test]
     fn grok_default_bridge_adds_the_always_approve_flag_when_unrestricted() {
-        let (_, arguments) = bridge_launch(crate::hel_config::HarnessKind::Grok, None, true);
+        let (_, arguments) = bridge_launch(
+            crate::hel_config::HarnessKind::Grok,
+            None,
+            ExecutionPolicy::Unconstrained,
+        );
         let script = &arguments[1];
         assert!(script.contains("exec grok agent --always-approve stdio"));
         assert!(script.contains("exec \"$GROK_HOME/bin/grok\" agent --always-approve stdio"));
@@ -2155,23 +2178,27 @@ mod tests {
     #[test]
     fn bridge_executable_override_carries_the_acp_subcommand_per_harness() {
         let executable = std::path::PathBuf::from("/opt/harness");
-        for (kind, expected) in [
-            (crate::hel_config::HarnessKind::Codex, Vec::new()),
-            (crate::hel_config::HarnessKind::Claude, Vec::new()),
-            (crate::hel_config::HarnessKind::Kimi, vec!["acp"]),
-            (
-                crate::hel_config::HarnessKind::Grok,
-                vec!["agent", "--always-approve", "stdio"],
-            ),
-            (crate::hel_config::HarnessKind::Deepseek, Vec::new()),
+        for policy in [
+            ExecutionPolicy::ConfiguredApprovals,
+            ExecutionPolicy::Unconstrained,
         ] {
-            for unrestricted in [false, true] {
-                let (command, arguments) = bridge_launch(kind, Some(&executable), unrestricted);
+            for (kind, expected) in [
+                (crate::hel_config::HarnessKind::Codex, Vec::new()),
+                (crate::hel_config::HarnessKind::Claude, Vec::new()),
+                (crate::hel_config::HarnessKind::Kimi, vec!["acp"]),
+                (
+                    crate::hel_config::HarnessKind::Grok,
+                    if policy.is_unconstrained() {
+                        vec!["agent", "--always-approve", "stdio"]
+                    } else {
+                        vec!["agent", "stdio"]
+                    },
+                ),
+                (crate::hel_config::HarnessKind::Deepseek, Vec::new()),
+            ] {
+                let (command, arguments) = bridge_launch(kind, Some(&executable), policy);
                 assert_eq!(command, "/opt/harness");
-                assert_eq!(
-                    arguments, expected,
-                    "{kind:?} override arguments, unrestricted: {unrestricted}"
-                );
+                assert_eq!(arguments, expected, "{kind:?} policy: {policy:?}");
             }
         }
     }

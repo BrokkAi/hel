@@ -7,13 +7,18 @@ description: Set up a disposable container target for hel and start your first i
 
 Each session on a container target runs in its own disposable, labeled
 container: local Podman on Linux or WSL2, or Apple's `container` runtime on
-macOS 26 or newer on Apple silicon. On these isolated targets, hel runs the
-selected harness in its unrestricted mode (`agent-full-access`,
-`bypassPermissions`, `auto`, Grok Build's `--always-approve` launch flag, or
-DeepSeek Harness's `danger-full-access` permission mode),
-instead of the localhost approval flow. Every one of those approves every
-call. Note that Kimi Code's mode is named `auto` but is not a review policy
-that approves only low-risk calls.
+macOS 26 or newer on Apple silicon. Target isolation selects Hel's
+`unconstrained` execution policy, which Hel translates into the selected
+harness's own control: Codex `agent-full-access`, Claude Code
+`bypassPermissions`, Kimi Code `auto`, Grok Build's `--always-approve` launch
+flag, or DeepSeek Harness's `danger-full-access` permission mode. Every one of
+those approves every call. Note that Kimi Code's mode is named `auto` but is
+not a guardian policy that approves only low-risk calls.
+
+Raw localhost worktrees preserve the profile and harness's configured approval
+behavior instead. Codex, Claude Code, and Grok Build expose guardian modes
+through their harnesses; Kimi Code and DeepSeek Harness do not. Hel warns
+against running either unsupported harness on a raw, unsandboxed target.
 
 Closing a session first writes and verifies a recovery archive, then removes
 that exact container. Nothing about the container persists past the session

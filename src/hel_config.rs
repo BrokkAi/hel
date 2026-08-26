@@ -24,10 +24,27 @@ pub enum HarnessKind {
     Deepseek,
 }
 
-/// How Hel puts a harness into the unrestricted mode where actions run without
-/// per-action approval. Permission modes are not user-configurable.
+/// The target-level execution policy Hel applies independently of the selected
+/// harness. Raw localhost preserves the profile; other targets force full
+/// access because their isolation boundary contains the blast radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPolicy {
+    /// Preserve the harness and profile's configured approval behavior.
+    ConfiguredApprovals,
+    /// Run every action without sandboxing or approval checks.
+    Unconstrained,
+}
+
+impl ExecutionPolicy {
+    pub const fn is_unconstrained(self) -> bool {
+        matches!(self, Self::Unconstrained)
+    }
+}
+
+/// Harness-specific controls that realize a target-level execution policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnrestrictedEnforcement {
+pub enum ExecutionEnforcement {
     /// Selected over ACP once the session exists.
     AcpMode(&'static str),
     /// Selected at bridge launch and enforced again over ACP once the session
@@ -52,7 +69,7 @@ pub enum UnrestrictedEnforcement {
     },
 }
 
-impl UnrestrictedEnforcement {
+impl ExecutionEnforcement {
     /// Name reported to the UI for the mode this session runs in.
     pub const fn label(self) -> &'static str {
         match self {
@@ -144,70 +161,73 @@ impl HarnessKind {
         }
     }
 
-    /// How Hel forces this harness into its unrestricted mode.
-    pub const fn unrestricted_enforcement(self) -> UnrestrictedEnforcement {
-        match self {
-            Self::Codex => UnrestrictedEnforcement::AcpModeWithLaunchEnvironment {
-                mode: "agent-full-access",
-                key: "INITIAL_AGENT_MODE",
-                value: "agent-full-access",
-            },
-            Self::Claude => UnrestrictedEnforcement::AcpMode("bypassPermissions"),
-            Self::Kimi => UnrestrictedEnforcement::AcpMode("auto"),
-            Self::Grok => UnrestrictedEnforcement::LaunchFlag {
-                flag: "--always-approve",
-                label: "always-approve",
-            },
-            Self::Deepseek => UnrestrictedEnforcement::LaunchEnvironment {
-                key: "DSH_PERMISSION_MODE",
-                value: "danger-full-access",
-                label: "danger-full-access",
-            },
+    /// How this harness realizes a target-level execution policy. Configured
+    /// approvals require no override; the imported profile and harness retain
+    /// control on raw localhost.
+    pub const fn execution_enforcement(
+        self,
+        policy: ExecutionPolicy,
+    ) -> Option<ExecutionEnforcement> {
+        match (self, policy) {
+            (_, ExecutionPolicy::ConfiguredApprovals) => None,
+            (Self::Codex, ExecutionPolicy::Unconstrained) => {
+                Some(ExecutionEnforcement::AcpModeWithLaunchEnvironment {
+                    mode: "agent-full-access",
+                    key: "INITIAL_AGENT_MODE",
+                    value: "agent-full-access",
+                })
+            }
+            (Self::Claude, ExecutionPolicy::Unconstrained) => {
+                Some(ExecutionEnforcement::AcpMode("bypassPermissions"))
+            }
+            (Self::Kimi, ExecutionPolicy::Unconstrained) => {
+                Some(ExecutionEnforcement::AcpMode("auto"))
+            }
+            (Self::Grok, ExecutionPolicy::Unconstrained) => {
+                Some(ExecutionEnforcement::LaunchFlag {
+                    flag: "--always-approve",
+                    label: "always-approve",
+                })
+            }
+            (Self::Deepseek, ExecutionPolicy::Unconstrained) => {
+                Some(ExecutionEnforcement::LaunchEnvironment {
+                    key: "DSH_PERMISSION_MODE",
+                    value: "danger-full-access",
+                    label: "danger-full-access",
+                })
+            }
         }
     }
 
-    /// Whether this harness runs every action without asking, even on a bare
-    /// target where Hel does not force unrestricted mode.
-    ///
-    /// Kimi Code arrives there through its own default `auto` mode. Grok Build
-    /// arrives there because Hel always passes `--always-approve`: its default
-    /// is to ask, and Hel answers a permission request by cancelling, so a
-    /// session without the flag could not write anything at all. Codex and
-    /// Claude Code ask on a bare target, and Hel cancels, which is a usable
-    /// read-only session for them.
-    pub const fn auto_approves_on_bare_targets(self) -> bool {
-        match self {
-            Self::Kimi | Self::Grok => true,
-            Self::Codex | Self::Claude | Self::Deepseek => false,
-        }
+    pub const fn supports_guardian_approvals(self) -> bool {
+        matches!(self, Self::Codex | Self::Claude | Self::Grok)
     }
 
-    /// How this harness ends up approving everything, named for the person
-    /// reading a warning about it.
-    pub const fn bare_target_auto_approval(self) -> Option<&'static str> {
-        match self {
-            Self::Kimi => Some("its default auto mode"),
-            Self::Grok => Some("Hel's --always-approve launch flag"),
-            Self::Codex | Self::Claude | Self::Deepseek => None,
-        }
+    /// Shared warning for selecting a harness without guardian approvals on a
+    /// raw target. Containers and remote instances run unconstrained by design
+    /// and rely on target isolation instead.
+    pub fn unsandboxed_guardian_warning(self) -> Option<String> {
+        (!self.supports_guardian_approvals()).then(|| {
+            format!(
+                "DANGER: {} has no guardian approval mode. Do not run it on a raw, unsandboxed target.",
+                self.display_name()
+            )
+        })
     }
 
     /// The launch flag the bridge command line carries, if any.
     ///
-    /// A harness that auto-approves on bare targets carries its flag on every
-    /// target, because withholding it would not make that harness safer — it
-    /// would only make the session useless.
-    pub const fn launch_flag_for(self, unrestricted: bool) -> Option<&'static str> {
-        match self.unrestricted_enforcement().launch_flag() {
-            Some(flag) if unrestricted || self.auto_approves_on_bare_targets() => Some(flag),
-            _ => None,
+    pub const fn launch_flag_for(self, policy: ExecutionPolicy) -> Option<&'static str> {
+        match self.execution_enforcement(policy) {
+            Some(enforcement) => enforcement.launch_flag(),
+            None => None,
         }
     }
 
     /// Sub-command a `profile.executable` override needs to speak ACP. Codex
     /// and Claude override an adapter binary that already speaks it.
-    pub fn bridge_override_args(self, unrestricted: bool) -> Vec<&'static str> {
-        let flag = self.launch_flag_for(unrestricted);
+    pub fn bridge_override_args(self, policy: ExecutionPolicy) -> Vec<&'static str> {
+        let flag = self.launch_flag_for(policy);
         match self {
             Self::Codex | Self::Claude | Self::Deepseek => Vec::new(),
             Self::Kimi => vec!["acp"],
@@ -248,8 +268,8 @@ impl HarnessProfile {
         self.kind.home_env()
     }
 
-    pub fn unrestricted_enforcement(&self) -> UnrestrictedEnforcement {
-        self.kind.unrestricted_enforcement()
+    pub fn execution_enforcement(&self, policy: ExecutionPolicy) -> Option<ExecutionEnforcement> {
+        self.kind.execution_enforcement(policy)
     }
 
     fn validate(&self, id: &str) -> Result<()> {
@@ -1006,54 +1026,72 @@ mod tests {
         assert_eq!(HarnessKind::Kimi.home_env(), "KIMI_CODE_HOME");
         assert_eq!(HarnessKind::Grok.home_env(), "GROK_HOME");
         assert_eq!(
-            HarnessKind::Codex.unrestricted_enforcement(),
-            UnrestrictedEnforcement::AcpModeWithLaunchEnvironment {
+            HarnessKind::Codex.execution_enforcement(ExecutionPolicy::Unconstrained),
+            Some(ExecutionEnforcement::AcpModeWithLaunchEnvironment {
                 mode: "agent-full-access",
                 key: "INITIAL_AGENT_MODE",
                 value: "agent-full-access",
-            }
+            })
         );
         assert_eq!(
-            HarnessKind::Claude.unrestricted_enforcement(),
-            UnrestrictedEnforcement::AcpMode("bypassPermissions")
+            HarnessKind::Claude.execution_enforcement(ExecutionPolicy::Unconstrained),
+            Some(ExecutionEnforcement::AcpMode("bypassPermissions"))
         );
         assert_eq!(
-            HarnessKind::Kimi.unrestricted_enforcement(),
-            UnrestrictedEnforcement::AcpMode("auto")
+            HarnessKind::Kimi.execution_enforcement(ExecutionPolicy::Unconstrained),
+            Some(ExecutionEnforcement::AcpMode("auto"))
         );
         assert_eq!(
-            HarnessKind::Grok.unrestricted_enforcement(),
-            UnrestrictedEnforcement::LaunchFlag {
+            HarnessKind::Grok.execution_enforcement(ExecutionPolicy::Unconstrained),
+            Some(ExecutionEnforcement::LaunchFlag {
                 flag: "--always-approve",
                 label: "always-approve",
-            }
+            })
         );
     }
 
     #[test]
-    fn harness_unrestricted_enforcement_splits_acp_modes_from_launch_flags() {
+    fn unconstrained_enforcement_splits_acp_modes_from_launch_controls() {
         for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
-            let enforcement = kind.unrestricted_enforcement();
+            let enforcement = kind
+                .execution_enforcement(ExecutionPolicy::Unconstrained)
+                .unwrap();
             assert_eq!(enforcement.acp_mode(), Some(enforcement.label()));
             assert_eq!(enforcement.launch_flag(), None);
         }
         assert_eq!(
             HarnessKind::Codex
-                .unrestricted_enforcement()
+                .execution_enforcement(ExecutionPolicy::Unconstrained)
+                .unwrap()
                 .launch_environment(),
             Some(("INITIAL_AGENT_MODE", "agent-full-access"))
         );
-        let grok = HarnessKind::Grok.unrestricted_enforcement();
+        let grok = HarnessKind::Grok
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
         assert_eq!(grok.acp_mode(), None);
         assert_eq!(grok.launch_flag(), Some("--always-approve"));
         assert_eq!(grok.label(), "always-approve");
-        let deepseek = HarnessKind::Deepseek.unrestricted_enforcement();
+        let deepseek = HarnessKind::Deepseek
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
         assert_eq!(deepseek.acp_mode(), None);
         assert_eq!(deepseek.launch_flag(), None);
         assert_eq!(
             deepseek.launch_environment(),
             Some(("DSH_PERMISSION_MODE", "danger-full-access"))
         );
+    }
+
+    #[test]
+    fn configured_approvals_never_override_the_profile() {
+        for kind in HarnessKind::ALL {
+            assert_eq!(
+                kind.execution_enforcement(ExecutionPolicy::ConfiguredApprovals),
+                None,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -1077,80 +1115,62 @@ mod tests {
 
     #[test]
     fn bridge_override_args_carry_the_acp_subcommand_per_harness() {
-        for unrestricted in [false, true] {
-            assert!(
-                HarnessKind::Codex
-                    .bridge_override_args(unrestricted)
-                    .is_empty()
-            );
-            assert!(
-                HarnessKind::Claude
-                    .bridge_override_args(unrestricted)
-                    .is_empty()
-            );
-            assert_eq!(
-                HarnessKind::Kimi.bridge_override_args(unrestricted),
-                ["acp"]
-            );
+        for policy in [
+            ExecutionPolicy::ConfiguredApprovals,
+            ExecutionPolicy::Unconstrained,
+        ] {
+            assert!(HarnessKind::Codex.bridge_override_args(policy).is_empty());
+            assert!(HarnessKind::Claude.bridge_override_args(policy).is_empty());
+            assert_eq!(HarnessKind::Kimi.bridge_override_args(policy), ["acp"]);
             assert!(
                 HarnessKind::Deepseek
-                    .bridge_override_args(unrestricted)
+                    .bridge_override_args(policy)
                     .is_empty()
             );
-            // Grok Build asks by default and Hel answers by cancelling, so a
-            // session without the flag could not write at all. It carries the
-            // flag on every target, restricted ones included.
             assert_eq!(
-                HarnessKind::Grok.bridge_override_args(unrestricted),
-                ["agent", "--always-approve", "stdio"],
-                "unrestricted: {unrestricted}"
+                HarnessKind::Grok.bridge_override_args(policy),
+                if policy.is_unconstrained() {
+                    vec!["agent", "--always-approve", "stdio"]
+                } else {
+                    vec!["agent", "stdio"]
+                },
+                "policy: {policy:?}"
             );
         }
     }
 
     #[test]
-    fn only_a_blanket_approval_harness_carries_its_launch_flag_everywhere() {
-        for unrestricted in [false, true] {
-            assert_eq!(
-                HarnessKind::Grok.launch_flag_for(unrestricted),
-                Some("--always-approve")
-            );
-            // The ACP-mode harnesses have no launch flag to carry.
-            for kind in [
-                HarnessKind::Codex,
-                HarnessKind::Claude,
-                HarnessKind::Kimi,
-                HarnessKind::Deepseek,
+    fn only_unconstrained_grok_carries_the_blanket_approval_flag() {
+        assert_eq!(
+            HarnessKind::Grok.launch_flag_for(ExecutionPolicy::ConfiguredApprovals),
+            None
+        );
+        assert_eq!(
+            HarnessKind::Grok.launch_flag_for(ExecutionPolicy::Unconstrained),
+            Some("--always-approve")
+        );
+        for kind in [
+            HarnessKind::Codex,
+            HarnessKind::Claude,
+            HarnessKind::Kimi,
+            HarnessKind::Deepseek,
+        ] {
+            for policy in [
+                ExecutionPolicy::ConfiguredApprovals,
+                ExecutionPolicy::Unconstrained,
             ] {
-                assert_eq!(kind.launch_flag_for(unrestricted), None, "{kind:?}");
+                assert_eq!(kind.launch_flag_for(policy), None, "{kind:?}");
             }
         }
     }
 
     #[test]
-    fn bare_target_auto_approval_names_the_mechanism_per_harness() {
-        assert_eq!(
-            HarnessKind::Kimi.bare_target_auto_approval(),
-            Some("its default auto mode")
-        );
-        assert_eq!(
-            HarnessKind::Grok.bare_target_auto_approval(),
-            Some("Hel's --always-approve launch flag")
-        );
-        for kind in [
-            HarnessKind::Codex,
-            HarnessKind::Claude,
-            HarnessKind::Deepseek,
-        ] {
-            assert_eq!(kind.bare_target_auto_approval(), None, "{kind:?}");
+    fn guardian_support_is_declared_per_harness() {
+        for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Grok] {
+            assert!(kind.supports_guardian_approvals(), "{kind:?}");
         }
-        // The warning and the flag decision read the same fact.
-        for kind in HarnessKind::ALL {
-            assert_eq!(
-                kind.auto_approves_on_bare_targets(),
-                kind.bare_target_auto_approval().is_some(),
-                "{kind:?}"
-            );
+        for kind in [HarnessKind::Kimi, HarnessKind::Deepseek] {
+            assert!(!kind.supports_guardian_approvals(), "{kind:?}");
         }
     }
 

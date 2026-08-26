@@ -877,8 +877,8 @@ impl DashboardState {
                 .map(ProfileQuota::compact)
                 .unwrap_or_else(|| "refreshing".to_string())
         };
-        let danger = match harness.bare_target_auto_approval() {
-            Some(mechanism) => format!("  ⚠ DANGER: {mechanism} approves every command"),
+        let danger = match harness.unsandboxed_guardian_warning() {
+            Some(warning) => format!("  ⚠ {warning}"),
             None => String::new(),
         };
         format!("{id}  {}  ·  {quota}{danger}", harness.display_name())

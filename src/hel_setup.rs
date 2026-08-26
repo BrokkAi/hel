@@ -666,10 +666,8 @@ fn write_discovered_homes(output: &mut impl Write, homes: &[DiscoveredHome]) -> 
             "  {}: {} ({authentication}){}",
             home.kind.display_name(),
             home.path.display(),
-            match home.kind.bare_target_auto_approval() {
-                Some(mechanism) => format!(
-                    " — DANGER: {mechanism} approves every command, including on raw localhost"
-                ),
+            match home.kind.unsandboxed_guardian_warning() {
+                Some(warning) => format!(" — {warning}"),
                 None => String::new(),
             }
         )?;
@@ -1934,12 +1932,12 @@ Host builder
         );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("DANGER"));
-        assert!(output.contains("its default auto mode approves every command"));
+        assert!(output.contains("has no guardian approval mode"));
         assert!(output.contains("raw localhost will still be configured"));
     }
 
     #[test]
-    fn discovered_homes_warn_for_every_harness_that_approves_everything() {
+    fn discovered_homes_warn_for_harnesses_without_guardian_approvals() {
         let warning = |kind: HarnessKind| {
             let mut output = Vec::new();
             write_discovered_homes(
@@ -1954,24 +1952,17 @@ Host builder
             String::from_utf8(output).unwrap()
         };
 
-        // Both harnesses approve everything; the warning names how each does.
-        let grok = warning(HarnessKind::Grok);
-        assert!(grok.contains("Grok Build"), "{grok}");
-        assert!(
-            grok.contains("DANGER: Hel's --always-approve launch flag approves every command"),
-            "{grok}"
-        );
-        let kimi = warning(HarnessKind::Kimi);
-        assert!(
-            kimi.contains("DANGER: its default auto mode approves every command"),
-            "{kimi}"
-        );
+        for kind in [HarnessKind::Kimi, HarnessKind::Deepseek] {
+            let output = warning(kind);
+            assert!(output.contains("DANGER"), "{kind:?}: {output}");
+            assert!(
+                output.contains("has no guardian approval mode"),
+                "{kind:?}: {output}"
+            );
+            assert!(output.contains("raw, unsandboxed target"), "{output}");
+        }
 
-        for kind in [
-            HarnessKind::Codex,
-            HarnessKind::Claude,
-            HarnessKind::Deepseek,
-        ] {
+        for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Grok] {
             assert!(!warning(kind).contains("DANGER"), "{kind:?}");
         }
     }

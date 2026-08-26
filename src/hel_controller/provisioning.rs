@@ -1442,8 +1442,14 @@ fn inherits_controller_git_settings(locator: &hel_targets::TargetLocator) -> boo
     )
 }
 
-pub(super) fn force_unrestricted_mode(locator: &hel_targets::TargetLocator) -> bool {
-    !matches!(locator, hel_targets::TargetLocator::LocalBare { .. })
+pub(super) fn execution_policy(
+    locator: &hel_targets::TargetLocator,
+) -> crate::hel_config::ExecutionPolicy {
+    if matches!(locator, hel_targets::TargetLocator::LocalBare { .. }) {
+        crate::hel_config::ExecutionPolicy::ConfiguredApprovals
+    } else {
+        crate::hel_config::ExecutionPolicy::Unconstrained
+    }
 }
 
 fn inherited_git_setting_commands(
@@ -1935,8 +1941,17 @@ mod tests {
         };
         assert!(!inherits_controller_git_settings(&persistent));
         assert!(!inherits_controller_git_settings(&local));
-        assert!(!force_unrestricted_mode(&local));
-        assert!(force_unrestricted_mode(&ephemeral[0]));
+        assert_eq!(
+            execution_policy(&local),
+            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
+        );
+        for locator in ephemeral.iter().chain(std::iter::once(&persistent)) {
+            assert_eq!(
+                execution_policy(locator),
+                crate::hel_config::ExecutionPolicy::Unconstrained,
+                "isolated and remote targets run unconstrained: {locator:?}"
+            );
+        }
         assert!(
             inherited_git_setting_commands(
                 &persistent,

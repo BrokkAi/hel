@@ -824,22 +824,17 @@ fn render_review_wizard(
             }
         )));
     }
-    // Not a permission mode Hel picked, but the state the session runs in:
-    // every command is approved, and on raw localhost that is this machine.
+    // Raw targets rely on the harness guardian rather than target isolation.
     if matches!(target, TargetTemplate::LocalBare)
         && let Some(kind) = dashboard
             .config
             .profiles
             .get(profile_id)
             .map(|profile| profile.kind)
-        && let Some(mechanism) = kind.bare_target_auto_approval()
+        && let Some(warning) = kind.unsandboxed_guardian_warning()
     {
         lines.push(Line::styled(
-            format!(
-                "⚠ DANGER: {} approves every command through {mechanism}. On raw localhost it can \
-                 change this machine without asking.",
-                kind.display_name()
-            ),
+            format!("⚠ {warning}"),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
@@ -3185,10 +3180,10 @@ mod tests {
         );
     }
 
-    /// The review pane names the harness and the mechanism that approves
-    /// everything, so the two ways of arriving there are both visible.
+    /// The review pane warns when a raw target cannot rely on a harness
+    /// guardian for risky actions.
     #[test]
-    fn raw_localhost_names_the_blanket_approval_mechanism_per_harness() {
+    fn raw_localhost_warns_for_harnesses_without_guardian_approvals() {
         let review_text = |kind: HarnessKind| {
             let mut config = config();
             config.profiles = BTreeMap::from([(
@@ -3219,17 +3214,16 @@ mod tests {
                 .collect::<String>()
         };
 
-        let grok = review_text(HarnessKind::Grok);
-        assert!(grok.contains("DANGER"), "{grok}");
-        assert!(grok.contains("Grok Build"), "{grok}");
-        assert!(grok.contains("--always-approve launch flag"), "{grok}");
+        for kind in [HarnessKind::Kimi, HarnessKind::Deepseek] {
+            let warning = review_text(kind);
+            assert!(warning.contains("DANGER"), "{kind:?}: {warning}");
+            assert!(
+                warning.contains("has no guardian approval mode"),
+                "{kind:?}: {warning}"
+            );
+        }
 
-        let kimi = review_text(HarnessKind::Kimi);
-        assert!(kimi.contains("DANGER"), "{kimi}");
-        assert!(kimi.contains("default auto mode"), "{kimi}");
-
-        // Codex and Claude Code ask on a bare target, so there is no warning.
-        for kind in [HarnessKind::Codex, HarnessKind::Claude] {
+        for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Grok] {
             let quiet = review_text(kind);
             assert!(!quiet.contains("DANGER"), "{kind:?}: {quiet}");
         }

@@ -2933,7 +2933,7 @@ mod tests {
                     .join("projects/replica/.hel-memory-baseline"),
                 repository_roots: Default::default(),
             }),
-            force_unrestricted_mode: true,
+            execution_policy: crate::hel_config::ExecutionPolicy::Unconstrained,
         }
         .write(&spec.relay_root.join("launch.json"))
         .unwrap();

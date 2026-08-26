@@ -32,7 +32,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::hel_config::{HarnessKind, UnrestrictedEnforcement};
+use crate::hel_config::{ExecutionEnforcement, ExecutionPolicy, HarnessKind};
 use crate::hel_elicitation::{
     ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationRequest,
     ElicitationResponse, ElicitationValue,
@@ -53,7 +53,7 @@ pub struct LaunchSpec {
     pub project_memory: Option<ProjectMemoryLaunchConfig>,
     pub resume_session: Option<String>,
     pub harness: HarnessKind,
-    pub force_unrestricted_mode: bool,
+    pub execution_policy: ExecutionPolicy,
     pub acp_activity: AcpActivityClock,
 }
 
@@ -150,7 +150,7 @@ pub enum RuntimeEvent {
         native_session_id: String,
         resumed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        unrestricted_mode: Option<String>,
+        execution_mode: Option<String>,
     },
     SessionConfigured {
         config_options: Vec<SessionConfigOption>,
@@ -160,10 +160,6 @@ pub enum RuntimeEvent {
     },
     SessionUpdate {
         update: serde_json::Value,
-    },
-    PermissionAutoApproved {
-        option_id: String,
-        option_name: String,
     },
     ElicitationRequested {
         request: ElicitationRequest,
@@ -451,7 +447,7 @@ async fn run_bridge(
 }
 
 const ACP_STDERR_TAIL_BYTES: usize = 16 * 1024;
-const UNEXPECTED_PERMISSION_REQUEST_WARNING: &str = "The agent made a permission request, which means its permission policy is misconfigured. Hel is designed to run in either auto-review or YOLO mode.";
+const UNEXPECTED_PERMISSION_REQUEST_WARNING: &str = "The agent made a permission request while configured to run unconstrained; its execution policy is misconfigured.";
 /// Chatter the Claude bridge logs for SDK events it does not model, for example
 /// `Unexpected case: {"type":"vcs_state_changed"}`. It arrives often enough to
 /// fill the whole stderr tail and bury the real failure in worker exit records.
@@ -782,7 +778,7 @@ where
     let ext_review_ids = Arc::new(AtomicU64::new(1));
     let session_elicitations = pending_elicitations.clone();
     let next_elicitation_id = Arc::new(AtomicU64::new(1));
-    let auto_approve_permissions = spec.force_unrestricted_mode;
+    let permission_policy = spec.execution_policy;
     let scratch_outputs = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
     let notification_scratch_outputs = scratch_outputs.clone();
     let terminals = TerminalRegistry::new();
@@ -895,43 +891,20 @@ where
                     });
                     return Ok(());
                 }
-                permission_events
-                    .send(RuntimeEvent::Warning {
-                        message: UNEXPECTED_PERMISSION_REQUEST_WARNING.to_owned(),
-                    })
-                    .await
-                    .map_err(|_| relay_event_channel_error())?;
-                if !auto_approve_permissions {
-                    return responder.respond(RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Cancelled,
-                    ));
+                if permission_policy.is_unconstrained() {
+                    permission_events
+                        .send(RuntimeEvent::Warning {
+                            message: UNEXPECTED_PERMISSION_REQUEST_WARNING.to_owned(),
+                        })
+                        .await
+                        .map_err(|_| relay_event_channel_error())?;
                 }
-                let selected = request
-                    .options
-                    .iter()
-                    .find(|option| option.kind == PermissionOptionKind::AllowAlways)
-                    .or_else(|| {
-                        request
-                            .options
-                            .iter()
-                            .find(|option| option.kind == PermissionOptionKind::AllowOnce)
-                    });
-                let Some(selected) = selected else {
-                    return responder.respond(RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Cancelled,
-                    ));
-                };
-                permission_events
-                    .send(RuntimeEvent::PermissionAutoApproved {
-                        option_id: selected.option_id.to_string(),
-                        option_name: selected.name.clone(),
-                    })
-                    .await
-                    .map_err(|_| relay_event_channel_error())?;
+                // Permission escalations are denied safely because Hel has no
+                // per-action human approval surface. An unconstrained harness
+                // must never ask; denying instead of auto-approving makes a
+                // broken mode selection visible rather than masking it.
                 responder.respond(RequestPermissionResponse::new(
-                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                        selected.option_id.clone(),
-                    )),
+                    RequestPermissionOutcome::Cancelled,
                 ))
             },
             agent_client_protocol::on_receive_request!(),
@@ -1687,24 +1660,21 @@ async fn serve_session(
         started_at: tokio::time::Instant::now(),
     });
 
-    // A launch-flag harness was already put in its unrestricted mode when the
-    // bridge process started; there is nothing to select over ACP, but the
-    // session still reports which mode it runs in.
-    let enforcement = spec
-        .force_unrestricted_mode
-        .then(|| spec.harness.unrestricted_enforcement());
-    if let Some(desired_mode) = enforcement.and_then(UnrestrictedEnforcement::acp_mode) {
-        enforce_unrestricted_mode(
+    // Launch flags and environment are applied before the bridge starts. ACP
+    // modes are selected after the session exists, before any prompt can run.
+    let enforcement = spec.harness.execution_enforcement(spec.execution_policy);
+    let mut config_options = config_options.unwrap_or_default();
+    let mut modes = modes;
+    if let Some(desired_mode) = enforcement.and_then(ExecutionEnforcement::acp_mode) {
+        enforce_execution_mode(
             connection,
             &session_id,
             desired_mode,
-            config_options.as_deref().unwrap_or_default(),
-            modes.as_ref(),
+            &mut config_options,
+            &mut modes,
         )
         .await?;
     }
-    let mut config_options = config_options.unwrap_or_default();
-    let mut modes = modes;
     // Grok Build never returns `configOptions`; present its catalogue in the
     // shape the rest of Hel reads so `/model` and `/effort` work unchanged.
     if let Some(state) = &grok_models
@@ -1717,16 +1687,7 @@ async fn serve_session(
         RuntimeEvent::SessionStarted {
             native_session_id: session_id.to_string(),
             resumed,
-            // A launch flag Hel passes on every target is genuinely on even
-            // when the target did not force unrestricted mode, so the session
-            // reports the mode it really runs in rather than nothing.
-            unrestricted_mode: enforcement
-                .or_else(|| {
-                    spec.harness
-                        .launch_flag_for(spec.force_unrestricted_mode)
-                        .map(|_| spec.harness.unrestricted_enforcement())
-                })
-                .map(|enforcement| enforcement.label().to_owned()),
+            execution_mode: enforcement.map(|enforcement| enforcement.label().to_owned()),
         },
     )
     .await?;
@@ -2350,27 +2311,20 @@ async fn compact_in_scratch_session(
         .await
         .context("create scratch ACP session")?;
     let session_id = created.session_id;
-    if let Some(desired_mode) = spec
-        .force_unrestricted_mode
-        .then(|| spec.harness.unrestricted_enforcement())
-        .and_then(UnrestrictedEnforcement::acp_mode)
-    {
-        enforce_unrestricted_mode(
+    let enforcement = spec.harness.execution_enforcement(spec.execution_policy);
+    let mut config_options = created.config_options.unwrap_or_default();
+    let mut modes = created.modes;
+    if let Some(desired_mode) = enforcement.and_then(ExecutionEnforcement::acp_mode) {
+        enforce_execution_mode(
             connection,
             &session_id,
             desired_mode,
-            created.config_options.as_deref().unwrap_or_default(),
-            created.modes.as_ref(),
+            &mut config_options,
+            &mut modes,
         )
         .await?;
     }
-    configure_production_compactor(
-        connection,
-        &session_id,
-        spec.harness,
-        created.config_options.unwrap_or_default(),
-    )
-    .await?;
+    configure_production_compactor(connection, &session_id, spec.harness, config_options).await?;
     scratch_outputs
         .lock()
         .expect("scratch output lock poisoned")
@@ -2466,18 +2420,18 @@ async fn configure_production_compactor(
     Ok(())
 }
 
-async fn enforce_unrestricted_mode(
+async fn enforce_execution_mode(
     connection: &ConnectionTo<Agent>,
     session_id: &SessionId,
     desired: &str,
-    config_options: &[SessionConfigOption],
-    legacy_modes: Option<&agent_client_protocol::schema::v1::SessionModeState>,
+    config_options: &mut Vec<SessionConfigOption>,
+    legacy_modes: &mut Option<agent_client_protocol::schema::v1::SessionModeState>,
 ) -> Result<()> {
     if let Some(option) = config_options.iter().find(|option| {
         option.category == Some(SessionConfigOptionCategory::Mode)
             && select_contains(&option.kind, desired)
     }) {
-        connection
+        let response = connection
             .send_request(SetSessionConfigOptionRequest::new(
                 session_id.clone(),
                 option.id.clone(),
@@ -2485,10 +2439,14 @@ async fn enforce_unrestricted_mode(
             ))
             .block_task()
             .await
-            .with_context(|| format!("select unrestricted ACP mode {desired}"))?;
+            .with_context(|| format!("select required ACP execution mode {desired}"))?;
+        *config_options = response.config_options;
+        if let Some(modes) = legacy_modes.as_mut() {
+            modes.current_mode_id = desired.to_owned().into();
+        }
         return Ok(());
     }
-    if legacy_modes.is_some_and(|modes| {
+    if legacy_modes.as_ref().is_some_and(|modes| {
         modes
             .available_modes
             .iter()
@@ -2501,10 +2459,13 @@ async fn enforce_unrestricted_mode(
             ))
             .block_task()
             .await
-            .with_context(|| format!("select unrestricted ACP mode {desired}"))?;
+            .with_context(|| format!("select required ACP execution mode {desired}"))?;
+        if let Some(modes) = legacy_modes.as_mut() {
+            modes.current_mode_id = desired.to_owned().into();
+        }
         return Ok(());
     }
-    bail!("ACP bridge does not expose required unrestricted mode {desired}")
+    bail!("ACP bridge does not expose required execution mode {desired}")
 }
 
 pub(crate) fn select_contains(kind: &SessionConfigKind, desired: &str) -> bool {
@@ -2555,7 +2516,7 @@ mod tests {
             }),
             resume_session: None,
             harness: HarnessKind::Codex,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let servers = project_memory_mcp(&spec);
@@ -2669,8 +2630,7 @@ mod tests {
     #[test]
     fn permission_request_warning_explains_required_permission_modes() {
         assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("misconfigured"));
-        assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("auto-review"));
-        assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("YOLO"));
+        assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("unconstrained"));
     }
 
     #[tokio::test]
@@ -2888,7 +2848,7 @@ mod tests {
 
     async fn answer_to_ext_request(
         method: &'static str,
-        force_unrestricted_mode: bool,
+        execution_policy: ExecutionPolicy,
     ) -> serde_json::Value {
         let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
         let (answered_tx, answered_rx) = tokio::sync::oneshot::channel();
@@ -2909,7 +2869,7 @@ mod tests {
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Grok,
-            force_unrestricted_mode,
+            execution_policy,
             acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
@@ -3057,7 +3017,7 @@ mod tests {
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Claude,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
@@ -3391,7 +3351,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_client_request_is_answered_with_an_error_rather_than_silence() {
-        let answer = answer_to_ext_request("_someone.example/unknown", true).await;
+        let answer =
+            answer_to_ext_request("_someone.example/unknown", ExecutionPolicy::Unconstrained).await;
         assert!(
             answer.get("result").is_none(),
             "an unimplemented request must not be answered with a result: {answer}"
@@ -3494,7 +3455,7 @@ mod tests {
             project_memory: None,
             resume_session: None,
             harness,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
@@ -3550,15 +3511,19 @@ mod tests {
                 "currentValue": current,
                 "options": [
                     {"value": "default", "name": "Default"},
-                    {"value": "plan", "name": "Plan"}
+                    {"value": "plan", "name": "Plan"},
+                    {"value": "agent", "name": "Agent"},
+                    {"value": "agent-full-access", "name": "Full access"}
                 ]
             })
         };
         let modes = serde_json::json!({
             "currentModeId": "default",
-            "availableModes": [
-                {"id": "default", "name": "Default"},
-                {"id": "plan", "name": "Plan"}
+                "availableModes": [
+                    {"id": "default", "name": "Default"},
+                    {"id": "plan", "name": "Plan"},
+                    {"id": "agent", "name": "Agent"},
+                    {"id": "agent-full-access", "name": "Full access"}
             ]
         });
         let (read, mut write) = tokio::io::split(stream);
@@ -3588,9 +3553,10 @@ mod tests {
                     if let Some(observed) = observed.take() {
                         let _ = observed.send(message.clone());
                     }
+                    let selected = message["params"]["value"].as_str().unwrap_or("default");
                     serde_json::json!({
                         "jsonrpc": "2.0", "id": id,
-                        "result": {"configOptions": [mode_option("plan")]}
+                        "result": {"configOptions": [mode_option(selected)]}
                     })
                 }
                 _ => {
@@ -3628,7 +3594,7 @@ mod tests {
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Claude,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
@@ -3672,6 +3638,79 @@ mod tests {
         let request = mode_change_request(ModeSurface::Both).await;
 
         assert_eq!(request["method"], "session/set_mode");
+    }
+
+    #[tokio::test]
+    async fn unconstrained_policy_is_enforced_before_the_session_is_reported() {
+        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let bridge = tokio::spawn(mode_change_bridge(
+            bridge_stream,
+            ModeSurface::Both,
+            observed_tx,
+        ));
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let spec = LaunchSpec {
+            command: "scripted".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            project_memory: None,
+            resume_session: None,
+            harness: HarnessKind::Codex,
+            execution_policy: ExecutionPolicy::Unconstrained,
+            acp_activity: AcpActivityClock::default(),
+        };
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx)
+            .await
+            .expect("Hel must enforce the target execution policy")
+            .expect("the bridge must publish the request");
+        assert_eq!(request["method"], "session/set_config_option");
+        assert_eq!(request["params"]["value"], "agent-full-access");
+
+        let mut reported_mode = None;
+        let mut configured_mode = None;
+        while reported_mode.is_none() || configured_mode.is_none() {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("the configured session must be reported")
+                .expect("the runtime must keep its event channel open");
+            match event {
+                RuntimeEvent::SessionStarted { execution_mode, .. } => {
+                    reported_mode = execution_mode;
+                }
+                RuntimeEvent::SessionConfigured { config_options } => {
+                    configured_mode = Some(
+                        serde_json::to_value(config_options).unwrap()[0]["currentValue"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(reported_mode.as_deref(), Some("agent-full-access"));
+        assert_eq!(configured_mode.as_deref(), Some("agent-full-access"));
+
+        drop(request_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+        bridge.abort();
     }
 
     #[tokio::test]
@@ -3723,7 +3762,7 @@ mod tests {
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Claude,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
@@ -3893,7 +3932,7 @@ mod tests {
             // Kimi has no production compactor, so the scratch session goes
             // straight from `session/new` to the prompt that stalls.
             harness: HarnessKind::Kimi,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
@@ -4071,7 +4110,7 @@ mod tests {
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
@@ -4160,7 +4199,7 @@ mod tests {
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let driver = tokio::spawn(async move {
@@ -4401,7 +4440,7 @@ mod tests {
                 project_memory: None,
                 resume_session: None,
                 harness: HarnessKind::Kimi,
-                force_unrestricted_mode: false,
+                execution_policy: ExecutionPolicy::ConfiguredApprovals,
                 acp_activity: AcpActivityClock::default(),
             };
             let driver = tokio::spawn(async move {
@@ -4889,7 +4928,7 @@ while True:
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
-            force_unrestricted_mode: false,
+            execution_policy: ExecutionPolicy::ConfiguredApprovals,
             acp_activity: AcpActivityClock::default(),
         };
         let runtime = tokio::spawn(run(spec, request_rx, event_tx));
@@ -4952,7 +4991,7 @@ while True:
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
-            force_unrestricted_mode: true,
+            execution_policy: ExecutionPolicy::Unconstrained,
             acp_activity: AcpActivityClock::default(),
         };
 
@@ -5000,7 +5039,7 @@ while True:
             project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
-            force_unrestricted_mode: true,
+            execution_policy: ExecutionPolicy::Unconstrained,
             acp_activity: AcpActivityClock::default(),
         };
 
