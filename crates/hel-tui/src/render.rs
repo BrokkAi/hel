@@ -1211,13 +1211,13 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · [T] Resume · [R]ename · [E]dit container · sto[P] · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [S] Resume · [R]ename · [E]dit container · sto[P] · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
         }
         Focus::Capacity => {
-            "[N]ew · [T] Resume · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [S] Resume · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
         }
         Focus::Quotas => {
-            "[N]ew · [T] Resume · [R]efresh · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [S] Resume · [R]efresh · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
         }
     };
     frame.render_widget(

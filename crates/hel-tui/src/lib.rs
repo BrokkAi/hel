@@ -594,7 +594,7 @@ impl DashboardState {
                     DashboardAction::CancelOperation { session_id }
                 })
             }
-            (KeyCode::Char('t'), true) => DashboardAction::OpenResumeDialog,
+            (KeyCode::Char('s'), true) => DashboardAction::OpenResumeDialog,
             (KeyCode::Char('r'), true) => {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
@@ -1060,9 +1060,10 @@ mod tests {
             DashboardAction::RefreshQuotas
         );
         assert_eq!(
-            dashboard.handle_key(ctrl_key('t')),
+            dashboard.handle_key(ctrl_key('s')),
             DashboardAction::OpenResumeDialog
         );
+        assert_eq!(dashboard.handle_key(ctrl_key('t')), DashboardAction::None);
         assert_eq!(dashboard.handle_key(ctrl_key('i')), DashboardAction::None);
         assert_eq!(
             dashboard.handle_key(ctrl_key('q')),
