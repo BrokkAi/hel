@@ -52,6 +52,7 @@ enum SettingsRow {
     },
     DiscreteReview,
     BifrostAnalysis,
+    BifrostVersion,
     ReviewTier,
     CorrectionThreshold,
     MaxParallelSubagents,
@@ -68,12 +69,19 @@ pub struct SettingsEditor {
     active_models: Option<ModelsConfig>,
     active_session_config: Vec<SessionConfigOption>,
     inventory: AcpInventory,
+    bifrost_versions: Vec<String>,
+    bifrost_versions_loading: bool,
+    bifrost_versions_error: Option<String>,
+    /// The pin as saved when the editor opened. The cycle list anchors to it
+    /// so an older pin stays reachable after stepping off it.
+    saved_bifrost_version: Option<String>,
 }
 
 impl SettingsEditor {
     pub fn new(mut config: Config, choices: Vec<ModelChoice>, notice: Option<String>) -> Self {
         config.apply_registered_external_team();
         let inventory = crate::roster::discover_inventory(&config);
+        let saved_bifrost_version = config.review.bifrost_version.clone();
         Self {
             config,
             tab: SettingsTab::Team,
@@ -83,6 +91,10 @@ impl SettingsEditor {
             active_models: None,
             active_session_config: Vec::new(),
             inventory,
+            bifrost_versions: Vec::new(),
+            bifrost_versions_loading: false,
+            bifrost_versions_error: None,
+            saved_bifrost_version,
         }
     }
 
@@ -101,6 +113,25 @@ impl SettingsEditor {
     pub fn with_active_session_config(mut self, options: Vec<SessionConfigOption>) -> Self {
         self.active_session_config = options;
         self
+    }
+
+    pub fn start_bifrost_version_discovery(&mut self) {
+        self.bifrost_versions_loading = true;
+        self.bifrost_versions_error = None;
+    }
+
+    pub fn finish_bifrost_version_discovery(
+        &mut self,
+        result: std::result::Result<Vec<String>, String>,
+    ) {
+        self.bifrost_versions_loading = false;
+        match result {
+            Ok(versions) => {
+                self.bifrost_versions = versions;
+                self.bifrost_versions_error = None;
+            }
+            Err(error) => self.bifrost_versions_error = Some(error),
+        }
     }
 
     /// Replace the model and ACP catalog without discarding staged settings.
@@ -220,6 +251,7 @@ impl SettingsEditor {
                 }
                 SettingsRow::ReviewTier => self.cycle_review_tier(delta),
                 SettingsRow::CorrectionThreshold => self.cycle_correction_threshold(delta),
+                SettingsRow::BifrostVersion => self.cycle_bifrost_version(delta),
                 SettingsRow::DiscreteReview
                 | SettingsRow::BifrostAnalysis
                 | SettingsRow::AutomaticQuotaFailover => {
@@ -331,6 +363,7 @@ impl SettingsEditor {
                 // left/right keys do rather than doing nothing here.
                 SettingsRow::ReviewTier => self.cycle_review_tier(1),
                 SettingsRow::CorrectionThreshold => self.cycle_correction_threshold(1),
+                SettingsRow::BifrostVersion => self.cycle_bifrost_version(1),
                 SettingsRow::AutomaticQuotaFailover => {
                     self.config.subagents.auto_failover = !self.config.subagents.auto_failover;
                 }
@@ -396,6 +429,7 @@ impl SettingsEditor {
                 );
                 rows.push(SettingsRow::DiscreteReview);
                 rows.push(SettingsRow::BifrostAnalysis);
+                rows.push(SettingsRow::BifrostVersion);
                 rows.push(SettingsRow::ReviewTier);
                 rows.push(SettingsRow::CorrectionThreshold);
                 rows
@@ -643,6 +677,25 @@ impl SettingsEditor {
             .unwrap_or(0);
         let next = (current as i32 + delta).rem_euclid(tiers.len() as i32) as usize;
         self.config.agent.set_review_tier(tiers[next]);
+    }
+
+    fn cycle_bifrost_version(&mut self, delta: i32) {
+        // Anchored to the saved pin, not the staged value: stepping off an
+        // older pin must keep it in the wheel, and the web panel (which
+        // lists from the saved config) offers the same choices.
+        let choices = mj_core::bifrost::version_choices(
+            self.saved_bifrost_version.as_deref(),
+            &self.bifrost_versions,
+        );
+        let selected =
+            mj_core::bifrost::selection_label(self.config.review.bifrost_version.as_deref());
+        let current = choices
+            .iter()
+            .position(|version| version == selected)
+            .unwrap_or(0);
+        let next = (current as i32 + delta).rem_euclid(choices.len() as i32) as usize;
+        self.config.review.bifrost_version =
+            mj_core::bifrost::parse_selection(&choices[next]).unwrap_or_default();
     }
 
     fn cycle_correction_threshold(&mut self, delta: i32) {
@@ -1132,6 +1185,7 @@ fn draw_agents(
             | SettingsRow::SubagentPermissions
             | SettingsRow::DiscreteReview
             | SettingsRow::BifrostAnalysis
+            | SettingsRow::BifrostVersion
             | SettingsRow::ReviewTier
             | SettingsRow::CorrectionThreshold
             | SettingsRow::MaxParallelSubagents
@@ -1236,6 +1290,33 @@ fn draw_reviewer(
                         theme.muted
                     } else {
                         theme.warning
+                    }),
+                ));
+            }
+            SettingsRow::BifrostVersion => {
+                let version = mj_core::bifrost::selection_label(
+                    editor.config.review.bifrost_version.as_deref(),
+                );
+                lines.push(selected_line(
+                    selected,
+                    format!("Bifrost version < {version} >"),
+                    theme,
+                ));
+                let detail = if editor.bifrost_versions_loading {
+                    "loading recent versions…".to_string()
+                } else if let Some(error) = &editor.bifrost_versions_error {
+                    format!("couldn't load recent versions: {error}")
+                } else if editor.config.review.bifrost_version.is_some() {
+                    "uses this exact npm version".to_string()
+                } else {
+                    "tracks npm's latest tag".to_string()
+                };
+                lines.push(Line::styled(
+                    format!("  {detail}"),
+                    Style::default().ink(if editor.bifrost_versions_error.is_some() {
+                        theme.warning
+                    } else {
+                        theme.muted
                     }),
                 ));
             }
@@ -1382,6 +1463,7 @@ fn draw_subagents(
             | SettingsRow::ReviewPermissions
             | SettingsRow::DiscreteReview
             | SettingsRow::BifrostAnalysis
+            | SettingsRow::BifrostVersion
             | SettingsRow::ReviewTier
             | SettingsRow::CorrectionThreshold => {}
         }
@@ -2572,12 +2654,17 @@ mod tests {
             .iter()
             .position(|row| *row == SettingsRow::ReviewTier)
             .expect("review tier row");
+        let bifrost = rows
+            .iter()
+            .position(|row| *row == SettingsRow::BifrostVersion)
+            .expect("Bifrost version row");
         let threshold = rows
             .iter()
             .position(|row| *row == SettingsRow::CorrectionThreshold)
             .expect("correction threshold row");
         assert_eq!(analysis, review + 1, "analysis belongs beside review");
-        assert_eq!(tier, analysis + 1, "the tier follows analysis");
+        assert_eq!(bifrost, analysis + 1, "the Bifrost pin follows analysis");
+        assert_eq!(tier, bifrost + 1, "the tier follows the Bifrost pin");
         assert_eq!(
             threshold,
             tier + 1,
@@ -2624,6 +2711,62 @@ mod tests {
             SettingsAction::Changed
         );
         assert_eq!(editor.config.agent.review_tier, ReviewTier::Extended);
+    }
+
+    #[test]
+    fn bifrost_version_defaults_to_latest_and_cycles_through_recent_versions() {
+        let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
+        editor
+            .finish_bifrost_version_discovery(Ok(vec!["0.9.10".to_string(), "0.9.9".to_string()]));
+        editor.tab = SettingsTab::Reviewer;
+        editor.selected = editor
+            .settings_rows(SettingsTab::Reviewer)
+            .iter()
+            .position(|row| *row == SettingsRow::BifrostVersion)
+            .expect("Bifrost version row");
+
+        assert_eq!(editor.config.review.bifrost_version, None);
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(
+            editor.config.review.bifrost_version.as_deref(),
+            Some("0.9.10")
+        );
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(
+            editor.config.review.bifrost_version.as_deref(),
+            Some("0.9.9")
+        );
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(editor.config.review.bifrost_version, None);
+    }
+
+    #[test]
+    fn cycling_off_an_old_saved_pin_keeps_it_reachable() {
+        // The wheel anchors to the saved pin: peeking at newer versions and
+        // stepping back must land on the pin again, not lose it until the
+        // whole settings edit is cancelled.
+        let mut config = Config::default();
+        config.review.bifrost_version = Some("0.8.7".to_string());
+        let mut editor = SettingsEditor::new(config, Vec::new(), None);
+        editor
+            .finish_bifrost_version_discovery(Ok(vec!["0.9.10".to_string(), "0.9.9".to_string()]));
+        editor.tab = SettingsTab::Reviewer;
+        editor.selected = editor
+            .settings_rows(SettingsTab::Reviewer)
+            .iter()
+            .position(|row| *row == SettingsRow::BifrostVersion)
+            .expect("Bifrost version row");
+
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(
+            editor.config.review.bifrost_version.as_deref(),
+            Some("0.9.10")
+        );
+        assert_eq!(editor.handle_key(KeyCode::Left), SettingsAction::Changed);
+        assert_eq!(
+            editor.config.review.bifrost_version.as_deref(),
+            Some("0.8.7")
+        );
     }
 
     #[test]

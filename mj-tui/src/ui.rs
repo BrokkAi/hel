@@ -1657,6 +1657,10 @@ async fn ui_loop(
     let mut dictation_cancel_tx: Option<std_mpsc::Sender<()>> = None;
     let (current_pr_tx, mut current_pr_rx) = mpsc::unbounded_channel::<CurrentBranchPrProbe>();
     let mut current_pr_probe_in_flight = false;
+    let (bifrost_version_tx, mut bifrost_version_rx) =
+        mpsc::unbounded_channel::<std::result::Result<Vec<String>, String>>();
+    let mut bifrost_version_probe_in_flight = false;
+    let mut bifrost_version_result: Option<std::result::Result<Vec<String>, String>> = None;
     let (file_scan_tx, mut file_scan_rx) = mpsc::unbounded_channel::<FileAutocompleteScan>();
     let mut inline_height = INLINE_CHAT_HEIGHT;
     // Wake-up timers so queued input can render at the interactive cadence
@@ -1683,6 +1687,10 @@ async fn ui_loop(
     let mut shutdown_deadline: Option<Instant> = None;
 
     loop {
+        // Captured ahead of the select so any arm that opens `/mjconfig`
+        // (keyboard, dictation, a future command path) triggers the version
+        // discovery below, not only the crossterm arm.
+        let mjconfig_was_open = state.mjconfig_menu.is_some();
         tokio::select! {
             biased;
             _ = termination.cancelled() => {
@@ -1780,6 +1788,21 @@ async fn ui_loop(
                     && apply_current_branch_pr_probe(&mut state, probe)
                 {
                     pending_redraw.mark_interactive();
+                }
+            }
+            maybe_versions = bifrost_version_rx.recv() => {
+                bifrost_version_probe_in_flight = false;
+                if let Some(result) = maybe_versions {
+                    // Cache only successes: the open menu still sees the
+                    // error, but the next open re-probes instead of
+                    // replaying a stale failure for the session's lifetime.
+                    if result.is_ok() {
+                        bifrost_version_result = Some(result.clone());
+                    }
+                    if let Some(menu) = state.mjconfig_menu.as_mut() {
+                        menu.editor.finish_bifrost_version_discovery(result);
+                        pending_redraw.mark_interactive();
+                    }
                 }
             }
             maybe_scan = file_scan_rx.recv() => {
@@ -1980,6 +2003,31 @@ async fn ui_loop(
             _ = animation_tick.tick() => {
                 if timer_driven_live_redraw(mode, &state) {
                     pending_redraw.mark_animation();
+                }
+            }
+        }
+
+        // A freshly opened `/mjconfig` menu gets the cached version list, or
+        // starts the registry probe when none is cached. Errors are delivered
+        // by the channel arm but never cached, so the next open retries.
+        if !mjconfig_was_open && state.mjconfig_menu.is_some() {
+            if let Some(result) = bifrost_version_result.clone() {
+                if let Some(menu) = state.mjconfig_menu.as_mut() {
+                    menu.editor.finish_bifrost_version_discovery(result);
+                }
+            } else {
+                if let Some(menu) = state.mjconfig_menu.as_mut() {
+                    menu.editor.start_bifrost_version_discovery();
+                }
+                if !bifrost_version_probe_in_flight {
+                    bifrost_version_probe_in_flight = true;
+                    let tx = bifrost_version_tx.clone();
+                    std::mem::drop(tokio::spawn(async move {
+                        let result = mj_core::bifrost::fetch_recent_versions()
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = tx.send(result);
+                    }));
                 }
             }
         }
@@ -20054,6 +20102,8 @@ mod tests {
         state.mjconfig_menu_key(KeyCode::Char(' '));
         state.mjconfig_menu_key(KeyCode::Down);
         state.mjconfig_menu_key(KeyCode::Char(' '));
+        // Skip the Bifrost version row; this test changes review policy only.
+        state.mjconfig_menu_key(KeyCode::Down);
         state.mjconfig_menu_key(KeyCode::Down);
         state.mjconfig_menu_key(KeyCode::Right);
         state.mjconfig_menu_key(KeyCode::Down);

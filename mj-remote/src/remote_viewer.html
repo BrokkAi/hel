@@ -4060,6 +4060,7 @@
           snapshot && (
             (snapshot.login && snapshot.login.running)
             || snapshot.probing
+            || snapshot.bifrost_versions_probing
           );
         if (!backgroundRunning || mjconfigModalEl.hidden) {
           return;
@@ -4077,10 +4078,12 @@
               applyServerSnapshot(mjcfg.snapshot, true);
               const wasRunning =
                 (previous.login && previous.login.running)
-                || previous.probing;
+                || previous.probing
+                || previous.bifrost_versions_probing;
               const stillRunning =
                 (mjcfg.snapshot.login && mjcfg.snapshot.login.running)
-                || mjcfg.snapshot.probing;
+                || mjcfg.snapshot.probing
+                || mjcfg.snapshot.bifrost_versions_probing;
               const discoveryChanged =
                 previous.discovery_revision !== mjcfg.snapshot.discovery_revision;
               if (discoveryChanged || (wasRunning && !stillRunning)) {
@@ -4467,6 +4470,35 @@
           ),
         );
         mjconfigBodyEl.appendChild(analysisRow);
+
+        const bifrostRow = mjRow("Bifrost version");
+        const bifrostVersion = mjEditedValue("bifrost_version", panel.bifrost_version);
+        bifrostRow.appendChild(
+          mjCombo(
+            panel.bifrost_versions.map((version) => ({
+              value: version,
+              label: version === "latest" ? "Latest" : version,
+              description: version === "latest"
+                ? "Tracks npm's latest tag"
+                : "Uses this exact npm version",
+            })),
+            bifrostVersion,
+            (next) => {
+              mjcfg.edits.bifrost_version = next;
+              renderMjConfig();
+            },
+          ),
+        );
+        bifrostRow.appendChild(mjDetail(
+          mjcfg.snapshot.bifrost_versions_probing
+            ? "Loading recent versions…"
+            : panel.bifrost_versions_error
+            ? `Couldn't load recent versions: ${panel.bifrost_versions_error}`
+            : bifrostVersion === "latest"
+            ? "Tracks npm's latest tag."
+            : "Pins every Bifrost CLI and MCP launch to this version.",
+        ));
+        mjconfigBodyEl.appendChild(bifrostRow);
 
         const tierRow = mjRow("Review depth");
         const tier = mjEditedValue("review_tier", mjStagedTeamPreset()?.review_tier ?? panel.review_tier);

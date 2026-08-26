@@ -13,7 +13,7 @@ use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 
 pub const DISABLED_MODEL: &str = "disabled";
-pub const CONFIG_VERSION: u32 = 6;
+pub const CONFIG_VERSION: u32 = 7;
 /// Version of the product-model explanation accepted by the user. This is
 /// intentionally independent from the storage schema version.
 pub const ONBOARDING_CONTENT_VERSION: u32 = 4;
@@ -39,6 +39,7 @@ fn model_provider(model: &str) -> Option<&'static str> {
 const V3_CONFIG_VERSION: u32 = 3;
 const V4_CONFIG_VERSION: u32 = 4;
 const V5_CONFIG_VERSION: u32 = 5;
+const V6_CONFIG_VERSION: u32 = 6;
 
 /// Saved ACP session defaults are scoped to the seat that will consume them.
 /// Live accepted values remain in the top-level `session_config` cache.
@@ -1037,6 +1038,10 @@ pub struct ReviewConfig {
     /// Adapter-owned session defaults selected for future review sessions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_defaults: BTreeMap<String, BTreeMap<String, String>>,
+    /// Exact Bifrost npm version used by discrete review. `None` follows the
+    /// package's moving `latest` tag, preserving the default launch behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bifrost_version: Option<String>,
 }
 
 impl Default for ReviewConfig {
@@ -1048,6 +1053,7 @@ impl Default for ReviewConfig {
             reasoning_effort: None,
             permission: PermissionPreset::default(),
             session_defaults: BTreeMap::new(),
+            bifrost_version: None,
         }
     }
 }
@@ -1195,6 +1201,7 @@ impl Config {
                     || version == i64::from(V3_CONFIG_VERSION)
                     || version == i64::from(V4_CONFIG_VERSION)
                     || version == i64::from(V5_CONFIG_VERSION)
+                    || version == i64::from(V6_CONFIG_VERSION)
         )
     }
 
@@ -1332,6 +1339,11 @@ impl Config {
         }
         if version == Some(i64::from(V5_CONFIG_VERSION)) {
             let mut cfg = migrate_v5(&s).with_context(|| format!("migrate {}", path.display()))?;
+            cfg.normalize()?;
+            return Ok(cfg);
+        }
+        if version == Some(i64::from(V6_CONFIG_VERSION)) {
+            let mut cfg = migrate_v6(&s).with_context(|| format!("migrate {}", path.display()))?;
             cfg.normalize()?;
             return Ok(cfg);
         }
@@ -1518,6 +1530,18 @@ impl Config {
             self.subagents.max_parallel <= 16,
             "subagents.max_parallel must be between 0 and 16"
         );
+        // A pin this build cannot parse falls back to `latest` the way an
+        // unmappable team id falls back above: the field is hand-editable
+        // and a newer build may accept formats this one does not, so it must
+        // never cost the rest of the config.
+        if let Some(version) = self.review.bifrost_version.take() {
+            match crate::bifrost::parse_selection(&version) {
+                Ok(selection) => self.review.bifrost_version = selection,
+                Err(error) => {
+                    tracing::warn!("ignoring review.bifrost_version and tracking latest: {error}");
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1638,6 +1662,13 @@ fn migrate_v4(body: &str) -> Result<Config> {
 /// obsolete table while preserving all fields that remain in the schema.
 fn migrate_v5(body: &str) -> Result<Config> {
     let mut config: Config = toml::from_str(body).context("parse v5 config")?;
+    config.version = CONFIG_VERSION;
+    Ok(config)
+}
+
+/// V6 predates the optional Bifrost pin. Absence keeps following `latest`.
+fn migrate_v6(body: &str) -> Result<Config> {
+    let mut config: Config = toml::from_str(body).context("parse v6 config")?;
     config.version = CONFIG_VERSION;
     Ok(config)
 }
@@ -2315,6 +2346,8 @@ kimi = "disabled"
         assert!(Config::path_has_saved_config(&path));
         std::fs::write(&path, "version = 5\n").expect("v5 config");
         assert!(Config::path_has_saved_config(&path));
+        std::fs::write(&path, "version = 6\n").expect("v6 config");
+        assert!(Config::path_has_saved_config(&path));
         Config::default().save(&path).expect("current config");
         assert!(Config::path_has_saved_config(&path));
         // A newer build's file counts too: its owner already finished setup,
@@ -2371,6 +2404,75 @@ kimi = "disabled"
         config.save(&path).expect("save migrated config");
         let saved = std::fs::read_to_string(&path).expect("read saved config");
         assert!(!saved.contains("ragnarok"), "saved config: {saved}");
+    }
+
+    #[test]
+    fn v6_migration_keeps_latest_as_the_bifrost_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("version = {V6_CONFIG_VERSION}\n")).expect("write v6 config");
+
+        let config = Config::load(&path).expect("migrate v6");
+
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(config.review.bifrost_version, None);
+    }
+
+    #[test]
+    fn bifrost_version_defaults_to_latest_and_persists_only_an_explicit_pin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        Config::default().save(&path).expect("save default");
+        let default_body = std::fs::read_to_string(&path).expect("read default");
+        assert!(!default_body.contains("bifrost_version"));
+
+        let mut pinned = Config::default();
+        pinned.review.bifrost_version = Some("0.9.10".to_string());
+        pinned.save(&path).expect("save pin");
+        let body = std::fs::read_to_string(&path).expect("read pin");
+        assert!(body.contains("bifrost_version = \"0.9.10\""), "{body}");
+        assert_eq!(
+            Config::load(&path)
+                .expect("reload pin")
+                .review
+                .bifrost_version
+                .as_deref(),
+            Some("0.9.10")
+        );
+
+        std::fs::write(
+            &path,
+            format!("version = {CONFIG_VERSION}\n[review]\nbifrost_version = \"latest\"\n"),
+        )
+        .expect("write latest");
+        assert_eq!(
+            Config::load(&path)
+                .expect("normalize latest")
+                .review
+                .bifrost_version,
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_bifrost_version_falls_back_to_latest_without_failing_the_load() {
+        // The pin is hand-editable and a newer build may accept formats this
+        // one does not; a load failure here would abort startup on the CLI
+        // paths and stage a default config on the unwrap_or_default paths,
+        // where the next save wipes the user's real settings.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "version = {CONFIG_VERSION}\nteam = \"codex\"\n[review]\nbifrost_version = \"next\"\n"
+            ),
+        )
+        .expect("write config");
+
+        let config = Config::load(&path).expect("invalid pin must not fail the load");
+        assert_eq!(config.review.bifrost_version, None);
+        assert_eq!(config.team.as_deref(), Some("codex"));
     }
 
     #[test]

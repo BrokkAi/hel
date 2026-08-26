@@ -252,6 +252,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                                 fs_max_text_bytes: cfg.fs_max_text_bytes,
                                 bifrost_analysis: app_config.agent.bifrost_analysis,
                                 permission: review_permission,
+                                bifrost_version: app_config.review.bifrost_version.clone(),
                                 id_allocator: subagent_ids.clone(),
                             },
                         ),
