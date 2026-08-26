@@ -735,6 +735,10 @@ impl DashboardState {
         self.notices.set(notice);
     }
 
+    pub fn set_failure_notice(&mut self, notice: impl Into<String>) {
+        self.notices.set_failure(notice);
+    }
+
     pub fn replace_notice_if(&mut self, expected: &str, replacement: impl Into<String>) -> bool {
         self.notices.replace_if(expected, replacement)
     }

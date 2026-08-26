@@ -1912,6 +1912,7 @@ pub const NOTICE_MINIMUM_DISPLAY: std::time::Duration = std::time::Duration::fro
 struct Notice {
     text: String,
     set_at: std::time::Instant,
+    protected: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1945,9 +1946,28 @@ impl Notices {
     /// cannot corrupt the footer row.
     pub fn set(&self, notice: impl Into<String>) {
         let text = sanitize_terminal_text(&notice.into());
+        let mut slot = self.lock();
+        if slot.notice.as_ref().is_some_and(|current| {
+            current.protected && current.set_at.elapsed() < NOTICE_MINIMUM_DISPLAY
+        }) {
+            return;
+        }
+        slot.write(Some(Notice {
+            text,
+            set_at: std::time::Instant::now(),
+            protected: false,
+        }));
+    }
+
+    /// Sets a failure notice that routine background updates cannot replace
+    /// before it has been readable for [`NOTICE_MINIMUM_DISPLAY`]. A newer
+    /// failure still replaces it immediately.
+    pub fn set_failure(&self, notice: impl Into<String>) {
+        let text = sanitize_terminal_text(&notice.into());
         self.lock().write(Some(Notice {
             text,
             set_at: std::time::Instant::now(),
+            protected: true,
         }));
     }
 
@@ -1965,6 +1985,7 @@ impl Notices {
         slot.write(Some(Notice {
             text,
             set_at: std::time::Instant::now(),
+            protected: false,
         }));
         true
     }
@@ -2257,6 +2278,32 @@ mod tests {
 
         notices.clear();
         assert_eq!(notices.current(), None);
+    }
+
+    #[test]
+    fn a_fresh_failure_notice_survives_routine_background_notices() {
+        let notices = Notices::default();
+        notices.set_failure("Resume failed: archived transcript is invalid");
+
+        notices.set("Profile quotas refreshed");
+        assert_eq!(
+            notices.current().as_deref(),
+            Some("Resume failed: archived transcript is invalid")
+        );
+
+        notices.set_failure("Resume failed: target disconnected");
+        assert_eq!(
+            notices.current().as_deref(),
+            Some("Resume failed: target disconnected")
+        );
+
+        let after_set = std::time::Instant::now();
+        assert!(notices.dismiss(after_set + NOTICE_MINIMUM_DISPLAY));
+        notices.set("Profile quotas refreshed");
+        assert_eq!(
+            notices.current().as_deref(),
+            Some("Profile quotas refreshed")
+        );
     }
 
     #[test]

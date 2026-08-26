@@ -379,7 +379,9 @@ fn split_at_utf8_midpoint(text: &str) -> (&str, &str) {
 
 /// Fold the archived transcript into user turns with their agent, tool, and
 /// plan events. Thoughts and system notices carry no durable state, so they
-/// are dropped rather than summarized.
+/// are dropped rather than summarized. Harness startup can also report tool
+/// failures before the first prompt; those are operational diagnostics rather
+/// than part of a user turn and are left out of the handoff.
 fn turns_from_snapshot(snapshot: &CanonicalSessionSnapshot) -> Result<Vec<Turn>> {
     let mut turns = Vec::<Turn>::new();
     for item in &snapshot.transcript {
@@ -400,7 +402,9 @@ fn turns_from_snapshot(snapshot: &CanonicalSessionSnapshot) -> Result<Vec<Turn>>
                 TurnEvent::Assistant(crate::hel_chat::materialized_chunks_text(chunks)),
             )?,
             CanonicalTranscriptBody::Tool { call, .. } => {
-                push_turn_event(&mut turns, TurnEvent::Tool(call.clone()))?;
+                if let Some(turn) = turns.last_mut() {
+                    append_turn_event(turn, TurnEvent::Tool(call.clone()));
+                }
             }
             CanonicalTranscriptBody::Plan { plan } => {
                 push_turn_event(&mut turns, TurnEvent::Plan(plan.clone()))?;
@@ -419,7 +423,7 @@ fn turns_from_snapshot(snapshot: &CanonicalSessionSnapshot) -> Result<Vec<Turn>>
 
 fn push_turn_event(turns: &mut [Turn], event: TurnEvent) -> Result<()> {
     let turn = turns.last_mut().context(
-        "canonical transcript contains assistant/tool history before its first user turn",
+        "canonical transcript contains assistant/plan history before its first user turn",
     )?;
     append_turn_event(turn, event);
     Ok(())
@@ -1029,6 +1033,26 @@ mod tests {
             error.to_string().contains("before its first user turn"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn startup_tool_history_before_a_user_turn_is_ignored() {
+        let turns = turns_from_snapshot(&snapshot(vec![
+            CanonicalTranscriptBody::Tool {
+                call: tool_call("failed", "MCP server startup was cancelled"),
+                terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
+            },
+            user("do the work"),
+            agent("done"),
+        ]))
+        .unwrap();
+
+        let rendered = render_turns(&turns, 0);
+        assert_eq!(turns.len(), 1);
+        assert!(rendered.contains("do the work"));
+        assert!(rendered.contains("done"));
+        assert!(!rendered.contains("startup was cancelled"));
     }
 
     #[test]

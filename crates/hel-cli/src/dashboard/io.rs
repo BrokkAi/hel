@@ -1292,7 +1292,7 @@ impl DashboardContext {
                         .as_ref()
                         .map_or("Operation", |operation| operation.kind.label());
                     self.dashboard
-                        .set_notice(format!("{label} failed: {error}"));
+                        .set_failure_notice(format!("{label} failed: {error}"));
                 }
             }
         }
