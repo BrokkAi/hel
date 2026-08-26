@@ -106,8 +106,25 @@ fn wait_for_exit(
             return status;
         }
         if Instant::now() >= deadline {
+            let signal_status = fs::read_to_string(format!("/proc/{}/status", child.id()))
+                .ok()
+                .map(|status| {
+                    status
+                        .lines()
+                        .filter(|line| {
+                            [
+                                "State:", "Threads:", "SigQ:", "SigPnd:", "ShdPnd:", "SigBlk:",
+                                "SigIgn:", "SigCgt:",
+                            ]
+                            .iter()
+                            .any(|prefix| line.starts_with(prefix))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "unavailable".into());
             panic!(
-                "PTY child did not exit after {reason}; output: {:?}",
+                "PTY child did not exit after {reason}; process status: {signal_status}; output: {:?}",
                 String::from_utf8_lossy(output)
             );
         }

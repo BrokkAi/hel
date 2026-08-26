@@ -24,9 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
-      # The repo's .cargo/config.toml defaults to the musl worker target; the
-      # runner only has host std, and registry consumers build for their own
-      # hosts anyway, so verification builds use the host target.
+      # The repo defaults to the shipped musl Linux target; registry consumers
+      # build for their own hosts, so package verification uses the runner's
+      # GNU host target.
       CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
 
     steps:
@@ -85,9 +85,9 @@ jobs:
       contents: read
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
-      # The repo's .cargo/config.toml defaults to the musl worker target; the
-      # runner only has host std, and registry consumers build for their own
-      # hosts anyway, so verification builds use the host target.
+      # The repo defaults to the shipped musl Linux target; registry consumers
+      # build for their own hosts, so package verification uses the runner's
+      # GNU host target.
       CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
 
     steps:

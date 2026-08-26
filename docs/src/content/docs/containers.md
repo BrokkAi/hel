@@ -33,11 +33,11 @@ Pick one runtime:
   [Podman for Hel](/podman/) for installation and verification steps.
 - **Apple's `container` CLI** on macOS 26 or newer on Apple silicon.
 
-If you installed hel with `install.sh`, it already placed the matching
-`hel-worker-<arch>-unknown-linux-musl` companion binary next to `hel`. hel
-uses that companion to run its session relay inside Linux containers when the
-controller binary itself isn't a Linux binary for the container's
-architecture.
+Linux releases are static musl binaries, so the controller itself runs the
+session relay in same-architecture Linux containers. The installer also places
+the other supported Linux architecture's
+`hel-worker-<arch>-unknown-linux-musl` companion next to `hel`. On macOS it
+installs both Linux companions.
 
 ## Get the agent-dev image
 

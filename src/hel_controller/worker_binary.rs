@@ -517,6 +517,22 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
         ));
         candidates.push((directory.join(&triple).join("hel"), "HEL_WORKER_DIR"));
     }
+    if let Some((path, source)) = candidates.into_iter().find(|(path, _)| path.is_file()) {
+        return Ok(WorkerBinaryAvailability::Local {
+            path,
+            source: source.into(),
+        });
+    }
+    if cfg!(all(target_os = "linux", target_env = "musl"))
+        && ((arch == "x86_64" && cfg!(target_arch = "x86_64"))
+            || (arch == "aarch64" && cfg!(target_arch = "aarch64")))
+    {
+        return Ok(WorkerBinaryAvailability::Local {
+            path: stable_running_executable(&current)?,
+            source: "native musl Hel binary".into(),
+        });
+    }
+    let mut candidates = Vec::new();
     if let Some(directory) = current.parent() {
         candidates.push((
             packaged_worker_binary_path(directory, &triple),

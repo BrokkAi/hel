@@ -10,6 +10,10 @@ mod import;
 mod pollers;
 mod server;
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
