@@ -1188,7 +1188,15 @@ pub(super) fn tool_content_details(
         if referenced.contains(&record.terminal_id.as_str()) {
             continue;
         }
-        details.push(sanitize_terminal_text(&terminal_output_detail(record)));
+        let output = sanitize_terminal_text(&record.output);
+        if !output.is_empty() && details.iter().any(|detail| detail == &output) {
+            // Kimi sends the captured stdout as ordinary tool content and in
+            // its raw result. Keep the exit summary without printing those
+            // same bytes a second time in Raw mode.
+            details.push(terminal_exit_summary(record));
+        } else {
+            details.push(sanitize_terminal_text(&terminal_output_detail(record)));
+        }
     }
     details
 }
@@ -3373,6 +3381,75 @@ mod tests {
             browser.entries[0].lines,
             ["Bash"],
             "the remote viewer shows the decluttered title, not the output"
+        );
+    }
+
+    #[test]
+    fn kimi_text_and_captured_terminal_output_render_once_and_only_in_raw_mode() {
+        const OUTPUT: &str = "toolchain inventory";
+        let mut session = MaterializedSession::empty("session-kimi-terminal");
+        session.applied_event_ordinal = 1;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![Arc::new(TranscriptItem {
+            stable_id: "tool:kimi-shell".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 1,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "kimi-shell",
+                    "title": "Execute `inspect toolchain`",
+                    "status": "completed",
+                    "content": [{
+                        "type": "content",
+                        "content": {"type": "text", "text": OUTPUT}
+                    }],
+                    "rawOutput": {
+                        "type": "Bash",
+                        "output": OUTPUT.as_bytes(),
+                        "exit_code": 1,
+                        "command": "inspect toolchain"
+                    }
+                }),
+                terminal_outputs: vec![TerminalOutputRecord {
+                    terminal_id: "term-1".into(),
+                    output: OUTPUT.into(),
+                    truncated: false,
+                    exit_code: Some(1),
+                    signal: None,
+                }],
+                terminal_refs: vec!["term-1".into()],
+            },
+        })];
+
+        let entries = materialized_chat_entries(&session);
+        assert_eq!(entries[0].tool_content, [OUTPUT, "exited 1"]);
+
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        let rich = transcript_text(&mut chat, 80);
+        assert!(
+            !rich.iter().any(|line| line.contains(OUTPUT)),
+            "Rich mode shows the tool call, not its duplicate output: {rich:?}"
+        );
+
+        chat.render_mode = TranscriptRenderMode::Raw;
+        let raw = transcript_text(&mut chat, 80);
+        assert_eq!(
+            raw.iter().filter(|line| line.contains(OUTPUT)).count(),
+            1,
+            "Raw mode keeps one copy of the output: {raw:?}"
+        );
+        assert!(raw.iter().any(|line| line.contains("exited 1")));
+
+        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        assert!(
+            browser
+                .entries
+                .iter()
+                .flat_map(|entry| &entry.lines)
+                .all(|line| !line.contains(OUTPUT)),
+            "the remote Rich feed suppresses the duplicate output"
         );
     }
 

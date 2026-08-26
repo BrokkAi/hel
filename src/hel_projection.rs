@@ -941,12 +941,65 @@ fn replace_or_push_terminal_record(
     }
 }
 
+/// Whether a completed ACP tool's provider-specific raw result is the same
+/// child result Hel captured. Kimi reports shell output as a byte array beside
+/// its exit status but omits the ACP terminal reference, so the exact result
+/// is the only ownership information it publishes.
+fn raw_tool_result_matches_terminal(call: &Value, record: &TerminalOutputRecord) -> bool {
+    if !matches!(
+        call.get("status").and_then(Value::as_str),
+        Some("completed" | "failed")
+    ) {
+        return false;
+    }
+    let Some(raw) = call.get("rawOutput") else {
+        return false;
+    };
+    let Some(exit_code) = raw
+        .get("exit_code")
+        .and_then(Value::as_u64)
+        .and_then(|code| u32::try_from(code).ok())
+    else {
+        return false;
+    };
+    if record.exit_code != Some(exit_code) || record.signal.is_some() {
+        return false;
+    }
+    match raw.get("output") {
+        Some(Value::Array(bytes)) => {
+            bytes.len() == record.output.len()
+                && bytes
+                    .iter()
+                    .zip(record.output.as_bytes())
+                    .all(|(value, byte)| value.as_u64() == Some(u64::from(*byte)))
+        }
+        Some(Value::String(output)) => output == &record.output,
+        _ => false,
+    }
+}
+
+/// The one parked terminal result an ACP tool demonstrably owns through its
+/// raw result. Ambiguous identical results stay standalone rather than being
+/// assigned to an arbitrary concurrent tool.
+fn uniquely_matching_raw_terminal(current: &MaterializedSession, call: &Value) -> Option<String> {
+    let mut matching = current.transcript.iter().filter_map(|item| {
+        let TranscriptBody::TerminalOutput { record } = &item.body else {
+            return None;
+        };
+        raw_tool_result_matches_terminal(call, record).then(|| record.terminal_id.clone())
+    });
+    let terminal_id = matching.next()?;
+    matching.next().is_none().then_some(terminal_id)
+}
+
 /// Remember every terminal the current call refers to, move any parked output
 /// for the terminals `item` has ever referred to into the item, and remove the
-/// standalone items it consumed. Output that arrives before the tool call
-/// therefore ends up exactly where output that arrives after it does, and a
-/// call that drops its terminal reference on a later content update still owns
-/// the terminal it started.
+/// standalone items it consumed. An exact provider raw result also claims its
+/// one matching parked terminal: Kimi supplies that result but no ACP terminal
+/// reference. Output that arrives before the tool call therefore ends up
+/// exactly where output that arrives after it does, and a call that drops its
+/// terminal reference on a later content update still owns the terminal it
+/// started.
 fn attach_terminal_outputs(
     current: &MaterializedSession,
     mutation: &mut MaterializedSessionMutation,
@@ -964,6 +1017,12 @@ fn attach_terminal_outputs(
         if !terminal_refs.contains(&terminal_id) {
             terminal_refs.push(terminal_id);
         }
+    }
+    if terminal_refs.is_empty()
+        && let Some(terminal_id) = uniquely_matching_raw_terminal(current, call)
+        && !terminal_refs.contains(&terminal_id)
+    {
+        terminal_refs.push(terminal_id);
     }
     let mut consumed = Vec::new();
     for terminal_id in terminal_refs.iter() {
@@ -1936,6 +1995,159 @@ mod tests {
             outputs,
             "output arriving before or after the call must read the same"
         );
+    }
+
+    #[test]
+    fn kimi_raw_result_claims_its_unreferenced_terminal_output() {
+        const OUTPUT: &str = "toolchain inventory\n";
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "Execute `inspect toolchain`",
+                ))),
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::TerminalOutput {
+                terminal_id: "term-1".into(),
+                output: OUTPUT.into(),
+                truncated: false,
+                exit_code: Some(1),
+                signal: None,
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "call-1",
+                    ToolCallUpdateFields::new()
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed)
+                        .content(vec![ToolCallContent::from(ContentBlock::Text(
+                            TextContent::new(OUTPUT),
+                        ))])
+                        .raw_output(json!({
+                            "type": "Bash",
+                            "output": OUTPUT.as_bytes(),
+                            "exit_code": 1,
+                            "command": "inspect toolchain"
+                        })),
+                ))),
+            },
+        );
+
+        assert_eq!(
+            session.transcript.len(),
+            1,
+            "the completed tool consumes the duplicate standalone item"
+        );
+        let TranscriptBody::Tool {
+            terminal_outputs,
+            terminal_refs,
+            ..
+        } = &session.transcript[0].body
+        else {
+            panic!("the surviving item is the tool call");
+        };
+        assert_eq!(terminal_refs, &["term-1"]);
+        assert_eq!(terminal_outputs.len(), 1);
+        assert_eq!(terminal_outputs[0].output, OUTPUT);
+        assert_eq!(terminal_outputs[0].exit_code, Some(1));
+    }
+
+    #[test]
+    fn mismatched_raw_result_does_not_hide_a_genuine_orphan_failure() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new("call-1", "Execute"))),
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::TerminalOutput {
+                terminal_id: "term-1".into(),
+                output: "orphan failure\n".into(),
+                truncated: false,
+                exit_code: Some(1),
+                signal: None,
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "call-1",
+                    ToolCallUpdateFields::new()
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed)
+                        .raw_output(json!({
+                            "output": b"different output",
+                            "exit_code": 1
+                        })),
+                ))),
+            },
+        );
+
+        assert_eq!(session.transcript.len(), 2);
+        assert!(session.transcript.iter().any(|item| matches!(
+            &item.body,
+            TranscriptBody::TerminalOutput { record }
+                if record.output == "orphan failure\n"
+        )));
+    }
+
+    #[test]
+    fn identical_orphan_results_are_not_assigned_arbitrarily() {
+        const OUTPUT: &str = "same output\n";
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new("call-1", "Execute"))),
+            },
+        );
+        for terminal_id in ["term-1", "term-2"] {
+            apply_observation(
+                &mut session,
+                RelayObservation::TerminalOutput {
+                    terminal_id: terminal_id.into(),
+                    output: OUTPUT.into(),
+                    truncated: false,
+                    exit_code: Some(1),
+                    signal: None,
+                },
+            );
+        }
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "call-1",
+                    ToolCallUpdateFields::new()
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed)
+                        .raw_output(json!({
+                            "output": OUTPUT.as_bytes(),
+                            "exit_code": 1
+                        })),
+                ))),
+            },
+        );
+
+        assert_eq!(
+            session
+                .transcript
+                .iter()
+                .filter(|item| matches!(item.body, TranscriptBody::TerminalOutput { .. }))
+                .count(),
+            2,
+            "identical concurrent results need an explicit reference"
+        );
+        assert!(attached_terminal_outputs(&session.transcript[0]).is_empty());
     }
 
     #[test]
