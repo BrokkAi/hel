@@ -42,68 +42,35 @@ impl ExecutionPolicy {
     }
 }
 
-/// Harness-specific controls that realize a target-level execution policy.
+/// Harness-specific controls that collectively realize a target-level
+/// execution policy. A harness may need more than one launch-time mechanism
+/// in addition to an ACP mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionEnforcement {
-    /// Selected over ACP once the session exists.
-    AcpMode(&'static str),
-    /// Selected at bridge launch and enforced again over ACP once the session
-    /// exists. Initializing the bridge in the desired mode prevents it from
-    /// creating or restoring a session with a transient restrictive policy.
-    AcpModeWithLaunchEnvironment {
-        mode: &'static str,
-        key: &'static str,
-        value: &'static str,
-    },
-    /// Applied to the bridge command line at launch. The harness exposes no
-    /// ACP equivalent, so there is nothing to enforce after the session opens.
-    LaunchFlag {
-        flag: &'static str,
-        label: &'static str,
-    },
-    /// Applied through the child environment at launch.
-    LaunchEnvironment {
-        key: &'static str,
-        value: &'static str,
-        label: &'static str,
-    },
+pub struct ExecutionEnforcement {
+    label: &'static str,
+    acp_mode: Option<&'static str>,
+    launch_flag: Option<&'static str>,
+    launch_environment: Option<(&'static str, &'static str)>,
 }
 
 impl ExecutionEnforcement {
     /// Name reported to the UI for the mode this session runs in.
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::AcpMode(mode) => mode,
-            Self::AcpModeWithLaunchEnvironment { mode, .. } => mode,
-            Self::LaunchFlag { label, .. } => label,
-            Self::LaunchEnvironment { label, .. } => label,
-        }
+        self.label
     }
 
     /// The ACP mode to select after the session opens, when there is one.
     pub const fn acp_mode(self) -> Option<&'static str> {
-        match self {
-            Self::AcpMode(mode) => Some(mode),
-            Self::AcpModeWithLaunchEnvironment { mode, .. } => Some(mode),
-            Self::LaunchFlag { .. } | Self::LaunchEnvironment { .. } => None,
-        }
+        self.acp_mode
     }
 
     /// The launch flag to add to the bridge command line, when there is one.
     pub const fn launch_flag(self) -> Option<&'static str> {
-        match self {
-            Self::AcpMode(_) | Self::AcpModeWithLaunchEnvironment { .. } => None,
-            Self::LaunchFlag { flag, .. } => Some(flag),
-            Self::LaunchEnvironment { .. } => None,
-        }
+        self.launch_flag
     }
 
     pub const fn launch_environment(self) -> Option<(&'static str, &'static str)> {
-        match self {
-            Self::LaunchEnvironment { key, value, .. } => Some((key, value)),
-            Self::AcpModeWithLaunchEnvironment { key, value, .. } => Some((key, value)),
-            Self::AcpMode(_) | Self::LaunchFlag { .. } => None,
-        }
+        self.launch_environment
     }
 }
 
@@ -170,32 +137,36 @@ impl HarnessKind {
     ) -> Option<ExecutionEnforcement> {
         match (self, policy) {
             (_, ExecutionPolicy::ConfiguredApprovals) => None,
-            (Self::Codex, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::AcpModeWithLaunchEnvironment {
-                    mode: "agent-full-access",
-                    key: "INITIAL_AGENT_MODE",
-                    value: "agent-full-access",
-                })
-            }
-            (Self::Claude, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::AcpMode("bypassPermissions"))
-            }
-            (Self::Kimi, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::AcpMode("auto"))
-            }
-            (Self::Grok, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::LaunchFlag {
-                    flag: "--always-approve",
-                    label: "always-approve",
-                })
-            }
-            (Self::Deepseek, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::LaunchEnvironment {
-                    key: "DSH_PERMISSION_MODE",
-                    value: "danger-full-access",
-                    label: "danger-full-access",
-                })
-            }
+            (Self::Codex, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "agent-full-access",
+                acp_mode: Some("agent-full-access"),
+                launch_flag: None,
+                launch_environment: Some(("INITIAL_AGENT_MODE", "agent-full-access")),
+            }),
+            (Self::Claude, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "bypassPermissions / sandbox-off",
+                acp_mode: Some("bypassPermissions"),
+                launch_flag: None,
+                launch_environment: None,
+            }),
+            (Self::Kimi, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "auto",
+                acp_mode: Some("auto"),
+                launch_flag: None,
+                launch_environment: None,
+            }),
+            (Self::Grok, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "always-approve / sandbox-off",
+                acp_mode: None,
+                launch_flag: Some("--always-approve"),
+                launch_environment: Some(("GROK_SANDBOX", "off")),
+            }),
+            (Self::Deepseek, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "danger-full-access",
+                acp_mode: None,
+                launch_flag: None,
+                launch_environment: Some(("DSH_PERMISSION_MODE", "danger-full-access")),
+            }),
         }
     }
 
@@ -1025,34 +996,24 @@ mod tests {
         assert_eq!(HarnessKind::Claude.home_env(), "CLAUDE_CONFIG_DIR");
         assert_eq!(HarnessKind::Kimi.home_env(), "KIMI_CODE_HOME");
         assert_eq!(HarnessKind::Grok.home_env(), "GROK_HOME");
-        assert_eq!(
-            HarnessKind::Codex.execution_enforcement(ExecutionPolicy::Unconstrained),
-            Some(ExecutionEnforcement::AcpModeWithLaunchEnvironment {
-                mode: "agent-full-access",
-                key: "INITIAL_AGENT_MODE",
-                value: "agent-full-access",
-            })
-        );
-        assert_eq!(
-            HarnessKind::Claude.execution_enforcement(ExecutionPolicy::Unconstrained),
-            Some(ExecutionEnforcement::AcpMode("bypassPermissions"))
-        );
-        assert_eq!(
-            HarnessKind::Kimi.execution_enforcement(ExecutionPolicy::Unconstrained),
-            Some(ExecutionEnforcement::AcpMode("auto"))
-        );
-        assert_eq!(
-            HarnessKind::Grok.execution_enforcement(ExecutionPolicy::Unconstrained),
-            Some(ExecutionEnforcement::LaunchFlag {
-                flag: "--always-approve",
-                label: "always-approve",
-            })
-        );
+        let codex = HarnessKind::Codex
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
+        assert_eq!(codex.acp_mode(), Some("agent-full-access"));
+        assert_eq!(codex.label(), "agent-full-access");
+        let claude = HarnessKind::Claude
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
+        assert_eq!(claude.acp_mode(), Some("bypassPermissions"));
+        let kimi = HarnessKind::Kimi
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
+        assert_eq!(kimi.acp_mode(), Some("auto"));
     }
 
     #[test]
     fn unconstrained_enforcement_splits_acp_modes_from_launch_controls() {
-        for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
+        for kind in [HarnessKind::Codex, HarnessKind::Kimi] {
             let enforcement = kind
                 .execution_enforcement(ExecutionPolicy::Unconstrained)
                 .unwrap();
@@ -1071,7 +1032,13 @@ mod tests {
             .unwrap();
         assert_eq!(grok.acp_mode(), None);
         assert_eq!(grok.launch_flag(), Some("--always-approve"));
-        assert_eq!(grok.label(), "always-approve");
+        assert_eq!(grok.label(), "always-approve / sandbox-off");
+        assert_eq!(grok.launch_environment(), Some(("GROK_SANDBOX", "off")));
+        let claude = HarnessKind::Claude
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
+        assert_eq!(claude.acp_mode(), Some("bypassPermissions"));
+        assert_eq!(claude.label(), "bypassPermissions / sandbox-off");
         let deepseek = HarnessKind::Deepseek
             .execution_enforcement(ExecutionPolicy::Unconstrained)
             .unwrap();
