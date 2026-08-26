@@ -1382,6 +1382,14 @@ fn load_materialized_session_summary_from(
 
     let last_user_message = last_materialized_user_message(&connection, session_id)?;
     let last_agent_message = last_materialized_agent_message(&connection, session_id)?;
+    let last_agent_message_follows_last_user =
+        last_agent_message
+            .as_ref()
+            .is_some_and(|(agent_position, _)| {
+                last_user_message
+                    .as_ref()
+                    .is_none_or(|(user_position, _)| agent_position > user_position)
+            });
     let mut ordinal_statement = connection.prepare(
         "SELECT latest_content_event_ordinal
          FROM materialized_transcript_items
@@ -1415,8 +1423,9 @@ fn load_materialized_session_summary_from(
         last_activity_at_ms,
         execution: parse_materialized_execution(&execution, running_started_at_ms)?,
         session_title,
-        last_agent_message,
-        last_user_message,
+        last_agent_message: last_agent_message.map(|(_, message)| message),
+        last_user_message: last_user_message.map(|(_, message)| message),
+        last_agent_message_follows_last_user,
         agent_message_latest_content_ordinals,
     }))
 }
@@ -1424,9 +1433,9 @@ fn load_materialized_session_summary_from(
 fn last_materialized_user_message(
     connection: &Connection,
     session_id: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(u64, String)>> {
     let mut statement = connection.prepare(
-        "SELECT body_json
+        "SELECT position, body_json
          FROM materialized_transcript_items
          WHERE session_id = ?1
            AND json_extract(
@@ -1439,16 +1448,19 @@ fn last_materialized_user_message(
            ) = 'user'
          ORDER BY position DESC, stable_id DESC",
     )?;
-    let bodies = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
-    for body_json in bodies {
-        let body: TranscriptBody = serde_json::from_str(&body_json?)
+    let rows = statement.query_map([session_id], |row| {
+        Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (position, body_json) = row?;
+        let body: TranscriptBody = serde_json::from_str(&body_json)
             .with_context(|| format!("parse materialized user message for session {session_id}"))?;
         let TranscriptBody::User { content } = body else {
             continue;
         };
         let text = crate::hel_chat::materialized_content_text(&content);
         if !text.trim().is_empty() {
-            return Ok(Some(text));
+            return Ok(Some((position, text)));
         }
     }
     Ok(None)
@@ -1457,10 +1469,10 @@ fn last_materialized_user_message(
 fn last_materialized_agent_message(
     connection: &Connection,
     session_id: &str,
-) -> Result<Option<String>> {
-    let body_json = connection
+) -> Result<Option<(u64, String)>> {
+    let row = connection
         .query_row(
-            "SELECT body_json
+            "SELECT position, body_json
              FROM materialized_transcript_items
              WHERE session_id = ?1
                AND latest_content_event_ordinal IS NOT NULL
@@ -1483,10 +1495,10 @@ fn last_materialized_agent_message(
              ORDER BY position DESC, stable_id DESC
              LIMIT 1",
             [session_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    let Some(body_json) = body_json else {
+    let Some((position, body_json)) = row else {
         return Ok(None);
     };
     let body: TranscriptBody = serde_json::from_str(&body_json)
@@ -1495,7 +1507,7 @@ fn last_materialized_agent_message(
         return Ok(None);
     };
     let text = crate::hel_chat::materialized_chunks_text(&chunks);
-    Ok((!text.trim().is_empty()).then_some(text))
+    Ok((!text.trim().is_empty()).then_some((position, text)))
 }
 
 /// Read only the projection's event frontier. Deciding whether a stored
@@ -4464,6 +4476,19 @@ mod tests {
                     streaming: false,
                 },
             }),
+            Arc::new(TranscriptItem {
+                stable_id: "user:7".into(),
+                position: 7,
+                latest_content_event_ordinal: None,
+                created_at_ms: 1_800,
+                last_changed_at_ms: 1_800,
+                body: TranscriptBody::User {
+                    content: vec![serde_json::json!({
+                        "type": "text",
+                        "text": "one more thing"
+                    })],
+                },
+            }),
         ]);
         save_materialized_session_to(&database, &materialized).unwrap();
 
@@ -4481,8 +4506,9 @@ mod tests {
         let summary = load_materialized_session_summary_from(&database, "session-1")
             .unwrap()
             .unwrap();
-        assert_eq!(summary.last_user_message.as_deref(), Some("ship it"));
+        assert_eq!(summary.last_user_message.as_deref(), Some("one more thing"));
         assert_eq!(summary.last_agent_message.as_deref(), Some("Finished"));
+        assert!(!summary.last_agent_message_follows_last_user);
         assert_eq!(summary.agent_message_latest_content_ordinals, vec![2, 7]);
         assert_eq!(summary.execution, materialized.execution);
         assert!(load_materialized_session_from(&database, "session-1").is_err());

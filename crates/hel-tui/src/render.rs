@@ -477,32 +477,37 @@ fn render_sessions(
                 detail.and_then(|detail| detail.last_user_message.as_deref()),
                 usize::from(active_area.width.saturating_sub(4)),
             ));
-            let mut agent = detail
-                .and_then(|detail| detail.last_agent_message.as_deref())
-                .map(|message| {
-                    render_agent_message_head(
-                        message,
-                        usize::from(active_area.width.saturating_sub(11)),
-                        2,
-                    )
-                })
-                .unwrap_or_default();
-            if agent.is_empty() {
-                agent.push(Line::raw("No messages yet"));
-            }
-            agent.resize(2, Line::default());
-            for (agent_index, mut line) in agent.into_iter().take(2).enumerate() {
-                let mut spans = vec![Span::raw("  ")];
-                spans.push(Span::styled(
-                    if agent_index == 0 {
-                        "Agent: "
-                    } else {
-                        "       "
-                    },
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                spans.append(&mut line.spans);
-                lines.push(Line::from(spans));
+            let show_agent_excerpt = detail.is_none_or(|detail| {
+                detail.last_user_message.is_none() || detail.last_agent_message_follows_last_user
+            });
+            if show_agent_excerpt {
+                let mut agent = detail
+                    .and_then(|detail| detail.last_agent_message.as_deref())
+                    .map(|message| {
+                        render_agent_message_head(
+                            message,
+                            usize::from(active_area.width.saturating_sub(11)),
+                            2,
+                        )
+                    })
+                    .unwrap_or_default();
+                if agent.is_empty() {
+                    agent.push(Line::raw("No messages yet"));
+                }
+                agent.resize(2, Line::default());
+                for (agent_index, mut line) in agent.into_iter().take(2).enumerate() {
+                    let mut spans = vec![Span::raw("  ")];
+                    spans.push(Span::styled(
+                        if agent_index == 0 {
+                            "Agent: "
+                        } else {
+                            "       "
+                        },
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                    spans.append(&mut line.spans);
+                    lines.push(Line::from(spans));
+                }
             }
         } else {
             lines.push(collapsed_session_line(
@@ -1297,6 +1302,32 @@ mod tests {
         assert!(rendered.contains("You: question 1"));
         assert!(rendered.contains("Agent: "));
         assert!(rendered.contains("answer 1"));
+    }
+
+    #[test]
+    fn expanded_dashboard_omits_an_agent_excerpt_older_than_the_last_user_message() {
+        let mut dashboard = dashboard_with_session(running_session());
+        let mut transcript = numbered_conversation(1);
+        transcript.push(transcript_item(
+            3,
+            TranscriptBody::User {
+                content: vec![serde_json::json!({
+                    "type": "text",
+                    "text": "unanswered follow-up"
+                })],
+            },
+        ));
+        apply_materialized_transcript(&mut dashboard, transcript);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("You: unanswered follow-up"));
+        assert!(!rendered.contains("Agent:"));
+        assert!(!rendered.contains("answer 0"));
     }
 
     #[test]

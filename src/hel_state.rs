@@ -129,6 +129,9 @@ pub struct MaterializedSessionSummary {
     pub session_title: Option<String>,
     pub last_agent_message: Option<String>,
     pub last_user_message: Option<String>,
+    /// Whether the last nonempty agent message appears after the last
+    /// nonempty user message in transcript order.
+    pub last_agent_message_follows_last_user: bool,
     pub agent_message_latest_content_ordinals: Vec<u64>,
 }
 

@@ -47,6 +47,7 @@ pub(crate) struct SessionDetail {
     pub(crate) last_activity_at_ms: Option<u64>,
     pub(crate) last_agent_message: Option<Arc<str>>,
     pub(crate) last_user_message: Option<Arc<str>>,
+    pub(crate) last_agent_message_follows_last_user: bool,
     pub(crate) last_acp_activity_at_ms: Option<u64>,
     /// Latest agent-content ordinals retained so a state-only read-cursor
     /// update can recompute the single unread count exactly.
@@ -145,6 +146,7 @@ pub struct PreparedMaterializedSessionDetail {
     pub(crate) last_activity_at_ms: Option<u64>,
     pub(crate) last_agent_message: Option<Arc<str>>,
     pub(crate) last_user_message: Option<Arc<str>>,
+    pub(crate) last_agent_message_follows_last_user: bool,
     agent_message_latest_content_ordinals: Vec<u64>,
     pub(crate) unread_agent_messages: usize,
     pub(crate) transcript: TranscriptSnapshot,
@@ -162,6 +164,7 @@ pub struct PreparedMaterializedSessionSummary {
     last_activity_at_ms: Option<u64>,
     last_agent_message: Option<Arc<str>>,
     last_user_message: Option<Arc<str>>,
+    last_agent_message_follows_last_user: bool,
     agent_message_latest_content_ordinals: Vec<u64>,
     unread_agent_messages: usize,
 }
@@ -200,6 +203,7 @@ impl PreparedMaterializedSessionSummary {
                 let visible = hel::hel_worker::strip_hidden_prompt_context(&message);
                 (!visible.trim().is_empty()).then(|| Arc::from(visible.to_owned()))
             }),
+            last_agent_message_follows_last_user: summary.last_agent_message_follows_last_user,
             agent_message_latest_content_ordinals: summary.agent_message_latest_content_ordinals,
             unread_agent_messages,
         }
@@ -225,13 +229,25 @@ impl PreparedMaterializedSessionDetail {
         let unchanged_prefix = previous.unchanged_prefix(&session.transcript);
         let last_agent_message =
             last_agent_message(&session.transcript, unchanged_prefix, &previous);
-        let last_user_message = session.transcript.iter().rev().find_map(|item| {
-            let TranscriptBody::User { content } = &item.body else {
-                return None;
-            };
-            let text = materialized_content_text(content);
-            (!text.trim().is_empty()).then(|| Arc::from(text))
-        });
+        let last_user_message =
+            session
+                .transcript
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, item)| {
+                    let TranscriptBody::User { content } = &item.body else {
+                        return None;
+                    };
+                    let text = materialized_content_text(content);
+                    (!text.trim().is_empty()).then(|| (index, Arc::from(text)))
+                });
+        let last_agent_message_follows_last_user =
+            last_agent_message.as_ref().is_some_and(|(agent_index, _)| {
+                last_user_message
+                    .as_ref()
+                    .is_none_or(|(user_index, _)| agent_index > user_index)
+            });
         let mut cached_tool_diffstats = previous.tool_diffstats;
         let mut tool_diffstats = BTreeMap::new();
         let mut current_tool_diffstats = BTreeMap::new();
@@ -295,7 +311,8 @@ impl PreparedMaterializedSessionDetail {
             last_agent_message: last_agent_message
                 .as_ref()
                 .map(|(_, text)| Arc::clone(text)),
-            last_user_message,
+            last_user_message: last_user_message.map(|(_, message)| message),
+            last_agent_message_follows_last_user,
             agent_message_latest_content_ordinals,
             unread_agent_messages,
             transcript,
@@ -627,6 +644,7 @@ impl DashboardState {
         detail.last_activity_at_ms = prepared.last_activity_at_ms;
         detail.last_agent_message = prepared.last_agent_message;
         detail.last_user_message = prepared.last_user_message;
+        detail.last_agent_message_follows_last_user = prepared.last_agent_message_follows_last_user;
         detail.agent_message_latest_content_ordinals =
             prepared.agent_message_latest_content_ordinals;
         detail.unread_agent_messages = prepared.unread_agent_messages;
@@ -664,6 +682,7 @@ impl DashboardState {
         detail.last_activity_at_ms = prepared.last_activity_at_ms;
         detail.last_agent_message = prepared.last_agent_message;
         detail.last_user_message = prepared.last_user_message;
+        detail.last_agent_message_follows_last_user = prepared.last_agent_message_follows_last_user;
         detail.agent_message_latest_content_ordinals =
             prepared.agent_message_latest_content_ordinals;
         detail.unread_agent_messages = prepared.unread_agent_messages;
@@ -967,6 +986,7 @@ mod tests {
             session_title: Some("Persisted title".into()),
             last_agent_message: Some("Persisted answer".into()),
             last_user_message: Some("Persisted question".into()),
+            last_agent_message_follows_last_user: true,
             agent_message_latest_content_ordinals: vec![2, 5, 7],
         };
 
@@ -984,6 +1004,7 @@ mod tests {
             Some("Persisted answer")
         );
         assert_eq!(detail.unread_agent_messages, 2);
+        assert!(detail.last_agent_message_follows_last_user);
         assert_eq!(detail.current_turn_started_at, Some(4));
         assert_eq!(detail.transcript_hydration, TranscriptHydration::Loading);
         assert!(detail.transcript.is_none());
@@ -1014,6 +1035,7 @@ mod tests {
                 )
                 .into(),
             ),
+            last_agent_message_follows_last_user: false,
             agent_message_latest_content_ordinals: vec![],
         };
 
@@ -1213,6 +1235,34 @@ mod tests {
                 .as_deref(),
             Some("The container lacked uv, so validation used Python 3 directly.")
         );
+    }
+
+    #[test]
+    fn latest_user_message_tracks_whether_the_agent_has_replied() {
+        let mut dashboard = dashboard_with_session(stopped_session());
+        let mut transcript = numbered_conversation(1);
+        transcript.push(transcript_item(
+            3,
+            TranscriptBody::User {
+                content: vec![serde_json::json!({
+                    "type": "text",
+                    "text": "follow-up question"
+                })],
+            },
+        ));
+        apply_materialized_transcript(&mut dashboard, transcript.clone());
+
+        let detail = &dashboard.session_details["session-1"];
+        assert_eq!(detail.last_agent_message.as_deref(), Some("answer 0"));
+        assert_eq!(
+            detail.last_user_message.as_deref(),
+            Some("follow-up question")
+        );
+        assert!(!detail.last_agent_message_follows_last_user);
+
+        transcript.push(agent_message(4, "follow-up answer"));
+        apply_materialized_transcript(&mut dashboard, transcript);
+        assert!(dashboard.session_details["session-1"].last_agent_message_follows_last_user);
     }
 
     #[test]
