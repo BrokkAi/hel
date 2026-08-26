@@ -864,7 +864,7 @@ fn collect_export_native_artifacts(
         artifacts
     };
     let launch_path = spec.relay_root.join("launch.json");
-    match crate::hel_worker_runtime::WorkerLaunchConfig::read(&launch_path) {
+    match read_project_memory_checkpoint_endpoint(&launch_path) {
         Ok(launch) => {
             if let Some(memory) = launch.project_memory {
                 let root = resolve_home_relative_target_path(&memory.root)?;
@@ -890,6 +890,27 @@ fn collect_export_native_artifacts(
         "native session artifacts are too large"
     );
     Ok(artifacts)
+}
+
+/// Checkpoint exporters can be refreshed independently of the live worker, so
+/// read only the stable launch fields needed for collection. Fully parsing the
+/// current worker config would reject launch files written by older versions.
+#[derive(Deserialize)]
+struct ProjectMemoryCheckpointLaunch {
+    #[serde(default)]
+    project_memory: Option<ProjectMemoryCheckpointEndpoint>,
+}
+
+#[derive(Deserialize)]
+struct ProjectMemoryCheckpointEndpoint {
+    root: PathBuf,
+}
+
+fn read_project_memory_checkpoint_endpoint(path: &Path) -> Result<ProjectMemoryCheckpointLaunch> {
+    let body =
+        fs::read(path).with_context(|| format!("read worker launch config {}", path.display()))?;
+    serde_json::from_slice(&body)
+        .with_context(|| format!("parse worker launch config {}", path.display()))
 }
 
 /// A session delta is measured against every origin ref, so a repository that
@@ -2943,6 +2964,43 @@ mod tests {
         assert!(artifacts.iter().any(|artifact| {
             artifact.relative_path == Path::new("projects/replica/memory/MEMORY.md")
                 && artifact.data == b"remember this"
+        }));
+    }
+
+    #[test]
+    fn checkpoint_collects_memory_from_a_legacy_worker_launch_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        let memory_root = spec.harness_home.join("projects/replica/memory");
+        fs::create_dir_all(&memory_root).unwrap();
+        fs::write(memory_root.join("MEMORY.md"), "legacy memory").unwrap();
+        let legacy_launch = json!({
+            "session_id": SESSION,
+            "harness": "codex",
+            "bridge_command": "codex-acp",
+            "bridge_args": [],
+            "environment": {},
+            "cwd": spec.workspace_root.join("app"),
+            "native_session_id": NATIVE,
+            "project_memory": {
+                "project_key": "project",
+                "root": memory_root,
+                "baseline_root": spec.harness_home.join("projects/replica/.hel-memory-baseline"),
+                "repository_roots": {}
+            },
+            "force_unrestricted_mode": true
+        });
+        fs::write(
+            spec.relay_root.join("launch.json"),
+            serde_json::to_vec_pretty(&legacy_launch).unwrap(),
+        )
+        .unwrap();
+
+        let artifacts = collect_export_native_artifacts(&spec, false).unwrap();
+
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.relative_path == Path::new("projects/replica/memory/MEMORY.md")
+                && artifact.data == b"legacy memory"
         }));
     }
 
