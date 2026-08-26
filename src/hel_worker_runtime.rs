@@ -166,6 +166,9 @@ mod unix {
     use tokio::sync::mpsc;
 
     use super::{AcpSupervisorSpec, CredentialEndpoint, WorkerLaunchConfig};
+
+    pub(super) const PROXY_INITIAL_INPUT_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_config::HarnessKind;
     use crate::hel_worker::{
@@ -1931,9 +1934,30 @@ exec gh "$@"
         // exec` client), leaking one thread-heavy process per poll inside the
         // container. Exit as soon as either side closes. An idle connection
         // is intentional: it may own a checkpoint barrier while the
-        // controller transfers a large archive.
+        // controller transfers a large archive. Before the first request,
+        // however, a bounded deadline prevents a detached Podman conmon from
+        // holding the target-side proxy forever after the controller kills a
+        // launcher whose handshake timed out.
         let mut client_buf = [0_u8; 64 * 1024];
         let mut relay_buf = [0_u8; 64 * 1024];
+        let first_count = match tokio::time::timeout(
+            PROXY_INITIAL_INPUT_TIMEOUT,
+            client_read.read(&mut client_buf),
+        )
+        .await
+        {
+            Ok(read) => read.context("read initial proxy stdin")?,
+            Err(_) => return Ok(()),
+        };
+        if first_count == 0 {
+            let _ = relay_write.shutdown().await;
+            return Ok(());
+        }
+        relay_write
+            .write_all(&client_buf[..first_count])
+            .await
+            .context("forward initial request to worker")?;
+
         loop {
             tokio::select! {
                 read = client_read.read(&mut client_buf) => {
@@ -3226,10 +3250,6 @@ mod relay_tests {
             relay_write,
         ));
 
-        tokio::time::advance(std::time::Duration::from_secs(16 * 60)).await;
-        tokio::task::yield_now().await;
-        assert!(!proxy.is_finished(), "idle proxy connection expired");
-
         controller.write_all(b"request").await.unwrap();
         let mut request = [0_u8; 7];
         relay_peer.read_exact(&mut request).await.unwrap();
@@ -3239,9 +3259,42 @@ mod relay_tests {
         controller.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"response");
 
+        tokio::time::advance(std::time::Duration::from_secs(16 * 60)).await;
+        tokio::task::yield_now().await;
+        assert!(!proxy.is_finished(), "idle proxy connection expired");
+
+        controller.write_all(b"another").await.unwrap();
+        let mut request = [0_u8; 7];
+        relay_peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"another");
+        relay_peer.write_all(b"answer!!").await.unwrap();
+        let mut response = [0_u8; 8];
+        controller.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"answer!!");
+
         drop(relay_peer);
         drop(controller);
         proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_transport_expires_while_waiting_for_its_first_request() {
+        let (_controller, proxy_client) = tokio::io::duplex(1024);
+        let (proxy_relay, _relay_peer) = tokio::io::duplex(1024);
+        let (client_read, client_write) = tokio::io::split(proxy_client);
+        let (relay_read, relay_write) = tokio::io::split(proxy_relay);
+        let proxy = tokio::spawn(unix::forward_proxy_streams(
+            client_read,
+            client_write,
+            relay_read,
+            relay_write,
+        ));
+
+        tokio::time::advance(unix::PROXY_INITIAL_INPUT_TIMEOUT).await;
+        proxy
+            .await
+            .expect("proxy task stopped cleanly")
+            .expect("pre-handshake proxy timeout is clean shutdown");
     }
 
     #[tokio::test]
