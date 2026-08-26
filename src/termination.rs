@@ -6,7 +6,9 @@
 //! convention (SIGINT 130, SIGHUP 129, SIGTERM 143); Windows uses 1.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +22,9 @@ enum SignalAction {
 }
 
 static SUPPRESSED_INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Keeps a foreground child process's Ctrl-C from also terminating Hel.
 ///
@@ -61,20 +66,7 @@ impl Coordinator {
             signals_seen: Arc::new(AtomicU8::new(0)),
         };
         #[cfg(unix)]
-        {
-            let mut signals =
-                signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
-                    .expect("install termination signal listeners");
-            let listener = coordinator.clone();
-            std::thread::Builder::new()
-                .name("hel-termination".to_string())
-                .spawn(move || {
-                    for signal in signals.forever() {
-                        listener.received_signal(signal);
-                    }
-                })
-                .expect("spawn termination signal listener");
-        }
+        install_unix_signals(&coordinator);
         #[cfg(windows)]
         {
             // Register both handlers before returning from `install`. Signals
@@ -124,6 +116,51 @@ impl Coordinator {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn install_unix_signals(coordinator: &Coordinator) {
+    let requested = Arc::new(AtomicBool::new(false));
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        // Registration order matters: the first handler exits only when a
+        // previous signal armed the flag; the second one arms it.
+        signal_hook::flag::register_conditional_shutdown(
+            signal,
+            exit_code(signal),
+            requested.clone(),
+        )
+        .expect("install forced termination signal handler");
+        let requested = requested.clone();
+        // SAFETY: the handler only reads and writes lock-free atomics, which
+        // are async-signal-safe. Polling outside the handler avoids relying on
+        // a self-pipe write to wake the graceful-shutdown listener.
+        unsafe {
+            signal_hook::low_level::register(signal, move || {
+                if signal != libc::SIGINT || SUPPRESSED_INTERRUPTS.load(Ordering::Acquire) == 0 {
+                    requested.store(true, Ordering::SeqCst);
+                }
+            })
+        }
+        .expect("install graceful termination signal handler");
+    }
+
+    signal_hook::flag::register_conditional_shutdown(
+        libc::SIGHUP,
+        exit_code(libc::SIGHUP),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .expect("install hangup signal handler");
+
+    let listener = coordinator.clone();
+    std::thread::Builder::new()
+        .name("hel-termination".to_string())
+        .spawn(move || {
+            while !requested.load(Ordering::Acquire) {
+                std::thread::sleep(SIGNAL_POLL_INTERVAL);
+            }
+            listener.received_signal(0);
+        })
+        .expect("spawn termination signal listener");
 }
 
 #[cfg(windows)]
