@@ -786,7 +786,7 @@ fn bridge_launch(
             "sh".into(),
             vec![
                 "-lc".into(),
-                format!("if command -v codex-acp >/dev/null 2>&1; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@{CODEX_ACP_FALLBACK_VERSION}", ensure_node_script()),
+                format!("if command -v codex-acp >/dev/null 2>&1 && [ \"$(codex-acp --version 2>/dev/null)\" = \"@agentclientprotocol/codex-acp {CODEX_ACP_FALLBACK_VERSION}\" ]; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@{CODEX_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Claude => (
@@ -2156,6 +2156,7 @@ mod tests {
             ExecutionPolicy::Unconstrained,
         );
         assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.6.2"));
+        assert!(codex_arguments[1].contains("codex-acp --version"));
 
         let (_, claude_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Claude,
