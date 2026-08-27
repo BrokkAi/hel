@@ -3124,12 +3124,12 @@ async fn run_session(
                     }
                 };
                 cmd_orchestrator.set_review_fanout(review_fanout);
-                cmd_orchestrator.set_review_enabled(updated_config.agent.discrete_review);
-                cmd_orchestrator.set_review_tier(updated_config.agent.review_tier);
-                cmd_orchestrator
-                    .set_correction_threshold(updated_config.agent.correction_threshold);
-                cmd_orchestrator
-                    .set_max_correction_rounds(updated_config.agent.max_correction_rounds);
+                cmd_orchestrator.set_review_policy(
+                    updated_config.agent.discrete_review,
+                    updated_config.agent.review_tier,
+                    updated_config.agent.correction_threshold,
+                    updated_config.agent.max_correction_rounds,
+                );
                 let _ = side_ui_event_tx.send(UiEvent::Info(
                     "reviewer and subagent configuration is active for the current primary session"
                         .to_string(),
@@ -3143,10 +3143,12 @@ async fn run_session(
                 max_correction_rounds,
             } = &command
             {
-                cmd_orchestrator.set_review_enabled(*enabled);
-                cmd_orchestrator.set_review_tier(*tier);
-                cmd_orchestrator.set_correction_threshold(*correction_threshold);
-                cmd_orchestrator.set_max_correction_rounds(*max_correction_rounds);
+                cmd_orchestrator.set_review_policy(
+                    *enabled,
+                    *tier,
+                    *correction_threshold,
+                    *max_correction_rounds,
+                );
                 continue;
             }
             if let UiCommand::RunReview { request } = command {

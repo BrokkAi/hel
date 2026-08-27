@@ -941,13 +941,12 @@ fn start_server_agent_session(
                             }
                         };
                         primary_orchestrator.set_review_fanout(review_fanout);
-                        primary_orchestrator
-                            .set_review_enabled(updated_config.agent.discrete_review);
-                        primary_orchestrator.set_review_tier(updated_config.agent.review_tier);
-                        primary_orchestrator
-                            .set_correction_threshold(updated_config.agent.correction_threshold);
-                        primary_orchestrator
-                            .set_max_correction_rounds(updated_config.agent.max_correction_rounds);
+                        primary_orchestrator.set_review_policy(
+                            updated_config.agent.discrete_review,
+                            updated_config.agent.review_tier,
+                            updated_config.agent.correction_threshold,
+                            updated_config.agent.max_correction_rounds,
+                        );
                         tracker.observe_event(&UiEvent::Info(
                             "reviewer and subagent configuration is active for this server session"
                                 .to_string(),

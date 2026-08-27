@@ -188,6 +188,19 @@ impl Handle {
             .store(encode_max_correction_rounds(rounds), Ordering::Release);
     }
 
+    pub fn set_review_policy(
+        &self,
+        enabled: bool,
+        tier: ReviewTier,
+        correction_threshold: ReviewCorrectionThreshold,
+        max_correction_rounds: Option<u32>,
+    ) {
+        self.set_review_enabled(enabled);
+        self.set_review_tier(tier);
+        self.set_correction_threshold(correction_threshold);
+        self.set_max_correction_rounds(max_correction_rounds);
+    }
+
     /// Apply a newly resolved reviewer/subagent route to reviews that start
     /// after this call. An already-running review retains its own snapshot.
     pub fn set_review_fanout(&self, review_fanout: ReviewFanout) {
@@ -3591,7 +3604,12 @@ mod tests {
         // The session started with the tier default of one pass. Saving Off
         // while the turn is active must affect the correction contract that
         // is issued after this review, without replacing the ACP session.
-        running.handle.set_max_correction_rounds(Some(0));
+        running.handle.set_review_policy(
+            true,
+            ReviewTier::Extended,
+            ReviewCorrectionThreshold::default(),
+            Some(0),
+        );
         runtime_tx.send(completion()).expect("send completion");
 
         let corrective = next_prompt(&mut command_rx).await;
