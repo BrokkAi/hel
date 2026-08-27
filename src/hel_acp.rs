@@ -815,6 +815,15 @@ const CANCEL_UNACKED_WARNING: &str =
 
 const ACP_BRIDGE_LOST_WARNING: &str = "ACP bridge exited; reloading the native session";
 
+/// Kimi may start an internal background-task notification turn as a cancelled
+/// `session/prompt` settles. Reusing that connection lets the next ACP prompt be
+/// accepted but parked behind the invisible turn, so Hel reports the new user
+/// prompt as running before Kimi has added it to the conversation. Reloading the
+/// native session gives the next durable command a genuinely idle bridge.
+fn restart_after_acknowledged_cancel(harness: HarnessKind) -> bool {
+    harness == HarnessKind::Kimi
+}
+
 /// Give up if a freshly opened session dies this many times in a row before it
 /// has lived for [`RAPID_BRIDGE_WINDOW`]. A later crash of a healthy session
 /// resets the count.
@@ -1866,6 +1875,11 @@ async fn serve_session(
                                 },
                             )
                             .await?;
+                            if cancel_deadline.is_some()
+                                && restart_after_acknowledged_cancel(spec.harness)
+                            {
+                                return Ok(Some(session_id.to_string()));
+                            }
                             break;
                         }
                         _ = async {
@@ -4267,7 +4281,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancel_that_the_agent_acks_does_not_restart_the_harness() {
+    async fn acknowledged_kimi_cancel_reloads_before_the_next_prompt() {
         let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
         let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
         let (complete_tx, complete_rx) = mpsc::channel(1);
@@ -4345,13 +4359,13 @@ mod tests {
             stop_reason.to_lowercase().contains("cancel"),
             "{stop_reason}"
         );
-        drop(request_tx);
         let restart = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
             .await
             .expect("runtime exits")
             .expect("runtime task does not panic")
             .expect("a cancelled prompt must not fail the runtime");
-        assert_eq!(restart, None);
+        assert_eq!(restart.as_deref(), Some("scripted"));
+        drop(request_tx);
         bridge.abort();
     }
 
