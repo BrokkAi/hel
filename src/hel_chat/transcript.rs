@@ -1431,17 +1431,7 @@ pub(super) fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatSt
     // The window resolves and clamps the anchor: an anchor inside the last
     // screenful snaps back to following the tail.
     chat.anchor = window.anchor;
-    let title = match (chat.anchor, chat.render_mode) {
-        (TranscriptAnchor::Bottom, TranscriptRenderMode::Rich) => " Conversation ".to_owned(),
-        (TranscriptAnchor::Bottom, TranscriptRenderMode::Raw) => {
-            " Conversation · raw source ".to_owned()
-        }
-        (TranscriptAnchor::Row { entry, .. }, _) => format!(
-            " Conversation · message {} of {} · End to follow ",
-            entry.saturating_add(1),
-            chat.entries.len()
-        ),
-    };
+    let title = transcript_title(chat, crate::clock::epoch_seconds());
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .title(title)
@@ -1454,6 +1444,32 @@ pub(super) fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatSt
         .take(usize::from(inner.height))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn transcript_title(chat: &ChatState, now_epoch_seconds: u64) -> String {
+    let summary = if chat.header_target.is_empty() || chat.header_profile.is_empty() {
+        "Conversation".to_owned()
+    } else {
+        crate::usage_format::format_session_summary(
+            &chat.header_target,
+            chat.queued_prompts.len(),
+            now_epoch_seconds,
+            chat.turn_started_at_epoch_seconds,
+            chat.last_acp_activity_at_ms,
+            &chat.header_profile,
+        )
+    };
+    match (chat.anchor, chat.render_mode) {
+        (TranscriptAnchor::Bottom, TranscriptRenderMode::Rich) => format!(" {summary} "),
+        (TranscriptAnchor::Bottom, TranscriptRenderMode::Raw) => {
+            format!(" {summary} · raw source ")
+        }
+        (TranscriptAnchor::Row { entry, .. }, _) => format!(
+            " {summary} · message {} of {} · End to follow ",
+            entry.saturating_add(1),
+            chat.entries.len()
+        ),
+    }
 }
 
 const ROLE_GUTTER: &str = "│ ";
@@ -1792,6 +1808,25 @@ mod tests {
         assert_eq!(
             transcript_text(&mut chat, 80),
             ["No messages yet — send a prompt to begin."]
+        );
+    }
+
+    #[test]
+    fn conversation_title_is_the_dashboard_summary_without_the_session_name() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_header_summary("precision-3260/bifrost-fuzz", "kimi");
+        chat.turn_started_at_epoch_seconds = Some(7_847);
+        chat.set_last_acp_activity(Some(20_000_000));
+
+        assert_eq!(
+            transcript_title(&chat, 20_000),
+            " precision-3260/bifrost-fuzz  Turn 03:22:33  Step 00:00:00  kimi "
+        );
+
+        chat.render_mode = TranscriptRenderMode::Raw;
+        assert_eq!(
+            transcript_title(&chat, 20_000),
+            " precision-3260/bifrost-fuzz  Turn 03:22:33  Step 00:00:00  kimi · raw source "
         );
     }
 

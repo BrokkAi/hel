@@ -1029,7 +1029,12 @@ impl DashboardContext {
             })
             .collect::<Vec<_>>();
         active.sort_by(|left, right| left.compare_by_creation(right));
-        let mut header = hel::hel_chat::SessionHeaderIdentity::default();
+        let mut header = hel::hel_chat::SessionHeaderIdentity {
+            target: session_record
+                .project_target(&self.controller.config, &session_record.target_template_id),
+            profile: session_record.last_profile.clone(),
+            ..Default::default()
+        };
         for (position, record) in active.into_iter().enumerate() {
             if record.id == session_id {
                 header.position = position;

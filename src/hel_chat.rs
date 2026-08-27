@@ -171,6 +171,10 @@ impl QueuedPrompt {
 pub struct SessionHeaderIdentity {
     pub position: usize,
     pub others: Vec<OtherSessionIdentity>,
+    /// Dashboard target label, including the project suffix for bare targets.
+    pub target: String,
+    /// Profile column from the dashboard's live-session summary.
+    pub profile: String,
 }
 
 /// Identity of another same-project session, snapshotted when the chat opens.
@@ -316,10 +320,12 @@ pub struct ChatState {
     render_cache: TranscriptRenderCache,
     notices: Notices,
     voice_active: bool,
-    /// Project name and header position of this session, snapshotted when the
-    /// chat opened.
+    /// Dashboard identity and header position snapshotted when the chat opened.
     position: usize,
+    header_target: String,
+    header_profile: String,
     turn_started_at_epoch_seconds: Option<u64>,
+    last_acp_activity_at_ms: Option<u64>,
     other_sessions: Vec<OtherSessionActivity>,
     focus: ChatFocus,
     /// Where the conversations pane's window starts. `None` centres it on the
@@ -400,7 +406,10 @@ impl ChatState {
             notices: Notices::default(),
             voice_active: false,
             position: 0,
+            header_target: String::new(),
+            header_profile: String::new(),
             turn_started_at_epoch_seconds: None,
+            last_acp_activity_at_ms: None,
             other_sessions: Vec::new(),
             focus: ChatFocus::Prompt,
             conversations_window_start: None,
@@ -827,10 +836,20 @@ impl ChatState {
         })
     }
 
-    /// Names this session in the header and places its line among the other
-    /// sessions. Both are fixed for the visit.
+    /// Places this session's line among the other sessions. The position is
+    /// fixed for the visit.
     pub fn set_header_position(&mut self, position: usize) {
         self.position = position;
+    }
+
+    /// Installs the stable dashboard columns used by the conversation title.
+    pub fn set_header_summary(&mut self, target: impl Into<String>, profile: impl Into<String>) {
+        self.header_target = target.into();
+        self.header_profile = profile.into();
+    }
+
+    fn set_last_acp_activity(&mut self, timestamp_ms: Option<i64>) {
+        self.last_acp_activity_at_ms = timestamp_ms.and_then(|value| u64::try_from(value).ok());
     }
 
     /// Last line of this session's most recent agent message that has text.

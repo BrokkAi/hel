@@ -592,6 +592,7 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
             &snapshot.operational.active_agent_terminals,
             &snapshot.materialized,
         );
+        state.set_last_acp_activity(snapshot.operational.last_acp_activity_at_ms);
     }
     if let Some(error) = view.error {
         match error {
@@ -712,12 +713,14 @@ impl ActiveChat {
                     &snapshot.operational.active_agent_terminals,
                     &snapshot.materialized,
                 );
+                state.set_last_acp_activity(snapshot.operational.last_acp_activity_at_ms);
             }
             let pending = PendingPrefix::of(materialized, state.unconverted_prefix());
             (state, pending)
         };
         state.set_history_context(bundle_id);
         state.set_header_position(header.position);
+        state.set_header_summary(header.target, header.profile);
         state.restore_draft(draft);
         state.notices = notices;
         let (chat_io_tx, chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
@@ -1664,12 +1667,17 @@ mod tests {
         session.applied_event_digest = "a".repeat(64);
         session.transcript = vec![agent_transcript_item("first", 5)];
 
-        assert!(apply_session_view(
-            &mut chat,
-            Ok(managed_view(session.clone()))
-        ));
+        let mut first_view = managed_view(session.clone());
+        first_view
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .operational
+            .last_acp_activity_at_ms = Some(12_345);
+        assert!(apply_session_view(&mut chat, Ok(first_view)));
         assert_eq!(chat.latest_seq(), 5);
         assert_eq!(chat.entries.len(), 1);
+        assert_eq!(chat.last_acp_activity_at_ms, Some(12_345));
         assert!(!chat.transcript_loading);
 
         session.applied_event_ordinal = 8;
@@ -1677,6 +1685,7 @@ mod tests {
         assert!(apply_session_view(&mut chat, Ok(managed_view(session))));
         assert_eq!(chat.latest_seq(), 8);
         assert_eq!(chat.entries.len(), 2);
+        assert_eq!(chat.last_acp_activity_at_ms, None);
     }
 
     #[test]
@@ -2405,6 +2414,7 @@ mod tests {
     #[test]
     fn chat_view_draws_one_header_row_per_session_above_the_transcript() {
         let mut chat = header_chat("current", 0, Vec::new());
+        chat.set_header_summary("precision-3260/bifrost-fuzz", "kimi");
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
         let row = |terminal: &Terminal<TestBackend>, offset: u16| {
             let buffer = terminal.backend().buffer();
@@ -2430,7 +2440,7 @@ mod tests {
         assert_eq!(bordered_row(&terminal, 1), "› [idle]");
         // Row 2 is the pane's bottom border, so the transcript's chrome
         // starts at row 3.
-        assert!(row(&terminal, 3).contains("Conversation"));
+        assert!(row(&terminal, 3).contains("precision-3260/bifrost-fuzz  [idle]  kimi"));
 
         apply_chat_io_update(
             &mut chat,
@@ -2443,7 +2453,7 @@ mod tests {
         assert_eq!(bordered_row(&terminal, 2), "  [idle] wrote the guide");
         // The transcript keeps its own chrome, below the header and the
         // pane's now-taller bottom border.
-        assert!(row(&terminal, 4).contains("Conversation"));
+        assert!(row(&terminal, 4).contains("precision-3260/bifrost-fuzz  [idle]  kimi"));
     }
 
     /// A conversation long enough that opening it converts the tail only.
