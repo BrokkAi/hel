@@ -79,6 +79,9 @@ pub struct SettingsEditor {
     /// The pin as saved when the editor opened. The cycle list anchors to it
     /// so an older pin stays reachable after stepping off it.
     saved_bifrost_version: Option<String>,
+    /// The correction budget as saved when the editor opened. A custom value
+    /// must stay in the choice wheel after the user steps off it.
+    saved_max_correction_rounds: Option<u32>,
 }
 
 impl SettingsEditor {
@@ -86,6 +89,7 @@ impl SettingsEditor {
         config.apply_registered_external_team();
         let inventory = crate::roster::discover_inventory(&config);
         let saved_bifrost_version = config.review.bifrost_version.clone();
+        let saved_max_correction_rounds = config.agent.max_correction_rounds;
         Self {
             config,
             tab: SettingsTab::Team,
@@ -99,6 +103,7 @@ impl SettingsEditor {
             bifrost_versions_loading: false,
             bifrost_versions_error: None,
             saved_bifrost_version,
+            saved_max_correction_rounds,
         }
     }
 
@@ -716,8 +721,7 @@ impl SettingsEditor {
     }
 
     fn cycle_max_correction_rounds(&mut self, delta: i32) {
-        let choices =
-            crate::config::correction_round_choices(self.config.agent.max_correction_rounds);
+        let choices = crate::config::correction_round_choices(self.saved_max_correction_rounds);
         let current = choices
             .iter()
             .position(|rounds| *rounds == self.config.agent.max_correction_rounds)
@@ -2775,6 +2779,24 @@ mod tests {
             SettingsAction::Changed
         );
         assert_eq!(editor.config.agent.review_tier, ReviewTier::Extended);
+    }
+
+    #[test]
+    fn custom_correction_round_budget_stays_reachable_after_cycling_away() {
+        let mut config = Config::default();
+        config.agent.max_correction_rounds = Some(7);
+        let mut editor = SettingsEditor::new(config, Vec::new(), None);
+        editor.tab = SettingsTab::Reviewer;
+        editor.selected = editor
+            .settings_rows(SettingsTab::Reviewer)
+            .iter()
+            .position(|row| *row == SettingsRow::MaxCorrectionRounds)
+            .expect("correction rounds row");
+
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(editor.config.agent.max_correction_rounds, None);
+        assert_eq!(editor.handle_key(KeyCode::Left), SettingsAction::Changed);
+        assert_eq!(editor.config.agent.max_correction_rounds, Some(7));
     }
 
     #[test]

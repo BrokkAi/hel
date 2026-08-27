@@ -1237,6 +1237,7 @@ pub struct UiRunOptions<'a> {
     pub review_enabled: bool,
     pub review_tier: crate::config::ReviewTier,
     pub correction_threshold: crate::config::ReviewCorrectionThreshold,
+    pub max_correction_rounds: Option<u32>,
     pub runtime_stall_minutes: u64,
     pub primary_acp_name: String,
     pub primary_reasoning_effort: Option<String>,
@@ -1278,6 +1279,7 @@ struct UiInitialState {
     review_enabled: bool,
     review_tier: crate::config::ReviewTier,
     correction_threshold: crate::config::ReviewCorrectionThreshold,
+    max_correction_rounds: Option<u32>,
     runtime_stall_minutes: u64,
     primary_acp_name: String,
     primary_reasoning_effort: Option<String>,
@@ -1366,6 +1368,7 @@ pub async fn run(
             review_enabled: options.review_enabled,
             review_tier: options.review_tier,
             correction_threshold: options.correction_threshold,
+            max_correction_rounds: options.max_correction_rounds,
             runtime_stall_minutes: options.runtime_stall_minutes,
             primary_acp_name: options.primary_acp_name,
             primary_reasoning_effort: options.primary_reasoning_effort,
@@ -1631,6 +1634,7 @@ async fn ui_loop(
     state.review_enabled = initial.review_enabled;
     state.review_tier = initial.review_tier;
     state.correction_threshold = initial.correction_threshold;
+    state.max_correction_rounds = initial.max_correction_rounds;
     state.set_runtime_stall_minutes(initial.runtime_stall_minutes);
     state.set_primary_acp_name(initial.primary_acp_name);
     state.primary_route_reasoning_effort = initial.primary_reasoning_effort.clone();
@@ -6216,7 +6220,8 @@ fn persist_mjconfig_selection(
     let style = config.spinner;
     let review_changed = state.review_enabled != config.agent.discrete_review
         || state.review_tier != config.agent.review_tier
-        || state.correction_threshold != config.agent.correction_threshold;
+        || state.correction_threshold != config.agent.correction_threshold
+        || state.max_correction_rounds != config.agent.max_correction_rounds;
     let feature_hints_enabled = config.feature_hints;
     let keep_awake_enabled = config.keep_awake;
     let thought_output = config.thought_output;
@@ -6239,6 +6244,7 @@ fn persist_mjconfig_selection(
                 state.review_enabled = config.agent.discrete_review;
                 state.review_tier = config.agent.review_tier;
                 state.correction_threshold = config.agent.correction_threshold;
+                state.max_correction_rounds = config.agent.max_correction_rounds;
                 state.feature_hints_enabled = feature_hints_enabled;
                 state.keep_awake.set_enabled(keep_awake_enabled);
                 state.set_thought_output(thought_output);
@@ -6248,6 +6254,7 @@ fn persist_mjconfig_selection(
                         enabled: config.agent.discrete_review,
                         tier: config.agent.review_tier,
                         correction_threshold: config.agent.correction_threshold,
+                        max_correction_rounds: config.agent.max_correction_rounds,
                     });
                 }
                 if auxiliary_agents_update_live {
@@ -20599,6 +20606,8 @@ mod tests {
         state.mjconfig_menu_key(KeyCode::Right);
         state.mjconfig_menu_key(KeyCode::Down);
         state.mjconfig_menu_key(KeyCode::Left);
+        state.mjconfig_menu_key(KeyCode::Down);
+        state.mjconfig_menu_key(KeyCode::Right);
 
         handle_mjconfig_menu_key(
             &mut state,
@@ -20625,12 +20634,14 @@ mod tests {
             saved.agent.correction_threshold,
             config::ReviewCorrectionThreshold::P2
         );
+        assert_eq!(saved.agent.max_correction_rounds, Some(0));
         assert!(matches!(
             cmd_rx.try_recv(),
             Ok(UiCommand::SetReviewPolicy {
                 enabled: false,
                 tier: config::ReviewTier::Extended,
                 correction_threshold: config::ReviewCorrectionThreshold::P2,
+                max_correction_rounds: Some(0),
             })
         ));
     }

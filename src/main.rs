@@ -3128,6 +3128,8 @@ async fn run_session(
                 cmd_orchestrator.set_review_tier(updated_config.agent.review_tier);
                 cmd_orchestrator
                     .set_correction_threshold(updated_config.agent.correction_threshold);
+                cmd_orchestrator
+                    .set_max_correction_rounds(updated_config.agent.max_correction_rounds);
                 let _ = side_ui_event_tx.send(UiEvent::Info(
                     "reviewer and subagent configuration is active for the current primary session"
                         .to_string(),
@@ -3138,11 +3140,13 @@ async fn run_session(
                 enabled,
                 tier,
                 correction_threshold,
+                max_correction_rounds,
             } = &command
             {
                 cmd_orchestrator.set_review_enabled(*enabled);
                 cmd_orchestrator.set_review_tier(*tier);
                 cmd_orchestrator.set_correction_threshold(*correction_threshold);
+                cmd_orchestrator.set_max_correction_rounds(*max_correction_rounds);
                 continue;
             }
             if let UiCommand::RunReview { request } = command {
@@ -3245,6 +3249,7 @@ async fn run_session(
                 review_enabled: agent_config.discrete_review,
                 review_tier: agent_config.review_tier,
                 correction_threshold: agent_config.correction_threshold,
+                max_correction_rounds: agent_config.max_correction_rounds,
                 runtime_stall_minutes: ui_config.agent.runtime_stall_minutes,
                 primary_acp_name: roster.primary.launch.kind.display_name().to_string(),
                 primary_reasoning_effort: roster.primary.reasoning_effort.clone(),
