@@ -117,6 +117,7 @@ const RELAY_SEGMENT_BYTE_LIMIT: u64 = 1024 * 1024;
 /// journaled without their own snapshot write until this much has accumulated.
 const RELAY_SNAPSHOT_LAG_BYTE_LIMIT: usize = 1024 * 1024;
 const RELAY_HOT_EVENT_CAPACITY: usize = 32;
+const RELAY_REPLAY_CURSOR_CAPACITY: usize = 32;
 const NATIVE_SESSION_IDENTITY_FILE: &str = "native-session.json";
 
 /// Remove controller-only context that an ACP harness copied into a user-facing
@@ -177,6 +178,11 @@ pub struct DurableRelay {
     /// A small optimization for recent cursor validation. This is never the
     /// source of truth and is deliberately fixed-size.
     hot_events: VecDeque<RelayEvent>,
+    /// Digests proven while serving older replay pages. Controllers normally
+    /// return the previous page's frontier, so retaining those sparse cursors
+    /// avoids decompressing that segment again merely to validate the next
+    /// request. Event bodies remain on disk and authoritative.
+    replay_cursors: VecDeque<(u64, String)>,
     /// Journal bytes appended since `relay-state.json` last matched this
     /// snapshot. Zero means the durable file is exactly this state.
     unpersisted_journal_bytes: usize,
@@ -330,6 +336,7 @@ impl DurableRelay {
             snapshot,
             journal_spans,
             hot_events,
+            replay_cursors: VecDeque::new(),
             unpersisted_journal_bytes: 0,
             journal_generation: 0,
             acp_activity: AcpActivityClock::default(),
@@ -460,7 +467,7 @@ impl DurableRelay {
     pub fn events_after(&self, after_ordinal: u64, after_digest: &str) -> Result<Vec<RelayEvent>> {
         let plan = self.replay_plan();
         plan.validate_cursor(after_ordinal, after_digest)?;
-        plan.read_events_after(after_ordinal, usize::MAX)
+        plan.read_events_after(after_ordinal, after_digest, usize::MAX)
             .map(|page| page.events)
     }
 
@@ -480,6 +487,7 @@ impl DurableRelay {
                 .hot_events
                 .iter()
                 .map(|event| (event.ordinal, event.digest.clone()))
+                .chain(self.replay_cursors.iter().cloned())
                 .collect(),
             latest_ordinal: self.snapshot.latest_ordinal,
             latest_digest: self.snapshot.latest_digest.clone(),
@@ -491,6 +499,37 @@ impl DurableRelay {
             retained_digest: self.snapshot.retained_digest().to_owned(),
             generation: self.journal_generation,
         }
+    }
+
+    /// Retain a cursor this worker just proved while reading a replay page.
+    /// This is an optimization only: losing the cache causes another journal
+    /// validation scan, never a loss of durable history.
+    pub fn remember_replay_cursor(&mut self, response: &RelayResponseEnvelope) {
+        let RelayResponseBody::Ok {
+            payload:
+                RelayResponsePayload::Attached {
+                    through_ordinal,
+                    through_digest,
+                    ..
+                },
+        } = &response.body
+        else {
+            return;
+        };
+        if self
+            .replay_cursors
+            .back()
+            .is_some_and(|(ordinal, digest)| ordinal == through_ordinal && digest == through_digest)
+        {
+            return;
+        }
+        self.replay_cursors
+            .retain(|(ordinal, _)| ordinal != through_ordinal);
+        if self.replay_cursors.len() == RELAY_REPLAY_CURSOR_CAPACITY {
+            self.replay_cursors.pop_front();
+        }
+        self.replay_cursors
+            .push_back((*through_ordinal, through_digest.clone()));
     }
 
     /// Split an attach into the cheap part that needs the relay lock and the
@@ -1662,8 +1701,8 @@ struct RelayEventPage {
 /// of a real desynchronization.
 pub struct RelayReplayPlan {
     spans: Vec<RelayJournalSpan>,
-    /// Digests of the newest events, so a controller cursor near the frontier
-    /// validates without touching the disk at all.
+    /// Digests of recent live events and proven replay-page cursors, so the
+    /// next sequential attachment validates without touching old segments.
     hot_digests: Vec<(u64, String)>,
     latest_ordinal: u64,
     latest_digest: String,
@@ -1691,7 +1730,7 @@ impl RelayReplayPlan {
                 Some(self.desynchronized_detail(after_ordinal, after_digest)),
             )));
         }
-        let page = self.read_events_after(after_ordinal, RELAY_REPLAY_BYTE_BUDGET)?;
+        let page = self.read_events_after(after_ordinal, after_digest, RELAY_REPLAY_BYTE_BUDGET)?;
         ensure_serialized_budget(&state, RELAY_STATE_BYTE_BUDGET, "relay operational state")?;
         Ok(Ok(RelayResponsePayload::Attached {
             state,
@@ -1737,6 +1776,9 @@ impl RelayReplayPlan {
         if ordinal == self.recovery_floor_ordinal {
             return Ok(Some(self.recovery_floor_digest.clone()));
         }
+        if let Some((_, digest)) = self.hot_digests.iter().find(|(hot, _)| *hot == ordinal) {
+            return Ok(Some(digest.clone()));
+        }
         if let Some(span) = self.spans.iter().find(|span| {
             span.file_first_ordinal.checked_sub(1) == Some(ordinal) && ordinal >= span.after_ordinal
         }) {
@@ -1755,9 +1797,6 @@ impl RelayReplayPlan {
                 Ok(ControlFlow::Break(()))
             })?;
             return Ok(digest);
-        }
-        if let Some((_, digest)) = self.hot_digests.iter().find(|(hot, _)| *hot == ordinal) {
-            return Ok(Some(digest.clone()));
         }
         let Some(span) = self
             .spans
@@ -1790,13 +1829,19 @@ impl RelayReplayPlan {
         Ok(digest)
     }
 
-    fn read_events_after(&self, after_ordinal: u64, byte_budget: usize) -> Result<RelayEventPage> {
+    fn read_events_after(
+        &self,
+        after_ordinal: u64,
+        after_digest: &str,
+        byte_budget: usize,
+    ) -> Result<RelayEventPage> {
         let mut events = Vec::new();
         let mut used = 0_usize;
         let mut through_ordinal = after_ordinal;
-        let mut through_digest = self
-            .digest_at(after_ordinal)?
-            .ok_or_else(|| anyhow!("relay digest missing at event {after_ordinal}"))?;
+        // `attach` validated this exact cursor immediately before entering the
+        // reader. Reusing it avoids a second decompression pass over the
+        // cursor's sealed segment.
+        let mut through_digest = after_digest.to_owned();
         let mut page_full = false;
 
         for span in &self.spans {
@@ -2332,6 +2377,45 @@ mod tests {
         assert_eq!(cursor.ordinal, through_ordinal);
         assert_eq!(cursor.digest, through_digest);
         assert_eq!(state.latest_ordinal, planned_frontier);
+    }
+
+    #[test]
+    fn a_proven_replay_cursor_does_not_reread_its_old_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        record_paged_history(&mut relay, 80);
+        let first_request = attach_envelope(&relay, "first", 0);
+        let first = relay.handle(first_request);
+        let RelayResponseBody::Ok {
+            payload:
+                RelayResponsePayload::Attached {
+                    through_ordinal,
+                    through_digest,
+                    ..
+                },
+        } = &first.body
+        else {
+            panic!("first replay page failed: {:?}", first.body);
+        };
+        assert!(*through_ordinal < relay.latest_ordinal());
+        relay.remember_replay_cursor(&first);
+
+        let old_segment = relay
+            .journal_spans
+            .iter()
+            .find(|span| {
+                *through_ordinal > span.after_ordinal && *through_ordinal <= span.file_last_ordinal
+            })
+            .expect("the replay cursor belongs to a journal segment")
+            .path
+            .clone();
+        std::fs::rename(&old_segment, old_segment.with_extension("moved")).unwrap();
+
+        assert_eq!(
+            relay.digest_at(*through_ordinal).unwrap().as_deref(),
+            Some(through_digest.as_str()),
+            "validating the returned cursor must not reopen its old segment"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::hel_config::{ProjectBundle, ProjectRepository, atomic_write, data_dir};
 use crate::hel_project_memory::{ProjectMemoryIdentity, RepositoryMemoryIdentity};
 use crate::hel_session_manager::{
-    ProjectMemorySyncTarget, WorkerBinaryRefreshPlan, WorkerRecoveryPlan,
+    ProjectMemorySyncTarget, WorkerBinaryRefreshPlan, WorkerLaunchRefreshPlan, WorkerRecoveryPlan,
 };
 use crate::hel_targets::{
     self, CommandExecutor, CommandPlan, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
@@ -68,64 +68,8 @@ impl Controller {
             .is_none()
             .then(|| self.config.bundles.get(&session.bundle_id))
             .flatten();
-        let target_profile_home = target_profile_home(backend, session_id, profile);
-        let workspace = if let Some(project_directory) = &session.project_directory {
-            (project_directory.to_string_lossy().into_owned(), Vec::new())
-        } else {
-            workspace_paths(
-                backend,
-                bundle.context("session bundle is missing")?,
-                session_id,
-            )?
-        };
-        let mut additional_directories = workspace.1.iter().map(PathBuf::from).collect::<Vec<_>>();
-        additional_directories.extend(
-            session
-                .additional_mounts
-                .iter()
-                .map(|resource| resource.destination.clone()),
-        );
-        if profile.kind == crate::hel_config::HarnessKind::Deepseek
-            && !additional_directories.is_empty()
-        {
-            bail!(
-                "DeepSeek Harness ACP does not support multiple workspace roots; use a single-repository bundle"
-            );
-        }
-        // Some harnesses need the policy on their command line or in their
-        // environment, so resolve it before constructing the launch config.
-        let execution_policy = execution_policy(backend);
-        let (bridge_command, bridge_args) = bridge_launch(
-            profile.kind,
-            profile.executable.as_deref(),
-            execution_policy,
-        );
-        let mut environment = profile.environment.clone();
-        environment.insert(profile.home_env().into(), target_profile_home.clone());
-        profile
-            .kind
-            .configure_execution_environment(execution_policy, &mut environment);
-        let mut project_memory =
-            project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
-        project_memory.mcp_delivery = project_memory_mcp_delivery(profile.kind, backend);
-        if profile.kind == crate::hel_config::HarnessKind::Claude {
-            environment.insert(
-                "CLAUDE_CODE_PROJECT_DIR_NAME".into(),
-                project_memory_replica_slug(&project_memory.project_key, session_id),
-            );
-        }
-        let launch = WorkerLaunchConfig {
-            session_id: session_id.to_string(),
-            harness: profile.kind,
-            bridge_command: PathBuf::from(bridge_command),
-            bridge_args,
-            environment,
-            cwd: PathBuf::from(&workspace.0),
-            additional_directories,
-            native_session_id: session.native_session_id.clone(),
-            project_memory: Some(project_memory.clone()),
-            execution_policy,
-        };
+        let (launch, project_memory, target_profile_home) =
+            worker_launch_config(session, profile, bundle, backend, session_id)?;
 
         let staging = tempfile::tempdir().context("create worker staging directory")?;
         let launch_path = staging.path().join("launch.json");
@@ -200,10 +144,27 @@ impl Controller {
     /// session manager runs both off its async actor.
     pub fn worker_recovery_plan(&self, session_id: &str) -> Result<WorkerRecoveryPlan> {
         let (backend, worker_root) = self.worker_placement(session_id)?;
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let profile = self
+            .config
+            .profiles
+            .get(&session.last_profile)
+            .context("session profile is missing")?;
+        let bundle = session
+            .project_directory
+            .is_none()
+            .then(|| self.config.bundles.get(&session.bundle_id))
+            .flatten();
+        let (launch, _, _) = worker_launch_config(session, profile, bundle, &backend, session_id)?;
         Ok(WorkerRecoveryPlan {
             target: hel_targets::target_recovery_plan(&backend, session_id)?,
             liveness_probe: worker_liveness_command(&backend, &worker_root),
             binary_refresh: worker_binary_refresh_plan(&backend, session_id)?,
+            launch_refresh: Some(worker_launch_refresh_plan(&backend, session_id, &launch)?),
             restart: CommandPlan {
                 description: format!("restart Hel worker for session {session_id}"),
                 commands: vec![
@@ -250,6 +211,75 @@ impl Controller {
             canonical_root: canonical_memory_root(&launch.project_key),
         })
     }
+}
+
+fn worker_launch_config(
+    session: &crate::hel_state::SessionRecord,
+    profile: &crate::hel_config::HarnessProfile,
+    bundle: Option<&ProjectBundle>,
+    backend: &hel_targets::TargetLocator,
+    session_id: &str,
+) -> Result<(WorkerLaunchConfig, ProjectMemoryLaunchConfig, String)> {
+    let target_profile_home = target_profile_home(backend, session_id, profile);
+    let workspace = if let Some(project_directory) = &session.project_directory {
+        (project_directory.to_string_lossy().into_owned(), Vec::new())
+    } else {
+        workspace_paths(
+            backend,
+            bundle.context("session bundle is missing")?,
+            session_id,
+        )?
+    };
+    let mut additional_directories = workspace.1.iter().map(PathBuf::from).collect::<Vec<_>>();
+    additional_directories.extend(
+        session
+            .additional_mounts
+            .iter()
+            .map(|resource| resource.destination.clone()),
+    );
+    if profile.kind == crate::hel_config::HarnessKind::Deepseek
+        && !additional_directories.is_empty()
+    {
+        bail!(
+            "DeepSeek Harness ACP does not support multiple workspace roots; use a single-repository bundle"
+        );
+    }
+    let execution_policy = execution_policy(backend);
+    let (bridge_command, bridge_args) = bridge_launch(
+        profile.kind,
+        profile.executable.as_deref(),
+        execution_policy,
+    );
+    let mut environment = profile.environment.clone();
+    environment.insert(profile.home_env().into(), target_profile_home.clone());
+    profile
+        .kind
+        .configure_execution_environment(execution_policy, &mut environment);
+    let mut project_memory =
+        project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
+    project_memory.mcp_delivery = project_memory_mcp_delivery(profile.kind, backend);
+    if profile.kind == crate::hel_config::HarnessKind::Claude {
+        environment.insert(
+            "CLAUDE_CODE_PROJECT_DIR_NAME".into(),
+            project_memory_replica_slug(&project_memory.project_key, session_id),
+        );
+    }
+    Ok((
+        WorkerLaunchConfig {
+            session_id: session_id.to_string(),
+            harness: profile.kind,
+            bridge_command: PathBuf::from(bridge_command),
+            bridge_args,
+            environment,
+            cwd: PathBuf::from(&workspace.0),
+            additional_directories,
+            native_session_id: session.native_session_id.clone(),
+            project_memory: Some(project_memory.clone()),
+            execution_policy,
+        },
+        project_memory,
+        target_profile_home,
+    ))
 }
 
 fn project_memory_launch(
@@ -1455,6 +1485,77 @@ fn installed_worker_binary_replacement_plan(
     })
 }
 
+fn installed_file_digest_command(
+    locator: &hel_targets::TargetLocator,
+    path: &str,
+    purpose: &str,
+) -> CommandSpec {
+    match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sha256sum", [path]),
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", container_id, "sha256sum", path])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => {
+            CommandSpec::new("container", ["exec", container_id, "sha256sum", path])
+        }
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_spec(ssh, ["sha256sum", path])
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
+            ssh_command_spec(ssh, ["podman", "exec", container_id, "sha256sum", path])
+        }
+    }
+    .purpose(purpose)
+}
+
+fn worker_launch_refresh_plan(
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    launch: &WorkerLaunchConfig,
+) -> Result<WorkerLaunchRefreshPlan> {
+    let worker_root = hel_targets::worker_root(locator, session_id)?;
+    let installed = format!("{worker_root}/launch.json");
+    let staged = format!("{installed}.next");
+    let staged_arg = hel_targets::join_remote_command(std::slice::from_ref(&staged));
+    let installed_arg = hel_targets::join_remote_command(std::slice::from_ref(&installed));
+    let script = format!("umask 077; cat > {staged_arg} && mv -f -- {staged_arg} {installed_arg}");
+    let body = serde_json::to_vec_pretty(launch).context("serialize worker launch config")?;
+    let expected_sha256 = format!("{:x}", Sha256::digest(&body));
+    let replace = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", "-i", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => CommandSpec::new(
+            "container",
+            ["exec", "-i", container_id, "sh", "-c", &script],
+        ),
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_spec(ssh, ["sh", "-lc", &script])
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => ssh_command_spec(
+            ssh,
+            ["podman", "exec", "-i", container_id, "sh", "-c", &script],
+        ),
+    }
+    .purpose("replace stale Hel worker launch config")
+    .with_sensitive_stdin(body);
+    Ok(WorkerLaunchRefreshPlan {
+        expected_sha256,
+        installed_digest: installed_file_digest_command(
+            locator,
+            &installed,
+            "identify installed Hel worker launch config",
+        ),
+        replace: CommandPlan {
+            description: format!("replace stale Hel launch config for session {session_id}"),
+            commands: vec![replace],
+        },
+    })
+}
+
 /// Prepare a local refresh without hashing the controller binary. Digesting
 /// happens only after recovery has proved that the worker needs a restart.
 fn worker_binary_refresh_plan(
@@ -1482,23 +1583,14 @@ fn worker_binary_refresh_plan(
     };
     let worker_root = hel_targets::worker_root(locator, session_id)?;
     let installed = format!("{worker_root}/hel");
-    let installed_digest = match locator {
-        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sha256sum", [&installed]),
-        hel_targets::TargetLocator::LocalPodman { container_id } => {
-            CommandSpec::new("podman", ["exec", container_id, "sha256sum", &installed])
-        }
-        hel_targets::TargetLocator::AppleContainer { container_id } => {
-            CommandSpec::new("container", ["exec", container_id, "sha256sum", &installed])
-        }
-        hel_targets::TargetLocator::AwsEc2 { .. }
-        | hel_targets::TargetLocator::SshBare { .. }
-        | hel_targets::TargetLocator::SshPodman { .. } => unreachable!(),
-    }
-    .purpose("identify installed Hel worker binary");
     Ok(Some(WorkerBinaryRefreshPlan {
         replace: installed_worker_binary_replacement_plan(locator, session_id, &source)?,
         source,
-        installed_digest,
+        installed_digest: installed_file_digest_command(
+            locator,
+            &installed,
+            "identify installed Hel worker binary",
+        ),
     }))
 }
 

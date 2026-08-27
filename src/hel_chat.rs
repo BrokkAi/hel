@@ -1691,15 +1691,10 @@ impl ChatState {
                 self.set_config_options(&config_options)
             }
             RuntimeEvent::SessionModesConfigured { modes } => self.set_session_modes(modes),
-            RuntimeEvent::SessionStarted { resumed, .. } => self.entries.push(ChatEntry::plain(
-                seq,
-                ChatRole::System,
-                if resumed {
-                    "harness session resumed"
-                } else {
-                    "harness session started"
-                },
-            )),
+            RuntimeEvent::SessionStarted { resumed: false, .. } => self.entries.push(
+                ChatEntry::plain(seq, ChatRole::System, "harness session started"),
+            ),
+            RuntimeEvent::SessionStarted { resumed: true, .. } => {}
             _ => {}
         }
     }

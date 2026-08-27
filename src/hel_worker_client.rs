@@ -31,6 +31,19 @@ use crate::hel_worker::{
 };
 
 const RELAY_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_SLOW_OPERATION_WARNING: Duration = Duration::from_secs(5);
+/// Starting a target-side proxy may page the full worker executable in and
+/// traverse a container runtime before the relay sees `hello`. That is worker
+/// startup latency, not an ordinary in-connection RPC.
+const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
+/// An attachment can decompress a transport-sized page from cold journal
+/// segments. It remains bounded by the relay frame budget, but cold or loaded
+/// storage needs a filesystem deadline rather than an in-memory RPC deadline.
+const RELAY_HISTORY_TIMEOUT: Duration = Duration::from_secs(900);
+/// Advancing an acknowledgement can durably prune a large relay journal. The
+/// worker performs that maintenance before replying, so it needs a deadline
+/// sized for filesystem work rather than ordinary relay bookkeeping.
+const RELAY_ACKNOWLEDGE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A compaction request runs a full model turn in a scratch ACP session, so it
 /// outlives the deadline that suits the relay's bookkeeping calls.
 const RELAY_COMPACT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -38,15 +51,21 @@ const RELAY_COMPACT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Forward a relay proxy's stderr to the log, one line at a time, until the
 /// child closes it. Reporting rather than dropping keeps connect failures
 /// diagnosable now that the controller no longer shares its terminal.
-async fn drain_proxy_stderr(errors: tokio::process::ChildStderr, purpose: String) {
+async fn drain_proxy_stderr(
+    errors: tokio::process::ChildStderr,
+    purpose: String,
+    session_id: String,
+) {
     let mut lines = BufReader::new(errors).lines();
     loop {
         match lines.next_line().await {
             Ok(Some(line)) if line.trim().is_empty() => continue,
-            Ok(Some(line)) => tracing::warn!(%purpose, %line, "relay proxy stderr"),
+            Ok(Some(line)) => {
+                tracing::warn!(%session_id, %purpose, %line, "relay proxy stderr")
+            }
             Ok(None) => return,
             Err(error) => {
-                tracing::warn!(%purpose, %error, "read relay proxy stderr");
+                tracing::warn!(%session_id, %purpose, %error, "read relay proxy stderr");
                 return;
             }
         }
@@ -152,9 +171,9 @@ impl RelayTransportDead {
     }
 
     /// Whether the worker was reachable enough to run its liveness probe but
-    /// still failed to serve a fresh relay handshake. After repeated failures,
-    /// restarting that exact managed worker is safe: a shared target outage
-    /// cannot pass the liveness probe, while merely slow calls are not marked.
+    /// the proxy then disconnected or failed I/O during a fresh handshake.
+    /// Timeouts are deliberately not marked: a live proxy can be waiting on a
+    /// loaded container runtime or filesystem, which restarting only worsens.
     pub fn marks_failed_handshake(error: &anyhow::Error) -> bool {
         error
             .downcast_ref::<Self>()
@@ -165,9 +184,9 @@ impl RelayTransportDead {
 /// Whether an exchange is the handshake that proves the transport carries
 /// traffic at all.
 ///
-/// A handshake that never answers means the worker is not serving; a later
-/// call's timeout can just be a busy worker, and restarting that worker would
-/// be worse than waiting for it.
+/// A disconnected handshake proves the new transport never became usable. A
+/// timeout does not: the proxy launcher or worker can still be alive and slow,
+/// so timeout classification is handled separately in [`RelayClient::exchange`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExchangeKind {
     Handshake,
@@ -176,9 +195,9 @@ enum ExchangeKind {
 
 /// Controller-side connection to the durable ACP relay protocol.
 ///
-/// This type does not construct transcript state or request an unbounded
-/// history. Callers persist each attachment page, then acknowledge its
-/// `through` frontier only after committing it locally.
+/// This type does not construct transcript state or request unbounded history.
+/// Callers persist bounded attachment pages, then acknowledge only a frontier
+/// that is already durable locally.
 pub struct RelayClient {
     child: Option<Child>,
     input: Option<ChildStdin>,
@@ -198,13 +217,30 @@ pub struct RelayClient {
 
 impl RelayClient {
     pub async fn connect(spec: &CommandSpec, expected_session_id: &str) -> Result<Self> {
-        Self::connect_with_timeout(spec, expected_session_id, RELAY_RPC_TIMEOUT).await
+        Self::connect_with_timeouts(
+            spec,
+            expected_session_id,
+            RELAY_RPC_TIMEOUT,
+            RELAY_HANDSHAKE_TIMEOUT,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn connect_with_timeout(
         spec: &CommandSpec,
         expected_session_id: &str,
         request_timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_with_timeouts(spec, expected_session_id, request_timeout, request_timeout)
+            .await
+    }
+
+    async fn connect_with_timeouts(
+        spec: &CommandSpec,
+        expected_session_id: &str,
+        request_timeout: Duration,
+        handshake_timeout: Duration,
     ) -> Result<Self> {
         let mut child = Command::new(&spec.program)
             .args(&spec.args)
@@ -220,7 +256,8 @@ impl RelayClient {
             .with_context(|| format!("start session relay proxy for {}", spec.purpose))?;
         if let Some(errors) = child.stderr.take() {
             let purpose = spec.purpose.clone();
-            tokio::spawn(drain_proxy_stderr(errors, purpose));
+            let session_id = expected_session_id.to_owned();
+            tokio::spawn(drain_proxy_stderr(errors, purpose, session_id));
         }
         let input = child
             .stdin
@@ -242,16 +279,22 @@ impl RelayClient {
             next_request: 1,
             connection_nonce: u64::from_le_bytes(nonce_bytes),
             protocol_version: RELAY_PROTOCOL_VERSION,
-            session_id: String::new(),
+            // Keep the expected identity from process creation onward so a
+            // handshake failure and the dropped proxy that follows it remain
+            // attributable even when Hello never returns a session ID.
+            session_id: expected_session_id.to_owned(),
             relay_version: String::new(),
             latest_ordinal: 0,
             latest_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
         };
         let response = client
-            .call_hello(RelayRequest::Hello {
-                controller_version: env!("CARGO_PKG_VERSION").to_owned(),
-                supported: RelayVersionRange::CURRENT,
-            })
+            .call_hello(
+                RelayRequest::Hello {
+                    controller_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    supported: RelayVersionRange::CURRENT,
+                },
+                handshake_timeout,
+            )
             .await?;
         let RelayResponsePayload::Hello {
             negotiated,
@@ -308,10 +351,13 @@ impl RelayClient {
     ) -> Result<RelayAttachment> {
         let after_digest = after_digest.into();
         match self
-            .call(RelayRequest::Attach {
-                after_ordinal,
-                after_digest: after_digest.clone(),
-            })
+            .call_with_timeout(
+                RelayRequest::Attach {
+                    after_ordinal,
+                    after_digest: after_digest.clone(),
+                },
+                RELAY_HISTORY_TIMEOUT,
+            )
             .await?
         {
             RelayResponsePayload::Attached {
@@ -347,8 +393,9 @@ impl RelayClient {
     }
 
     /// Start a bounded catch-up by capturing the relay frontier before the
-    /// caller applies anything. Callers persist and acknowledge `first_page`,
-    /// then request further pages with [`Self::next_catch_up_page`].
+    /// caller applies anything. Callers persist `first_page`, request further
+    /// pages with [`Self::next_catch_up_page`], and may acknowledge the fixed
+    /// frontier after all of those pages are durable.
     pub async fn begin_catch_up(
         &mut self,
         after_ordinal: u64,
@@ -396,10 +443,13 @@ impl RelayClient {
         through_digest: impl Into<String>,
     ) -> Result<RelayCursor> {
         match self
-            .call(RelayRequest::Acknowledge {
-                through_ordinal,
-                through_digest: through_digest.into(),
-            })
+            .call_with_timeout(
+                RelayRequest::Acknowledge {
+                    through_ordinal,
+                    through_digest: through_digest.into(),
+                },
+                RELAY_ACKNOWLEDGE_TIMEOUT,
+            )
             .await?
         {
             RelayResponsePayload::Acknowledged {
@@ -664,7 +714,11 @@ impl RelayClient {
             .with_context(|| format!("relay {} could not perform {operation}", self.relay_version))
     }
 
-    async fn call_hello(&mut self, request: RelayRequest) -> Result<RelayResponsePayload> {
+    async fn call_hello(
+        &mut self,
+        request: RelayRequest,
+        timeout: Duration,
+    ) -> Result<RelayResponsePayload> {
         let operation = request.method_name();
         let request_id = self.request_id();
         let envelope = RelayRequestEnvelope {
@@ -672,7 +726,6 @@ impl RelayClient {
             protocol_version: RELAY_PROTOCOL_VERSION,
             request,
         };
-        let timeout = self.request_timeout;
         let line = self
             .exchange(&envelope, operation, timeout, ExchangeKind::Handshake)
             .await?;
@@ -703,6 +756,7 @@ impl RelayClient {
             bail!("relay {operation} request frame is too large");
         }
         frame.push(b'\n');
+        let session_id = self.session_id.clone();
         let exchanged = tokio::time::timeout(timeout, async {
             self.input
                 .as_mut()
@@ -718,8 +772,22 @@ impl RelayClient {
                 .await
                 .map_err(|error| RelayTransportDead::from_io(error, kind))
                 .with_context(|| format!("flush relay {operation} request"))?;
-            read_bounded_frame(&mut self.output, kind)
-                .await
+            let response = read_bounded_frame(&mut self.output, kind);
+            tokio::pin!(response);
+            let response = tokio::select! {
+                response = &mut response => response,
+                () = tokio::time::sleep(RELAY_SLOW_OPERATION_WARNING) => {
+                    tracing::warn!(
+                        %session_id,
+                        %operation,
+                        warning_after_seconds = RELAY_SLOW_OPERATION_WARNING.as_secs_f64(),
+                        timeout_seconds = timeout.as_secs_f64(),
+                        "relay operation is still waiting for its response"
+                    );
+                    response.await
+                }
+            };
+            response
                 .with_context(|| format!("read relay {operation} response"))?
                 .ok_or_else(|| {
                     anyhow::Error::new(RelayTransportDead::during_exchange(
@@ -733,16 +801,17 @@ impl RelayClient {
             Ok(line) => line,
             Err(_elapsed) => {
                 let seconds = timeout.as_secs_f64();
+                tracing::warn!(
+                    %session_id,
+                    %operation,
+                    timeout_seconds = seconds,
+                    "relay operation timed out; abandoning its sequential connection"
+                );
                 self.abandoned = Some(format!(
                     "relay connection abandoned after {operation} timed out after {seconds} seconds"
                 ));
                 let timed_out = format!("relay {operation} timed out after {seconds} seconds");
-                match kind {
-                    ExchangeKind::Handshake => Err(anyhow::Error::new(
-                        RelayTransportDead::during_exchange(timed_out, kind),
-                    )),
-                    ExchangeKind::Call => Err(anyhow!(timed_out)),
-                }
+                Err(anyhow!(timed_out))
             }
         }
     }
@@ -1567,9 +1636,11 @@ sys.stdin.read()
             .expect("silent relay must time out");
 
         assert!(error.to_string().contains("relay hello timed out"));
-        // A handshake that never answers means the transport carries nothing.
-        assert!(RelayTransportDead::marks(&error), "{error:#}");
-        assert!(RelayTransportDead::marks_failed_handshake(&error));
+        // The launcher is still alive. A loaded target can look exactly like
+        // this while starting its proxy, so worker recovery must not restart
+        // the native session merely because the deadline elapsed.
+        assert!(!RelayTransportDead::marks(&error), "{error:#}");
+        assert!(!RelayTransportDead::marks_failed_handshake(&error));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

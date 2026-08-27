@@ -1178,6 +1178,10 @@ mod unix {
                 .await
                 .context("assemble relay replay page")?;
             if !matches!(response.body, RelayResponseBody::Error { .. }) {
+                let mut guard = relay.lock().expect("relay state lock poisoned");
+                if guard.journal_generation() == generation {
+                    guard.remember_replay_cursor(&response);
+                }
                 return Ok(response);
             }
             let replanned = {

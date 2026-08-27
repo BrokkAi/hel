@@ -1775,6 +1775,14 @@ pub struct ProjectionPage<'a> {
     transaction: Transaction<'a>,
     applied_ordinal: u64,
     applied_digest: String,
+    dirty: bool,
+    pending: MaterializedSessionMutation,
+    pending_transcript: BTreeMap<String, PendingTranscriptMutation>,
+}
+
+struct PendingTranscriptMutation {
+    final_mutation: TranscriptMutation,
+    remove_before_upsert: bool,
 }
 
 impl ProjectionPage<'_> {
@@ -1822,19 +1830,79 @@ impl ProjectionPage<'_> {
             );
         }
 
-        let tx = &self.transaction;
         if let Some(activity_at_ms) = mutation.last_activity_at_ms {
-            tx.execute(
-                "UPDATE materialized_sessions
-                 SET last_activity_at_ms = CASE
-                     WHEN last_activity_at_ms IS NULL OR last_activity_at_ms < ?2 THEN ?2
-                     ELSE last_activity_at_ms
-                 END
-                 WHERE session_id = ?1",
-                params![session_id, activity_at_ms],
-            )?;
+            self.pending.last_activity_at_ms = Some(
+                self.pending
+                    .last_activity_at_ms
+                    .map_or(activity_at_ms, |existing| existing.max(activity_at_ms)),
+            );
         }
         if let Some(execution) = mutation.execution {
+            self.pending.execution = Some(execution);
+        }
+        if let Some(title) = &mutation.session_title {
+            if title.as_ref().is_some_and(|title| title.trim().is_empty()) {
+                bail!("materialized session title cannot be empty");
+            }
+            self.pending.session_title = Some(title.clone());
+        }
+        if let Some(configuration) = &mutation.configuration {
+            self.pending.configuration = Some(configuration.clone());
+        }
+        for item_mutation in &mutation.transcript {
+            match item_mutation {
+                TranscriptMutation::Upsert(item) => {
+                    item.validate(event_ordinal)?;
+                    let stable_id = item.stable_id.clone();
+                    let entry = self.pending_transcript.entry(stable_id).or_insert_with(|| {
+                        PendingTranscriptMutation {
+                            final_mutation: TranscriptMutation::Upsert(item.clone()),
+                            remove_before_upsert: false,
+                        }
+                    });
+                    entry.remove_before_upsert |=
+                        matches!(&entry.final_mutation, TranscriptMutation::Remove { .. });
+                    entry.final_mutation = TranscriptMutation::Upsert(item.clone());
+                }
+                TranscriptMutation::Remove { stable_id } => {
+                    if stable_id.trim().is_empty() {
+                        bail!("cannot remove a transcript item with an empty stable id");
+                    }
+                    let removed = TranscriptMutation::Remove {
+                        stable_id: stable_id.clone(),
+                    };
+                    self.pending_transcript
+                        .entry(stable_id.clone())
+                        .and_modify(|entry| entry.final_mutation = removed.clone())
+                        .or_insert(PendingTranscriptMutation {
+                            final_mutation: removed,
+                            remove_before_upsert: false,
+                        });
+                }
+            }
+        }
+        if let Some(queued_prompts) = &mutation.queued_prompts {
+            self.pending.queued_prompts = Some(queued_prompts.clone());
+        }
+        if let Some(pending_elicitations) = &mutation.pending_elicitations {
+            self.pending.pending_elicitations = Some(pending_elicitations.clone());
+        }
+        self.applied_ordinal = event_ordinal;
+        event_digest.clone_into(&mut self.applied_digest);
+        self.dirty = true;
+        Ok(ProjectionApplyOutcome::Applied)
+    }
+
+    /// Persist the coalesced final state of this page. Intermediate event
+    /// frontiers are useful only for chain validation: a page commits or rolls
+    /// back as a unit, so writing them individually adds no recovery value.
+    fn flush(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let tx = &self.transaction;
+        let session_id = self.session_id;
+        if let Some(execution) = self.pending.execution {
             let (state, started_at_ms) = materialized_execution_columns(execution);
             tx.execute(
                 "UPDATE materialized_sessions
@@ -1843,31 +1911,34 @@ impl ProjectionPage<'_> {
                 params![session_id, state, started_at_ms],
             )?;
         }
-        if let Some(title) = &mutation.session_title {
-            if title.as_ref().is_some_and(|title| title.trim().is_empty()) {
-                bail!("materialized session title cannot be empty");
-            }
+        if let Some(title) = &self.pending.session_title {
             tx.execute(
                 "UPDATE materialized_sessions SET session_title = ?2 WHERE session_id = ?1",
                 params![session_id, title],
             )?;
         }
-        if let Some(configuration) = &mutation.configuration {
+        if let Some(configuration) = &self.pending.configuration {
             tx.execute(
                 "UPDATE materialized_sessions SET configuration_json = ?2 WHERE session_id = ?1",
                 params![session_id, serde_json::to_string(configuration)?],
             )?;
         }
-        for item_mutation in &mutation.transcript {
-            match item_mutation {
+        for pending in self.pending_transcript.values() {
+            match &pending.final_mutation {
                 TranscriptMutation::Upsert(item) => {
-                    item.validate(event_ordinal)?;
+                    // A remove followed by an upsert deliberately starts a new
+                    // item identity. Preserve that boundary even though other
+                    // repeated updates are coalesced to one write.
+                    if pending.remove_before_upsert {
+                        tx.execute(
+                            "DELETE FROM materialized_transcript_items
+                             WHERE session_id = ?1 AND stable_id = ?2",
+                            params![session_id, item.stable_id],
+                        )?;
+                    }
                     upsert_transcript_item(tx, session_id, item)?;
                 }
                 TranscriptMutation::Remove { stable_id } => {
-                    if stable_id.trim().is_empty() {
-                        bail!("cannot remove a transcript item with an empty stable id");
-                    }
                     tx.execute(
                         "DELETE FROM materialized_transcript_items
                          WHERE session_id = ?1 AND stable_id = ?2",
@@ -1876,10 +1947,10 @@ impl ProjectionPage<'_> {
                 }
             }
         }
-        if let Some(queued_prompts) = &mutation.queued_prompts {
+        if let Some(queued_prompts) = &self.pending.queued_prompts {
             replace_materialized_queue(tx, session_id, queued_prompts)?;
         }
-        if let Some(pending_elicitations) = &mutation.pending_elicitations {
+        if let Some(pending_elicitations) = &self.pending.pending_elicitations {
             tx.execute(
                 "UPDATE materialized_sessions
                  SET pending_elicitations_json = ?2 WHERE session_id = ?1",
@@ -1888,13 +1959,22 @@ impl ProjectionPage<'_> {
         }
         tx.execute(
             "UPDATE materialized_sessions
-             SET applied_event_ordinal = ?2, applied_event_digest = ?3
+             SET last_activity_at_ms = CASE
+                     WHEN ?2 IS NULL THEN last_activity_at_ms
+                     WHEN last_activity_at_ms IS NULL OR last_activity_at_ms < ?2 THEN ?2
+                     ELSE last_activity_at_ms
+                 END,
+                 applied_event_ordinal = ?3,
+                 applied_event_digest = ?4
              WHERE session_id = ?1",
-            params![session_id, event_ordinal, event_digest],
+            params![
+                session_id,
+                self.pending.last_activity_at_ms,
+                self.applied_ordinal,
+                self.applied_digest,
+            ],
         )?;
-        self.applied_ordinal = event_ordinal;
-        event_digest.clone_into(&mut self.applied_digest);
-        Ok(ProjectionApplyOutcome::Applied)
+        Ok(())
     }
 }
 
@@ -1936,10 +2016,14 @@ fn apply_projection_page_to<T>(
         transaction,
         applied_ordinal,
         applied_digest,
+        dirty: false,
+        pending: MaterializedSessionMutation::default(),
+        pending_transcript: BTreeMap::new(),
     };
     // Dropping the page on failure rolls the whole transaction back, leaving
     // the projection at the frontier the relay last saw acknowledged.
     let filled = fill(&mut page)?;
+    page.flush()?;
     page.transaction.commit()?;
     Ok(filled)
 }
@@ -5012,6 +5096,85 @@ mod tests {
             vec!["item-1".to_owned(), "item-2".to_owned()]
         );
         assert_eq!(committed.last_activity_at_ms(), Some(1_002));
+    }
+
+    #[test]
+    fn projection_page_coalesces_repeated_item_updates_to_the_final_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+        let first = agent_message_mutation(1);
+        let mut second = agent_message_mutation(2);
+        let TranscriptMutation::Upsert(second_item) = &mut second.transcript[0] else {
+            unreachable!();
+        };
+        second_item.stable_id = "item-1".into();
+        second_item.position = 1;
+        second_item.created_at_ms = 1_001;
+        apply_projection_page_to(&database, "session-1", |page| {
+            page.apply(1, RELAY_EVENT_GENESIS_DIGEST, &event_digest(1), &first)?;
+            page.apply(2, &event_digest(1), &event_digest(2), &second)
+        })
+        .unwrap();
+
+        let committed = load_materialized_session_from(&database, "session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.applied_event_ordinal, 2);
+        assert_eq!(committed.transcript.len(), 1);
+        assert_eq!(committed.transcript[0].stable_id, "item-1");
+        assert_eq!(
+            committed.transcript[0].latest_content_event_ordinal,
+            Some(2)
+        );
+        let TranscriptBody::Agent { chunks, .. } = &committed.transcript[0].body else {
+            panic!("coalesced item stayed an agent message");
+        };
+        assert_eq!(chunks[0]["content"]["text"], "event 2");
+        assert_eq!(committed.last_activity_at_ms(), Some(1_002));
+    }
+
+    #[test]
+    fn projection_page_preserves_remove_then_reinsert_identity_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+        apply_projection_event_to(
+            &database,
+            "session-1",
+            1,
+            RELAY_EVENT_GENESIS_DIGEST,
+            &event_digest(1),
+            &agent_message_mutation(1),
+        )
+        .unwrap();
+
+        let removed = MaterializedSessionMutation {
+            transcript: vec![TranscriptMutation::Remove {
+                stable_id: "item-1".into(),
+            }],
+            ..MaterializedSessionMutation::default()
+        };
+        let mut reinserted = agent_message_mutation(3);
+        let TranscriptMutation::Upsert(reinserted_item) = &mut reinserted.transcript[0] else {
+            unreachable!();
+        };
+        reinserted_item.stable_id = "item-1".into();
+        apply_projection_page_to(&database, "session-1", |page| {
+            page.apply(2, &event_digest(1), &event_digest(2), &removed)?;
+            page.apply(3, &event_digest(2), &event_digest(3), &reinserted)
+        })
+        .unwrap();
+
+        let committed = load_materialized_session_from(&database, "session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.applied_event_ordinal, 3);
+        assert_eq!(committed.transcript.len(), 1);
+        assert_eq!(committed.transcript[0].stable_id, "item-1");
+        assert_eq!(committed.transcript[0].position, 3);
+        assert_eq!(committed.transcript[0].created_at_ms, 1_003);
     }
 
     /// The process caches which databases it has migrated. A database that is

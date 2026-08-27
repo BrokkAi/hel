@@ -17,7 +17,8 @@ use crate::hel_database::{
 };
 use crate::hel_elicitation::ElicitationResponse;
 use crate::hel_projection::{
-    apply_committed_projection_event, materialized_session_from_canonical, project_relay_event,
+    ProjectionIndex, apply_committed_projection_event_indexed, materialized_session_from_canonical,
+    project_relay_event_indexed,
 };
 use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
 use crate::hel_targets::{
@@ -70,12 +71,22 @@ pub struct WorkerRecoveryPlan {
     /// computed inside the recovery task so hashing a large binary never
     /// blocks a controller UI loop.
     pub binary_refresh: Option<WorkerBinaryRefreshPlan>,
+    /// Keep the worker executable and its launch schema paired. Configuration
+    /// bytes travel through redacted stdin only when their digest is stale.
+    pub launch_refresh: Option<WorkerLaunchRefreshPlan>,
     pub restart: CommandPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerBinaryRefreshPlan {
     pub source: PathBuf,
+    pub installed_digest: CommandSpec,
+    pub replace: CommandPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerLaunchRefreshPlan {
+    pub expected_sha256: String,
     pub installed_digest: CommandSpec,
     pub replace: CommandPlan,
 }
@@ -120,19 +131,42 @@ fn refresh_worker_binary_if_stale(
         return Ok(());
     };
     let expected = worker_binary_digest(&plan.source)?;
-    let installed = executor.execute(&plan.installed_digest);
-    if installed.as_ref().is_ok_and(|output| {
-        output.status == 0
-            && String::from_utf8_lossy(&output.stdout)
-                .split_whitespace()
-                .next()
-                .is_some_and(|digest| digest.eq_ignore_ascii_case(&expected))
-    }) {
+    if installed_digest_matches(executor, &plan.installed_digest, &expected) {
         return Ok(());
     }
     plan.replace
         .execute(executor)
         .context("replace stale relay worker binary")?;
+    Ok(())
+}
+
+fn installed_digest_matches(
+    executor: &impl CommandExecutor,
+    command: &CommandSpec,
+    expected: &str,
+) -> bool {
+    executor.execute(command).as_ref().is_ok_and(|output| {
+        output.status == 0
+            && String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .next()
+                .is_some_and(|digest| digest.eq_ignore_ascii_case(expected))
+    })
+}
+
+fn refresh_worker_launch_if_stale(
+    executor: &impl CommandExecutor,
+    plan: Option<&WorkerLaunchRefreshPlan>,
+) -> Result<()> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    if installed_digest_matches(executor, &plan.installed_digest, &plan.expected_sha256) {
+        return Ok(());
+    }
+    plan.replace
+        .execute(executor)
+        .context("replace stale relay worker launch config")?;
     Ok(())
 }
 
@@ -164,11 +198,13 @@ async fn recover_worker(
             "alive" if !restart_unresponsive => Ok(WorkerRecoveryOutcome::Alive),
             "alive" => {
                 refresh_worker_binary_if_stale(&executor, plan.binary_refresh.as_ref())?;
+                refresh_worker_launch_if_stale(&executor, plan.launch_refresh.as_ref())?;
                 plan.restart.execute(&executor)?;
                 Ok(WorkerRecoveryOutcome::RestartedUnresponsive)
             }
             "dead" => {
                 refresh_worker_binary_if_stale(&executor, plan.binary_refresh.as_ref())?;
+                refresh_worker_launch_if_stale(&executor, plan.launch_refresh.as_ref())?;
                 plan.restart.execute(&executor)?;
                 Ok(WorkerRecoveryOutcome::RestartedDead)
             }
@@ -894,6 +930,13 @@ async fn run_session_actor(
                         // retry, so report it at once rather than waiting for
                         // the unreachable threshold.
                         let integrity = projection_integrity_failure(&error);
+                        tracing::warn!(
+                            session_id = target.session_id,
+                            consecutive_failures = failures,
+                            projection_integrity = integrity,
+                            transport_dead = worker_connect_needs_restart(&error),
+                            "session relay sync failed: {error:#}"
+                        );
                         let recovery_due = !integrity
                             && failures >= UNREACHABLE_FAILURE_THRESHOLD
                             && worker_connect_needs_restart(&error)
@@ -1463,9 +1506,10 @@ impl StandaloneSession {
         Ok(changed)
     }
 
-    /// Apply and acknowledge one relay page at a time through the exact
-    /// frontier captured by the first response. This bounds memory by the
-    /// relay frame size and makes every completed page durable progress.
+    /// Apply relay pages through the exact frontier captured by the first
+    /// response, then acknowledge that frontier once. Every projection page is
+    /// independently durable; delaying the relay's GC watermark avoids one
+    /// snapshot fsync per transport-sized page without risking redelivery.
     async fn catch_up_fixed_frontier(&mut self) -> Result<()> {
         let after = RelayCursor {
             ordinal: self.materialized.applied_event_ordinal,
@@ -1493,6 +1537,20 @@ impl StandaloneSession {
             cursor == catch_up.frontier,
             "controller projection did not reach the captured relay frontier"
         );
+        if cursor.ordinal > 0 {
+            let acknowledged = self
+                .client
+                .acknowledge(cursor.ordinal, &cursor.digest)
+                .await?;
+            ensure!(
+                acknowledged == cursor,
+                "relay acknowledged cursor {}:{} instead of {}:{}",
+                acknowledged.ordinal,
+                acknowledged.digest,
+                cursor.ordinal,
+                cursor.digest,
+            );
+        }
         let mut operational = catch_up.state;
         operational.acknowledged_through = cursor.ordinal;
         operational.acknowledged_digest = cursor.digest;
@@ -1600,59 +1658,73 @@ impl StandaloneSession {
         self.client.install_prompt_context(text).await
     }
 
-    /// Apply one relay page and acknowledge it. The whole page commits in a
-    /// single projection transaction, so a failure part-way leaves both the
-    /// durable and the in-memory projection at the previous frontier and the
-    /// relay redelivers the page.
+    /// Apply one relay page. The whole page commits in a single projection
+    /// transaction, so a failure part-way leaves both the durable and the
+    /// in-memory projection at the previous frontier and the relay redelivers
+    /// the page. Catch-up advances the relay GC watermark after its last page.
     async fn apply_event_page(&mut self, page: RelayEventPage) -> Result<RelayCursor> {
-        let completed_prompt = page.events.iter().any(|event| {
-            matches!(
-                &event.observation,
-                crate::hel_worker::RelayObservation::CommandCompleted {
-                    outcome: crate::hel_worker::RelayCommandOutcome::Prompt { .. },
-                    ..
-                }
-            )
-        });
-        if completed_prompt {
-            self.sync_project_memory().await?;
-        }
         if !page.events.is_empty() {
-            // The in-memory projection advances on a working copy, so it is
-            // published only once the page it belongs to is durable.
-            let mut projection = self.materialized.clone();
-            let mut credential_sync_signal = None;
-            apply_projection_page(&self.materialized.session_id, |committed| {
-                for event in &page.events {
-                    let mutation = project_relay_event(&projection, event)?.mutation;
-                    match committed.apply(
-                        event.ordinal,
-                        &event.previous_digest,
-                        &event.digest,
-                        &mutation,
-                    )? {
-                        ProjectionApplyOutcome::Applied => {
-                            // The mutation commits with the page, so hand its
-                            // values to the projection rather than copying them
-                            // again.
-                            apply_committed_projection_event(&mut projection, event, mutation)?;
-                            if let Some(reason) = relay_event_credential_sync_reason(event) {
-                                credential_sync_signal = Some(CredentialSyncSignal {
-                                    ordinal: event.ordinal,
-                                    reason,
-                                });
+            let session_id = self.materialized.session_id.clone();
+            let events = page.events;
+            let projection = self.materialized.clone();
+            // Projection is CPU work and its durable page uses synchronous
+            // SQLite. Keep both off the async actor runtime so independent
+            // sessions stay responsive during a large catch-up.
+            let (projection, credential_sync_signal) = tokio::task::spawn_blocking(
+                move || -> Result<(MaterializedSession, Option<CredentialSyncSignal>)> {
+                    // The in-memory projection advances on a working copy and
+                    // is published only once its page is durable.
+                    let mut projection = projection;
+                    let mut projection_index = ProjectionIndex::new(&projection);
+                    let mut credential_sync_signal = None;
+                    apply_projection_page(&session_id, |committed| {
+                        for event in &events {
+                            let mutation = project_relay_event_indexed(
+                                &projection,
+                                &projection_index,
+                                event,
+                            )?
+                            .mutation;
+                            match committed.apply(
+                                event.ordinal,
+                                &event.previous_digest,
+                                &event.digest,
+                                &mutation,
+                            )? {
+                                ProjectionApplyOutcome::Applied => {
+                                    // The mutation commits with the page, so
+                                    // hand its values to the projection rather
+                                    // than copying them again.
+                                    apply_committed_projection_event_indexed(
+                                        &mut projection,
+                                        &mut projection_index,
+                                        event,
+                                        mutation,
+                                    )?;
+                                    if let Some(reason) =
+                                        relay_event_credential_sync_reason(event)
+                                    {
+                                        credential_sync_signal = Some(CredentialSyncSignal {
+                                            ordinal: event.ordinal,
+                                            reason,
+                                        });
+                                    }
+                                }
+                                ProjectionApplyOutcome::AlreadyApplied => {
+                                    bail!(
+                                        "session actor received relay event {} after its projection had already applied it",
+                                        event.ordinal
+                                    );
+                                }
                             }
                         }
-                        ProjectionApplyOutcome::AlreadyApplied => {
-                            bail!(
-                                "session actor received relay event {} after its projection had already applied it",
-                                event.ordinal
-                            );
-                        }
-                    }
-                }
-                Ok(())
-            })?;
+                        Ok(())
+                    })?;
+                    Ok((projection, credential_sync_signal))
+                },
+            )
+            .await
+            .context("relay projection page task failed")??;
             self.materialized = projection;
             if let Some(signal) = credential_sync_signal {
                 self.latest_credential_sync_signal = Some(signal);
@@ -1668,21 +1740,6 @@ impl StandaloneSession {
             self.materialized.applied_event_digest == page.through_digest,
             "relay page digest does not match its claimed frontier"
         );
-        if page.through_ordinal > 0 {
-            let acknowledged = self
-                .client
-                .acknowledge(page.through_ordinal, &page.through_digest)
-                .await?;
-            ensure!(
-                acknowledged.ordinal == page.through_ordinal
-                    && acknowledged.digest == page.through_digest,
-                "relay acknowledged cursor {}:{} instead of {}:{}",
-                acknowledged.ordinal,
-                acknowledged.digest,
-                page.through_ordinal,
-                page.through_digest,
-            );
-        }
         Ok(RelayCursor {
             ordinal: delivered_through,
             digest: self.materialized.applied_event_digest.clone(),
@@ -1893,6 +1950,7 @@ mod tests {
             liveness_probe: CommandSpec::new("printf", [format!("{liveness}\n")])
                 .purpose("probe test worker liveness"),
             binary_refresh: None,
+            launch_refresh: None,
             restart: CommandPlan {
                 description: "restart test worker".into(),
                 commands: vec![
@@ -1982,6 +2040,7 @@ mod tests {
                         ],
                     },
                 }),
+                launch_refresh: None,
                 restart: CommandPlan {
                     description: "restart test worker".into(),
                     commands: vec![restart],
@@ -2007,6 +2066,66 @@ mod tests {
         );
         assert!(refreshed.exists(), "a stale binary must be refreshed");
         assert!(restarted.exists(), "refresh must finish before restart");
+    }
+
+    #[tokio::test]
+    async fn recovery_refreshes_a_stale_launch_config_before_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let refreshed = directory.path().join("launch-refreshed");
+        let restarted = directory.path().join("worker-restarted");
+        let mut restart = CommandSpec::new(
+            "sh",
+            [
+                "-c",
+                "test -f \"$HEL_TEST_REFRESHED\" && touch -- \"$HEL_TEST_RESTARTED\"",
+            ],
+        )
+        .purpose("restart test worker");
+        restart.env.insert(
+            "HEL_TEST_REFRESHED".into(),
+            refreshed.to_string_lossy().into_owned(),
+        );
+        restart.env.insert(
+            "HEL_TEST_RESTARTED".into(),
+            restarted.to_string_lossy().into_owned(),
+        );
+        let outcome = recover_worker(
+            WorkerRecoveryPlan {
+                target: None,
+                liveness_probe: CommandSpec::new("printf", ["dead\n"])
+                    .purpose("probe test worker liveness"),
+                binary_refresh: None,
+                launch_refresh: Some(WorkerLaunchRefreshPlan {
+                    expected_sha256: "a".repeat(64),
+                    installed_digest: CommandSpec::new(
+                        "printf",
+                        [format!("{}  /worker/launch.json\n", "b".repeat(64))],
+                    )
+                    .purpose("identify test launch config"),
+                    replace: CommandPlan {
+                        description: "refresh test launch config".into(),
+                        commands: vec![
+                            CommandSpec::new("touch", [refreshed.to_string_lossy().into_owned()])
+                                .purpose("refresh test launch config"),
+                        ],
+                    },
+                }),
+                restart: CommandPlan {
+                    description: "restart test worker".into(),
+                    commands: vec![restart],
+                },
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, WorkerRecoveryOutcome::RestartedDead);
+        assert!(refreshed.exists());
+        assert!(
+            restarted.exists(),
+            "config refresh must finish before restart"
+        );
     }
 
     #[tokio::test]
@@ -2072,6 +2191,7 @@ mod tests {
                 }),
                 liveness_probe: liveness,
                 binary_refresh: None,
+                launch_refresh: None,
                 restart: CommandPlan {
                     description: "restart test worker".into(),
                     commands: vec![
@@ -2106,6 +2226,7 @@ mod tests {
                 }),
                 liveness_probe: CommandSpec::new("false", std::iter::empty::<&str>()),
                 binary_refresh: None,
+                launch_refresh: None,
                 restart: CommandPlan {
                     description: "must not restart".into(),
                     commands: vec![CommandSpec::new("false", std::iter::empty::<&str>())],
@@ -2624,6 +2745,7 @@ mod tests {
             liveness_probe: CommandSpec::new("printf", ["alive\n"])
                 .purpose("probe test relay worker"),
             binary_refresh: None,
+            launch_refresh: None,
             restart: CommandPlan {
                 description: "restart test relay worker".into(),
                 commands: vec![

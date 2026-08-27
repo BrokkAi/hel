@@ -148,6 +148,13 @@ impl CommandSpec {
         self.creates_target = true;
         self
     }
+
+    /// Feed private file content through the shared concurrent pipe handler.
+    /// The bytes stay out of argv, environments, serialization, and Debug.
+    pub(crate) fn with_sensitive_stdin(mut self, input: Vec<u8>) -> Self {
+        self.sensitive_stdin = Some(SensitiveCommandInput(input));
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

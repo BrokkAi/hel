@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use agent_client_protocol::schema::v1::{
     SessionConfigOptionCategory, SessionConfigValueId, SessionId, SessionModeState,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
     StopReason, TerminalExitStatus, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
-    TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    TextContent, ToolCallUpdateFields, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -42,6 +42,18 @@ use crate::hel_terminal::{
 };
 use crate::hel_worker::AcpActivityClock;
 use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery};
+
+/// Private ACP metadata is provider-local and has no Hel projection. In
+/// particular, Codex can replay terminal-output metadata for old tool calls on
+/// every `session/load`; journaling those invisible deltas grows the relay and
+/// makes every later recovery replay them again.
+fn session_update_is_relay_visible(update: &SessionUpdate) -> bool {
+    !matches!(
+        update,
+        SessionUpdate::ToolCallUpdate(update)
+            if update.fields == ToolCallUpdateFields::default()
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
@@ -110,7 +122,11 @@ fn new_session_request(spec: &LaunchSpec, include_project_memory: bool) -> NewSe
 fn load_session_request(spec: &LaunchSpec, session_id: SessionId) -> LoadSessionRequest {
     LoadSessionRequest::new(session_id, spec.cwd.clone())
         .additional_directories(spec.additional_directories.clone())
-        .mcp_servers(project_memory_mcp(spec))
+        // Loading must preserve the native session's original MCP set. Adding
+        // Hel's current project-memory server here mutates an existing Codex
+        // session and can make its history replay emit updates for tools whose
+        // creation was never part of this relay stream. New sessions receive
+        // the server above; resumed sessions keep whatever they began with.
         .meta(session_request_meta(spec))
 }
 
@@ -819,6 +835,12 @@ where
     let notification_activity = spec.acp_activity.clone();
     let session_update_count = Arc::new(AtomicU64::new(0));
     let notification_session_update_count = session_update_count.clone();
+    // A provider may replay the native transcript as `session/update`
+    // notifications while answering `session/load`. Hel already owns that
+    // history in its durable relay, so accepting the replay would duplicate
+    // every old turn on every restart. New sessions have no old history.
+    let session_updates_enabled = Arc::new(AtomicBool::new(spec.resume_session.is_none()));
+    let notification_session_updates_enabled = session_updates_enabled.clone();
     let permission_events = events.clone();
     let permission_activity = spec.acp_activity.clone();
     let ext_events = events.clone();
@@ -871,6 +893,12 @@ where
                         }
                         return Ok(());
                     }
+                }
+                if !notification_session_updates_enabled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if !session_update_is_relay_visible(&notification.update) {
+                    return Ok(());
                 }
                 let update = serde_json::to_value(notification.update).map_err(|error| {
                     agent_client_protocol::Error::internal_error().data(serde_json::Value::String(
@@ -1263,6 +1291,7 @@ where
                 session_elicitations,
                 opened,
                 session_update_count,
+                session_updates_enabled,
             )
             .await
             {
@@ -1557,6 +1586,7 @@ async fn drive_connection(
     pending_elicitations: PendingElicitations,
     opened: Arc<Mutex<Option<OpenedSession>>>,
     session_update_count: Arc<AtomicU64>,
+    session_updates_enabled: Arc<AtomicBool>,
 ) -> Result<Option<String>> {
     // Terminals belong to the connection. However the session ends — closed,
     // failed, or with its command channel dropped — their process groups must
@@ -1571,6 +1601,7 @@ async fn drive_connection(
         &pending_elicitations,
         opened,
         &session_update_count,
+        &session_updates_enabled,
     )
     .await;
     pending_elicitations
@@ -1623,6 +1654,7 @@ async fn serve_session(
     pending_elicitations: &PendingElicitations,
     opened: Arc<Mutex<Option<OpenedSession>>>,
     session_update_count: &AtomicU64,
+    session_updates_enabled: &AtomicBool,
 ) -> Result<Option<String>> {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal_output".into(), serde_json::Value::Bool(true));
@@ -1683,6 +1715,9 @@ async fn serve_session(
             .await;
         spec.acp_activity.mark();
         let loaded = loaded.with_context(|| format!("load ACP session {existing}"))?;
+        // The response is the boundary between provider replay and future
+        // live updates for this connection.
+        session_updates_enabled.store(true, Ordering::Release);
         Some((
             SessionId::from(existing.clone()),
             loaded.config_options,
@@ -2552,7 +2587,27 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
         SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions,
+        ToolCallUpdate,
     };
+
+    #[test]
+    fn private_tool_metadata_is_not_sent_to_the_durable_relay() {
+        let metadata_only = SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new("old-tool", ToolCallUpdateFields::default()).meta(
+                serde_json::Map::from_iter([(
+                    "terminal_output_delta".into(),
+                    serde_json::json!({"data": "replayed output"}),
+                )]),
+            ),
+        );
+        assert!(!session_update_is_relay_visible(&metadata_only));
+
+        let visible = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "old-tool",
+            ToolCallUpdateFields::new().title("updated"),
+        ));
+        assert!(session_update_is_relay_visible(&visible));
+    }
 
     #[test]
     fn project_memory_mcp_honors_harness_delivery_and_claude_native_memory() {
@@ -5028,6 +5083,18 @@ while True:
     if method == "initialize":
         write({{"jsonrpc": "2.0", "id": ident, "result": {{"protocolVersion": 1}}}})
     elif method in ("session/new", "session/load"):
+        servers = request.get("params", {{}}).get("mcpServers", [])
+        if method == "session/new":
+            assert len(servers) == 1, request
+        else:
+            assert not servers, request
+            write({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+                "sessionId": "scripted",
+                "update": {{
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {{"type": "text", "text": "replayed old history"}}
+                }}
+            }}}})
         write({{"jsonrpc": "2.0", "id": ident, "result": {{"sessionId": "scripted"}}}})
         if not second:
             open(marker, "w").close()
@@ -5049,7 +5116,13 @@ while True:
             environment: BTreeMap::new(),
             cwd: temp.path().to_path_buf(),
             additional_directories: Vec::new(),
-            project_memory: None,
+            project_memory: Some(ProjectMemoryLaunchConfig {
+                project_key: "abc".into(),
+                root: temp.path().join("memory"),
+                baseline_root: temp.path().join("baseline"),
+                repository_roots: BTreeMap::new(),
+                mcp_delivery: ProjectMemoryMcpDelivery::Acp,
+            }),
             resume_session: None,
             harness: HarnessKind::Kimi,
             execution_policy: ExecutionPolicy::ConfiguredApprovals,
@@ -5082,6 +5155,9 @@ while True:
                         "{message}"
                     );
                     saw_reload = true;
+                }
+                RuntimeEvent::SessionUpdate { update } => {
+                    panic!("resume replay leaked into the relay: {update}")
                 }
                 RuntimeEvent::Stopped => panic!("worker stopped before reloading the session"),
                 _ => {}
