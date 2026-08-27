@@ -1729,7 +1729,6 @@ mod tests {
             "remote",
             TargetTemplate::SshPodman {
                 ssh: ssh_connection(),
-                permissions: crate::hel_config::PermissionMode::Yolo,
                 container: container("ubuntu:24.04"),
             },
         )]);
@@ -1753,7 +1752,6 @@ mod tests {
             "remote",
             TargetTemplate::SshPodman {
                 ssh: ssh_connection(),
-                permissions: crate::hel_config::PermissionMode::Yolo,
                 container: remote,
             },
         )]);

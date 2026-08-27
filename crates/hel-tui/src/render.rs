@@ -1978,11 +1978,18 @@ mod tests {
             },
         );
         config.targets.insert(
-            "morannon".into(),
+            "morannon-podman".into(),
             hel::hel_config::TargetTemplate::SshPodman {
                 ssh: ssh("morannon"),
-                permissions: PermissionMode::Guardian,
                 container,
+            },
+        );
+        config.targets.insert(
+            "morannon-raw".into(),
+            hel::hel_config::TargetTemplate::SshBare {
+                ssh: ssh("morannon"),
+                permissions: PermissionMode::Guardian,
+                workspace_prefix: ".local/share/hel/workspaces".into(),
             },
         );
         let mut session = running_session();
@@ -1994,18 +2001,19 @@ mod tests {
             mount_history: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
-        let capacity_target = |id: &str| hel::hel_targets::DeploymentCapacityTarget {
-            id: format!("ssh:{id}"),
-            host: id.into(),
-            target_ids: vec![id.into()],
-            kind: DeploymentCapacityKind::Host,
-            local: false,
-            probes: Vec::new(),
-            probe_error: None,
-        };
+        let capacity_target =
+            |host: &str, target_ids: &[&str]| hel::hel_targets::DeploymentCapacityTarget {
+                id: format!("ssh:{host}"),
+                host: host.into(),
+                target_ids: target_ids.iter().map(|id| (*id).into()).collect(),
+                kind: DeploymentCapacityKind::Host,
+                local: false,
+                probes: Vec::new(),
+                probe_error: None,
+            };
         dashboard.set_deployment_capacity_targets(vec![
-            capacity_target("precision-3260"),
-            capacity_target("morannon"),
+            capacity_target("precision-3260", &["precision-3260"]),
+            capacity_target("morannon", &["morannon-podman", "morannon-raw"]),
         ]);
         let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
 
@@ -2026,7 +2034,11 @@ mod tests {
         };
         let rendered = lines.join("\n");
         assert!(rendered.contains("precision-3260 [Y]"), "{rendered}");
-        assert!(rendered.contains("morannon [G]"), "{rendered}");
+        assert!(
+            rendered.contains("morannon-podman, morannon-raw [G]"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("morannon-podman [G]"), "{rendered}");
         assert!(badge_has_color("[Y]", Color::Red), "{rendered}");
         assert!(badge_has_color("[G]", Color::Green), "{rendered}");
     }

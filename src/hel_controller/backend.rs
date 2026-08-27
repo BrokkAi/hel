@@ -1236,7 +1236,6 @@ mod tests {
                     "remote-container".into(),
                     TargetTemplate::SshPodman {
                         ssh: ssh("builder"),
-                        permissions: crate::hel_config::PermissionMode::Yolo,
                         container: container(),
                     },
                 ),
@@ -1315,7 +1314,6 @@ mod tests {
                 identity_file: None,
                 extra_args: vec![],
             },
-            permissions: crate::hel_config::PermissionMode::Yolo,
             container: ConfigContainer {
                 image: "ubuntu:24.04".into(),
                 pull_policy: Default::default(),
