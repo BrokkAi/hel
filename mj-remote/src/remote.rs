@@ -5345,6 +5345,7 @@ struct MjTeamRoleEntry {
 struct MjAgentsPanel {
     roles: Vec<MjRoleEntry>,
     discrete_review: bool,
+    mcp_discrete_review: bool,
     bifrost_analysis: bool,
     review_tier: String,
     review_tiers: Vec<MjReviewTierEntry>,
@@ -5541,6 +5542,7 @@ struct MjConfigApplyRequest {
     review_permission: Option<String>,
     subagents_permission: Option<String>,
     discrete_review: Option<bool>,
+    mcp_discrete_review: Option<bool>,
     bifrost_analysis: Option<bool>,
     /// `quick` | `extended`.
     review_tier: Option<String>,
@@ -6047,6 +6049,7 @@ fn mjconfig_snapshot_response(state: &ServerState, notice: Option<String>) -> Mj
         agents: MjAgentsPanel {
             roles,
             discrete_review: config.agent.discrete_review,
+            mcp_discrete_review: config.agent.mcp_discrete_review,
             bifrost_analysis: config.agent.bifrost_analysis,
             review_tier: config.agent.review_tier.as_str().to_string(),
             review_tiers: config::ReviewTier::ALL
@@ -6276,6 +6279,9 @@ fn mjconfig_apply_edits(
     }
     if let Some(enabled) = request.discrete_review {
         config.agent.discrete_review = enabled;
+    }
+    if let Some(enabled) = request.mcp_discrete_review {
+        config.agent.mcp_discrete_review = enabled;
     }
     if let Some(enabled) = request.bifrost_analysis {
         config.agent.bifrost_analysis = enabled;
@@ -12012,6 +12018,7 @@ mod tests {
                     "review_permission": "manual",
                     "subagents_permission": "yolo",
                     "discrete_review": false,
+                    "mcp_discrete_review": true,
                     "bifrost_analysis": false,
                     "review_tier": "extended",
                     "correction_threshold": "p1",
@@ -12050,6 +12057,7 @@ mod tests {
             "not reported this session"
         );
         assert_eq!(snapshot["agents"]["discrete_review"], false);
+        assert_eq!(snapshot["agents"]["mcp_discrete_review"], true);
         assert_eq!(snapshot["agents"]["bifrost_analysis"], false);
         assert_eq!(snapshot["agents"]["review_tier"], "extended");
         assert_eq!(snapshot["agents"]["review_tiers"][0]["tier"], "quick");
@@ -12086,6 +12094,7 @@ mod tests {
         let saved = config::Config::load(&config_path).expect("reload saved config");
         assert_eq!(saved.agent.model, "gpt-5-6-terra");
         assert!(!saved.agent.discrete_review);
+        assert!(saved.agent.mcp_discrete_review);
         assert!(!saved.agent.bifrost_analysis);
         assert_eq!(saved.agent.review_tier, config::ReviewTier::Extended);
         assert!(!saved.agent.review_tier_from_team_default);
@@ -13029,6 +13038,8 @@ if (permissionsEl.children.length !== 0 || permissionCards.size !== 0) {
         assert!(viewer.contains("delete mjcfg.edits.team;"));
         // A staged Team previews the panel settings its save will overwrite.
         assert!(viewer.contains("mjStagedTeamPreset()?.discrete_review ?? panel.discrete_review"));
+        assert!(viewer.contains("mcp_discrete_review"));
+        assert!(viewer.contains("MCP discrete review"));
         assert!(viewer.contains("mjStagedTeamPreset()?.review_tier ?? panel.review_tier"));
         assert!(viewer.contains("mjStagedTeamPreset()?.auto_failover ?? panel.auto_failover"));
         assert!(viewer.contains("function renderMjInput()"));
