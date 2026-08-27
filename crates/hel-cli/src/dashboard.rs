@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{self, Event};
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
@@ -43,7 +43,7 @@ use tokio_stream::StreamExt as _;
 use crate::dashboard::io::{
     ActiveLifecycleOperation, DashboardIoUpdate, LifecycleReload, checkpoint_archive_targets,
     spawn_checkpoint_archive_size_refresh, spawn_lifecycle_reload,
-    spawn_materialized_session_projection, spawn_project_source_resolution,
+    spawn_materialized_session_projection, spawn_project_source_resolution, spawn_recovery_reload,
     spawn_stored_session_summary,
 };
 use crate::import::{
@@ -54,7 +54,7 @@ use crate::pollers::{
     CapacityPollUpdate, CredentialSyncNotices, CredentialSyncSignalTracker, Feed, LifecycleUpdate,
     QuotaRefreshBatch, QuotaUpdate, ResourcePollTarget, ResourcePollUpdate, WorkerDiagnosisTracker,
     WorkerPollTarget, apply_worker_poll_update, complete_manual_quota_refresh,
-    dashboard_worker_targets, interrupted_close_session_ids, merge_recovery_result,
+    dashboard_worker_targets, interrupted_close_session_ids, merge_recovery_result_loaded,
     projected_queued_prompts, quota_refresh_profiles, refresh_dashboard_poll_targets,
     schedule_due_credential_syncs, spawn_dashboard_capacity_poller,
     spawn_dashboard_resource_poller, spawn_dashboard_worker_poller,
@@ -225,6 +225,12 @@ pub(crate) struct DashboardContext {
     /// At most one chat stays warm: the session opened last. Its feeds keep
     /// running off screen, so reopening it costs a draw rather than a rebuild.
     pub(crate) active_chat: Option<hel::hel_chat::ActiveChat>,
+    /// Session-manager attachment is asynchronous: an actor may need to
+    /// answer from a worker or relay before a chat can be built.
+    pub(crate) opening_chat_session: Option<String>,
+    /// Conversation-to-conversation navigation asks the newly opened chat to
+    /// retain focus in its conversation list after the async attachment.
+    pub(crate) opening_chat_focus_conversations: bool,
     /// The first pass always draws; after that a redraw needs a wakeup.
     pub(crate) dirty: bool,
     /// The notice generation the frame on screen was drawn from. Background
@@ -280,6 +286,10 @@ pub(crate) struct DashboardContext {
     pub(crate) import_discovery_id: u64,
     pub(crate) next_import_task_id: u64,
     pub(crate) active_import: Option<ActiveDashboardImport>,
+    /// At most one desktop clipboard IPC request is allowed at a time. The
+    /// request itself runs on a blocking worker; this flag keeps repeated
+    /// Ctrl-V key repeats from creating an unbounded queue of reads.
+    pub(crate) clipboard_read_in_flight: bool,
 
     pub(crate) dashboard_io_tx: UnboundedSender<DashboardIoUpdate>,
     dashboard_io: Feed<UnboundedReceiver<DashboardIoUpdate>>,
@@ -715,6 +725,8 @@ impl DashboardContext {
             events: Some(event::EventStream::new()),
             view: View::Dashboard,
             active_chat: None,
+            opening_chat_session: None,
+            opening_chat_focus_conversations: false,
             dirty: true,
             drawn_notice_generation: 0,
             controller_changed: true,
@@ -754,6 +766,7 @@ impl DashboardContext {
             import_discovery_id: 0,
             next_import_task_id: 0,
             active_import: None,
+            clipboard_read_in_flight: false,
             dashboard_io_tx,
             dashboard_io: Feed::new(dashboard_io_rx),
             materialized_projection_permits: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -969,27 +982,102 @@ impl DashboardContext {
         }
     }
 
-    /// Opens or reveals the chat for `session_id`, reporting a failure as a
-    /// notice rather than ending the run.
-    pub(crate) async fn hold_chat_session(&mut self, session_id: &str) -> Result<(), ()> {
-        match hold_chat_session(
-            &self.controller,
-            &self.dashboard,
-            &mut self.active_chat,
-            session_id,
-            &self.worker_commands_tx,
-            &self.recovery_observer,
-            self.notices.clone(),
-        )
-        .await
+    /// Opens or reveals the chat for `session_id` without waiting on the
+    /// session manager. Attaching can involve worker/relay I/O, so the result
+    /// comes back through the dashboard I/O channel and the current view stays
+    /// responsive while it is in flight.
+    pub(crate) fn open_chat_session(&mut self, session_id: &str) {
+        self.open_chat_session_with_focus(session_id, false);
+    }
+
+    fn open_chat_session_with_focus(&mut self, session_id: &str, focus_conversations: bool) {
+        if self
+            .active_chat
+            .as_ref()
+            .is_some_and(|chat| chat.session_id() == session_id && chat.session_feed_open())
         {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.dashboard
-                    .set_notice(format!("Could not open session: {error:#}"));
-                Err(())
+            if focus_conversations && let Some(chat) = self.active_chat.as_mut() {
+                chat.focus_conversations();
+            }
+            self.view = View::Chat;
+            self.acknowledge_visible_chat();
+            self.dirty = true;
+            return;
+        }
+        if self.opening_chat_session.as_deref() == Some(session_id) {
+            self.opening_chat_focus_conversations |= focus_conversations;
+            return;
+        }
+        if self.opening_chat_session.is_some() {
+            self.dashboard.set_notice("A session is already opening…");
+            return;
+        }
+        let Some(session_record) = self.controller.state.sessions.get(session_id).cloned() else {
+            self.dashboard.set_notice(format!(
+                "Could not open session: unknown session {session_id}"
+            ));
+            return;
+        };
+        let project_key = self.dashboard.project_source(&session_record).key;
+        let mut active = self
+            .controller
+            .state
+            .sessions
+            .values()
+            .filter(|record| {
+                record.state.is_active() && self.dashboard.project_source(record).key == project_key
+            })
+            .collect::<Vec<_>>();
+        active.sort_by(|left, right| left.compare_by_creation(right));
+        let mut header = hel::hel_chat::SessionHeaderIdentity::default();
+        for (position, record) in active.into_iter().enumerate() {
+            if record.id == session_id {
+                header.position = position;
+            } else {
+                header.others.push(hel::hel_chat::OtherSessionIdentity {
+                    session_id: record.id.clone(),
+                    position,
+                });
             }
         }
+        let recovery_context = hel::hel_state::RecoveryContext {
+            observer: self.recovery_observer.clone(),
+            session: session_record.clone(),
+            config: self.controller.config.clone(),
+        };
+        let sessions = self.worker_commands_tx.clone();
+        let notices = self.notices.clone();
+        let updates = self.dashboard_io_tx.clone();
+        let session_id = session_id.to_owned();
+        let bundle_id = session_record.bundle_id.clone();
+        let draft = session_record.draft_input.clone();
+        self.opening_chat_session = Some(session_id.clone());
+        self.opening_chat_focus_conversations = focus_conversations;
+        self.dashboard.set_notice("Opening session…");
+        tokio::spawn(async move {
+            let result = sessions
+                .session(session_id.clone())
+                .await
+                .map(|managed| {
+                    hel::hel_chat::ActiveChat::open(
+                        managed,
+                        &bundle_id,
+                        Some(recovery_context),
+                        sessions,
+                        header,
+                        draft,
+                        notices,
+                    )
+                })
+                .map_err(|error| format!("{error:#}"));
+            if let Err(error) = updates.send(DashboardIoUpdate::ChatOpened {
+                session_id,
+                result: Box::new(result),
+            }) {
+                tracing::debug!(%error, "chat-open result dropped after dashboard shutdown");
+            }
+        });
+        self.dirty = true;
     }
 
     /// Suspends the terminal for the setup dialog and takes back what it
@@ -1158,8 +1246,7 @@ impl DashboardContext {
 
     fn drain_recovery_results(&mut self) {
         while let Some(result) = self.recovery.next_ready() {
-            self.controller_changed = true;
-            apply_recovery_result(&mut self.controller, &mut self.dashboard, result);
+            spawn_recovery_reload(result, self.dashboard_io_tx.clone());
         }
     }
 
@@ -1368,13 +1455,7 @@ impl DashboardContext {
                 //
                 // The user arrived by walking the list, so the pane keeps focus
                 // and the next key walks on from here.
-                if self.hold_chat_session(&session_id).await.is_ok()
-                    && let Some(chat) = self.active_chat.as_mut()
-                {
-                    chat.focus_conversations();
-                    self.acknowledge_visible_chat();
-                }
-                self.dirty = true;
+                self.open_chat_session_with_focus(&session_id, true);
             }
             hel::hel_chat::ChatEventOutcome::Back {
                 last_seen_event_ordinal,
@@ -1440,104 +1521,6 @@ async fn next_terminal_event(
 
 /// Builds a chat view for one session: its identity, the other sessions it
 /// reports activity for, and its recovery context.
-async fn open_chat_view(
-    controller: &Controller,
-    dashboard: &DashboardState,
-    session_id: &str,
-    sessions: &SessionManagerControl,
-    recovery_observer: &RecoveryObserver,
-    notices: hel::hel_chat::Notices,
-) -> Result<hel::hel_chat::ActiveChat> {
-    let session_record = controller
-        .state
-        .sessions
-        .get(session_id)
-        .with_context(|| format!("unknown session {session_id}"))?
-        .clone();
-    let bundle_id = session_record.bundle_id.clone();
-    // Only a fresh view is seeded: a warm chat the loop kept alive holds newer
-    // input than this saved copy.
-    let saved_draft = session_record.draft_input.clone();
-    // Conversation switching stays inside the canonical source project. A
-    // managed worktree and its source checkout therefore remain together,
-    // while unrelated repositories never crowd this pane.
-    let project_key = dashboard.project_source(&session_record).key;
-    let mut active = controller
-        .state
-        .sessions
-        .values()
-        .filter(|record| {
-            record.state.is_active() && dashboard.project_source(record).key == project_key
-        })
-        .collect::<Vec<_>>();
-    active.sort_by(|left, right| left.compare_by_creation(right));
-    let mut header = hel::hel_chat::SessionHeaderIdentity::default();
-    for (position, record) in active.into_iter().enumerate() {
-        if record.id == session_id {
-            header.position = position;
-            continue;
-        }
-        header.others.push(hel::hel_chat::OtherSessionIdentity {
-            session_id: record.id.clone(),
-            position,
-        });
-    }
-    let recovery_context = hel::hel_state::RecoveryContext {
-        observer: recovery_observer.clone(),
-        session: session_record,
-        config: controller.config.clone(),
-    };
-    let managed = sessions.session(session_id.to_owned()).await?;
-    Ok(hel::hel_chat::ActiveChat::open(
-        managed,
-        &bundle_id,
-        Some(recovery_context),
-        sessions.clone(),
-        header,
-        saved_draft,
-        notices,
-    ))
-}
-
-/// Makes `session_id` the chat the loop holds. A warm chat for the same
-/// session is left as it is, so showing it costs a draw; any other session is
-/// opened fresh, which drops the previous chat and detaches its proxy.
-///
-/// A warm chat whose session actor has already been retired is not reused.
-/// Pause closes that actor after sealing the worker, and the view keeps the
-/// Closing/Closed snapshot; reopening attaches to the worker resume started.
-async fn hold_chat_session(
-    controller: &Controller,
-    dashboard: &DashboardState,
-    active_chat: &mut Option<hel::hel_chat::ActiveChat>,
-    session_id: &str,
-    sessions: &SessionManagerControl,
-    recovery_observer: &RecoveryObserver,
-    notices: hel::hel_chat::Notices,
-) -> Result<()> {
-    if active_chat
-        .as_ref()
-        .is_some_and(|chat| chat.session_id() == session_id && chat.session_feed_open())
-    {
-        // The warm chat is this session and still follows its worker, so
-        // showing it is only a redraw.
-        return Ok(());
-    }
-    let chat = open_chat_view(
-        controller,
-        dashboard,
-        session_id,
-        sessions,
-        recovery_observer,
-        notices,
-    )
-    .await?;
-    // Only one chat stays warm, so the previous one is dropped here; its
-    // supervisor detaches on drop.
-    *active_chat = Some(chat);
-    Ok(())
-}
-
 /// Records what leaving a chat produced — how far the user has read and the
 /// input they left unsent — and persists both in the background. A missing
 /// session is reported rather than fatal: the session itself is unaffected.
@@ -1589,9 +1572,9 @@ fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> Dashb
     }
 }
 
-fn apply_recovery_result(
-    controller: &mut Controller,
-    dashboard: &mut DashboardState,
+pub(super) fn apply_recovery_result_loaded(
+    context: &mut DashboardContext,
+    mut loaded: Controller,
     result: hel::hel_recovery::RecoveryResult,
 ) {
     let session_id = result.session_id.clone();
@@ -1601,14 +1584,21 @@ fn apply_recovery_result(
     } else {
         result.outcome.as_ref().err().cloned()
     };
-    if merge_recovery_result(controller, result) {
-        dashboard.set_state(controller.state.clone());
-        if let Some(detail) = failure {
-            dashboard.set_notice(format!(
-                "Recovery copy for {} failed: {detail}",
-                short_id(&session_id)
-            ));
-        }
+    let merged = merge_recovery_result_loaded(&mut loaded, result);
+    context.controller = loaded;
+    context
+        .dashboard
+        .set_config(context.controller.config.clone());
+    context
+        .dashboard
+        .set_state(context.controller.state.clone());
+    context.refresh_poll_targets();
+    context.controller_changed = true;
+    if merged && let Some(detail) = failure {
+        context.dashboard.set_notice(format!(
+            "Recovery copy for {} failed: {detail}",
+            short_id(&session_id)
+        ));
     }
 }
 

@@ -188,6 +188,27 @@ mod unix {
 
     pub(super) const ACP_EVENT_CHANNEL_CAPACITY: usize = 256;
 
+    #[derive(Clone)]
+    pub(super) struct ProjectMemoryEndpoint {
+        config: Option<super::ProjectMemoryLaunchConfig>,
+        io: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl ProjectMemoryEndpoint {
+        fn new(config: Option<super::ProjectMemoryLaunchConfig>) -> Self {
+            Self {
+                config,
+                io: Arc::new(tokio::sync::Semaphore::new(1)),
+            }
+        }
+    }
+
+    impl Default for ProjectMemoryEndpoint {
+        fn default() -> Self {
+            Self::new(None)
+        }
+    }
+
     struct SocketGuard(PathBuf);
 
     impl Drop for SocketGuard {
@@ -237,7 +258,7 @@ mod unix {
         let mut durable_relay =
             DurableRelay::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
         let resume_session = select_resume_session(&config, &durable_relay);
-        let project_memory = config.project_memory.clone();
+        let project_memory = ProjectMemoryEndpoint::new(config.project_memory.clone());
         if resume_session.is_none()
             && config.harness != HarnessKind::Claude
             && let Some(memory) = &config.project_memory
@@ -460,7 +481,7 @@ mod unix {
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
-        project_memory: Option<super::ProjectMemoryLaunchConfig>,
+        project_memory: ProjectMemoryEndpoint,
         fatal: mpsc::Sender<anyhow::Error>,
         mut fatal_reports: mpsc::Receiver<anyhow::Error>,
     ) -> Result<()> {
@@ -1220,7 +1241,7 @@ mod unix {
             relay,
             dispatch_wake,
             credentials,
-            None,
+            ProjectMemoryEndpoint::default(),
             commands,
             fatal,
         )
@@ -1232,7 +1253,7 @@ mod unix {
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
-        project_memory: Option<super::ProjectMemoryLaunchConfig>,
+        project_memory: ProjectMemoryEndpoint,
         commands: Option<mpsc::Sender<CommandRequest>>,
         fatal: mpsc::Sender<anyhow::Error>,
     ) -> Result<()> {
@@ -1241,6 +1262,11 @@ mod unix {
             .expect("relay state lock poisoned")
             .root()
             .to_path_buf();
+        let session_id = relay
+            .lock()
+            .expect("relay state lock poisoned")
+            .operational_state()
+            .session_id;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let mut checkpoint_barriers = BTreeSet::new();
@@ -1260,7 +1286,8 @@ mod unix {
                     } => {
                         let response =
                             unsupported_relay_method_response(request_id, protocol_version, method);
-                        write_response(&mut writer, &response).await?;
+                        write_logged_response(&mut writer, &response, &session_id, "unknown")
+                            .await?;
                         continue;
                     }
                     DecodedRelayRequest::Invalid {
@@ -1270,7 +1297,8 @@ mod unix {
                     } => {
                         let response =
                             invalid_relay_request_response(request_id, protocol_version, message);
-                        write_response(&mut writer, &response).await?;
+                        write_logged_response(&mut writer, &response, &session_id, "invalid")
+                            .await?;
                         continue;
                     }
                 };
@@ -1288,8 +1316,9 @@ mod unix {
                     // Credential, token, and skills bytes stay on this connection.
                     // They never reach DurableRelay, its journal, or its
                     // command ledger.
+                    let operation = envelope.request.method_name();
                     let response = credential_response(envelope, &credentials, &relay_root).await;
-                    write_response(&mut writer, &response).await?;
+                    write_logged_response(&mut writer, &response, &session_id, operation).await?;
                     continue;
                 }
                 if matches!(
@@ -1297,8 +1326,9 @@ mod unix {
                     RelayRequest::ProjectMemorySnapshot
                         | RelayRequest::InstallProjectMemorySnapshot { .. }
                 ) {
-                    let response = project_memory_response(envelope, project_memory.as_ref()).await;
-                    write_response(&mut writer, &response).await?;
+                    let operation = envelope.request.method_name();
+                    let response = project_memory_response(envelope, &project_memory).await;
+                    write_logged_response(&mut writer, &response, &session_id, operation).await?;
                     continue;
                 }
                 if let RelayRequest::Compact { .. } = &envelope.request {
@@ -1308,25 +1338,47 @@ mod unix {
                     // connection; the controller drives it as a single
                     // sequential RPC.
                     let response = compaction_response(envelope, commands.as_ref()).await;
-                    write_response(&mut writer, &response).await?;
+                    write_logged_response(&mut writer, &response, &session_id, "compact").await?;
                     continue;
                 }
                 if let RelayRequest::RespondElicitation { .. } = &envelope.request {
                     // Form answers can contain private user input. They travel
                     // directly to the ACP runtime and never touch relay state.
                     let response = elicitation_response(envelope, commands.as_ref()).await;
-                    write_response(&mut writer, &response).await?;
+                    write_logged_response(
+                        &mut writer,
+                        &response,
+                        &session_id,
+                        "respond_elicitation",
+                    )
+                    .await?;
                     continue;
                 }
                 let wakes_dispatch = matches!(&envelope.request, RelayRequest::Submit { .. });
                 let checkpoint_change = checkpoint_change(&envelope.request);
-                let response = handle_request(&relay, envelope).await?;
+                let operation = envelope.request.method_name();
+                let response = match handle_request(&relay, envelope).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::error!(
+                            %session_id,
+                            %operation,
+                            "relay request handling failed: {error:#}"
+                        );
+                        return Err(error);
+                    }
+                };
                 if worker_root_was_removed(&response.body, &relay_root) {
                     // One report is enough; the daemon is already winding down.
-                    let _ = fatal.try_send(anyhow::anyhow!(
-                        "worker root {} was removed while the relay was serving",
-                        relay_root.display()
-                    ));
+                    report_fatal(
+                        &fatal,
+                        anyhow::anyhow!(
+                            "worker root {} was removed while the relay was serving",
+                            relay_root.display()
+                        ),
+                        &session_id,
+                        "worker root removed",
+                    );
                 }
                 let accepted = matches!(
                     &response.body,
@@ -1351,7 +1403,7 @@ mod unix {
                 // Dispatch is driven from durable state, not from delivery of
                 // the acknowledgement. A controller can disappear after its
                 // request reaches the relay but before the response write.
-                write_response(&mut writer, &response).await?;
+                write_logged_response(&mut writer, &response, &session_id, operation).await?;
             }
             Ok(())
         }
@@ -1367,10 +1419,15 @@ mod unix {
             ))),
         };
         if outcome.is_err() && !relay_root.is_dir() {
-            let _ = fatal.try_send(anyhow::anyhow!(
-                "worker root {} was removed while the relay was serving",
-                relay_root.display()
-            ));
+            report_fatal(
+                &fatal,
+                anyhow::anyhow!(
+                    "worker root {} was removed while the relay was serving",
+                    relay_root.display()
+                ),
+                &session_id,
+                "worker root removed",
+            );
         }
         outcome
     }
@@ -1567,9 +1624,33 @@ mod unix {
 
     /// Snapshot and install project memory off the socket task. These payloads
     /// are connection-only and are never journaled as conversation history.
+    pub(super) async fn run_serialized_project_memory_io<T, F>(
+        project_memory_io: &Arc<tokio::sync::Semaphore>,
+        operation: F,
+    ) -> std::result::Result<Result<T>, tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        // A timed-out client can abandon this future, but Tokio cannot cancel
+        // blocking filesystem work after it starts. Keep the permit inside
+        // that work so reconnects wait instead of piling more reads and fsyncs
+        // onto the degraded storage device.
+        let permit = project_memory_io
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("project memory I/O semaphore is never closed");
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await
+    }
+
     async fn project_memory_response(
         envelope: RelayRequestEnvelope,
-        memory: Option<&super::ProjectMemoryLaunchConfig>,
+        endpoint: &ProjectMemoryEndpoint,
     ) -> RelayResponseEnvelope {
         if !envelope.request.supported_at(envelope.protocol_version) {
             return incompatible_request_protocol_response(
@@ -1577,7 +1658,7 @@ mod unix {
                 envelope.protocol_version,
             );
         }
-        let body = match memory {
+        let body = match endpoint.config.as_ref() {
             None => RelayResponseBody::Error {
                 error: RelayProtocolError {
                     code: RelayErrorCode::InvalidState,
@@ -1589,7 +1670,7 @@ mod unix {
             Some(memory) => {
                 let memory = memory.clone();
                 let request = envelope.request.clone();
-                match tokio::task::spawn_blocking(move || {
+                match run_serialized_project_memory_io(&endpoint.io, move || {
                     apply_project_memory_request(&memory, &request)
                 })
                 .await
@@ -1874,6 +1955,29 @@ exec gh "$@"
         }
     }
 
+    fn report_fatal(
+        fatal: &mpsc::Sender<anyhow::Error>,
+        error: anyhow::Error,
+        session_id: &str,
+        reason: &str,
+    ) {
+        let detail = format!("{error:#}");
+        tracing::error!(
+            %session_id,
+            %reason,
+            error = %detail,
+            "relay daemon reported a fatal failure"
+        );
+        if let Err(send_error) = fatal.try_send(error) {
+            tracing::error!(
+                %session_id,
+                %reason,
+                error = %send_error,
+                "could not deliver relay fatal failure to daemon"
+            );
+        }
+    }
+
     fn release_checkpoint_barriers(
         relay: &Arc<Mutex<DurableRelay>>,
         dispatch_wake: &mpsc::Sender<()>,
@@ -1932,6 +2036,31 @@ exec gh "$@"
         Ok(())
     }
 
+    /// Protocol rejections are ordinary responses rather than Rust errors, so
+    /// the socket loop must log them explicitly. Keep this next to the write
+    /// boundary so every request route (including credentials and old
+    /// protocol methods) gets the same session and operation context.
+    async fn write_logged_response(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        response: &RelayResponseEnvelope,
+        session_id: &str,
+        operation: &str,
+    ) -> Result<()> {
+        if let RelayResponseBody::Error { error } = &response.body {
+            tracing::warn!(
+                %session_id,
+                %operation,
+                request_id = %response.request_id,
+                protocol_version = response.protocol_version,
+                relay_error_code = ?error.code,
+                relay_retryable = error.retryable,
+                error_message = %error.message,
+                "relay request returned an error"
+            );
+        }
+        write_response(writer, response).await
+    }
+
     pub(super) async fn forward_proxy_streams(
         mut client_read: impl tokio::io::AsyncRead + Unpin,
         mut client_write: impl tokio::io::AsyncWrite + Unpin,
@@ -1958,10 +2087,22 @@ exec gh "$@"
         .await
         {
             Ok(read) => read.context("read initial proxy stdin")?,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                tracing::debug!(
+                    operation = "proxy_initial_input",
+                    "relay proxy client sent no initial frame before the idle deadline"
+                );
+                return Ok(());
+            }
         };
         if first_count == 0 {
-            let _ = relay_write.shutdown().await;
+            if let Err(error) = relay_write.shutdown().await {
+                tracing::debug!(
+                    operation = "proxy_shutdown",
+                    %error,
+                    "could not close relay socket after proxy client EOF"
+                );
+            }
             return Ok(());
         }
         relay_write
@@ -1976,12 +2117,25 @@ exec gh "$@"
                     if count == 0 {
                         // Client is gone; flush any final in-flight response
                         // briefly, then exit.
-                        let _ = relay_write.shutdown().await;
-                        let _ = tokio::time::timeout(
+                        if let Err(error) = relay_write.shutdown().await {
+                            tracing::debug!(
+                                operation = "proxy_shutdown",
+                                %error,
+                                "could not close relay socket after proxy client EOF"
+                            );
+                        }
+                        if let Err(error) = tokio::time::timeout(
                             std::time::Duration::from_millis(500),
                             tokio::io::copy(&mut relay_read, &mut client_write),
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::debug!(
+                                operation = "proxy_final_response",
+                                %error,
+                                "could not forward the final relay response before proxy shutdown"
+                            );
+                        }
                         return Ok(());
                     }
                     relay_write
@@ -2062,7 +2216,13 @@ exec gh "$@"
                 }
             }
         };
-        let _ = child_stdin.shutdown().await;
+        if let Err(error) = child_stdin.shutdown().await {
+            tracing::debug!(
+                operation = "acp_supervisor_shutdown",
+                %error,
+                "could not close ACP bridge stdin before termination"
+            );
+        }
         terminate_process_group(pid, libc::SIGTERM);
         match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
             Ok(status) => {
@@ -5380,7 +5540,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx,
             test_credentials(),
-            None,
+            unix::ProjectMemoryEndpoint::default(),
             fatal_tx,
             fatal_rx,
         ));
@@ -6074,5 +6234,52 @@ mod relay_tests {
         )
         .unwrap();
         assert_eq!(baseline.snapshot().unwrap(), captured_replica);
+    }
+
+    #[tokio::test]
+    async fn abandoned_project_memory_requests_do_not_overlap_blocking_io() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_gate = gate.clone();
+        let first = tokio::spawn(async move {
+            unix::run_serialized_project_memory_io(&first_gate, move || {
+                first_started_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        first_started_rx.await.unwrap();
+
+        // Model a controller dropping its request future after its transport
+        // timeout. The blocking operation survives that cancellation.
+        first.abort();
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let second_gate = gate.clone();
+        let second = tokio::spawn(async move {
+            unix::run_serialized_project_memory_io(&second_gate, move || {
+                second_started_tx.send(()).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        let mut second_started_rx = std::pin::pin!(second_started_rx);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                &mut second_started_rx,
+            )
+            .await
+            .is_err(),
+            "abandoning a request released its in-flight filesystem permit"
+        );
+
+        release_first_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut second_started_rx)
+            .await
+            .expect("the queued request did not start after prior I/O completed")
+            .unwrap();
+        second.await.unwrap().unwrap().unwrap();
     }
 }

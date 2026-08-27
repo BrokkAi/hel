@@ -275,6 +275,13 @@ impl Controller {
             .cleanup_new_session_worktree_after_failure(session_id, executor)
             .err()
             .map(|cleanup_error| format!("{cleanup_error:#}"));
+        if let Some(cleanup_error) = &cleanup_error {
+            tracing::warn!(
+                session_id,
+                error = %cleanup_error,
+                "new-session worktree rollback reported a cleanup failure"
+            );
+        }
         let failure = apply_failed_new_session_rollback(
             &mut self.state,
             session_id,

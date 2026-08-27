@@ -29,12 +29,11 @@ use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected, RelayTransportDead};
 
 const SESSION_SYNC_INTERVAL: Duration = Duration::from_millis(150);
-const PROJECT_MEMORY_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// Ceiling for reconnect backoff. A worker that exited stays gone until the
 /// user acts, so retrying it every second only burns process spawns.
 const RECONNECT_BACKOFF_CEILING: Duration = Duration::from_secs(30);
-const UNREACHABLE_FAILURE_THRESHOLD: u32 = 4;
+const UNREACHABLE_FAILURE_THRESHOLD: u32 = 2;
 const WORKER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -347,6 +346,7 @@ pub struct ManagedSessionHandle {
 /// The actor queues them and forwards them in arrival order once the lease is
 /// released or dropped.
 pub struct ManagedSessionLease {
+    session_id: String,
     lease_id: Option<u64>,
     connection: Option<StandaloneSession>,
     releases: mpsc::UnboundedSender<ReturnedConnection>,
@@ -372,10 +372,17 @@ impl ManagedSessionLease {
             .take()
             .expect("managed session lease has already been released");
         let connection = self.connection.take();
-        let _ = self.releases.send(ReturnedConnection {
+        if let Err(error) = self.releases.send(ReturnedConnection {
             lease_id,
             connection,
-        });
+        }) {
+            tracing::warn!(
+                session_id = %self.session_id,
+                operation = "lease_release",
+                %error,
+                "session actor stopped before receiving released relay connection"
+            );
+        }
     }
 }
 
@@ -387,10 +394,17 @@ impl Drop for ManagedSessionLease {
         // Drop the proxy before telling the actor to reconnect so the relay
         // observes EOF and releases any abandoned checkpoint barrier first.
         drop(self.connection.take());
-        let _ = self.releases.send(ReturnedConnection {
+        if let Err(error) = self.releases.send(ReturnedConnection {
             lease_id,
             connection: None,
-        });
+        }) {
+            tracing::warn!(
+                session_id = %self.session_id,
+                operation = "lease_drop",
+                %error,
+                "session actor stopped before receiving dropped relay lease"
+            );
+        }
     }
 }
 
@@ -485,6 +499,7 @@ impl ManagedSessionHandle {
             .context("session manager stopped")?;
         let (lease_id, connection) = response.await.context("session manager stopped")??;
         Ok(ManagedSessionLease {
+            session_id: self.session_id.clone(),
             lease_id: Some(lease_id),
             connection: Some(connection),
             releases: self.releases.clone(),
@@ -584,19 +599,55 @@ enum ActorCommand {
 }
 
 impl ActorCommand {
-    fn reject(self, message: &str) {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Submit { .. } => "submit",
+            Self::Sync { .. } => "sync",
+            Self::RespondElicitation { .. } => "respond_elicitation",
+            Self::Lease { .. } => "lease",
+        }
+    }
+
+    fn reject(self, session_id: &str, message: &str) {
         match self {
             Self::Submit { reply, .. } => {
-                let _ = reply.send(Err(message.to_owned()));
+                if reply.send(Err(message.to_owned())).is_err() {
+                    tracing::debug!(
+                        %session_id,
+                        operation = "submit",
+                        "submit rejection receiver was already closed"
+                    );
+                }
             }
             Self::Sync { reply } => {
-                let _ = reply.send(Err(message.to_owned()));
+                if reply.send(Err(message.to_owned())).is_err() {
+                    tracing::debug!(
+                        %session_id,
+                        operation = "sync",
+                        "sync rejection receiver was already closed"
+                    );
+                }
             }
             Self::RespondElicitation { reply, .. } => {
-                let _ = reply.send(Err(message.to_owned()));
+                if reply.send(Err(message.to_owned())).is_err() {
+                    tracing::debug!(
+                        %session_id,
+                        operation = "respond_elicitation",
+                        "elicitation rejection receiver was already closed"
+                    );
+                }
             }
             Self::Lease { reply } => {
-                let _ = reply.send(Err(anyhow::anyhow!(message.to_owned())));
+                if reply
+                    .send(Err(anyhow::anyhow!(message.to_owned())))
+                    .is_err()
+                {
+                    tracing::debug!(
+                        %session_id,
+                        operation = "lease",
+                        "lease rejection receiver was already closed"
+                    );
+                }
             }
         }
     }
@@ -807,12 +858,18 @@ pub fn spawn_session_manager() -> Result<SessionManagerChannels> {
                         .filter(|actor| !actor.commands.is_closed())
                         .filter(|actor| desired_targets.get(&session_id) == Some(&actor.target))
                         .map(|actor| ManagedSessionHandle {
-                            session_id,
+                            session_id: session_id.clone(),
                             commands: actor.commands.clone(),
                             releases: actor.releases.clone(),
                             view: actor.view.clone(),
                         });
-                    let _ = reply.send(handle);
+                    if reply.send(handle).is_err() {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            operation = "session_lookup",
+                            "session lookup receiver was already closed"
+                        );
+                    }
                 }
                 joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
                     match joined {
@@ -1071,7 +1128,12 @@ async fn run_session_actor(
                 let Some(command) = command else { break };
                 lifecycle.set_retirement_requested(*retirement.borrow());
                 if !lifecycle.accepts_new_work() {
-                    command.reject("session target is changing");
+                    tracing::debug!(
+                        session_id = %target.session_id,
+                        operation = command.operation_name(),
+                        "rejecting relay operation while session target changes"
+                    );
+                    command.reject(&target.session_id, "session target is changing");
                     continue;
                 }
                 match command {
@@ -1100,9 +1162,21 @@ async fn run_session_actor(
                     }
                     ActorCommand::Sync { reply } => {
                         if lifecycle.is_leased() {
-                            let _ = reply.send(Err(
-                                "session is reserved for a lifecycle operation".into(),
-                            ));
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                operation = "sync",
+                                "rejecting sync while session is leased"
+                            );
+                            if reply
+                                .send(Err("session is reserved for a lifecycle operation".into()))
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    session_id = %target.session_id,
+                                    operation = "sync",
+                                    "sync rejection receiver was already closed"
+                                );
+                            }
                             continue;
                         }
                         let result = sync_actor_connection(
@@ -1120,7 +1194,21 @@ async fn run_session_actor(
                         if result.is_err() {
                             connection = None;
                         }
-                        let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                        if let Err(error) = &result {
+                            tracing::warn!(
+                                session_id = %target.session_id,
+                                operation = "sync",
+                                error = %error,
+                                "explicit relay synchronization failed"
+                            );
+                        }
+                    if reply.send(result.map_err(|error| format!("{error:#}"))).is_err() {
+                        tracing::debug!(
+                            session_id = %target.session_id,
+                            operation = "sync",
+                            "sync result receiver was already closed"
+                        );
+                    }
                     }
                     ActorCommand::RespondElicitation {
                         elicitation_id,
@@ -1128,9 +1216,21 @@ async fn run_session_actor(
                         reply,
                     } => {
                         if lifecycle.is_leased() {
-                            let _ = reply.send(Err(
-                                "session is reserved for a lifecycle operation".into(),
-                            ));
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                operation = "respond_elicitation",
+                                "rejecting elicitation response while session is leased"
+                            );
+                            if reply
+                                .send(Err("session is reserved for a lifecycle operation".into()))
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    session_id = %target.session_id,
+                                    operation = "respond_elicitation",
+                                    "elicitation rejection receiver was already closed"
+                                );
+                            }
                             continue;
                         }
                         let result = async {
@@ -1158,13 +1258,44 @@ async fn run_session_actor(
                             Err(ref error) if !is_final_rejection(error) => connection = None,
                             Err(_) => {}
                         }
-                        let _ = reply.send(result.map(|_| ()).map_err(|error| format!("{error:#}")));
+                        if let Err(error) = &result {
+                            tracing::warn!(
+                                session_id = %target.session_id,
+                                operation = "respond_elicitation",
+                                error = %error,
+                                "relay elicitation response failed"
+                            );
+                        }
+                        if reply
+                            .send(result.map(|_| ()).map_err(|error| format!("{error:#}")))
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                operation = "respond_elicitation",
+                                "elicitation result receiver was already closed"
+                            );
+                        }
                     }
                     ActorCommand::Lease { reply } => {
                         if lifecycle.is_leased() {
-                            let _ = reply.send(Err(anyhow::anyhow!(
-                                "session already has a lifecycle operation"
-                            )));
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                operation = "lease",
+                                "rejecting duplicate session lifecycle lease"
+                            );
+                            if reply
+                                .send(Err(anyhow::anyhow!(
+                                    "session already has a lifecycle operation"
+                                )))
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    session_id = %target.session_id,
+                                    operation = "lease",
+                                    "lease rejection receiver was already closed"
+                                );
+                            }
                             continue;
                         }
                         let lease_id = next_lease_id;
@@ -1184,6 +1315,14 @@ async fn run_session_actor(
                         });
                         if result.is_err() {
                             connection = None;
+                        }
+                        if let Err(error) = &result {
+                            tracing::warn!(
+                                session_id = %target.session_id,
+                                operation = "lease",
+                                error = %error,
+                                "could not acquire relay session lease"
+                            );
                         }
                         let acquired = result.is_ok();
                         match reply.send(result) {
@@ -1217,7 +1356,17 @@ async fn run_session_actor(
                     let retiring = *retirement.borrow();
                     while let Some(deferred) = deferred_submits.pop_front() {
                         if retiring {
-                            let _ = deferred.reply.send(Err("session target is changing".into()));
+                            if deferred
+                                .reply
+                                .send(Err("session target is changing".into()))
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    session_id = %target.session_id,
+                                    operation = "submit",
+                                    "deferred submit rejection receiver was already closed"
+                                );
+                            }
                             continue;
                         }
                         deliver_submit(
@@ -1242,7 +1391,17 @@ async fn run_session_actor(
     }
     // No caller may wait forever on a submission this actor will never deliver.
     for deferred in deferred_submits {
-        let _ = deferred.reply.send(Err("session manager stopped".into()));
+        if deferred
+            .reply
+            .send(Err("session manager stopped".into()))
+            .is_err()
+        {
+            tracing::debug!(
+                session_id = %target.session_id,
+                operation = "submit",
+                "deferred submit shutdown receiver was already closed"
+            );
+        }
     }
 }
 
@@ -1275,12 +1434,32 @@ async fn deliver_submit(
         );
         tracing::trace!(%ordinal, %command_id, "relay command accepted");
     }
+    if let Err(error) = result.as_ref() {
+        tracing::warn!(
+            session_id = %target.session_id,
+            operation = "submit",
+            %command_id,
+            retryable = !is_final_rejection(error),
+            error = %error,
+            "relay command submission failed"
+        );
+    }
     if let Err(error) = result.as_ref()
         && !is_final_rejection(error)
     {
         *connection = None;
     }
-    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+    if reply
+        .send(result.map_err(|error| format!("{error:#}")))
+        .is_err()
+    {
+        tracing::debug!(
+            session_id = %target.session_id,
+            operation = "submit",
+            %command_id,
+            "submit result receiver was already closed"
+        );
+    }
 }
 
 /// Whether the relay refused this request outright.
@@ -1301,7 +1480,7 @@ async fn submit_actor_command(
     command: &RelayCommand,
 ) -> Result<u64> {
     let mut first_error = None;
-    for _ in 0..2 {
+    for attempt in 1..=2 {
         if connection.is_none() {
             sync_actor_connection(target, connection).await?;
         }
@@ -1319,6 +1498,15 @@ async fn submit_actor_command(
             // an older worker does not understand would lose it.
             Err(error) if is_final_rejection(&error) => return Err(error),
             Err(error) => {
+                tracing::warn!(
+                    session_id = %target.session_id,
+                    operation = "submit",
+                    %command_id,
+                    attempt,
+                    retryable = true,
+                    error = %error,
+                    "retryable relay command failure; reconnecting"
+                );
                 if first_error.is_none() {
                     first_error = Some(format!("{error:#}"));
                 }
@@ -1424,13 +1612,11 @@ pub struct StandaloneSession {
     operational: RelayOperationalState,
     latest_credential_sync_signal: Option<CredentialSyncSignal>,
     project_memory: Option<ProjectMemorySyncTarget>,
-    last_memory_sync: Option<tokio::time::Instant>,
 }
 
 impl StandaloneSession {
     pub fn set_project_memory_target(&mut self, target: Option<ProjectMemorySyncTarget>) {
         self.project_memory = target;
-        self.last_memory_sync = None;
     }
 
     pub async fn connect(target: &RelaySessionTarget) -> Result<Self> {
@@ -1446,7 +1632,6 @@ impl StandaloneSession {
             operational,
             latest_credential_sync_signal: None,
             project_memory: target.project_memory.clone(),
-            last_memory_sync: None,
         };
         connection.sync_in_place().await?;
         Ok(connection)
@@ -1495,14 +1680,6 @@ impl StandaloneSession {
             || self.materialized.applied_event_ordinal != original_ordinal
             || self.materialized.applied_event_digest != original_digest
             || self.operational != original_operational;
-        if self.project_memory.is_some()
-            && self.operational.active_prompt.is_none()
-            && self
-                .last_memory_sync
-                .is_none_or(|last| last.elapsed() >= PROJECT_MEMORY_SYNC_INTERVAL)
-        {
-            self.sync_project_memory().await?;
-        }
         Ok(changed)
     }
 
@@ -1746,7 +1923,11 @@ impl StandaloneSession {
         })
     }
 
-    async fn sync_project_memory(&mut self) -> Result<()> {
+    /// Reconcile this worker's project-memory replica at an explicit durable
+    /// boundary. Normal relay attachment and polling must never perform this
+    /// filesystem work: a degraded target could otherwise turn reconnects
+    /// into an unbounded queue of timed-out snapshot writes.
+    pub async fn sync_project_memory(&mut self) -> Result<()> {
         let Some(target) = self.project_memory.clone() else {
             return Ok(());
         };
@@ -1778,32 +1959,27 @@ impl StandaloneSession {
         };
         let canonical_root = target.canonical_root;
         let session_id = self.materialized.session_id.clone();
-        let reconciliation = tokio::task::spawn_blocking(move || {
-            crate::hel_project_memory::reconcile_into_canonical(
+        let (reconciliation, worker_install_needed) = tokio::task::spawn_blocking(move || {
+            let reconciliation = crate::hel_project_memory::reconcile_into_canonical(
                 &canonical_root,
                 &baseline,
                 &replica,
                 &session_id,
-            )
+            )?;
+            let worker_install_needed =
+                reconciliation.merged != baseline || reconciliation.merged != replica;
+            Ok::<_, anyhow::Error>((reconciliation, worker_install_needed))
         })
         .await
         .context("project memory reconciliation task failed")??;
         for conflict in &reconciliation.conflicts {
             tracing::warn!(session_id = self.materialized.session_id, %conflict, "project memory conflict preserved");
         }
-        let conflicts = reconciliation.conflicts;
-        self.client
-            .install_project_memory_snapshot(reconciliation.merged)
-            .await?;
-        if !conflicts.is_empty() {
+        if worker_install_needed {
             self.client
-                .install_prompt_context(format!(
-                    "<hel-project-memory-conflicts>Concurrent project-memory edits were preserved in {}. Reconcile those documents with their original paths using the project memory tools; do not discard either version.</hel-project-memory-conflicts>",
-                    conflicts.join(", ")
-                ))
+                .install_project_memory_snapshot(reconciliation.merged)
                 .await?;
         }
-        self.last_memory_sync = Some(tokio::time::Instant::now());
         Ok(())
     }
 }
@@ -2645,6 +2821,8 @@ mod tests {
     const RETIRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_RETIRED_SUBMIT_CHILD";
     #[cfg(unix)]
     const RETURNED_LEASE_VIEW_TEST_CHILD: &str = "HEL_TEST_RETURNED_LEASE_VIEW_CHILD";
+    #[cfg(unix)]
+    const EXPLICIT_MEMORY_SYNC_TEST_CHILD: &str = "HEL_TEST_EXPLICIT_MEMORY_SYNC_CHILD";
     const LEASED_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
 
     /// Relay server half of the leased-submission tests. It does nothing unless
@@ -2698,6 +2876,42 @@ mod tests {
             "isolated {test} failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relay_attach_does_not_probe_or_install_project_memory() {
+        if std::env::var_os(EXPLICIT_MEMORY_SYNC_TEST_CHILD).is_none() {
+            run_in_isolated_child(
+                EXPLICIT_MEMORY_SYNC_TEST_CHILD,
+                "relay_attach_does_not_probe_or_install_project_memory",
+            );
+            return;
+        }
+        register_leased_relay_session();
+        let relay_root = tempfile::tempdir().unwrap();
+        let canonical = tempfile::tempdir().unwrap();
+        let mut target = leased_relay_target(relay_root.path());
+        target.project_memory = Some(ProjectMemorySyncTarget {
+            canonical_root: canonical.path().to_path_buf(),
+        });
+
+        let mut connection = StandaloneSession::connect(&target)
+            .await
+            .expect("relay attach must not depend on its memory endpoint");
+        assert!(
+            connection.project_memory.is_some(),
+            "attach must leave memory pending for an explicit checkpoint sync"
+        );
+
+        connection
+            .sync_project_memory()
+            .await
+            .expect("an explicit sync may detect a legacy memory endpoint");
+        assert!(
+            connection.project_memory.is_none(),
+            "the explicit sync reached the relay and disabled its unavailable endpoint"
         );
     }
 

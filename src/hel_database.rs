@@ -20,7 +20,7 @@ use crate::hel_state::{
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -428,6 +428,23 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 13 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE sessions
+                SET state = 'error'
+              WHERE state = 'lost'
+                AND EXISTS(
+                    SELECT 1
+                      FROM session_checkpoints
+                     WHERE session_checkpoints.session_id = sessions.session_id
+                );
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 13;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -621,8 +638,10 @@ fn migrate_destroying_session_state(connection: &Connection) -> Result<()> {
          PRAGMA user_version = 7;
          COMMIT;",
     );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
+    if migration.is_err()
+        && let Err(error) = connection.execute_batch("ROLLBACK;")
+    {
+        tracing::warn!(%error, "could not roll back durable-destroying-session migration");
     }
     let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
     migration.context("migrate durable destroying session state")?;
@@ -684,8 +703,10 @@ fn migrate_grok_harness_kind(connection: &Connection) -> Result<()> {
          PRAGMA user_version = 9;
          COMMIT;",
     );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
+    if migration.is_err()
+        && let Err(error) = connection.execute_batch("ROLLBACK;")
+    {
+        tracing::warn!(%error, "could not roll back Grok harness migration");
     }
     let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
     migration.context("migrate sessions table for the Grok Build harness")?;
@@ -760,8 +781,10 @@ fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
          PRAGMA user_version = 10;
          COMMIT;",
     );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
+    if migration.is_err()
+        && let Err(error) = connection.execute_batch("ROLLBACK;")
+    {
+        tracing::warn!(%error, "could not roll back stopped-session migration");
     }
     let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
     migration.context("migrate sessions table for the stopped session state")?;
@@ -822,8 +845,10 @@ fn migrate_deepseek_harness_kind(connection: &Connection) -> Result<()> {
          PRAGMA user_version = 11;
          COMMIT;",
     );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
+    if migration.is_err()
+        && let Err(error) = connection.execute_batch("ROLLBACK;")
+    {
+        tracing::warn!(%error, "could not roll back DeepSeek harness migration");
     }
     let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
     migration.context("migrate sessions table for DeepSeek Harness")?;
@@ -1014,28 +1039,53 @@ pub fn set_session_archived(session_id: &str, archived: bool) -> Result<()> {
 }
 
 /// Record that the managed target of an otherwise live session is definitively
-/// gone. The state predicate keeps a late poll result from overwriting a
-/// concurrent checkpoint or teardown transition.
-pub fn mark_session_target_lost(session_id: &str, detail: &str, updated_at: &str) -> Result<bool> {
-    mark_session_target_lost_to(&database_path(), session_id, detail, updated_at)
+/// gone. A verified checkpoint keeps the session recoverable as an error on the
+/// dashboard; without one, the session is lost. The state predicate keeps a
+/// late poll result from overwriting a concurrent lifecycle transition.
+pub fn mark_session_target_missing(
+    session_id: &str,
+    detail: &str,
+    updated_at: &str,
+) -> Result<Option<SessionState>> {
+    mark_session_target_missing_to(&database_path(), session_id, detail, updated_at)
 }
 
-fn mark_session_target_lost_to(
+fn mark_session_target_missing_to(
     path: &Path,
     session_id: &str,
     detail: &str,
     updated_at: &str,
-) -> Result<bool> {
-    let connection = open(path)?;
-    let changed = connection.execute(
+) -> Result<Option<SessionState>> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
         "UPDATE sessions
-         SET state = 'lost', last_error = ?2, updated_at = ?3
+         SET state = CASE
+                 WHEN EXISTS(
+                     SELECT 1 FROM session_checkpoints
+                     WHERE session_checkpoints.session_id = sessions.session_id
+                 ) THEN 'error'
+                 ELSE 'lost'
+             END,
+             last_error = ?2,
+             updated_at = ?3
          WHERE session_id = ?1
            AND state IN ('provisioning', 'running', 'disconnected', 'error')",
         params![session_id, detail, updated_at],
     )?;
     ensure!(changed <= 1, "updated {changed} sessions for {session_id}");
-    Ok(changed == 1)
+    let state = if changed == 1 {
+        let stored: String = tx.query_row(
+            "SELECT state FROM sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Some(parse_session_state(&stored))
+    } else {
+        None
+    };
+    tx.commit()?;
+    Ok(state)
 }
 
 fn set_session_archived_to(path: &Path, session_id: &str, archived: bool) -> Result<()> {
@@ -3460,44 +3510,101 @@ mod tests {
     }
 
     #[test]
-    fn missing_target_marks_only_a_live_session_lost() {
+    fn missing_target_keeps_a_checkpointed_session_recoverable_and_loses_one_without_checkpoint() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("hel.sqlite3");
         let mut live = session("session-1", "project-1");
         live.state = SessionState::Running;
         save_session_to(&database, &live).unwrap();
 
-        assert!(
-            mark_session_target_lost_to(
+        assert_eq!(
+            mark_session_target_missing_to(
                 &database,
                 "session-1",
                 "managed container is missing",
                 "2026-08-25T16:00:00Z",
             )
-            .unwrap()
+            .unwrap(),
+            Some(SessionState::Error)
         );
         let loaded = load_state_from(&database).unwrap();
-        let lost = &loaded.sessions["session-1"];
-        assert_eq!(lost.state, SessionState::Lost);
+        let recoverable = &loaded.sessions["session-1"];
+        assert_eq!(recoverable.state, SessionState::Error);
         assert_eq!(
-            lost.last_error.as_deref(),
+            recoverable.last_error.as_deref(),
             Some("managed container is missing")
         );
 
-        assert!(
-            !mark_session_target_lost_to(
+        assert_eq!(
+            mark_session_target_missing_to(
                 &database,
                 "session-1",
                 "late duplicate",
                 "2026-08-25T16:01:00Z",
             )
-            .unwrap()
+            .unwrap(),
+            Some(SessionState::Error)
         );
+
+        let mut unrecoverable = session("session-2", "project-1");
+        unrecoverable.state = SessionState::Running;
+        unrecoverable.checkpoint = None;
+        save_session_to(&database, &unrecoverable).unwrap();
+        assert_eq!(
+            mark_session_target_missing_to(
+                &database,
+                "session-2",
+                "managed container is missing",
+                "2026-08-25T16:02:00Z",
+            )
+            .unwrap(),
+            Some(SessionState::Lost)
+        );
+
         let loaded = load_state_from(&database).unwrap();
         assert_eq!(
             loaded.sessions["session-1"].last_error.as_deref(),
-            Some("managed container is missing")
+            Some("late duplicate")
         );
+        assert_eq!(loaded.sessions["session-2"].state, SessionState::Lost);
+
+        assert_eq!(
+            mark_session_target_missing_to(
+                &database,
+                "session-2",
+                "late duplicate",
+                "2026-08-25T16:03:00Z",
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn version_thirteen_restores_checkpointed_lost_sessions_to_recoverable_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let mut checkpointed = session("session-1", "project-1");
+        checkpointed.state = SessionState::Lost;
+        save_session_to(&database, &checkpointed).unwrap();
+        let mut without_checkpoint = session("session-2", "project-1");
+        without_checkpoint.state = SessionState::Lost;
+        without_checkpoint.checkpoint = None;
+        save_session_to(&database, &without_checkpoint).unwrap();
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "DELETE FROM schema_migrations WHERE version = 13;
+                 PRAGMA user_version = 12;",
+            )
+            .unwrap();
+        drop(connection);
+        forget_verified_schema(&database);
+
+        let loaded = load_state_from(&database).unwrap();
+        assert_eq!(loaded.sessions["session-1"].state, SessionState::Error);
+        assert_eq!(loaded.sessions["session-2"].state, SessionState::Lost);
     }
 
     #[test]

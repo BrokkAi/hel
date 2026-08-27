@@ -409,7 +409,14 @@ impl RecoveryObserver {
     /// Queues one observation for the coordinator. Returns as soon as the
     /// observation is queued; a stopped coordinator makes this a no-op.
     pub fn observe(&self, observation: RecoveryObservation) {
-        let _ = self.observations.send(observation);
+        let session_id = observation.session.id.clone();
+        if let Err(error) = self.observations.send(observation) {
+            tracing::debug!(
+                %session_id,
+                %error,
+                "recovery observation dropped because the coordinator stopped"
+            );
+        }
     }
 
     pub fn is_busy(&self, session_id: &str) -> bool {

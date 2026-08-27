@@ -74,13 +74,23 @@ impl PendingActionReplies {
         if matches!(action, ControllerAction::New { .. }) {
             self.0.insert(action_id, reply);
         } else {
-            let _ = reply.send(ActionOutcome::Accepted);
+            if reply.send(ActionOutcome::Accepted).is_err() {
+                tracing::debug!(
+                    action_id,
+                    "phone action acceptance reply dropped after client disconnect"
+                );
+            }
         }
     }
 
     fn resolve(&mut self, action_id: u64, outcome: ActionOutcome) {
-        if let Some(reply) = self.0.remove(&action_id) {
-            let _ = reply.send(outcome);
+        if let Some(reply) = self.0.remove(&action_id)
+            && reply.send(outcome).is_err()
+        {
+            tracing::debug!(
+                action_id,
+                "phone action completion reply dropped after client disconnect"
+            );
         }
     }
 }
@@ -109,6 +119,45 @@ struct ReadReceiptPersisted {
     session_id: String,
     result: std::result::Result<u64, String>,
     reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+struct ControllerReloaded {
+    result: std::result::Result<Controller, String>,
+}
+
+/// Loads durable controller state without occupying the phone control loop.
+/// The outer task observes blocking-task panics and reports a closed result
+/// channel instead of silently abandoning the refresh.
+fn spawn_controller_reload(completed: tokio::sync::mpsc::UnboundedSender<ControllerReloaded>) {
+    spawn_controller_reload_with(completed, Controller::load);
+}
+
+fn spawn_controller_reload_with(
+    completed: tokio::sync::mpsc::UnboundedSender<ControllerReloaded>,
+    load: impl FnOnce() -> Result<Controller> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let result = match tokio::task::spawn_blocking(load).await {
+            Ok(result) => result.map_err(|error| format!("{error:#}")),
+            Err(error) => Err(format!("controller reload task failed: {error}")),
+        };
+        if completed.send(ControllerReloaded { result }).is_err() {
+            tracing::debug!("controller reload completed after the phone control loop stopped");
+        }
+    });
+}
+
+fn request_controller_reload(
+    in_flight: &mut bool,
+    requested: &mut bool,
+    completed: &tokio::sync::mpsc::UnboundedSender<ControllerReloaded>,
+) {
+    if *in_flight {
+        *requested = true;
+    } else {
+        *in_flight = true;
+        spawn_controller_reload(completed.clone());
+    }
 }
 
 /// What one phone read receipt actually needs.
@@ -314,6 +363,11 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
             tokio::sync::mpsc::unbounded_channel::<PhoneActionStarted>();
         let (receipt_done_tx, mut receipt_done_rx) =
             tokio::sync::mpsc::unbounded_channel::<ReadReceiptPersisted>();
+        let (controller_reload_tx, mut controller_reload_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ControllerReloaded>();
+        let mut controller_reload_in_flight = false;
+        let mut controller_reload_requested = false;
+        let mut pending_action_errors = std::collections::BTreeMap::<String, String>::new();
         let mut active_actions = interrupted_close_ids
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
@@ -326,6 +380,20 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
         // exists to follow sessions, so losing that feed is a named failure
         // rather than a silent success.
         let mut failure: Option<anyhow::Error> = None;
+        macro_rules! publish_snapshot {
+            ($revision:expr) => {
+                if let Err(error) = snapshot_tx.send(viewer_snapshot(
+                    &controller,
+                    &quotas,
+                    &conversations,
+                    &queued_prompts,
+                    &active_user_shells,
+                    $revision,
+                )) {
+                    tracing::debug!(revision = $revision, %error, "phone snapshot delivery failed; no viewer is subscribed");
+                }
+            };
+        }
         loop {
             tokio::select! {
                 _ = termination.cancelled() => break,
@@ -338,14 +406,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             }
                             quotas.insert(outcome.report.profile_id.clone(), outcome.report);
                             revision += 1;
-                            let _ = snapshot_tx.send(viewer_snapshot(
-                                &controller,
-                                &quotas,
-                                &conversations,
-                                &queued_prompts,
-                                &active_user_shells,
-                                revision,
-                            ));
+                            publish_snapshot!(revision);
                         }
                         Some(QuotaUpdate::Refreshing { .. } | QuotaUpdate::Finished { .. }) => {}
                         None => {
@@ -408,14 +469,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                         );
                         revision += 1;
                         conversation_tx.send_replace(conversations.clone());
-                        let _ = snapshot_tx.send(viewer_snapshot(
-                            &controller,
-                            &quotas,
-                            &conversations,
-                            &queued_prompts,
-                            &active_user_shells,
-                            revision,
-                        ));
+                        publish_snapshot!(revision);
                     }
                 }
                 _ = recovery_tick.tick() => {
@@ -435,7 +489,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     if changed {
                         revision += 1;
-                        let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, &active_user_shells, revision));
+                        publish_snapshot!(revision);
                     }
                 }
                 completed = interrupted_close_rx.recv() => {
@@ -445,27 +499,11 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     if let Err(error) = &completed.result {
                         tracing::warn!(session_id = %completed.session_id, "could not resume interrupted close: {error}");
                     }
-                    if let Err(error) = controller.reload() {
-                        tracing::warn!(%error, "interrupted close completed but controller state could not be reloaded");
-                        continue;
-                    }
-                    worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
-                    credential_sync_handle.set_targets(credential_sync_targets(&controller));
-                    republish_quota_profiles(
-                        &controller,
-                        &mut published_quota_profiles,
-                        &mut quota_batch,
-                        &quota_profiles_tx,
+                    request_controller_reload(
+                        &mut controller_reload_in_flight,
+                        &mut controller_reload_requested,
+                        &controller_reload_tx,
                     );
-                    queued_prompts.retain(|session_id, _| {
-                        controller.state.sessions.contains_key(session_id)
-                    });
-                    conversations.retain(|id, _| {
-                        controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
-                    });
-                    revision += 1;
-                    conversation_tx.send_replace(conversations.clone());
-                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, &active_user_shells, revision));
                 }
                 receipt = receipt_rx.recv() => {
                     let Some(ReadReceiptRequest { session_id, through, reply }) = receipt else {
@@ -474,13 +512,17 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     };
                     match plan_read_receipt(&controller.state, &session_id, through) {
                         ReadReceiptPlan::UnknownSession => {
-                            let _ = reply.send(Err("unknown session".into()));
+                            if reply.send(Err("unknown session".into())).is_err() {
+                                tracing::debug!(%session_id, "unknown-session read receipt reply dropped after client disconnect");
+                            }
                         }
                         // The viewer re-posts its cursor after every refresh.
                         // A cursor that has not moved is not work: no database
                         // write, no revision, and so no refresh to answer.
                         ReadReceiptPlan::AlreadyRead => {
-                            let _ = reply.send(Ok(()));
+                            if reply.send(Ok(())).is_err() {
+                                tracing::debug!(%session_id, "read receipt acknowledgement dropped after client disconnect");
+                            }
                         }
                         ReadReceiptPlan::Persist => {
                             let done = receipt_done_tx.clone();
@@ -497,8 +539,8 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                                     Ok(result) => result.map_err(|error| format!("{error:#}")),
                                     Err(error) => Err(format!("phone read receipt task failed: {error}")),
                                 };
-                                if done.send(ReadReceiptPersisted { session_id, result, reply }).is_err() {
-                                    tracing::debug!("phone read receipt finished after the server stopped");
+                                if let Err(error) = done.send(ReadReceiptPersisted { session_id, result, reply }) {
+                                    tracing::debug!(%error, "phone read receipt finished after the server stopped");
                                 }
                             });
                         }
@@ -512,20 +554,26 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             // shows, so only then does the revision move.
                             if apply_read_receipt(&mut controller.state, &session_id, receipt) {
                                 revision += 1;
-                                let _ = snapshot_tx.send(viewer_snapshot(
+                                if let Err(error) = snapshot_tx.send(viewer_snapshot(
                                     &controller,
                                     &quotas,
                                     &conversations,
                                     &queued_prompts,
                                     &active_user_shells,
                                     revision,
-                                ));
+                                )) {
+                                    tracing::debug!(revision, %error, "phone snapshot delivery failed; no viewer is subscribed");
+                                }
                             }
-                            let _ = reply.send(Ok(()));
+                            if reply.send(Ok(())).is_err() {
+                                tracing::debug!(%session_id, "phone read receipt reply dropped after client disconnect");
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(%session_id, "could not persist a phone read receipt: {error}");
-                            let _ = reply.send(Err(error));
+                            if reply.send(Err(error)).is_err() {
+                                tracing::debug!(%session_id, "failed phone read receipt reply dropped after client disconnect");
+                            }
                         }
                     }
                 }
@@ -545,7 +593,9 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                         } else {
                             ActionOutcome::NotCancellable
                         };
-                        let _ = request.reply.send(outcome);
+                        if request.reply.send(outcome).is_err() {
+                            tracing::debug!(%session_id, "phone cancellation reply dropped after client disconnect");
+                        }
                         continue;
                     }
                     let session_id = match admit_phone_action(
@@ -555,7 +605,9 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     ) {
                         Ok(session_id) => session_id,
                         Err(refusal) => {
-                            let _ = request.reply.send(refusal);
+                            if request.reply.send(refusal).is_err() {
+                                tracing::debug!("phone action refusal reply dropped after client disconnect");
+                            }
                             continue;
                         }
                     };
@@ -616,8 +668,8 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             Ok(result) => result,
                             Err(error) => Err(format!("phone action task failed: {error}")),
                         };
-                        if done.send((action_id, session_id, result)).is_err() {
-                            tracing::debug!(action_id, "phone action finished after the server stopped");
+                        if let Err(error) = done.send((action_id, session_id, result)) {
+                            tracing::debug!(action_id, %error, "phone action finished after the server stopped");
                         }
                     });
                 }
@@ -636,14 +688,16 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     };
                     if publication.is_ok() {
                         revision += 1;
-                        let _ = snapshot_tx.send(viewer_snapshot(
+                        if let Err(error) = snapshot_tx.send(viewer_snapshot(
                             &controller,
                             &quotas,
                             &conversations,
                             &queued_prompts,
                             &active_user_shells,
                             revision,
-                        ));
+                        )) {
+                            tracing::debug!(revision, %error, "phone snapshot delivery failed; no viewer is subscribed");
+                        }
                     };
                     if publication.is_err()
                         && let Some(control) = action_cancellations.get(&started.action_id)
@@ -660,7 +714,9 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             ActionOutcome::Failed
                         },
                     );
-                    let _ = started.published.send(publication);
+                    if started.published.send(publication).is_err() {
+                        tracing::debug!(action_id = started.action_id, "phone new-session publication reply dropped after client disconnect");
+                    }
                 }
                 completed = action_done_rx.recv() => {
                     let Some((action_id, session_id, result)) = completed else {
@@ -677,37 +733,69 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     // waiting for a reply it can act on.
                     action_replies.resolve(action_id, ActionOutcome::Failed);
                     if let Err(error) = &result {
-                        eprintln!("Hel phone action failed: {error}");
-                    }
-                    if let Err(error) = controller.reload() {
-                        tracing::warn!(%error, "phone action completed but controller state could not be reloaded");
-                        continue;
+                        tracing::warn!(action_id, %error, "phone action failed");
                     }
                     // Nothing is waiting on the request any more, so a failure
                     // the action itself did not record would reach no one but
-                    // this process's stderr. Carry it on the session, where
-                    // the snapshot's `has_error` takes it to the phone.
-                    if let Err(error) = &result
-                        && let Some(session_id) = &session_id
-                        && let Some(session) = controller.state.sessions.get_mut(session_id)
-                        && session.last_error.is_none()
+                    // this process's stderr. Preserve it as an in-memory
+                    // overlay for every later durable reload, where the
+                    // snapshot's `has_error` takes it to the phone.
+                    if let (Err(error), Some(session_id)) = (&result, &session_id)
                     {
-                        session.last_error = Some(error.clone());
+                        pending_action_errors.insert(session_id.clone(), error.clone());
                     }
-                    worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
-                    credential_sync_handle.set_targets(credential_sync_targets(&controller));
-                    republish_quota_profiles(
-                        &controller,
-                        &mut published_quota_profiles,
-                        &mut quota_batch,
-                        &quota_profiles_tx,
+                    request_controller_reload(
+                        &mut controller_reload_in_flight,
+                        &mut controller_reload_requested,
+                        &controller_reload_tx,
                     );
-                    conversations.retain(|id, _| {
-                        controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
-                    });
-                    revision += 1;
-                    conversation_tx.send_replace(conversations.clone());
-                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, &active_user_shells, revision));
+                }
+                reloaded = controller_reload_rx.recv() => {
+                    let Some(ControllerReloaded { result }) = reloaded else {
+                        failure = feed_stopped(
+                            termination.is_cancelled(),
+                            "the controller reload pipeline stopped while the phone server was running",
+                        );
+                        break;
+                    };
+                    controller_reload_in_flight = false;
+                    match result {
+                        Ok(mut reloaded) => {
+                            for (session_id, error) in &pending_action_errors {
+                                if let Some(session) = reloaded.state.sessions.get_mut(session_id)
+                                    && session.last_error.is_none()
+                                {
+                                    session.last_error = Some(error.clone());
+                                }
+                            }
+                            controller = reloaded;
+                            worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                            credential_sync_handle.set_targets(credential_sync_targets(&controller));
+                            republish_quota_profiles(
+                                &controller,
+                                &mut published_quota_profiles,
+                                &mut quota_batch,
+                                &quota_profiles_tx,
+                            );
+                            queued_prompts.retain(|session_id, _| {
+                                controller.state.sessions.contains_key(session_id)
+                            });
+                            conversations.retain(|id, _| {
+                                controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
+                            });
+                            revision += 1;
+                            conversation_tx.send_replace(conversations.clone());
+                            publish_snapshot!(revision);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "completed phone operation could not reload controller state");
+                        }
+                    }
+                    if controller_reload_requested {
+                        controller_reload_requested = false;
+                        controller_reload_in_flight = true;
+                        spawn_controller_reload(controller_reload_tx.clone());
+                    }
                 }
             }
         }
@@ -1143,6 +1231,38 @@ mod tests {
             last_checkpoint_error: None,
             checkpoint: None,
         }
+    }
+
+    #[tokio::test]
+    async fn controller_reload_does_not_block_the_phone_control_loop() {
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let loaded = controller_with_profiles(&[]);
+        let release = std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            release_tx.send(()).unwrap();
+        });
+
+        let started = Instant::now();
+        spawn_controller_reload_with(completed_tx, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(loaded)
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "scheduling a controller reload occupied the control loop for {:?}",
+            started.elapsed()
+        );
+
+        let completed = tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+            .await
+            .expect("background reload timed out")
+            .expect("background reload channel closed");
+        assert!(completed.result.is_ok());
+        release.join().unwrap();
     }
 
     #[test]

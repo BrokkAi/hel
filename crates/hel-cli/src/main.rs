@@ -244,10 +244,16 @@ fn write_worker_exit_record(root: &std::path::Path, reason: &str) {
         "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "version": env!("CARGO_PKG_VERSION"),
     });
-    let _ = std::fs::write(
-        root.join("worker-exit.json"),
-        serde_json::to_vec_pretty(&record).unwrap_or_default(),
-    );
+    let bytes = match serde_json::to_vec_pretty(&record) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("Hel: could not serialize worker exit record: {error}");
+            return;
+        }
+    };
+    if let Err(error) = std::fs::write(root.join("worker-exit.json"), bytes) {
+        eprintln!("Hel: could not write worker exit record: {error}");
+    }
 }
 
 /// Capture panics as last words too; the default hook then prints the
@@ -756,17 +762,25 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if self.keyboard_enhancement {
-            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        if self.keyboard_enhancement
+            && let Err(error) = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags)
+        {
+            tracing::warn!(%error, "could not restore terminal keyboard enhancement flags");
         }
-        let _ = execute!(
+        if let Err(error) = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
-        );
-        let _ = disable_raw_mode();
-        let _ = self.terminal.show_cursor();
+        ) {
+            tracing::warn!(%error, "could not restore terminal screen and input modes");
+        }
+        if let Err(error) = disable_raw_mode() {
+            tracing::warn!(%error, "could not disable terminal raw mode");
+        }
+        if let Err(error) = self.terminal.show_cursor() {
+            tracing::warn!(%error, "could not show terminal cursor");
+        }
     }
 }
 

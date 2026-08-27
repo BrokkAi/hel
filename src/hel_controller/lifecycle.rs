@@ -286,9 +286,28 @@ impl Controller {
         if let Err(cleanup_error) = hel_targets::close_plan(&backend, session_id)?.execute(executor)
         {
             match hel_targets::cleanup_target_is_confirmed_absent(&backend, session_id, executor) {
-                Ok(true) => {}
-                Ok(false) => return Err(cleanup_error),
+                Ok(true) => {
+                    tracing::warn!(
+                        session_id,
+                        error = format!("{cleanup_error:#}"),
+                        "target cleanup command failed, but the target was confirmed absent"
+                    );
+                }
+                Ok(false) => {
+                    tracing::error!(
+                        session_id,
+                        error = format!("{cleanup_error:#}"),
+                        "target cleanup failed and the target is still present"
+                    );
+                    return Err(cleanup_error);
+                }
                 Err(probe_error) => {
+                    tracing::error!(
+                        session_id,
+                        cleanup_error = format!("{cleanup_error:#}"),
+                        probe_error = format!("{probe_error:#}"),
+                        "target cleanup failed and exact absence could not be confirmed"
+                    );
                     return Err(cleanup_error.context(format!(
                         "target cleanup failed and exact absence could not be confirmed: {probe_error:#}"
                     )));

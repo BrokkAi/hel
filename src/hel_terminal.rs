@@ -511,7 +511,13 @@ async fn supervise(
     // Release the waiters before any report: a report waits on a full event
     // channel, and the agent blocked in `terminal/wait_for_exit` is what keeps
     // that channel draining.
-    let _ = exit.send(Some(status.clone()));
+    if exit.send(Some(status.clone())).is_err() {
+        tracing::debug!(
+            %terminal_id,
+            operation = "terminal_exit",
+            "terminal exit watcher was closed before publication"
+        );
+    }
 
     if let Some(message) = failed_reap {
         report(&events, message).await;
@@ -564,9 +570,16 @@ async fn report(events: &mpsc::Sender<RuntimeEvent>, message: String) {
 }
 
 async fn report_event(events: &mpsc::Sender<RuntimeEvent>, event: RuntimeEvent) {
-    // A closed channel means the relay already stopped; there is nowhere left
-    // to report, and the runtime failure that closed it is reported by `run`.
-    let _ = events.send(event).await;
+    // A closed channel means the relay already stopped; retain this as a
+    // diagnostic because terminal cleanup can otherwise hide the first
+    // failed report while still remaining cancellation-safe.
+    if let Err(error) = events.send(event).await {
+        tracing::debug!(
+            operation = "terminal_event",
+            %error,
+            "terminal event could not reach the relay coordinator"
+        );
+    }
 }
 
 #[cfg(test)]

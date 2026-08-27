@@ -424,7 +424,8 @@ pub fn write_credential_file(kind: HarnessKind, path: &Path, bytes: &[u8]) -> Re
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restrict permissions on {}", parent.display()))?;
         }
     }
     // `atomic_write` creates the temporary file with mode 0600 and renames it
@@ -701,10 +702,16 @@ impl CredentialSyncHandle {
 
     /// Reconcile one profile now instead of waiting for the next cycle.
     pub fn sync_profile_now(&self, profile_id: &str, cause: Option<CredentialSyncCause>) {
-        let _ = self.triggers.send(SyncTrigger {
+        if let Err(error) = self.triggers.send(SyncTrigger {
             profile_id: profile_id.to_owned(),
             cause,
-        });
+        }) {
+            tracing::debug!(
+                %profile_id,
+                %error,
+                "credential sync request dropped because its coordinator stopped"
+            );
+        }
     }
 }
 

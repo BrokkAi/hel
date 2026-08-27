@@ -448,7 +448,17 @@ fn materialized_chat_entry_with_diffstats(
             terminal_outputs,
             ..
         } => {
-            let call = ToolCall::deserialize(call).ok();
+            let call = match ToolCall::deserialize(call) {
+                Ok(call) => Some(call),
+                Err(error) => {
+                    tracing::warn!(
+                        stable_id = %item.stable_id,
+                        %error,
+                        "could not decode a stored tool call; rendering it as invalid"
+                    );
+                    None
+                }
+            };
             let mut entry = ChatEntry::tool(
                 item.position,
                 call.as_ref()
@@ -484,7 +494,14 @@ fn materialized_chat_entry_with_diffstats(
             item.position,
             Plan::deserialize(plan)
                 .map(|plan| plan.entries)
-                .unwrap_or_default()
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        stable_id = %item.stable_id,
+                        %error,
+                        "could not decode a stored plan; rendering it empty"
+                    );
+                    Vec::new()
+                })
                 .into_iter()
                 .map(|line| PlanLine {
                     text: sanitize_terminal_text(&line.content),
@@ -520,7 +537,13 @@ pub fn materialized_content_text(content: &[serde_json::Value]) -> String {
 pub fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
     chunks
         .iter()
-        .filter_map(|value| ContentChunk::deserialize(value).ok())
+        .filter_map(|value| match ContentChunk::deserialize(value) {
+            Ok(chunk) => Some(chunk),
+            Err(error) => {
+                tracing::warn!(%error, "could not decode a stored content chunk");
+                None
+            }
+        })
         .filter_map(|chunk| content_block_text(&chunk.content))
         .map(|text| sanitize_terminal_text(&text))
         .collect::<Vec<_>>()
@@ -936,7 +959,7 @@ impl ChatState {
         let top = TranscriptAnchor::Row { entry: 0, row: 0 };
         if self.entries.is_empty() && fallback.is_none() {
             return TranscriptViewport {
-                rows: vec![empty_transcript_row()],
+                rows: vec![empty_transcript_row(self.transcript_loading)],
                 anchor: TranscriptAnchor::Bottom,
                 top,
             };
@@ -1310,7 +1333,17 @@ pub fn materialized_tool_diffstats(item: &TranscriptItem) -> Option<Vec<String>>
     let TranscriptBody::Tool { call, .. } = &item.body else {
         return None;
     };
-    let call = ToolCall::deserialize(call).ok()?;
+    let call = match ToolCall::deserialize(call) {
+        Ok(call) => call,
+        Err(error) => {
+            tracing::warn!(
+                stable_id = %item.stable_id,
+                %error,
+                "could not decode a stored tool call while reading diff summary"
+            );
+            return None;
+        }
+    };
     if !matches!(
         tool_status(&call.status),
         ToolStatus::Completed | ToolStatus::Failed
@@ -1333,7 +1366,17 @@ impl ToolDiffstatRequest {
         let TranscriptBody::Tool { call, .. } = &item.body else {
             return None;
         };
-        let call = ToolCall::deserialize(call).ok()?;
+        let call = match ToolCall::deserialize(call) {
+            Ok(call) => call,
+            Err(error) => {
+                tracing::warn!(
+                    stable_id = %item.stable_id,
+                    %error,
+                    "could not decode a stored tool call while scheduling diff summary"
+                );
+                return None;
+            }
+        };
         let terminal = matches!(
             tool_status(&call.status),
             ToolStatus::Completed | ToolStatus::Failed
@@ -1490,14 +1533,18 @@ pub(super) fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'st
         ));
     }
     if lines.is_empty() {
-        lines.push(empty_transcript_row());
+        lines.push(empty_transcript_row(chat.transcript_loading));
     }
     lines
 }
 
-fn empty_transcript_row() -> Line<'static> {
+fn empty_transcript_row(loading: bool) -> Line<'static> {
     Line::from(Span::styled(
-        "No messages yet — send a prompt to begin.",
+        if loading {
+            "[Loading]"
+        } else {
+            "No messages yet — send a prompt to begin."
+        },
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
@@ -1732,6 +1779,20 @@ mod tests {
 
     fn completed_tool(seq: u64, title: &str) -> ChatEntry {
         ChatEntry::tool(seq, title, None, ToolStatus::Completed)
+    }
+
+    #[test]
+    fn an_empty_conversation_identifies_initial_relay_loading() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
+
+        assert_eq!(transcript_text(&mut chat, 80), ["[Loading]"]);
+
+        chat.set_transcript_loading(false);
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            ["No messages yet — send a prompt to begin."]
+        );
     }
 
     #[test]

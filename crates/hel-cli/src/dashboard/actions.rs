@@ -15,11 +15,11 @@ use hel_tui::{DashboardAction, SessionOperationKind};
 use crate::dashboard::io::{
     ArchiveWriteTarget, ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest,
     ResumeRepositoryPreflightApply, StageReportingExecutor, config_only_controller,
-    spawn_archive_write, spawn_cancellable_io, spawn_create_bundle,
+    spawn_archive_write, spawn_cancellable_io, spawn_clipboard_read, spawn_create_bundle,
     spawn_dashboard_container_settings, spawn_dashboard_create_session, spawn_dashboard_rename,
-    spawn_lifecycle_operation,
+    spawn_io, spawn_lifecycle_operation,
 };
-use crate::dashboard::{DashboardContext, QUOTA_REFRESH_NOTICE, View, resume_progress_notice};
+use crate::dashboard::{DashboardContext, QUOTA_REFRESH_NOTICE, resume_progress_notice};
 use crate::import::{DashboardImportSafety, PendingDashboardImport};
 use crate::pollers::{LifecycleSuccess, spawn_aws_resource_options_resolution};
 use crate::short_id;
@@ -36,24 +36,26 @@ pub(crate) async fn apply_dashboard_action(
         }
         DashboardAction::OpenConfig => match context.run_setup_dialog()? {
             SetupOutcome::Written => {
-                context.controller.reload()?;
-                context
-                    .dashboard
-                    .set_config(context.controller.config.clone());
-                context
-                    .dashboard
-                    .set_state(context.controller.state.clone());
-                context.request_quota_refresh();
-                context.refresh_poll_targets();
-                context
-                    .dashboard
-                    .set_notice("Setup complete. Press Ctrl+N to start your first session.");
+                context.dashboard.set_notice("Saving setup changes…");
+                spawn_io(
+                    "reload setup state",
+                    context.dashboard_io_tx.clone(),
+                    Controller::load,
+                    DashboardIoUpdate::SetupReloaded,
+                );
             }
             SetupOutcome::Cancelled => context.dashboard.set_notice("Setup cancelled."),
         },
         DashboardAction::RefreshQuotas => {
             context.manual_quota_refresh_generation = Some(context.request_quota_refresh());
             context.dashboard.set_notice(QUOTA_REFRESH_NOTICE);
+        }
+        DashboardAction::PasteFromClipboard => {
+            if !context.clipboard_read_in_flight {
+                context.clipboard_read_in_flight = true;
+                context.dashboard.set_notice("Reading clipboard…");
+                spawn_clipboard_read(context.dashboard_io_tx.clone());
+            }
         }
         DashboardAction::MarkAllRead { receipts } => {
             context.acknowledge_dashboard_sessions(receipts);
@@ -314,11 +316,7 @@ pub(crate) async fn apply_dashboard_action(
         }
         action @ DashboardAction::CreateSession { .. } => start_session_launch(context, action),
         DashboardAction::Open { session_id } => {
-            if context.hold_chat_session(&session_id).await.is_ok() {
-                context.view = View::Chat;
-                context.acknowledge_visible_chat();
-            }
-            context.dirty = true;
+            context.open_chat_session(&session_id);
         }
         action @ DashboardAction::ResumeSession { .. } => start_session_launch(context, action),
         DashboardAction::Close { session_id } => {

@@ -181,8 +181,14 @@ impl CodexUsageClient {
         // Closing stdin asks app-server to stop. The quota process is always
         // launched directly (never through npx), so killing the recorded child
         // is sufficient if it does not notice EOF promptly.
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        if let Err(error) = self.child.start_kill()
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "could not stop the Codex quota process");
+        }
+        if let Err(error) = self.child.wait().await {
+            tracing::warn!(%error, "could not reap the Codex quota process");
+        }
     }
 }
 

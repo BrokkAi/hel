@@ -831,19 +831,19 @@ fn project_session_update(
                 .get(&stable_id)
                 .map(|item| TranscriptItem::clone(item));
             let Some(mut item) = item else {
-                // Some ACP bridges forward private metadata deltas for a tool
-                // that belonged to the pre-resume process without replaying
-                // that tool's public creation. Hel never projects `_meta`, so
-                // a metadata-only update is an observable no-op and must not
-                // pin the entire durable conversation behind it. A missing
-                // update with public fields is still an integrity failure.
-                if update.fields == ToolCallUpdateFields::default() {
-                    return Ok(());
-                }
-                bail!(
-                    "ACP updated tool call {} before creating it",
-                    update.tool_call_id
+                // Codex may finish dispatching a historical tool update after
+                // `session/load` returns even though Hel intentionally did not
+                // replay that tool's creation. The update has no target in the
+                // canonical transcript, so it is an observable no-op. Log it
+                // and advance the relay frontier instead of pinning every
+                // later live event behind provider-local resume noise.
+                tracing::warn!(
+                    session_id = %current.session_id,
+                    tool_call_id = %update.tool_call_id,
+                    has_public_fields = update.fields != ToolCallUpdateFields::default(),
+                    "ignored ACP update for a tool call absent from the durable transcript"
                 );
+                return Ok(());
             };
             close_streams(index, mutation, event.recorded_at_ms);
             let TranscriptBody::Tool { call, .. } = &mut item.body else {
@@ -1060,9 +1060,16 @@ fn tool_call_terminal_ids(call: &Value) -> Vec<String> {
     };
     content
         .iter()
-        .filter_map(|value| match ToolCallContent::deserialize(value).ok()? {
-            ToolCallContent::Terminal(terminal) => Some(terminal.terminal_id.0.to_string()),
-            _ => None,
+        .filter_map(|value| match ToolCallContent::deserialize(value) {
+            Ok(ToolCallContent::Terminal(terminal)) => Some(terminal.terminal_id.0.to_string()),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "ignoring malformed tool-call content while locating terminal output"
+                );
+                None
+            }
         })
         .collect()
 }
@@ -1230,13 +1237,25 @@ fn configuration_values(
     options
         .iter()
         .filter_map(|option| {
-            let value = serde_json::to_value(option).ok()?;
-            let id = value.get("id")?.as_str()?.to_owned();
+            let value = match serde_json::to_value(option) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, "could not serialize a session configuration option");
+                    return None;
+                }
+            };
+            let Some(id) = value.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                tracing::warn!("session configuration option omitted a string id");
+                return None;
+            };
             let current = value
                 .get("currentValue")
-                .or_else(|| value.get("current_value"))?
-                .clone();
-            Some((id, current))
+                .or_else(|| value.get("current_value"));
+            let Some(current) = current else {
+                tracing::warn!(option_id = %id, "session configuration option omitted its current value");
+                return None;
+            };
+            Some((id, current.clone()))
         })
         .collect()
 }
@@ -1952,24 +1971,26 @@ mod tests {
     }
 
     #[test]
-    fn tool_update_without_an_initial_call_is_rejected() {
-        let session = MaterializedSession::empty("session-1");
+    fn tool_update_without_an_initial_call_is_ignored_and_advances_the_frontier() {
+        let mut session = MaterializedSession::empty("session-1");
         let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "missing-tool",
             ToolCallUpdateFields::new().title("updated"),
         ));
-
-        let error = project_relay_event(
+        let relay_event = event(
             &session,
-            &event(
-                &session,
-                RelayObservation::SessionUpdate {
-                    update: Box::new(update),
-                },
-            ),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("before creating it"));
+            RelayObservation::SessionUpdate {
+                update: Box::new(update),
+            },
+        );
+
+        let projected = project_relay_event(&session, &relay_event)
+            .expect("a delayed pre-resume tool update is an observable no-op");
+        apply_committed_projection_event(&mut session, &relay_event, projected.mutation)
+            .expect("the no-op still advances the committed relay frontier");
+
+        assert!(session.transcript.is_empty());
+        assert_eq!(session.applied_event_ordinal, 1);
     }
 
     #[test]

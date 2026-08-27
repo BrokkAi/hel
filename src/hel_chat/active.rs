@@ -230,7 +230,10 @@ fn dispatch_history_search_request(
             Ok(result) => result,
             Err(error) => Err(format!("history search task failed: {error}")),
         };
-        let _ = updates.send(ChatIoUpdate::HistorySearchResults { generation, result });
+        if let Err(error) = updates.send(ChatIoUpdate::HistorySearchResults { generation, result })
+        {
+            tracing::debug!(%error, "history search result dropped because the chat closed");
+        }
     });
 }
 
@@ -250,11 +253,13 @@ fn dispatch_diffstat_requests(
                 Ok(result) => result,
                 Err(error) => Err(format!("diff summary task failed: {error}")),
             };
-            let _ = updates.send(ChatIoUpdate::ToolDiffstats {
+            if let Err(error) = updates.send(ChatIoUpdate::ToolDiffstats {
                 tool_call_id,
                 revision,
                 result,
-            });
+            }) {
+                tracing::debug!(%error, "tool diff summary dropped because the chat closed");
+            }
         });
     }
 }
@@ -299,7 +304,9 @@ fn spawn_transcript_prefix(
             Ok(entries) => Ok(entries),
             Err(error) => Err(format!("history conversion task failed: {error}")),
         };
-        let _ = updates.send(ChatIoUpdate::TranscriptPrefix { attempt, result });
+        if let Err(error) = updates.send(ChatIoUpdate::TranscriptPrefix { attempt, result }) {
+            tracing::debug!(%error, "transcript conversion result dropped because the chat closed");
+        }
     });
 }
 
@@ -332,10 +339,14 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
                     attempt: attempt.saturating_add(1),
                 };
             }
-            Err(error) => chat.set_notice(format!("Earlier messages failed to load: {error}")),
+            Err(error) => {
+                tracing::warn!(%error, "earlier chat history could not be converted");
+                chat.set_notice(format!("Earlier messages failed to load: {error}"));
+            }
         },
         ChatIoUpdate::ProjectHistoryPrefetched(Ok(entries)) => chat.set_project_history(entries),
         ChatIoUpdate::ProjectHistoryPrefetched(Err(error)) => {
+            tracing::warn!(%error, "project chat history prefetch failed");
             chat.set_project_history_unavailable(error);
         }
         ChatIoUpdate::HistorySearchResults { generation, result } => {
@@ -343,6 +354,7 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
         }
         ChatIoUpdate::ClipboardText(Ok(text)) => chat.handle_paste(&text),
         ChatIoUpdate::ClipboardText(Err(error)) => {
+            tracing::warn!(%error, "clipboard read failed and was shown in the UI");
             chat.set_notice(format!("Paste failed: {error}"));
         }
         ChatIoUpdate::OtherSessions(sessions) => chat.other_sessions = sessions,
@@ -536,10 +548,8 @@ fn spawn_other_session_poller(
                 resolved.remove(&session_id);
             }
             if summaries != sent {
-                if updates
-                    .send(ChatIoUpdate::OtherSessions(summaries.clone()))
-                    .is_err()
-                {
+                if let Err(error) = updates.send(ChatIoUpdate::OtherSessions(summaries.clone())) {
+                    tracing::debug!(%error, "other-session activity result dropped because the chat closed");
                     return;
                 }
                 sent = summaries;
@@ -561,10 +571,15 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
         Err(error) => {
             // Keep the transcript readable rather than tearing the dashboard
             // down around a stopped manager.
+            tracing::warn!(error = format!("{error:#}"), "chat session view failed");
+            state.set_transcript_loading(false);
             state.set_notice(format!("connection lost: {error:#}"));
             return false;
         }
     };
+    if view.snapshot.is_some() || view.error.is_some() {
+        state.set_transcript_loading(false);
+    }
     if let Some(snapshot) = view.snapshot {
         state.apply_materialized(
             &snapshot.materialized,
@@ -581,12 +596,15 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
     if let Some(error) = view.error {
         match error {
             ViewError::Unreachable(detail) => {
+                tracing::warn!(%detail, "chat session became unreachable");
                 state.set_notice(format!("connection lost: {detail}"))
             }
             ViewError::TargetMissing(detail) => {
+                tracing::warn!(%detail, "chat session target is missing");
                 state.set_notice(format!("managed target lost: {detail}"))
             }
             ViewError::ProjectionIntegrity(detail) => {
+                tracing::error!(%detail, "chat transcript projection failed");
                 state.set_notice(format!("transcript projection failed: {detail}"))
             }
         }
@@ -722,7 +740,9 @@ impl ActiveChat {
                     Ok(result) => result,
                     Err(error) => Err(format!("history prefetch task failed: {error}")),
                 };
-                let _ = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result));
+                if let Err(error) = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result)) {
+                    tracing::debug!(%error, "project history result dropped because the chat closed");
+                }
             });
         }
         if let Some(pending) = pending_prefix {
@@ -739,6 +759,7 @@ impl ActiveChat {
             tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
         let remote = ChatRemoteSupervisor::spawn(session.clone());
         if needs_initial_sync {
+            state.set_transcript_loading(true);
             state.set_notice("Connecting to session relay…");
             queue_chat_remote_operation(remote.operations(), ChatRemoteOperation::Sync, &mut state);
         }
@@ -1095,7 +1116,9 @@ impl ActiveChat {
                         Ok(result) => result,
                         Err(error) => Err(format!("clipboard task failed: {error}")),
                     };
-                    let _ = updates.send(ChatIoUpdate::ClipboardText(result));
+                    if let Err(error) = updates.send(ChatIoUpdate::ClipboardText(result)) {
+                        tracing::debug!(%error, "clipboard result dropped because the chat closed");
+                    }
                 });
             }
             ChatAction::ToggleVoice => {
@@ -1417,15 +1440,21 @@ fn spawn_dictation(
         let status_updates = updates.clone();
         let result = crate::speech::run_dictation(
             move |text| {
-                let _ = partial_updates.send(VoiceUpdate::Partial(text));
+                if let Err(error) = partial_updates.send(VoiceUpdate::Partial(text)) {
+                    tracing::debug!(%error, "voice partial result dropped because the chat closed");
+                }
             },
             |_| {},
             move |status| {
-                let _ = status_updates.send(VoiceUpdate::Status(status));
+                if let Err(error) = status_updates.send(VoiceUpdate::Status(status)) {
+                    tracing::debug!(%error, "voice status dropped because the chat closed");
+                }
             },
             cancel,
         );
-        let _ = updates.send(VoiceUpdate::Finished(result));
+        if let Err(error) = updates.send(VoiceUpdate::Finished(result)) {
+            tracing::debug!(%error, "voice result dropped because the chat closed");
+        }
     });
 }
 
@@ -1629,6 +1658,7 @@ mod tests {
     #[test]
     fn an_off_screen_chat_follows_the_session_view() {
         let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
         let mut session = MaterializedSession::empty("session-warm");
         session.applied_event_ordinal = 5;
         session.applied_event_digest = "a".repeat(64);
@@ -1640,6 +1670,7 @@ mod tests {
         ));
         assert_eq!(chat.latest_seq(), 5);
         assert_eq!(chat.entries.len(), 1);
+        assert!(!chat.transcript_loading);
 
         session.applied_event_ordinal = 8;
         session.transcript.push(agent_transcript_item("second", 8));
