@@ -529,16 +529,20 @@ impl ChatState {
                     self.pending_diffstats.push_back(request);
                 }
             }
-            self.queued_prompts = session
-                .queued_prompts
-                .iter()
-                .map(|prompt| QueuedPrompt {
-                    id: prompt.command_id.clone(),
-                    text: materialized_content_text(&prompt.content),
-                    kind: prompt.kind.clone(),
-                })
-                .collect();
         }
+        // Queue persistence can reach the materialized view independently of
+        // transcript projection. Keep the small queue authoritative even when
+        // the transcript frontier has not moved and its expensive rebuild is
+        // correctly skipped.
+        self.queued_prompts = session
+            .queued_prompts
+            .iter()
+            .map(|prompt| QueuedPrompt {
+                id: prompt.command_id.clone(),
+                text: materialized_content_text(&prompt.content),
+                kind: prompt.kind.clone(),
+            })
+            .collect();
         self.set_config_options(config_options);
         // `current_mode_update` lands in the projected configuration. Only
         // overwrite when it is there, so an optimistic toggle survives until
@@ -3190,7 +3194,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_materialized_skips_rebuild_at_same_ordinal() {
+    fn same_ordinal_materialized_update_keeps_transcript_cache_but_refreshes_queue() {
         let mut session = MaterializedSession::empty("session-same-ordinal");
         session.applied_event_ordinal = 1;
         session.transcript.push(Arc::new(TranscriptItem {
@@ -3219,7 +3223,8 @@ mod tests {
         chat.apply_materialized(&session, &[], &[]);
 
         assert_eq!(chat.entries[0].text, "first");
-        assert!(chat.queued_prompts.is_empty());
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].text, "queued prompt");
     }
 
     #[test]
