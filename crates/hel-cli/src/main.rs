@@ -958,7 +958,7 @@ mod tests {
 
         assert!(
             controller
-                .delete_session_controlled(session_id, &ProcessExecutor)
+                .destroy_session_controlled(session_id, &ProcessExecutor)
                 .is_err()
         );
         assert!(controller.state.sessions.contains_key(session_id));

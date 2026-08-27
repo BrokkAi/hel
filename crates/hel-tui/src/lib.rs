@@ -20,8 +20,8 @@ use hel::hel_state::{
 use hel::hel_targets::AdditionalMount;
 
 use crate::dialogs::{
-    ConfirmDialog, Confirmation, ContainerEditor, FORCE_CONFIRMATION, ImportBundleConfirmation,
-    ImportProgress, RenameEditor, RenameFocus, RepositoryOriginDialog,
+    ConfirmDialog, Confirmation, ContainerEditor, FORCE_STOP_CONFIRMATION,
+    ImportBundleConfirmation, ImportProgress, RenameEditor, RenameFocus, RepositoryOriginDialog,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::ResumeDialog;
@@ -120,10 +120,7 @@ pub enum DashboardAction {
     ForceStop {
         session_id: String,
     },
-    DeleteActive {
-        session_id: String,
-    },
-    DeleteStopped {
+    DestroyStopped {
         session_id: String,
     },
     RenameSession {
@@ -179,7 +176,6 @@ pub enum SessionOperationKind {
     Resuming,
     Stopping,
     Destroying,
-    Deleting,
     Connecting,
     Importing,
 }
@@ -191,7 +187,6 @@ impl SessionOperationKind {
             Self::Resuming => "Resuming",
             Self::Stopping => "Stopping",
             Self::Destroying => "Destroying",
-            Self::Deleting => "Deleting",
             Self::Connecting => "Connecting",
             Self::Importing => "Importing",
         }
@@ -429,11 +424,10 @@ impl DashboardState {
                 }
             }
             Mode::Confirm(ConfirmDialog {
-                confirmation:
-                    Confirmation::ForceStop { typed, .. } | Confirmation::DeleteActive { typed, .. },
+                confirmation: Confirmation::ForceStop { typed, .. },
                 ..
             }) => {
-                let remaining = FORCE_CONFIRMATION.len().saturating_sub(typed.len());
+                let remaining = FORCE_STOP_CONFIRMATION.len().saturating_sub(typed.len());
                 typed.extend(
                     pasted
                         .chars()

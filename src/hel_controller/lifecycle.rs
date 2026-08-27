@@ -1,4 +1,4 @@
-//! Session close, destroy, and delete transitions.
+//! Session close, force-stop, and permanent-destruction transitions.
 
 use std::time::Duration;
 
@@ -332,29 +332,6 @@ impl Controller {
         )
     }
 
-    pub fn force_destroy(
-        &mut self,
-        session_id: &str,
-        executor: &impl CommandExecutor,
-    ) -> Result<()> {
-        let session = self
-            .state
-            .sessions
-            .get(session_id)
-            .with_context(|| format!("unknown session {session_id}"))?
-            .clone();
-        retire_git_broker(session_id).context("stop the session's local Git broker")?;
-        if let Some(locator) = &session.target {
-            let backend = backend_locator(locator, &session, &self.config)?;
-            hel_targets::close_plan(&backend, session_id)?.execute(executor)?;
-        }
-        let record = self.state.sessions.get_mut(session_id).unwrap();
-        record.state = SessionState::DestroyedWithDataLoss;
-        record.target = None;
-        record.updated_at = now();
-        self.persist_session_state(session_id)
-    }
-
     /// Tear down the current target without taking a fresh checkpoint, then
     /// leave the logical session resumable from its latest verified archive.
     pub fn force_stop(&mut self, session_id: &str, executor: &impl CommandExecutor) -> Result<()> {
@@ -413,10 +390,10 @@ impl Controller {
         )
     }
 
-    /// Permanently remove an inactive session and every artifact Hel owns for it.
+    /// Permanently destroy an inactive session and every artifact Hel owns for it.
     /// External cleanup happens before the durable record is dropped so failures
     /// remain visible and retryable.
-    pub fn delete_session_controlled(
+    pub fn destroy_session_controlled(
         &mut self,
         session_id: &str,
         executor: &impl CommandExecutor,
@@ -428,9 +405,9 @@ impl Controller {
             .with_context(|| format!("unknown session {session_id}"))?
             .clone();
         if session.state.is_active() {
-            bail!("refusing to delete active session {session_id}");
+            bail!("refusing to destroy active session {session_id}");
         }
-        // A session deleted for good keeps nothing, including a broker an
+        // A session destroyed for good keeps nothing, including a broker an
         // earlier failure left running.
         retire_git_broker(session_id).context("stop the session's local Git broker")?;
         if let Some(worktree) = &session.managed_worktree {
@@ -449,8 +426,8 @@ impl Controller {
             });
         }
         crate::hel_database::delete_session(session_id)
-            .context("delete stopped session from database")?;
-        self.state.remove_stopped_session(session_id)?;
+            .context("destroy stopped session in database")?;
+        self.state.destroy_stopped_session(session_id)?;
         Ok(())
     }
 }
@@ -866,7 +843,7 @@ mod tests {
         );
     }
     /// Ending a session ends the local Git origin it was serving. Close,
-    /// force-destroy, and permanent delete all retire the broker on purpose:
+    /// force stop, and permanent destruction all retire the broker on purpose:
     /// its spec and lock file go, so nothing restarts it against a target
     /// that is being torn down, and its log stays for reading afterwards.
     #[cfg(unix)]
@@ -947,8 +924,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let closing = "0123456789abcdef0123456789abcdef";
-        let forced = "0123456789abcdef0123456789abcdee";
-        let deleted = "0123456789abcdef0123456789abcded";
+        let force_stopped = "0123456789abcdef0123456789abcdee";
+        let destroyed = "0123456789abcdef0123456789abcded";
         let checkpoint = write_checkpoint_gate_archive(directory.path(), closing, 7);
         let mut closing_session = checkpoint_test_session(closing);
         closing_session.target_template_id = "local".into();
@@ -957,18 +934,18 @@ mod tests {
             worker_root: directory.path().join(closing),
         });
         closing_session.checkpoint = Some(checkpoint.clone());
-        let mut forced_session = checkpoint_test_session(forced);
-        forced_session.target_template_id = "local".into();
-        forced_session.state = SessionState::Running;
-        forced_session.target = Some(TargetLocator::LocalBare {
-            worker_root: directory.path().join(forced),
+        let force_stop_checkpoint =
+            write_checkpoint_gate_archive(directory.path(), force_stopped, 7);
+        let mut force_stopped_session = checkpoint_test_session(force_stopped);
+        force_stopped_session.target_template_id = "local".into();
+        force_stopped_session.state = SessionState::Running;
+        force_stopped_session.target = Some(TargetLocator::LocalBare {
+            worker_root: directory.path().join(force_stopped),
         });
-        // force_destroy persists through the database, so the row it updates
-        // has to exist.
-        crate::hel_database::save_session(&forced_session).unwrap();
-        let mut deleted_session = checkpoint_test_session(deleted);
-        deleted_session.target_template_id = "local".into();
-        deleted_session.state = SessionState::Stopped;
+        force_stopped_session.checkpoint = Some(force_stop_checkpoint);
+        let mut destroyed_session = checkpoint_test_session(destroyed);
+        destroyed_session.target_template_id = "local".into();
+        destroyed_session.state = SessionState::Stopped;
         let mut config = HelConfig::default();
         config
             .targets
@@ -978,13 +955,13 @@ mod tests {
             state: HelState {
                 sessions: BTreeMap::from([
                     (closing.into(), closing_session),
-                    (forced.into(), forced_session),
-                    (deleted.into(), deleted_session),
+                    (force_stopped.into(), force_stopped_session),
+                    (destroyed.into(), destroyed_session),
                 ]),
                 ..HelState::default()
             },
         };
-        for session_id in [closing, forced, deleted] {
+        for session_id in [closing, force_stopped, destroyed] {
             seed_broker(session_id);
         }
 
@@ -999,14 +976,14 @@ mod tests {
         assert_retired(closing);
 
         controller
-            .force_destroy(forced, &SucceedingExecutor)
+            .force_stop_with(force_stopped, &SucceedingExecutor, |_| Ok(()))
             .unwrap();
-        assert_retired(forced);
+        assert_retired(force_stopped);
 
         controller
-            .delete_session_controlled(deleted, &SucceedingExecutor)
+            .destroy_session_controlled(destroyed, &SucceedingExecutor)
             .unwrap();
-        assert_retired(deleted);
+        assert_retired(destroyed);
     }
     #[test]
     fn interrupted_close_error_preserves_destroying_phase() {

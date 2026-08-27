@@ -11,11 +11,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use std::path::PathBuf;
 
-use hel::hel_chat::TranscriptSnapshot;
 use hel::hel_config::{HarnessKind, mount_history_host};
 use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_additional_mounts};
 
-use crate::ingest::TranscriptHydration;
 use crate::widgets::{action_buttons, centered_rect, focused_buttons, popup_height, truncate_text};
 use crate::wizards::read_only_marker;
 use crate::{
@@ -23,7 +21,7 @@ use crate::{
     cycle_control, move_index,
 };
 
-pub(crate) const FORCE_CONFIRMATION: &str = "DESTROY";
+pub(crate) const FORCE_STOP_CONFIRMATION: &str = "STOP";
 
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
@@ -128,14 +126,10 @@ pub(crate) enum Confirmation {
         session_id: String,
         typed: String,
     },
-    DeleteActive {
-        session_id: String,
-        typed: String,
-    },
-    DeleteStopped {
+    DestroyStopped {
         session_id: String,
         /// The resume dialog to restore afterwards, so confirming or
-        /// cancelling a delete leaves the user where they were.
+        /// cancelling destruction leaves the user where they were.
         reopen: Option<Box<crate::resume::ResumeDialog>>,
     },
 }
@@ -186,10 +180,10 @@ const IMPORT_PROGRESS_BUTTONS: &[&str] = &["Cancel"];
 fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] {
     match confirmation {
         Confirmation::DirtyLocal { .. } => &["Cancel", "Continue"],
-        Confirmation::Close { .. } => &["Cancel", "Delete", "Stop"],
-        Confirmation::DeleteStopped { .. } => &["Cancel", "Delete"],
+        Confirmation::Close { .. } => &["Cancel", "Stop"],
+        Confirmation::DestroyStopped { .. } => &["Cancel", "Destroy"],
         Confirmation::CloseFailed { .. } => &["Cancel", "Force stop", "Retry stop"],
-        Confirmation::ForceStop { .. } | Confirmation::DeleteActive { .. } => &[],
+        Confirmation::ForceStop { .. } => &[],
     }
 }
 
@@ -691,8 +685,8 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
     let nominal = match confirmation {
         Confirmation::DirtyLocal { .. } => 11,
         Confirmation::CloseFailed { .. } => 12,
-        Confirmation::Close { .. } | Confirmation::DeleteStopped { .. } => 10,
-        Confirmation::ForceStop { .. } | Confirmation::DeleteActive { .. } => 10,
+        Confirmation::Close { .. } | Confirmation::DestroyStopped { .. } => 10,
+        Confirmation::ForceStop { .. } => 10,
     };
     let (title, mut lines) = match confirmation {
         Confirmation::DirtyLocal { repositories, .. } => {
@@ -715,16 +709,15 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify a recovery copy before destroying the target."),
-                Line::raw("Delete permanently removes it without creating a recovery copy."),
             ],
         ),
-        Confirmation::DeleteStopped { session_id, .. } => (
-            " Permanently delete stopped session? ",
+        Confirmation::DestroyStopped { session_id, .. } => (
+            " Permanently destroy stopped session? ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Hel will permanently delete the recovery archive and session record."),
-                Line::raw("Any Hel-managed worktree and generated branch will also be deleted."),
+                Line::raw("Hel will permanently destroy the recovery archive and session record."),
+                Line::raw("Any Hel-managed worktree and generated branch will also be removed."),
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
@@ -745,16 +738,7 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
                 Line::raw(""),
                 Line::raw("The current target will be removed without a new checkpoint."),
                 Line::raw("You can resume from the latest verified recovery archive."),
-                Line::raw(format!("Type {FORCE_CONFIRMATION}, then press Enter:")),
-                Line::styled(typed.clone(), Style::default().fg(Color::Red)),
-            ],
-        ),
-        Confirmation::DeleteActive { session_id, typed } => (
-            " DELETE ACTIVE SESSION · NO CHECKPOINT ",
-            vec![
-                Line::raw(format!("Session: {session_id}")),
-                Line::raw(""),
-                Line::raw(format!("Type {FORCE_CONFIRMATION}, then press Enter:")),
+                Line::raw(format!("Type {FORCE_STOP_CONFIRMATION}, then press Enter:")),
                 Line::styled(typed.clone(), Style::default().fg(Color::Red)),
             ],
         ),
@@ -1212,7 +1196,7 @@ impl DashboardState {
                 return self.activate_confirmation_button(confirmation, index);
             }
             ButtonKey::Cancel => {
-                if let Confirmation::DeleteStopped { reopen, .. } = confirmation {
+                if let Confirmation::DestroyStopped { reopen, .. } = confirmation {
                     self.restore_after_confirmation(reopen);
                 } else {
                     self.cancel_modal();
@@ -1246,14 +1230,13 @@ impl DashboardState {
                 self.cancel_modal();
                 action
             }
-            (Confirmation::Close { session_id }, 1) => self.begin_delete_active(session_id),
-            (Confirmation::Close { session_id }, 2) => {
+            (Confirmation::Close { session_id }, 1) => {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
             }
-            (Confirmation::DeleteStopped { session_id, reopen }, 1) => {
+            (Confirmation::DestroyStopped { session_id, reopen }, 1) => {
                 self.restore_after_confirmation(reopen);
-                DashboardAction::DeleteStopped { session_id }
+                DashboardAction::DestroyStopped { session_id }
             }
             (Confirmation::CloseFailed { session_id, .. }, 1) => {
                 self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
@@ -1266,7 +1249,7 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
             }
-            (Confirmation::DeleteStopped { reopen, .. }, _) => {
+            (Confirmation::DestroyStopped { reopen, .. }, _) => {
                 self.restore_after_confirmation(reopen);
                 DashboardAction::None
             }
@@ -1274,30 +1257,6 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::None
             }
-        }
-    }
-
-    fn begin_delete_active(&mut self, session_id: String) -> DashboardAction {
-        // Deleting without the typed confirmation needs Hel to know there is
-        // no agent work to lose. An unhydrated transcript can look empty.
-        let known_to_have_no_assistant_messages =
-            self.session_details.get(&session_id).is_some_and(|detail| {
-                detail.transcript_hydration == TranscriptHydration::Ready
-                    && detail.last_agent_message.is_none()
-                    && !detail
-                        .transcript
-                        .as_ref()
-                        .is_some_and(TranscriptSnapshot::has_assistant_messages)
-            });
-        if known_to_have_no_assistant_messages {
-            self.cancel_modal();
-            DashboardAction::DeleteActive { session_id }
-        } else {
-            self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
-                session_id,
-                typed: String::new(),
-            }));
-            DashboardAction::None
         }
     }
 
@@ -1336,7 +1295,7 @@ impl DashboardState {
                     DashboardAction::None
                 }
                 KeyCode::Char(c) => {
-                    if typed.len() < FORCE_CONFIRMATION.len() {
+                    if typed.len() < FORCE_STOP_CONFIRMATION.len() {
                         typed.push(c.to_ascii_uppercase());
                     }
                     self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
@@ -1345,50 +1304,12 @@ impl DashboardState {
                     }));
                     DashboardAction::None
                 }
-                KeyCode::Enter if typed == FORCE_CONFIRMATION => {
+                KeyCode::Enter if typed == FORCE_STOP_CONFIRMATION => {
                     self.cancel_modal();
                     DashboardAction::ForceStop { session_id }
                 }
                 _ => {
                     self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-            },
-            Confirmation::DeleteActive {
-                session_id,
-                mut typed,
-            } => match code {
-                KeyCode::Esc => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                KeyCode::Backspace => {
-                    typed.pop();
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-                KeyCode::Char(c) => {
-                    if typed.len() < FORCE_CONFIRMATION.len() {
-                        typed.push(c.to_ascii_uppercase());
-                    }
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-                KeyCode::Enter if typed == FORCE_CONFIRMATION => {
-                    self.cancel_modal();
-                    DashboardAction::DeleteActive { session_id }
-                }
-                _ => {
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
                         session_id,
                         typed,
                     }));
@@ -1420,74 +1341,6 @@ mod tests {
 
     use crate::render::render;
     use crate::{DashboardAction, DashboardState, Mode};
-
-    fn asks_to_type_destroy(dashboard: &DashboardState) -> bool {
-        matches!(
-            dashboard.mode,
-            Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::DeleteActive { .. },
-                ..
-            })
-        )
-    }
-
-    #[test]
-    fn delete_active_is_immediate_only_once_a_hydrated_transcript_shows_no_assistant_messages() {
-        let mut session = stopped_session();
-        session.state = SessionState::Running;
-        session.checkpoint = None;
-        let mut dashboard = dashboard_with_session(session);
-
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Delete)),
-            DashboardAction::None
-        );
-        assert!(matches!(dashboard.mode, Mode::Dashboard));
-        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
-        assert!(matches!(dashboard.mode, Mode::Dashboard));
-
-        // Nothing has hydrated yet, so a session that looks empty may simply
-        // be one Hel has not read.
-        dashboard.handle_key(ctrl_key('p'));
-        dashboard.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert!(asks_to_type_destroy(&dashboard));
-        dashboard.handle_key(key(KeyCode::Esc));
-
-        // A transcript that could not be read is no better evidence.
-        dashboard.mark_transcript_unavailable("session-1");
-        dashboard.handle_key(ctrl_key('p'));
-        dashboard.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert!(asks_to_type_destroy(&dashboard));
-        dashboard.handle_key(key(KeyCode::Esc));
-
-        // Hydrated and empty: there is no agent work to lose.
-        apply_materialized_transcript(&mut dashboard, Vec::new());
-        dashboard.handle_key(ctrl_key('p'));
-        dashboard.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::DeleteActive {
-                session_id: "session-1".into()
-            }
-        );
-
-        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "hello")]);
-        dashboard.handle_key(ctrl_key('p'));
-        dashboard.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert!(asks_to_type_destroy(&dashboard));
-    }
 
     fn dashboard_with_container_session() -> DashboardState {
         let mut session = running_session();
@@ -2145,7 +1998,7 @@ mod tests {
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("FORCE STOP · RECENT WORK MAY BE LOST"));
         assert!(rendered.contains("resume from the latest verified recovery archive"));
-        for character in FORCE_CONFIRMATION.chars() {
+        for character in FORCE_STOP_CONFIRMATION.chars() {
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Char(character))),
                 DashboardAction::None
@@ -2205,9 +2058,9 @@ mod tests {
         };
         assert_eq!(
             confirmation_buttons(&dialog.confirmation),
-            &["Cancel", "Delete", "Stop"]
+            &["Cancel", "Stop"]
         );
-        assert_eq!(dialog.focus, 2);
+        assert_eq!(dialog.focus, 1);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
@@ -2222,8 +2075,8 @@ mod tests {
         for cycle_keys in [
             vec![KeyCode::Tab],
             vec![KeyCode::Right],
-            vec![KeyCode::Left, KeyCode::Left],
-            vec![KeyCode::BackTab, KeyCode::BackTab],
+            vec![KeyCode::Left],
+            vec![KeyCode::BackTab],
         ] {
             let mut dashboard = running_dashboard_with_stop_dialog();
             for cycle_key in &cycle_keys {
@@ -2254,10 +2107,6 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Tab)),
-            DashboardAction::None
-        );
-        assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
                 session_id: "session-1".into()
@@ -2267,7 +2116,7 @@ mod tests {
 
     #[test]
     fn stop_confirmation_escape_cancels_from_any_button() {
-        for presses in 0..3 {
+        for presses in 0..2 {
             let mut dashboard = running_dashboard_with_stop_dialog();
             for _ in 0..presses {
                 dashboard.handle_key(key(KeyCode::Tab));
@@ -2304,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_confirmation_renders_cancel_delete_and_stop_with_stop_focused() {
+    fn stop_confirmation_renders_only_cancel_and_stop_with_stop_focused() {
         let mut dashboard = running_dashboard_with_stop_dialog();
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
         terminal
@@ -2314,17 +2163,13 @@ mod tests {
         let lines = buffer_lines(buffer);
         let row = lines
             .iter()
-            .position(|line| {
-                line.contains(" Cancel ") && line.contains(" Delete ") && line.contains(" Stop ")
-            })
+            .position(|line| line.contains(" Cancel ") && line.contains(" Stop "))
             .expect("button row");
         let button_y = buffer.area.y + row as u16;
         let cancel_x = buffer.area.x + cell_column(&lines[row], "Cancel");
-        let delete_x = buffer.area.x + cell_column(&lines[row], "Delete");
         let stop_x = buffer.area.x + cell_column(&lines[row], "Stop");
         assert_eq!(buffer[(stop_x, button_y)].bg, Color::Cyan);
         assert_eq!(buffer[(cancel_x, button_y)].bg, Color::DarkGray);
-        assert_eq!(buffer[(delete_x, button_y)].bg, Color::DarkGray);
         // Each label keeps its one-cell padding inside the button background.
         assert_eq!(buffer[(cancel_x - 1, button_y)].bg, Color::DarkGray);
         assert_eq!(buffer[(stop_x - 1, button_y)].bg, Color::Cyan);
@@ -2337,7 +2182,7 @@ mod tests {
             Confirmation::Close {
                 session_id: "session-1".into(),
             },
-            Confirmation::DeleteStopped {
+            Confirmation::DestroyStopped {
                 session_id: "session-1".into(),
                 reopen: None,
             },
@@ -2371,24 +2216,24 @@ mod tests {
     }
 
     #[test]
-    fn delete_stopped_confirmation_deletes_from_its_primary_button() {
+    fn destroy_stopped_confirmation_destroys_from_its_primary_button() {
         let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_resume_dialog(1, Vec::new());
         dashboard.handle_key(key(KeyCode::Delete));
         let Mode::Confirm(dialog) = &dashboard.mode else {
-            panic!("expected delete confirmation");
+            panic!("expected destroy confirmation");
         };
         assert_eq!(
             confirmation_buttons(&dialog.confirmation),
-            &["Cancel", "Delete"]
+            &["Cancel", "Destroy"]
         );
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::DeleteStopped {
+            DashboardAction::DestroyStopped {
                 session_id: "session-1".into()
             }
         );
-        // Deleting from the dialog leaves the user in the dialog.
+        // Destroying from the dialog leaves the user in the dialog.
         assert!(matches!(dashboard.mode, Mode::ResumeDialog(_)));
     }
 

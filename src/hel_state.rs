@@ -1087,13 +1087,13 @@ impl HelState {
         directories.truncate(20);
     }
 
-    pub fn remove_stopped_session(&mut self, session_id: &str) -> Result<SessionRecord> {
+    pub fn destroy_stopped_session(&mut self, session_id: &str) -> Result<SessionRecord> {
         let session = self
             .sessions
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?;
         if session.state.is_active() {
-            bail!("refusing to delete active session {session_id}");
+            bail!("refusing to destroy active session {session_id}");
         }
         Ok(self
             .sessions
@@ -1749,7 +1749,7 @@ mod tests {
         let mut state = sample_state();
         assert!(
             state
-                .remove_stopped_session("0123456789abcdef")
+                .destroy_stopped_session("0123456789abcdef")
                 .unwrap_err()
                 .to_string()
                 .contains("active session")
@@ -1757,7 +1757,7 @@ mod tests {
         assert!(state.sessions.contains_key("0123456789abcdef"));
 
         state.sessions.values_mut().next().unwrap().state = SessionState::Stopped;
-        let removed = state.remove_stopped_session("0123456789abcdef").unwrap();
+        let removed = state.destroy_stopped_session("0123456789abcdef").unwrap();
         assert_eq!(removed.id, "0123456789abcdef");
         assert!(state.sessions.is_empty());
     }
