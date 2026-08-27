@@ -117,7 +117,7 @@ pub enum DashboardAction {
     Close {
         session_id: String,
     },
-    ForceDestroy {
+    ForceStop {
         session_id: String,
     },
     DeleteActive {
@@ -430,7 +430,7 @@ impl DashboardState {
             }
             Mode::Confirm(ConfirmDialog {
                 confirmation:
-                    Confirmation::ForceDestroy { typed, .. } | Confirmation::DeleteActive { typed, .. },
+                    Confirmation::ForceStop { typed, .. } | Confirmation::DeleteActive { typed, .. },
                 ..
             }) => {
                 let remaining = FORCE_CONFIRMATION.len().saturating_sub(typed.len());

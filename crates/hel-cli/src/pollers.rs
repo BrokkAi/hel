@@ -1423,7 +1423,7 @@ pub(crate) enum LifecycleSuccess {
         materialized: Box<MaterializedSession>,
     },
     Closed,
-    Destroyed,
+    ForceStopped,
     DeletedActive,
     DeletedStopped,
 }

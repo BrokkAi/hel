@@ -1423,8 +1423,8 @@ impl DashboardContext {
                 self.dashboard
                     .set_notice(format!("Stopped {}", short_id(&session_id)));
             }
-            Ok(LifecycleSuccess::Destroyed) => self.dashboard.set_notice(format!(
-                "Destroyed {} without an archive",
+            Ok(LifecycleSuccess::ForceStopped) => self.dashboard.set_notice(format!(
+                "Force-stopped {} at its latest recovery archive",
                 short_id(&session_id)
             )),
             Ok(LifecycleSuccess::DeletedActive) => self.dashboard.set_notice(format!(

@@ -355,6 +355,64 @@ impl Controller {
         self.persist_session_state(session_id)
     }
 
+    /// Tear down the current target without taking a fresh checkpoint, then
+    /// leave the logical session resumable from its latest verified archive.
+    pub fn force_stop(&mut self, session_id: &str, executor: &impl CommandExecutor) -> Result<()> {
+        self.force_stop_with(
+            session_id,
+            executor,
+            crate::hel_database::save_lifecycle_session,
+        )
+    }
+
+    fn force_stop_with(
+        &mut self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+        persist: impl Fn(&SessionRecord) -> Result<()>,
+    ) -> Result<()> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?
+            .clone();
+        ensure!(
+            session.state.is_active(),
+            "session {session_id} is already inactive"
+        );
+        let checkpoint = session
+            .checkpoint
+            .as_ref()
+            .context("force stop requires an existing recovery archive")?;
+        // Force stop skips a new checkpoint, never verification of the archive
+        // that makes the logical session resumable afterwards.
+        verify_installed_checkpoint_gate(session_id, checkpoint)
+            .context("verify the recovery archive before force stopping")?;
+        retire_git_broker(session_id).context("stop the session's local Git broker")?;
+        if let Some(locator) = &session.target {
+            let backend = backend_locator(locator, &session, &self.config)?;
+            hel_targets::close_plan(&backend, session_id)?.execute(executor)?;
+        }
+        if let Some(worktree) = &session.managed_worktree {
+            retire_managed_worktree(executor, worktree)
+                .context("retire managed raw-session worktree after force stop")?;
+        }
+        let record = self.state.sessions.get_mut(session_id).unwrap();
+        record.state = SessionState::Stopped;
+        record.target = None;
+        record.updated_at = now();
+        record.last_error = None;
+        record.last_checkpoint_error = None;
+        persist_session_record_transition_or_restore(
+            &mut self.state,
+            session_id,
+            &session,
+            "persist stopped state after force stopping the current target",
+            &persist,
+        )
+    }
+
     /// Permanently remove an inactive session and every artifact Hel owns for it.
     /// External cleanup happens before the durable record is dropped so failures
     /// remain visible and retryable.
@@ -562,6 +620,106 @@ mod tests {
             controller.state.sessions[session_id].state,
             SessionState::Stopped
         );
+    }
+    #[test]
+    fn force_stop_reuses_verified_archive_and_leaves_session_resumable() {
+        let archive_directory = tempfile::tempdir().unwrap();
+        let repository = committed_repository();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(archive_directory.path(), session_id, 7);
+        let mut session = managed_worktree_session(repository.path(), session_id);
+        let worktree = session.managed_worktree.clone().unwrap();
+        session.state = SessionState::Running;
+        session.target = Some(TargetLocator::LocalBare {
+            worker_root: archive_directory.path().join(session_id),
+        });
+        session.checkpoint = Some(checkpoint.clone());
+        let mut config = HelConfig::default();
+        config
+            .targets
+            .insert("local-bare".into(), TargetTemplate::LocalBare);
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+
+        controller
+            .force_stop_with(session_id, &ProcessExecutor, |_| Ok(()))
+            .unwrap();
+
+        let stopped = &controller.state.sessions[session_id];
+        assert_eq!(stopped.state, SessionState::Stopped);
+        assert!(stopped.target.is_none());
+        assert_eq!(stopped.checkpoint.as_ref(), Some(&checkpoint));
+        assert!(checkpoint.archive_path.is_file());
+        assert!(!worktree.worktree_root.exists());
+        assert!(
+            !test_git(
+                repository.path(),
+                &[
+                    "show-ref",
+                    "--hash",
+                    &format!("refs/heads/{}", worktree.branch),
+                ],
+            )
+            .is_empty()
+        );
+    }
+    #[test]
+    fn force_stop_without_a_recovery_archive_does_not_touch_the_target() {
+        struct RecordingExecutor {
+            calls: RefCell<usize>,
+        }
+
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, _command: &CommandSpec) -> Result<CommandOutput> {
+                *self.calls.borrow_mut() += 1;
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut session = checkpoint_test_session(session_id);
+        session.state = SessionState::Running;
+        session.checkpoint = None;
+        session.target_template_id = "local".into();
+        session.target = Some(TargetLocator::LocalBare {
+            worker_root: directory.path().join(session_id),
+        });
+        let mut config = HelConfig::default();
+        config
+            .targets
+            .insert("local".into(), TargetTemplate::LocalBare);
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+        let executor = RecordingExecutor {
+            calls: RefCell::new(0),
+        };
+
+        let error = controller
+            .force_stop_with(session_id, &executor, |_| Ok(()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("existing recovery archive"));
+        assert_eq!(*executor.calls.borrow(), 0);
+        assert_eq!(
+            controller.state.sessions[session_id].state,
+            SessionState::Running
+        );
+        assert!(controller.state.sessions[session_id].target.is_some());
     }
     #[test]
     fn destroying_retry_blocks_cleanup_when_the_archive_gate_changed() {

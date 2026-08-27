@@ -124,7 +124,7 @@ pub(crate) enum Confirmation {
         session_id: String,
         error: String,
     },
-    ForceDestroy {
+    ForceStop {
         session_id: String,
         typed: String,
     },
@@ -188,8 +188,8 @@ fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] 
         Confirmation::DirtyLocal { .. } => &["Cancel", "Continue"],
         Confirmation::Close { .. } => &["Cancel", "Delete", "Stop"],
         Confirmation::DeleteStopped { .. } => &["Cancel", "Delete"],
-        Confirmation::CloseFailed { .. } => &["Cancel", "Force destroy", "Retry stop"],
-        Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => &[],
+        Confirmation::CloseFailed { .. } => &["Cancel", "Force stop", "Retry stop"],
+        Confirmation::ForceStop { .. } | Confirmation::DeleteActive { .. } => &[],
     }
 }
 
@@ -692,7 +692,7 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
         Confirmation::DirtyLocal { .. } => 11,
         Confirmation::CloseFailed { .. } => 12,
         Confirmation::Close { .. } | Confirmation::DeleteStopped { .. } => 10,
-        Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => 9,
+        Confirmation::ForceStop { .. } | Confirmation::DeleteActive { .. } => 10,
     };
     let (title, mut lines) = match confirmation {
         Confirmation::DirtyLocal { repositories, .. } => {
@@ -738,12 +738,13 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
                 ),
             ],
         ),
-        Confirmation::ForceDestroy { session_id, typed } => (
-            " FORCE DESTROY · DATA MAY BE LOST ",
+        Confirmation::ForceStop { session_id, typed } => (
+            " FORCE STOP · RECENT WORK MAY BE LOST ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("The Hel-managed worktree and generated branch will be deleted."),
+                Line::raw("The current target will be removed without a new checkpoint."),
+                Line::raw("You can resume from the latest verified recovery archive."),
                 Line::raw(format!("Type {FORCE_CONFIRMATION}, then press Enter:")),
                 Line::styled(typed.clone(), Style::default().fg(Color::Red)),
             ],
@@ -1255,7 +1256,7 @@ impl DashboardState {
                 DashboardAction::DeleteStopped { session_id }
             }
             (Confirmation::CloseFailed { session_id, .. }, 1) => {
-                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
                     session_id,
                     typed: String::new(),
                 }));
@@ -1318,7 +1319,7 @@ impl DashboardState {
         confirmation: Confirmation,
     ) -> DashboardAction {
         match confirmation {
-            Confirmation::ForceDestroy {
+            Confirmation::ForceStop {
                 session_id,
                 mut typed,
             } => match code {
@@ -1328,7 +1329,7 @@ impl DashboardState {
                 }
                 KeyCode::Backspace => {
                     typed.pop();
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
                         session_id,
                         typed,
                     }));
@@ -1338,7 +1339,7 @@ impl DashboardState {
                     if typed.len() < FORCE_CONFIRMATION.len() {
                         typed.push(c.to_ascii_uppercase());
                     }
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
                         session_id,
                         typed,
                     }));
@@ -1346,10 +1347,10 @@ impl DashboardState {
                 }
                 KeyCode::Enter if typed == FORCE_CONFIRMATION => {
                     self.cancel_modal();
-                    DashboardAction::ForceDestroy { session_id }
+                    DashboardAction::ForceStop { session_id }
                 }
                 _ => {
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
                         session_id,
                         typed,
                     }));
@@ -2095,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_archive_dialog_offers_retry_or_explicit_force_destroy() {
+    fn failed_archive_dialog_offers_retry_or_explicit_force_stop() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
@@ -2121,7 +2122,7 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Char('x'))),
             DashboardAction::None
         );
-        // "Force destroy" sits between Cancel and Retry stop.
+        // "Force stop" sits between Cancel and Retry stop.
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Left)),
             DashboardAction::None
@@ -2133,10 +2134,17 @@ mod tests {
         assert!(matches!(
             dashboard.mode,
             Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::ForceDestroy { .. },
+                confirmation: Confirmation::ForceStop { .. },
                 ..
             })
         ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .unwrap();
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("FORCE STOP · RECENT WORK MAY BE LOST"));
+        assert!(rendered.contains("resume from the latest verified recovery archive"));
         for character in FORCE_CONFIRMATION.chars() {
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Char(character))),
@@ -2145,7 +2153,7 @@ mod tests {
         }
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::ForceDestroy {
+            DashboardAction::ForceStop {
                 session_id: "session-1".into()
             }
         );

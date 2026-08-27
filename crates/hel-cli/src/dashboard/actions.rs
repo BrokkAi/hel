@@ -355,10 +355,10 @@ pub(crate) async fn apply_dashboard_action(
                 context.critical_operations.clone(),
             );
         }
-        DashboardAction::ForceDestroy { session_id } => {
+        DashboardAction::ForceStop { session_id } => {
             let request = context.begin_lifecycle_operation(
                 &session_id,
-                SessionOperationKind::Destroying,
+                SessionOperationKind::Stopping,
                 true,
             );
             spawn_lifecycle_operation(
@@ -366,8 +366,8 @@ pub(crate) async fn apply_dashboard_action(
                 context.critical_operations.clone(),
                 move |controller, cancelled| {
                     let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.force_destroy(&session_id, &executor)?;
-                    Ok(LifecycleSuccess::Destroyed)
+                    controller.force_stop(&session_id, &executor)?;
+                    Ok(LifecycleSuccess::ForceStopped)
                 },
             );
         }
