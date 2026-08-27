@@ -3185,7 +3185,13 @@ fn handle_crossterm(
         && matches!(key.code, KeyCode::Char('c'))
         && state.is_streaming()
     {
-        cancel_current_turn(state, cmd_tx);
+        if !state.input.is_empty() {
+            clear_prompt_input(state);
+        } else if attachment_count(state) > 0 {
+            clear_prompt_attachments(state);
+        } else {
+            cancel_current_turn(state, cmd_tx);
+        }
         return TerminalRequest::None;
     }
 
@@ -3524,16 +3530,9 @@ fn handle_crossterm(
             } else if state.input.is_empty() && attachment_count(state) == 0 {
                 state.exit_reason = Some(UiExitReason::Quit);
             } else if !state.input.is_empty() {
-                state.input.clear();
-                state.input_cursor = 0;
-                state.reset_history_navigation();
-                state.scroll_input_to_bottom();
-                state.update_autocomplete();
+                clear_prompt_input(state);
             } else {
-                clear_attachments(state);
-                state.reset_history_navigation();
-                state.scroll_input_to_bottom();
-                state.update_autocomplete();
+                clear_prompt_attachments(state);
             }
         }
         (_, KeyCode::Esc) if state.is_streaming() => {
@@ -3703,6 +3702,21 @@ fn handle_crossterm(
         _ => {}
     }
     TerminalRequest::None
+}
+
+fn clear_prompt_input(state: &mut AppState) {
+    state.input.clear();
+    state.input_cursor = 0;
+    state.reset_history_navigation();
+    state.scroll_input_to_bottom();
+    state.update_autocomplete();
+}
+
+fn clear_prompt_attachments(state: &mut AppState) {
+    clear_attachments(state);
+    state.reset_history_navigation();
+    state.scroll_input_to_bottom();
+    state.update_autocomplete();
 }
 
 fn cancel_current_turn(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
@@ -13481,10 +13495,17 @@ fn busy_prompt_title(state: &AppState) -> Option<Line<'static>> {
     // and the missing-arm compile error is what forces that.
     let hint = match state.connection_state() {
         ConnectionState::Streaming | ConnectionState::Cancelling => {
-            if queued > 0 {
-                format!("{queued} queued | Enter queue next | Ctrl-C/Esc cancel current")
+            let interrupt_hint = if !state.input.is_empty() {
+                "Ctrl-C clear draft | Esc cancel current"
+            } else if attachment_count(state) > 0 {
+                "Ctrl-C clear attachments | Esc cancel current"
             } else {
-                "Enter queue next | Ctrl-C/Esc cancel current".to_string()
+                "Ctrl-C/Esc cancel current"
+            };
+            if queued > 0 {
+                format!("{queued} queued | Enter queue next | {interrupt_hint}")
+            } else {
+                format!("Enter queue next | {interrupt_hint}")
             }
         }
         ConnectionState::Forking => {
@@ -15330,7 +15351,7 @@ fn general_help_lines(voice_input_supported: bool, theme: TerminalTheme) -> Vec<
         ),
         help_binding_line(
             "Ctrl-C",
-            "cancel streaming; clear input/chips; quit when empty",
+            "clear input, then chips; cancel streaming; quit when empty",
             theme,
         ),
     ];
@@ -25881,6 +25902,29 @@ mod tests {
         assert!(!cancelling.contains("streaming"), "{cancelling}");
         assert!(!cancelling.contains("prompt"), "{cancelling}");
 
+        state.input = "draft".to_string();
+        let drafting = line_text(&busy_prompt_title(&state).expect("drafting title"));
+        assert!(drafting.contains("Ctrl-C clear draft"), "{drafting}");
+        assert!(drafting.contains("Esc cancel current"), "{drafting}");
+        assert!(
+            !drafting.contains("Ctrl-C/Esc cancel current"),
+            "{drafting}"
+        );
+        state.input.clear();
+
+        state.attachments.push(PastedAttachment {
+            id: 1,
+            position: 0,
+            content: "attachment".to_string(),
+        });
+        let attaching = line_text(&busy_prompt_title(&state).expect("attaching title"));
+        assert!(
+            attaching.contains("Ctrl-C clear attachments"),
+            "{attaching}"
+        );
+        assert!(attaching.contains("Esc cancel current"), "{attaching}");
+        state.attachments.clear();
+
         state.push_queued_prompt(QueuedPrompt {
             text: "next".to_string(),
             images: Vec::new(),
@@ -29782,6 +29826,56 @@ mod tests {
             Some(UiExitReason::Quit),
             "second Ctrl-C quits when everything is empty"
         );
+    }
+
+    #[test]
+    fn ctrl_c_clears_draft_layers_before_cancelling_streaming_turn() {
+        let mut state = ready_state_with_session();
+        state.record_user_prompt("long-running task".to_string());
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        type_string(&mut state, &cmd_tx, "replace this draft");
+        state.attachments.push(PastedAttachment {
+            id: 1,
+            position: 0,
+            content: "attachment".to_string(),
+        });
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(state.input.is_empty());
+        assert_eq!(state.input_cursor, 0);
+        assert_eq!(attachment_count(&state), 1);
+        assert_eq!(state.connection_state(), ConnectionState::Streaming);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "clearing draft text must not interrupt the active turn"
+        );
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(attachment_count(&state), 0);
+        assert_eq!(state.connection_state(), ConnectionState::Streaming);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "clearing draft attachments must not interrupt the active turn"
+        );
+
+        handle_crossterm(
+            &mut state,
+            &cmd_tx,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(state.connection_state(), ConnectionState::Cancelling);
+        assert!(matches!(cmd_rx.try_recv(), Ok(UiCommand::CancelPrompt)));
     }
 
     #[test]
