@@ -15,7 +15,7 @@ use super::checkpoint::{
     verify_installed_checkpoint_gate, wait_for_relay_closed,
 };
 use super::provisioning::retire_git_broker;
-use super::worktree::cleanup_managed_worktree;
+use super::worktree::{cleanup_managed_worktree, retire_managed_worktree};
 use super::{Controller, now, persist_session_record_transition_or_restore};
 
 impl Controller {
@@ -314,6 +314,10 @@ impl Controller {
                 }
             }
         }
+        if let Some(worktree) = &destroying.managed_worktree {
+            retire_managed_worktree(executor, worktree)
+                .context("retire managed raw-session worktree after verified close")?;
+        }
         let record = self.state.sessions.get_mut(session_id).unwrap();
         record.state = SessionState::Stopped;
         record.target = None;
@@ -426,10 +430,11 @@ mod tests {
     use crate::hel_config::{ContainerTemplate as ConfigContainer, HelConfig, TargetTemplate};
     use crate::hel_controller::Controller;
     use crate::hel_controller::test_support::{
-        checkpoint_test_session, write_checkpoint_gate_archive,
+        checkpoint_test_session, committed_repository, managed_worktree_session, test_git,
+        write_checkpoint_gate_archive,
     };
     use crate::hel_state::{HelState, SessionState, TargetLocator};
-    use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec};
+    use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, ProcessExecutor};
 
     use super::*;
 
@@ -505,6 +510,60 @@ mod tests {
         assert!(stopped.target.is_none());
     }
     #[test]
+    fn verified_close_retires_managed_checkout_but_keeps_archive_and_branch() {
+        let archive_directory = tempfile::tempdir().unwrap();
+        let repository = committed_repository();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(archive_directory.path(), session_id, 7);
+        let mut session = managed_worktree_session(repository.path(), session_id);
+        let worktree = session.managed_worktree.clone().unwrap();
+        std::fs::write(worktree.worktree_root.join("dirty.txt"), "worktree state\n").unwrap();
+        session.state = SessionState::Closing;
+        session.target = Some(TargetLocator::LocalBare {
+            worker_root: archive_directory.path().join(session_id),
+        });
+        session.checkpoint = Some(checkpoint.clone());
+        let mut config = HelConfig::default();
+        config
+            .targets
+            .insert("local-bare".into(), TargetTemplate::LocalBare);
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+
+        controller
+            .destroy_after_verified_checkpoint_with(
+                session_id,
+                &checkpoint,
+                &ProcessExecutor,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        assert!(!worktree.worktree_root.exists());
+        assert!(checkpoint.archive_path.is_file());
+        assert_eq!(
+            test_git(
+                repository.path(),
+                &[
+                    "show-ref",
+                    "--hash",
+                    &format!("refs/heads/{}", worktree.branch),
+                ],
+            )
+            .len(),
+            40
+        );
+        assert_eq!(
+            controller.state.sessions[session_id].state,
+            SessionState::Stopped
+        );
+    }
+    #[test]
     fn destroying_retry_blocks_cleanup_when_the_archive_gate_changed() {
         struct RecordingExecutor {
             calls: RefCell<usize>,
@@ -522,10 +581,12 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
+        let repository = committed_repository();
         let session_id = "0123456789abcdef0123456789abcdef";
         let mut checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 7);
         checkpoint.event_frontier = 8;
-        let mut session = checkpoint_test_session(session_id);
+        let mut session = managed_worktree_session(repository.path(), session_id);
+        let worktree = session.managed_worktree.clone().unwrap();
         session.target_template_id = "local".into();
         session.state = SessionState::Destroying;
         session.target = Some(TargetLocator::LocalBare {
@@ -558,6 +619,7 @@ mod tests {
         assert!(error.to_string().contains("checkpoint frontier changed"));
         assert_eq!(*executor.calls.borrow(), 0);
         assert!(persisted.into_inner().is_empty());
+        assert!(worktree.worktree_root.is_dir());
         assert_eq!(
             controller.state.sessions[session_id].state,
             SessionState::Destroying

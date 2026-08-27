@@ -79,23 +79,32 @@ impl Controller {
         let Some(directory) = session.project_directory.as_deref() else {
             return Ok(session.project_source(&self.config));
         };
-        let target = match &session.managed_worktree {
-            Some(worktree) => worktree.target.clone(),
-            None => managed_worktree_target(
-                self.config
-                    .targets
-                    .get(&session.target_template_id)
-                    .with_context(|| {
-                        format!(
-                            "session {session_id} target {:?} is no longer configured",
-                            session.target_template_id
-                        )
-                    })?,
-            )?,
+        let (target, origin_directory) = match &session.managed_worktree {
+            // The source repository is the durable owner of a linked
+            // worktree's shared Git configuration and remains available while
+            // a stopped session's checkout is retired.
+            Some(worktree) => (
+                worktree.target.clone(),
+                worktree.source_repository.as_path(),
+            ),
+            None => (
+                managed_worktree_target(
+                    self.config
+                        .targets
+                        .get(&session.target_template_id)
+                        .with_context(|| {
+                            format!(
+                                "session {session_id} target {:?} is no longer configured",
+                                session.target_template_id
+                            )
+                        })?,
+                )?,
+                directory,
+            ),
         };
         let output = executor.execute(&managed_git_command(
             &target,
-            directory,
+            origin_directory,
             ["config", "--get", "remote.origin.url"],
             "resolve project Git origin",
         ))?;
@@ -791,6 +800,13 @@ fn path_exists_on_managed_target(
     }
 }
 
+pub(super) fn managed_worktree_checkout_exists(
+    executor: &impl CommandExecutor,
+    worktree: &ManagedWorktree,
+) -> Result<bool> {
+    path_exists_on_managed_target(executor, &worktree.target, &worktree.worktree_root)
+}
+
 /// Whether a new managed worktree needs the primary checkout to be clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrimaryCheckoutRequirement {
@@ -862,6 +878,78 @@ pub(super) fn create_managed_worktree(
         )?;
     }
     Ok(())
+}
+
+/// Recreate a retired checkout from the session branch. Returns whether this
+/// call created it, so a failed resume can put the session back into its
+/// stopped, checkout-free state.
+pub(super) fn restore_managed_worktree(
+    executor: &impl CommandExecutor,
+    worktree: &ManagedWorktree,
+) -> Result<bool> {
+    if managed_worktree_checkout_exists(executor, worktree)? {
+        return Ok(false);
+    }
+    ensure!(
+        path_exists_on_managed_target(executor, &worktree.target, &worktree.source_repository)?,
+        "managed worktree source repository is unavailable: {}",
+        worktree.source_repository.display()
+    );
+    let branch_ref = format!("refs/heads/{}", worktree.branch);
+    let check = managed_git_command(
+        &worktree.target,
+        &worktree.source_repository,
+        ["show-ref", "--verify", "--quiet", &branch_ref],
+        "check retired managed worktree branch",
+    );
+    let output = executor.execute(&check)?;
+    match output.status {
+        0 => {}
+        1 => bail!(
+            "managed worktree branch is unavailable: {}",
+            worktree.branch
+        ),
+        status => bail!(
+            "check retired managed worktree branch failed with status {status}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+    // A remote bare target may already have removed the checkout directory.
+    // Prune its stale registration before adding the retained branch again.
+    execute_checked(
+        executor,
+        managed_git_command(
+            &worktree.target,
+            &worktree.source_repository,
+            ["worktree", "prune"],
+            "prune retired managed worktree metadata",
+        ),
+    )?;
+    let parent = worktree
+        .worktree_root
+        .parent()
+        .context("managed worktree root has no parent")?;
+    execute_checked(
+        executor,
+        managed_target_command(&worktree.target, "mkdir", ["-p", &parent.to_string_lossy()])
+            .purpose("recreate managed worktree directory"),
+    )?;
+    execute_checked(
+        executor,
+        managed_git_command(
+            &worktree.target,
+            &worktree.source_repository,
+            [
+                "worktree",
+                "add",
+                "--",
+                &worktree.worktree_root.to_string_lossy(),
+                &worktree.branch,
+            ],
+            "restore managed raw-session worktree",
+        ),
+    )?;
+    Ok(true)
 }
 
 fn ensure_managed_worktree_available(
@@ -1243,6 +1331,45 @@ mod tests {
         assert_eq!(source.key, "github:brokkai/bifrost-dev");
         assert_eq!(source.short, "bifrost-dev");
         assert_eq!(source.full, "BrokkAi/bifrost-dev");
+    }
+    #[test]
+    fn managed_worktree_origin_uses_source_repository_while_checkout_is_retired() {
+        struct OriginExecutor;
+        impl CommandExecutor for OriginExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                assert_eq!(
+                    command.args,
+                    [
+                        "-C",
+                        "/home/dev/project",
+                        "config",
+                        "--get",
+                        "remote.origin.url",
+                    ]
+                );
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: b"git@github.com:example/project.git\n".to_vec(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let session = managed_raw_session(ManagedWorktreeTarget::Local);
+        let session_id = session.id.clone();
+        let controller = Controller {
+            config: HelConfig::default(),
+            state: HelState {
+                sessions: [(session_id.clone(), session)].into_iter().collect(),
+                ..HelState::default()
+            },
+        };
+
+        let source = controller
+            .resolve_session_project_source(&session_id, &OriginExecutor)
+            .unwrap();
+
+        assert_eq!(source.key, "github:example/project");
     }
 
     /// Answers the two Git reads that locate a checkout, and nothing else.
@@ -1665,7 +1792,7 @@ mod tests {
         assert!(!output.status.success());
     }
     #[test]
-    fn retiring_a_converted_worktree_removes_the_checkout_and_keeps_its_branch() {
+    fn retired_worktree_can_be_recreated_from_its_retained_branch() {
         let repository = committed_repository();
         let session_id = "0123456789abcdef0123456789abcdef";
         let session = managed_worktree_session(repository.path(), session_id);
@@ -1690,6 +1817,69 @@ mod tests {
         assert!(
             branch.status.success(),
             "the session branch must survive: later checkpoints are deltas against it"
+        );
+
+        assert!(restore_managed_worktree(&ProcessExecutor, &worktree).unwrap());
+        assert!(worktree.worktree_root.join("nested/file.txt").is_file());
+        assert!(!restore_managed_worktree(&ProcessExecutor, &worktree).unwrap());
+    }
+    #[test]
+    fn retiring_a_remote_worktree_prunes_registration_after_target_removed_checkout() {
+        struct RemoteExecutor {
+            path_checks: RefCell<usize>,
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+
+        impl CommandExecutor for RemoteExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                let status = if command.purpose == "check managed worktree path" {
+                    let mut checks = self.path_checks.borrow_mut();
+                    let status = i32::from(*checks != 0);
+                    *checks += 1;
+                    status
+                } else {
+                    0
+                };
+                Ok(CommandOutput {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let worktree = ManagedWorktree {
+            source_project_directory: PathBuf::from("/srv/project"),
+            source_repository: PathBuf::from("/srv/project"),
+            worktree_root: PathBuf::from("/srv/project/.hel/worktrees/session"),
+            branch: "hel/session".into(),
+            target: ManagedWorktreeTarget::Ssh {
+                destination: "builder".into(),
+                ssh_args: Vec::new(),
+            },
+        };
+        let executor = RemoteExecutor {
+            path_checks: RefCell::new(0),
+            commands: RefCell::new(Vec::new()),
+        };
+
+        retire_managed_worktree(&executor, &worktree).unwrap();
+
+        let purposes = executor
+            .commands
+            .borrow()
+            .iter()
+            .map(|command| command.purpose.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            purposes,
+            [
+                "check managed worktree path",
+                "check managed worktree path",
+                "prune managed worktree metadata",
+                "remove empty managed worktree directories",
+            ]
         );
     }
     #[test]
