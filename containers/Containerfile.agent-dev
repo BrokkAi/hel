@@ -45,7 +45,7 @@ RUN apt-get update \
 # intentionally left to Hel's official on-demand installer because that path is
 # not version-pinned yet.
 RUN npm install --global --no-audit --no-fund \
-        @agentclientprotocol/codex-acp@1.1.14 \
+        @agentclientprotocol/codex-acp@1.6.2 \
         @agentclientprotocol/claude-agent-acp@0.68.0 \
         @deepseek-ai/dsh@0.1.1-rc.2 \
         dsh-acp-server@0.10.0 \

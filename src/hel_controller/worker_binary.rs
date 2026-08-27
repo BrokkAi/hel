@@ -756,7 +756,11 @@ fn workspace_paths(
 // Package versions for ACP bridges. Keep these in lockstep with the global npm installs in
 // containers/Containerfile.agent-dev; bridge_pins_match_containerfile() below
 // fails the build when they drift.
-const CODEX_ACP_FALLBACK_VERSION: &str = "1.1.14";
+// Codex 0.148 reuses pending MCP startups during runtime reconciliation. Older
+// releases could cancel the first project-memory startup while immediately
+// replacing it with an equivalent connection, leaving a false failed-tool
+// event at the beginning of every session.
+const CODEX_ACP_FALLBACK_VERSION: &str = "1.6.2";
 
 const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
 
@@ -2151,7 +2155,7 @@ mod tests {
             None,
             ExecutionPolicy::Unconstrained,
         );
-        assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.1.14"));
+        assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.6.2"));
 
         let (_, claude_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Claude,
