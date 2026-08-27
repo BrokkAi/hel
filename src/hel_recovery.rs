@@ -132,7 +132,14 @@ impl RecoveryCoordinator {
                                     outcome,
                                     cancelled: copy_cancelled.load(Ordering::Acquire),
                                 };
-                                let _ = completed_tx.send(result);
+                                let result_session_id = result.session_id.clone();
+                                if let Err(error) = completed_tx.send(result) {
+                                    tracing::debug!(
+                                        session_id = %result_session_id,
+                                        %error,
+                                        "recovery result dropped because the coordinator stopped"
+                                    );
+                                }
                             });
                         }
                     }
@@ -152,7 +159,14 @@ impl RecoveryCoordinator {
                                     // attempt nor be recorded as a checkpoint
                                     // failure against the session.
                                     policy.last_attempted_turn = None;
-                                    let _ = results_tx.send(result);
+                                    let result_session_id = result.session_id.clone();
+                                    if let Err(error) = results_tx.send(result) {
+                                        tracing::debug!(
+                                            session_id = %result_session_id,
+                                            %error,
+                                            "cancelled recovery result dropped because its consumer stopped"
+                                        );
+                                    }
                                     continue;
                                 }
                                 policy.record_failure(Utc::now());
@@ -169,7 +183,14 @@ impl RecoveryCoordinator {
                                 }
                             }
                         }
-                        let _ = results_tx.send(result);
+                        let result_session_id = result.session_id.clone();
+                        if let Err(error) = results_tx.send(result) {
+                            tracing::debug!(
+                                session_id = %result_session_id,
+                                %error,
+                                "recovery result dropped because its consumer stopped"
+                            );
+                        }
                     }
                 }
             }

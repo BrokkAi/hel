@@ -134,8 +134,28 @@ impl Controller {
     ) -> Option<String> {
         let session = self.state.sessions.get(session_id)?;
         let locator = session.target.as_ref()?;
-        let backend = backend_locator(locator, session, &self.config).ok()?;
-        let worker_root = hel_targets::worker_root(&backend, session_id).ok()?;
+        let backend = match backend_locator(locator, session, &self.config) {
+            Ok(backend) => backend,
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "could not construct a worker diagnostic probe"
+                );
+                return None;
+            }
+        };
+        let worker_root = match hel_targets::worker_root(&backend, session_id) {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "could not derive the worker diagnostic root"
+                );
+                return None;
+            }
+        };
         worker_last_words(executor, &backend, &worker_root)
     }
 
@@ -1826,7 +1846,25 @@ pub(super) fn worker_last_words(
         }
     }
     .purpose("collect worker last words");
-    let output = executor.execute(&command).ok()?;
+    let output = match executor.execute(&command) {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(
+                worker_root,
+                %error,
+                "could not collect worker diagnostics"
+            );
+            return None;
+        }
+    };
+    if output.status != 0 {
+        tracing::debug!(
+            worker_root,
+            status = output.status,
+            "worker diagnostic probe returned a failure"
+        );
+        return None;
+    }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!text.is_empty()).then(|| format!("worker diagnostics:\n{text}"))
 }

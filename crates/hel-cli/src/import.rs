@@ -515,12 +515,14 @@ pub(crate) fn spawn_dashboard_import(
                 return;
             }
             if force {
-                let _ = updates.blocking_send(DashboardImportUpdate::Progress {
+                if let Err(error) = updates.blocking_send(DashboardImportUpdate::Progress {
                     task_id,
                     step,
                     total,
                     message: message.into(),
-                });
+                }) {
+                    tracing::debug!(task_id, %error, "import progress consumer closed");
+                }
                 return;
             }
             let mut last_update = last_detail_update.lock().expect("import progress lock");
@@ -528,16 +530,17 @@ pub(crate) fn spawn_dashboard_import(
             if now.duration_since(*last_update) < Duration::from_millis(250) {
                 return;
             }
-            if updates
-                .try_send(DashboardImportUpdate::Progress {
-                    task_id,
-                    step,
-                    total,
-                    message: message.into(),
-                })
-                .is_ok()
-            {
-                *last_update = now;
+            match updates.try_send(DashboardImportUpdate::Progress {
+                task_id,
+                step,
+                total,
+                message: message.into(),
+            }) {
+                Ok(()) => *last_update = now,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(task_id, "import progress consumer closed");
+                }
             }
         };
         let mut result = import_session_from_profile(
@@ -558,16 +561,19 @@ pub(crate) fn spawn_dashboard_import(
                     .get(&imported.session_id)
                     .and_then(|session| session.checkpoint.as_ref())
                     .map(|checkpoint| checkpoint.archive_path.clone())
+                && let Err(error) = std::fs::remove_file(&path)
             {
-                let _ = std::fs::remove_file(path);
+                tracing::warn!(path = %path.display(), %error, "could not remove cancelled import checkpoint");
             }
             result = Ok(DashboardImportTaskResult::Cancelled);
         }
-        let _ = updates.blocking_send(DashboardImportUpdate::Finished {
+        if let Err(error) = updates.blocking_send(DashboardImportUpdate::Finished {
             task_id,
             pending,
             result,
-        });
+        }) {
+            tracing::debug!(task_id, %error, "import completion consumer closed");
+        }
         drop(guard);
     });
 }

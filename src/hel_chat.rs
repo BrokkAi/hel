@@ -600,6 +600,12 @@ impl ChatState {
             }
             Err(error) => {
                 self.scheduled_diffstats.remove(&key);
+                tracing::warn!(
+                    tool_call_id,
+                    revision,
+                    %error,
+                    "could not calculate a tool diff summary"
+                );
                 self.set_notice(format!("Could not calculate diff summary: {error}"));
             }
         }
@@ -1670,8 +1676,16 @@ impl ChatState {
         recorded_at_ms: Option<i64>,
         payload: &serde_json::Value,
     ) {
-        let Ok(runtime) = serde_json::from_value::<RuntimeEvent>(payload.clone()) else {
-            return;
+        let runtime = match serde_json::from_value::<RuntimeEvent>(payload.clone()) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!(
+                    seq,
+                    %error,
+                    "ignoring malformed persisted runtime event"
+                );
+                return;
+            }
         };
         match runtime {
             RuntimeEvent::SessionUpdate { update } => {

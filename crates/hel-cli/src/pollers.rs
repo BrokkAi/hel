@@ -356,6 +356,7 @@ pub(crate) fn spawn_quota_refresher() -> (
                 }
                 changed = profiles_rx.changed() => {
                     if changed.is_err() {
+                        tracing::debug!("quota profile target feed closed; stopping quota refresher");
                         break;
                     }
                     batch = profiles_rx.borrow_and_update().clone();
@@ -390,6 +391,7 @@ async fn refresh_profile_quotas(
         .await
         .is_err()
     {
+        tracing::debug!("quota update consumer closed before refresh started");
         return false;
     }
     // Keep draining even if the UI is gone so codex clients return to the
@@ -402,6 +404,7 @@ async fn refresh_profile_quotas(
                 if delivered.load(Ordering::Acquire)
                     && updates.send(QuotaUpdate::Report(quota)).await.is_err()
                 {
+                    tracing::debug!("quota update consumer closed while reporting a profile");
                     delivered.store(false, Ordering::Release);
                 }
             }
@@ -410,10 +413,19 @@ async fn refresh_profile_quotas(
     if !delivered.into_inner() {
         return false;
     }
-    updates
+    if updates
         .send(QuotaUpdate::Finished { generation })
         .await
-        .is_ok()
+        .is_err()
+    {
+        tracing::debug!(
+            generation,
+            "quota update consumer closed before refresh completed"
+        );
+        false
+    } else {
+        true
+    }
 }
 
 pub(crate) fn complete_manual_quota_refresh(
@@ -434,12 +446,30 @@ pub(crate) fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPol
         .values()
         .filter(|session| session.state.is_active() && session.target.is_some())
         .filter_map(|session| {
-            let spec = controller.reconnect_command(&session.id).ok()?;
+            let spec = match controller.reconnect_command(&session.id) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    tracing::warn!(session_id = %session.id, "could not build worker poll target: {error:#}");
+                    return None;
+                }
+            };
             Some(WorkerPollTarget {
                 session_id: session.id.clone(),
                 spec,
-                worker_recovery: controller.worker_recovery_plan(&session.id).ok(),
-                project_memory: controller.project_memory_sync_target(&session.id).ok(),
+                worker_recovery: match controller.worker_recovery_plan(&session.id) {
+                    Ok(plan) => Some(plan),
+                    Err(error) => {
+                        tracing::debug!(session_id = %session.id, "worker recovery target unavailable: {error:#}");
+                        None
+                    }
+                },
+                project_memory: match controller.project_memory_sync_target(&session.id) {
+                    Ok(target) => Some(target),
+                    Err(error) => {
+                        tracing::debug!(session_id = %session.id, "project memory target unavailable: {error:#}");
+                        None
+                    }
+                },
             })
         })
         .collect()
@@ -461,7 +491,13 @@ pub(crate) fn credential_sync_targets(controller: &Controller) -> Vec<Credential
         })
         .filter_map(|session| {
             let profile = controller.config.profiles.get(&session.last_profile)?;
-            let spec = controller.reconnect_command(&session.id).ok()?;
+            let spec = match controller.reconnect_command(&session.id) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    tracing::warn!(session_id = %session.id, "could not build credential sync target: {error:#}");
+                    return None;
+                }
+            };
             let sync_github_token = target_syncs_github_token(session.target.as_ref());
             Some(CredentialSyncTarget {
                 session_id: session.id.clone(),
@@ -716,13 +752,16 @@ fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget
         .values()
         .filter(|session| session.state.is_active() && session.target.is_some())
         .filter_map(|session| {
-            controller
-                .resource_probe(&session.id)
-                .ok()
-                .map(|probe| ResourcePollTarget {
+            match controller.resource_probe(&session.id) {
+                Ok(probe) => Some(ResourcePollTarget {
                     session_id: session.id.clone(),
                     probe,
-                })
+                }),
+                Err(error) => {
+                    tracing::warn!(session_id = %session.id, "could not build resource poll target: {error:#}");
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -767,7 +806,9 @@ pub(crate) fn spawn_aws_resource_options_resolution(
         let result = controller
             .resolve_aws_resource_options(&target_id, &CancellableProcessExecutor::new(cancelled))
             .map_err(|error| format!("{error:#}"));
-        let _ = updates.send((target_id, result));
+        if let Err(error) = updates.send((target_id.clone(), result)) {
+            tracing::debug!(target_id, %error, "AWS resource options result dropped after dashboard shutdown");
+        }
         drop(guard);
     });
 }
@@ -796,6 +837,7 @@ pub(crate) fn spawn_dashboard_resource_poller() -> (
                 }
                 changed = targets_rx.changed() => {
                     if changed.is_err() {
+                        tracing::debug!("resource poll target feed closed; stopping resource poller");
                         break;
                     }
                     targets = targets_rx
@@ -843,22 +885,34 @@ fn schedule_resource_sample(
     last_started.insert(target.session_id.clone(), now);
     let updates = updates.clone();
     tokio::spawn(async move {
-        let usage = tokio::time::timeout(
+        let usage = match tokio::time::timeout(
             RESOURCE_POLL_TIMEOUT,
             collect_session_resource_usage(&target.probe),
         )
         .await
-        .ok()
-        .and_then(Result::ok);
+        {
+            Ok(Ok(usage)) => Some(usage),
+            Ok(Err(error)) => {
+                tracing::warn!(session_id = %target.session_id, "resource probe failed: {error:#}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(session_id = %target.session_id, "resource probe timed out");
+                None
+            }
+        };
         let Some(usage) = usage else {
             return;
         };
-        let _ = updates
+        if let Err(error) = updates
             .send(ResourcePollUpdate {
-                session_id: target.session_id,
+                session_id: target.session_id.clone(),
                 usage,
             })
-            .await;
+            .await
+        {
+            tracing::debug!(session_id = %target.session_id, %error, "resource probe result dropped after dashboard shutdown");
+        }
     });
 }
 
@@ -867,7 +921,13 @@ async fn collect_session_resource_usage(
 ) -> Result<SessionResourceUsage> {
     let memory = execute_resource_command(&probe.memory).await?;
     let disk = match &probe.disk {
-        Some(command) => execute_resource_command(command).await.ok(),
+        Some(command) => match execute_resource_command(command).await {
+            Ok(output) => Some(output),
+            Err(error) => {
+                tracing::debug!(purpose = %command.purpose, "optional disk resource probe failed: {error:#}");
+                None
+            }
+        },
         None => None,
     };
     hel::hel_targets::parse_resource_usage(
@@ -894,6 +954,7 @@ pub(crate) fn spawn_dashboard_capacity_poller() -> (
                 }
                 changed = targets_rx.changed() => {
                     if changed.is_err() {
+                        tracing::debug!("capacity poll target feed closed; stopping capacity poller");
                         break;
                     }
                     targets = targets_rx.borrow_and_update().clone();
@@ -916,13 +977,16 @@ fn schedule_capacity_samples(
                 .await
                 .map_err(|_| "capacity probe timed out".to_string())
                 .and_then(|result| result.map_err(|error| format!("{error:#}")));
-            let _ = updates
+            if let Err(error) = updates
                 .send(CapacityPollUpdate {
-                    target_id: target.id,
+                    target_id: target.id.clone(),
                     result,
                     sampled_at_epoch_seconds: epoch_seconds(),
                 })
-                .await;
+                .await
+            {
+                tracing::debug!(target_id = %target.id, %error, "capacity probe result dropped after dashboard shutdown");
+            }
         });
     }
 }
@@ -1214,7 +1278,11 @@ fn spawn_worker_record_persistence(
             } => hel::hel_database::mark_session_target_lost(session_id, detail, updated_at),
         }
         .map_err(|error| format!("{error:#}"));
-        let _ = updates.send(DashboardIoUpdate::WorkerRecordPersistence { operation, result });
+        if let Err(error) =
+            updates.send(DashboardIoUpdate::WorkerRecordPersistence { operation, result })
+        {
+            tracing::debug!(%error, "worker record persistence result dropped after dashboard shutdown");
+        }
         drop(guard);
     });
 }
@@ -1244,15 +1312,12 @@ pub(crate) fn spawn_worker_diagnosis(
         })
         .await;
         let result = joined.map_err(|error| format!("worker diagnosis task failed: {error}"));
-        if updates
-            .send(DashboardIoUpdate::WorkerDiagnosis {
-                session_id: session_id.clone(),
-                episode_id,
-                result,
-            })
-            .is_err()
-        {
-            tracing::debug!(%session_id, "worker diagnosis finished after the dashboard stopped");
+        if let Err(error) = updates.send(DashboardIoUpdate::WorkerDiagnosis {
+            session_id: session_id.clone(),
+            episode_id,
+            result,
+        }) {
+            tracing::debug!(%session_id, %error, "worker diagnosis result dropped after dashboard shutdown");
         }
         drop(guard);
     });
@@ -1282,20 +1347,32 @@ pub(crate) fn merge_recovery_result(
     controller: &mut Controller,
     result: hel::hel_recovery::RecoveryResult,
 ) -> bool {
+    if let Err(error) = controller.reload() {
+        tracing::warn!(%error, "could not reload a completed recovery checkpoint");
+        return false;
+    }
+    merge_recovery_result_loaded(controller, result)
+}
+
+/// Applies a recovery result after its controller reload already ran on a
+/// blocking task. The dashboard uses this variant so the event loop only
+/// folds in memory state.
+pub(crate) fn merge_recovery_result_loaded(
+    controller: &mut Controller,
+    result: hel::hel_recovery::RecoveryResult,
+) -> bool {
     let hel::hel_recovery::RecoveryResult {
         session_id,
         expected_target,
         outcome,
         cancelled,
     } = result;
-    if let Err(error) = controller.reload() {
-        tracing::warn!(%session_id, "could not reload a completed recovery checkpoint: {error:#}");
-        return false;
-    }
     let Some(session) = controller.state.sessions.get_mut(&session_id) else {
+        tracing::warn!(%session_id, "recovery result refers to a session no longer in controller state");
         return false;
     };
     if session.target.as_ref() != Some(&expected_target) || !session.state.is_active() {
+        tracing::debug!(%session_id, "discarding recovery result for a session whose target or state changed");
         return false;
     }
     match outcome {
@@ -1396,14 +1473,11 @@ pub(crate) fn spawn_interrupted_close_recovery(
             Ok(result) => result,
             Err(error) => Err(format!("interrupted close recovery task failed: {error}")),
         };
-        if updates
-            .send(LifecycleUpdate {
-                session_id: session_id.clone(),
-                result,
-            })
-            .is_err()
-        {
-            tracing::debug!(%session_id, "interrupted close finished after its controller stopped");
+        if let Err(error) = updates.send(LifecycleUpdate {
+            session_id: session_id.clone(),
+            result,
+        }) {
+            tracing::debug!(%session_id, %error, "interrupted close result dropped after dashboard shutdown");
         }
         drop(guard);
     });

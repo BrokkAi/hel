@@ -391,12 +391,39 @@ fn scan_target_workers(
                 .stdout
                 .split(|byte| *byte == b'\n')
                 .filter_map(|line| {
-                    let path = std::str::from_utf8(line).ok()?.trim();
-                    let session_id = Path::new(path).parent()?.file_name()?.to_str()?;
-                    hel_targets::resource_name(session_id).ok()?;
-                    let backend =
-                        backend_target(template, None, ContainerOverrides::default()).ok()?;
-                    let workspace = hel_targets::workspace_for(&backend, session_id).ok()?;
+                    let path = match std::str::from_utf8(line) {
+                        Ok(path) => path.trim(),
+                        Err(error) => {
+                            tracing::debug!(%error, "recovery scan skipped a non-UTF-8 worker marker path");
+                            return None;
+                        }
+                    };
+                    let Some(session_id) = Path::new(path)
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                    else {
+                        tracing::debug!(path, "recovery scan skipped a malformed worker marker path");
+                        return None;
+                    };
+                    if let Err(error) = hel_targets::resource_name(session_id) {
+                        tracing::debug!(session_id, %error, "recovery scan skipped an invalid session id");
+                        return None;
+                    }
+                    let backend = match backend_target(template, None, ContainerOverrides::default()) {
+                        Ok(backend) => backend,
+                        Err(error) => {
+                            tracing::debug!(session_id, %error, "recovery scan could not construct the target backend");
+                            return None;
+                        }
+                    };
+                    let workspace = match hel_targets::workspace_for(&backend, session_id) {
+                        Ok(workspace) => workspace,
+                        Err(error) => {
+                            tracing::debug!(session_id, %error, "recovery scan could not derive the target workspace");
+                            return None;
+                        }
+                    };
                     Some(RecoveryCandidate {
                         session_id: session_id.to_owned(),
                         target_template_id: target_id.to_owned(),
@@ -446,7 +473,13 @@ fn candidates_from_container_json(
     Ok(sessions
         .into_iter()
         .filter_map(|session_id| {
-            let generated = hel_targets::resource_name(&session_id).ok()?;
+            let generated = match hel_targets::resource_name(&session_id) {
+                Ok(generated) => generated,
+                Err(error) => {
+                    tracing::debug!(%session_id, %error, "recovery scan skipped an invalid managed session id");
+                    return None;
+                }
+            };
             let locator = match template {
                 TargetTemplate::LocalPodman { .. } => TargetLocator::LocalPodman {
                     container_id: generated,
@@ -610,24 +643,87 @@ fn read_recovery_ownership(
     executor: &impl CommandExecutor,
 ) -> Option<WorkerOwnership> {
     let backend =
-        recovery_backend_locator(template, &candidate.locator, &candidate.session_id).ok()?;
-    let root = hel_targets::worker_root(&backend, &candidate.session_id).ok()?;
-    let command = hel_targets::command_on_locator(
+        match recovery_backend_locator(template, &candidate.locator, &candidate.session_id) {
+            Ok(backend) => backend,
+            Err(error) => {
+                tracing::debug!(
+                    session_id = %candidate.session_id,
+                    %error,
+                    "could not construct a recovery ownership probe"
+                );
+                return None;
+            }
+        };
+    let root = match hel_targets::worker_root(&backend, &candidate.session_id) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::debug!(
+                session_id = %candidate.session_id,
+                %error,
+                "could not derive a recovery worker root"
+            );
+            return None;
+        }
+    };
+    let command = match hel_targets::command_on_locator(
         &backend,
         &candidate.session_id,
         vec!["cat".into(), format!("{root}/ownership.json")],
         "read worker ownership marker",
-    )
-    .ok()?;
-    let output = executor.execute(&command).ok()?;
+    ) {
+        Ok(command) => command,
+        Err(error) => {
+            tracing::debug!(
+                session_id = %candidate.session_id,
+                %error,
+                "could not construct a recovery ownership command"
+            );
+            return None;
+        }
+    };
+    let output = match executor.execute(&command) {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(
+                session_id = %candidate.session_id,
+                %error,
+                "could not read a recovery worker ownership marker"
+            );
+            return None;
+        }
+    };
     if output.status != 0 {
+        tracing::debug!(
+            session_id = %candidate.session_id,
+            status = output.status,
+            "recovery worker ownership probe returned a failure"
+        );
         return None;
     }
-    let marker: WorkerOwnership = serde_json::from_slice(&output.stdout).ok()?;
-    (marker.version == WorkerOwnership::VERSION
-        && marker.session_id == candidate.session_id
-        && marker.target_template_id == candidate.target_template_id)
-        .then_some(marker)
+    let marker: WorkerOwnership = match serde_json::from_slice(&output.stdout) {
+        Ok(marker) => marker,
+        Err(error) => {
+            tracing::debug!(
+                session_id = %candidate.session_id,
+                %error,
+                "recovery worker ownership marker was not valid JSON"
+            );
+            return None;
+        }
+    };
+    if marker.version != WorkerOwnership::VERSION
+        || marker.session_id != candidate.session_id
+        || marker.target_template_id != candidate.target_template_id
+    {
+        tracing::debug!(
+            session_id = %candidate.session_id,
+            marker_session_id = %marker.session_id,
+            marker_target_template_id = %marker.target_template_id,
+            "recovery worker ownership marker did not match the candidate"
+        );
+        return None;
+    }
+    Some(marker)
 }
 
 fn recovery_backend_locator(

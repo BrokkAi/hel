@@ -790,6 +790,17 @@ pub(super) fn restore_unsent_input(chat: &mut ChatState, input: &str) {
 }
 
 pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteResult) {
+    // Most failures are intentionally converted into a notice so the user can
+    // keep reading and editing the chat. Keep the diagnostic in the process
+    // log as well; notices are transient and can be overwritten by the next
+    // event.
+    if let Some(error) = result.failure_message() {
+        tracing::warn!(
+            session_id = %chat.session_id,
+            %error,
+            "chat operation failed and was shown in the UI"
+        );
+    }
     match result {
         ChatRemoteResult::Sync(Ok(())) => chat.set_notice("Connected to session relay"),
         ChatRemoteResult::Sync(Err(error)) => {

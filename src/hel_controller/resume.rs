@@ -1085,6 +1085,12 @@ impl Controller {
                 .and_then(|plan| plan.retire.as_ref())
                 && let Err(error) = retire_managed_worktree(executor, worktree)
             {
+                tracing::warn!(
+                    session_id,
+                    worktree = %worktree.worktree_root.display(),
+                    error = format!("{error:#}"),
+                    "could not retire the old managed worktree after resume"
+                );
                 resume_notices.push(format!(
                     "Hel could not remove the worktree at {}: {error:#}. Remove it with `git worktree remove --force {}`.",
                     worktree.worktree_root.display(),
@@ -1126,18 +1132,39 @@ impl Controller {
                 // so they are correct whether or not the write had happened
                 // when the resume failed.
                 if rebuild_projection {
-                    if let Ok(previous_projection) =
-                        materialized_session_from_canonical(session_id, &canonical_session)
-                    {
-                        let _ =
-                            crate::hel_database::save_materialized_session(&previous_projection);
+                    match materialized_session_from_canonical(session_id, &canonical_session) {
+                        Ok(previous_projection) => {
+                            if let Err(restore_error) =
+                                crate::hel_database::save_materialized_session(&previous_projection)
+                            {
+                                tracing::error!(
+                                    session_id,
+                                    error = format!("{restore_error:#}"),
+                                    "could not restore the durable projection after resume failed"
+                                );
+                            }
+                        }
+                        Err(restore_error) => {
+                            tracing::error!(
+                                session_id,
+                                error = format!("{restore_error:#}"),
+                                "could not rebuild the durable projection after resume failed"
+                            );
+                        }
                     }
-                } else if discard_queued_prompts {
-                    let _ = crate::hel_database::replace_materialized_queued_prompts(
+                } else if discard_queued_prompts
+                    && let Err(restore_error) =
+                        crate::hel_database::replace_materialized_queued_prompts(
+                            session_id,
+                            &crate::hel_projection::materialized_queued_prompts_from_canonical(
+                                &canonical_session.queued_prompts,
+                            ),
+                        )
+                {
+                    tracing::error!(
                         session_id,
-                        &crate::hel_projection::materialized_queued_prompts_from_canonical(
-                            &canonical_session.queued_prompts,
-                        ),
+                        error = format!("{restore_error:#}"),
+                        "could not restore queued prompts after resume failed"
                     );
                 }
                 Err(self.rollback_failed_resume(session_id, &previous, error, executor)?)
@@ -1188,6 +1215,13 @@ impl Controller {
             .map(|cleanup_error| format!("{cleanup_error:#}"))
             .collect::<Vec<_>>()
             .join("; ");
+        if !cleanup_error.is_empty() {
+            tracing::warn!(
+                session_id,
+                error = %cleanup_error,
+                "resume rollback cleanup reported failures"
+            );
+        }
         let original = format!("{error:#}");
         let record = self.state.sessions.get_mut(session_id).unwrap();
         let failure = apply_failed_resume_rollback(

@@ -448,7 +448,17 @@ fn materialized_chat_entry_with_diffstats(
             terminal_outputs,
             ..
         } => {
-            let call = ToolCall::deserialize(call).ok();
+            let call = match ToolCall::deserialize(call) {
+                Ok(call) => Some(call),
+                Err(error) => {
+                    tracing::warn!(
+                        stable_id = %item.stable_id,
+                        %error,
+                        "could not decode a stored tool call; rendering it as invalid"
+                    );
+                    None
+                }
+            };
             let mut entry = ChatEntry::tool(
                 item.position,
                 call.as_ref()
@@ -484,7 +494,14 @@ fn materialized_chat_entry_with_diffstats(
             item.position,
             Plan::deserialize(plan)
                 .map(|plan| plan.entries)
-                .unwrap_or_default()
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        stable_id = %item.stable_id,
+                        %error,
+                        "could not decode a stored plan; rendering it empty"
+                    );
+                    Vec::new()
+                })
                 .into_iter()
                 .map(|line| PlanLine {
                     text: sanitize_terminal_text(&line.content),
@@ -520,7 +537,13 @@ pub fn materialized_content_text(content: &[serde_json::Value]) -> String {
 pub fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
     chunks
         .iter()
-        .filter_map(|value| ContentChunk::deserialize(value).ok())
+        .filter_map(|value| match ContentChunk::deserialize(value) {
+            Ok(chunk) => Some(chunk),
+            Err(error) => {
+                tracing::warn!(%error, "could not decode a stored content chunk");
+                None
+            }
+        })
         .filter_map(|chunk| content_block_text(&chunk.content))
         .map(|text| sanitize_terminal_text(&text))
         .collect::<Vec<_>>()
@@ -1310,7 +1333,17 @@ pub fn materialized_tool_diffstats(item: &TranscriptItem) -> Option<Vec<String>>
     let TranscriptBody::Tool { call, .. } = &item.body else {
         return None;
     };
-    let call = ToolCall::deserialize(call).ok()?;
+    let call = match ToolCall::deserialize(call) {
+        Ok(call) => call,
+        Err(error) => {
+            tracing::warn!(
+                stable_id = %item.stable_id,
+                %error,
+                "could not decode a stored tool call while reading diff summary"
+            );
+            return None;
+        }
+    };
     if !matches!(
         tool_status(&call.status),
         ToolStatus::Completed | ToolStatus::Failed
@@ -1333,7 +1366,17 @@ impl ToolDiffstatRequest {
         let TranscriptBody::Tool { call, .. } = &item.body else {
             return None;
         };
-        let call = ToolCall::deserialize(call).ok()?;
+        let call = match ToolCall::deserialize(call) {
+            Ok(call) => call,
+            Err(error) => {
+                tracing::warn!(
+                    stable_id = %item.stable_id,
+                    %error,
+                    "could not decode a stored tool call while scheduling diff summary"
+                );
+                return None;
+            }
+        };
         let terminal = matches!(
             tool_status(&call.status),
             ToolStatus::Completed | ToolStatus::Failed

@@ -3,7 +3,7 @@
 //! The worker owns exactly one harness process and one foreground session.  It
 //! deliberately does not know about orchestration, review lanes, or subagents.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,12 +47,40 @@ use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, ProjectMemoryMcpDeliv
 /// particular, Codex can replay terminal-output metadata for old tool calls on
 /// every `session/load`; journaling those invisible deltas grows the relay and
 /// makes every later recovery replay them again.
-fn session_update_is_relay_visible(update: &SessionUpdate) -> bool {
-    !matches!(
-        update,
+fn session_update_is_relay_visible(
+    update: &SessionUpdate,
+    live_tool_calls: &Mutex<BTreeSet<String>>,
+    session_id: &str,
+) -> bool {
+    match update {
+        SessionUpdate::ToolCall(call) => {
+            live_tool_calls
+                .lock()
+                .expect("live ACP tool-call set lock poisoned")
+                .insert(call.tool_call_id.to_string());
+            true
+        }
         SessionUpdate::ToolCallUpdate(update)
-            if update.fields == ToolCallUpdateFields::default()
-    )
+            if update.fields == ToolCallUpdateFields::default() =>
+        {
+            false
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let created_live = live_tool_calls
+                .lock()
+                .expect("live ACP tool-call set lock poisoned")
+                .contains(&update.tool_call_id.to_string());
+            if !created_live {
+                tracing::warn!(
+                    %session_id,
+                    tool_call_id = %update.tool_call_id,
+                    "ignored delayed ACP update for a tool call not created on this live connection"
+                );
+            }
+            created_live
+        }
+        _ => true,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -431,8 +459,20 @@ async fn run_bridge(
     // to kill the child, so a non-zero exit is the expected outcome.
     if !child_reaped {
         if restarting {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            if let Err(error) = child.kill().await {
+                tracing::warn!(
+                    operation = "acp_bridge_restart",
+                    %error,
+                    "could not kill ACP bridge during planned restart"
+                );
+            }
+            if let Err(error) = child.wait().await {
+                tracing::warn!(
+                    operation = "acp_bridge_restart",
+                    %error,
+                    "could not reap ACP bridge during planned restart"
+                );
+            }
         } else {
             let cleanup =
                 match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
@@ -841,6 +881,13 @@ where
     // every old turn on every restart. New sessions have no old history.
     let session_updates_enabled = Arc::new(AtomicBool::new(spec.resume_session.is_none()));
     let notification_session_updates_enabled = session_updates_enabled.clone();
+    // Codex can finish dispatching old tool updates after `session/load` has
+    // already returned. Track only creations observed after the load boundary,
+    // so those delayed updates cannot reintroduce historical tool state into
+    // the durable relay. A live tool always announces its creation before its
+    // updates on the same ACP connection.
+    let live_tool_calls = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+    let notification_live_tool_calls = live_tool_calls.clone();
     let permission_events = events.clone();
     let permission_activity = spec.acp_activity.clone();
     let ext_events = events.clone();
@@ -868,8 +915,6 @@ where
     let wait_activity = spec.acp_activity.clone();
     let kill_activity = spec.acp_activity.clone();
     let release_activity = spec.acp_activity.clone();
-    let wait_events = events.clone();
-    let release_events = events.clone();
     // A terminal runs where the session runs unless the agent names a
     // directory of its own.
     let session_cwd = spec.cwd.clone();
@@ -897,7 +942,11 @@ where
                 if !notification_session_updates_enabled.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                if !session_update_is_relay_visible(&notification.update) {
+                if !session_update_is_relay_visible(
+                    &notification.update,
+                    &notification_live_tool_calls,
+                    &notification.session_id.to_string(),
+                ) {
                     return Ok(());
                 }
                 let update = serde_json::to_value(notification.update).map_err(|error| {
@@ -943,7 +992,16 @@ where
                                 .lock()
                                 .expect("pending elicitation lock poisoned")
                                 .remove(&id);
-                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            if let Err(error) =
+                                responder.respond_with_error(relay_event_channel_error())
+                            {
+                                tracing::debug!(
+                                    %id,
+                                    operation = "permission_request",
+                                    %error,
+                                    "could not report a stopped relay coordinator to ACP"
+                                );
+                            }
                             return;
                         }
                         let response = tokio::select! {
@@ -958,17 +1016,32 @@ where
                             .as_ref()
                             .map_or("cancel", ElicitationResponse::action_name)
                             .to_owned();
-                        let _ = events
+                        if let Err(error) = events
                             .send(RuntimeEvent::ElicitationResolved {
-                                elicitation_id: id,
+                                elicitation_id: id.clone(),
                                 action,
                             })
-                            .await;
+                            .await
+                        {
+                            tracing::debug!(
+                                %id,
+                                operation = "elicitation_resolved",
+                                %error,
+                                "could not report permission response to relay coordinator"
+                            );
+                        }
                         let answer = response.map_or_else(
                             || RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
                             |response| permission_plan_response(&request, response),
                         );
-                        let _ = responder.respond(answer);
+                        if let Err(error) = responder.respond(answer) {
+                            tracing::debug!(
+                                %id,
+                                operation = "permission_response",
+                                %error,
+                                "ACP permission responder was already closed"
+                            );
+                        }
                     });
                     return Ok(());
                 }
@@ -1064,7 +1137,6 @@ where
                 };
                 // Handlers run on the dispatch loop, so awaiting the child here
                 // would stop every other message until it exits.
-                let events = wait_events.clone();
                 tokio::spawn(async move {
                     let exit = crate::hel_terminal::wait_for_exit(exit).await;
                     if let Err(error) = responder.respond(WaitForTerminalExitResponse::new(
@@ -1072,13 +1144,12 @@ where
                     )) {
                         // A closed channel means the relay already stopped, so
                         // this warning has nowhere left to go.
-                        let _ = events
-                            .send(RuntimeEvent::Warning {
-                                message: format!(
-                                    "report the exit of client terminal {terminal_id}: {error}"
-                                ),
-                            })
-                            .await;
+                        tracing::debug!(
+                            %terminal_id,
+                            operation = "terminal_wait_response",
+                            %error,
+                            "ACP terminal wait responder was already closed"
+                        );
                     }
                 });
                 Ok(())
@@ -1107,16 +1178,14 @@ where
                 };
                 // Reap off the dispatch loop: the supervisor still has to watch
                 // the killed child exit before it reports the terminal closed.
-                let events = release_events.clone();
                 tokio::spawn(async move {
                     if let Err(error) = supervisor.await {
-                        let _ = events
-                            .send(RuntimeEvent::Warning {
-                                message: format!(
-                                    "reap released client terminal {terminal_id}: {error}"
-                                ),
-                            })
-                            .await;
+                        tracing::warn!(
+                            %terminal_id,
+                            operation = "terminal_release_reap",
+                            %error,
+                            "released terminal supervisor failed"
+                        );
                     }
                 });
                 responder.respond(ReleaseTerminalResponse::new())
@@ -1170,7 +1239,16 @@ where
                                 .lock()
                                 .expect("pending elicitation lock poisoned")
                                 .remove(&id);
-                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            if let Err(error) =
+                                responder.respond_with_error(relay_event_channel_error())
+                            {
+                                tracing::debug!(
+                                    %id,
+                                    operation = "elicitation_request",
+                                    %error,
+                                    "could not report a stopped relay coordinator to ACP"
+                                );
+                            }
                             return;
                         }
                         let response = tokio::select! {
@@ -1185,31 +1263,60 @@ where
                             .as_ref()
                             .map_or("cancel", ElicitationResponse::action_name)
                             .to_owned();
-                        let _ = events
+                        if let Err(error) = events
                             .send(RuntimeEvent::ElicitationResolved {
-                                elicitation_id: id,
+                                elicitation_id: id.clone(),
                                 action,
                             })
-                            .await;
+                            .await
+                        {
+                            tracing::debug!(
+                                %id,
+                                operation = "elicitation_resolved",
+                                %error,
+                                "could not report elicitation response to relay coordinator"
+                            );
+                        }
                         match response {
                             Some(response) => match serde_json::to_value(response) {
                                 Ok(response) => {
-                                    let _ = responder.respond(response);
+                                    if let Err(error) = responder.respond(response) {
+                                        tracing::debug!(
+                                            %id,
+                                            operation = "elicitation_response",
+                                            %error,
+                                            "ACP elicitation responder was already closed"
+                                        );
+                                    }
                                 }
                                 Err(error) => {
-                                    let _ = responder.respond_with_error(
+                                    if let Err(error) = responder.respond_with_error(
                                         agent_client_protocol::Error::internal_error().data(
                                             serde_json::Value::String(format!(
                                                 "serialize elicitation response: {error}"
                                             )),
                                         ),
-                                    );
+                                    ) {
+                                        tracing::debug!(
+                                            %id,
+                                            operation = "elicitation_response",
+                                            %error,
+                                            "ACP elicitation error responder was already closed"
+                                        );
+                                    }
                                 }
                             },
                             None => {
-                                let _ = responder.respond_with_error(
+                                if let Err(error) = responder.respond_with_error(
                                     agent_client_protocol::Error::request_cancelled(),
-                                );
+                                ) {
+                                    tracing::debug!(
+                                        %id,
+                                        operation = "elicitation_cancel",
+                                        %error,
+                                        "ACP cancellation responder was already closed"
+                                    );
+                                }
                             }
                         }
                     });
@@ -1239,7 +1346,16 @@ where
                                 .lock()
                                 .expect("pending elicitation lock poisoned")
                                 .remove(&id);
-                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            if let Err(error) =
+                                responder.respond_with_error(relay_event_channel_error())
+                            {
+                                tracing::debug!(
+                                    %id,
+                                    operation = "plan_review_request",
+                                    %error,
+                                    "could not report a stopped relay coordinator to ACP"
+                                );
+                            }
                             return;
                         }
                         let response = tokio::select! {
@@ -1254,16 +1370,31 @@ where
                             .as_ref()
                             .map_or("cancel", ElicitationResponse::action_name)
                             .to_owned();
-                        let _ = events
+                        if let Err(error) = events
                             .send(RuntimeEvent::ElicitationResolved {
-                                elicitation_id: id,
+                                elicitation_id: id.clone(),
                                 action,
                             })
-                            .await;
-                        let _ = responder.respond(response.map_or_else(
+                            .await
+                        {
+                            tracing::debug!(
+                                %id,
+                                operation = "plan_review_resolved",
+                                %error,
+                                "could not report plan review response to relay coordinator"
+                            );
+                        }
+                        if let Err(error) = responder.respond(response.map_or_else(
                             || serde_json::json!({ "outcome": "cancelled" }),
                             grok_plan_response,
-                        ));
+                        )) {
+                            tracing::debug!(
+                                %id,
+                                operation = "plan_review_response",
+                                %error,
+                                "ACP plan review responder was already closed"
+                            );
+                        }
                     });
                     return Ok(());
                 }
@@ -1996,20 +2127,40 @@ async fn serve_session(
                                 .await?;
                             }
                             Some(CommandRequest::Compact { response, .. }) => {
-                                let _ = response.send(Err(
-                                    "cannot compact while the destination prompt is running".into(),
-                                ));
+                                if response
+                                    .send(Err(
+                                        "cannot compact while the destination prompt is running"
+                                            .into(),
+                                    ))
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "compact_rejected",
+                                        "compaction rejection receiver was already closed"
+                                    );
+                                }
                             }
                             Some(CommandRequest::ResolveElicitation {
                                 elicitation_id,
                                 response,
                                 resolved,
                             }) => {
-                                let _ = resolved.send(resolve_pending_elicitation(
-                                    pending_elicitations,
-                                    &elicitation_id,
-                                    response,
-                                ));
+                                if resolved
+                                    .send(resolve_pending_elicitation(
+                                        pending_elicitations,
+                                        &elicitation_id,
+                                        response,
+                                    ))
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "resolve_elicitation",
+                                        %elicitation_id,
+                                        "elicitation resolution receiver was already closed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2124,8 +2275,16 @@ async fn serve_session(
                 loop {
                     tokio::select! {
                         result = &mut compaction => {
-                            if let Some(response) = response.take() {
-                                let _ = response.send(result.map_err(|error| format!("{error:#}")));
+                            if let Some(response) = response.take()
+                                && response
+                                    .send(result.map_err(|error| format!("{error:#}")))
+                                    .is_err()
+                            {
+                                tracing::debug!(
+                                    session_id = %session_id,
+                                    operation = "compact",
+                                    "compaction result receiver was already closed"
+                                );
                             }
                             break;
                         }
@@ -2141,8 +2300,16 @@ async fn serve_session(
                                 .await?;
                             }
                             Some(CommandRequest::Close { request_id: close_id }) => {
-                                if let Some(response) = response.take() {
-                                    let _ = response.send(Err("session closed during compaction".into()));
+                                if let Some(response) = response.take()
+                                    && response
+                                        .send(Err("session closed during compaction".into()))
+                                        .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "compact_close",
+                                        "compaction close receiver was already closed"
+                                    );
                                 }
                                 if let Err(error) = connection.send_notification(CancelNotification::new(session_id.clone())) {
                                     emit_runtime_event(
@@ -2188,10 +2355,19 @@ async fn serve_session(
                                 return Ok(None);
                             }
                             None => {
-                                if let Some(response) = response.take() {
-                                    let _ = response.send(Err(
-                                        "ACP command channel closed while a compaction was running".into(),
-                                    ));
+                                if let Some(response) = response.take()
+                                    && response
+                                        .send(Err(
+                                            "ACP command channel closed while a compaction was running"
+                                                .into(),
+                                        ))
+                                        .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "compact_shutdown",
+                                        "compaction shutdown receiver was already closed"
+                                    );
                                 }
                                 connection
                                     .send_notification(CancelNotification::new(session_id.clone()))
@@ -2229,20 +2405,37 @@ async fn serve_session(
                                 .await?;
                             }
                             Some(CommandRequest::Compact { response, .. }) => {
-                                let _ = response.send(Err(
-                                    "a compaction is already running".into(),
-                                ));
+                                if response
+                                    .send(Err("a compaction is already running".into()))
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "compact_rejected",
+                                        "duplicate compaction rejection receiver was already closed"
+                                    );
+                                }
                             }
                             Some(CommandRequest::ResolveElicitation {
                                 elicitation_id,
                                 response,
                                 resolved,
                             }) => {
-                                let _ = resolved.send(resolve_pending_elicitation(
-                                    pending_elicitations,
-                                    &elicitation_id,
-                                    response,
-                                ));
+                                if resolved
+                                    .send(resolve_pending_elicitation(
+                                        pending_elicitations,
+                                        &elicitation_id,
+                                        response,
+                                    ))
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "resolve_elicitation",
+                                        %elicitation_id,
+                                        "elicitation resolution receiver was already closed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2256,11 +2449,21 @@ async fn serve_session(
                 response,
                 resolved,
             } => {
-                let _ = resolved.send(resolve_pending_elicitation(
-                    pending_elicitations,
-                    &elicitation_id,
-                    response,
-                ));
+                if resolved
+                    .send(resolve_pending_elicitation(
+                        pending_elicitations,
+                        &elicitation_id,
+                        response,
+                    ))
+                    .is_err()
+                {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        operation = "resolve_elicitation",
+                        %elicitation_id,
+                        "elicitation resolution receiver was already closed"
+                    );
+                }
             }
             CommandRequest::Close { request_id } => {
                 match connection
@@ -2591,7 +2794,8 @@ mod tests {
     };
 
     #[test]
-    fn private_tool_metadata_is_not_sent_to_the_durable_relay() {
+    fn only_updates_for_tool_calls_created_on_the_live_connection_are_relayed() {
+        let live_tool_calls = Mutex::new(BTreeSet::new());
         let metadata_only = SessionUpdate::ToolCallUpdate(
             ToolCallUpdate::new("old-tool", ToolCallUpdateFields::default()).meta(
                 serde_json::Map::from_iter([(
@@ -2600,13 +2804,40 @@ mod tests {
                 )]),
             ),
         );
-        assert!(!session_update_is_relay_visible(&metadata_only));
+        assert!(!session_update_is_relay_visible(
+            &metadata_only,
+            &live_tool_calls,
+            "session-1"
+        ));
 
-        let visible = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        let delayed = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "old-tool",
             ToolCallUpdateFields::new().title("updated"),
         ));
-        assert!(session_update_is_relay_visible(&visible));
+        assert!(!session_update_is_relay_visible(
+            &delayed,
+            &live_tool_calls,
+            "session-1"
+        ));
+
+        let created = SessionUpdate::ToolCall(agent_client_protocol::schema::v1::ToolCall::new(
+            "live-tool",
+            "read",
+        ));
+        assert!(session_update_is_relay_visible(
+            &created,
+            &live_tool_calls,
+            "session-1"
+        ));
+        let visible = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "live-tool",
+            ToolCallUpdateFields::new().title("updated"),
+        ));
+        assert!(session_update_is_relay_visible(
+            &visible,
+            &live_tool_calls,
+            "session-1"
+        ));
     }
 
     #[test]
@@ -5096,6 +5327,19 @@ while True:
                 }}
             }}}})
         write({{"jsonrpc": "2.0", "id": ident, "result": {{"sessionId": "scripted"}}}})
+        if method == "session/load":
+            # Codex can finish dispatching an old tool completion after the
+            # load response. Its creation belongs to pre-resume history and
+            # was intentionally not injected into this connection.
+            write({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+                "sessionId": "scripted",
+                "update": {{
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "old-wait-tool",
+                    "status": "completed",
+                    "title": "wait"
+                }}
+            }}}})
         if not second:
             open(marker, "w").close()
             import time

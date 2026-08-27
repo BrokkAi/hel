@@ -56,6 +56,10 @@ pub(crate) enum DashboardIoUpdate {
         session_id: String,
         result: std::result::Result<ProjectSourceIdentity, String>,
     },
+    ChatOpened {
+        session_id: String,
+        result: Box<std::result::Result<hel::hel_chat::ActiveChat, String>>,
+    },
     CreateSession(Box<DashboardCreateSessionUpdate>),
     RenameSession {
         session_id: String,
@@ -64,8 +68,9 @@ pub(crate) enum DashboardIoUpdate {
     },
     ContainerSettings {
         session_id: String,
-        result: std::result::Result<(), String>,
+        result: std::result::Result<Controller, String>,
     },
+    SetupReloaded(std::result::Result<Controller, String>),
     DetachedSessionState {
         session_id: String,
         result: std::result::Result<(), String>,
@@ -81,6 +86,10 @@ pub(crate) enum DashboardIoUpdate {
         result: Box<std::result::Result<ImportedDashboardSessionApply, String>>,
     },
     LifecycleReloaded(Box<LifecycleReloaded>),
+    RecoveryReloaded {
+        recovery: Box<hel::hel_recovery::RecoveryResult>,
+        result: std::result::Result<Controller, String>,
+    },
     CheckpointArchiveSizes {
         generation: u64,
         sizes: BTreeMap<String, Option<u64>>,
@@ -111,6 +120,9 @@ pub(crate) enum DashboardIoUpdate {
         directory: String,
         result: std::result::Result<(), String>,
     },
+    /// Clipboard providers may use a blocking desktop IPC call. The result
+    /// is delivered here after that work finishes on a blocking task.
+    ClipboardText(std::result::Result<String, String>),
     LifecycleStage {
         session_id: String,
         stage: ProvisionStage,
@@ -215,10 +227,29 @@ pub(crate) struct LifecycleReloaded {
     result: std::result::Result<Controller, String>,
 }
 
+/// Reloads durable state for a completed recovery copy off the dashboard
+/// loop. Recovery itself is already supervised; the follow-up reload must be
+/// supervised too because it reads the database and state files.
+pub(crate) fn spawn_recovery_reload(
+    recovery: hel::hel_recovery::RecoveryResult,
+    updates: UnboundedSender<DashboardIoUpdate>,
+) -> JoinHandle<()> {
+    spawn_io(
+        "reload recovery state",
+        updates,
+        Controller::load,
+        move |result| DashboardIoUpdate::RecoveryReloaded {
+            recovery: Box::new(recovery),
+            result,
+        },
+    )
+}
+
 /// Runs one blocking job off the loop and reports its outcome on the
 /// dashboard's I/O channel. Errors are formatted once, here, so no caller can
 /// quietly drop one.
 pub(crate) fn spawn_io<T>(
+    operation: &'static str,
     updates: UnboundedSender<DashboardIoUpdate>,
     work: impl FnOnce() -> Result<T> + Send + 'static,
     report: impl FnOnce(std::result::Result<T, String>) -> DashboardIoUpdate + Send + 'static,
@@ -227,8 +258,14 @@ where
     T: Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let result = work().map_err(|error| format!("{error:#}"));
-        let _ = updates.send(report(result));
+        let result = work().map_err(|error| {
+            let error = format!("{error:#}");
+            tracing::warn!(operation, %error, "dashboard background operation failed");
+            error
+        });
+        if let Err(error) = updates.send(report(result)) {
+            tracing::debug!(operation, %error, "dashboard background result dropped after shutdown");
+        }
     })
 }
 
@@ -244,10 +281,17 @@ pub(crate) fn spawn_critical_io<T>(
 where
     T: Send + 'static,
 {
-    let guard = tracker.begin(label);
+    let label = label.into();
+    let guard = tracker.begin(label.clone());
     tokio::task::spawn_blocking(move || {
-        let result = work().map_err(|error| format!("{error:#}"));
-        let _ = updates.send(report(result));
+        let result = work().map_err(|error| {
+            let error = format!("{error:#}");
+            tracing::warn!(operation = %label, %error, "critical dashboard operation failed");
+            error
+        });
+        if let Err(error) = updates.send(report(result)) {
+            tracing::debug!(operation = %label, %error, "critical dashboard result dropped after shutdown");
+        }
         drop(guard);
     })
 }
@@ -264,11 +308,18 @@ pub(crate) fn spawn_cancellable_io<T>(
 where
     T: Send + 'static,
 {
+    let label = label.into();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let guard = tracker.begin_cancellable(label, cancelled.clone());
+    let guard = tracker.begin_cancellable(label.clone(), cancelled.clone());
     tokio::task::spawn_blocking(move || {
-        let result = work(cancelled).map_err(|error| format!("{error:#}"));
-        let _ = updates.send(report(result));
+        let result = work(cancelled).map_err(|error| {
+            let error = format!("{error:#}");
+            tracing::warn!(operation = %label, %error, "cancellable dashboard operation failed");
+            error
+        });
+        if let Err(error) = updates.send(report(result)) {
+            tracing::debug!(operation = %label, %error, "cancellable dashboard result dropped after shutdown");
+        }
         drop(guard);
     })
 }
@@ -279,6 +330,7 @@ pub(crate) fn spawn_hidden_native_sessions_load(
     updates: UnboundedSender<DashboardIoUpdate>,
 ) -> JoinHandle<()> {
     spawn_io(
+        "load hidden native sessions",
         updates,
         hel::hel_database::hidden_native_sessions,
         |result| DashboardIoUpdate::HiddenNativeSessions { result },
@@ -317,10 +369,12 @@ pub(crate) fn spawn_project_source_resolution(
         let result = source_controller
             .resolve_session_project_source(&session_id, &executor)
             .map_err(|error| format!("{error:#}"));
-        let _ = updates.send(DashboardIoUpdate::ProjectSource {
+        if let Err(error) = updates.send(DashboardIoUpdate::ProjectSource {
             session_id: reported_session_id,
             result,
-        });
+        }) {
+            tracing::debug!(%error, "project source result dropped after dashboard shutdown");
+        }
         drop(guard);
     })
 }
@@ -400,7 +454,9 @@ pub(crate) fn spawn_lifecycle_operation(
             work(&mut controller, cancelled)
         })()
         .map_err(|error| format!("{error:#}"));
-        let _ = updates.send(LifecycleUpdate { session_id, result });
+        if let Err(error) = updates.send(LifecycleUpdate { session_id, result }) {
+            tracing::debug!(%error, "lifecycle result dropped after dashboard shutdown");
+        }
         drop(guard);
     });
 }
@@ -431,8 +487,11 @@ pub(crate) fn spawn_materialized_session_projection(
             }
             Err(error) => Err(format!("session projection worker stopped: {error}")),
         };
-        let _ =
-            updates.send(DashboardIoUpdate::MaterializedSessionProjection { session_id, result });
+        if let Err(error) =
+            updates.send(DashboardIoUpdate::MaterializedSessionProjection { session_id, result })
+        {
+            tracing::debug!(%error, "session projection result dropped after dashboard shutdown");
+        }
     });
 }
 
@@ -443,6 +502,7 @@ pub(crate) fn spawn_stored_session_summary(
 ) {
     let reported_session_id = session_id.clone();
     spawn_io(
+        "load stored session summary",
         updates,
         move || {
             let summary = hel::hel_database::load_materialized_session_summary(&session_id)?
@@ -463,9 +523,14 @@ pub(crate) fn spawn_lifecycle_reload(
     reload: LifecycleReload,
     updates: UnboundedSender<DashboardIoUpdate>,
 ) {
-    spawn_io(updates, Controller::load, move |result| {
-        DashboardIoUpdate::LifecycleReloaded(Box::new(LifecycleReloaded { reload, result }))
-    });
+    spawn_io(
+        "reload lifecycle state",
+        updates,
+        Controller::load,
+        move |result| {
+            DashboardIoUpdate::LifecycleReloaded(Box::new(LifecycleReloaded { reload, result }))
+        },
+    );
 }
 
 pub(crate) fn spawn_dashboard_rename(
@@ -509,13 +574,18 @@ pub(crate) fn spawn_dashboard_container_settings(
         format!("saving container settings for {}", short_id(&session_id)),
         updates,
         move || {
-            Controller::load()?.update_session_container_settings(
+            let mut controller = Controller::load()?;
+            controller.update_session_container_settings(
                 &request.session_id,
                 request.cpus,
                 request.memory,
                 request.additional_mounts,
                 request.mount_history,
-            )
+            )?;
+            // Return a fresh durable snapshot so the dashboard can update its
+            // state without synchronously reloading the database while it is
+            // applying the worker result.
+            Controller::load()
         },
         move |result| DashboardIoUpdate::ContainerSettings { session_id, result },
     );
@@ -568,6 +638,15 @@ pub(crate) fn spawn_read_receipt_persist(
         },
         move |result| DashboardIoUpdate::ReadReceipt { session_id, result },
     );
+}
+
+pub(crate) fn spawn_clipboard_read(updates: UnboundedSender<DashboardIoUpdate>) -> JoinHandle<()> {
+    spawn_io(
+        "read clipboard",
+        updates,
+        hel::hel_clipboard::read_text,
+        DashboardIoUpdate::ClipboardText,
+    )
 }
 
 pub(crate) fn spawn_create_bundle(
@@ -661,11 +740,22 @@ pub(crate) fn spawn_checkpoint_archive_size_refresh(
         let sizes = targets
             .into_iter()
             .map(|(session_id, path)| {
-                let size = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+                let size = match std::fs::metadata(&path) {
+                    Ok(metadata) => Some(metadata.len()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "could not read checkpoint archive size");
+                        None
+                    }
+                };
                 (session_id, size)
             })
             .collect();
-        let _ = updates.send(DashboardIoUpdate::CheckpointArchiveSizes { generation, sizes });
+        if let Err(error) =
+            updates.send(DashboardIoUpdate::CheckpointArchiveSizes { generation, sizes })
+        {
+            tracing::debug!(generation, %error, "checkpoint archive size result dropped after dashboard shutdown");
+        }
     });
 }
 
@@ -710,12 +800,14 @@ pub(crate) fn spawn_dashboard_create_session(
                             format!("{}: {}", repository.path.display(), repository.summary)
                         })
                         .collect();
-                    let _ = updates.send(DashboardIoUpdate::CreateSession(Box::new(
+                    if let Err(error) = updates.send(DashboardIoUpdate::CreateSession(Box::new(
                         DashboardCreateSessionUpdate::DirtyLocal {
                             action,
                             repositories,
                         },
-                    )));
+                    ))) {
+                        tracing::debug!(%error, "dirty repository result dropped after dashboard shutdown");
+                    }
                     return Ok(None);
                 }
             }
@@ -756,9 +848,11 @@ pub(crate) fn spawn_dashboard_create_session(
         let Some(registered) = (match registered {
             Ok(registered) => registered,
             Err(error) => {
-                let _ = updates.send(DashboardIoUpdate::CreateSession(Box::new(
+                if let Err(error) = updates.send(DashboardIoUpdate::CreateSession(Box::new(
                     DashboardCreateSessionUpdate::Failed(format!("{error:#}")),
-                )));
+                ))) {
+                    tracing::debug!(%error, "session creation failure dropped after dashboard shutdown");
+                }
                 None
             }
         }) else {
@@ -766,12 +860,10 @@ pub(crate) fn spawn_dashboard_create_session(
         };
         let session_id = registered.session.id.clone();
         let cancelled = registered.cancelled.clone();
-        if updates
-            .send(DashboardIoUpdate::CreateSession(Box::new(
-                DashboardCreateSessionUpdate::Registered(Box::new(registered)),
-            )))
-            .is_err()
-        {
+        if let Err(error) = updates.send(DashboardIoUpdate::CreateSession(Box::new(
+            DashboardCreateSessionUpdate::Registered(Box::new(registered)),
+        ))) {
+            tracing::debug!(%error, "registered session result dropped after dashboard shutdown");
             cancelled.store(true, Ordering::Release);
         }
         let result = (|| -> Result<()> {
@@ -785,7 +877,9 @@ pub(crate) fn spawn_dashboard_create_session(
         })()
         .map(|()| LifecycleSuccess::Created)
         .map_err(|error| format!("{error:#}"));
-        let _ = lifecycle_updates.send(LifecycleUpdate { session_id, result });
+        if let Err(error) = lifecycle_updates.send(LifecycleUpdate { session_id, result }) {
+            tracing::debug!(%error, "session creation lifecycle result dropped after dashboard shutdown");
+        }
         drop(guard);
     });
 }
@@ -831,10 +925,12 @@ impl<E: CommandExecutor> StageReportingExecutor<E> {
             return;
         }
         *reported = Some(stage);
-        let _ = self.updates.send(DashboardIoUpdate::LifecycleStage {
+        if let Err(error) = self.updates.send(DashboardIoUpdate::LifecycleStage {
             session_id: self.session_id.clone(),
             stage,
-        });
+        }) {
+            tracing::debug!(%error, "lifecycle stage result dropped after dashboard shutdown");
+        }
     }
 }
 
@@ -853,9 +949,11 @@ impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
     }
 
     fn notify_notice(&self, notice: &str) {
-        let _ = self.updates.send(DashboardIoUpdate::LifecycleNotice {
+        if let Err(error) = self.updates.send(DashboardIoUpdate::LifecycleNotice {
             notice: notice.to_owned(),
-        });
+        }) {
+            tracing::debug!(%error, "lifecycle notice dropped after dashboard shutdown");
+        }
     }
 
     fn execute_with_stdin(
@@ -981,6 +1079,31 @@ impl DashboardContext {
                     ),
                 }
             }
+            DashboardIoUpdate::ChatOpened { session_id, result } => {
+                // Ignore a late result after a newer request has taken its
+                // place (or the dashboard has shut down).
+                if self.opening_chat_session.as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+                self.opening_chat_session = None;
+                let focus_conversations =
+                    std::mem::take(&mut self.opening_chat_focus_conversations);
+                match *result {
+                    Ok(mut chat) => {
+                        if focus_conversations {
+                            chat.focus_conversations();
+                        }
+                        self.active_chat = Some(chat);
+                        self.view = crate::dashboard::View::Chat;
+                        self.dashboard.clear_notice();
+                        self.acknowledge_visible_chat();
+                    }
+                    Err(error) => self
+                        .dashboard
+                        .set_notice(format!("Could not open session: {error}")),
+                }
+                self.dirty = true;
+            }
             DashboardIoUpdate::CreateSession(update) => self.apply_create_session_update(*update),
             DashboardIoUpdate::RenameSession {
                 session_id,
@@ -1002,29 +1125,42 @@ impl DashboardContext {
                 }
             },
             DashboardIoUpdate::ContainerSettings { session_id, result } => match result {
-                Ok(()) => {
-                    // Reload so the saved mounts, overrides, and mount history
-                    // all come back from one durable read.
-                    match Controller::load() {
-                        Ok(controller) => {
-                            self.controller = controller;
-                            self.dashboard.set_state(self.controller.state.clone());
-                            self.dashboard.set_notice(format!(
-                                "Container settings saved for {}; applies when it is next recreated.",
-                                short_id(&session_id)
-                            ));
-                        }
-                        Err(error) => self.dashboard.set_notice(format!(
-                            "Container settings saved for {}, but reloading state failed: {error:#}",
-                            short_id(&session_id)
-                        )),
-                    }
+                Ok(controller) => {
+                    self.controller = controller;
+                    self.dashboard.set_config(self.controller.config.clone());
+                    self.dashboard.set_state(self.controller.state.clone());
+                    self.dashboard.set_notice(format!(
+                        "Container settings saved for {}; applies when it is next recreated.",
+                        short_id(&session_id)
+                    ));
                 }
                 Err(error) => self.dashboard.set_notice(format!(
                     "Container settings failed for {}: {error}",
                     short_id(&session_id)
                 )),
             },
+            DashboardIoUpdate::SetupReloaded(result) => match result {
+                Ok(controller) => {
+                    self.controller = controller;
+                    self.dashboard.set_config(self.controller.config.clone());
+                    self.dashboard.set_state(self.controller.state.clone());
+                    self.request_quota_refresh();
+                    self.refresh_poll_targets();
+                    self.dashboard
+                        .set_notice("Setup complete. Press Ctrl+N to start your first session.");
+                }
+                Err(error) => {
+                    self.dashboard
+                        .set_notice(format!("Could not reload setup changes: {error}"));
+                }
+            },
+            DashboardIoUpdate::ClipboardText(result) => {
+                self.clipboard_read_in_flight = false;
+                match result {
+                    Ok(text) => self.dashboard.handle_paste(&text),
+                    Err(error) => self.dashboard.set_notice(format!("Paste failed: {error}")),
+                }
+            }
             DashboardIoUpdate::DetachedSessionState { session_id, result } => {
                 if let Err(error) = result {
                     self.dashboard.set_notice(format!(
@@ -1078,6 +1214,17 @@ impl DashboardContext {
             DashboardIoUpdate::LifecycleReloaded(reloaded) => {
                 self.apply_lifecycle_reloaded(*reloaded)
             }
+            DashboardIoUpdate::RecoveryReloaded { recovery, result } => match result {
+                Ok(controller) => {
+                    super::apply_recovery_result_loaded(self, controller, *recovery);
+                }
+                Err(error) => {
+                    tracing::warn!("could not reload a completed recovery checkpoint: {error}");
+                    self.dashboard.set_notice(format!(
+                        "Could not refresh recovered session state: {error}"
+                    ));
+                }
+            },
             DashboardIoUpdate::CheckpointArchiveSizes { generation, sizes } => {
                 if generation == self.checkpoint_archive_generation {
                     self.dashboard.apply_checkpoint_archive_sizes(sizes);

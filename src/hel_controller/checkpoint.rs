@@ -898,7 +898,17 @@ impl Controller {
         worker_root: &str,
         reconnect: &hel_targets::CommandSpec,
     ) -> Result<(ControllerRelayLease, bool)> {
-        let project_memory = self.project_memory_sync_target(session_id).ok();
+        let project_memory = match self.project_memory_sync_target(session_id) {
+            Ok(target) => Some(target),
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "project memory will not be synchronized during checkpoint reconnect"
+                );
+                None
+            }
+        };
         match connect_checkpoint_relay(session_id, manager, reconnect, project_memory.clone()).await
         {
             Ok(relay) => Ok((relay, false)),
@@ -966,7 +976,18 @@ impl Controller {
                 );
             }
         };
-        connection.set_project_memory_target(self.project_memory_sync_target(session_id).ok());
+        let project_memory = match self.project_memory_sync_target(session_id) {
+            Ok(target) => Some(target),
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "project memory will not be synchronized after checkpoint worker restart"
+                );
+                None
+            }
+        };
+        connection.set_project_memory_target(project_memory);
         wait_for_native_session(&mut connection, executor)
             .await
             .context("wait for ACP session after restarting the worker for checkpoint")?;

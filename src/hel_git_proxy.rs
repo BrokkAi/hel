@@ -180,8 +180,17 @@ pub async fn run_broker(spec_path: &Path) -> Result<()> {
     // Held until this process exits: it is what `broker_is_alive` observes.
     let pid_file = claim_broker_pid_file(&spec.pid_path)?;
     let result = run_bridge_process(&spec, repositories).await;
-    let _ = std::fs::remove_file(&spec.ready_path);
-    let _ = std::fs::remove_file(&spec.pid_path);
+    for path in [&spec.ready_path, &spec.pid_path] {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not remove Git broker lifecycle marker"
+            );
+        }
+    }
     drop(pid_file);
     result
 }
@@ -226,7 +235,15 @@ async fn run_bridge_process(
     let status = match tokio::time::timeout(BRIDGE_EXIT_GRACE, child.wait()).await {
         Ok(status) => Some(status.context("wait for target Git bridge")?),
         Err(_) => {
-            let _ = child.kill().await;
+            if let Err(error) = child.kill().await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    session_id = %spec.session_id,
+                    %error,
+                    "could not terminate a timed-out target Git bridge"
+                );
+            }
             None
         }
     };
@@ -469,7 +486,9 @@ where
         Err(error) => return refuse_exchange(bridge_input, bridge_output, error).await,
     };
     let (Some(mut git_input), Some(mut git_output)) = (git.stdin.take(), git.stdout.take()) else {
-        let _ = git.kill().await;
+        if let Err(kill_error) = git.kill().await {
+            tracing::warn!(%kill_error, "could not stop Git service with missing pipes");
+        }
         let error = anyhow!("git {command} was started without both pipes");
         return refuse_exchange(bridge_input, bridge_output, error).await;
     };
@@ -541,13 +560,25 @@ where
     if let Some(stalled) = stalled {
         // A service that outlived its exchange would hold the repository and
         // its pipes for as long as it liked.
-        let _ = git.kill().await;
+        if let Err(kill_error) = git.kill().await {
+            tracing::warn!(
+                service = command,
+                %kill_error,
+                "could not stop stalled Git service"
+            );
+        }
         return Ok(Exchange::Failed(
             stalled.context(format!("git {command} stalled")),
         ));
     }
     if let Some(failure) = service_failure {
-        let _ = git.kill().await;
+        if let Err(kill_error) = git.kill().await {
+            tracing::warn!(
+                service = command,
+                %kill_error,
+                "could not stop failed Git service"
+            );
+        }
         return Ok(Exchange::Failed(failure));
     }
     match git.wait().await {
@@ -621,7 +652,8 @@ async fn run_worker_bridge_over(
     std::fs::create_dir_all(root)?;
     let socket = root.join("git.sock");
     if socket.exists() {
-        let _ = std::fs::remove_file(&socket);
+        std::fs::remove_file(&socket)
+            .with_context(|| format!("remove stale Git proxy socket {}", socket.display()))?;
     }
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("bind Git proxy socket {}", socket.display()))?;
@@ -738,7 +770,9 @@ async fn serve_client(
                 Frame::Closed => bail!("the Git broker closed the bridge"),
             }
         }
-        let _ = write.shutdown().await;
+        if let Err(error) = write.shutdown().await {
+            tracing::debug!(%error, "Git proxy client closed before its response was flushed");
+        }
         served.notify_one();
         Ok::<_, anyhow::Error>(())
     };

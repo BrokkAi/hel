@@ -1240,6 +1240,11 @@ mod unix {
             .expect("relay state lock poisoned")
             .root()
             .to_path_buf();
+        let session_id = relay
+            .lock()
+            .expect("relay state lock poisoned")
+            .operational_state()
+            .session_id;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let mut checkpoint_barriers = BTreeSet::new();
@@ -1259,7 +1264,8 @@ mod unix {
                     } => {
                         let response =
                             unsupported_relay_method_response(request_id, protocol_version, method);
-                        write_response(&mut writer, &response).await?;
+                        write_logged_response(&mut writer, &response, &session_id, "unknown")
+                            .await?;
                         continue;
                     }
                     DecodedRelayRequest::Invalid {
@@ -1269,7 +1275,8 @@ mod unix {
                     } => {
                         let response =
                             invalid_relay_request_response(request_id, protocol_version, message);
-                        write_response(&mut writer, &response).await?;
+                        write_logged_response(&mut writer, &response, &session_id, "invalid")
+                            .await?;
                         continue;
                     }
                 };
@@ -1287,8 +1294,9 @@ mod unix {
                     // Credential, token, and skills bytes stay on this connection.
                     // They never reach DurableRelay, its journal, or its
                     // command ledger.
+                    let operation = envelope.request.method_name();
                     let response = credential_response(envelope, &credentials, &relay_root).await;
-                    write_response(&mut writer, &response).await?;
+                    write_logged_response(&mut writer, &response, &session_id, operation).await?;
                     continue;
                 }
                 if matches!(
@@ -1296,8 +1304,9 @@ mod unix {
                     RelayRequest::ProjectMemorySnapshot
                         | RelayRequest::InstallProjectMemorySnapshot { .. }
                 ) {
+                    let operation = envelope.request.method_name();
                     let response = project_memory_response(envelope, project_memory.as_ref()).await;
-                    write_response(&mut writer, &response).await?;
+                    write_logged_response(&mut writer, &response, &session_id, operation).await?;
                     continue;
                 }
                 if let RelayRequest::Compact { .. } = &envelope.request {
@@ -1307,25 +1316,47 @@ mod unix {
                     // connection; the controller drives it as a single
                     // sequential RPC.
                     let response = compaction_response(envelope, commands.as_ref()).await;
-                    write_response(&mut writer, &response).await?;
+                    write_logged_response(&mut writer, &response, &session_id, "compact").await?;
                     continue;
                 }
                 if let RelayRequest::RespondElicitation { .. } = &envelope.request {
                     // Form answers can contain private user input. They travel
                     // directly to the ACP runtime and never touch relay state.
                     let response = elicitation_response(envelope, commands.as_ref()).await;
-                    write_response(&mut writer, &response).await?;
+                    write_logged_response(
+                        &mut writer,
+                        &response,
+                        &session_id,
+                        "respond_elicitation",
+                    )
+                    .await?;
                     continue;
                 }
                 let wakes_dispatch = matches!(&envelope.request, RelayRequest::Submit { .. });
                 let checkpoint_change = checkpoint_change(&envelope.request);
-                let response = handle_request(&relay, envelope).await?;
+                let operation = envelope.request.method_name();
+                let response = match handle_request(&relay, envelope).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::error!(
+                            %session_id,
+                            %operation,
+                            "relay request handling failed: {error:#}"
+                        );
+                        return Err(error);
+                    }
+                };
                 if worker_root_was_removed(&response.body, &relay_root) {
                     // One report is enough; the daemon is already winding down.
-                    let _ = fatal.try_send(anyhow::anyhow!(
-                        "worker root {} was removed while the relay was serving",
-                        relay_root.display()
-                    ));
+                    report_fatal(
+                        &fatal,
+                        anyhow::anyhow!(
+                            "worker root {} was removed while the relay was serving",
+                            relay_root.display()
+                        ),
+                        &session_id,
+                        "worker root removed",
+                    );
                 }
                 let accepted = matches!(
                     &response.body,
@@ -1350,7 +1381,7 @@ mod unix {
                 // Dispatch is driven from durable state, not from delivery of
                 // the acknowledgement. A controller can disappear after its
                 // request reaches the relay but before the response write.
-                write_response(&mut writer, &response).await?;
+                write_logged_response(&mut writer, &response, &session_id, operation).await?;
             }
             Ok(())
         }
@@ -1366,10 +1397,15 @@ mod unix {
             ))),
         };
         if outcome.is_err() && !relay_root.is_dir() {
-            let _ = fatal.try_send(anyhow::anyhow!(
-                "worker root {} was removed while the relay was serving",
-                relay_root.display()
-            ));
+            report_fatal(
+                &fatal,
+                anyhow::anyhow!(
+                    "worker root {} was removed while the relay was serving",
+                    relay_root.display()
+                ),
+                &session_id,
+                "worker root removed",
+            );
         }
         outcome
     }
@@ -1873,6 +1909,29 @@ exec gh "$@"
         }
     }
 
+    fn report_fatal(
+        fatal: &mpsc::Sender<anyhow::Error>,
+        error: anyhow::Error,
+        session_id: &str,
+        reason: &str,
+    ) {
+        let detail = format!("{error:#}");
+        tracing::error!(
+            %session_id,
+            %reason,
+            error = %detail,
+            "relay daemon reported a fatal failure"
+        );
+        if let Err(send_error) = fatal.try_send(error) {
+            tracing::error!(
+                %session_id,
+                %reason,
+                error = %send_error,
+                "could not deliver relay fatal failure to daemon"
+            );
+        }
+    }
+
     fn release_checkpoint_barriers(
         relay: &Arc<Mutex<DurableRelay>>,
         dispatch_wake: &mpsc::Sender<()>,
@@ -1931,6 +1990,31 @@ exec gh "$@"
         Ok(())
     }
 
+    /// Protocol rejections are ordinary responses rather than Rust errors, so
+    /// the socket loop must log them explicitly. Keep this next to the write
+    /// boundary so every request route (including credentials and old
+    /// protocol methods) gets the same session and operation context.
+    async fn write_logged_response(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        response: &RelayResponseEnvelope,
+        session_id: &str,
+        operation: &str,
+    ) -> Result<()> {
+        if let RelayResponseBody::Error { error } = &response.body {
+            tracing::warn!(
+                %session_id,
+                %operation,
+                request_id = %response.request_id,
+                protocol_version = response.protocol_version,
+                relay_error_code = ?error.code,
+                relay_retryable = error.retryable,
+                error_message = %error.message,
+                "relay request returned an error"
+            );
+        }
+        write_response(writer, response).await
+    }
+
     pub(super) async fn forward_proxy_streams(
         mut client_read: impl tokio::io::AsyncRead + Unpin,
         mut client_write: impl tokio::io::AsyncWrite + Unpin,
@@ -1957,10 +2041,22 @@ exec gh "$@"
         .await
         {
             Ok(read) => read.context("read initial proxy stdin")?,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                tracing::debug!(
+                    operation = "proxy_initial_input",
+                    "relay proxy client sent no initial frame before the idle deadline"
+                );
+                return Ok(());
+            }
         };
         if first_count == 0 {
-            let _ = relay_write.shutdown().await;
+            if let Err(error) = relay_write.shutdown().await {
+                tracing::debug!(
+                    operation = "proxy_shutdown",
+                    %error,
+                    "could not close relay socket after proxy client EOF"
+                );
+            }
             return Ok(());
         }
         relay_write
@@ -1975,12 +2071,25 @@ exec gh "$@"
                     if count == 0 {
                         // Client is gone; flush any final in-flight response
                         // briefly, then exit.
-                        let _ = relay_write.shutdown().await;
-                        let _ = tokio::time::timeout(
+                        if let Err(error) = relay_write.shutdown().await {
+                            tracing::debug!(
+                                operation = "proxy_shutdown",
+                                %error,
+                                "could not close relay socket after proxy client EOF"
+                            );
+                        }
+                        if let Err(error) = tokio::time::timeout(
                             std::time::Duration::from_millis(500),
                             tokio::io::copy(&mut relay_read, &mut client_write),
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::debug!(
+                                operation = "proxy_final_response",
+                                %error,
+                                "could not forward the final relay response before proxy shutdown"
+                            );
+                        }
                         return Ok(());
                     }
                     relay_write
@@ -2061,7 +2170,13 @@ exec gh "$@"
                 }
             }
         };
-        let _ = child_stdin.shutdown().await;
+        if let Err(error) = child_stdin.shutdown().await {
+            tracing::debug!(
+                operation = "acp_supervisor_shutdown",
+                %error,
+                "could not close ACP bridge stdin before termination"
+            );
+        }
         terminate_process_group(pid, libc::SIGTERM);
         match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
             Ok(status) => {

@@ -349,14 +349,30 @@ pub fn local_directory_completions(prefix: &str) -> Vec<String> {
     } else {
         &directory
     };
-    let Ok(entries) = fs::read_dir(lookup) else {
-        return Vec::new();
+    let entries = match fs::read_dir(lookup) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(path = lookup, %error, "path completion directory could not be read");
+            return Vec::new();
+        }
     };
     let mut matches = entries
         .filter_map(|entry| {
-            let entry = entry.ok()?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::debug!(path = lookup, %error, "path completion directory entry could not be read");
+                    return None;
+                }
+            };
             let name = entry.file_name();
-            let name = name.to_str()?;
+            let name = match name.to_str() {
+                Some(name) => name,
+                None => {
+                    tracing::debug!(path = %entry.path().display(), "path completion skipped a non-UTF-8 directory entry");
+                    return None;
+                }
+            };
             (name.starts_with(fragment) && entry.path().is_dir())
                 .then(|| format!("{directory}{name}/"))
         })
@@ -539,7 +555,12 @@ fn stream_command_with_stdin(
         let status = loop {
             if is_cancelled() {
                 terminate_cancellable_child(&mut child);
-                let _ = input_writer.join();
+                if let Err(error) = input_writer.join() {
+                    tracing::warn!(
+                        purpose = command.purpose.as_str(),
+                        "streamed command input writer panicked while cancelling: {error:?}"
+                    );
+                }
                 bail!("operation cancelled while {}", command.purpose);
             }
             match child.try_wait() {
@@ -547,7 +568,12 @@ fn stream_command_with_stdin(
                 Ok(None) => std::thread::sleep(Duration::from_millis(25)),
                 Err(error) => {
                     terminate_cancellable_child(&mut child);
-                    let _ = input_writer.join();
+                    if let Err(join_error) = input_writer.join() {
+                        tracing::warn!(
+                            purpose = command.purpose.as_str(),
+                            "streamed command input writer panicked while waiting: {join_error:?}"
+                        );
+                    }
                     return Err(error).with_context(|| format!("wait for {}", command.purpose));
                 }
             }
@@ -637,12 +663,17 @@ fn terminate_cancellable_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     // The child owns a fresh process group, so descendants such as an SSH or
     // shell helper cannot keep its output pipes open after cancellation.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(pid = child.id(), %error, "could not terminate cancelled command process group");
     }
     #[cfg(not(unix))]
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Err(error) = child.kill() {
+        tracing::warn!(pid = child.id(), %error, "could not terminate cancelled command");
+    }
+    if let Err(error) = child.wait() {
+        tracing::warn!(pid = child.id(), %error, "could not reap cancelled command");
+    }
 }
 
 impl CommandExecutor for CancellableProcessExecutor {

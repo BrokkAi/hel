@@ -70,7 +70,17 @@ impl UserShellRegistry {
         let (cancel, cancelled) = oneshot::channel();
         let task_id = request_id.clone();
         let task_events = self.events.clone();
-        let task = spawn_user_shell(request_id, spec, cancelled, task_events)?;
+        let task = spawn_user_shell(request_id.clone(), spec, cancelled, task_events).map_err(
+            |error| {
+                tracing::warn!(
+                    %request_id,
+                    operation = "user_shell_start",
+                    %error,
+                    "could not start user shell"
+                );
+                error
+            },
+        )?;
         self.cancellations.insert(task_id.clone(), Some(cancel));
         self.tasks.spawn(async move {
             if let Err(error) = task.await {
@@ -94,6 +104,11 @@ impl UserShellRegistry {
             // The child already finished and its terminal event is waiting to
             // be folded. Interrupting its durable dispatch here would make
             // that legitimate completion look like a duplicate.
+            tracing::debug!(
+                %request_id,
+                operation = "user_shell_cancel",
+                "user shell cancellation receiver was already closed"
+            );
             UserShellCancelOutcome::AlreadyRequested
         }
     }
@@ -229,12 +244,19 @@ fn spawn_user_shell(
             status,
             error: (!read_errors.is_empty()).then(|| read_errors.join("; ")),
         };
-        if events
-            .send(RuntimeEvent::UserShellFinished { request_id, result })
+        if let Err(error) = events
+            .send(RuntimeEvent::UserShellFinished {
+                request_id: request_id.clone(),
+                result,
+            })
             .await
-            .is_err()
         {
-            tracing::error!("user shell result was lost because the relay coordinator stopped");
+            tracing::warn!(
+                %request_id,
+                operation = "user_shell_finished",
+                %error,
+                "user shell result was lost because the relay coordinator stopped"
+            );
         }
     }))
 }
@@ -273,14 +295,24 @@ where
             .lock()
             .expect("user shell stderr lock poisoned")
             .live_text();
-        let _ = events.try_send(RuntimeEvent::UserShellOutput {
+        match events.try_send(RuntimeEvent::UserShellOutput {
             request_id: request_id.clone(),
             command: command.clone(),
             stdout: stdout_text,
             stderr: stderr_text,
             stdout_truncated,
             stderr_truncated,
-        });
+        }) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(
+                    %request_id,
+                    operation = "user_shell_output",
+                    "user shell output could not reach the relay coordinator"
+                );
+                return Ok(());
+            }
+        }
     }
 }
 

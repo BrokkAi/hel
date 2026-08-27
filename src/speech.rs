@@ -123,7 +123,13 @@ mod worker {
         let (event_tx, event_rx) = mpsc::channel::<Option<WorkerEvent>>();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
+                let line = match line {
+                    Ok(line) => line,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not read voice worker output");
+                        break;
+                    }
+                };
                 if let Some(event) = parse_event(&line)
                     && event_tx.send(Some(event)).is_err()
                 {
@@ -147,11 +153,19 @@ mod worker {
             if let Some(at) = cancelled_at
                 && at.elapsed() >= CANCEL_GRACE
             {
-                let _ = child.kill();
+                if let Err(error) = child.kill()
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(%error, "could not stop the cancelled voice worker");
+                }
                 break Some(Ok(last_partial.clone()));
             }
             if started_at.elapsed() >= DICTATION_TIMEOUT + WORKER_GRACE {
-                let _ = child.kill();
+                if let Err(error) = child.kill()
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(%error, "could not stop the timed-out voice worker");
+                }
                 break Some(Err(anyhow!("voice dictation timed out")));
             }
             match event_rx.recv_timeout(Duration::from_millis(50)) {
@@ -171,7 +185,13 @@ mod worker {
 
         let status = reap(child);
         let stderr_tail = stderr_reader
-            .and_then(|reader| reader.join().ok())
+            .and_then(|reader| match reader.join() {
+                Ok(tail) => Some(tail),
+                Err(error) => {
+                    tracing::warn!("voice worker stderr reader panicked: {error:?}");
+                    None
+                }
+            })
             .unwrap_or_default();
         match outcome {
             Some(result) => result,
@@ -192,8 +212,18 @@ mod worker {
                 Ok(Some(status)) => return Some(status),
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
                 _ => {
-                    let _ = child.kill();
-                    return child.wait().ok();
+                    if let Err(error) = child.kill()
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(%error, "could not stop the voice worker while reaping it");
+                    }
+                    return match child.wait() {
+                        Ok(status) => Some(status),
+                        Err(error) => {
+                            tracing::warn!(%error, "could not reap the voice worker");
+                            None
+                        }
+                    };
                 }
             }
         }

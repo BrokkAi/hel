@@ -131,6 +131,9 @@ pub enum DashboardAction {
         title: String,
     },
     RefreshQuotas,
+    /// Read the system clipboard on a worker before applying its contents.
+    /// Clipboard providers may perform IPC and must never run on the TUI loop.
+    PasteFromClipboard,
     MarkAllRead {
         receipts: Vec<(String, u64)>,
     },
@@ -358,11 +361,7 @@ impl DashboardState {
             return DashboardAction::None;
         }
         if is_paste_shortcut(key) {
-            match hel::hel_clipboard::read_text() {
-                Ok(text) => self.handle_paste(&text),
-                Err(error) => self.notices.set(format!("Paste failed: {error:#}")),
-            }
-            return DashboardAction::None;
+            return DashboardAction::PasteFromClipboard;
         }
         if dashboard_accelerator(key.modifiers)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
@@ -1065,6 +1064,10 @@ mod tests {
         );
         assert_eq!(dashboard.handle_key(ctrl_key('t')), DashboardAction::None);
         assert_eq!(dashboard.handle_key(ctrl_key('i')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('v')),
+            DashboardAction::PasteFromClipboard
+        );
         assert_eq!(
             dashboard.handle_key(ctrl_key('q')),
             DashboardAction::QuitDetach

@@ -621,8 +621,10 @@ fn migrate_destroying_session_state(connection: &Connection) -> Result<()> {
          PRAGMA user_version = 7;
          COMMIT;",
     );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
+    if migration.is_err()
+        && let Err(error) = connection.execute_batch("ROLLBACK;")
+    {
+        tracing::warn!(%error, "could not roll back durable-destroying-session migration");
     }
     let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
     migration.context("migrate durable destroying session state")?;
@@ -684,8 +686,10 @@ fn migrate_grok_harness_kind(connection: &Connection) -> Result<()> {
          PRAGMA user_version = 9;
          COMMIT;",
     );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
+    if migration.is_err()
+        && let Err(error) = connection.execute_batch("ROLLBACK;")
+    {
+        tracing::warn!(%error, "could not roll back Grok harness migration");
     }
     let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
     migration.context("migrate sessions table for the Grok Build harness")?;
@@ -760,8 +764,10 @@ fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
          PRAGMA user_version = 10;
          COMMIT;",
     );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
+    if migration.is_err()
+        && let Err(error) = connection.execute_batch("ROLLBACK;")
+    {
+        tracing::warn!(%error, "could not roll back stopped-session migration");
     }
     let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
     migration.context("migrate sessions table for the stopped session state")?;
@@ -822,8 +828,10 @@ fn migrate_deepseek_harness_kind(connection: &Connection) -> Result<()> {
          PRAGMA user_version = 11;
          COMMIT;",
     );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
+    if migration.is_err()
+        && let Err(error) = connection.execute_batch("ROLLBACK;")
+    {
+        tracing::warn!(%error, "could not roll back DeepSeek harness migration");
     }
     let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
     migration.context("migrate sessions table for DeepSeek Harness")?;

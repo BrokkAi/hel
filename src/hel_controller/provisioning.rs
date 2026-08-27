@@ -139,6 +139,13 @@ impl Controller {
             .map(|error| format!("{error:#}"))
             .collect::<Vec<_>>()
             .join("; ");
+        if !cleanup_error.is_empty() {
+            tracing::warn!(
+                session_id,
+                error = %cleanup_error,
+                "new-session rollback cleanup reported failures"
+            );
+        }
         let original = format!("{error:#}");
         let original = match persist_launch_failure(session_id, &original) {
             Ok(path) => format!("{original}; full diagnostic saved to {}", path.display()),
@@ -770,7 +777,14 @@ fn cleanup_failed_provision(
     );
     let plan = match hel_targets::close_plan(&locator, session_id) {
         Ok(plan) => plan,
-        Err(error) => return Some(format!("cleanup FAILED: {error:#}; {leak}")),
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                error = format!("{error:#}"),
+                "could not build provisioning cleanup plan"
+            );
+            return Some(format!("cleanup FAILED: {error:#}; {leak}"));
+        }
     };
     let purpose = plan
         .commands
@@ -783,7 +797,24 @@ fn cleanup_failed_provision(
     };
     match hel_targets::cleanup_target_is_confirmed_absent(&locator, session_id, executor) {
         Ok(true) => Some(format!("cleanup succeeded: {purpose}")),
-        _ => Some(format!("cleanup FAILED ({purpose}): {error:#}; {leak}")),
+        Ok(false) => {
+            tracing::warn!(
+                session_id,
+                error = format!("{error:#}"),
+                "provisioning cleanup failed and the target may still exist"
+            );
+            Some(format!("cleanup FAILED ({purpose}): {error:#}; {leak}"))
+        }
+        Err(confirm_error) => {
+            tracing::warn!(
+                session_id,
+                error = format!("{confirm_error:#}"),
+                "could not confirm whether the failed provisioning target was removed"
+            );
+            Some(format!(
+                "cleanup FAILED ({purpose}): {error:#}; checking whether it was removed also failed: {confirm_error:#}; {leak}"
+            ))
+        }
     }
 }
 
@@ -1088,8 +1119,15 @@ fn start_git_broker(files: &BrokerFiles) -> Result<std::process::Child> {
     // A broker killed outright leaves its marker behind, and the new one has
     // to publish its own before it counts as ready. A marker a live broker
     // owns is never touched.
-    if !broker_is_alive(&files.pid) {
-        let _ = std::fs::remove_file(&files.ready);
+    if !broker_is_alive(&files.pid)
+        && let Err(error) = std::fs::remove_file(&files.ready)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %files.ready.display(),
+            %error,
+            "could not remove stale Git broker ready marker"
+        );
     }
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -1124,8 +1162,12 @@ fn start_git_broker(files: &BrokerFiles) -> Result<std::process::Child> {
         }
         if Instant::now() >= deadline {
             // Leave no half-started broker behind holding the session slot.
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(error) = child.kill() {
+                tracing::warn!(%error, "could not terminate timed-out Git broker");
+            }
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "could not reap timed-out Git broker");
+            }
             bail!(
                 "timed out starting local Git broker; see {}",
                 files.log.display()
@@ -1331,6 +1373,10 @@ pub(super) fn enforce_overlay_capable_mounts(
     let filesystems = match hel_targets::probe_filesystem_types(ssh, &overlaid, executor) {
         Ok(filesystems) => filesystems,
         Err(error) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "could not probe attached-directory filesystems; preserving overlay mounts"
+            );
             return vec![format!(
                 "Could not read the filesystem under the attached directories, so they keep the \
                  copy-on-write overlay: {error:#}"

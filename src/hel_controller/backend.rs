@@ -388,19 +388,34 @@ pub(crate) fn controller_github_token() -> Option<String> {
             return Some(token.to_owned());
         }
     }
-    let output = Command::new("gh")
+    let output = match Command::new("gh")
         .args(["auth", "token", "--hostname", "github.com"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then_some(())
-        .and_then(|()| std::str::from_utf8(&output.stdout).ok())
-        .and_then(usable_github_token)
-        .map(str::to_owned)
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(%error, "could not query the GitHub CLI for a token");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::debug!(status = ?output.status, "GitHub CLI did not return an authenticated token");
+        return None;
+    }
+    let token = match std::str::from_utf8(&output.stdout) {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::debug!(%error, "GitHub CLI returned a non-UTF-8 token");
+            return None;
+        }
+    };
+    let Some(token) = usable_github_token(token) else {
+        tracing::debug!("GitHub CLI returned an empty or invalid token");
+        return None;
+    };
+    Some(token.to_owned())
 }
 
 fn usable_github_token(token: &str) -> Option<&str> {

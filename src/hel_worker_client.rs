@@ -253,7 +253,17 @@ impl RelayClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("start session relay proxy for {}", spec.purpose))?;
+            .with_context(|| format!("start session relay proxy for {}", spec.purpose))
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %expected_session_id,
+                    operation = "connect",
+                    purpose = %spec.purpose,
+                    error = %error,
+                    "could not start relay proxy"
+                );
+                error
+            })?;
         if let Some(errors) = child.stderr.take() {
             let purpose = spec.purpose.clone();
             let session_id = expected_session_id.to_owned();
@@ -262,14 +272,42 @@ impl RelayClient {
         let input = child
             .stdin
             .take()
-            .context("relay proxy stdin unavailable")?;
+            .context("relay proxy stdin unavailable")
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %expected_session_id,
+                    operation = "connect",
+                    purpose = %spec.purpose,
+                    error = %error,
+                    "relay proxy did not provide stdin"
+                );
+                error
+            })?;
         let output = child
             .stdout
             .take()
-            .context("relay proxy stdout unavailable")?;
+            .context("relay proxy stdout unavailable")
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %expected_session_id,
+                    operation = "connect",
+                    purpose = %spec.purpose,
+                    error = %error,
+                    "relay proxy did not provide stdout"
+                );
+                error
+            })?;
         let mut nonce_bytes = [0_u8; 8];
-        getrandom::fill(&mut nonce_bytes)
-            .map_err(|error| anyhow!("generate relay request nonce: {error}"))?;
+        getrandom::fill(&mut nonce_bytes).map_err(|error| {
+            let error = anyhow!("generate relay request nonce: {error}");
+            tracing::warn!(
+                session_id = %expected_session_id,
+                operation = "connect",
+                error = %error,
+                "could not initialize relay request nonce"
+            );
+            error
+        })?;
         let mut client = Self {
             child: Some(child),
             input: Some(input),
@@ -302,17 +340,23 @@ impl RelayClient {
             session_id,
         } = response
         else {
-            bail!("relay returned an unexpected hello response")
+            let error = anyhow!("relay returned an unexpected hello response");
+            log_relay_client_failure(&client, "hello", "relay-hello", &error);
+            return Err(error);
         };
         if session_id != expected_session_id {
-            bail!("relay belongs to session {session_id}, not {expected_session_id}");
+            let error = anyhow!("relay belongs to session {session_id}, not {expected_session_id}");
+            log_relay_client_failure(&client, "hello", "relay-hello", &error);
+            return Err(error);
         }
         if !RelayVersionRange::CURRENT.contains(negotiated) {
-            bail!(
+            let error = anyhow!(
                 "relay negotiated unsupported protocol {negotiated}; this controller supports {}-{}",
                 RELAY_MIN_PROTOCOL_VERSION,
                 RELAY_PROTOCOL_VERSION
             );
+            log_relay_client_failure(&client, "hello", "relay-hello", &error);
+            return Err(error);
         }
         client.protocol_version = negotiated;
         client.session_id = session_id;
@@ -684,8 +728,23 @@ impl RelayClient {
                 status.context("wait for relay proxy")?;
             }
             Err(_) => {
-                child.start_kill().context("stop relay proxy")?;
-                let _ = child.wait().await;
+                if let Err(error) = child.start_kill().context("stop relay proxy") {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        operation = "detach",
+                        %error,
+                        "could not stop relay proxy after detach timeout"
+                    );
+                    return Err(error);
+                }
+                if let Err(error) = child.wait().await {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        operation = "detach",
+                        %error,
+                        "could not reap relay proxy after stopping it"
+                    );
+                }
             }
         }
         Ok(())
@@ -707,11 +766,22 @@ impl RelayClient {
             protocol_version: self.protocol_version,
             request,
         };
-        let line = self
+        let line = match self
             .exchange(&envelope, operation, timeout, ExchangeKind::Call)
-            .await?;
-        decode_relay_response(&line, &request_id, self.protocol_version)
-            .with_context(|| format!("relay {} could not perform {operation}", self.relay_version))
+            .await
+        {
+            Ok(line) => line,
+            Err(error) => {
+                log_relay_client_failure(self, operation, &request_id, &error);
+                return Err(error);
+            }
+        };
+        let result = decode_relay_response(&line, &request_id, self.protocol_version)
+            .with_context(|| format!("relay {} could not perform {operation}", self.relay_version));
+        if let Err(error) = &result {
+            log_relay_client_failure(self, operation, &request_id, error);
+        }
+        result
     }
 
     async fn call_hello(
@@ -726,10 +796,21 @@ impl RelayClient {
             protocol_version: RELAY_PROTOCOL_VERSION,
             request,
         };
-        let line = self
+        let line = match self
             .exchange(&envelope, operation, timeout, ExchangeKind::Handshake)
-            .await?;
-        decode_relay_hello_response(&line, &request_id)
+            .await
+        {
+            Ok(line) => line,
+            Err(error) => {
+                log_relay_client_failure(self, operation, &request_id, &error);
+                return Err(error);
+            }
+        };
+        let result = decode_relay_hello_response(&line, &request_id);
+        if let Err(error) = &result {
+            log_relay_client_failure(self, operation, &request_id, error);
+        }
+        result
     }
 
     /// Write one request frame and read the reply that belongs to it.
@@ -820,6 +901,46 @@ impl RelayClient {
         let id = format!("relay-{:016x}-{}", self.connection_nonce, self.next_request);
         self.next_request = self.next_request.wrapping_add(1);
         id
+    }
+}
+
+/// Keep transport, protocol, and explicit relay rejections visible at the
+/// point where a request fails. Callers often turn these into a user-facing
+/// string or a retry, which otherwise loses the operation and request ID that
+/// make concurrent session failures diagnosable.
+fn log_relay_client_failure(
+    client: &RelayClient,
+    operation: &str,
+    request_id: &str,
+    error: &anyhow::Error,
+) {
+    let rejection = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<RelayRejected>()
+            .map(|rejected| &rejected.0)
+    });
+    let transport_dead = RelayTransportDead::marks(error);
+    match rejection {
+        Some(rejection) => tracing::warn!(
+            session_id = %client.session_id,
+            relay_version = %client.relay_version,
+            %operation,
+            %request_id,
+            relay_error_code = ?rejection.code,
+            relay_retryable = rejection.retryable,
+            transport_dead,
+            error = %error,
+            "relay request rejected"
+        ),
+        None => tracing::warn!(
+            session_id = %client.session_id,
+            relay_version = %client.relay_version,
+            %operation,
+            %request_id,
+            transport_dead,
+            error = %error,
+            "relay request failed"
+        ),
     }
 }
 
@@ -1111,7 +1232,14 @@ impl CredentialSyncCoordinator {
                             || result.failure.is_some()
                             || !result.outcomes.is_empty()
                         {
-                            let _ = results_tx.send(result);
+                            let profile_id = result.profile_id.clone();
+                            if results_tx.send(result).is_err() {
+                                tracing::debug!(
+                                    %profile_id,
+                                    operation = "credential_sync_result",
+                                    "credential sync result receiver was already closed"
+                                );
+                            }
                         }
                     }
                 }
@@ -1130,12 +1258,22 @@ impl CredentialSyncCoordinator {
                         .collect();
                     if targets.is_empty() {
                         if trigger.cause.is_some() {
-                            let _ = results_tx.send(CredentialSyncResult {
-                                profile_id: trigger.profile_id,
-                                trigger: trigger.cause,
-                                failure: None,
-                                outcomes: Vec::new(),
-                            });
+                            let profile_id = trigger.profile_id.clone();
+                            if results_tx
+                                .send(CredentialSyncResult {
+                                    profile_id: trigger.profile_id,
+                                    trigger: trigger.cause,
+                                    failure: None,
+                                    outcomes: Vec::new(),
+                                })
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    %profile_id,
+                                    operation = "credential_sync_result",
+                                    "credential sync result receiver was already closed"
+                                );
+                            }
                         }
                         continue;
                     }
@@ -1153,12 +1291,22 @@ impl CredentialSyncCoordinator {
                             Ok(outcomes) => (None, outcomes),
                             Err(error) => (Some(format!("sync task stopped: {error}")), Vec::new()),
                         };
-                        let _ = completed_tx.send(CredentialSyncResult {
-                            profile_id: trigger.profile_id,
-                            trigger: trigger.cause,
-                            failure,
-                            outcomes,
-                        });
+                        let profile_id = trigger.profile_id.clone();
+                        if completed_tx
+                            .send(CredentialSyncResult {
+                                profile_id: trigger.profile_id,
+                                trigger: trigger.cause,
+                                failure,
+                                outcomes,
+                            })
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                %profile_id,
+                                operation = "credential_sync_completion",
+                                "credential sync coordinator stopped before receiving completion"
+                            );
+                        }
                     });
                 }
                 queue = deferred;
@@ -1220,6 +1368,13 @@ async fn reconcile_profile(targets: &[CredentialSyncTarget]) -> Vec<CredentialSy
                     );
                 }
                 Err(error) => {
+                    tracing::warn!(
+                        session_id = %target.session_id,
+                        profile_id = %target.profile_id,
+                        pass = pass + 1,
+                        error = %error,
+                        "credential synchronization failed for relay session"
+                    );
                     outcomes.insert(
                         target.session_id.clone(),
                         CredentialSyncOutcome {
