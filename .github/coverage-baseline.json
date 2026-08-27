@@ -1,45 +1,49 @@
 {
   "aggregate": {
-    "lines": 65.91,
+    "lines": 83.75,
     "material_regression_tolerance": 0.25
   },
   "production_module_line_target": 70.0,
   "module_exceptions": {
-    "src/hel_acp.rs": {
-      "minimum": 11.5,
-      "reason": "Remaining branches require live provider ACP processes and full bidirectional protocol sessions."
-    },
-    "src/hel_chat.rs": {
-      "minimum": 64.5,
-      "reason": "Remaining branches are terminal rendering and asynchronous input paths exercised through the interactive TUI."
-    },
-    "src/hel_controller.rs": {
-      "minimum": 22.5,
-      "reason": "Provisioning and lifecycle branches cross container, SSH, EC2, filesystem, and live ACP boundaries."
-    },
-    "src/hel_doctor.rs": {
-      "minimum": 48.0,
-      "reason": "Remaining diagnostics depend on platform-specific runtime executables, host capabilities, and authentication homes."
-    },
-    "src/hel_import.rs": {
-      "minimum": 52.25,
-      "reason": "Remaining import branches depend on complete native provider homes and live cross-harness conversion flows."
-    },
-    "src/hel_main.rs": {
-      "minimum": 29.75,
-      "reason": "The binary entrypoint is exercised primarily through PTY and end-to-end process tests."
-    },
-    "src/hel_quota.rs": {
+    "src/hel_chat/active.rs": {
       "minimum": 63.25,
-      "reason": "Remaining branches depend on live provider-specific quota responses."
+      "reason": "Remaining branches are interactive terminal and asynchronous session-feed paths."
+    },
+    "src/hel_chat/remote.rs": {
+      "minimum": 16.5,
+      "reason": "Remaining branches require a live remote relay and interactive UI runtime."
+    },
+    "src/hel_clipboard.rs": {
+      "minimum": 0.0,
+      "reason": "Clipboard access requires a host display server and is unavailable in headless CI."
+    },
+    "src/hel_controller/lifecycle.rs": {
+      "minimum": 66.0,
+      "reason": "Remaining lifecycle branches cross container, SSH, filesystem, and live worker boundaries."
+    },
+    "src/hel_controller/provisioning.rs": {
+      "minimum": 59.0,
+      "reason": "Remaining provisioning branches require live container, SSH, and cloud backends."
+    },
+    "src/hel_controller/recovery_scan.rs": {
+      "minimum": 45.5,
+      "reason": "Remaining recovery scans require live managed resources on remote targets."
+    },
+    "src/hel_controller/worker_binary.rs": {
+      "minimum": 55.25,
+      "reason": "Remaining worker installation paths depend on host toolchains, networks, and target runtimes."
+    },
+    "src/hel_elicitation.rs": {
+      "minimum": 69.5,
+      "reason": "Remaining elicitation branches require full interactive ACP form exchanges."
+    },
+    "src/hel_project_memory.rs": {
+      "minimum": 65.25,
+      "reason": "Remaining project-memory branches require live MCP transports and repository processes."
     },
     "src/hel_worker_client.rs": {
-      "minimum": 23.5,
+      "minimum": 69.25,
       "reason": "Remaining client branches require remote worker transports and injected lifecycle failures."
-    },
-    "src/hel_worker_runtime.rs": {
-      "minimum": 0.0,
-      "reason": "The target runtime requires a live Unix socket, durable worker process, and provider ACP subprocess."
     }
   }
 }

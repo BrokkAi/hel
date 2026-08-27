@@ -24,10 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
-      # The repo defaults to the shipped musl Linux target; registry consumers
-      # build for their own hosts, so package verification uses the runner's
-      # GNU host target.
-      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v6
@@ -36,11 +33,13 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
-      - name: Install Linux audio dependencies
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev
+          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev musl-tools
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
@@ -66,7 +65,8 @@ jobs:
           # packaged (and verify-built) by cargo publish itself, which runs in
           # dependency order after hel-core is live.
           cargo package --locked -p hel-core
-          cargo package --locked -p hel-voice-worker
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
+            cargo package --locked -p hel-voice-worker
 
       - uses: actions/upload-artifact@v7
         with:
@@ -85,10 +85,7 @@ jobs:
       contents: read
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
-      # The repo defaults to the shipped musl Linux target; registry consumers
-      # build for their own hosts, so package verification uses the runner's
-      # GNU host target.
-      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v6
@@ -97,11 +94,13 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
-      - name: Install Linux audio dependencies
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev
+          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev musl-tools
 
       - name: Authenticate to crates.io
         uses: rust-lang/crates-io-auth-action@v1
@@ -153,5 +152,10 @@ jobs:
               echo "$crate $version is already on crates.io, skipping"
               continue
             fi
-            cargo publish --locked -p "$crate"
+            if [ "$crate" = hel-voice-worker ]; then
+              CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
+                cargo publish --locked -p "$crate"
+            else
+              cargo publish --locked -p "$crate"
+            fi
           done
