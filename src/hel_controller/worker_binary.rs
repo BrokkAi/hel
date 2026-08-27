@@ -7,7 +7,9 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use crate::hel_config::{ProjectBundle, ProjectRepository, atomic_write, data_dir};
+use crate::hel_config::{
+    ExecutionPolicy, ProjectBundle, ProjectRepository, atomic_write, data_dir,
+};
 use crate::hel_project_memory::{ProjectMemoryIdentity, RepositoryMemoryIdentity};
 use crate::hel_session_manager::{
     ProjectMemorySyncTarget, WorkerBinaryRefreshPlan, WorkerLaunchRefreshPlan, WorkerRecoveryPlan,
@@ -20,7 +22,7 @@ use crate::hel_worker_runtime::{
 };
 
 use super::backend::backend_locator;
-use super::provisioning::{execution_policy, install_inherited_git_settings};
+use super::provisioning::install_inherited_git_settings;
 use super::readiness::WORKER_EXIT_RECORD_MARKER;
 use super::{Controller, execute_checked, scp_command_spec, ssh_command_spec, target_profile_home};
 
@@ -68,8 +70,19 @@ impl Controller {
             .is_none()
             .then(|| self.config.bundles.get(&session.bundle_id))
             .flatten();
-        let (launch, project_memory, target_profile_home) =
-            worker_launch_config(session, profile, bundle, backend, session_id)?;
+        let target = self
+            .config
+            .targets
+            .get(&session.target_template_id)
+            .context("session target template is missing")?;
+        let (launch, project_memory, target_profile_home) = worker_launch_config(
+            session,
+            profile,
+            bundle,
+            backend,
+            session_id,
+            target.execution_policy(),
+        )?;
 
         let staging = tempfile::tempdir().context("create worker staging directory")?;
         let launch_path = staging.path().join("launch.json");
@@ -179,7 +192,19 @@ impl Controller {
             .is_none()
             .then(|| self.config.bundles.get(&session.bundle_id))
             .flatten();
-        let (launch, _, _) = worker_launch_config(session, profile, bundle, &backend, session_id)?;
+        let target = self
+            .config
+            .targets
+            .get(&session.target_template_id)
+            .context("session target template is missing")?;
+        let (launch, _, _) = worker_launch_config(
+            session,
+            profile,
+            bundle,
+            &backend,
+            session_id,
+            target.execution_policy(),
+        )?;
         Ok(WorkerRecoveryPlan {
             target: hel_targets::target_recovery_plan(&backend, session_id)?,
             liveness_probe: worker_liveness_command(&backend, &worker_root),
@@ -239,6 +264,7 @@ fn worker_launch_config(
     bundle: Option<&ProjectBundle>,
     backend: &hel_targets::TargetLocator,
     session_id: &str,
+    execution_policy: ExecutionPolicy,
 ) -> Result<(WorkerLaunchConfig, ProjectMemoryLaunchConfig, String)> {
     let target_profile_home = target_profile_home(backend, session_id, profile);
     let workspace = if let Some(project_directory) = &session.project_directory {
@@ -264,7 +290,6 @@ fn worker_launch_config(
             "DeepSeek Harness ACP does not support multiple workspace roots; use a single-repository bundle"
         );
     }
-    let execution_policy = execution_policy(backend);
     let (bridge_command, bridge_args) = bridge_launch(
         profile.kind,
         profile.executable.as_deref(),

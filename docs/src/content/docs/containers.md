@@ -7,9 +7,11 @@ description: Set up a disposable container target for hel and start your first i
 
 Each session on a container target runs in its own disposable, labeled
 container: local Podman on Linux or WSL2, or Apple's `container` runtime on
-macOS 26 or newer on Apple silicon. Target isolation selects Hel's
-`unconstrained` execution policy, which Hel translates into the selected
-harness's own control: Codex `agent-full-access`, Claude Code
+macOS 26 or newer on Apple silicon. Local container isolation selects Hel's
+`unconstrained` execution policy. Named SSH targets instead select it with
+`permissions = "yolo"`; `permissions = "guardian"` preserves the harness's
+configured approvals even for Podman over SSH. Hel translates the policy into
+the selected harness's own control: Codex `agent-full-access`, Claude Code
 `bypassPermissions`, Kimi Code `auto`, Grok Build's `--always-approve` launch
 flag, or DeepSeek Harness's `danger-full-access` permission mode. Every one of
 those approves every call. Note that Kimi Code's mode is named `auto` but is

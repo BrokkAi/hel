@@ -824,8 +824,10 @@ fn render_review_wizard(
             }
         )));
     }
-    // Raw targets rely on the harness guardian rather than target isolation.
-    if matches!(target, TargetTemplate::LocalBare)
+    // Guardian targets rely on the harness's own approval mode rather than
+    // Hel-managed isolation.
+    if (matches!(target, TargetTemplate::LocalBare)
+        || target.permission_mode() == Some(hel::hel_config::PermissionMode::Guardian))
         && let Some(kind) = dashboard
             .config
             .profiles
@@ -3095,6 +3097,7 @@ mod tests {
                     identity_file: None,
                     extra_args: Vec::new(),
                 },
+                permissions: hel::hel_config::PermissionMode::Guardian,
                 workspace_prefix: ".local/share/hel/workspaces".into(),
             },
         )]);

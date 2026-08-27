@@ -709,7 +709,7 @@ fn ssh_podman_checks(
         .targets
         .iter()
         .filter_map(|(id, target)| match target {
-            TargetTemplate::SshPodman { ssh, container } => Some(ssh_podman_check(
+            TargetTemplate::SshPodman { ssh, container, .. } => Some(ssh_podman_check(
                 id,
                 &backend_ssh(ssh),
                 &container.image,
@@ -1621,6 +1621,7 @@ mod tests {
                     identity_file: Some(PathBuf::from("/home/dev/.ssh/id_ed25519")),
                     extra_args: vec![],
                 },
+                permissions: crate::hel_config::PermissionMode::Yolo,
                 workspace_prefix: PathBuf::from(".local/share/hel/workspaces"),
             },
         )])
@@ -1728,6 +1729,7 @@ mod tests {
             "remote",
             TargetTemplate::SshPodman {
                 ssh: ssh_connection(),
+                permissions: crate::hel_config::PermissionMode::Yolo,
                 container: container("ubuntu:24.04"),
             },
         )]);
@@ -1751,6 +1753,7 @@ mod tests {
             "remote",
             TargetTemplate::SshPodman {
                 ssh: ssh_connection(),
+                permissions: crate::hel_config::PermissionMode::Yolo,
                 container: remote,
             },
         )]);

@@ -1488,16 +1488,6 @@ fn inherits_controller_git_settings(locator: &hel_targets::TargetLocator) -> boo
     )
 }
 
-pub(super) fn execution_policy(
-    locator: &hel_targets::TargetLocator,
-) -> crate::hel_config::ExecutionPolicy {
-    if matches!(locator, hel_targets::TargetLocator::LocalBare { .. }) {
-        crate::hel_config::ExecutionPolicy::ConfiguredApprovals
-    } else {
-        crate::hel_config::ExecutionPolicy::Unconstrained
-    }
-}
-
 fn inherited_git_setting_commands(
     locator: &hel_targets::TargetLocator,
     session_id: &str,
@@ -1987,17 +1977,6 @@ mod tests {
         };
         assert!(!inherits_controller_git_settings(&persistent));
         assert!(!inherits_controller_git_settings(&local));
-        assert_eq!(
-            execution_policy(&local),
-            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
-        );
-        for locator in ephemeral.iter().chain(std::iter::once(&persistent)) {
-            assert_eq!(
-                execution_policy(locator),
-                crate::hel_config::ExecutionPolicy::Unconstrained,
-                "isolated and remote targets run unconstrained: {locator:?}"
-            );
-        }
         assert!(
             inherited_git_setting_commands(
                 &persistent,
@@ -2006,6 +1985,55 @@ mod tests {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn named_ssh_targets_select_guardian_or_yolo_execution() {
+        let ssh = crate::hel_config::SshConnection {
+            host: "builder".into(),
+            user: None,
+            identity_file: None,
+            extra_args: Vec::new(),
+        };
+        let guardian = TargetTemplate::SshBare {
+            ssh: ssh.clone(),
+            permissions: crate::hel_config::PermissionMode::Guardian,
+            workspace_prefix: ".local/share/hel/workspaces".into(),
+        };
+        let guardian_podman = TargetTemplate::SshPodman {
+            ssh: ssh.clone(),
+            permissions: crate::hel_config::PermissionMode::Guardian,
+            container: crate::hel_config::ContainerTemplate {
+                image: "example.invalid/agent:latest".into(),
+                pull_policy: Default::default(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: BTreeMap::new(),
+            },
+        };
+        let yolo = TargetTemplate::SshBare {
+            ssh,
+            permissions: crate::hel_config::PermissionMode::Yolo,
+            workspace_prefix: ".local/share/hel/workspaces".into(),
+        };
+
+        assert_eq!(
+            TargetTemplate::LocalBare.execution_policy(),
+            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
+        );
+        assert_eq!(
+            guardian.execution_policy(),
+            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
+        );
+        assert_eq!(
+            guardian_podman.execution_policy(),
+            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
+        );
+        assert_eq!(
+            yolo.execution_policy(),
+            crate::hel_config::ExecutionPolicy::Unconstrained
         );
     }
     const PROVISIONED_SESSION: &str = "0123456789abcdef0123456789abcdef";

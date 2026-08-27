@@ -138,6 +138,7 @@ pub(super) fn resume_compatibility_config() -> HelConfig {
                 identity_file: None,
                 extra_args: Vec::new(),
             },
+            permissions: crate::hel_config::PermissionMode::Yolo,
             workspace_prefix: ".local/share/hel/workspaces".into(),
         },
     );

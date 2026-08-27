@@ -1170,6 +1170,7 @@ mod tests {
                     identity_file: None,
                     extra_args: Vec::new(),
                 },
+                permissions: hel::hel_config::PermissionMode::Yolo,
                 workspace_prefix: ".local/share/hel/workspaces".into(),
             },
         );

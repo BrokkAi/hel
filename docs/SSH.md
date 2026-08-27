@@ -39,6 +39,7 @@ Shared SSH connection keys (flattened into both target kinds):
 | `user` | no | SSH login user; omit to use your SSH config / default. |
 | `identity_file` | no | Path to the private key. |
 | `extra_args` | no | Extra arguments appended to every `ssh` invocation for this target. |
+| `permissions` | yes | `guardian` preserves configured harness approvals; `yolo` runs unconstrained. |
 
 `ssh-bare` also takes:
 
@@ -50,6 +51,7 @@ Shared SSH connection keys (flattened into both target kinds):
 [targets.builder]
 kind = "ssh-bare"
 host = "builder"
+permissions = "guardian"
 workspace_prefix = ".local/share/hel/workspaces"
 ```
 
@@ -60,6 +62,7 @@ workspace_prefix = ".local/share/hel/workspaces"
 [targets.builder-podman]
 kind = "ssh-podman"
 host = "builder"
+permissions = "yolo"
 image = "ghcr.io/brokkai/hel/agent-dev:latest"
 ```
 

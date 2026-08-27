@@ -36,6 +36,25 @@ pub enum ExecutionPolicy {
     Unconstrained,
 }
 
+/// Approval behavior selected for a named SSH target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    /// Preserve the selected harness profile's approval behavior.
+    Guardian,
+    /// Run every action without sandboxing or approval checks.
+    Yolo,
+}
+
+impl PermissionMode {
+    pub const fn execution_policy(self) -> ExecutionPolicy {
+        match self {
+            Self::Guardian => ExecutionPolicy::ConfiguredApprovals,
+            Self::Yolo => ExecutionPolicy::Unconstrained,
+        }
+    }
+}
+
 impl ExecutionPolicy {
     pub const fn is_unconstrained(self) -> bool {
         matches!(self, Self::Unconstrained)
@@ -534,18 +553,39 @@ pub enum TargetTemplate {
     SshBare {
         #[serde(flatten)]
         ssh: SshConnection,
+        permissions: PermissionMode,
         #[serde(default = "default_named_machine_prefix")]
         workspace_prefix: PathBuf,
     },
     SshPodman {
         #[serde(flatten)]
         ssh: SshConnection,
+        permissions: PermissionMode,
         #[serde(flatten)]
         container: ContainerTemplate,
     },
 }
 
 impl TargetTemplate {
+    pub const fn execution_policy(&self) -> ExecutionPolicy {
+        match self {
+            Self::LocalBare => ExecutionPolicy::ConfiguredApprovals,
+            Self::SshBare { permissions, .. } | Self::SshPodman { permissions, .. } => {
+                permissions.execution_policy()
+            }
+            _ => ExecutionPolicy::Unconstrained,
+        }
+    }
+
+    pub const fn permission_mode(&self) -> Option<PermissionMode> {
+        match self {
+            Self::SshBare { permissions, .. } | Self::SshPodman { permissions, .. } => {
+                Some(*permissions)
+            }
+            _ => None,
+        }
+    }
+
     fn validate(&self, id: &str) -> Result<()> {
         validate_id("target template", id)?;
         match self {
@@ -581,6 +621,7 @@ impl TargetTemplate {
             Self::SshBare {
                 ssh,
                 workspace_prefix,
+                ..
             } => {
                 ssh.validate(id)?;
                 if workspace_prefix.as_os_str().is_empty()
@@ -593,7 +634,7 @@ impl TargetTemplate {
                 }
                 Ok(())
             }
-            Self::SshPodman { ssh, container } => {
+            Self::SshPodman { ssh, container, .. } => {
                 ssh.validate(id)?;
                 container.validate(id)
             }
@@ -1293,6 +1334,56 @@ mod tests {
                 .contains("pull_policy = \"never\"")
         );
         assert_eq!(HelConfig::load_from(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn named_ssh_target_permissions_are_required_and_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = sample_config();
+        let container = match config.targets.remove("podman-default").unwrap() {
+            TargetTemplate::LocalPodman { container } => container,
+            _ => unreachable!(),
+        };
+        let ssh = SshConnection {
+            host: "builder".into(),
+            user: None,
+            identity_file: None,
+            extra_args: Vec::new(),
+        };
+        config.targets = BTreeMap::from([
+            (
+                "builder-raw".into(),
+                TargetTemplate::SshBare {
+                    ssh: ssh.clone(),
+                    permissions: PermissionMode::Guardian,
+                    workspace_prefix: default_named_machine_prefix(),
+                },
+            ),
+            (
+                "builder-podman".into(),
+                TargetTemplate::SshPodman {
+                    ssh,
+                    permissions: PermissionMode::Yolo,
+                    container,
+                },
+            ),
+        ]);
+
+        config.save_to(&path).unwrap();
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("permissions = \"guardian\""), "{body}");
+        assert!(body.contains("permissions = \"yolo\""), "{body}");
+        assert_eq!(HelConfig::load_from(&path).unwrap(), config);
+
+        fs::write(
+            &path,
+            "version = 1\n[targets.builder]\nkind = \"ssh-bare\"\nhost = \"builder\"\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", HelConfig::load_from(&path).unwrap_err());
+        assert!(error.contains("permissions"), "{error}");
     }
 
     #[test]

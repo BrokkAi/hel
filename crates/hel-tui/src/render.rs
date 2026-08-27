@@ -14,7 +14,7 @@ use ratatui::widgets::{
 use hel::hel_chat::render_agent_message_head;
 #[cfg(test)]
 use hel::hel_chat::render_agent_message_tail;
-use hel::hel_config::{HarnessKind, HelConfig};
+use hel::hel_config::{HarnessKind, HelConfig, PermissionMode};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
 use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
@@ -462,6 +462,11 @@ fn render_sessions(
         let expanded = dashboard.project_is_expanded(session);
         let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
         let prefix = if selected { "› " } else { "  " };
+        let permission = session_permission_badge(
+            session,
+            dashboard.session_operations.get(id),
+            &dashboard.config,
+        );
         if expanded {
             lines.push(session_top_line(
                 prefix,
@@ -470,6 +475,7 @@ fn render_sessions(
                 dashboard.session_operations.get(id),
                 now_epoch_seconds,
                 &target,
+                permission,
             ));
             lines.push(prefixed_summary_line(
                 "  ",
@@ -516,6 +522,7 @@ fn render_sessions(
                 detail,
                 now_epoch_seconds,
                 usize::from(active_area.width.saturating_sub(4)),
+                permission,
             ));
         }
         let heading = usize::from(first);
@@ -602,6 +609,7 @@ fn collapsed_session_line(
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
     width: usize,
+    permission: Option<Span<'static>>,
 ) -> Line<'static> {
     let clock = hel::usage_format::format_turn_clock(
         now_epoch_seconds,
@@ -612,14 +620,24 @@ fn collapsed_session_line(
         .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("No messages yet")
         .trim();
-    let lead = format!("{prefix}{target}  {clock} ");
-    Line::styled(
+    let style = Style::default().fg(session_band_color(detail));
+    let mut lead_width = prefix.chars().count() + target.chars().count() + 2;
+    let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
+    if let Some(permission) = permission {
+        spans.push(Span::styled("  ", style));
+        lead_width += permission.width() + 2;
+        spans.push(permission);
+    }
+    spans.push(Span::styled("  ", style));
+    lead_width += clock.chars().count() + 1;
+    spans.push(Span::styled(
         format!(
-            "{lead}{}",
-            crate::widgets::truncate_text(fragment, width.saturating_sub(lead.chars().count()))
+            "{clock} {}",
+            crate::widgets::truncate_text(fragment, width.saturating_sub(lead_width))
         ),
-        Style::default().fg(session_band_color(detail)),
-    )
+        style,
+    ));
+    Line::from(spans).style(style)
 }
 
 fn session_top_line(
@@ -629,6 +647,7 @@ fn session_top_line(
     operation: Option<&SessionOperationDisplay>,
     now_epoch_seconds: u64,
     target: &str,
+    permission: Option<Span<'static>>,
 ) -> Line<'static> {
     let (profile, _) = operation
         .and_then(|operation| operation.resume_destination.clone())
@@ -674,7 +693,7 @@ fn session_top_line(
         .map(|detail| detail.queued_prompts.len())
         .filter(|count| *count > 0)
         .map(|count| format!("[Q {count}]"));
-    let mut columns = vec![target.to_owned()];
+    let mut columns = Vec::new();
     columns.extend(queued);
     columns.extend(status_columns);
     columns.push(profile);
@@ -683,8 +702,16 @@ fn session_top_line(
         session_name(session).to_owned(),
         now_epoch_seconds,
     ));
-    let content = format!("{prefix}{}", columns.join("  "));
-    Line::styled(content, Style::default().fg(session_band_color(detail)))
+    let style = Style::default().fg(session_band_color(detail));
+    let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
+    if let Some(permission) = permission {
+        spans.push(Span::styled("  ", style));
+        spans.push(permission);
+    }
+    if !columns.is_empty() {
+        spans.push(Span::styled(format!("  {}", columns.join("  ")), style));
+    }
+    Line::from(spans).style(style)
 }
 
 fn session_target_label(
@@ -697,6 +724,55 @@ fn session_target_label(
         .map(|(_, target_id)| target_id)
         .unwrap_or(&session.target_template_id);
     session.project_target(config, target_id)
+}
+
+fn session_permission_badge(
+    session: &SessionRecord,
+    operation: Option<&SessionOperationDisplay>,
+    config: &HelConfig,
+) -> Option<Span<'static>> {
+    let target_id = operation
+        .and_then(|operation| operation.resume_destination.as_ref())
+        .map(|(_, target_id)| target_id)
+        .unwrap_or(&session.target_template_id);
+    config
+        .targets
+        .get(target_id)
+        .and_then(|target| permission_badge(target.permission_mode()))
+}
+
+fn permission_badge(mode: Option<PermissionMode>) -> Option<Span<'static>> {
+    mode.map(|mode| match mode {
+        PermissionMode::Guardian => Span::styled(
+            "[G]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        PermissionMode::Yolo => Span::styled(
+            "[Y]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    })
+}
+
+fn capacity_target_labels(target_ids: &[String], config: &HelConfig) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, target_id) in target_ids.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(", "));
+        }
+        spans.push(Span::raw(target_id.clone()));
+        if let Some(badge) = config
+            .targets
+            .get(target_id)
+            .and_then(|target| permission_badge(target.permission_mode()))
+        {
+            spans.push(Span::raw(" "));
+            spans.push(badge);
+        }
+    }
+    Line::from(spans)
 }
 
 fn prefixed_summary_line(
@@ -949,7 +1025,10 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         }
         Row::new([
             Cell::from(detail.target.host.clone()),
-            Cell::from(detail.target.target_ids.join(", ")),
+            Cell::from(capacity_target_labels(
+                &detail.target.target_ids,
+                &dashboard.config,
+            )),
             Cell::from(Line::from(in_use)),
         ])
     });
@@ -1546,7 +1625,7 @@ mod tests {
         };
         assert_eq!(session_band_color(Some(&unread_idle)), Color::LightBlue);
 
-        let collapsed = collapsed_session_line("› ", "podman", Some(&unread_idle), 1, 80);
+        let collapsed = collapsed_session_line("› ", "podman", Some(&unread_idle), 1, 80, None);
         assert_eq!(collapsed.style.fg, Some(Color::LightBlue));
     }
 
@@ -1872,6 +1951,81 @@ mod tests {
             .find(|line| line.contains("Host / fleet") && line.contains("Targets"))
             .expect("capacity header");
         assert!(header.contains("In Use"));
+    }
+
+    #[test]
+    fn dashboard_colors_named_host_permission_badges() {
+        let mut config = config();
+        let container = match config.targets["podman"].clone() {
+            hel::hel_config::TargetTemplate::LocalPodman { container } => container,
+            _ => unreachable!(),
+        };
+        let ssh = |host: &str| hel::hel_config::SshConnection {
+            host: host.into(),
+            user: None,
+            identity_file: None,
+            extra_args: Vec::new(),
+        };
+        config.targets.insert(
+            "precision-3260".into(),
+            hel::hel_config::TargetTemplate::SshBare {
+                ssh: ssh("precision-3260"),
+                permissions: PermissionMode::Yolo,
+                workspace_prefix: ".local/share/hel/workspaces".into(),
+            },
+        );
+        config.targets.insert(
+            "morannon".into(),
+            hel::hel_config::TargetTemplate::SshPodman {
+                ssh: ssh("morannon"),
+                permissions: PermissionMode::Guardian,
+                container,
+            },
+        );
+        let mut session = running_session();
+        session.target_template_id = "precision-3260".into();
+        session.project_directory = Some("/home/dev/hel".into());
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([(session.id.clone(), session)]),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
+        let capacity_target = |id: &str| hel::hel_targets::DeploymentCapacityTarget {
+            id: format!("ssh:{id}"),
+            host: id.into(),
+            target_ids: vec![id.into()],
+            kind: DeploymentCapacityKind::Host,
+            local: false,
+            probes: Vec::new(),
+            probe_error: None,
+        };
+        dashboard.set_deployment_capacity_targets(vec![
+            capacity_target("precision-3260"),
+            capacity_target("morannon"),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let badge_has_color = |needle: &str, color: Color| {
+            lines.iter().enumerate().any(|(row, line)| {
+                let Some(byte) = line.find(needle) else {
+                    return false;
+                };
+                let x = buffer.area.x + line[..byte].chars().count() as u16;
+                (x..x + 3).all(|x| buffer[(x, buffer.area.y + row as u16)].fg == color)
+            })
+        };
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("precision-3260 [Y]"), "{rendered}");
+        assert!(rendered.contains("morannon [G]"), "{rendered}");
+        assert!(badge_has_color("[Y]", Color::Red), "{rendered}");
+        assert!(badge_has_color("[G]", Color::Green), "{rendered}");
     }
 
     fn now_epoch_seconds() -> u64 {

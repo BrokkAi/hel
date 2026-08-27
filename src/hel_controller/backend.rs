@@ -369,14 +369,17 @@ pub(super) fn backend_target(
         TargetTemplate::SshBare {
             ssh,
             workspace_prefix,
+            ..
         } => hel_targets::TargetTemplate::SshBare {
             ssh: backend_ssh(ssh),
             workspace_prefix: workspace_prefix.to_string_lossy().into_owned(),
         },
-        TargetTemplate::SshPodman { ssh, container } => hel_targets::TargetTemplate::SshPodman {
-            ssh: backend_ssh(ssh),
-            container: backend_container(container, allocation, overrides),
-        },
+        TargetTemplate::SshPodman { ssh, container, .. } => {
+            hel_targets::TargetTemplate::SshPodman {
+                ssh: backend_ssh(ssh),
+                container: backend_container(container, allocation, overrides),
+            }
+        }
     })
 }
 
@@ -1225,6 +1228,7 @@ mod tests {
                     "bare".into(),
                     TargetTemplate::SshBare {
                         ssh: ssh("builder"),
+                        permissions: crate::hel_config::PermissionMode::Yolo,
                         workspace_prefix: ".local/share/hel/workspaces".into(),
                     },
                 ),
@@ -1232,6 +1236,7 @@ mod tests {
                     "remote-container".into(),
                     TargetTemplate::SshPodman {
                         ssh: ssh("builder"),
+                        permissions: crate::hel_config::PermissionMode::Yolo,
                         container: container(),
                     },
                 ),
@@ -1239,6 +1244,7 @@ mod tests {
                     "alias".into(),
                     TargetTemplate::SshBare {
                         ssh: ssh("builder-alias"),
+                        permissions: crate::hel_config::PermissionMode::Yolo,
                         workspace_prefix: ".local/share/hel/workspaces".into(),
                     },
                 ),
@@ -1309,6 +1315,7 @@ mod tests {
                 identity_file: None,
                 extra_args: vec![],
             },
+            permissions: crate::hel_config::PermissionMode::Yolo,
             container: ConfigContainer {
                 image: "ubuntu:24.04".into(),
                 pull_policy: Default::default(),

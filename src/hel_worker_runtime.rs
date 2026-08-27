@@ -68,8 +68,8 @@ pub struct WorkerLaunchConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_memory: Option<ProjectMemoryLaunchConfig>,
     /// Target-level policy translated into harness-specific controls by the
-    /// worker. Raw localhost preserves configured approvals; isolated and
-    /// remote targets run unconstrained.
+    /// worker. Raw localhost and guardian SSH targets preserve configured
+    /// approvals; other targets run unconstrained.
     #[serde(
         alias = "force_unrestricted_mode",
         deserialize_with = "deserialize_execution_policy"
