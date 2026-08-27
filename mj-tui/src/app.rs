@@ -4709,6 +4709,9 @@ impl AppState {
             }
             UiEvent::InternalMessage(message) => {
                 let now = Instant::now();
+                let primary_review_notice = message
+                    .is_quick_review_started()
+                    .then(|| message.text.clone());
                 // An internal message starts a fresh orchestrator-initiated
                 // exchange. The previous turn's completion may have been
                 // deliberately withheld (a Findings verdict drops it and lets
@@ -4744,6 +4747,9 @@ impl AppState {
                         // info/warning events, while full nested packets live
                         // only under an explicitly identified actor.
                     }
+                }
+                if let Some(notice) = primary_review_notice {
+                    self.push_system_message(notice);
                 }
             }
             UiEvent::AgentUsage(record) => self.agent_usage.observe(record),
@@ -5177,7 +5183,11 @@ impl AppState {
                     Some(model) => format!("{agent}/{model}"),
                     None => agent.clone(),
                 };
-                if !resumed {
+                if !resumed
+                    && !role
+                        .as_ref()
+                        .is_some_and(crate::workflow::WorkflowActorRole::is_quick_reviewer)
+                {
                     // A retained actor has one identity across ACP turns. Its
                     // later resumes update the durable detail without
                     // manufacturing another permanent "started" record.
@@ -8376,6 +8386,61 @@ mod tests {
     }
 
     #[test]
+    fn quick_review_notice_replaces_the_prompt_derived_start_record() {
+        use crate::workflow::{
+            WorkflowActorId, WorkflowActorRole, WorkflowEvent, WorkflowId, WorkflowKind,
+            WorkflowPhase, WorkflowStage, WorkflowTransition,
+        };
+
+        const BRIEF: &str = "You are the sole reviewer for one completed user turn, in a fresh read-only session: `general` (General). A validator reads your findings afterwards and verifies each against source; findings you cannot support are dropped there.";
+
+        let mut state = AppState::new();
+        let workflow_id = WorkflowId::review(10);
+        state.apply_event(UiEvent::Workflow(WorkflowEvent::new(
+            workflow_id,
+            WorkflowTransition::Started {
+                kind: WorkflowKind::Review,
+                stage: WorkflowStage::new(0, WorkflowPhase::SpecialistReview),
+            },
+        )));
+        state.apply_event(UiEvent::Workflow(WorkflowEvent::new(
+            workflow_id,
+            WorkflowTransition::ActorStarted {
+                actor_id: WorkflowActorId::Subagent(7),
+                role: WorkflowActorRole::SpecialistReviewer {
+                    lane: crate::workflow::QUICK_REVIEWER_LANE_ID.to_string(),
+                },
+            },
+        )));
+        state.apply_event(UiEvent::InternalMessage(
+            InternalMessage::quick_review_started(7),
+        ));
+        state.apply_event(UiEvent::InternalMessage(InternalMessage {
+            source: "primary".to_string(),
+            target: "reviewer general".to_string(),
+            kind: crate::event::InternalMessageKind::Delegation,
+            text: BRIEF.to_string(),
+            owner_subagent_id: Some(7),
+        }));
+        state.apply_event(subagent_started(7, "review · general", "review · general"));
+
+        assert!(
+            state
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, Entry::System(text) if text == crate::event::QUICK_REVIEW_STARTED_NOTICE))
+        );
+        assert!(!state.transcript.iter().any(|entry| matches!(
+            entry,
+            Entry::System(text) if text.starts_with("reviewer general #7 · started")
+        )));
+        assert_eq!(
+            state.nested_agent(7).expect("quick reviewer").objective,
+            BRIEF
+        );
+    }
+
+    #[test]
     fn specialist_report_summary_keeps_the_actor_id() {
         use crate::workflow::{
             WorkflowActorId, WorkflowActorRole, WorkflowEvent, WorkflowId, WorkflowKind,
@@ -8405,6 +8470,10 @@ mod tests {
             "review · Error handling",
             "inspect correctness",
         ));
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            Entry::System(text) if text.starts_with("reviewer Error handling #12 · started")
+        )));
         state.apply_event(UiEvent::Subagent(SubagentEvent::Finished {
             subagent_id: 12,
             outcome: SubagentOutcome::Completed,
