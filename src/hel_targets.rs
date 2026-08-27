@@ -1958,24 +1958,42 @@ fi
 "#;
 
 const HOST_RESOURCE_USAGE_SCRIPT: &str = r#"
+memory_proc_root=${1:-/proc}
 read_cpu() { awk '/^cpu / { total=0; for (i=2; i<=NF; i++) total += $i; print total, $5 + $6 }' /proc/stat; }
 set -- $(read_cpu); total_before=$1; idle_before=$2
 sleep 0.25
 set -- $(read_cpu); total_after=$1; idle_after=$2
 awk -v total="$((total_after - total_before))" -v idle="$((idle_after - idle_before))" \
     'BEGIN { if (total > 0) printf "cpu.percent=%.0f\n", (total - idle) * 100 / total }'
-awk '
+arc_size=0
+arc_min=0
+arcstats="$memory_proc_root/spl/kstat/zfs/arcstats"
+if [ -r "$arcstats" ]; then
+    set -- $(awk '
+        $1 == "c_min" { arc_min = $3 }
+        $1 == "size" { arc_size = $3 }
+        END { printf "%.0f %.0f\n", arc_size, arc_min }
+    ' "$arcstats")
+    arc_size=$1
+    arc_min=$2
+fi
+awk -v arc_size="$arc_size" -v arc_min="$arc_min" '
     /^MemTotal:/ { memory_total = $2 }
     /^MemAvailable:/ { memory_available = $2 }
     /^SwapTotal:/ { swap_total = $2 }
     /^SwapFree:/ { swap_free = $2 }
     END {
-        printf "memory.current=%.0f\n", (memory_total - memory_available) * 1024
-        printf "memory.max=%.0f\n", memory_total * 1024
+        memory_total *= 1024
+        memory_available *= 1024
+        # Like btop, count ARC above its minimum size as reclaimable cache.
+        if (arc_size > arc_min) memory_available += arc_size - arc_min
+        if (memory_available > memory_total) memory_available = memory_total
+        printf "memory.current=%.0f\n", memory_total - memory_available
+        printf "memory.max=%.0f\n", memory_total
         printf "memory.swap.current=%.0f\n", (swap_total - swap_free) * 1024
         printf "memory.swap.max=%.0f\n", swap_total * 1024
     }
-' /proc/meminfo
+' "$memory_proc_root/meminfo"
 printf 'logical.cores=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
 "#;
 
@@ -4405,6 +4423,49 @@ mod tests {
             "the failure must name the path: {}",
             String::from_utf8_lossy(&with_missing.stderr)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_capacity_counts_zfs_arc_above_its_minimum_as_available_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("meminfo"),
+            "MemTotal: 1000 kB\nMemAvailable: 400 kB\nSwapTotal: 10 kB\nSwapFree: 8 kB\n",
+        )
+        .unwrap();
+        let sample = || {
+            ProcessExecutor
+                .execute(
+                    &CommandSpec::new(
+                        "sh",
+                        [
+                            "-c".to_owned(),
+                            HOST_RESOURCE_USAGE_SCRIPT.to_owned(),
+                            "sh".to_owned(),
+                            directory.path().to_string_lossy().into_owned(),
+                        ],
+                    )
+                    .purpose("test host available-memory accounting"),
+                )
+                .unwrap()
+        };
+
+        let without_arc = sample();
+        assert_eq!(without_arc.status, 0);
+        let values = parse_key_values(&without_arc.stdout);
+        assert_eq!(values["memory.current"], "614400");
+        assert_eq!(values["memory.max"], "1024000");
+
+        let arcstats = directory.path().join("spl/kstat/zfs");
+        fs::create_dir_all(&arcstats).unwrap();
+        fs::write(arcstats.join("arcstats"), "c_min 4 102400\nsize 4 409600\n").unwrap();
+
+        let with_arc = sample();
+        assert_eq!(with_arc.status, 0);
+        let values = parse_key_values(&with_arc.stdout);
+        assert_eq!(values["memory.current"], "307200");
+        assert_eq!(values["memory.max"], "1024000");
     }
 
     #[test]
