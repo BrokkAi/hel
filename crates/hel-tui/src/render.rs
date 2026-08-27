@@ -667,50 +667,53 @@ fn session_top_line(
             ),
             _ => (operation.kind.label(), operation.started_at_epoch_seconds),
         };
-        vec![format!(
+        Some(vec![format!(
             "{label} {}",
             format_elapsed(now_epoch_seconds.saturating_sub(started_at))
-        )]
+        )])
     } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
-        vec![format!(
+        Some(vec![format!(
             "Launch {}",
             format_elapsed(now_epoch_seconds.saturating_sub(started_at))
-        )]
-    } else if let Some(turn_started) = detail.and_then(|detail| detail.current_turn_started_at) {
-        let turn = hel::usage_format::format_turn_clock(now_epoch_seconds, Some(turn_started));
-        let step_started = detail
-            .and_then(|detail| detail.last_acp_activity_at_ms)
-            .map(|value| value / 1_000)
-            .unwrap_or(turn_started)
-            .max(turn_started);
-        let step = hel::usage_format::format_turn_clock(now_epoch_seconds, Some(step_started));
-        vec![format!("Turn {turn}"), format!("Step {step}")]
+        )])
     } else {
-        vec!["[idle]".into()]
+        None
     };
-    let queued = detail
-        .map(|detail| detail.queued_prompts.len())
-        .filter(|count| *count > 0)
-        .map(|count| format!("[Q {count}]"));
-    let mut columns = Vec::new();
-    columns.extend(queued);
-    columns.extend(status_columns);
-    columns.push(profile);
-    columns.push(recovery_warning_name(
-        session,
-        session_name(session).to_owned(),
-        now_epoch_seconds,
-    ));
+    let queued_prompts = detail.map_or(0, |detail| detail.queued_prompts.len());
+    let summary = if let Some(status_columns) = status_columns {
+        let mut columns = vec![target.to_owned()];
+        if queued_prompts > 0 {
+            columns.push(format!("[Q {queued_prompts}]"));
+        }
+        columns.extend(status_columns);
+        columns.push(profile.clone());
+        columns.join("  ")
+    } else {
+        hel::usage_format::format_session_summary(
+            target,
+            queued_prompts,
+            now_epoch_seconds,
+            detail.and_then(|detail| detail.current_turn_started_at),
+            detail.and_then(|detail| detail.last_acp_activity_at_ms),
+            &profile,
+        )
+    };
+    let session_name =
+        recovery_warning_name(session, session_name(session).to_owned(), now_epoch_seconds);
+    let summary_tail = summary
+        .strip_prefix(target)
+        .expect("session summary starts with its target");
     let style = Style::default().fg(session_band_color(detail));
     let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
     if let Some(permission) = permission {
         spans.push(Span::styled("  ", style));
         spans.push(permission);
     }
-    if !columns.is_empty() {
-        spans.push(Span::styled(format!("  {}", columns.join("  ")), style));
-    }
+    spans.push(Span::styled(
+        format!("{summary_tail}  {session_name}"),
+        style,
+    ));
     Line::from(spans).style(style)
 }
 

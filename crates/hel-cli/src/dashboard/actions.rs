@@ -355,10 +355,10 @@ pub(crate) async fn apply_dashboard_action(
                 context.critical_operations.clone(),
             );
         }
-        DashboardAction::ForceDestroy { session_id } => {
+        DashboardAction::ForceStop { session_id } => {
             let request = context.begin_lifecycle_operation(
                 &session_id,
-                SessionOperationKind::Destroying,
+                SessionOperationKind::Stopping,
                 true,
             );
             spawn_lifecycle_operation(
@@ -366,34 +366,17 @@ pub(crate) async fn apply_dashboard_action(
                 context.critical_operations.clone(),
                 move |controller, cancelled| {
                     let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.force_destroy(&session_id, &executor)?;
-                    Ok(LifecycleSuccess::Destroyed)
+                    controller.force_stop(&session_id, &executor)?;
+                    Ok(LifecycleSuccess::ForceStopped)
                 },
             );
         }
-        DashboardAction::DeleteActive { session_id } => {
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Deleting,
-                true,
-            );
-            spawn_lifecycle_operation(
-                request,
-                context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.force_destroy(&session_id, &executor)?;
-                    controller.delete_session_controlled(&session_id, &executor)?;
-                    Ok(LifecycleSuccess::DeletedActive)
-                },
-            );
-        }
-        DashboardAction::DeleteStopped { session_id } => {
+        DashboardAction::DestroyStopped { session_id } => {
             // A stopped session has no worker, so nothing is copying it and
             // no recovery reservation is needed.
             let request = context.begin_lifecycle_operation(
                 &session_id,
-                SessionOperationKind::Deleting,
+                SessionOperationKind::Destroying,
                 false,
             );
             spawn_lifecycle_operation(
@@ -404,8 +387,8 @@ pub(crate) async fn apply_dashboard_action(
                         bail!("operation cancelled");
                     }
                     let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.delete_session_controlled(&session_id, &executor)?;
-                    Ok(LifecycleSuccess::DeletedStopped)
+                    controller.destroy_session_controlled(&session_id, &executor)?;
+                    Ok(LifecycleSuccess::DestroyedStopped)
                 },
             );
         }

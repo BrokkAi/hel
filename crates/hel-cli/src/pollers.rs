@@ -1423,9 +1423,8 @@ pub(crate) enum LifecycleSuccess {
         materialized: Box<MaterializedSession>,
     },
     Closed,
-    Destroyed,
-    DeletedActive,
-    DeletedStopped,
+    ForceStopped,
+    DestroyedStopped,
 }
 
 pub(crate) struct LifecycleUpdate {

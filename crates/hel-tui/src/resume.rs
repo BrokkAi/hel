@@ -601,7 +601,7 @@ impl DashboardState {
                 };
                 let Some(session_id) = row.session_id().map(ToOwned::to_owned) else {
                     self.notices.set(
-                        "Hel never deletes a harness's own session. Press a to archive this row.",
+                        "Hel never destroys a harness's own session. Press a to archive this row.",
                     );
                     return DashboardAction::None;
                 };
@@ -611,7 +611,7 @@ impl DashboardState {
                 else {
                     return DashboardAction::None;
                 };
-                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteStopped {
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DestroyStopped {
                     session_id,
                     reopen: Some(Box::new(dialog)),
                 }));
@@ -673,7 +673,7 @@ impl DashboardState {
         };
         if let Some(reason) = row.status.explanation() {
             self.notices.set(format!(
-                "This session was {reason}. Press d to delete its record."
+                "This session was {reason}. Press d to destroy its record."
             ));
             return DashboardAction::None;
         }
@@ -873,7 +873,7 @@ pub(crate) fn render_resume_dialog(
         ));
     }
     footer.push(Line::styled(
-        "Enter resumes or imports · a archives · d deletes · s shows archived · / searches · Tab moves",
+        "Enter resumes or imports · a archives · d destroys · s shows archived · / searches · Tab moves",
         Style::default().fg(Color::DarkGray),
     ));
     footer.push(action_buttons(&[
@@ -1446,16 +1446,16 @@ mod tests {
             assert!(matches!(dashboard.mode, Mode::ResumeDialog(_)));
             let notice = dashboard.notices.current().unwrap_or_default();
             assert!(notice.contains(reason), "{notice}");
-            assert!(notice.contains("delete its record"), "{notice}");
+            assert!(notice.contains("destroy its record"), "{notice}");
 
             dashboard.handle_key(key(KeyCode::Char('d')));
             assert!(matches!(dashboard.mode, Mode::Confirm(_)));
         }
     }
 
-    /// Hel never modifies a harness home, so a native-only row has no delete.
+    /// Hel never modifies a harness home, so a native-only row has no destroy action.
     #[test]
-    fn a_native_only_row_cannot_be_deleted_from_hel() {
+    fn a_native_only_row_cannot_be_destroyed_from_hel() {
         let mut dashboard = DashboardState::new(config(), state_with(Vec::new()), BTreeMap::new());
         dashboard.show_resume_dialog(
             1,
@@ -1476,7 +1476,7 @@ mod tests {
                 .notices
                 .current()
                 .unwrap_or_default()
-                .contains("never deletes")
+                .contains("never destroys")
         );
     }
 
@@ -1906,7 +1906,7 @@ mod tests {
             .draw(|frame| crate::render::render(frame, &mut dashboard))
             .expect("draw the resume dialog");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        for hint in ["a archives", "d deletes", "s shows archived", "/ searches"] {
+        for hint in ["a archives", "d destroys", "s shows archived", "/ searches"] {
             assert!(rendered.contains(hint), "{rendered}");
         }
     }

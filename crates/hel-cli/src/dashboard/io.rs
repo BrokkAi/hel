@@ -1423,16 +1423,12 @@ impl DashboardContext {
                 self.dashboard
                     .set_notice(format!("Stopped {}", short_id(&session_id)));
             }
-            Ok(LifecycleSuccess::Destroyed) => self.dashboard.set_notice(format!(
-                "Destroyed {} without an archive",
+            Ok(LifecycleSuccess::ForceStopped) => self.dashboard.set_notice(format!(
+                "Force-stopped {} at its latest recovery archive",
                 short_id(&session_id)
             )),
-            Ok(LifecycleSuccess::DeletedActive) => self.dashboard.set_notice(format!(
-                "Deleted active session {} without checkpointing",
-                short_id(&session_id)
-            )),
-            Ok(LifecycleSuccess::DeletedStopped) => self.dashboard.set_notice(format!(
-                "Permanently deleted stopped session {}",
+            Ok(LifecycleSuccess::DestroyedStopped) => self.dashboard.set_notice(format!(
+                "Permanently destroyed stopped session {}",
                 short_id(&session_id)
             )),
             Err(error) => {

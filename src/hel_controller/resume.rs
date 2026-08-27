@@ -35,8 +35,8 @@ use super::worker_binary::{start_worker, worker_probe_diagnosis};
 use super::worktree::{
     PrimaryCheckoutRequirement, ResumeConversion, ResumePlan, apply_raw_to_workspace,
     apply_workspace_to_raw, cleanup_managed_worktree, create_managed_worktree,
-    plan_raw_to_workspace, raw_checkout_divergence_notice, raw_checkout_position,
-    resume_compatibility, retire_managed_worktree,
+    managed_worktree_checkout_exists, plan_raw_to_workspace, raw_checkout_divergence_notice,
+    raw_checkout_position, restore_managed_worktree, resume_compatibility, retire_managed_worktree,
 };
 use super::{Controller, SessionResumeOptions, execute_checked, now, target_profile_home};
 
@@ -649,6 +649,7 @@ impl Controller {
         let plan = resume_compatibility(&previous, &self.config, target_id)
             .map_err(|reason| anyhow::anyhow!("{reason}"))?;
         if plan == ResumePlan::InPlace
+            && previous.managed_worktree.is_none()
             && let Some(project_directory) = &previous.project_directory
         {
             self.validate_project_directory(target_id, project_directory, executor)
@@ -719,9 +720,15 @@ impl Controller {
                 conversion.worktree.branch,
             ));
         }
-        // The live checkout, not the archive, is the truth for a raw session.
-        // Say so in the conversation when the two disagree; never reconcile.
-        if let Some(project_directory) = &previous.project_directory {
+        let managed_checkout_present = previous
+            .managed_worktree
+            .as_ref()
+            .map(|worktree| managed_worktree_checkout_exists(executor, worktree))
+            .transpose()?
+            .unwrap_or(true);
+        // A checkout Hel did not retire remains the truth for a raw session.
+        // A retired checkout is recreated from the branch and archive below.
+        if managed_checkout_present && let Some(project_directory) = &previous.project_directory {
             match raw_checkout_position(&previous, &self.config, project_directory, executor) {
                 Ok(live) => resume_notices.extend(raw_checkout_divergence_notice(
                     project_directory,
@@ -835,7 +842,20 @@ impl Controller {
         // directories and the harness session id, so it writes the whole row.
         crate::hel_database::save_session(&self.state.sessions[session_id])?;
 
+        let mut recreated_managed_worktree = false;
         let result = async {
+            if let Some(worktree) = previous.managed_worktree.as_ref() {
+                recreated_managed_worktree = restore_managed_worktree(executor, worktree)?;
+                if recreated_managed_worktree && plan == ResumePlan::RawToWorkspace {
+                    crate::hel_checkpoint::restore_single_repository_onto_branch(
+                        &checkpoint.archive_path,
+                        &worktree.worktree_root,
+                        &worktree.branch,
+                        &SystemGit,
+                    )
+                    .context("restore the retired checkout before moving it into a target")?;
+                }
+            }
             // The record already names the worktree, so a failure here rolls
             // back through the same path that cleans up a new session's.
             if let Some(conversion) =
@@ -900,8 +920,11 @@ impl Controller {
                 relay_root: target_path(&worker_root),
                 harness_home: target_path(&harness_home),
                 // A converted session's repository arrives as a seed from its
-                // own checkout, not from the archive's metadata-only capture.
-                restore_repositories: resumed_project_directory.is_none() && conversion.is_none(),
+                // own checkout. An in-place managed checkout recreated from
+                // its retained branch still needs the archive's dirty state.
+                restore_repositories: (resumed_project_directory.is_none()
+                    && conversion.is_none())
+                    || (recreated_managed_worktree && plan == ResumePlan::InPlace),
                 restore_native: same_harness,
                 // A conversion puts the checkout somewhere the archive could
                 // not have named, so the restored harness session is pointed at
@@ -1167,7 +1190,13 @@ impl Controller {
                         "could not restore queued prompts after resume failed"
                     );
                 }
-                Err(self.rollback_failed_resume(session_id, &previous, error, executor)?)
+                Err(self.rollback_failed_resume(
+                    session_id,
+                    &previous,
+                    recreated_managed_worktree,
+                    error,
+                    executor,
+                )?)
             }
         }
     }
@@ -1176,6 +1205,7 @@ impl Controller {
         &mut self,
         session_id: &str,
         previous: &SessionRecord,
+        recreated_managed_worktree: bool,
         error: anyhow::Error,
         _executor: &impl CommandExecutor,
     ) -> Result<anyhow::Error> {
@@ -1202,6 +1232,10 @@ impl Controller {
             current.managed_worktree.as_ref(),
             previous.managed_worktree.as_ref(),
         ) {
+            (_, Some(previous)) if recreated_managed_worktree => retire_managed_worktree(
+                &CancellableProcessExecutor::with_timeout(Duration::from_secs(15)),
+                previous,
+            ),
             (Some(current), Some(previous)) if current == previous => Ok(()),
             (Some(worktree), _) => cleanup_managed_worktree(
                 &CancellableProcessExecutor::with_timeout(Duration::from_secs(15)),
@@ -1381,6 +1415,7 @@ mod tests {
     use super::*;
 
     const RESUME_ROLLBACK_TEST_CHILD: &str = "HEL_RESUME_ROLLBACK_TEST_CHILD";
+    const RETIRED_WORKTREE_RESUME_TEST_CHILD: &str = "HEL_RETIRED_WORKTREE_RESUME_TEST_CHILD";
 
     #[test]
     fn raw_in_place_preflight_does_not_require_its_synthetic_bundle() {
@@ -2224,6 +2259,119 @@ mod tests {
             crate::hel_database::load_materialized_session(session_id).unwrap(),
             Some(expected_projection)
         );
+    }
+    #[test]
+    fn failed_resume_retires_a_checkout_it_recreated() {
+        if std::env::var_os(RETIRED_WORKTREE_RESUME_TEST_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let test_name = format!(
+                "{}::failed_resume_retires_a_checkout_it_recreated",
+                module_path!()
+                    .strip_prefix("hel::")
+                    .unwrap_or(module_path!())
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(RETIRED_WORKTREE_RESUME_TEST_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path().join("data"))
+                .env("HEL_CONFIG_DIR", directory.path().join("config"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated retired-worktree resume test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct FailAfterWorktreeRestore;
+
+        impl CommandExecutor for FailAfterWorktreeRestore {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                if matches!(command.program.as_str(), "git" | "mkdir") {
+                    return ProcessExecutor.execute(command);
+                }
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: Vec::new(),
+                    stderr: b"stop after recreating the checkout".to_vec(),
+                })
+            }
+        }
+
+        let data_directory = PathBuf::from(std::env::var_os("HEL_DATA_DIR").unwrap());
+        let archive_directory = data_directory.join("archives");
+        std::fs::create_dir_all(&archive_directory).unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(&archive_directory, session_id, 7);
+        let repository = committed_repository();
+        let mut session = managed_worktree_session(repository.path(), session_id);
+        session.checkpoint = Some(checkpoint);
+        let worktree = session.managed_worktree.clone().unwrap();
+        retire_managed_worktree(&ProcessExecutor, &worktree).unwrap();
+        assert!(!worktree.worktree_root.exists());
+
+        let profile_home = data_directory.join("profile");
+        std::fs::create_dir_all(&profile_home).unwrap();
+        let mut config = resume_compatibility_config();
+        config.profiles.insert(
+            "codex".into(),
+            HarnessProfile {
+                kind: crate::hel_config::HarnessKind::Codex,
+                home: profile_home,
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        );
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+        crate::hel_database::save_state(&controller.state).unwrap();
+
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(controller.resume_session_controlled(
+                session_id,
+                "codex",
+                "local-bare",
+                SessionResumeOptions {
+                    additional_mounts: None,
+                    resource_allocation: None,
+                    discard_queue: false,
+                },
+                &FailAfterWorktreeRestore,
+            ))
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("stop after recreating the checkout"),
+            "{error:#}"
+        );
+        assert!(!worktree.worktree_root.exists());
+        assert_eq!(
+            controller.state.sessions[session_id].state,
+            SessionState::Stopped
+        );
+        let branch = Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args([
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", worktree.branch),
+            ])
+            .status()
+            .unwrap();
+        assert!(branch.success(), "resume rollback must retain the branch");
     }
     const RAW_CONVERSION_TEST_CHILD: &str = "HEL_RAW_CONVERSION_TEST_CHILD";
     #[test]
