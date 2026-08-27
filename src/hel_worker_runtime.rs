@@ -132,6 +132,7 @@ impl ProjectMemoryMcpDelivery {
 }
 
 impl WorkerLaunchConfig {
+    #[cfg(unix)]
     fn enforce_execution_policy(&mut self) {
         self.harness
             .configure_execution_environment(self.execution_policy, &mut self.environment);
