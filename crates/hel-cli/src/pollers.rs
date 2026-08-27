@@ -444,7 +444,7 @@ pub(crate) fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPol
         .state
         .sessions
         .values()
-        .filter(|session| session.state.is_active() && session.target.is_some())
+        .filter(|session| session_target_is_pollable(session))
         .filter_map(|session| {
             let spec = match controller.reconnect_command(&session.id) {
                 Ok(spec) => spec,
@@ -750,7 +750,7 @@ fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget
         .state
         .sessions
         .values()
-        .filter(|session| session.state.is_active() && session.target.is_some())
+        .filter(|session| session_target_is_pollable(session))
         .filter_map(|session| {
             match controller.resource_probe(&session.id) {
                 Ok(probe) => Some(ResourcePollTarget {
@@ -764,6 +764,14 @@ fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget
             }
         })
         .collect()
+}
+
+/// `is_active` means visible on the active dashboard, not necessarily backed
+/// by a live target. A recoverable error stays visible so the user can resume
+/// its checkpoint, but its failed target must not keep reconnecting or being
+/// sampled.
+fn session_target_is_pollable(session: &hel::hel_state::SessionRecord) -> bool {
+    session.state.is_active() && session.state != SessionState::Error && session.target.is_some()
 }
 
 pub(crate) fn refresh_dashboard_poll_targets(
@@ -1525,6 +1533,72 @@ pub(crate) fn reserve_recovery_or_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn podman_controller(state: SessionState) -> Controller {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "podman".into(),
+            hel::hel_config::TargetTemplate::LocalPodman {
+                container: hel::hel_config::ContainerTemplate {
+                    image: "ubuntu:24.04".into(),
+                    pull_policy: Default::default(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: std::collections::BTreeMap::new(),
+                },
+            },
+        );
+        let mut hel_state = HelState::default();
+        hel_state.sessions.insert(
+            session_id.into(),
+            hel::hel_state::SessionRecord {
+                archived: false,
+                container_cpus: None,
+                container_memory: None,
+                id: session_id.into(),
+                title: "poll target".into(),
+                harness_kind: hel::hel_config::HarnessKind::Codex,
+                last_profile: "codex".into(),
+                bundle_id: "project".into(),
+                project_directory: None,
+                managed_worktree: None,
+                target_template_id: "podman".into(),
+                resource_allocation: None,
+                additional_mounts: Vec::new(),
+                state,
+                target: Some(hel::hel_state::TargetLocator::LocalPodman {
+                    container_id: "a".repeat(64),
+                }),
+                native_session_id: None,
+                acp_session_title: None,
+                session_title_override: None,
+                created_at: "2026-08-27T00:00:00Z".into(),
+                updated_at: "2026-08-27T00:00:00Z".into(),
+                viewed_through_event_ordinal: 0,
+                draft_input: String::new(),
+                last_error: None,
+                last_checkpoint_error: None,
+                checkpoint: None,
+            },
+        );
+        Controller {
+            config,
+            state: hel_state,
+        }
+    }
+
+    #[test]
+    fn recoverable_error_session_stays_out_of_live_target_pollers() {
+        let running = podman_controller(SessionState::Running);
+        assert_eq!(dashboard_worker_targets(&running).len(), 1);
+        assert_eq!(dashboard_resource_targets(&running).len(), 1);
+
+        let recoverable_error = podman_controller(SessionState::Error);
+        assert!(dashboard_worker_targets(&recoverable_error).is_empty());
+        assert!(dashboard_resource_targets(&recoverable_error).is_empty());
+    }
 
     #[test]
     fn worker_diagnosis_is_coalesced_for_one_unreachable_episode() {
