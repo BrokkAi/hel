@@ -3174,7 +3174,7 @@ mod tests {
 
     #[test]
     fn correction_round_default_follows_review_tier_and_explicit_override_wins() {
-        assert_eq!(effective_max_correction_rounds(None, ReviewTier::Quick), 0);
+        assert_eq!(effective_max_correction_rounds(None, ReviewTier::Quick), 1);
         assert_eq!(
             effective_max_correction_rounds(None, ReviewTier::Extended),
             1
@@ -3185,6 +3185,10 @@ mod tests {
         );
         assert_eq!(
             effective_max_correction_rounds(Some(0), ReviewTier::Extended),
+            0
+        );
+        assert_eq!(
+            effective_max_correction_rounds(Some(0), ReviewTier::Quick),
             0
         );
     }
@@ -3859,7 +3863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quick_review_releases_changed_correction_without_another_review_pass() {
+    async fn quick_review_verifies_a_changed_correction_by_default() {
         let temp = tempfile::tempdir().expect("tempdir");
         let snapshot = changed_workspace(temp.path()).await;
         let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
@@ -3867,12 +3871,16 @@ mod tests {
         let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawned_passes = Arc::clone(&passes);
         let spawner = ReviewSpawner::stub(move |job, _events, _cancel, outcomes| {
-            spawned_passes.fetch_add(1, Ordering::SeqCst);
+            let pass = spawned_passes.fetch_add(1, Ordering::SeqCst);
             let _ = outcomes.send(ReviewOutcome {
                 epoch: job.epoch,
-                verdict: ReviewVerdict::Findings {
-                    synthesis: "[P1] tracked.txt:1 -- correct this".to_string(),
-                    evidence: ReviewPassEvidence::default(),
+                verdict: if pass == 0 {
+                    ReviewVerdict::Findings {
+                        synthesis: "[P1] tracked.txt:1 -- correct this".to_string(),
+                        evidence: ReviewPassEvidence::default(),
+                    }
+                } else {
+                    ReviewVerdict::Clean
                 },
             });
         });
@@ -3887,10 +3895,7 @@ mod tests {
         runtime_tx.send(completion()).expect("send completion");
 
         let corrective = next_prompt(&mut command_rx).await;
-        assert!(corrective.contains("no further automated review follows"));
-        // Changing the live setting affects later review dispatches, not the
-        // correction contract already presented to the primary.
-        running.handle.set_review_tier(ReviewTier::Extended);
+        assert!(corrective.contains("A bounded verification pass will re-check"));
         std::fs::write(temp.path().join("tracked.txt"), "corrected change\n")
             .expect("write correction");
         runtime_tx
@@ -3899,7 +3904,7 @@ mod tests {
 
         let recap = next_prompt(&mut command_rx).await;
         assert!(recap.contains("the original work completed"));
-        assert_eq!(passes.load(Ordering::SeqCst), 1);
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
         runtime_tx.send(completion()).expect("complete final recap");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -3907,7 +3912,7 @@ mod tests {
         loop {
             let event = tokio::time::timeout_at(deadline, running.events.recv())
                 .await
-                .expect("quick correction released completion")
+                .expect("quick correction verification released completion")
                 .expect("orchestrated event");
             if matches!(&event, UiEvent::Info(text) if text.contains("correction round limit reached"))
             {
@@ -3919,7 +3924,7 @@ mod tests {
         }
         assert!(
             !cap_announced,
-            "Quick's normal single-pass completion must not report an exhausted budget"
+            "Quick's clean verification must not report an exhausted budget"
         );
         assert!(command_rx.try_recv().is_err());
 
