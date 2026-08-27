@@ -1152,7 +1152,7 @@ pub(crate) fn apply_worker_poll_update(
         Some(ViewError::TargetMissing(detail)) => {
             dashboard.mark_transcript_unavailable(&update.session_id);
             dashboard.set_notice(format!(
-                "Session {}: {detail}; recording the session as lost…",
+                "Session {}: {detail}; recording the missing target…",
                 &update.session_id[..update.session_id.len().min(8)]
             ));
             if controller
@@ -1171,7 +1171,7 @@ pub(crate) fn apply_worker_poll_update(
             {
                 spawn_worker_record_persistence(
                     update.session_id.clone(),
-                    WorkerRecordPersistence::TargetLost {
+                    WorkerRecordPersistence::TargetMissing {
                         session_id: update.session_id.clone(),
                         detail,
                         updated_at: chrono::Utc::now()
@@ -1244,15 +1244,23 @@ pub(crate) fn apply_worker_record_update(
     Ok(changed)
 }
 
+#[derive(Debug)]
 pub(crate) enum WorkerRecordPersistence {
     AcpTitle {
         title: Option<String>,
     },
-    TargetLost {
+    TargetMissing {
         session_id: String,
         detail: String,
         updated_at: String,
     },
+}
+
+#[derive(Debug)]
+pub(crate) enum WorkerRecordPersistenceOutcome {
+    Saved,
+    TargetMissing(SessionState),
+    Unchanged,
 }
 
 fn spawn_worker_record_persistence(
@@ -1261,21 +1269,28 @@ fn spawn_worker_record_persistence(
     updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
     tracker: crate::dashboard::CriticalOperationTracker,
 ) {
-    let guard = tracker.begin(format!(
-        "saving agent title for {}",
-        crate::short_id(&session_id)
-    ));
+    let label = match &operation {
+        WorkerRecordPersistence::AcpTitle { .. } => "saving agent title for",
+        WorkerRecordPersistence::TargetMissing { .. } => "saving missing target for",
+    };
+    let guard = tracker.begin(format!("{label} {}", crate::short_id(&session_id)));
     tokio::task::spawn_blocking(move || {
         let result = match &operation {
             WorkerRecordPersistence::AcpTitle { title } => {
                 hel::hel_database::set_session_acp_title(&session_id, title.as_deref())
-                    .map(|()| true)
+                    .map(|()| WorkerRecordPersistenceOutcome::Saved)
             }
-            WorkerRecordPersistence::TargetLost {
+            WorkerRecordPersistence::TargetMissing {
                 session_id,
                 detail,
                 updated_at,
-            } => hel::hel_database::mark_session_target_lost(session_id, detail, updated_at),
+            } => hel::hel_database::mark_session_target_missing(session_id, detail, updated_at)
+                .map(|state| {
+                    state.map_or(
+                        WorkerRecordPersistenceOutcome::Unchanged,
+                        WorkerRecordPersistenceOutcome::TargetMissing,
+                    )
+                }),
         }
         .map_err(|error| format!("{error:#}"));
         if let Err(error) =

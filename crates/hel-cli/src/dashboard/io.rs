@@ -34,7 +34,8 @@ use tokio::task::JoinHandle;
 use crate::dashboard::{CriticalOperationTracker, DashboardContext};
 use crate::import::{DashboardImportSuccess, PendingDashboardImport, persist_imported_session};
 use crate::pollers::{
-    LifecycleSuccess, LifecycleUpdate, WorkerRecordPersistence, reserve_recovery_or_cancel,
+    LifecycleSuccess, LifecycleUpdate, WorkerRecordPersistence, WorkerRecordPersistenceOutcome,
+    reserve_recovery_or_cancel,
 };
 use crate::short_id;
 
@@ -42,7 +43,7 @@ use crate::short_id;
 pub(crate) enum DashboardIoUpdate {
     WorkerRecordPersistence {
         operation: WorkerRecordPersistence,
-        result: std::result::Result<bool, String>,
+        result: std::result::Result<WorkerRecordPersistenceOutcome, String>,
     },
     MaterializedSessionProjection {
         session_id: String,
@@ -976,19 +977,13 @@ impl DashboardContext {
                         .dashboard
                         .set_notice(format!("Could not save harness title: {error}")),
                     (
-                        WorkerRecordPersistence::TargetLost {
+                        WorkerRecordPersistence::TargetMissing {
                             session_id,
                             detail,
                             updated_at,
                         },
-                        Ok(true),
+                        Ok(WorkerRecordPersistenceOutcome::TargetMissing(state)),
                     ) => {
-                        let checkpoint_available = self
-                            .controller
-                            .state
-                            .sessions
-                            .get(&session_id)
-                            .is_some_and(|session| session.checkpoint.is_some());
                         if let Some(session) = self.controller.state.sessions.get_mut(&session_id)
                             && matches!(
                                 session.state,
@@ -998,31 +993,43 @@ impl DashboardContext {
                                     | SessionState::Error
                             )
                         {
-                            session.state = SessionState::Lost;
+                            session.state = state;
                             session.last_error = Some(detail);
                             session.updated_at = updated_at;
                             self.dashboard.set_state(self.controller.state.clone());
                             self.drop_warm_chat_for(&session_id);
                             self.refresh_poll_targets();
-                            let recovery = if checkpoint_available {
-                                "; its last verified checkpoint remains available from Resume"
-                            } else {
-                                ""
+                            let notice = match state {
+                                SessionState::Error => format!(
+                                    "Session {} cannot reach its managed target; its last verified checkpoint is ready to resume",
+                                    short_id(&session_id)
+                                ),
+                                SessionState::Lost => format!(
+                                    "Session {} is lost because its managed target no longer exists",
+                                    short_id(&session_id)
+                                ),
+                                _ => unreachable!("a missing target persisted as {state:?}"),
                             };
-                            self.dashboard.set_notice(format!(
-                                "Session {} is lost because its managed target no longer exists{recovery}",
-                                short_id(&session_id)
-                            ));
+                            self.dashboard.set_notice(notice);
                         }
                     }
-                    (WorkerRecordPersistence::TargetLost { session_id, .. }, Err(error)) => {
+                    (WorkerRecordPersistence::TargetMissing { session_id, .. }, Err(error)) => {
                         self.dashboard.set_notice(format!(
                             "Could not record missing target for {}: {error}",
                             short_id(&session_id)
                         ))
                     }
-                    (WorkerRecordPersistence::AcpTitle { .. }, Ok(_))
-                    | (WorkerRecordPersistence::TargetLost { .. }, Ok(false)) => {}
+                    (
+                        WorkerRecordPersistence::AcpTitle { .. },
+                        Ok(WorkerRecordPersistenceOutcome::Saved),
+                    )
+                    | (
+                        WorkerRecordPersistence::TargetMissing { .. },
+                        Ok(WorkerRecordPersistenceOutcome::Unchanged),
+                    ) => {}
+                    (operation, Ok(outcome)) => {
+                        unreachable!("persistence operation {operation:?} returned {outcome:?}")
+                    }
                 }
             }
             DashboardIoUpdate::LifecycleStage { session_id, stage } => {
