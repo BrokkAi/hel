@@ -23,8 +23,8 @@ use hel::hel_credentials::{
 use hel::hel_quota::{QuotaManager, QuotaRefreshOutcome, QuotaRefreshRequest};
 use hel::hel_recovery::{RecoveryCoordinator, RecoveryResult};
 use hel::hel_session_manager::{
-    RelaySessionTarget, SessionManagerControl, SessionManagerUpdate, SessionManagerUpdates,
-    ViewError, spawn_session_manager,
+    RelaySessionTarget, SessionManagerControl, SessionManagerShutdown, SessionManagerUpdate,
+    SessionManagerUpdates, ViewError, spawn_session_manager,
 };
 use hel::hel_state::{
     HelState, MaterializedSession, SessionResourceAllocation, SessionState, normalize_session_title,
@@ -1126,9 +1126,15 @@ pub(crate) fn spawn_dashboard_worker_poller() -> Result<(
     tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
     SessionManagerUpdates,
     SessionManagerControl,
+    SessionManagerShutdown,
 )> {
     let channels = spawn_session_manager()?;
-    Ok((channels.targets, channels.updates, channels.control))
+    Ok((
+        channels.targets,
+        channels.updates,
+        channels.control,
+        channels.shutdown,
+    ))
 }
 
 pub(crate) fn apply_worker_poll_update(

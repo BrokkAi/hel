@@ -302,7 +302,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
     let (receipt_tx, mut receipt_rx) = tokio::sync::mpsc::channel(32);
-    let (worker_targets_tx, mut worker_updates_rx, worker_commands_tx) =
+    let (worker_targets_tx, mut worker_updates_rx, worker_commands_tx, worker_shutdown) =
         spawn_dashboard_worker_poller()?;
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
     let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn(worker_commands_tx.clone());
@@ -811,10 +811,15 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
             None => Ok::<(), anyhow::Error>(()),
         }
     };
-    tokio::select! {
+    let result = tokio::select! {
         result = serve => result,
         result = control => result,
-    }?;
+    };
+    worker_shutdown
+        .shutdown()
+        .await
+        .context("shut down phone server session manager")?;
+    result?;
     Ok(())
 }
 

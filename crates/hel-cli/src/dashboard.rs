@@ -19,13 +19,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event};
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
 use hel::hel_credentials::CredentialSyncHandle;
 use hel::hel_recovery::RecoveryCoordinator;
-use hel::hel_session_manager::{SessionManagerControl, SessionManagerUpdates, ViewError};
+use hel::hel_session_manager::{
+    SessionManagerControl, SessionManagerShutdown, SessionManagerUpdates, ViewError,
+};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
 use hel::hel_state::{
     MaterializedSession, RecoveryObserver, SessionResourceAllocation, SessionState,
@@ -253,6 +255,7 @@ pub(crate) struct DashboardContext {
     worker_targets_tx: watch::Sender<Vec<WorkerPollTarget>>,
     worker: Feed<SessionManagerUpdates>,
     pub(crate) worker_commands_tx: SessionManagerControl,
+    worker_shutdown: Option<SessionManagerShutdown>,
     worker_diagnoses: WorkerDiagnosisTracker,
 
     recovery: Feed<RecoveryCoordinator>,
@@ -512,6 +515,12 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
     // the background feeds are torn down after, as the rest of the context
     // drops.
     drop(context.terminal);
+    if let Some(shutdown) = context.worker_shutdown.take() {
+        shutdown
+            .shutdown()
+            .await
+            .context("shut down dashboard session manager")?;
+    }
     Ok(if quit_detached {
         DashboardExit::Detached
     } else if context.shutdown_requested {
@@ -659,7 +668,7 @@ impl DashboardContext {
         }
 
         let (quota_profiles_tx, quota_updates_rx) = spawn_quota_refresher();
-        let (worker_targets_tx, worker_updates_rx, worker_commands_tx) =
+        let (worker_targets_tx, worker_updates_rx, worker_commands_tx, worker_shutdown) =
             spawn_dashboard_worker_poller()?;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
         let recovery = RecoveryCoordinator::spawn(worker_commands_tx.clone());
@@ -740,6 +749,7 @@ impl DashboardContext {
             worker_targets_tx,
             worker: Feed::new(worker_updates_rx),
             worker_commands_tx,
+            worker_shutdown: Some(worker_shutdown),
             worker_diagnoses: WorkerDiagnosisTracker::default(),
             recovery: Feed::new(recovery),
             recovery_observer,

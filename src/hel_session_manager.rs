@@ -36,6 +36,7 @@ const RECONNECT_BACKOFF_CEILING: Duration = Duration::from_secs(30);
 const UNREACHABLE_FAILURE_THRESHOLD: u32 = 2;
 const WORKER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
+const SESSION_MANAGER_SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 
 /// Delay before the next reconnect attempt after `failures` consecutive
 /// failures. Doubles from `RECONNECT_INTERVAL` up to the ceiling.
@@ -251,6 +252,40 @@ pub struct SessionManagerChannels {
     pub targets: watch::Sender<Vec<RelaySessionTarget>>,
     pub control: SessionManagerControl,
     pub updates: SessionManagerUpdates,
+    pub shutdown: SessionManagerShutdown,
+}
+
+/// Exclusive owner of the manager task and every relay actor below it.
+///
+/// Long-running control surfaces explicitly await [`Self::shutdown`] before
+/// their Tokio runtime goes away. Drop remains an aborting fallback for tests
+/// and early-return paths that cannot await.
+pub struct SessionManagerShutdown {
+    signal: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SessionManagerShutdown {
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.await.context("session manager shutdown task failed")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SessionManagerShutdown {
+    fn drop(&mut self) {
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -825,17 +860,16 @@ pub fn spawn_session_manager() -> Result<SessionManagerChannels> {
     let (targets_tx, mut targets_rx) = watch::channel(Vec::<RelaySessionTarget>::new());
     let (commands_tx, mut commands_rx) = mpsc::channel(32);
     let (updates_tx, updates_rx) = coalesced_update_channel();
-    tokio::spawn(async move {
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
         let mut actors = BTreeMap::<String, ActorRegistration>::new();
         let mut tasks = tokio::task::JoinSet::<String>::new();
         let mut desired_targets = BTreeMap::<String, RelaySessionTarget>::new();
         loop {
             tokio::select! {
+                _ = &mut shutdown_rx => break,
                 changed = targets_rx.changed() => {
                     if changed.is_err() {
-                        for (_, actor) in actors {
-                            actor.abort.abort();
-                        }
                         break;
                     }
                     desired_targets = target_map(&targets_rx.borrow_and_update());
@@ -848,9 +882,6 @@ pub fn spawn_session_manager() -> Result<SessionManagerChannels> {
                 }
                 command = commands_rx.recv() => {
                     let Some(ManagerCommand::Session { session_id, reply }) = command else {
-                        for (_, actor) in actors {
-                            actor.abort.abort();
-                        }
                         break;
                     };
                     let handle = actors
@@ -925,6 +956,7 @@ pub fn spawn_session_manager() -> Result<SessionManagerChannels> {
                 }
             }
         }
+        shutdown_session_actors(&mut actors, &mut tasks).await;
     });
     Ok(SessionManagerChannels {
         targets: targets_tx,
@@ -932,7 +964,52 @@ pub fn spawn_session_manager() -> Result<SessionManagerChannels> {
             commands: commands_tx,
         },
         updates: updates_rx,
+        shutdown: SessionManagerShutdown {
+            signal: Some(shutdown_tx),
+            task: Some(task),
+        },
     })
+}
+
+async fn shutdown_session_actors(
+    actors: &mut BTreeMap<String, ActorRegistration>,
+    tasks: &mut tokio::task::JoinSet<String>,
+) {
+    for actor in actors.values() {
+        actor.retirement.send_replace(true);
+    }
+    actors.clear();
+
+    let graceful = async {
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(_) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    tracing::error!(%error, "session relay actor failed during shutdown");
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(SESSION_MANAGER_SHUTDOWN_GRACE, graceful)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    tracing::warn!(
+        timeout_ms = SESSION_MANAGER_SHUTDOWN_GRACE.as_millis(),
+        "session relay actors did not stop before the shutdown deadline; aborting them"
+    );
+    tasks.abort_all();
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(error) = joined
+            && !error.is_cancelled()
+        {
+            tracing::error!(%error, "session relay actor failed while being aborted");
+        }
+    }
 }
 
 async fn run_session_actor(
@@ -1389,6 +1466,15 @@ async fn run_session_actor(
             }
         }
     }
+    if let Some(connection) = connection.take()
+        && let Err(error) = connection.detach().await
+    {
+        tracing::warn!(
+            session_id = %target.session_id,
+            %error,
+            "could not detach relay connection during session actor shutdown"
+        );
+    }
     // No caller may wait forever on a submission this actor will never deliver.
     for deferred in deferred_submits {
         if deferred
@@ -1645,6 +1731,10 @@ impl StandaloneSession {
             project_memory: None,
         })
         .await
+    }
+
+    async fn detach(self) -> Result<()> {
+        self.client.detach().await
     }
 
     pub async fn sync(&mut self) -> Result<ManagedSessionSnapshot> {
@@ -2823,6 +2913,8 @@ mod tests {
     const RETURNED_LEASE_VIEW_TEST_CHILD: &str = "HEL_TEST_RETURNED_LEASE_VIEW_CHILD";
     #[cfg(unix)]
     const EXPLICIT_MEMORY_SYNC_TEST_CHILD: &str = "HEL_TEST_EXPLICIT_MEMORY_SYNC_CHILD";
+    #[cfg(unix)]
+    const MANAGER_SHUTDOWN_TEST_CHILD: &str = "HEL_TEST_MANAGER_SHUTDOWN_CHILD";
     const LEASED_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
 
     /// Relay server half of the leased-submission tests. It does nothing unless
@@ -2877,6 +2969,41 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_manager_shutdown_joins_a_live_relay_actor() {
+        if std::env::var_os(MANAGER_SHUTDOWN_TEST_CHILD).is_none() {
+            run_in_isolated_child(
+                MANAGER_SHUTDOWN_TEST_CHILD,
+                "session_manager_shutdown_joins_a_live_relay_actor",
+            );
+            return;
+        }
+        register_leased_relay_session();
+        let relay_root = tempfile::tempdir().unwrap();
+        let SessionManagerChannels {
+            targets,
+            control,
+            updates: _updates,
+            shutdown,
+        } = spawn_session_manager().expect("spawn the session manager");
+        targets.send_replace(vec![leased_relay_target(relay_root.path())]);
+        let session = control
+            .wait_for_session(LEASED_RELAY_SESSION, Duration::from_secs(2))
+            .await
+            .expect("manager registered the relay actor");
+        session
+            .sync_now()
+            .await
+            .expect("relay actor established a live connection");
+        assert!(session.view().connected);
+
+        tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
+            .await
+            .expect("manager shutdown stayed within its deadline")
+            .expect("manager shutdown task completed cleanly");
     }
 
     #[cfg(unix)]

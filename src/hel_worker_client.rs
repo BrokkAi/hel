@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
@@ -47,6 +47,8 @@ const RELAY_ACKNOWLEDGE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A compaction request runs a full model turn in a scratch ACP session, so it
 /// outlives the deadline that suits the relay's bookkeeping calls.
 const RELAY_COMPACT_TIMEOUT: Duration = Duration::from_secs(600);
+const RELAY_PROXY_DETACH_GRACE: Duration = Duration::from_millis(500);
+const RELAY_PROXY_REAP_POLL: Duration = Duration::from_millis(10);
 
 /// Forward a relay proxy's stderr to the log, one line at a time, until the
 /// child closes it. Reporting rather than dropping keeps connect failures
@@ -723,7 +725,7 @@ impl RelayClient {
             .await
             .context("close relay proxy stdin")?;
         let mut child = self.child.take().expect("connected relay owns proxy child");
-        match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await {
+        match tokio::time::timeout(RELAY_PROXY_DETACH_GRACE, child.wait()).await {
             Ok(status) => {
                 status.context("wait for relay proxy")?;
             }
@@ -946,40 +948,77 @@ fn log_relay_client_failure(
 
 impl Drop for RelayClient {
     fn drop(&mut self) {
-        // Closing stdin while the proxy launcher is still alive lets `podman
-        // exec -i` and ssh forward EOF to the target-side proxy. Killing the
-        // launcher first can strand that proxy (and its worker socket) after a
-        // controller-side connection is replaced.
+        // Async owners call `detach` so EOF has a bounded chance to propagate
+        // through Podman or SSH before the launcher is stopped. Drop is the
+        // shutdown-safe fallback: it may run while Tokio's drivers are already
+        // gone, so its bounded reaper cannot use runtime work or Tokio timers.
         drop(self.input.take());
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            if let Err(error) = child.start_kill() {
-                tracing::warn!(%error, "could not stop dropped relay proxy without a runtime");
-            }
+        let Some(child) = self.child.take() else {
             return;
         };
         let session_id = self.session_id.clone();
-        runtime.spawn(async move {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await {
-                Ok(Ok(status)) if status.success() => {}
-                Ok(Ok(status)) => {
-                    tracing::warn!(%session_id, %status, "dropped relay proxy exited unsuccessfully");
+        if let Err(error) = std::thread::Builder::new()
+            .name("hel-relay-reaper".into())
+            .spawn(move || reap_dropped_relay_proxy(child, session_id))
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                %error,
+                "could not start dropped relay proxy reaper"
+            );
+        }
+    }
+}
+
+/// Let EOF traverse a proxy launcher, then stop and reap it without relying on
+/// an async runtime that may already be shutting down.
+fn reap_dropped_relay_proxy(mut child: Child, session_id: String) {
+    let deadline = Instant::now() + RELAY_PROXY_DETACH_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    tracing::warn!(
+                        %session_id,
+                        %status,
+                        "dropped relay proxy exited unsuccessfully"
+                    );
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(%session_id, %error, "could not reap dropped relay proxy");
-                }
-                Err(_) => {
-                    if let Err(error) = child.start_kill() {
-                        tracing::warn!(%session_id, %error, "could not stop dropped relay proxy");
-                    }
-                    if let Err(error) = child.wait().await {
-                        tracing::warn!(%session_id, %error, "could not reap stopped relay proxy");
-                    }
-                }
+                return;
             }
-        });
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(RELAY_PROXY_REAP_POLL);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "could not reap dropped relay proxy");
+                return;
+            }
+        }
+    }
+
+    if let Err(error) = child.start_kill()
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%session_id, %error, "could not stop dropped relay proxy");
+        return;
+    }
+    let deadline = Instant::now() + RELAY_PROXY_DETACH_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(RELAY_PROXY_REAP_POLL);
+            }
+            Ok(None) => {
+                tracing::warn!(%session_id, "stopped relay proxy could not be reaped in time");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "could not reap stopped relay proxy");
+                return;
+            }
+        }
     }
 }
 
