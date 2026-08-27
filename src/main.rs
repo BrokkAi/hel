@@ -3124,31 +3124,14 @@ async fn run_session(
                     }
                 };
                 cmd_orchestrator.set_review_fanout(review_fanout);
-                cmd_orchestrator.set_review_policy(
-                    updated_config.agent.discrete_review,
-                    updated_config.agent.review_tier,
-                    updated_config.agent.correction_threshold,
-                    updated_config.agent.max_correction_rounds,
-                );
+                cmd_orchestrator.set_review_policy_from_agent_config(&updated_config.agent);
                 let _ = side_ui_event_tx.send(UiEvent::Info(
                     "reviewer and subagent configuration is active for the current primary session"
                         .to_string(),
                 ));
                 continue;
             }
-            if let UiCommand::SetReviewPolicy {
-                enabled,
-                tier,
-                correction_threshold,
-                max_correction_rounds,
-            } = &command
-            {
-                cmd_orchestrator.set_review_policy(
-                    *enabled,
-                    *tier,
-                    *correction_threshold,
-                    *max_correction_rounds,
-                );
+            if cmd_orchestrator.apply_review_policy_command(&command) {
                 continue;
             }
             if let UiCommand::RunReview { request } = command {

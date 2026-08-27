@@ -201,6 +201,34 @@ impl Handle {
         self.set_max_correction_rounds(max_correction_rounds);
     }
 
+    pub fn set_review_policy_from_agent_config(&self, config: &crate::config::AgentConfig) {
+        self.set_review_policy(
+            config.discrete_review,
+            config.review_tier,
+            config.correction_threshold,
+            config.max_correction_rounds,
+        );
+    }
+
+    pub fn apply_review_policy_command(&self, command: &UiCommand) -> bool {
+        let UiCommand::SetReviewPolicy {
+            enabled,
+            tier,
+            correction_threshold,
+            max_correction_rounds,
+        } = command
+        else {
+            return false;
+        };
+        self.set_review_policy(
+            *enabled,
+            *tier,
+            *correction_threshold,
+            *max_correction_rounds,
+        );
+        true
+    }
+
     /// Apply a newly resolved reviewer/subagent route to reviews that start
     /// after this call. An already-running review retains its own snapshot.
     pub fn set_review_fanout(&self, review_fanout: ReviewFanout) {
@@ -3604,11 +3632,21 @@ mod tests {
         // The session started with the tier default of one pass. Saving Off
         // while the turn is active must affect the correction contract that
         // is issued after this review, without replacing the ACP session.
-        running.handle.set_review_policy(
-            true,
-            ReviewTier::Extended,
-            ReviewCorrectionThreshold::default(),
-            Some(0),
+        let mut policy = crate::config::AgentConfig::default();
+        policy.set_review_tier(ReviewTier::Extended);
+        policy.max_correction_rounds = Some(2);
+        running.handle.set_review_policy_from_agent_config(&policy);
+        let command = UiCommand::SetReviewPolicy {
+            enabled: true,
+            tier: ReviewTier::Extended,
+            correction_threshold: ReviewCorrectionThreshold::default(),
+            max_correction_rounds: Some(0),
+        };
+        assert!(running.handle.apply_review_policy_command(&command));
+        assert!(
+            !running
+                .handle
+                .apply_review_policy_command(&UiCommand::CancelReview)
         );
         runtime_tx.send(completion()).expect("send completion");
 
