@@ -24,11 +24,19 @@ enum FieldValue {
     Boolean(bool),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DisplayField {
+    field: usize,
+    custom: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ElicitationDialog {
     request: ElicitationRequest,
     values: Vec<FieldValue>,
     option_cursors: Vec<usize>,
+    display_fields: Vec<DisplayField>,
+    active_custom_fields: BTreeSet<usize>,
     focus: usize,
     error: Option<String>,
 }
@@ -36,18 +44,31 @@ pub(super) struct ElicitationDialog {
 impl ElicitationDialog {
     pub(super) fn new(request: ElicitationRequest) -> Self {
         let values = request.fields.iter().map(default_value).collect::<Vec<_>>();
-        let option_cursors = values
+        let mut option_cursors = values
             .iter()
             .map(|value| match value {
                 FieldValue::Single(Some(index)) => *index,
                 FieldValue::Multi(selected) => selected.first().copied().unwrap_or(0),
                 _ => 0,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let (display_fields, active_custom_fields) = display_fields(&request, &values);
+        for display in &display_fields {
+            let Some(custom) = display.custom else {
+                continue;
+            };
+            if active_custom_fields.contains(&custom)
+                && let Some(option_count) = select_option_count(&request.fields[display.field])
+            {
+                option_cursors[display.field] = option_count;
+            }
+        }
         Self {
             request,
             values,
             option_cursors,
+            display_fields,
+            active_custom_fields,
             focus: 0,
             error: None,
         }
@@ -63,7 +84,13 @@ impl ElicitationDialog {
 
     pub(super) fn paste(&mut self, text: &str) {
         let text = sanitize_terminal_text(text);
-        if let Some(FieldValue::Text { value, cursor }) = self.values.get_mut(self.focus) {
+        let Some((field, custom)) = self.editable_field() else {
+            return;
+        };
+        if custom {
+            self.active_custom_fields.insert(field);
+        }
+        if let Some(FieldValue::Text { value, cursor }) = self.values.get_mut(field) {
             value.insert_str(*cursor, &text);
             *cursor += text.len();
             self.error = None;
@@ -79,7 +106,8 @@ impl ElicitationDialog {
         if code == KeyCode::Esc {
             return Some(ElicitationResponse::Cancel);
         }
-        let focus_count = self.request.fields.len() + 3;
+        let field_count = self.display_fields.len();
+        let focus_count = field_count + 3;
         match code {
             KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
                 self.focus = self.focus.checked_sub(1).unwrap_or(focus_count - 1);
@@ -88,16 +116,16 @@ impl ElicitationDialog {
                 self.focus = self.focus.checked_sub(1).unwrap_or(focus_count - 1);
             }
             KeyCode::Tab => self.focus = (self.focus + 1) % focus_count,
-            KeyCode::Enter if self.focus == self.request.fields.len() => {
+            KeyCode::Enter if self.focus == field_count => {
                 return self.accept();
             }
-            KeyCode::Enter if self.focus == self.request.fields.len() + 1 => {
+            KeyCode::Enter if self.focus == field_count + 1 => {
                 return Some(ElicitationResponse::Decline);
             }
-            KeyCode::Enter if self.focus == self.request.fields.len() + 2 => {
+            KeyCode::Enter if self.focus == field_count + 2 => {
                 return Some(ElicitationResponse::Cancel);
             }
-            KeyCode::Enter => self.focus = (self.focus + 1).min(self.request.fields.len()),
+            KeyCode::Enter => self.focus = (self.focus + 1).min(field_count),
             KeyCode::Up => self.move_option(-1),
             KeyCode::Down => self.move_option(1),
             KeyCode::Char(' ') => self.toggle_current(),
@@ -118,53 +146,76 @@ impl ElicitationDialog {
     }
 
     fn move_option(&mut self, delta: isize) {
-        let Some(field) = self.request.fields.get(self.focus) else {
+        let Some(display) = self.display_fields.get(self.focus).copied() else {
             return;
         };
-        let option_count = match &field.kind {
-            ElicitationFieldKind::SingleSelect { options, .. }
-            | ElicitationFieldKind::MultiSelect { options, .. } => options.len(),
-            _ => return,
+        let Some(option_count) = select_option_count(&self.request.fields[display.field]) else {
+            return;
         };
-        if option_count == 0 {
+        let row_count = option_count + usize::from(display.custom.is_some());
+        if row_count == 0 {
             return;
         }
-        let cursor = &mut self.option_cursors[self.focus];
+        let cursor = &mut self.option_cursors[display.field];
         *cursor = if delta.is_negative() {
-            cursor.checked_sub(1).unwrap_or(option_count - 1)
+            cursor.checked_sub(1).unwrap_or(row_count - 1)
         } else {
-            (*cursor + 1) % option_count
+            (*cursor + 1) % row_count
         };
-        if let FieldValue::Single(selected) = &mut self.values[self.focus] {
-            *selected = Some(*cursor);
+        if let FieldValue::Single(selected) = &mut self.values[display.field] {
+            if *cursor == option_count {
+                *selected = None;
+                if let Some(custom) = display.custom {
+                    self.active_custom_fields.insert(custom);
+                }
+            } else {
+                *selected = Some(*cursor);
+                if let Some(custom) = display.custom {
+                    self.active_custom_fields.remove(&custom);
+                }
+            }
         }
     }
 
     fn toggle_current(&mut self) {
-        let Some(value) = self.values.get_mut(self.focus) else {
+        if self.editable_field().is_some() {
+            self.edit_text(TextEdit::Insert(' '));
+            return;
+        }
+        let Some(display) = self.display_fields.get(self.focus).copied() else {
             return;
         };
+        let value = &mut self.values[display.field];
         match value {
             FieldValue::Single(selected) => {
-                *selected = Some(self.option_cursors[self.focus]);
+                *selected = Some(self.option_cursors[display.field]);
+                if let Some(custom) = display.custom {
+                    self.active_custom_fields.remove(&custom);
+                }
             }
             FieldValue::Multi(selected) => {
-                let index = self.option_cursors[self.focus];
+                let index = self.option_cursors[display.field];
                 if !selected.remove(&index) {
                     selected.insert(index);
                 }
+                if let Some(custom) = display.custom {
+                    self.active_custom_fields.remove(&custom);
+                }
             }
             FieldValue::Boolean(selected) => *selected = !*selected,
-            FieldValue::Text { value, cursor } => {
-                value.insert(*cursor, ' ');
-                *cursor += 1;
-            }
+            FieldValue::Text { .. } => unreachable!("text fields are handled above"),
         }
     }
 
     fn edit_text(&mut self, edit: TextEdit) {
-        let Some(FieldValue::Text { value, cursor }) = self.values.get_mut(self.focus) else {
+        let Some((field, custom)) = self.editable_field() else {
             return;
+        };
+        if custom {
+            self.active_custom_fields.insert(field);
+        }
+        let Some(FieldValue::Text { value, cursor }) = self.values.get_mut(field) else {
+            unreachable!("editable fields contain text values")
         };
         match edit {
             TextEdit::Insert(character) => {
@@ -190,7 +241,13 @@ impl ElicitationDialog {
 
     fn accept(&mut self) -> Option<ElicitationResponse> {
         let mut content = BTreeMap::new();
-        for (field, value) in self.request.fields.iter().zip(&self.values) {
+        for (display_index, display) in self.display_fields.iter().copied().enumerate() {
+            let field_index = display
+                .custom
+                .filter(|custom| self.active_custom_fields.contains(custom))
+                .unwrap_or(display.field);
+            let field = &self.request.fields[field_index];
+            let value = &self.values[field_index];
             match validated_value(field, value) {
                 Ok(Some(value)) => {
                     content.insert(field.id.clone(), value);
@@ -198,17 +255,88 @@ impl ElicitationDialog {
                 Ok(None) => {}
                 Err(error) => {
                     self.error = Some(error);
-                    self.focus = self
-                        .request
-                        .fields
-                        .iter()
-                        .position(|candidate| candidate.id == field.id)
-                        .unwrap_or(0);
+                    self.focus = display_index;
+                    if field_index != display.field
+                        && let Some(option_count) =
+                            select_option_count(&self.request.fields[display.field])
+                    {
+                        self.option_cursors[display.field] = option_count;
+                    }
                     return None;
                 }
             }
         }
         Some(ElicitationResponse::Accept { content })
+    }
+
+    fn editable_field(&self) -> Option<(usize, bool)> {
+        let display = self.display_fields.get(self.focus)?;
+        if matches!(self.values[display.field], FieldValue::Text { .. }) {
+            return Some((display.field, false));
+        }
+        let custom = display.custom?;
+        let option_count = select_option_count(&self.request.fields[display.field])?;
+        (self.option_cursors[display.field] == option_count).then_some((custom, true))
+    }
+}
+
+fn display_fields(
+    request: &ElicitationRequest,
+    values: &[FieldValue],
+) -> (Vec<DisplayField>, BTreeSet<usize>) {
+    let fields_by_id = request
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (field.id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut custom_by_owner = BTreeMap::new();
+    let mut attached_custom = BTreeSet::new();
+    for (custom, field) in request.fields.iter().enumerate() {
+        let Some(owner) = field
+            .custom_answer_for
+            .as_deref()
+            .and_then(|owner| fields_by_id.get(owner))
+            .copied()
+        else {
+            continue;
+        };
+        if !matches!(field.kind, ElicitationFieldKind::Text { .. })
+            || select_option_count(&request.fields[owner]).is_none()
+            || custom_by_owner.contains_key(&owner)
+        {
+            continue;
+        }
+        custom_by_owner.insert(owner, custom);
+        attached_custom.insert(custom);
+    }
+    let display_fields = request
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !attached_custom.contains(index))
+        .map(|(field, _)| DisplayField {
+            field,
+            custom: custom_by_owner.get(&field).copied(),
+        })
+        .collect::<Vec<_>>();
+    let active_custom_fields = attached_custom
+        .into_iter()
+        .filter(|index| {
+            matches!(
+                &values[*index],
+                FieldValue::Text { value, .. } if !value.is_empty()
+            )
+        })
+        .collect();
+    (display_fields, active_custom_fields)
+}
+
+fn select_option_count(field: &ElicitationField) -> Option<usize> {
+    match &field.kind {
+        ElicitationFieldKind::SingleSelect { options, .. }
+        | ElicitationFieldKind::MultiSelect { options, .. } => Some(options.len()),
+        _ => None,
     }
 }
 
@@ -427,7 +555,7 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
         chunks[0],
     );
     render_focus(frame, chunks[1], dialog);
-    let field_count = dialog.request.fields.len();
+    let field_count = dialog.display_fields.len();
     let buttons = ["Submit", "Skip", "Cancel"]
         .into_iter()
         .enumerate()
@@ -468,8 +596,8 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
 }
 
 fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
-    let Some(field) = dialog.request.fields.get(dialog.focus) else {
-        let label = match dialog.focus.saturating_sub(dialog.request.fields.len()) {
+    let Some(display) = dialog.display_fields.get(dialog.focus).copied() else {
+        let label = match dialog.focus.saturating_sub(dialog.display_fields.len()) {
             0 => "Submit these answers",
             1 => "Skip this question and let the agent continue",
             _ => "Cancel this question",
@@ -477,10 +605,11 @@ fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
         frame.render_widget(Paragraph::new(label).alignment(Alignment::Center), area);
         return;
     };
+    let field = &dialog.request.fields[display.field];
     let required = if field.required { " (required)" } else { "" };
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            format!("{}/{}  ", dialog.focus + 1, dialog.request.fields.len()),
+            format!("{}/{}  ", dialog.focus + 1, dialog.display_fields.len()),
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
@@ -494,7 +623,8 @@ fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
             Style::default().fg(Color::Gray),
         ));
     }
-    match (&field.kind, &dialog.values[dialog.focus]) {
+    let mut text_cursor = None;
+    match (&field.kind, &dialog.values[display.field]) {
         (_, FieldValue::Text { value, .. }) => {
             let shown = if field.secret {
                 "•".repeat(value.chars().count())
@@ -502,15 +632,23 @@ fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
                 value.clone()
             };
             lines.push(Line::raw(""));
+            let input_line = lines.len() as u16;
             lines.push(Line::styled(
                 format!("> {shown}"),
                 Style::default().fg(Color::Cyan),
             ));
+            let FieldValue::Text { cursor, .. } = &dialog.values[display.field] else {
+                unreachable!("text fields contain text values")
+            };
+            text_cursor = Some((input_line, value[..*cursor].chars().count()));
         }
         (ElicitationFieldKind::SingleSelect { options, .. }, FieldValue::Single(selected)) => {
+            let custom_active = display
+                .custom
+                .is_some_and(|custom| dialog.active_custom_fields.contains(&custom));
             for (index, option) in options.iter().enumerate() {
-                let cursor = dialog.option_cursors[dialog.focus] == index;
-                let marker = if *selected == Some(index) {
+                let cursor = dialog.option_cursors[display.field] == index;
+                let marker = if !custom_active && *selected == Some(index) {
                     "●"
                 } else {
                     "○"
@@ -538,15 +676,27 @@ fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
                     }
                 }
             }
+            render_custom_answer(
+                &mut lines,
+                &mut text_cursor,
+                dialog,
+                display,
+                options.len(),
+                "○",
+                "●",
+            );
         }
         (ElicitationFieldKind::MultiSelect { options, .. }, FieldValue::Multi(selected)) => {
+            let custom_active = display
+                .custom
+                .is_some_and(|custom| dialog.active_custom_fields.contains(&custom));
             for (index, option) in options.iter().enumerate() {
-                let marker = if selected.contains(&index) {
+                let marker = if !custom_active && selected.contains(&index) {
                     "☑"
                 } else {
                     "☐"
                 };
-                let style = if dialog.option_cursors[dialog.focus] == index {
+                let style = if dialog.option_cursors[display.field] == index {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
@@ -555,6 +705,15 @@ fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
                 };
                 lines.push(Line::styled(format!("{marker} {}", option.title), style));
             }
+            render_custom_answer(
+                &mut lines,
+                &mut text_cursor,
+                dialog,
+                display,
+                options.len(),
+                "☐",
+                "☑",
+            );
         }
         (ElicitationFieldKind::Boolean { .. }, FieldValue::Boolean(selected)) => {
             lines.push(Line::styled(
@@ -565,16 +724,68 @@ fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
         _ => {}
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-    if let FieldValue::Text { value, cursor } = &dialog.values[dialog.focus]
+    if let Some((line, column)) = text_cursor
         && area.width > 2
-        && area.height > 3
+        && area.height > 0
     {
-        let column = value[..*cursor].chars().count();
         frame.set_cursor_position((
             area.x + 2 + (column as u16).min(area.width.saturating_sub(3)),
-            area.y + 3.min(area.height.saturating_sub(1)),
+            area.y + line.min(area.height.saturating_sub(1)),
         ));
     }
+}
+
+fn render_custom_answer(
+    lines: &mut Vec<Line<'_>>,
+    text_cursor: &mut Option<(u16, usize)>,
+    dialog: &ElicitationDialog,
+    display: DisplayField,
+    option_count: usize,
+    unselected_marker: &str,
+    selected_marker: &str,
+) {
+    let Some(custom_index) = display.custom else {
+        return;
+    };
+    let custom = &dialog.request.fields[custom_index];
+    let FieldValue::Text { value, cursor } = &dialog.values[custom_index] else {
+        unreachable!("custom answer fields contain text values")
+    };
+    let focused = dialog.option_cursors[display.field] == option_count;
+    let active = dialog.active_custom_fields.contains(&custom_index);
+    let marker = if active {
+        selected_marker
+    } else {
+        unselected_marker
+    };
+    let style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    lines.push(Line::styled(format!("{marker} {}", custom.title), style));
+    if !focused {
+        return;
+    }
+    if let Some(description) = &custom.description {
+        lines.push(Line::styled(
+            format!("    {description}"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    let shown = if custom.secret {
+        "•".repeat(value.chars().count())
+    } else {
+        value.clone()
+    };
+    let input_line = lines.len() as u16;
+    lines.push(Line::styled(
+        format!("> {shown}"),
+        Style::default().fg(Color::Cyan),
+    ));
+    *text_cursor = Some((input_line, value[..*cursor].chars().count()));
 }
 
 fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
@@ -614,6 +825,8 @@ fn next_char_boundary(value: &str, cursor: usize) -> usize {
 mod tests {
     use super::*;
     use crate::hel_elicitation::ElicitationOption;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn request(kind: ElicitationFieldKind, required: bool) -> ElicitationRequest {
         ElicitationRequest {
@@ -631,6 +844,88 @@ mod tests {
                 kind,
             }],
         }
+    }
+
+    fn paired_request(question_count: usize, multi_select: bool) -> ElicitationRequest {
+        let mut fields = Vec::new();
+        for index in 0..question_count {
+            let id = format!("question_{index}");
+            let options = vec![
+                ElicitationOption {
+                    value: "alpha".into(),
+                    title: "Alpha".into(),
+                    description: Some("Choose alpha".into()),
+                    preview: None,
+                },
+                ElicitationOption {
+                    value: "beta".into(),
+                    title: "Beta".into(),
+                    description: Some("Choose beta".into()),
+                    preview: None,
+                },
+            ];
+            fields.push(ElicitationField {
+                id: id.clone(),
+                title: format!("Question {}", index + 1),
+                description: Some(format!("Prompt {}", index + 1)),
+                required: false,
+                secret: false,
+                custom_answer_for: None,
+                kind: if multi_select {
+                    ElicitationFieldKind::MultiSelect {
+                        options,
+                        default: Vec::new(),
+                        min_items: None,
+                        max_items: None,
+                    }
+                } else {
+                    ElicitationFieldKind::SingleSelect {
+                        options,
+                        default: None,
+                    }
+                },
+            });
+            fields.push(ElicitationField {
+                id: format!("{id}__other"),
+                title: "Other".into(),
+                description: Some(
+                    "Type your own answer instead of choosing an option above.".into(),
+                ),
+                required: false,
+                secret: false,
+                custom_answer_for: Some(id),
+                kind: ElicitationFieldKind::Text {
+                    default: None,
+                    min_length: None,
+                    max_length: None,
+                    pattern: None,
+                    format: None,
+                },
+            });
+        }
+        ElicitationRequest {
+            id: "ask-paired".into(),
+            message: "Input requested".into(),
+            title: None,
+            description: None,
+            fields,
+        }
+    }
+
+    fn rendered(dialog: &ElicitationDialog) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render_elicitation(frame, dialog))
+            .expect("render elicitation");
+        let buffer = terminal.backend().buffer();
+        (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -667,6 +962,94 @@ mod tests {
                 )])
             })
         );
+    }
+
+    #[test]
+    fn paired_custom_answers_share_their_question_page() {
+        let mut dialog = ElicitationDialog::new(paired_request(3, false));
+
+        assert_eq!(dialog.display_fields.len(), 3);
+        let first = rendered(&dialog);
+        assert!(first.contains("1/3"));
+        assert!(first.contains("○ Other"));
+        assert!(!first.contains("1/6"));
+
+        dialog.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        let second = rendered(&dialog);
+        assert!(second.contains("2/3"));
+        assert!(second.contains("Question 2"));
+    }
+
+    #[test]
+    fn custom_answer_uses_the_adapter_field_instead_of_the_stale_selection() {
+        let mut dialog = ElicitationDialog::new(paired_request(1, false));
+        dialog.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        dialog.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        for character in "custom answer".chars() {
+            dialog.handle_key(KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(ElicitationResponse::Accept {
+                content: BTreeMap::from([(
+                    "question_0__other".into(),
+                    ElicitationValue::String("custom answer".into())
+                )])
+            })
+        );
+    }
+
+    #[test]
+    fn choosing_an_option_after_typing_other_omits_the_custom_draft() {
+        let mut dialog = ElicitationDialog::new(paired_request(1, false));
+        dialog.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        dialog.paste("custom draft");
+        dialog.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(ElicitationResponse::Accept {
+                content: BTreeMap::from([(
+                    "question_0".into(),
+                    ElicitationValue::String("beta".into())
+                )])
+            })
+        );
+    }
+
+    #[test]
+    fn toggling_a_multi_select_option_deactivates_other() {
+        let mut dialog = ElicitationDialog::new(paired_request(1, true));
+        dialog.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        dialog.paste("custom draft");
+        dialog.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        dialog.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(ElicitationResponse::Accept {
+                content: BTreeMap::from([(
+                    "question_0".into(),
+                    ElicitationValue::StringArray(vec!["beta".into()])
+                )])
+            })
+        );
+    }
+
+    #[test]
+    fn dangling_custom_metadata_remains_a_standalone_page() {
+        let mut request = paired_request(1, false);
+        request.fields[1].custom_answer_for = Some("missing".into());
+        let mut dialog = ElicitationDialog::new(request);
+
+        assert_eq!(dialog.display_fields.len(), 2);
+        dialog.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(rendered(&dialog).contains("2/2"));
+        assert!(rendered(&dialog).contains("Other"));
     }
 
     #[test]
