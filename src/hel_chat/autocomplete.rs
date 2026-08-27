@@ -168,7 +168,7 @@ impl ChatState {
                 source: CommandSource::Hel,
             });
         }
-        for command in &self.agent_commands {
+        for command in self.acp_surface.agent_commands() {
             let name = command.name.trim();
             if name.is_empty()
                 || matches!(name.to_ascii_lowercase().as_str(), "plan" | "implement")
@@ -194,13 +194,7 @@ impl ChatState {
     }
 
     pub(super) fn set_config_options(&mut self, options: &[SessionConfigOption]) {
-        let changed = self.config_options != options;
-        self.config_options = options.to_vec();
-        self.current_model = config_current_value(options, "model");
-        self.current_effort = config_current_value(options, "effort");
-        if changed || self.current_mode.is_none() {
-            self.set_plan_mode_from_surfaces();
-        }
+        self.acp_surface.set_config_options(options);
         self.model_values = config_values(options, "model");
         self.effort_values = config_values(options, "effort");
         self.rebuild_command_choices();
@@ -314,25 +308,11 @@ pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> 
     Some((command, args))
 }
 
-pub(super) fn is_goal_prompt(prompt: &str) -> bool {
-    prompt
-        .strip_prefix("/goal")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-}
-
 fn find_config_option<'a>(
     options: &'a [SessionConfigOption],
     key: &str,
 ) -> Option<&'a SessionConfigOption> {
     find_session_config_option(options, key)
-}
-
-pub(super) fn config_current_value(options: &[SessionConfigOption], key: &str) -> Option<String> {
-    let option = find_config_option(options, key)?;
-    let SessionConfigKind::Select(select) = &option.kind else {
-        return None;
-    };
-    Some(select.current_value.to_string())
 }
 
 fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueChoice> {

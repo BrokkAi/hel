@@ -3,6 +3,12 @@
 //! The worker owns exactly one harness process and one foreground session.  It
 //! deliberately does not know about orchestration, review lanes, or subagents.
 
+mod dialect;
+pub(crate) mod surface;
+pub use surface::PlanControl;
+
+use dialect::grok;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -18,11 +24,11 @@ use agent_client_protocol::schema::v1::{
     KillTerminalResponse, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
     PermissionOptionKind, PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigValueId, SessionId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    StopReason, TerminalExitStatus, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
-    TextContent, ToolCallUpdateFields, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigValueId, SessionId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalExitStatus,
+    TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallUpdateFields,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -559,16 +565,6 @@ const ADAPTER_CHATTER_PREFIX: &str = "Unexpected case: ";
 /// It is adapter routing noise and commonly precedes a useful ACP error.
 const KIMI_NULL_RESPONSE_CHATTER: &str = "Got response to unknown request null";
 
-/// Grok Build's `exit_plan_mode` tool asks the client whether the agent may
-/// leave plan mode. It is an ACP ext method, so it reaches Hel untyped, and
-/// the ext framing prefixes the method name with `_`. Both spellings are
-/// accepted so a bridge that sends the bare name still works.
-const EXIT_PLAN_MODE_METHOD: &str = "x.ai/exit_plan_mode";
-
-fn is_exit_plan_mode_method(method: &str) -> bool {
-    method.strip_prefix('_').unwrap_or(method) == EXIT_PLAN_MODE_METHOD
-}
-
 const PLAN_REVIEW_ACTION: &str = "action";
 const PLAN_REVIEW_FEEDBACK: &str = "feedback";
 
@@ -752,16 +748,6 @@ fn permission_plan_response(
             ))
         },
     )
-}
-
-fn grok_plan_response(response: ElicitationResponse) -> serde_json::Value {
-    let (action, feedback) = plan_review_answer(response);
-    match action.as_str() {
-        "implement" => serde_json::json!({ "outcome": "approved" }),
-        "exit" => serde_json::json!({ "outcome": "abandoned" }),
-        "revise" => serde_json::json!({ "outcome": "cancelled", "feedback": feedback }),
-        _ => serde_json::json!({ "outcome": "cancelled" }),
-    }
 }
 
 fn unsupported_client_request_report(method: &str) -> String {
@@ -1331,7 +1317,7 @@ where
                     });
                     return Ok(());
                 }
-                if is_exit_plan_mode_method(&method) {
+                if grok::is_exit_plan_mode_method(&method) {
                     let id = format!(
                         "plan-review-grok-{}",
                         ext_review_ids.fetch_add(1, Ordering::Relaxed)
@@ -1395,7 +1381,7 @@ where
                         }
                         if let Err(error) = responder.respond(response.map_or_else(
                             || serde_json::json!({ "outcome": "cancelled" }),
-                            grok_plan_response,
+                            grok::plan_response,
                         )) {
                             tracing::debug!(
                                 %id,
@@ -1455,234 +1441,6 @@ where
         .lock()
         .expect("ACP restart slot lock poisoned")
         .take())
-}
-
-/// Grok Build speaks an older ACP dialect. It never returns `configOptions`,
-/// and model and reasoning effort move through the legacy `session/set_model`
-/// method: `{sessionId, modelId}` with the effort as
-/// `_meta.reasoningEffort`. Hel synthesizes the same `SessionConfigOption`
-/// list every other harness returns, so `/model` and `/effort` behave
-/// identically everywhere.
-const GROK_SET_MODEL_METHOD: &str = "session/set_model";
-
-/// Grok Build's model catalogue, from `_meta.modelState` on the `initialize`
-/// response and `_meta["x.ai/modelState"]`-shaped payloads after a switch.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct GrokModelState {
-    current_model_id: String,
-    current_effort: Option<String>,
-    models: Vec<GrokModel>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GrokModel {
-    id: String,
-    name: String,
-    description: Option<String>,
-    /// Reasoning tiers this model accepts. Empty when it has none.
-    efforts: Vec<GrokChoice>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GrokChoice {
-    id: String,
-    name: String,
-    description: Option<String>,
-}
-
-impl GrokModelState {
-    fn current_model(&self) -> Option<&GrokModel> {
-        self.models
-            .iter()
-            .find(|model| model.id == self.current_model_id)
-    }
-}
-
-/// Read `modelState` out of a `_meta` object. `None` when the agent is not
-/// speaking this dialect, which is every harness except Grok Build.
-fn grok_model_state(
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<GrokModelState> {
-    let state = meta?.get("modelState")?;
-    grok_model_state_from_value(state)
-}
-
-fn grok_model_state_from_value(state: &serde_json::Value) -> Option<GrokModelState> {
-    let current_model_id = state.get("currentModelId")?.as_str()?.to_owned();
-    let models = state
-        .get("availableModels")?
-        .as_array()?
-        .iter()
-        .filter_map(|model| {
-            let id = model.get("modelId")?.as_str()?.to_owned();
-            let efforts = model
-                .pointer("/_meta/reasoningEfforts")
-                .and_then(serde_json::Value::as_array)
-                .map(|efforts| {
-                    efforts
-                        .iter()
-                        .filter_map(|effort| {
-                            let id = effort
-                                .get("value")
-                                .or_else(|| effort.get("id"))?
-                                .as_str()?
-                                .to_owned();
-                            Some(GrokChoice {
-                                name: effort
-                                    .get("label")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or(&id)
-                                    .to_owned(),
-                                description: effort
-                                    .get("description")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToOwned::to_owned),
-                                id,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(GrokModel {
-                name: model
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&id)
-                    .to_owned(),
-                description: model
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned),
-                id,
-                efforts,
-            })
-        })
-        .collect::<Vec<_>>();
-    let current_effort = state
-        .get("availableModels")?
-        .as_array()?
-        .iter()
-        .find(|model| {
-            model.get("modelId").and_then(serde_json::Value::as_str) == Some(&current_model_id)
-        })
-        .and_then(|model| model.pointer("/_meta/reasoningEffort"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    (!models.is_empty()).then_some(GrokModelState {
-        current_model_id,
-        current_effort,
-        models,
-    })
-}
-
-/// Present Grok Build's catalogue as the option list the rest of Hel already
-/// understands: a `model` selector, plus an `effort` selector carrying the
-/// current model's reasoning tiers.
-fn grok_config_options(state: &GrokModelState) -> Vec<SessionConfigOption> {
-    use agent_client_protocol::schema::v1::{
-        SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions,
-    };
-
-    let choice = |choice: &GrokChoice| {
-        let mut option = SessionConfigSelectOption::new(
-            SessionConfigValueId::new(choice.id.clone()),
-            choice.name.clone(),
-        );
-        option.description = choice.description.clone();
-        option
-    };
-    let mut options = vec![{
-        let models = state
-            .models
-            .iter()
-            .map(|model| {
-                choice(&GrokChoice {
-                    id: model.id.clone(),
-                    name: model.name.clone(),
-                    description: model.description.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut option = SessionConfigOption::new(
-            SessionConfigId::new("model"),
-            "Model",
-            SessionConfigKind::Select(SessionConfigSelect::new(
-                SessionConfigValueId::new(state.current_model_id.clone()),
-                SessionConfigSelectOptions::Ungrouped(models),
-            )),
-        );
-        option.category = Some(SessionConfigOptionCategory::Model);
-        option
-    }];
-    let efforts = state
-        .current_model()
-        .map(|model| model.efforts.as_slice())
-        .unwrap_or_default();
-    if !efforts.is_empty() {
-        let current = state
-            .current_effort
-            .clone()
-            .unwrap_or_else(|| efforts[0].id.clone());
-        let mut option = SessionConfigOption::new(
-            SessionConfigId::new("effort"),
-            "Reasoning effort",
-            SessionConfigKind::Select(SessionConfigSelect::new(
-                SessionConfigValueId::new(current),
-                SessionConfigSelectOptions::Ungrouped(
-                    efforts.iter().map(choice).collect::<Vec<_>>(),
-                ),
-            )),
-        );
-        option.category = Some(SessionConfigOptionCategory::ThoughtLevel);
-        options.push(option);
-    }
-    options
-}
-
-/// Translate a Hel `/model` or `/effort` change into Grok Build's
-/// `session/set_model` request. An effort change re-sends the current model,
-/// because effort only travels as meta on that same request.
-fn grok_set_model_request(
-    session_id: &SessionId,
-    state: &GrokModelState,
-    key: &str,
-    value: &str,
-) -> Result<(serde_json::Value, GrokModelState)> {
-    let mut updated = state.clone();
-    let model_id = match key {
-        "model" => {
-            ensure!(
-                state.models.iter().any(|model| model.id == value),
-                "{value:?} is not an available model value"
-            );
-            updated.current_model_id = value.to_owned();
-            // A different model has its own tiers, so the old effort no longer
-            // applies; the agent reports the new one.
-            updated.current_effort = None;
-            value.to_owned()
-        }
-        "effort" => {
-            ensure!(
-                state
-                    .current_model()
-                    .is_some_and(|model| model.efforts.iter().any(|effort| effort.id == value)),
-                "{value:?} is not an available effort value"
-            );
-            updated.current_effort = Some(value.to_owned());
-            state.current_model_id.clone()
-        }
-        _ => bail!("Grok Build has no {key} selector"),
-    };
-    let mut params = serde_json::Map::new();
-    params.insert("sessionId".into(), session_id.to_string().into());
-    params.insert("modelId".into(), model_id.into());
-    if key == "effort" {
-        params.insert(
-            "_meta".into(),
-            serde_json::json!({ "reasoningEffort": value }),
-        );
-    }
-    Ok((serde_json::Value::Object(params), updated))
 }
 
 /// Stop reason reported for a turn the bridge rejected instead of finishing.
@@ -1825,7 +1583,7 @@ async fn serve_session(
     }
     // Grok Build publishes its catalogue here rather than as `configOptions`.
     let mut grok_models = (spec.harness == HarnessKind::Grok)
-        .then(|| grok_model_state(initialized.meta.as_ref()))
+        .then(|| grok::model_state(initialized.meta.as_ref()))
         .flatten();
     emit_runtime_event(
         events,
@@ -1879,7 +1637,7 @@ async fn serve_session(
             // A session may open on a different model than the agent-wide
             // default, so a fresher catalogue on the session wins.
             if let Some(state) = grok_models.as_mut()
-                && let Some(fresh) = grok_model_state(created.meta.as_ref())
+                && let Some(fresh) = grok::model_state(created.meta.as_ref())
             {
                 *state = fresh;
             }
@@ -1915,7 +1673,7 @@ async fn serve_session(
     if let Some(state) = &grok_models
         && config_options.is_empty()
     {
-        config_options = grok_config_options(state);
+        config_options = grok::config_options(state);
     }
     emit_runtime_event(
         events,
@@ -2186,9 +1944,11 @@ async fn serve_session(
                 value,
             } => {
                 let applied = match grok_models.as_mut() {
-                    Some(state) => set_grok_model(connection, &session_id, state, &key, &value)
-                        .await
-                        .inspect(|()| config_options = grok_config_options(state)),
+                    Some(state) => {
+                        grok::apply_model_change(connection, &session_id, state, &key, &value)
+                            .await
+                            .inspect(|()| config_options = grok::config_options(state))
+                    }
                     None => {
                         set_session_config(
                             connection,
@@ -2235,8 +1995,8 @@ async fn serve_session(
                         .iter()
                         .any(|mode| mode.id.to_string() == mode_id)
                 });
-                let grok_plan_fallback = spec.harness == HarnessKind::Grok
-                    && matches!(mode_id.as_str(), "plan" | "default");
+                let grok_plan_fallback =
+                    spec.harness == HarnessKind::Grok && grok::permits_unadvertised_mode(&mode_id);
                 let applied = if advertised || grok_plan_fallback {
                     connection
                         .send_request(SetSessionModeRequest::new(
@@ -2549,29 +2309,6 @@ async fn set_session_config(
         .await
         .with_context(|| format!("set session {key} to {value}"))?;
     *options = response.config_options;
-    Ok(())
-}
-
-/// Apply a `/model` or `/effort` change through Grok Build's legacy
-/// `session/set_model` method. The ACP crate has no type for it, so the
-/// request goes out as an untyped JSON-RPC message.
-async fn set_grok_model(
-    connection: &ConnectionTo<Agent>,
-    session_id: &SessionId,
-    state: &mut GrokModelState,
-    key: &str,
-    value: &str,
-) -> Result<()> {
-    let (params, updated) = grok_set_model_request(session_id, state, key, value)?;
-    connection
-        .send_request(
-            agent_client_protocol::UntypedMessage::new(GROK_SET_MODEL_METHOD, params)
-                .context("build Grok Build set-model request")?,
-        )
-        .block_task()
-        .await
-        .with_context(|| format!("set session {key} to {value}"))?;
-    *state = updated;
     Ok(())
 }
 
@@ -3567,7 +3304,7 @@ mod tests {
 
     #[test]
     fn grok_model_state_reads_the_catalogue_out_of_initialize_meta() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
+        let state = grok::model_state(Some(&grok_model_meta())).unwrap();
 
         assert_eq!(state.current_model_id, "grok-4.6");
         assert_eq!(state.current_effort.as_deref(), Some("high"));
@@ -3585,9 +3322,9 @@ mod tests {
 
         // Every other harness returns real `configOptions`, so nothing is
         // synthesized for them.
-        assert_eq!(grok_model_state(None), None);
+        assert_eq!(grok::model_state(None), None);
         assert_eq!(
-            grok_model_state(Some(&serde_json::Map::new())),
+            grok::model_state(Some(&serde_json::Map::new())),
             None,
             "an agent without a catalogue must not get a synthesized one"
         );
@@ -3595,9 +3332,9 @@ mod tests {
 
     #[test]
     fn grok_config_options_carry_the_model_and_its_reasoning_tiers() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
+        let state = grok::model_state(Some(&grok_model_meta())).unwrap();
 
-        let options = grok_config_options(&state);
+        let options = grok::config_options(&state);
 
         assert_eq!(options.len(), 2);
         assert_eq!(options[0].id.to_string(), "model");
@@ -3632,10 +3369,10 @@ mod tests {
 
     #[test]
     fn a_grok_model_change_sends_the_new_id_without_an_effort_meta() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
+        let state = grok::model_state(Some(&grok_model_meta())).unwrap();
 
         let (params, updated) =
-            grok_set_model_request(&SessionId::from("s-1"), &state, "model", "grok-4.5").unwrap();
+            grok::set_model_request(&SessionId::from("s-1"), &state, "model", "grok-4.5").unwrap();
 
         assert_eq!(
             params,
@@ -3646,17 +3383,17 @@ mod tests {
         assert_eq!(updated.current_effort, None);
         // The effort selector now offers the new model's tiers.
         assert_eq!(
-            select_values(&grok_config_options(&updated)[1]),
+            select_values(&grok::config_options(&updated)[1]),
             ["high", "low"]
         );
     }
 
     #[test]
     fn a_grok_effort_change_resends_the_current_model_with_the_effort_meta() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
+        let state = grok::model_state(Some(&grok_model_meta())).unwrap();
 
         let (params, updated) =
-            grok_set_model_request(&SessionId::from("s-1"), &state, "effort", "low").unwrap();
+            grok::set_model_request(&SessionId::from("s-1"), &state, "effort", "low").unwrap();
 
         assert_eq!(
             params,
@@ -3668,7 +3405,7 @@ mod tests {
         );
         assert_eq!(updated.current_model_id, "grok-4.6");
         assert_eq!(updated.current_effort.as_deref(), Some("low"));
-        let SessionConfigKind::Select(select) = &grok_config_options(&updated)[1].kind else {
+        let SessionConfigKind::Select(select) = &grok::config_options(&updated)[1].kind else {
             panic!("expected a select option");
         };
         assert_eq!(select.current_value.to_string(), "low");
@@ -3676,17 +3413,17 @@ mod tests {
 
     #[test]
     fn grok_rejects_values_and_keys_it_has_no_selector_for() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
+        let state = grok::model_state(Some(&grok_model_meta())).unwrap();
         let session = SessionId::from("s-1");
 
         for (key, value) in [("model", "grok-9"), ("effort", "ludicrous")] {
-            let error = grok_set_model_request(&session, &state, key, value).unwrap_err();
+            let error = grok::set_model_request(&session, &state, key, value).unwrap_err();
             assert!(
                 format!("{error:#}").contains(&format!("is not an available {key} value")),
                 "{error:#}"
             );
         }
-        let error = grok_set_model_request(&session, &state, "verbosity", "high").unwrap_err();
+        let error = grok::set_model_request(&session, &state, "verbosity", "high").unwrap_err();
         assert!(
             format!("{error:#}").contains("no verbosity selector"),
             "{error:#}"
@@ -3695,10 +3432,12 @@ mod tests {
 
     #[test]
     fn exit_plan_mode_is_recognized_with_and_without_the_ext_prefix() {
-        assert!(is_exit_plan_mode_method("_x.ai/exit_plan_mode"));
-        assert!(is_exit_plan_mode_method("x.ai/exit_plan_mode"));
-        assert!(!is_exit_plan_mode_method("_x.ai/other"));
-        assert!(!is_exit_plan_mode_method("session/request_permission"));
+        assert!(grok::is_exit_plan_mode_method("_x.ai/exit_plan_mode"));
+        assert!(grok::is_exit_plan_mode_method("x.ai/exit_plan_mode"));
+        assert!(!grok::is_exit_plan_mode_method("_x.ai/other"));
+        assert!(!grok::is_exit_plan_mode_method(
+            "session/request_permission"
+        ));
     }
 
     #[test]
@@ -3719,7 +3458,7 @@ mod tests {
             ElicitationValue::String("implement".into()),
         );
         assert_eq!(
-            grok_plan_response(ElicitationResponse::Accept { content }),
+            grok::plan_response(ElicitationResponse::Accept { content }),
             serde_json::json!({"outcome": "approved"})
         );
     }

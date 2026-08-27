@@ -1041,7 +1041,7 @@ impl ActiveChat {
             }
             ChatAction::SetSessionMode { mode_id } => {
                 let Some(command_id) = self.command_id("set-session-mode") else {
-                    self.state.current_mode = None;
+                    self.state.acp_surface.clear_current_mode();
                     return ChatEventOutcome::Handled;
                 };
                 queue_chat_remote_operation(
@@ -1396,8 +1396,8 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
 
 fn prompt_title(chat: &ChatState, queued: usize) -> String {
     let mut parts = [
-        chat.current_model.as_deref(),
-        chat.current_effort.as_deref(),
+        chat.acp_surface.current_model(),
+        chat.acp_surface.current_effort(),
     ]
     .into_iter()
     .flatten()
@@ -1818,7 +1818,7 @@ mod tests {
     #[test]
     fn composer_title_names_plan_mode_even_during_a_turn() {
         let mut chat = crate::hel_chat::test_support::grok_chat();
-        chat.current_mode = Some("plan".into());
+        chat.acp_surface.set_optimistic_plan_mode(true);
         chat.phase = WorkerPhase::Running;
 
         assert!(prompt_title(&chat, 0).contains("Prompt — PLAN MODE"));

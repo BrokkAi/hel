@@ -876,7 +876,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
         } => {
             // The optimistic toggle never happened, so drop it rather than
             // leave the status line claiming a mode the agent is not in.
-            chat.current_mode = None;
+            chat.acp_surface.clear_current_mode();
             chat.set_notice(format!(
                 "Session mode was not changed to {mode_id}: {error}"
             ));
@@ -887,7 +887,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             ..
         } => {
             chat.plan_command_pending = false;
-            chat.current_mode = Some(if requested_active { "plan" } else { "default" }.into());
+            chat.acp_surface.set_optimistic_plan_mode(requested_active);
             chat.set_notice(match ordinal {
                 Some(ordinal) => format!("Prompt accepted by relay at {ordinal}"),
                 None if requested_active => "Plan mode on".to_owned(),
@@ -901,14 +901,8 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             result: Err(error),
         } => {
             chat.plan_command_pending = false;
-            chat.current_mode = Some(
-                if control_applied == requested_active {
-                    "plan"
-                } else {
-                    "default"
-                }
-                .into(),
-            );
+            chat.acp_surface
+                .set_optimistic_plan_mode(control_applied == requested_active);
             restore_unsent_input(chat, &original);
             chat.set_notice(format!("Plan command was not completed: {error}"));
         }
@@ -922,7 +916,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             ..
         } => {
             if let Some(active) = desired_plan_active {
-                chat.current_mode = Some(if active { "plan" } else { "default" }.into());
+                chat.acp_surface.set_optimistic_plan_mode(active);
             }
             chat.set_notice("Answer sent")
         }
@@ -962,14 +956,14 @@ pub(super) fn queue_chat_remote_operation(
             ChatRemoteOperation::SetConfig { key, value, .. } => {
                 restore_unsent_input(chat, &config_command_text(&key, &value));
             }
-            ChatRemoteOperation::SetSessionMode { .. } => chat.current_mode = None,
+            ChatRemoteOperation::SetSessionMode { .. } => chat.acp_surface.clear_current_mode(),
             ChatRemoteOperation::PlanCommand {
                 original,
                 requested_active,
                 ..
             } => {
                 chat.plan_command_pending = false;
-                chat.current_mode = Some(if requested_active { "default" } else { "plan" }.into());
+                chat.acp_surface.set_optimistic_plan_mode(!requested_active);
                 restore_unsent_input(chat, &original);
             }
             ChatRemoteOperation::RespondElicitation { request, .. } => {
@@ -1015,7 +1009,7 @@ mod tests {
     #[test]
     fn failed_plan_control_restores_the_full_command_and_rolls_back_mode() {
         let mut chat = crate::hel_chat::test_support::grok_chat();
-        chat.current_mode = Some("plan".into());
+        chat.acp_surface.set_optimistic_plan_mode(true);
         chat.plan_command_pending = true;
 
         apply_chat_remote_result(
@@ -1028,7 +1022,7 @@ mod tests {
             },
         );
 
-        assert_eq!(chat.current_mode.as_deref(), Some("default"));
+        assert_eq!(chat.acp_surface.current_mode(), Some("default"));
         assert_eq!(chat.input, "/plan inspect this");
         assert!(!chat.plan_command_pending);
     }
@@ -1048,7 +1042,7 @@ mod tests {
             },
         );
 
-        assert_eq!(chat.current_mode.as_deref(), Some("plan"));
+        assert_eq!(chat.acp_surface.current_mode(), Some("plan"));
         assert_eq!(chat.input, "/plan inspect this");
     }
 

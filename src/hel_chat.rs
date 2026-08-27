@@ -35,7 +35,8 @@ use ratatui::style::Color;
 use sha2::{Digest, Sha256};
 
 use crate::clock::epoch_seconds;
-use crate::hel_acp::{RuntimeEvent, find_session_config_option, select_contains};
+use crate::hel_acp::surface::AcpSessionSurface;
+use crate::hel_acp::{PlanControl, RuntimeEvent};
 use crate::hel_config::HarnessKind;
 use crate::hel_elicitation::ElicitationValue;
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
@@ -53,7 +54,7 @@ use crate::hel_worker::{
 
 use autocomplete::{
     Autocomplete, CommandChoice, ConfigValueChoice, LocalCommand, builtin_command_choices,
-    config_current_value, is_goal_prompt, parse_local_command,
+    parse_local_command,
 };
 use elicitation::ElicitationDialog;
 use history::{HistorySearch, HistorySearchRequest};
@@ -131,12 +132,6 @@ pub enum ChatAction {
     },
     Back,
     QuitDetach,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanControl {
-    SetConfig { key: String, value: String },
-    SetSessionMode { mode_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,19 +295,11 @@ pub struct ChatState {
     elicitation: Option<ElicitationDialog>,
     recovery_busy: bool,
     goal_prompt_active: bool,
-    config_options: Vec<SessionConfigOption>,
-    session_modes: Option<SessionModeState>,
-    /// Latest ACP session mode, from `current_mode_update` by way of the
-    /// projection, or set optimistically when Hel asks for a change.
-    current_mode: Option<String>,
-    harness_kind: Option<HarnessKind>,
+    acp_surface: AcpSessionSurface,
     plan_command_pending: bool,
-    agent_commands: Vec<AvailableCommand>,
     command_choices: Vec<CommandChoice>,
     model_values: Vec<ConfigValueChoice>,
     effort_values: Vec<ConfigValueChoice>,
-    current_model: Option<String>,
-    current_effort: Option<String>,
     autocomplete: Option<Autocomplete>,
     anchor: TranscriptAnchor,
     last_viewport_height: usize,
@@ -374,30 +361,12 @@ impl ChatState {
             goal_prompt_active: snapshot
                 .active_prompt
                 .as_ref()
-                .is_some_and(|prompt| is_goal_prompt(&prompt.text)),
-            config_options: Vec::new(),
-            session_modes: None,
-            current_mode: snapshot
-                .config
-                .get("mode")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            harness_kind: None,
+                .is_some_and(|prompt| AcpSessionSurface::prompt_invokes(&prompt.text, "goal")),
+            acp_surface: AcpSessionSurface::from_configuration(&snapshot.config),
             plan_command_pending: false,
-            agent_commands: Vec::new(),
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
             effort_values: Vec::new(),
-            current_model: snapshot
-                .config
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            current_effort: snapshot
-                .config
-                .get("effort")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
             autocomplete: None,
             anchor: TranscriptAnchor::Bottom,
             last_viewport_height: 0,
@@ -553,35 +522,11 @@ impl ChatState {
             })
             .collect();
         self.set_config_options(config_options);
-        // `current_mode_update` lands in the projected configuration. Only
-        // overwrite when it is there, so an optimistic toggle survives until
-        // the agent confirms it.
-        let plan_mode_key = if self.harness_kind == Some(HarnessKind::Codex) {
-            "collaboration_mode"
-        } else {
-            "mode"
-        };
-        if let Some(mode) = session
-            .configuration
-            .get(plan_mode_key)
-            .and_then(serde_json::Value::as_str)
-        {
-            self.current_mode = Some(mode.to_owned());
-        }
-        self.agent_commands = available_commands.to_vec();
+        self.acp_surface
+            .apply_projected_configuration(&session.configuration);
+        self.acp_surface
+            .set_agent_commands(available_commands.to_vec());
         self.rebuild_command_choices();
-        self.current_model = session
-            .configuration
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| config_current_value(config_options, "model"));
-        self.current_effort = session
-            .configuration
-            .get("effort")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| config_current_value(config_options, "effort"));
     }
 
     fn take_diffstat_requests(&mut self, maximum: usize) -> Vec<ToolDiffstatRequest> {
@@ -679,108 +624,25 @@ impl ChatState {
     }
 
     pub fn set_session_modes(&mut self, modes: Option<SessionModeState>) {
-        let changed = self.session_modes != modes;
-        self.session_modes = modes;
-        if changed || self.current_mode.is_none() {
-            self.set_plan_mode_from_surfaces();
-        }
+        self.acp_surface.set_session_modes(modes);
         self.rebuild_command_choices();
     }
 
     pub fn set_harness_kind(&mut self, harness_kind: HarnessKind) {
-        self.harness_kind = Some(harness_kind);
-        self.set_plan_mode_from_surfaces();
+        self.acp_surface.set_harness_kind(harness_kind);
         self.rebuild_command_choices();
     }
 
-    fn set_plan_mode_from_surfaces(&mut self) {
-        let config_key = match self.harness_kind {
-            Some(HarnessKind::Codex) => "collaboration_mode",
-            Some(HarnessKind::Claude | HarnessKind::Kimi) => "mode",
-            _ => "mode",
-        };
-        if let Some(value) = config_current_value(&self.config_options, config_key) {
-            self.current_mode = Some(value);
-        } else if self.harness_kind != Some(HarnessKind::Codex) {
-            self.current_mode = self
-                .session_modes
-                .as_ref()
-                .map(|modes| modes.current_mode_id.to_string());
-        }
-    }
-
     fn supports_plan_mode(&self) -> bool {
-        self.plan_control(true).is_ok()
-    }
-
-    fn advertised_plan_modes(&self) -> bool {
-        self.session_modes.as_ref().is_some_and(|modes| {
-            ["plan", "default"].into_iter().all(|desired| {
-                modes
-                    .available_modes
-                    .iter()
-                    .any(|mode| mode.id.to_string() == desired)
-            })
-        })
-    }
-
-    fn config_has_plan_pair(&self, key: &str) -> bool {
-        find_session_config_option(&self.config_options, key).is_some_and(|option| {
-            select_contains(&option.kind, "plan") && select_contains(&option.kind, "default")
-        })
-    }
-
-    fn exact_config_has_plan_pair(&self, key: &str) -> bool {
-        self.config_options.iter().any(|option| {
-            option.id.to_string() == key
-                && select_contains(&option.kind, "plan")
-                && select_contains(&option.kind, "default")
-        })
+        self.acp_surface.supports_plan_mode()
     }
 
     fn plan_control(&self, active: bool) -> Result<PlanControl, &'static str> {
-        let value = if active { "plan" } else { "default" };
-        match self.harness_kind {
-            Some(HarnessKind::Deepseek) => Err("Plan mode is unsupported in DSH."),
-            Some(HarnessKind::Codex) => self
-                .exact_config_has_plan_pair("collaboration_mode")
-                .then(|| PlanControl::SetConfig {
-                    key: "collaboration_mode".into(),
-                    value: value.into(),
-                })
-                .ok_or("This Codex ACP version does not expose collaboration_mode with plan/default values."),
-            Some(HarnessKind::Claude | HarnessKind::Kimi) => {
-                if self.exact_config_has_plan_pair("mode") {
-                    Ok(PlanControl::SetConfig {
-                        key: "mode".into(),
-                        value: value.into(),
-                    })
-                } else if self.advertised_plan_modes() {
-                    Ok(PlanControl::SetSessionMode { mode_id: value.into() })
-                } else {
-                    Err("This ACP harness does not expose compatible plan/default modes.")
-                }
-            }
-            Some(HarnessKind::Grok) => Ok(PlanControl::SetSessionMode {
-                mode_id: value.into(),
-            }),
-            None => {
-                if self.config_has_plan_pair("mode") {
-                    Ok(PlanControl::SetConfig {
-                        key: "mode".into(),
-                        value: value.into(),
-                    })
-                } else if self.advertised_plan_modes() {
-                    Ok(PlanControl::SetSessionMode { mode_id: value.into() })
-                } else {
-                    Err("This ACP harness does not expose compatible plan/default modes.")
-                }
-            }
-        }
+        self.acp_surface.plan_control(active)
     }
 
     fn plan_mode_active(&self) -> bool {
-        self.supports_plan_mode() && self.current_mode.as_deref() == Some("plan")
+        self.acp_surface.plan_mode_active()
     }
 
     fn plan_review_followup(
@@ -867,7 +729,7 @@ impl ChatState {
 
     fn mark_prompt_submitted(&mut self, prompt: &str) {
         self.phase = WorkerPhase::Running;
-        self.goal_prompt_active = is_goal_prompt(prompt);
+        self.goal_prompt_active = AcpSessionSurface::prompt_invokes(prompt, "goal");
         self.notices.clear();
         // Local echo: start the clock now so the header moves with the send.
         // The next materialized update replaces this with the recorded start.
@@ -885,11 +747,7 @@ impl ChatState {
     }
 
     fn pursuing_goal(&self) -> bool {
-        self.goal_prompt_active
-            && self
-                .agent_commands
-                .iter()
-                .any(|command| command.name == "goal")
+        self.goal_prompt_active && self.acp_surface.advertises_command("goal")
     }
     pub fn entries(&self) -> &[ChatEntry] {
         &self.entries
@@ -1035,11 +893,14 @@ impl ChatState {
             .and_then(|entry| entry.recorded_at_ms)
             .unwrap_or_default();
         let mut configuration = BTreeMap::new();
-        if let Some(model) = &self.current_model {
-            configuration.insert("model".into(), serde_json::Value::String(model.clone()));
+        if let Some(model) = self.acp_surface.current_model() {
+            configuration.insert("model".into(), serde_json::Value::String(model.to_owned()));
         }
-        if let Some(effort) = &self.current_effort {
-            configuration.insert("effort".into(), serde_json::Value::String(effort.clone()));
+        if let Some(effort) = self.acp_surface.current_effort() {
+            configuration.insert(
+                "effort".into(),
+                serde_json::Value::String(effort.to_owned()),
+            );
         }
         let applied_event_digest = if self.latest_seq == 0 {
             RELAY_EVENT_GENESIS_DIGEST.to_owned()
@@ -1267,7 +1128,7 @@ impl ChatState {
                     };
                     self.record_prompt_history(&prompt);
                     self.clear_input();
-                    self.current_mode = Some(if requested { "plan" } else { "default" }.into());
+                    self.acp_surface.set_optimistic_plan_mode(requested);
                     self.plan_command_pending = true;
                     self.set_notice(if requested {
                         "Plan mode on"
@@ -1307,7 +1168,7 @@ impl ChatState {
                     };
                     self.record_prompt_history(&prompt);
                     self.clear_input();
-                    self.current_mode = Some("default".into());
+                    self.acp_surface.set_optimistic_plan_mode(false);
                     self.plan_command_pending = true;
                     ChatAction::PlanCommand {
                         original: prompt,
@@ -1847,20 +1708,16 @@ impl ChatState {
                 }
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
-                self.agent_commands = update.available_commands;
+                self.acp_surface
+                    .set_agent_commands(update.available_commands);
                 self.rebuild_command_choices();
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.set_config_options(&update.config_options);
             }
-            SessionUpdate::CurrentModeUpdate(update)
-                if self.harness_kind != Some(HarnessKind::Codex) =>
-            {
-                self.current_mode = Some(update.current_mode_id.to_string());
-                if let Some(modes) = self.session_modes.as_mut() {
-                    modes.current_mode_id = update.current_mode_id;
-                }
-            }
+            SessionUpdate::CurrentModeUpdate(update) => self
+                .acp_surface
+                .apply_current_mode_update(update.current_mode_id.to_string()),
             _ => {}
         }
     }
@@ -2858,7 +2715,7 @@ mod tests {
     #[test]
     fn implement_exits_plan_mode_before_submitting_the_instruction() {
         let mut chat = grok_chat();
-        chat.current_mode = Some("plan".into());
+        chat.acp_surface.set_optimistic_plan_mode(true);
         chat.set_input("/implement start with the parser".into());
         assert_eq!(
             chat.submit_input(),
@@ -2876,7 +2733,7 @@ mod tests {
     #[test]
     fn plan_review_choices_have_distinct_followup_directions() {
         let mut chat = grok_chat();
-        chat.current_mode = Some("plan".into());
+        chat.acp_surface.set_optimistic_plan_mode(true);
         let standard = ElicitationRequest {
             id: "plan-review-1".into(),
             message: "review".into(),
