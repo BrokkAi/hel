@@ -572,10 +572,14 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
             // Keep the transcript readable rather than tearing the dashboard
             // down around a stopped manager.
             tracing::warn!(error = format!("{error:#}"), "chat session view failed");
+            state.set_transcript_loading(false);
             state.set_notice(format!("connection lost: {error:#}"));
             return false;
         }
     };
+    if view.snapshot.is_some() || view.error.is_some() {
+        state.set_transcript_loading(false);
+    }
     if let Some(snapshot) = view.snapshot {
         state.apply_materialized(
             &snapshot.materialized,
@@ -755,6 +759,7 @@ impl ActiveChat {
             tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
         let remote = ChatRemoteSupervisor::spawn(session.clone());
         if needs_initial_sync {
+            state.set_transcript_loading(true);
             state.set_notice("Connecting to session relay…");
             queue_chat_remote_operation(remote.operations(), ChatRemoteOperation::Sync, &mut state);
         }
@@ -1653,6 +1658,7 @@ mod tests {
     #[test]
     fn an_off_screen_chat_follows_the_session_view() {
         let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
         let mut session = MaterializedSession::empty("session-warm");
         session.applied_event_ordinal = 5;
         session.applied_event_digest = "a".repeat(64);
@@ -1664,6 +1670,7 @@ mod tests {
         ));
         assert_eq!(chat.latest_seq(), 5);
         assert_eq!(chat.entries.len(), 1);
+        assert!(!chat.transcript_loading);
 
         session.applied_event_ordinal = 8;
         session.transcript.push(agent_transcript_item("second", 8));

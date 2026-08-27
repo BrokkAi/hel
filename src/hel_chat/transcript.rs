@@ -959,7 +959,7 @@ impl ChatState {
         let top = TranscriptAnchor::Row { entry: 0, row: 0 };
         if self.entries.is_empty() && fallback.is_none() {
             return TranscriptViewport {
-                rows: vec![empty_transcript_row()],
+                rows: vec![empty_transcript_row(self.transcript_loading)],
                 anchor: TranscriptAnchor::Bottom,
                 top,
             };
@@ -1533,14 +1533,18 @@ pub(super) fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'st
         ));
     }
     if lines.is_empty() {
-        lines.push(empty_transcript_row());
+        lines.push(empty_transcript_row(chat.transcript_loading));
     }
     lines
 }
 
-fn empty_transcript_row() -> Line<'static> {
+fn empty_transcript_row(loading: bool) -> Line<'static> {
     Line::from(Span::styled(
-        "No messages yet — send a prompt to begin.",
+        if loading {
+            "[Loading]"
+        } else {
+            "No messages yet — send a prompt to begin."
+        },
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
@@ -1775,6 +1779,20 @@ mod tests {
 
     fn completed_tool(seq: u64, title: &str) -> ChatEntry {
         ChatEntry::tool(seq, title, None, ToolStatus::Completed)
+    }
+
+    #[test]
+    fn an_empty_conversation_identifies_initial_relay_loading() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
+
+        assert_eq!(transcript_text(&mut chat, 80), ["[Loading]"]);
+
+        chat.set_transcript_loading(false);
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            ["No messages yet — send a prompt to begin."]
+        );
     }
 
     #[test]

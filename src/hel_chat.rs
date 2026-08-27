@@ -268,6 +268,10 @@ pub struct ChatState {
     /// prefix has to end at to be spliced in front of the tail. `None`
     /// whenever the projection is complete.
     prefix_seam: Option<Arc<TranscriptItem>>,
+    /// The session actor has not produced its first relay projection yet.
+    /// Empty transcripts render a loading marker until that connection attempt
+    /// either yields a snapshot or fails.
+    transcript_loading: bool,
     input: String,
     input_cursor: usize,
     /// Stored prompts from other sessions in this project, oldest-first.
@@ -340,6 +344,7 @@ impl ChatState {
             scheduled_diffstats: BTreeSet::new(),
             unconverted_prefix: 0,
             prefix_seam: None,
+            transcript_loading: false,
             input: String::new(),
             input_cursor: 0,
             project_history: Vec::new(),
@@ -650,6 +655,10 @@ impl ChatState {
 
     pub fn phase(&self) -> WorkerPhase {
         self.phase
+    }
+
+    pub(super) fn set_transcript_loading(&mut self, loading: bool) {
+        self.transcript_loading = loading;
     }
 
     pub fn set_history_context(&mut self, bundle_id: impl Into<String>) {

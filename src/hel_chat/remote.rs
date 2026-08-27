@@ -802,8 +802,12 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
         );
     }
     match result {
-        ChatRemoteResult::Sync(Ok(())) => chat.set_notice("Connected to session relay"),
+        ChatRemoteResult::Sync(Ok(())) => {
+            chat.set_transcript_loading(false);
+            chat.set_notice("Connected to session relay");
+        }
         ChatRemoteResult::Sync(Err(error)) => {
+            chat.set_transcript_loading(false);
             chat.set_notice(format!("Connection failed: {error}"))
         }
         ChatRemoteResult::Prompt {
