@@ -33,7 +33,7 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// Ceiling for reconnect backoff. A worker that exited stays gone until the
 /// user acts, so retrying it every second only burns process spawns.
 const RECONNECT_BACKOFF_CEILING: Duration = Duration::from_secs(30);
-const UNREACHABLE_FAILURE_THRESHOLD: u32 = 4;
+const UNREACHABLE_FAILURE_THRESHOLD: u32 = 2;
 const WORKER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 
