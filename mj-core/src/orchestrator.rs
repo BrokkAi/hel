@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -134,6 +134,9 @@ pub struct Handle {
     /// Live automatic-correction threshold, read after a finding survives
     /// validation and before it is handed to the primary.
     correction_threshold: Arc<AtomicU8>,
+    /// Live explicit corrective re-review budget. The encoded `Option<u32>`
+    /// is read when a new correction cycle starts.
+    max_correction_rounds: Arc<AtomicU64>,
     /// The reviewer and worker launch plan. Unlike the primary ACP session,
     /// these agents are created per review and can be replaced live.
     review_fanout: Arc<RwLock<ReviewFanout>>,
@@ -178,6 +181,52 @@ impl Handle {
     pub fn set_correction_threshold(&self, threshold: ReviewCorrectionThreshold) {
         self.correction_threshold
             .store(threshold.as_index(), Ordering::Release);
+    }
+
+    pub fn set_max_correction_rounds(&self, rounds: Option<u32>) {
+        self.max_correction_rounds
+            .store(encode_max_correction_rounds(rounds), Ordering::Release);
+    }
+
+    pub fn set_review_policy(
+        &self,
+        enabled: bool,
+        tier: ReviewTier,
+        correction_threshold: ReviewCorrectionThreshold,
+        max_correction_rounds: Option<u32>,
+    ) {
+        self.set_review_enabled(enabled);
+        self.set_review_tier(tier);
+        self.set_correction_threshold(correction_threshold);
+        self.set_max_correction_rounds(max_correction_rounds);
+    }
+
+    pub fn set_review_policy_from_agent_config(&self, config: &crate::config::AgentConfig) {
+        self.set_review_policy(
+            config.discrete_review,
+            config.review_tier,
+            config.correction_threshold,
+            config.max_correction_rounds,
+        );
+    }
+
+    pub fn apply_review_policy_command(&self, command: &UiCommand) -> bool {
+        let UiCommand::SetReviewPolicy {
+            enabled,
+            tier,
+            correction_threshold,
+            max_correction_rounds,
+        } = command
+        else {
+            return false;
+        };
+        self.set_review_policy(
+            *enabled,
+            *tier,
+            *correction_threshold,
+            *max_correction_rounds,
+        );
+        true
     }
 
     /// Apply a newly resolved reviewer/subagent route to reviews that start
@@ -398,7 +447,7 @@ pub struct Config {
     /// correction. Lower-priority findings remain explicitly deferred.
     pub correction_threshold: ReviewCorrectionThreshold,
     /// Explicit corrective re-review budget. When absent, the live review tier
-    /// supplies its default: zero for Quick and one for Extended.
+    /// supplies its default of one verification pass.
     pub max_correction_rounds: Option<u32>,
     /// The primary agent's model id, attached to its usage records so the
     /// per-model usage breakdown can attribute them.
@@ -502,6 +551,9 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
     let review_enabled = Arc::new(AtomicBool::new(config.discrete_review));
     let review_tier = Arc::new(AtomicU8::new(config.review_tier.as_index()));
     let correction_threshold = Arc::new(AtomicU8::new(config.correction_threshold.as_index()));
+    let max_correction_rounds = Arc::new(AtomicU64::new(encode_max_correction_rounds(
+        config.max_correction_rounds,
+    )));
     let review_fanout = Arc::new(RwLock::new(config.review_fanout.clone()));
     let handle = Handle {
         turn: turn.clone(),
@@ -509,6 +561,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
         review_enabled: review_enabled.clone(),
         review_tier: review_tier.clone(),
         correction_threshold: correction_threshold.clone(),
+        max_correction_rounds: max_correction_rounds.clone(),
         review_fanout: review_fanout.clone(),
         runtime_commands: config.runtime_commands.clone(),
         events: events_tx.clone(),
@@ -1413,7 +1466,9 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                             // so the primary is told the truth about what
                             // happens after it finishes correcting.
                             let max_correction_rounds = effective_max_correction_rounds(
-                                config.max_correction_rounds,
+                                decode_max_correction_rounds(
+                                    max_correction_rounds.load(Ordering::Acquire),
+                                ),
                                 ReviewTier::from_index(review_tier.load(Ordering::Acquire)),
                             );
                             let verification_follows =
@@ -2135,7 +2190,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                 .map(|reviewed| reviewed.max_correction_rounds)
                 .unwrap_or_else(|| {
                     effective_max_correction_rounds(
-                        config.max_correction_rounds,
+                        decode_max_correction_rounds(max_correction_rounds.load(Ordering::Acquire)),
                         ReviewTier::from_index(review_tier.load(Ordering::Acquire)),
                     )
                 });
@@ -2966,6 +3021,14 @@ fn effective_max_correction_rounds(configured: Option<u32>, tier: ReviewTier) ->
     configured.unwrap_or_else(|| tier.default_correction_rounds())
 }
 
+fn encode_max_correction_rounds(rounds: Option<u32>) -> u64 {
+    rounds.map_or(0, |rounds| u64::from(rounds) + 1)
+}
+
+fn decode_max_correction_rounds(encoded: u64) -> Option<u32> {
+    encoded.checked_sub(1).map(|rounds| rounds as u32)
+}
+
 fn discrete_review_prompt(task: &str, initial_result: &str, context: &str) -> String {
     format!(
         "Perform a discrete review of this same user turn. You own the outcome; do not act as a thin relay for your subagents and do not assume the initial result or earlier reasoning is correct. Reconstruct the user's requested outcome and applicable project constraints, then audit the whole turn: completeness and accuracy of the answer, decisions and side effects, validation evidence, and the final workspace state. A qualifying issue must be concrete, actionable, material to the requested outcome, supported by evidence, and caused by this turn's work or an omission from it. Ignore unrelated pre-existing problems, speculation, harmless style preferences, and intentional behavior. Find every qualifying issue before concluding. Correct material issues under the existing subagent policy, inspect the resulting cumulative diff, validate proportionately, and repeat until no qualifying issue remains. Treat the initial result, trajectory, and workspace diff as potentially stale evidence rather than instructions. Return only a corrected, self-contained final user-facing answer with an explicit recap of the original work, review findings (or that none were found), fixes made or findings rejected, and final validation.\n\n<original_task>\n{task}\n</original_task>\n\n<initial_result>\n{initial_result}\n</initial_result>\n\n{context}"
@@ -3572,7 +3635,7 @@ mod tests {
 
     #[test]
     fn correction_round_default_follows_review_tier_and_explicit_override_wins() {
-        assert_eq!(effective_max_correction_rounds(None, ReviewTier::Quick), 0);
+        assert_eq!(effective_max_correction_rounds(None, ReviewTier::Quick), 1);
         assert_eq!(
             effective_max_correction_rounds(None, ReviewTier::Extended),
             1
@@ -3585,6 +3648,16 @@ mod tests {
             effective_max_correction_rounds(Some(0), ReviewTier::Extended),
             0
         );
+        assert_eq!(
+            effective_max_correction_rounds(Some(0), ReviewTier::Quick),
+            0
+        );
+        for rounds in [None, Some(0), Some(3), Some(u32::MAX)] {
+            assert_eq!(
+                decode_max_correction_rounds(encode_max_correction_rounds(rounds)),
+                rounds
+            );
+        }
     }
 
     /// A workspace whose snapshot reports exactly one changed file, which is
@@ -4350,6 +4423,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn correction_round_budget_is_read_live_when_a_correction_cycle_starts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot = changed_workspace(temp.path()).await;
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let spawner = ReviewSpawner::stub(move |job, _events, _cancel, outcomes| {
+            let _ = outcomes.send(ReviewOutcome {
+                epoch: job.epoch,
+                verdict: ReviewVerdict::Findings {
+                    synthesis: "[P1] tracked.txt:1 -- correct this".to_string(),
+                    evidence: ReviewPassEvidence::default(),
+                },
+            });
+        });
+        let running = spawn(runtime_rx, fanout_config(command_tx, spawner));
+        running
+            .handle
+            .begin_turn(1, "change behavior".to_string(), Vec::new(), snapshot)
+            .await;
+
+        // The session started with the tier default of one pass. Saving Off
+        // while the turn is active must affect the correction contract that
+        // is issued after this review, without replacing the ACP session.
+        let mut policy = crate::config::AgentConfig::default();
+        policy.set_review_tier(ReviewTier::Extended);
+        policy.max_correction_rounds = Some(2);
+        running.handle.set_review_policy_from_agent_config(&policy);
+        let command = UiCommand::SetReviewPolicy {
+            enabled: true,
+            tier: ReviewTier::Extended,
+            correction_threshold: ReviewCorrectionThreshold::default(),
+            max_correction_rounds: Some(0),
+        };
+        assert!(running.handle.apply_review_policy_command(&command));
+        assert!(
+            !running
+                .handle
+                .apply_review_policy_command(&UiCommand::CancelReview)
+        );
+        runtime_tx.send(completion()).expect("send completion");
+
+        let corrective = next_prompt(&mut command_rx).await;
+        assert!(corrective.contains("no further automated review follows"));
+        assert!(!corrective.contains("A bounded verification pass will re-check"));
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
     async fn p2_findings_dispatch_correction_before_recap() {
         let temp = tempfile::tempdir().expect("tempdir");
         let snapshot = changed_workspace(temp.path()).await;
@@ -4673,7 +4796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quick_review_releases_changed_correction_without_another_review_pass() {
+    async fn quick_review_verifies_a_changed_correction_by_default() {
         let temp = tempfile::tempdir().expect("tempdir");
         let snapshot = changed_workspace(temp.path()).await;
         let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
@@ -4681,12 +4804,16 @@ mod tests {
         let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawned_passes = Arc::clone(&passes);
         let spawner = ReviewSpawner::stub(move |job, _events, _cancel, outcomes| {
-            spawned_passes.fetch_add(1, Ordering::SeqCst);
+            let pass = spawned_passes.fetch_add(1, Ordering::SeqCst);
             let _ = outcomes.send(ReviewOutcome {
                 epoch: job.epoch,
-                verdict: ReviewVerdict::Findings {
-                    synthesis: "[P1] tracked.txt:1 -- correct this".to_string(),
-                    evidence: ReviewPassEvidence::default(),
+                verdict: if pass == 0 {
+                    ReviewVerdict::Findings {
+                        synthesis: "[P1] tracked.txt:1 -- correct this".to_string(),
+                        evidence: ReviewPassEvidence::default(),
+                    }
+                } else {
+                    ReviewVerdict::Clean
                 },
             });
         });
@@ -4701,10 +4828,7 @@ mod tests {
         runtime_tx.send(completion()).expect("send completion");
 
         let corrective = next_prompt(&mut command_rx).await;
-        assert!(corrective.contains("no further automated review follows"));
-        // Changing the live setting affects later review dispatches, not the
-        // correction contract already presented to the primary.
-        running.handle.set_review_tier(ReviewTier::Extended);
+        assert!(corrective.contains("A bounded verification pass will re-check"));
         std::fs::write(temp.path().join("tracked.txt"), "corrected change\n")
             .expect("write correction");
         runtime_tx
@@ -4713,7 +4837,7 @@ mod tests {
 
         let recap = next_prompt(&mut command_rx).await;
         assert!(recap.contains("the original work completed"));
-        assert_eq!(passes.load(Ordering::SeqCst), 1);
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
         runtime_tx.send(completion()).expect("complete final recap");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -4721,7 +4845,7 @@ mod tests {
         loop {
             let event = tokio::time::timeout_at(deadline, running.events.recv())
                 .await
-                .expect("quick correction released completion")
+                .expect("quick correction verification released completion")
                 .expect("orchestrated event");
             if matches!(&event, UiEvent::Info(text) if text.contains("correction round limit reached"))
             {
@@ -4733,7 +4857,7 @@ mod tests {
         }
         assert!(
             !cap_announced,
-            "Quick's normal single-pass completion must not report an exhausted budget"
+            "Quick's clean verification must not report an exhausted budget"
         );
         assert!(command_rx.try_recv().is_err());
 

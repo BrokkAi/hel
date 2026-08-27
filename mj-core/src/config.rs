@@ -772,11 +772,11 @@ impl ReviewTier {
     }
 
     /// Corrective re-review passes used when the user has not configured an
-    /// explicit round budget. Quick stays single-pass; Extended verifies one
-    /// findings-driven correction before releasing the turn.
+    /// explicit round budget. Both tiers verify one findings-driven correction
+    /// before releasing the turn.
     pub const fn default_correction_rounds(self) -> u32 {
         match self {
-            Self::Quick => 0,
+            Self::Quick => 1,
             Self::Extended => 1,
         }
     }
@@ -801,6 +801,54 @@ impl ReviewTier {
     fn is_default(&self) -> bool {
         matches!(self, Self::Quick)
     }
+}
+
+/// Compact correction-round choices shared by the terminal and web settings
+/// panels. A saved custom value is retained so opening the panel never makes
+/// an existing config impossible to select again.
+pub const CORRECTION_ROUND_PRESETS: [u32; 4] = [0, 1, 2, 3];
+
+pub fn correction_round_choices(configured: Option<u32>) -> Vec<Option<u32>> {
+    let mut choices = Vec::with_capacity(CORRECTION_ROUND_PRESETS.len() + 2);
+    choices.push(None);
+    choices.extend(CORRECTION_ROUND_PRESETS.into_iter().map(Some));
+    if !choices.contains(&configured) {
+        choices.push(configured);
+    }
+    choices
+}
+
+pub fn correction_round_label(configured: Option<u32>, tier: ReviewTier) -> String {
+    match configured {
+        None => format!(
+            "Default ({})",
+            verification_pass_count(tier.default_correction_rounds())
+        ),
+        Some(0) => "Off (0)".to_string(),
+        Some(rounds) => verification_pass_count(rounds),
+    }
+}
+
+pub fn correction_round_description(configured: Option<u32>, tier: ReviewTier) -> String {
+    match configured {
+        None => format!(
+            "use the {} default: {} per user turn",
+            tier.label(),
+            verification_pass_count(tier.default_correction_rounds())
+        ),
+        Some(0) => "do not automatically verify findings-driven corrections".to_string(),
+        Some(rounds) => format!(
+            "run up to {} per user turn",
+            verification_pass_count(rounds)
+        ),
+    }
+}
+
+fn verification_pass_count(rounds: u32) -> String {
+    format!(
+        "{rounds} verification {}",
+        if rounds == 1 { "pass" } else { "passes" }
+    )
 }
 
 impl std::fmt::Display for ReviewTier {
@@ -961,7 +1009,7 @@ pub struct AgentConfig {
     pub correction_threshold: ReviewCorrectionThreshold,
     /// Explicit override for how many corrective re-review passes one user
     /// turn may dispatch after its initial discrete review. When omitted,
-    /// Quick uses zero and Extended uses one.
+    /// both tiers use one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_correction_rounds: Option<u32>,
     /// Minutes without an ACP update before an active primary, review, or
@@ -1939,7 +1987,7 @@ mod tests {
         assert!(cfg.agent.discrete_review);
         assert!(cfg.agent.bifrost_analysis);
         assert_eq!(cfg.agent.max_correction_rounds, None);
-        assert_eq!(cfg.agent.review_tier.default_correction_rounds(), 0);
+        assert_eq!(cfg.agent.review_tier.default_correction_rounds(), 1);
         assert_eq!(cfg.subagents.model, "auto");
         assert_eq!(
             cfg.agent.acp_priority,
@@ -1983,6 +2031,26 @@ mod tests {
         assert_eq!(
             Config::load(&path).expect("reload").agent.review_tier,
             ReviewTier::Extended
+        );
+    }
+
+    #[test]
+    fn correction_round_choices_include_default_presets_and_saved_custom_value() {
+        assert_eq!(
+            correction_round_choices(None),
+            vec![None, Some(0), Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(
+            correction_round_choices(Some(7)),
+            vec![None, Some(0), Some(1), Some(2), Some(3), Some(7)]
+        );
+        assert_eq!(
+            correction_round_label(None, ReviewTier::Quick),
+            "Default (1 verification pass)"
+        );
+        assert_eq!(
+            correction_round_description(Some(0), ReviewTier::Quick),
+            "do not automatically verify findings-driven corrections"
         );
     }
 

@@ -452,6 +452,7 @@ pub enum UiCommand {
         enabled: bool,
         tier: crate::config::ReviewTier,
         correction_threshold: crate::config::ReviewCorrectionThreshold,
+        max_correction_rounds: Option<u32>,
     },
     /// Re-resolve and replace the reviewer and subagent seats while retaining
     /// the active primary ACP session. The command is accepted only when the

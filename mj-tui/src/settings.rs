@@ -58,6 +58,7 @@ enum SettingsRow {
     BifrostVersion,
     ReviewTier,
     CorrectionThreshold,
+    MaxCorrectionRounds,
     MaxParallelSubagents,
     AutomaticQuotaFailover,
 }
@@ -78,6 +79,9 @@ pub struct SettingsEditor {
     /// The pin as saved when the editor opened. The cycle list anchors to it
     /// so an older pin stays reachable after stepping off it.
     saved_bifrost_version: Option<String>,
+    /// The correction budget as saved when the editor opened. A custom value
+    /// must stay in the choice wheel after the user steps off it.
+    saved_max_correction_rounds: Option<u32>,
 }
 
 impl SettingsEditor {
@@ -85,6 +89,7 @@ impl SettingsEditor {
         config.apply_registered_external_team();
         let inventory = crate::roster::discover_inventory(&config);
         let saved_bifrost_version = config.review.bifrost_version.clone();
+        let saved_max_correction_rounds = config.agent.max_correction_rounds;
         Self {
             config,
             tab: SettingsTab::Team,
@@ -98,6 +103,7 @@ impl SettingsEditor {
             bifrost_versions_loading: false,
             bifrost_versions_error: None,
             saved_bifrost_version,
+            saved_max_correction_rounds,
         }
     }
 
@@ -254,6 +260,7 @@ impl SettingsEditor {
                 }
                 SettingsRow::ReviewTier => self.cycle_review_tier(delta),
                 SettingsRow::CorrectionThreshold => self.cycle_correction_threshold(delta),
+                SettingsRow::MaxCorrectionRounds => self.cycle_max_correction_rounds(delta),
                 SettingsRow::BifrostVersion => self.cycle_bifrost_version(delta),
                 SettingsRow::DiscreteReview
                 | SettingsRow::BifrostAnalysis
@@ -366,6 +373,7 @@ impl SettingsEditor {
                 // left/right keys do rather than doing nothing here.
                 SettingsRow::ReviewTier => self.cycle_review_tier(1),
                 SettingsRow::CorrectionThreshold => self.cycle_correction_threshold(1),
+                SettingsRow::MaxCorrectionRounds => self.cycle_max_correction_rounds(1),
                 SettingsRow::BifrostVersion => self.cycle_bifrost_version(1),
                 SettingsRow::AutomaticQuotaFailover => {
                     self.config.subagents.auto_failover = !self.config.subagents.auto_failover;
@@ -435,6 +443,7 @@ impl SettingsEditor {
                 rows.push(SettingsRow::BifrostVersion);
                 rows.push(SettingsRow::ReviewTier);
                 rows.push(SettingsRow::CorrectionThreshold);
+                rows.push(SettingsRow::MaxCorrectionRounds);
                 rows
             }
             SettingsTab::Subagents => {
@@ -709,6 +718,16 @@ impl SettingsEditor {
             .unwrap_or(thresholds.len() - 1);
         let next = (current as i32 + delta).rem_euclid(thresholds.len() as i32) as usize;
         self.config.agent.correction_threshold = thresholds[next];
+    }
+
+    fn cycle_max_correction_rounds(&mut self, delta: i32) {
+        let choices = crate::config::correction_round_choices(self.saved_max_correction_rounds);
+        let current = choices
+            .iter()
+            .position(|rounds| *rounds == self.config.agent.max_correction_rounds)
+            .unwrap_or(0);
+        let next = (current as i32 + delta).rem_euclid(choices.len() as i32) as usize;
+        self.config.agent.max_correction_rounds = choices[next];
     }
 
     fn cycle_team(&mut self, delta: i32) {
@@ -1184,6 +1203,7 @@ fn draw_agents(
             | SettingsRow::BifrostVersion
             | SettingsRow::ReviewTier
             | SettingsRow::CorrectionThreshold
+            | SettingsRow::MaxCorrectionRounds
             | SettingsRow::MaxParallelSubagents
             | SettingsRow::AutomaticQuotaFailover => {}
         }
@@ -1363,6 +1383,42 @@ fn draw_reviewer(
                     ));
                 }
             }
+            SettingsRow::MaxCorrectionRounds => {
+                let configured = editor.config.agent.max_correction_rounds;
+                lines.push(selected_line(
+                    selected,
+                    format!(
+                        "Post-correction verification < {} >",
+                        crate::config::correction_round_label(
+                            configured,
+                            editor.config.agent.review_tier
+                        )
+                    ),
+                    theme,
+                ));
+                lines.push(Line::styled(
+                    format!(
+                        "  {}",
+                        crate::config::correction_round_description(
+                            configured,
+                            editor.config.agent.review_tier
+                        )
+                    ),
+                    Style::default().ink(
+                        if !editor.config.agent.discrete_review || configured == Some(0) {
+                            theme.warning
+                        } else {
+                            theme.muted
+                        },
+                    ),
+                ));
+                if !editor.config.agent.discrete_review {
+                    lines.push(Line::styled(
+                        "  discrete review is off, so no correction is verified",
+                        Style::default().ink(theme.warning),
+                    ));
+                }
+            }
             SettingsRow::PrimaryModel
             | SettingsRow::SubagentModel
             | SettingsRow::SubagentPermissions
@@ -1464,7 +1520,8 @@ fn draw_subagents(
             | SettingsRow::BifrostAnalysis
             | SettingsRow::BifrostVersion
             | SettingsRow::ReviewTier
-            | SettingsRow::CorrectionThreshold => {}
+            | SettingsRow::CorrectionThreshold
+            | SettingsRow::MaxCorrectionRounds => {}
         }
     }
     draw_scrolling_settings_lines(frame, area, lines, selected_line_index);
@@ -2655,6 +2712,10 @@ mod tests {
             .iter()
             .position(|row| *row == SettingsRow::CorrectionThreshold)
             .expect("correction threshold row");
+        let rounds = rows
+            .iter()
+            .position(|row| *row == SettingsRow::MaxCorrectionRounds)
+            .expect("correction rounds row");
         assert_eq!(analysis, review + 1, "analysis belongs beside review");
         assert_eq!(bifrost, analysis + 1, "the Bifrost pin follows analysis");
         assert_eq!(tier, bifrost + 1, "the tier follows the Bifrost pin");
@@ -2662,6 +2723,11 @@ mod tests {
             threshold,
             tier + 1,
             "the correction policy belongs beside review depth"
+        );
+        assert_eq!(
+            rounds,
+            threshold + 1,
+            "post-correction verification belongs beside correction policy"
         );
 
         editor.selected = analysis;
@@ -2695,6 +2761,15 @@ mod tests {
             editor.config.agent.correction_threshold,
             crate::config::ReviewCorrectionThreshold::P3
         );
+        editor.selected = rounds;
+        assert_eq!(editor.config.agent.max_correction_rounds, None);
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(editor.config.agent.max_correction_rounds, Some(0));
+        assert_eq!(
+            editor.handle_key(KeyCode::Char(' ')),
+            SettingsAction::Changed
+        );
+        assert_eq!(editor.config.agent.max_correction_rounds, Some(1));
         editor.selected = tier;
         // Two tiers, so left, right, and the toggle key all return to Quick.
         assert_eq!(editor.handle_key(KeyCode::Left), SettingsAction::Changed);
@@ -2704,6 +2779,24 @@ mod tests {
             SettingsAction::Changed
         );
         assert_eq!(editor.config.agent.review_tier, ReviewTier::Extended);
+    }
+
+    #[test]
+    fn custom_correction_round_budget_stays_reachable_after_cycling_away() {
+        let mut config = Config::default();
+        config.agent.max_correction_rounds = Some(7);
+        let mut editor = SettingsEditor::new(config, Vec::new(), None);
+        editor.tab = SettingsTab::Reviewer;
+        editor.selected = editor
+            .settings_rows(SettingsTab::Reviewer)
+            .iter()
+            .position(|row| *row == SettingsRow::MaxCorrectionRounds)
+            .expect("correction rounds row");
+
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(editor.config.agent.max_correction_rounds, None);
+        assert_eq!(editor.handle_key(KeyCode::Left), SettingsAction::Changed);
+        assert_eq!(editor.config.agent.max_correction_rounds, Some(7));
     }
 
     #[test]
@@ -3108,6 +3201,14 @@ mod tests {
         );
         assert!(reviewer.contains("Review depth"), "rendered:\n{reviewer}");
         assert!(reviewer.contains("Quick"), "rendered:\n{reviewer}");
+        assert!(
+            reviewer.contains("Post-correction verification"),
+            "rendered:\n{reviewer}"
+        );
+        assert!(
+            reviewer.contains("Default (1 verification pass)"),
+            "rendered:\n{reviewer}"
+        );
 
         editor.tab = SettingsTab::Subagents;
         let subagents = render(&editor, 100, 30);

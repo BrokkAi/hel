@@ -127,11 +127,12 @@ thorough than Quick and spends far more tokens:
 On both tiers, surviving findings are injected as a corrective turn on the
 primary, framed as strong leads to verify rather than instructions to obey.
 Nothing surviving means the turn is released as it stands. If correction
-changes the workspace, Quick releases it after the primary's required
-validation. Extended runs one bounded, delta-scoped verification pass over the
-correction while reusing prior evidence instead of blindly relaunching every
-reviewer. Set `max_correction_rounds` under `[agent]` to override either tier's
-default.
+changes the workspace, both tiers run one bounded, delta-scoped verification
+pass over the correction while reusing prior evidence instead of blindly
+relaunching the review. Set `max_correction_rounds` under `[agent]` to override
+either tier's default, including `0` to disable post-correction verification.
+The same control is available as **Post-correction verification** in the
+Reviewer panel of `/mjconfig`.
 
 Reviewers have no model-turn deadline. The extended supervisor is reported as
 an internal `review_session`, while dispatched reviewers — General on the quick

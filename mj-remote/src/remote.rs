@@ -5346,6 +5346,8 @@ struct MjAgentsPanel {
     review_tiers: Vec<MjReviewTierEntry>,
     correction_threshold: String,
     correction_thresholds: Vec<MjCorrectionThresholdEntry>,
+    max_correction_rounds: String,
+    correction_round_choices: Vec<MjCorrectionRoundEntry>,
     bifrost_version: String,
     bifrost_default_version: String,
     bifrost_versions: Vec<String>,
@@ -5400,6 +5402,13 @@ struct MjReviewTierEntry {
 #[derive(Debug, Serialize)]
 struct MjCorrectionThresholdEntry {
     threshold: String,
+    label: String,
+    description: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MjCorrectionRoundEntry {
+    value: String,
     label: String,
     description: String,
 }
@@ -5533,6 +5542,8 @@ struct MjConfigApplyRequest {
     review_tier: Option<String>,
     /// `p0` | `p1` | `p2` | `p3`.
     correction_threshold: Option<String>,
+    /// `default` or a non-negative integer encoded as a string.
+    max_correction_rounds: Option<String>,
     /// `latest` or an exact semantic version from the npm catalog.
     bifrost_version: Option<String>,
     max_parallel: Option<usize>,
@@ -5684,6 +5695,33 @@ fn mjconfig_permission_panel(permission: config::PermissionPreset) -> MjPermissi
 }
 
 const MJ_SEAT_IDS: [&str; 3] = ["primary", "review", "subagents"];
+const DEFAULT_CORRECTION_ROUNDS_VALUE: &str = "default";
+
+fn correction_rounds_wire_value(configured: Option<u32>) -> String {
+    configured
+        .map(|rounds| rounds.to_string())
+        .unwrap_or_else(|| DEFAULT_CORRECTION_ROUNDS_VALUE.to_string())
+}
+
+fn correction_rounds_from_wire(value: &str) -> std::result::Result<Option<u32>, String> {
+    if value == DEFAULT_CORRECTION_ROUNDS_VALUE {
+        return Ok(None);
+    }
+    value.parse::<u32>().map(Some).map_err(|_| {
+        "max_correction_rounds must be `default` or a non-negative integer".to_string()
+    })
+}
+
+fn correction_round_entry(
+    configured: Option<u32>,
+    tier: config::ReviewTier,
+) -> MjCorrectionRoundEntry {
+    MjCorrectionRoundEntry {
+        value: correction_rounds_wire_value(configured),
+        label: config::correction_round_label(configured, tier),
+        description: config::correction_round_description(configured, tier),
+    }
+}
 
 fn mjconfig_login_status(state: &ServerState) -> Option<MjLoginStatus> {
     let mut guard = state.mjconfig.login.lock().expect("mjconfig login lock");
@@ -6024,6 +6062,13 @@ fn mjconfig_snapshot_response(state: &ServerState, notice: Option<String>) -> Mj
                     description: threshold.description().to_string(),
                 })
                 .collect(),
+            max_correction_rounds: correction_rounds_wire_value(config.agent.max_correction_rounds),
+            correction_round_choices: config::correction_round_choices(
+                config.agent.max_correction_rounds,
+            )
+            .into_iter()
+            .map(|rounds| correction_round_entry(rounds, config.agent.review_tier))
+            .collect(),
             bifrost_version: mj_core::bifrost::selection_label(
                 config.review.bifrost_version.as_deref(),
             )
@@ -6243,6 +6288,10 @@ fn mjconfig_apply_edits(
                 "unknown automatic correction threshold: {threshold}"
             ))
         })?;
+    }
+    if let Some(rounds) = request.max_correction_rounds {
+        config.agent.max_correction_rounds =
+            correction_rounds_from_wire(&rounds).map_err(bad_request)?;
     }
     if let Some(version) = request.bifrost_version {
         config.review.bifrost_version =
@@ -11180,6 +11229,11 @@ mod tests {
         );
         assert_eq!(roles[2]["permission"]["value"], "auto");
         assert_eq!(snapshot["agents"]["max_parallel_limit"], 16);
+        assert_eq!(snapshot["agents"]["max_correction_rounds"], "default");
+        assert_eq!(
+            snapshot["agents"]["correction_round_choices"][0]["label"],
+            "Default (1 verification pass)"
+        );
 
         let tabs = snapshot["tabs"].as_array().expect("settings tabs");
         assert_eq!(
@@ -11957,6 +12011,7 @@ mod tests {
                     "bifrost_analysis": false,
                     "review_tier": "extended",
                     "correction_threshold": "p1",
+                    "max_correction_rounds": "2",
                     "bifrost_version": "0.9.9",
                     "max_parallel": 4,
                     "theme": "ansi",
@@ -11995,6 +12050,7 @@ mod tests {
         assert_eq!(snapshot["agents"]["review_tier"], "extended");
         assert_eq!(snapshot["agents"]["review_tiers"][0]["tier"], "quick");
         assert_eq!(snapshot["agents"]["correction_threshold"], "p1");
+        assert_eq!(snapshot["agents"]["max_correction_rounds"], "2");
         assert_eq!(snapshot["agents"]["bifrost_version"], "0.9.9");
         assert_eq!(
             snapshot["agents"]["bifrost_versions"][0],
@@ -12033,6 +12089,7 @@ mod tests {
             saved.agent.correction_threshold,
             config::ReviewCorrectionThreshold::P1
         );
+        assert_eq!(saved.agent.max_correction_rounds, Some(2));
         assert_eq!(saved.review.bifrost_version.as_deref(), Some("0.9.9"));
         assert_eq!(saved.subagents.max_parallel, 4);
         assert_eq!(saved.theme, mj_core::theme::TerminalThemeKind::Ansi);
@@ -12077,6 +12134,35 @@ mod tests {
         assert_eq!(saved.review.acp_source.as_deref(), Some("codex-acp"));
         assert_eq!(saved.agent.acp_source.as_deref(), Some("claude-acp"));
         assert_eq!(saved.subagents.acp_source.as_deref(), Some("codex-acp"));
+    }
+
+    #[tokio::test]
+    async fn mjconfig_apply_can_restore_the_tier_correction_round_default() {
+        let runtime = test_mjconfig_runtime();
+        let config_path = runtime.config_path.clone();
+        let mut config = config::Config::default();
+        config::TeamPreset::Codex.apply(&mut config);
+        config.agent.max_correction_rounds = Some(3);
+        config.save(&config_path).expect("seed config");
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(runtime, token);
+
+        let response = app
+            .oneshot(mjconfig_request(
+                "POST",
+                Some(token),
+                Some(serde_json::json!({
+                    "max_correction_rounds": "default"
+                })),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = json_body(response).await;
+        assert_eq!(snapshot["agents"]["max_correction_rounds"], "default");
+        let saved = config::Config::load(&config_path).expect("reload saved config");
+        assert_eq!(saved.agent.max_correction_rounds, None);
     }
 
     #[tokio::test]
@@ -12171,6 +12257,7 @@ mod tests {
             serde_json::json!({ "thought_output": "summary" }),
             serde_json::json!({ "review_tier": "thorough" }),
             serde_json::json!({ "correction_threshold": "p4" }),
+            serde_json::json!({ "max_correction_rounds": "forever" }),
             serde_json::json!({ "bifrost_version": "next" }),
             serde_json::json!({ "review_permission": "always" }),
             serde_json::json!({ "subagents_permission": "ask" }),
@@ -12944,6 +13031,8 @@ if (permissionsEl.children.length !== 0 || permissionCards.size !== 0) {
         assert!(viewer.contains("function mjRolePermissionRow(role, field)"));
         assert!(viewer.contains("review_permission"));
         assert!(viewer.contains("subagents_permission"));
+        assert!(viewer.contains("Post-correction verification"));
+        assert!(viewer.contains("mjcfg.edits.max_correction_rounds = next"));
         assert!(viewer.contains("voice_auto_send"));
         assert!(viewer.contains("Terminal theme"));
         assert!(viewer.contains("Terminal interface"));

@@ -4553,6 +4553,29 @@
           thresholdRow.appendChild(mjDetail(selectedThreshold.description));
         }
         mjconfigBodyEl.appendChild(thresholdRow);
+
+        const correctionRoundsRow = mjRow("Post-correction verification");
+        const correctionRounds = mjEditedValue(
+          "max_correction_rounds",
+          panel.max_correction_rounds,
+        );
+        correctionRoundsRow.appendChild(
+          mjCombo(
+            panel.correction_round_choices,
+            correctionRounds,
+            (next) => {
+              mjcfg.edits.max_correction_rounds = next;
+              renderMjConfig();
+            },
+          ),
+        );
+        const selectedCorrectionRounds = panel.correction_round_choices.find(
+          (entry) => entry.value === correctionRounds,
+        );
+        if (selectedCorrectionRounds) {
+          correctionRoundsRow.appendChild(mjDetail(selectedCorrectionRounds.description));
+        }
+        mjconfigBodyEl.appendChild(correctionRoundsRow);
       }
 
       function renderMjSubagents() {

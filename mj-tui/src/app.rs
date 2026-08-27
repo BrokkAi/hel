@@ -1723,6 +1723,7 @@ pub struct AppState {
     pub review_enabled: bool,
     pub review_tier: crate::config::ReviewTier,
     pub correction_threshold: crate::config::ReviewCorrectionThreshold,
+    pub max_correction_rounds: Option<u32>,
     /// Holds the platform clipboard lease so copied text remains available
     /// on Linux/X11 where the owning process must stay alive.
     #[allow(dead_code)]
@@ -2469,6 +2470,7 @@ impl AppState {
             review_enabled: true,
             review_tier: crate::config::ReviewTier::default(),
             correction_threshold: crate::config::ReviewCorrectionThreshold::default(),
+            max_correction_rounds: None,
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
             startup_prompt: None,
@@ -2489,6 +2491,7 @@ impl AppState {
         side.review_enabled = self.review_enabled;
         side.review_tier = self.review_tier;
         side.correction_threshold = self.correction_threshold;
+        side.max_correction_rounds = self.max_correction_rounds;
         side.project_label = self.project_label.clone();
         side.worktree_label = self.worktree_label.clone();
         side.additional_roots = self.additional_roots;

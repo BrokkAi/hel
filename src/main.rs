@@ -3129,25 +3129,14 @@ async fn run_session(
                     }
                 };
                 cmd_orchestrator.set_review_fanout(review_fanout);
-                cmd_orchestrator.set_review_enabled(updated_config.agent.discrete_review);
-                cmd_orchestrator.set_review_tier(updated_config.agent.review_tier);
-                cmd_orchestrator
-                    .set_correction_threshold(updated_config.agent.correction_threshold);
+                cmd_orchestrator.set_review_policy_from_agent_config(&updated_config.agent);
                 let _ = side_ui_event_tx.send(UiEvent::Info(
                     "reviewer and subagent configuration is active for the current primary session"
                         .to_string(),
                 ));
                 continue;
             }
-            if let UiCommand::SetReviewPolicy {
-                enabled,
-                tier,
-                correction_threshold,
-            } = &command
-            {
-                cmd_orchestrator.set_review_enabled(*enabled);
-                cmd_orchestrator.set_review_tier(*tier);
-                cmd_orchestrator.set_correction_threshold(*correction_threshold);
+            if cmd_orchestrator.apply_review_policy_command(&command) {
                 continue;
             }
             if let UiCommand::RunReview { request } = command {
@@ -3250,6 +3239,7 @@ async fn run_session(
                 review_enabled: agent_config.discrete_review,
                 review_tier: agent_config.review_tier,
                 correction_threshold: agent_config.correction_threshold,
+                max_correction_rounds: agent_config.max_correction_rounds,
                 runtime_stall_minutes: ui_config.agent.runtime_stall_minutes,
                 primary_acp_name: roster.primary.launch.kind.display_name().to_string(),
                 primary_reasoning_effort: roster.primary.reasoning_effort.clone(),
