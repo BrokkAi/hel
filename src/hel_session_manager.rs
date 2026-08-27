@@ -1,10 +1,12 @@
 //! Multiplexed controller-side ownership of durable ACP relay sessions.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::hel_archive::verify_archive_streaming;
@@ -64,7 +66,18 @@ pub struct ProjectMemorySyncTarget {
 pub struct WorkerRecoveryPlan {
     pub target: Option<TargetRecoveryPlan>,
     pub liveness_probe: CommandSpec,
+    /// Refresh a stale installed worker before restarting it. The digest is
+    /// computed inside the recovery task so hashing a large binary never
+    /// blocks a controller UI loop.
+    pub binary_refresh: Option<WorkerBinaryRefreshPlan>,
     pub restart: CommandPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerBinaryRefreshPlan {
+    pub source: PathBuf,
+    pub installed_digest: CommandSpec,
+    pub replace: CommandPlan,
 }
 
 /// Whether a relay failure means the transport to the worker is gone, so
@@ -88,6 +101,39 @@ enum WorkerRecoveryOutcome {
     TargetMissing,
     RestartedDead,
     RestartedUnresponsive,
+}
+
+fn worker_binary_digest(path: &std::path::Path) -> Result<String> {
+    let mut binary = std::fs::File::open(path)
+        .with_context(|| format!("open worker binary {} for recovery", path.display()))?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut binary, &mut digest)
+        .with_context(|| format!("hash worker binary {} for recovery", path.display()))?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn refresh_worker_binary_if_stale(
+    executor: &impl CommandExecutor,
+    plan: Option<&WorkerBinaryRefreshPlan>,
+) -> Result<()> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    let expected = worker_binary_digest(&plan.source)?;
+    let installed = executor.execute(&plan.installed_digest);
+    if installed.as_ref().is_ok_and(|output| {
+        output.status == 0
+            && String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .next()
+                .is_some_and(|digest| digest.eq_ignore_ascii_case(&expected))
+    }) {
+        return Ok(());
+    }
+    plan.replace
+        .execute(executor)
+        .context("replace stale relay worker binary")?;
+    Ok(())
 }
 
 async fn recover_worker(
@@ -117,10 +163,12 @@ async fn recover_worker(
             "starting" => Ok(WorkerRecoveryOutcome::Starting),
             "alive" if !restart_unresponsive => Ok(WorkerRecoveryOutcome::Alive),
             "alive" => {
+                refresh_worker_binary_if_stale(&executor, plan.binary_refresh.as_ref())?;
                 plan.restart.execute(&executor)?;
                 Ok(WorkerRecoveryOutcome::RestartedUnresponsive)
             }
             "dead" => {
+                refresh_worker_binary_if_stale(&executor, plan.binary_refresh.as_ref())?;
                 plan.restart.execute(&executor)?;
                 Ok(WorkerRecoveryOutcome::RestartedDead)
             }
@@ -1844,6 +1892,7 @@ mod tests {
             target: None,
             liveness_probe: CommandSpec::new("printf", [format!("{liveness}\n")])
                 .purpose("probe test worker liveness"),
+            binary_refresh: None,
             restart: CommandPlan {
                 description: "restart test worker".into(),
                 commands: vec![
@@ -1883,6 +1932,81 @@ mod tests {
             WorkerRecoveryOutcome::RestartedDead
         );
         assert!(restarted.exists(), "a confirmed dead worker is restarted");
+    }
+
+    #[tokio::test]
+    async fn recovery_replaces_only_a_stale_worker_binary_before_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("current-worker");
+        let refreshed = directory.path().join("worker-refreshed");
+        let restarted = directory.path().join("worker-restarted");
+        std::fs::write(&source, b"current worker binary").unwrap();
+        let current_digest = format!("{:x}", Sha256::digest(b"current worker binary"));
+        let recovery = |installed_digest: &str, require_refresh: bool| {
+            let mut restart = if require_refresh {
+                CommandSpec::new(
+                    "sh",
+                    [
+                        "-c",
+                        "test -f \"$HEL_TEST_REFRESHED\" && touch -- \"$HEL_TEST_RESTARTED\"",
+                    ],
+                )
+            } else {
+                CommandSpec::new("touch", [restarted.to_string_lossy().into_owned()])
+            }
+            .purpose("restart test worker");
+            restart.env.insert(
+                "HEL_TEST_REFRESHED".into(),
+                refreshed.to_string_lossy().into_owned(),
+            );
+            restart.env.insert(
+                "HEL_TEST_RESTARTED".into(),
+                restarted.to_string_lossy().into_owned(),
+            );
+            WorkerRecoveryPlan {
+                target: None,
+                liveness_probe: CommandSpec::new("printf", ["dead\n"])
+                    .purpose("probe test worker liveness"),
+                binary_refresh: Some(WorkerBinaryRefreshPlan {
+                    source: source.clone(),
+                    installed_digest: CommandSpec::new(
+                        "printf",
+                        [format!("{installed_digest}  /worker/hel\n")],
+                    )
+                    .purpose("identify test worker binary"),
+                    replace: CommandPlan {
+                        description: "refresh test worker".into(),
+                        commands: vec![
+                            CommandSpec::new("touch", [refreshed.to_string_lossy().into_owned()])
+                                .purpose("refresh test worker"),
+                        ],
+                    },
+                }),
+                restart: CommandPlan {
+                    description: "restart test worker".into(),
+                    commands: vec![restart],
+                },
+            }
+        };
+
+        assert_eq!(
+            recover_worker(recovery(&current_digest, false), false)
+                .await
+                .unwrap(),
+            WorkerRecoveryOutcome::RestartedDead
+        );
+        assert!(!refreshed.exists(), "a current binary must not be copied");
+        assert!(restarted.exists());
+
+        std::fs::remove_file(&restarted).unwrap();
+        assert_eq!(
+            recover_worker(recovery(&"0".repeat(64), true), false)
+                .await
+                .unwrap(),
+            WorkerRecoveryOutcome::RestartedDead
+        );
+        assert!(refreshed.exists(), "a stale binary must be refreshed");
+        assert!(restarted.exists(), "refresh must finish before restart");
     }
 
     #[tokio::test]
@@ -1947,6 +2071,7 @@ mod tests {
                     session_id: "session-1".into(),
                 }),
                 liveness_probe: liveness,
+                binary_refresh: None,
                 restart: CommandPlan {
                     description: "restart test worker".into(),
                     commands: vec![
@@ -1980,6 +2105,7 @@ mod tests {
                     session_id: "session-1".into(),
                 }),
                 liveness_probe: CommandSpec::new("false", std::iter::empty::<&str>()),
+                binary_refresh: None,
                 restart: CommandPlan {
                     description: "must not restart".into(),
                     commands: vec![CommandSpec::new("false", std::iter::empty::<&str>())],
@@ -2497,6 +2623,7 @@ mod tests {
             target: None,
             liveness_probe: CommandSpec::new("printf", ["alive\n"])
                 .purpose("probe test relay worker"),
+            binary_refresh: None,
             restart: CommandPlan {
                 description: "restart test relay worker".into(),
                 commands: vec![

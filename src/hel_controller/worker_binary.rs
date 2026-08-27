@@ -9,7 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::hel_config::{ProjectBundle, ProjectRepository, atomic_write, data_dir};
 use crate::hel_project_memory::{ProjectMemoryIdentity, RepositoryMemoryIdentity};
-use crate::hel_session_manager::{ProjectMemorySyncTarget, WorkerRecoveryPlan};
+use crate::hel_session_manager::{
+    ProjectMemorySyncTarget, WorkerBinaryRefreshPlan, WorkerRecoveryPlan,
+};
 use crate::hel_targets::{
     self, CommandExecutor, CommandPlan, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
 };
@@ -201,6 +203,7 @@ impl Controller {
         Ok(WorkerRecoveryPlan {
             target: hel_targets::target_recovery_plan(&backend, session_id)?,
             liveness_probe: worker_liveness_command(&backend, &worker_root),
+            binary_refresh: worker_binary_refresh_plan(&backend, session_id)?,
             restart: CommandPlan {
                 description: format!("restart Hel worker for session {session_id}"),
                 commands: vec![
@@ -1332,30 +1335,33 @@ pub(super) fn replace_installed_worker_binary(
     session_id: &str,
     worker_binary: &Path,
 ) -> Result<()> {
+    let plan = installed_worker_binary_replacement_plan(locator, session_id, worker_binary)?;
+    for command in plan.commands {
+        execute_checked(executor, command)?;
+    }
+    Ok(())
+}
+
+fn installed_worker_binary_replacement_plan(
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    worker_binary: &Path,
+) -> Result<CommandPlan> {
     let worker_root = hel_targets::worker_root(locator, session_id)?;
     let installed = format!("{worker_root}/hel");
     let staged = format!("{worker_root}/hel.next");
-    match locator {
-        hel_targets::TargetLocator::LocalBare { .. } => {
-            execute_checked(
-                executor,
-                CommandSpec::new(
-                    "cp",
-                    [worker_binary.to_string_lossy().into_owned(), staged.clone()],
-                )
-                .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
-                CommandSpec::new("mv", ["-f", &staged, &installed])
-                    .purpose("replace installed Hel worker"),
-            )?;
-            execute_checked(
-                executor,
-                CommandSpec::new("chmod", ["700", &installed])
-                    .purpose("make replaced Hel worker executable"),
-            )?;
-        }
+    let commands = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => vec![
+            CommandSpec::new(
+                "cp",
+                [worker_binary.to_string_lossy().into_owned(), staged.clone()],
+            )
+            .purpose("stage replacement Hel worker"),
+            CommandSpec::new("mv", ["-f", &staged, &installed])
+                .purpose("replace installed Hel worker"),
+            CommandSpec::new("chmod", ["700", &installed])
+                .purpose("make replaced Hel worker executable"),
+        ],
         hel_targets::TargetLocator::LocalPodman { container_id }
         | hel_targets::TargetLocator::AppleContainer { container_id } => {
             let engine = if matches!(locator, hel_targets::TargetLocator::LocalPodman { .. }) {
@@ -1363,8 +1369,7 @@ pub(super) fn replace_installed_worker_binary(
             } else {
                 "container"
             };
-            execute_checked(
-                executor,
+            vec![
                 CommandSpec::new(
                     engine,
                     [
@@ -1374,9 +1379,6 @@ pub(super) fn replace_installed_worker_binary(
                     ],
                 )
                 .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 CommandSpec::new(
                     engine,
                     [
@@ -1389,9 +1391,6 @@ pub(super) fn replace_installed_worker_binary(
                     ],
                 )
                 .purpose("replace installed Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 CommandSpec::new(
                     engine,
                     [
@@ -1403,48 +1402,29 @@ pub(super) fn replace_installed_worker_binary(
                     ],
                 )
                 .purpose("make replaced Hel worker executable"),
-            )?;
+            ]
         }
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
-        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            execute_checked(
-                executor,
-                scp_command_spec(ssh, worker_binary, &staged, false)
-                    .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
-                ssh_command_spec(ssh, ["mv", "-f", "--", &staged, &installed])
-                    .purpose("replace installed Hel worker"),
-            )?;
-            execute_checked(
-                executor,
-                ssh_command_spec(ssh, ["chmod", "700", &installed])
-                    .purpose("make replaced Hel worker executable"),
-            )?;
-        }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => vec![
+            scp_command_spec(ssh, worker_binary, &staged, false)
+                .purpose("stage replacement Hel worker"),
+            ssh_command_spec(ssh, ["mv", "-f", "--", &staged, &installed])
+                .purpose("replace installed Hel worker"),
+            ssh_command_spec(ssh, ["chmod", "700", &installed])
+                .purpose("make replaced Hel worker executable"),
+        ],
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             let upload = format!(".cache/hel/uploads/{session_id}-hel.next");
-            execute_checked(
-                executor,
+            vec![
                 ssh_command_spec(ssh, ["mkdir", "-p", ".cache/hel/uploads"])
                     .purpose("create remote replacement worker staging"),
-            )?;
-            execute_checked(
-                executor,
                 scp_command_spec(ssh, worker_binary, &upload, false)
                     .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 ssh_command_spec(
                     ssh,
                     ["podman", "cp", &upload, &format!("{container_id}:{staged}")],
                 )
                 .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 ssh_command_spec(
                     ssh,
                     [
@@ -1459,23 +1439,67 @@ pub(super) fn replace_installed_worker_binary(
                     ],
                 )
                 .purpose("replace installed Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 ssh_command_spec(
                     ssh,
                     ["podman", "exec", container_id, "chmod", "700", &installed],
                 )
                 .purpose("make replaced Hel worker executable"),
-            )?;
-            execute_checked(
-                executor,
                 ssh_command_spec(ssh, ["rm", "-f", "--", &upload])
                     .purpose("remove remote replacement worker staging"),
-            )?;
+            ]
         }
+    };
+    Ok(CommandPlan {
+        description: format!("replace stale Hel worker for session {session_id}"),
+        commands,
+    })
+}
+
+/// Prepare a local refresh without hashing the controller binary. Digesting
+/// happens only after recovery has proved that the worker needs a restart.
+fn worker_binary_refresh_plan(
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+) -> Result<Option<WorkerBinaryRefreshPlan>> {
+    if matches!(
+        locator,
+        hel_targets::TargetLocator::AwsEc2 { .. }
+            | hel_targets::TargetLocator::SshBare { .. }
+            | hel_targets::TargetLocator::SshPodman { .. }
+    ) {
+        return Ok(None);
     }
-    Ok(())
+    // Resolving a deleted running executable materializes /proc/self/exe and
+    // can copy hundreds of megabytes. Target lists are assembled on UI/event
+    // loops, so leave refresh disabled until the next controller start rather
+    // than doing that work here.
+    if !std::env::current_exe().is_ok_and(|path| path.is_file()) {
+        return Ok(None);
+    }
+    let source = match worker_binary_prerequisite_for_arch(std::env::consts::ARCH) {
+        Ok(WorkerBinaryAvailability::Local { path, .. }) => path,
+        Ok(WorkerBinaryAvailability::Remote { .. }) | Err(_) => return Ok(None),
+    };
+    let worker_root = hel_targets::worker_root(locator, session_id)?;
+    let installed = format!("{worker_root}/hel");
+    let installed_digest = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sha256sum", [&installed]),
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", container_id, "sha256sum", &installed])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => {
+            CommandSpec::new("container", ["exec", container_id, "sha256sum", &installed])
+        }
+        hel_targets::TargetLocator::AwsEc2 { .. }
+        | hel_targets::TargetLocator::SshBare { .. }
+        | hel_targets::TargetLocator::SshPodman { .. } => unreachable!(),
+    }
+    .purpose("identify installed Hel worker binary");
+    Ok(Some(WorkerBinaryRefreshPlan {
+        replace: installed_worker_binary_replacement_plan(locator, session_id, &source)?,
+        source,
+        installed_digest,
+    }))
 }
 
 /// Stop the detached worker daemon at `worker_root` without deleting its files.
