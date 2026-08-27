@@ -609,6 +609,14 @@ impl Controller {
                 Err(error) => return Err(error),
             }
         };
+        // Project memory is checkpoint state, not relay connection state.
+        // Reconcile it once while the checkpoint barrier keeps the harness
+        // idle. Ordinary attach and polling deliberately never touch it.
+        relay
+            .connection_mut()
+            .sync_project_memory()
+            .await
+            .context("synchronize project memory for checkpoint")?;
         let cursor = barrier
             .operational
             .checkpoint_ready
@@ -1008,7 +1016,10 @@ async fn connect_checkpoint_relay(
         let handle = manager
             .wait_for_session(session_id, Duration::from_secs(5))
             .await?;
-        let lease = handle.lease_connection().await?;
+        let mut lease = handle.lease_connection().await?;
+        lease
+            .connection_mut()
+            .set_project_memory_target(project_memory);
         Ok(ControllerRelayLease::Managed {
             handle,
             lease: Some(lease),

@@ -187,6 +187,27 @@ mod unix {
 
     pub(super) const ACP_EVENT_CHANNEL_CAPACITY: usize = 256;
 
+    #[derive(Clone)]
+    pub(super) struct ProjectMemoryEndpoint {
+        config: Option<super::ProjectMemoryLaunchConfig>,
+        io: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl ProjectMemoryEndpoint {
+        fn new(config: Option<super::ProjectMemoryLaunchConfig>) -> Self {
+            Self {
+                config,
+                io: Arc::new(tokio::sync::Semaphore::new(1)),
+            }
+        }
+    }
+
+    impl Default for ProjectMemoryEndpoint {
+        fn default() -> Self {
+            Self::new(None)
+        }
+    }
+
     struct SocketGuard(PathBuf);
 
     impl Drop for SocketGuard {
@@ -236,7 +257,7 @@ mod unix {
         let mut durable_relay =
             DurableRelay::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
         let resume_session = select_resume_session(&config, &durable_relay);
-        let project_memory = config.project_memory.clone();
+        let project_memory = ProjectMemoryEndpoint::new(config.project_memory.clone());
         if resume_session.is_none()
             && config.harness != HarnessKind::Claude
             && let Some(memory) = &config.project_memory
@@ -459,7 +480,7 @@ mod unix {
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
-        project_memory: Option<super::ProjectMemoryLaunchConfig>,
+        project_memory: ProjectMemoryEndpoint,
         fatal: mpsc::Sender<anyhow::Error>,
         mut fatal_reports: mpsc::Receiver<anyhow::Error>,
     ) -> Result<()> {
@@ -1219,7 +1240,7 @@ mod unix {
             relay,
             dispatch_wake,
             credentials,
-            None,
+            ProjectMemoryEndpoint::default(),
             commands,
             fatal,
         )
@@ -1231,7 +1252,7 @@ mod unix {
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
-        project_memory: Option<super::ProjectMemoryLaunchConfig>,
+        project_memory: ProjectMemoryEndpoint,
         commands: Option<mpsc::Sender<CommandRequest>>,
         fatal: mpsc::Sender<anyhow::Error>,
     ) -> Result<()> {
@@ -1305,7 +1326,7 @@ mod unix {
                         | RelayRequest::InstallProjectMemorySnapshot { .. }
                 ) {
                     let operation = envelope.request.method_name();
-                    let response = project_memory_response(envelope, project_memory.as_ref()).await;
+                    let response = project_memory_response(envelope, &project_memory).await;
                     write_logged_response(&mut writer, &response, &session_id, operation).await?;
                     continue;
                 }
@@ -1602,9 +1623,33 @@ mod unix {
 
     /// Snapshot and install project memory off the socket task. These payloads
     /// are connection-only and are never journaled as conversation history.
+    pub(super) async fn run_serialized_project_memory_io<T, F>(
+        project_memory_io: &Arc<tokio::sync::Semaphore>,
+        operation: F,
+    ) -> std::result::Result<Result<T>, tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        // A timed-out client can abandon this future, but Tokio cannot cancel
+        // blocking filesystem work after it starts. Keep the permit inside
+        // that work so reconnects wait instead of piling more reads and fsyncs
+        // onto the degraded storage device.
+        let permit = project_memory_io
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("project memory I/O semaphore is never closed");
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await
+    }
+
     async fn project_memory_response(
         envelope: RelayRequestEnvelope,
-        memory: Option<&super::ProjectMemoryLaunchConfig>,
+        endpoint: &ProjectMemoryEndpoint,
     ) -> RelayResponseEnvelope {
         if !envelope.request.supported_at(envelope.protocol_version) {
             return incompatible_request_protocol_response(
@@ -1612,7 +1657,7 @@ mod unix {
                 envelope.protocol_version,
             );
         }
-        let body = match memory {
+        let body = match endpoint.config.as_ref() {
             None => RelayResponseBody::Error {
                 error: RelayProtocolError {
                     code: RelayErrorCode::InvalidState,
@@ -1624,7 +1669,7 @@ mod unix {
             Some(memory) => {
                 let memory = memory.clone();
                 let request = envelope.request.clone();
-                match tokio::task::spawn_blocking(move || {
+                match run_serialized_project_memory_io(&endpoint.io, move || {
                     apply_project_memory_request(&memory, &request)
                 })
                 .await
@@ -5494,7 +5539,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx,
             test_credentials(),
-            None,
+            unix::ProjectMemoryEndpoint::default(),
             fatal_tx,
             fatal_rx,
         ));
@@ -6188,5 +6233,52 @@ mod relay_tests {
         )
         .unwrap();
         assert_eq!(baseline.snapshot().unwrap(), captured_replica);
+    }
+
+    #[tokio::test]
+    async fn abandoned_project_memory_requests_do_not_overlap_blocking_io() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_gate = gate.clone();
+        let first = tokio::spawn(async move {
+            unix::run_serialized_project_memory_io(&first_gate, move || {
+                first_started_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        first_started_rx.await.unwrap();
+
+        // Model a controller dropping its request future after its transport
+        // timeout. The blocking operation survives that cancellation.
+        first.abort();
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let second_gate = gate.clone();
+        let second = tokio::spawn(async move {
+            unix::run_serialized_project_memory_io(&second_gate, move || {
+                second_started_tx.send(()).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        let mut second_started_rx = std::pin::pin!(second_started_rx);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                &mut second_started_rx,
+            )
+            .await
+            .is_err(),
+            "abandoning a request released its in-flight filesystem permit"
+        );
+
+        release_first_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut second_started_rx)
+            .await
+            .expect("the queued request did not start after prior I/O completed")
+            .unwrap();
+        second.await.unwrap().unwrap().unwrap();
     }
 }

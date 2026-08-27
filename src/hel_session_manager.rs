@@ -29,7 +29,6 @@ use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected, RelayTransportDead};
 
 const SESSION_SYNC_INTERVAL: Duration = Duration::from_millis(150);
-const PROJECT_MEMORY_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// Ceiling for reconnect backoff. A worker that exited stays gone until the
 /// user acts, so retrying it every second only burns process spawns.
@@ -1613,13 +1612,11 @@ pub struct StandaloneSession {
     operational: RelayOperationalState,
     latest_credential_sync_signal: Option<CredentialSyncSignal>,
     project_memory: Option<ProjectMemorySyncTarget>,
-    last_memory_sync: Option<tokio::time::Instant>,
 }
 
 impl StandaloneSession {
     pub fn set_project_memory_target(&mut self, target: Option<ProjectMemorySyncTarget>) {
         self.project_memory = target;
-        self.last_memory_sync = None;
     }
 
     pub async fn connect(target: &RelaySessionTarget) -> Result<Self> {
@@ -1635,7 +1632,6 @@ impl StandaloneSession {
             operational,
             latest_credential_sync_signal: None,
             project_memory: target.project_memory.clone(),
-            last_memory_sync: None,
         };
         connection.sync_in_place().await?;
         Ok(connection)
@@ -1684,14 +1680,6 @@ impl StandaloneSession {
             || self.materialized.applied_event_ordinal != original_ordinal
             || self.materialized.applied_event_digest != original_digest
             || self.operational != original_operational;
-        if self.project_memory.is_some()
-            && self.operational.active_prompt.is_none()
-            && self
-                .last_memory_sync
-                .is_none_or(|last| last.elapsed() >= PROJECT_MEMORY_SYNC_INTERVAL)
-        {
-            self.sync_project_memory().await?;
-        }
         Ok(changed)
     }
 
@@ -1935,7 +1923,11 @@ impl StandaloneSession {
         })
     }
 
-    async fn sync_project_memory(&mut self) -> Result<()> {
+    /// Reconcile this worker's project-memory replica at an explicit durable
+    /// boundary. Normal relay attachment and polling must never perform this
+    /// filesystem work: a degraded target could otherwise turn reconnects
+    /// into an unbounded queue of timed-out snapshot writes.
+    pub async fn sync_project_memory(&mut self) -> Result<()> {
         let Some(target) = self.project_memory.clone() else {
             return Ok(());
         };
@@ -1967,32 +1959,27 @@ impl StandaloneSession {
         };
         let canonical_root = target.canonical_root;
         let session_id = self.materialized.session_id.clone();
-        let reconciliation = tokio::task::spawn_blocking(move || {
-            crate::hel_project_memory::reconcile_into_canonical(
+        let (reconciliation, worker_install_needed) = tokio::task::spawn_blocking(move || {
+            let reconciliation = crate::hel_project_memory::reconcile_into_canonical(
                 &canonical_root,
                 &baseline,
                 &replica,
                 &session_id,
-            )
+            )?;
+            let worker_install_needed =
+                reconciliation.merged != baseline || reconciliation.merged != replica;
+            Ok::<_, anyhow::Error>((reconciliation, worker_install_needed))
         })
         .await
         .context("project memory reconciliation task failed")??;
         for conflict in &reconciliation.conflicts {
             tracing::warn!(session_id = self.materialized.session_id, %conflict, "project memory conflict preserved");
         }
-        let conflicts = reconciliation.conflicts;
-        self.client
-            .install_project_memory_snapshot(reconciliation.merged)
-            .await?;
-        if !conflicts.is_empty() {
+        if worker_install_needed {
             self.client
-                .install_prompt_context(format!(
-                    "<hel-project-memory-conflicts>Concurrent project-memory edits were preserved in {}. Reconcile those documents with their original paths using the project memory tools; do not discard either version.</hel-project-memory-conflicts>",
-                    conflicts.join(", ")
-                ))
+                .install_project_memory_snapshot(reconciliation.merged)
                 .await?;
         }
-        self.last_memory_sync = Some(tokio::time::Instant::now());
         Ok(())
     }
 }
@@ -2834,6 +2821,8 @@ mod tests {
     const RETIRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_RETIRED_SUBMIT_CHILD";
     #[cfg(unix)]
     const RETURNED_LEASE_VIEW_TEST_CHILD: &str = "HEL_TEST_RETURNED_LEASE_VIEW_CHILD";
+    #[cfg(unix)]
+    const EXPLICIT_MEMORY_SYNC_TEST_CHILD: &str = "HEL_TEST_EXPLICIT_MEMORY_SYNC_CHILD";
     const LEASED_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
 
     /// Relay server half of the leased-submission tests. It does nothing unless
@@ -2887,6 +2876,42 @@ mod tests {
             "isolated {test} failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relay_attach_does_not_probe_or_install_project_memory() {
+        if std::env::var_os(EXPLICIT_MEMORY_SYNC_TEST_CHILD).is_none() {
+            run_in_isolated_child(
+                EXPLICIT_MEMORY_SYNC_TEST_CHILD,
+                "relay_attach_does_not_probe_or_install_project_memory",
+            );
+            return;
+        }
+        register_leased_relay_session();
+        let relay_root = tempfile::tempdir().unwrap();
+        let canonical = tempfile::tempdir().unwrap();
+        let mut target = leased_relay_target(relay_root.path());
+        target.project_memory = Some(ProjectMemorySyncTarget {
+            canonical_root: canonical.path().to_path_buf(),
+        });
+
+        let mut connection = StandaloneSession::connect(&target)
+            .await
+            .expect("relay attach must not depend on its memory endpoint");
+        assert!(
+            connection.project_memory.is_some(),
+            "attach must leave memory pending for an explicit checkpoint sync"
+        );
+
+        connection
+            .sync_project_memory()
+            .await
+            .expect("an explicit sync may detect a legacy memory endpoint");
+        assert!(
+            connection.project_memory.is_none(),
+            "the explicit sync reached the relay and disabled its unavailable endpoint"
         );
     }
 

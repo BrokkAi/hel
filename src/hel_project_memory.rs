@@ -300,20 +300,32 @@ impl ProjectMemoryStore {
 
     /// Apply a reconciled snapshot. Memory has no delete operation, so this
     /// only creates or replaces documents and cannot erase a concurrent file.
-    pub fn install_snapshot(&self, snapshot: &ProjectMemorySnapshot) -> Result<()> {
+    pub fn install_snapshot(&self, snapshot: &ProjectMemorySnapshot) -> Result<bool> {
         let mut total = 0_usize;
+        let mut changed = false;
         for (path, content) in &snapshot.files {
             ensure_snapshot_budget(&mut total, content.len())?;
             let relative = validate_virtual_path(path, false)?;
             reject_symlink_path(&self.root, &relative, true)?;
             ensure_snapshot_document(content)?;
             let destination = self.root.join(relative);
+            match fs::read_to_string(&destination) {
+                Ok(existing) if existing == *content => continue,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("read memory document {}", destination.display())
+                    });
+                }
+            }
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
             crate::hel_config::atomic_write(&destination, content.as_bytes())?;
+            changed = true;
         }
-        Ok(())
+        Ok(changed)
     }
 }
 
@@ -419,7 +431,9 @@ pub fn reconcile_into_canonical(
     let store = ProjectMemoryStore::new(canonical_root);
     let canonical = store.snapshot()?;
     let reconciliation = reconcile_snapshots(baseline, &canonical, replica, session_id);
-    store.install_snapshot(&reconciliation.merged)?;
+    if reconciliation.merged != canonical {
+        store.install_snapshot(&reconciliation.merged)?;
+    }
     Ok(reconciliation)
 }
 
@@ -1196,12 +1210,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = ProjectMemoryStore::new(directory.path());
         write(&store, "/old.md", "keep", "new");
-        store
+        let changed = store
             .install_snapshot(&ProjectMemorySnapshot {
                 files: BTreeMap::from([("/new.md".into(), "new".into())]),
             })
             .unwrap();
+        assert!(changed);
         assert_eq!(store.read("/old.md").content.as_deref(), Some("keep"));
         assert_eq!(store.read("/new.md").content.as_deref(), Some("new"));
+
+        let changed = store
+            .install_snapshot(&ProjectMemorySnapshot {
+                files: BTreeMap::from([("/new.md".into(), "new".into())]),
+            })
+            .unwrap();
+        assert!(!changed, "an identical snapshot must not rewrite its files");
     }
 }
