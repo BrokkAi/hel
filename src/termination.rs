@@ -6,7 +6,9 @@
 //! convention (SIGINT 130, SIGHUP 129, SIGTERM 143); Windows uses 1.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::time::Duration;
 

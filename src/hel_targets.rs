@@ -4808,8 +4808,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::ExitStatusExt;
 
-        let directory = tempfile::tempdir().unwrap();
-        let worker_root = directory.path().join(SESSION);
+        let directory = tempfile::Builder::new()
+            .prefix("hel-stop-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let worker_root = directory.path().canonicalize().unwrap().join("worker");
         std::fs::create_dir_all(&worker_root).unwrap();
         let fake_hel = worker_root.join("hel");
         std::fs::write(&fake_hel, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
