@@ -25,8 +25,8 @@ pub enum HarnessKind {
 }
 
 /// The target-level execution policy Hel applies independently of the selected
-/// harness. Raw localhost preserves the profile; other targets force full
-/// access because their isolation boundary contains the blast radius.
+/// harness. Raw targets may preserve configured approvals; isolated targets
+/// force full access because their boundary contains the blast radius.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPolicy {
@@ -36,7 +36,7 @@ pub enum ExecutionPolicy {
     Unconstrained,
 }
 
-/// Approval behavior selected for a named SSH target.
+/// Approval behavior selected for a named raw SSH target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
@@ -560,7 +560,6 @@ pub enum TargetTemplate {
     SshPodman {
         #[serde(flatten)]
         ssh: SshConnection,
-        permissions: PermissionMode,
         #[serde(flatten)]
         container: ContainerTemplate,
     },
@@ -570,18 +569,14 @@ impl TargetTemplate {
     pub const fn execution_policy(&self) -> ExecutionPolicy {
         match self {
             Self::LocalBare => ExecutionPolicy::ConfiguredApprovals,
-            Self::SshBare { permissions, .. } | Self::SshPodman { permissions, .. } => {
-                permissions.execution_policy()
-            }
+            Self::SshBare { permissions, .. } => permissions.execution_policy(),
             _ => ExecutionPolicy::Unconstrained,
         }
     }
 
     pub const fn permission_mode(&self) -> Option<PermissionMode> {
         match self {
-            Self::SshBare { permissions, .. } | Self::SshPodman { permissions, .. } => {
-                Some(*permissions)
-            }
+            Self::SshBare { permissions, .. } => Some(*permissions),
             _ => None,
         }
     }
@@ -731,6 +726,7 @@ impl HelConfig {
             return Ok(Self::default());
         }
         reject_removed_profile_overrides(&contents)?;
+        reject_non_bare_permissions(&contents)?;
         let config: Self = toml::from_str(&contents)
             .with_context(|| format!("parse Hel config {}", path.display()))?;
         config.validate()?;
@@ -775,6 +771,24 @@ impl HelConfig {
         config.save_to(path)?;
         Ok(true)
     }
+}
+
+fn reject_non_bare_permissions(contents: &str) -> Result<()> {
+    let value: toml::Value = contents.parse().context("parse Hel config TOML")?;
+    let Some(targets) = value.get("targets").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (id, target) in targets {
+        let Some(target) = target.as_table() else {
+            continue;
+        };
+        if target.contains_key("permissions")
+            && target.get("kind").and_then(toml::Value::as_str) != Some("ssh-bare")
+        {
+            bail!("target {id:?} sets `permissions`, which is only valid for ssh-bare targets");
+        }
+    }
+    Ok(())
 }
 
 fn reject_removed_profile_overrides(contents: &str) -> Result<()> {
@@ -1337,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn named_ssh_target_permissions_are_required_and_round_trip() {
+    fn raw_ssh_permissions_are_required_and_podman_rejects_them() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         let mut config = sample_config();
@@ -1353,7 +1367,7 @@ mod tests {
         };
         config.targets = BTreeMap::from([
             (
-                "builder-raw".into(),
+                "builder-guardian".into(),
                 TargetTemplate::SshBare {
                     ssh: ssh.clone(),
                     permissions: PermissionMode::Guardian,
@@ -1361,12 +1375,16 @@ mod tests {
                 },
             ),
             (
-                "builder-podman".into(),
-                TargetTemplate::SshPodman {
-                    ssh,
+                "builder-yolo".into(),
+                TargetTemplate::SshBare {
+                    ssh: ssh.clone(),
                     permissions: PermissionMode::Yolo,
-                    container,
+                    workspace_prefix: default_named_machine_prefix(),
                 },
+            ),
+            (
+                "builder-podman".into(),
+                TargetTemplate::SshPodman { ssh, container },
             ),
         ]);
 
@@ -1375,6 +1393,7 @@ mod tests {
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("permissions = \"guardian\""), "{body}");
         assert!(body.contains("permissions = \"yolo\""), "{body}");
+        assert_eq!(body.matches("permissions = ").count(), 2, "{body}");
         assert_eq!(HelConfig::load_from(&path).unwrap(), config);
 
         fs::write(
@@ -1384,6 +1403,14 @@ mod tests {
         .unwrap();
         let error = format!("{:#}", HelConfig::load_from(&path).unwrap_err());
         assert!(error.contains("permissions"), "{error}");
+
+        fs::write(
+            &path,
+            "version = 1\n[targets.builder]\nkind = \"ssh-podman\"\nhost = \"builder\"\npermissions = \"guardian\"\nimage = \"example.invalid/agent:latest\"\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", HelConfig::load_from(&path).unwrap_err());
+        assert!(error.contains("only valid for ssh-bare"), "{error}");
     }
 
     #[test]

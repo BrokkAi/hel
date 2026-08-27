@@ -1989,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn named_ssh_targets_select_guardian_or_yolo_execution() {
+    fn raw_ssh_targets_select_permissions_and_ssh_podman_is_unconstrained() {
         let ssh = crate::hel_config::SshConnection {
             host: "builder".into(),
             user: None,
@@ -2001,9 +2001,8 @@ mod tests {
             permissions: crate::hel_config::PermissionMode::Guardian,
             workspace_prefix: ".local/share/hel/workspaces".into(),
         };
-        let guardian_podman = TargetTemplate::SshPodman {
+        let podman = TargetTemplate::SshPodman {
             ssh: ssh.clone(),
-            permissions: crate::hel_config::PermissionMode::Guardian,
             container: crate::hel_config::ContainerTemplate {
                 image: "example.invalid/agent:latest".into(),
                 pull_policy: Default::default(),
@@ -2028,8 +2027,8 @@ mod tests {
             crate::hel_config::ExecutionPolicy::ConfiguredApprovals
         );
         assert_eq!(
-            guardian_podman.execution_policy(),
-            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
+            podman.execution_policy(),
+            crate::hel_config::ExecutionPolicy::Unconstrained
         );
         assert_eq!(
             yolo.execution_policy(),

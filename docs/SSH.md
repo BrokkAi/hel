@@ -39,12 +39,12 @@ Shared SSH connection keys (flattened into both target kinds):
 | `user` | no | SSH login user; omit to use your SSH config / default. |
 | `identity_file` | no | Path to the private key. |
 | `extra_args` | no | Extra arguments appended to every `ssh` invocation for this target. |
-| `permissions` | yes | `guardian` preserves configured harness approvals; `yolo` runs unconstrained. |
 
 `ssh-bare` also takes:
 
 | Key | Required | Notes |
 | --- | --- | --- |
+| `permissions` | yes | `guardian` preserves configured harness approvals; `yolo` runs unconstrained. |
 | `workspace_prefix` | no | Remote directory session workspaces are created under. Defaults to `.local/share/hel/workspaces` (relative to the login home). |
 
 ```toml
@@ -55,14 +55,14 @@ permissions = "guardian"
 workspace_prefix = ".local/share/hel/workspaces"
 ```
 
-`ssh-podman` also takes the same container keys as `local-podman`
-(`image`, and optionally `platform`, `cpus`, `memory`, `environment`):
+`ssh-podman` always runs unconstrained and does not accept `permissions`. It
+also takes the same container keys as `local-podman` (`image`, and optionally
+`platform`, `cpus`, `memory`, `environment`):
 
 ```toml
 [targets.builder-podman]
 kind = "ssh-podman"
 host = "builder"
-permissions = "yolo"
 image = "ghcr.io/brokkai/hel/agent-dev:latest"
 ```
 

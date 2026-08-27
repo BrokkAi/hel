@@ -87,7 +87,7 @@ Issues and pull requests for new harnesses are welcome.
 | Podman container | `local-podman` | Linux, WSL2 | unrestricted |
 | Apple container | `apple-container` | macOS 26+, Apple silicon | unrestricted |
 | SSH machine | `ssh-bare` | a Linux host you name | guardian or unrestricted |
-| Podman over SSH | `ssh-podman` | a Linux host you name | guardian or unrestricted |
+| Podman over SSH | `ssh-podman` | a Linux host you name | unrestricted |
 | EC2 instance | `aws-ec2` | your AWS account | unrestricted |
 
 The controller (the `hel` binary you run) supports Linux and macOS. Windows is
@@ -189,13 +189,13 @@ Target prerequisites and full option lists are covered in
 ## Security and isolation model
 
 - Execution policy is selected by target, then translated into each harness's
-  own controls. Local containers and EC2 targets run unconstrained. Named SSH
-  targets explicitly select `permissions = "guardian"` to preserve configured
-  approvals or `permissions = "yolo"` for unconstrained execution. A local
-  worktree (`local-bare`) also preserves the profile and harness's configured
-  approval behavior. Codex, Claude Code, and Grok Build expose guardian modes;
-  Kimi Code and DeepSeek Harness do not, so Hel shows a prominent warning when
-  guardian permissions cannot be enforced on a target.
+  own controls. Containers and EC2 targets run unconstrained. Named raw SSH
+  targets (`ssh-bare`) explicitly select `permissions = "guardian"` to preserve
+  configured approvals or `permissions = "yolo"` for unconstrained execution.
+  A local worktree (`local-bare`) also preserves the profile and harness's
+  configured approval behavior. Codex, Claude Code, and Grok Build expose
+  guardian modes; Kimi Code and DeepSeek Harness do not, so Hel shows a
+  prominent warning when guardian permissions cannot be enforced on a target.
 - Harness homes are copied by allowlist, not wholesale. For Claude Code, for
   example: credentials, settings, `CLAUDE.md`, `skills/`, and `plugins/` — no
   transcripts, history, or caches. Hel sets `CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
