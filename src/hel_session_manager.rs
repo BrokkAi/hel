@@ -605,12 +605,36 @@ fn target_map(targets: &[RelaySessionTarget]) -> BTreeMap<String, RelaySessionTa
         .collect()
 }
 
+fn remove_actor_task(
+    actors: &mut BTreeMap<String, ActorRegistration>,
+    task_id: tokio::task::Id,
+) -> Option<String> {
+    let session_id = actors.iter().find_map(|(session_id, actor)| {
+        (actor.abort.id() == task_id).then(|| session_id.clone())
+    })?;
+    actors.remove(&session_id);
+    Some(session_id)
+}
+
 fn reconcile_actors(
     targets: &BTreeMap<String, RelaySessionTarget>,
     actors: &mut BTreeMap<String, ActorRegistration>,
     tasks: &mut tokio::task::JoinSet<String>,
     updates: &CoalescedUpdateSender,
 ) {
+    // A completed or cancelled task closes its command receiver before the
+    // JoinSet completion necessarily wins the manager's select. Do not let
+    // that dead registration suppress the replacement this reconciliation is
+    // responsible for starting. Task-ID-aware completion cleanup below keeps
+    // the old completion from removing the replacement later.
+    actors.retain(|session_id, actor| {
+        let live = !actor.commands.is_closed();
+        if !live {
+            tracing::warn!(session_id, "replacing stopped session relay actor");
+        }
+        live
+    });
+
     for (session_id, actor) in actors.iter() {
         let retiring = matches!(
             reconcile_action(Some(&actor.target), targets.get(session_id)),
@@ -708,8 +732,15 @@ pub fn spawn_session_manager() -> Result<SessionManagerChannels> {
                 }
                 joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
                     match joined {
-                        Some(Ok((_task_id, session_id))) => {
-                            actors.remove(&session_id);
+                        Some(Ok((task_id, session_id))) => {
+                            let removed = remove_actor_task(&mut actors, task_id);
+                            if removed.as_deref().is_some_and(|removed| removed != session_id) {
+                                tracing::error!(
+                                    completed_session_id = session_id,
+                                    registered_session_id = removed,
+                                    "session relay actor completed under the wrong registration"
+                                );
+                            }
                             // A watch sender may have published another target while this
                             // completion was already ready. Reconcile against its newest
                             // value so an intermediate replacement is never started.
@@ -721,21 +752,31 @@ pub fn spawn_session_manager() -> Result<SessionManagerChannels> {
                                 &updates_tx,
                             );
                         }
-                        Some(Err(error)) if error.is_cancelled() => {}
+                        Some(Err(error)) if error.is_cancelled() => {
+                            let cancelled_task = error.id();
+                            let session_id = remove_actor_task(&mut actors, cancelled_task);
+                            desired_targets = target_map(&targets_rx.borrow());
+                            reconcile_actors(
+                                &desired_targets,
+                                &mut actors,
+                                &mut tasks,
+                                &updates_tx,
+                            );
+                            tracing::warn!(
+                                session_id = ?session_id,
+                                "cancelled session relay actor was replaced"
+                            );
+                        }
                         Some(Err(error)) => {
                             let failed_task = error.id();
-                            if let Some(session_id) = actors.iter().find_map(|(session_id, actor)| {
-                                (actor.abort.id() == failed_task).then(|| session_id.clone())
-                            }) {
-                                actors.remove(&session_id);
-                                desired_targets = target_map(&targets_rx.borrow());
-                                reconcile_actors(
-                                    &desired_targets,
-                                    &mut actors,
-                                    &mut tasks,
-                                    &updates_tx,
-                                );
-                            }
+                            remove_actor_task(&mut actors, failed_task);
+                            desired_targets = target_map(&targets_rx.borrow());
+                            reconcile_actors(
+                                &desired_targets,
+                                &mut actors,
+                                &mut tasks,
+                                &updates_tx,
+                            );
                             tracing::error!(%error, "session relay actor failed");
                         }
                         None => {}
@@ -2176,6 +2217,42 @@ mod tests {
         assert!(lifecycle.return_lease(3));
         assert!(!lifecycle.should_stop());
         assert!(lifecycle.accepts_new_work());
+    }
+
+    #[tokio::test]
+    async fn stopped_actor_is_replaced_without_late_completion_removing_replacement() {
+        let desired = target("sh");
+        let desired_targets = target_map(std::slice::from_ref(&desired));
+        let mut actors = BTreeMap::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let (commands, commands_rx) = mpsc::channel(1);
+        drop(commands_rx);
+        let (releases, _releases_rx) = mpsc::unbounded_channel();
+        let (retirement, _retirement_rx) = watch::channel(false);
+        let (_view_tx, view) = watch::channel(ManagedSessionView::default());
+        let old_abort = tasks.spawn(async { "session-1".to_owned() });
+        let old_task_id = old_abort.id();
+        actors.insert(
+            "session-1".to_owned(),
+            ActorRegistration {
+                target: desired.clone(),
+                commands,
+                releases,
+                retirement,
+                view,
+                abort: old_abort,
+            },
+        );
+        let (updates, _updates_rx) = coalesced_update_channel();
+
+        reconcile_actors(&desired_targets, &mut actors, &mut tasks, &updates);
+
+        let replacement_task_id = actors["session-1"].abort.id();
+        assert_ne!(replacement_task_id, old_task_id);
+        assert!(!actors["session-1"].commands.is_closed());
+        assert_eq!(remove_actor_task(&mut actors, old_task_id), None);
+        assert_eq!(actors["session-1"].abort.id(), replacement_task_id);
+        tasks.abort_all();
     }
 
     const UNREACHABLE_VIEW_TEST_CHILD: &str = "HEL_TEST_UNREACHABLE_RELAY_CHILD";
