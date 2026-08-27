@@ -829,6 +829,7 @@ pub struct FeatureHintCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeatureHintRequirement {
     Always,
+    Desktop,
     /// Only when more than one team exists: a registered platform adapter
     /// (e.g. Anvil on Android) is the sole team, so advertising the team
     /// switcher would point at a key that does nothing.
@@ -848,9 +849,12 @@ struct FeatureHint {
     requirement: FeatureHintRequirement,
 }
 
+// Feature hints are for capabilities that are not already advertised by the
+// persistent TUI or web composer chrome. Keep the TUI shortcut guard below in
+// sync with the prompt chrome when it changes.
 const FEATURE_HINTS: &[FeatureHint] = &[
     FeatureHint {
-        text: "Press Shift+Tab to switch coding teams, or open /mjconfig for models and session options.",
+        text: "Pick Codex, Claude, or a mixed coder/reviewer team before the first turn from the Team tab in /mjconfig.",
         requirement: FeatureHintRequirement::TeamChoice,
     },
     FeatureHint {
@@ -858,7 +862,7 @@ const FEATURE_HINTS: &[FeatureHint] = &[
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
-        text: "Press Ctrl+J for a new line, Up/Down for prompt history, F10 for help, and Ctrl+Y to copy the latest reply.",
+        text: "Use Up/Down for prompt history and Ctrl+Y to copy the latest reply.",
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
@@ -878,23 +882,23 @@ const FEATURE_HINTS: &[FeatureHint] = &[
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
-        text: "Mjolnir can queue another prompt while an agent is working; Ctrl+C clears draft text and attachment chips before steering or stopping the active turn.",
+        text: "Send another instruction while an agent is working; Mjolnir queues it and can steer supported agents into the active turn.",
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
-        text: "Review permission requests before allowing tools, or change session permission behavior in /mjconfig.",
+        text: "Permission requests show the exact command or diff behind the action, so approvals are evidence-backed rather than blind.",
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
-        text: "Launch and monitor specialist subagents from the agent; F8 opens the nested-agent viewer.",
+        text: "Mjolnir's primary agent can launch specialist subagents in parallel, collect their reports, and retain their transcripts.",
         requirement: FeatureHintRequirement::Subagents,
     },
     FeatureHint {
-        text: "Press Ctrl+R to dictate a prompt when voice input is available.",
+        text: "Voice dictation runs locally, so microphone audio never goes to the agent; optional auto-send submits after a chosen silence delay.",
         requirement: FeatureHintRequirement::Voice,
     },
     FeatureHint {
-        text: "Run mj --remote to monitor sessions from the web viewer on another device.",
+        text: "mj server lets you control live sessions from a browser or phone, including prompts, approvals, reviews, and subagent activity.",
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
@@ -902,7 +906,7 @@ const FEATURE_HINTS: &[FeatureHint] = &[
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
-        text: "Run /discrete-review to check recent, uncommitted, or HEAD changes; add quick or extended to override the configured tier. F9 opens the review issue ledger.",
+        text: "Mjolnir can automatically review changed turns, track validated findings in the Review Board, and correct them according to your policy.",
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
@@ -930,7 +934,7 @@ const FEATURE_HINTS: &[FeatureHint] = &[
         requirement: FeatureHintRequirement::Fullscreen,
     },
     FeatureHint {
-        text: "Use /model, /effort, or their /mjconfig entries to change the active session directly.",
+        text: "When the agent supports live selectors, /model and /effort change the active session in place without losing the conversation.",
         requirement: FeatureHintRequirement::Always,
     },
     FeatureHint {
@@ -951,6 +955,26 @@ const FEATURE_HINTS: &[FeatureHint] = &[
     },
     FeatureHint {
         text: "The prompt honors readline keys: Ctrl+A/E jump to line start/end and Ctrl+K/U/W delete.",
+        requirement: FeatureHintRequirement::Always,
+    },
+    FeatureHint {
+        text: "mj app opens a native desktop control center over the same live sessions, history, approvals, and configuration as the terminal.",
+        requirement: FeatureHintRequirement::Desktop,
+    },
+    FeatureHint {
+        text: "Keep awake under Appearance controls whether Mjolnir prevents system sleep while the server runs or a turn is in flight.",
+        requirement: FeatureHintRequirement::Always,
+    },
+    FeatureHint {
+        text: "Start with mj --worktree to isolate agent changes in the session's own linked Git worktree instead of your main checkout.",
+        requirement: FeatureHintRequirement::Always,
+    },
+    FeatureHint {
+        text: "Mjolnir synchronizes verified project knowledge locally across Codex and Claude, so switching providers does not erase repository context.",
+        requirement: FeatureHintRequirement::Always,
+    },
+    FeatureHint {
+        text: "Choose Fullscreen under Appearance for the recommended, better-performing TUI; choose Inline when preserving normal terminal scrollback matters more.",
         requirement: FeatureHintRequirement::Always,
     },
 ];
@@ -3630,6 +3654,7 @@ impl AppState {
             let hint = FEATURE_HINTS[index];
             let eligible = match hint.requirement {
                 FeatureHintRequirement::Always => true,
+                FeatureHintRequirement::Desktop => !cfg!(target_os = "android"),
                 FeatureHintRequirement::TeamChoice => crate::roster::external_adapter().is_none(),
                 FeatureHintRequirement::Subagents => capabilities.subagents,
                 FeatureHintRequirement::Voice => capabilities.voice,
@@ -11681,6 +11706,8 @@ mod tests {
         };
         match requirement {
             FeatureHintRequirement::Always => {}
+            // Depends on the compile target rather than runtime capabilities.
+            FeatureHintRequirement::Desktop => {}
             // Depends on the process-global external adapter, which tests
             // cannot register per-case; no external adapter runs in this
             // test binary, so the hint behaves like Always here.
@@ -11699,13 +11726,15 @@ mod tests {
     #[test]
     fn every_gated_feature_hint_follows_its_own_capability() {
         for (index, hint) in FEATURE_HINTS.iter().enumerate() {
-            // TeamChoice reads the process-global external adapter, which a
-            // test cannot register per-case; none is registered in this test
-            // binary, so it cannot be exercised through capabilities here.
-            // gated_feature_hints_keep_their_capability_requirements pins it.
+            // Desktop depends on the compile target. TeamChoice reads the
+            // process-global external adapter, which a test cannot register
+            // per-case. gated_feature_hints_keep_their_capability_requirements
+            // pins both requirements.
             if matches!(
                 hint.requirement,
-                FeatureHintRequirement::Always | FeatureHintRequirement::TeamChoice
+                FeatureHintRequirement::Always
+                    | FeatureHintRequirement::Desktop
+                    | FeatureHintRequirement::TeamChoice
             ) {
                 continue;
             }
@@ -11745,23 +11774,27 @@ mod tests {
     fn gated_feature_hints_keep_their_capability_requirements() {
         let expected = [
             (
-                "Press Shift+Tab to switch coding teams",
+                "mixed coder/reviewer team",
                 FeatureHintRequirement::TeamChoice,
             ),
             (
-                "F8 opens the nested-agent viewer",
+                "specialist subagents in parallel",
                 FeatureHintRequirement::Subagents,
             ),
-            ("dictate", FeatureHintRequirement::Voice),
+            (
+                "Voice dictation runs locally",
+                FeatureHintRequirement::Voice,
+            ),
             ("/fork", FeatureHintRequirement::Fork),
             ("/side", FeatureHintRequirement::Side),
-            ("Paste an image", FeatureHintRequirement::Images),
+            ("clipboard with Ctrl+V", FeatureHintRequirement::Images),
             (
                 "With an empty prompt, Ctrl+F",
                 FeatureHintRequirement::Fullscreen,
             ),
             ("Press Alt+T", FeatureHintRequirement::Fullscreen),
             ("Open the transcript reader", FeatureHintRequirement::Inline),
+            ("mj app opens", FeatureHintRequirement::Desktop),
         ];
         for (needle, requirement) in expected {
             let matches: Vec<_> = FEATURE_HINTS
@@ -11848,6 +11881,119 @@ mod tests {
     }
 
     #[test]
+    fn feature_hints_include_approved_product_capabilities_once() {
+        let expected = [
+            (
+                "mixed coder/reviewer team",
+                FeatureHintRequirement::TeamChoice,
+            ),
+            (
+                "queues it and can steer supported agents",
+                FeatureHintRequirement::Always,
+            ),
+            (
+                "Permission requests show the exact command or diff",
+                FeatureHintRequirement::Always,
+            ),
+            (
+                "specialist subagents in parallel",
+                FeatureHintRequirement::Subagents,
+            ),
+            (
+                "Voice dictation runs locally",
+                FeatureHintRequirement::Voice,
+            ),
+            ("mj server lets you control", FeatureHintRequirement::Always),
+            (
+                "automatically review changed turns",
+                FeatureHintRequirement::Always,
+            ),
+            (
+                "/model and /effort change the active session",
+                FeatureHintRequirement::Always,
+            ),
+            ("mj app opens", FeatureHintRequirement::Desktop),
+            (
+                "Keep awake under Appearance",
+                FeatureHintRequirement::Always,
+            ),
+            ("mj --worktree", FeatureHintRequirement::Always),
+            (
+                "verified project knowledge locally across Codex and Claude",
+                FeatureHintRequirement::Always,
+            ),
+            (
+                "Fullscreen under Appearance for the recommended, better-performing TUI",
+                FeatureHintRequirement::Always,
+            ),
+        ];
+
+        for (needle, requirement) in expected {
+            let matches: Vec<_> = FEATURE_HINTS
+                .iter()
+                .filter(|hint| hint.text.contains(needle))
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one product hint containing {needle:?}"
+            );
+            assert_eq!(matches[0].requirement, requirement);
+        }
+    }
+
+    #[test]
+    fn feature_hints_avoid_persistent_prompt_shortcuts() {
+        fn words(text: &str) -> Vec<String> {
+            text.split(|character: char| !character.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        }
+
+        fn contains_words(haystack: &[String], needle: &[&str]) -> bool {
+            haystack.windows(needle.len()).any(|window| {
+                window
+                    .iter()
+                    .zip(needle)
+                    .all(|(actual, expected)| actual == expected)
+            })
+        }
+
+        let persistent_shortcuts: &[(&str, &[&str])] = &[
+            ("Enter", &["enter"]),
+            ("Ctrl-J", &["ctrl", "j"]),
+            ("Shift-Enter", &["shift", "enter"]),
+            ("Alt-Enter", &["alt", "enter"]),
+            ("Shift-Tab", &["shift", "tab"]),
+            ("Ctrl-R", &["ctrl", "r"]),
+            ("F10", &["f10"]),
+            ("Ctrl-C", &["ctrl", "c"]),
+            ("Esc", &["esc"]),
+            ("F12", &["f12"]),
+        ];
+
+        for (label, shortcut) in persistent_shortcuts {
+            let prose_example = words(&format!("Press {label} for this feature"));
+            assert!(
+                contains_words(&prose_example, shortcut),
+                "guard must recognize prose containing {label:?}"
+            );
+        }
+
+        for hint in FEATURE_HINTS {
+            let hint_words = words(hint.text);
+            for (label, shortcut) in persistent_shortcuts {
+                assert!(
+                    !contains_words(&hint_words, shortcut),
+                    "feature hint {:?} repeats persistent shortcut {label:?}",
+                    hint.text
+                );
+            }
+        }
+    }
+
+    #[test]
     fn feature_hints_skip_unsupported_capabilities() {
         let mut state = AppState::new();
         state.feature_hint_cursor = FEATURE_HINTS
@@ -11867,11 +12013,11 @@ mod tests {
         let Some(Entry::FeatureHint(text)) = state.transcript.last() else {
             panic!("expected feature hint");
         };
-        assert!(!text.contains("subagent"));
-        assert!(!text.contains("Ctrl+R"));
-        assert!(!text.contains("/fork"));
-        assert!(!text.contains("/side"));
-        assert!(!text.contains("Ctrl+V"));
+        let selected = FEATURE_HINTS
+            .iter()
+            .find(|hint| hint.text == text)
+            .expect("selected hint remains in the rotation");
+        assert_eq!(selected.requirement, FeatureHintRequirement::Always);
     }
 
     #[test]
