@@ -7,6 +7,7 @@
 
 mod dashboard;
 mod import;
+mod logging;
 mod pollers;
 mod server;
 
@@ -262,6 +263,28 @@ fn install_worker_last_words(root: &std::path::Path) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let is_user_process = !matches!(&cli.command, Some(Command::Worker(_) | Command::Broker(_)));
+    let log = if is_user_process {
+        Some(logging::ControllerLog::start(command_name(
+            cli.command.as_ref(),
+        ))?)
+    } else {
+        logging::start_stderr()?;
+        None
+    };
+    install_panic_logging();
+    let result = run(cli);
+    if let Err(error) = &result {
+        tracing::error!(error = format!("{error:#}"), "Hel exited with an error");
+    }
+    if result.is_ok() {
+        tracing::info!("Hel stopped");
+    }
+    drop(log);
+    result
+}
+
+fn run(cli: Cli) -> Result<()> {
     let is_controller_process = matches!(
         &cli.command,
         None | Some(
@@ -303,6 +326,29 @@ fn main() -> Result<()> {
         drop(runtime);
     }
     result.map(|_| ())
+}
+
+fn install_panic_logging() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(panic = %info, "Hel panicked");
+        default_hook(info);
+    }));
+}
+
+fn command_name(command: Option<&Command>) -> &'static str {
+    match command {
+        None => "dashboard",
+        Some(Command::Server(_)) => "server",
+        Some(Command::Doctor(_)) => "doctor",
+        Some(Command::Setup(_)) => "setup",
+        Some(Command::Import(_)) => "import",
+        Some(Command::Recover(_)) => "recover",
+        Some(Command::Checkpoint(_)) => "checkpoint",
+        Some(Command::Login(_)) => "login",
+        Some(Command::Worker(_)) => "worker",
+        Some(Command::Broker(_)) => "broker",
+    }
 }
 
 fn shutdown_dashboard_runtime(runtime: tokio::runtime::Runtime) {
