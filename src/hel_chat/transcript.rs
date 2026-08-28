@@ -1783,5 +1783,4 @@ fn line_is_empty(line: &Line<'_>) -> bool {
 }
 
 #[cfg(test)]
-#[path = "transcript/tests.rs"]
 mod tests;

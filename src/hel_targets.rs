@@ -2789,14 +2789,6 @@ fn at_boundary(boundary: ExecutionBoundary<'_>, args: Vec<String>) -> CommandSpe
     }
 }
 
-/// The connectivity probe `hel doctor` runs against an SSH target.
-///
-/// It reuses the provisioning argument order so the probe fails exactly where
-/// a real session would, with two deliberate overrides prepended. OpenSSH
-/// honours the first occurrence of an option, so these win over the
-/// provisioning defaults: `BatchMode=yes` never prompts for a password, and
-/// `StrictHostKeyChecking=yes` never accepts an unknown host key. Doctor
-/// diagnoses; the user decides whether to trust a key.
 mod ssh;
 
 pub(crate) use ssh::posix_quote;
@@ -2812,5 +2804,4 @@ use ssh::{
 };
 
 #[cfg(test)]
-#[path = "hel_targets/tests.rs"]
 mod tests;

@@ -2533,5 +2533,4 @@ pub(crate) fn select_contains(kind: &SessionConfigKind, desired: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "hel_acp/tests.rs"]
 mod tests;

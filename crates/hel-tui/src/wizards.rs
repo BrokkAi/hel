@@ -1384,5 +1384,4 @@ fn apply_mount_completions(wizard: &mut MountWizard, prefix: &str, candidates: V
 mod dashboard;
 
 #[cfg(test)]
-#[path = "wizards/tests.rs"]
 mod tests;
