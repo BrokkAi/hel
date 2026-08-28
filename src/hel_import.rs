@@ -2506,6 +2506,7 @@ fn import_claude_session_inner(
     state.sessions.insert(
         session_id.clone(),
         SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -2807,6 +2808,7 @@ fn import_native_session(
     state.sessions.insert(
         session_id.clone(),
         SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,

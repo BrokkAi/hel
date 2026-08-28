@@ -3179,6 +3179,7 @@ mod tests {
     #[cfg(unix)]
     fn register_leased_relay_session() {
         crate::hel_database::save_session(&crate::hel_state::SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,

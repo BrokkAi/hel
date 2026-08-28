@@ -34,13 +34,26 @@ pub(crate) async fn apply_dashboard_action(
         DashboardAction::QuitDetach => {
             context.request_shutdown();
         }
+        DashboardAction::OpenWorkspacePicker => {
+            context.request_workspace_switch();
+        }
         DashboardAction::OpenConfig => match context.run_setup_dialog()? {
             SetupOutcome::Written => {
                 context.dashboard.set_notice("Saving setup changes…");
+                let workspace_id = context.workspace_id.clone();
+                let client_id = context.client_id.clone();
                 spawn_io(
                     "reload setup state",
                     context.dashboard_io_tx.clone(),
-                    Controller::load,
+                    move || {
+                        let mut controller = Controller::load()?;
+                        super::retain_workspace_sessions(
+                            &mut controller,
+                            &workspace_id,
+                            &client_id,
+                        )?;
+                        Ok(controller)
+                    },
                     DashboardIoUpdate::SetupReloaded,
                 );
             }
@@ -475,6 +488,7 @@ fn start_session_launch_with_repository_preflight(
             context.dashboard.set_notice("Preparing session launch…");
             spawn_dashboard_create_session(
                 action,
+                context.workspace_id.clone(),
                 context.dashboard_io_tx.clone(),
                 context.lifecycle_updates_tx.clone(),
                 tokio::runtime::Handle::current(),

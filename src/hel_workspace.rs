@@ -16,6 +16,19 @@ pub struct WorkspaceRecord {
     pub session_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetachedDraft {
+    pub id: String,
+    pub workspace_id: String,
+    pub session_id: Option<String>,
+    pub source: String,
+    pub owner_pid: Option<u32>,
+    pub saved_at: String,
+    pub text: String,
+    pub recovered_at: Option<String>,
+}
+
 /// Normalize a display name and return the case-insensitive uniqueness key.
 pub fn normalize_workspace_name(name: &str) -> Result<(String, String)> {
     let name = name.trim();

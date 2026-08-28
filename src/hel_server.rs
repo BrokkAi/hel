@@ -15,7 +15,7 @@ use anyhow::{Context, Result as AnyResult};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HeaderValue, SET_COOKIE};
-use axum::http::{Response, StatusCode};
+use axum::http::{HeaderMap, Response, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -199,6 +199,8 @@ pub async fn run_server(options: ServerOptions) -> AnyResult<()> {
 pub struct ViewerSnapshot {
     pub revision: u64,
     pub generated_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<ViewerWorkspace>,
     pub sessions: Vec<ViewerSession>,
     pub profiles: Vec<ViewerProfile>,
     pub targets: Vec<ViewerTarget>,
@@ -215,6 +217,7 @@ impl ViewerSnapshot {
             .values()
             .map(|session| ViewerSession {
                 id: session.id.clone(),
+                workspace_id: session.workspace_id.clone(),
                 title: session.display_title().to_owned(),
                 harness_kind: session.harness_kind.id().into(),
                 profile_id: session.last_profile.clone(),
@@ -280,6 +283,7 @@ impl ViewerSnapshot {
         Self {
             revision,
             generated_at: now_unix().to_string(),
+            workspaces: Vec::new(),
             sessions,
             profiles,
             targets,
@@ -292,6 +296,8 @@ impl ViewerSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct ViewerSession {
     pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace_id: String,
     pub title: String,
     pub harness_kind: String,
     pub profile_id: String,
@@ -313,6 +319,13 @@ pub struct ViewerSession {
     /// projection deliberately keeps on the controller.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incompatible_resume_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerWorkspace {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +396,8 @@ pub struct ViewerRepository {
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControllerAction {
     New {
+        #[serde(default)]
+        workspace_id: String,
         profile_id: String,
         bundle_id: String,
         target_id: String,
@@ -496,6 +511,7 @@ pub struct ControllerRequest {
 /// therefore travels on its own channel and only persists one cursor field.
 #[derive(Debug)]
 pub struct ReadReceiptRequest {
+    pub client_id: String,
     pub session_id: String,
     pub through: u64,
     pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -735,14 +751,21 @@ struct ReadRequest {
 async fn mark_conversation_read(
     State(state): State<ServerState>,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<ReadRequest>,
 ) -> Result<StatusCode, ApiError> {
     validate_public_id(&session_id)?;
     require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
     let (reply, result) = tokio::sync::oneshot::channel();
+    let cookie = headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| cookie_value(header, COOKIE_NAME))
+        .ok_or_else(ApiError::unauthorized)?;
     state
         .receipt_tx
         .send(ReadReceiptRequest {
+            client_id: format!("phone:{cookie}"),
             session_id,
             through: request.through,
             reply,
@@ -794,6 +817,7 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             target_id,
             title,
             project_directory,
+            ..
         } => {
             validate_public_id(profile_id)?;
             validate_public_id(bundle_id)?;
@@ -1240,6 +1264,7 @@ mod tests {
     fn sample_config_state() -> (HelConfig, HelState) {
         let config = HelConfig {
             version: CONFIG_VERSION,
+            phone: Default::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
@@ -1285,6 +1310,7 @@ mod tests {
             sessions: BTreeMap::from([(
                 "session-1".into(),
                 SessionRecord {
+                    workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
                     archived: false,
                     container_cpus: None,
                     container_memory: None,
@@ -1582,6 +1608,7 @@ mod tests {
         assert_eq!(
             action.action,
             ControllerAction::New {
+                workspace_id: String::new(),
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
                 target_id: "raw".into(),
@@ -1601,6 +1628,7 @@ mod tests {
         let (config, state) = sample_config_state();
         let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
         let action = |target_id: &str, project_directory: Option<PathBuf>| ControllerAction::New {
+            workspace_id: String::new(),
             profile_id: "codex-1".into(),
             bundle_id: "hel".into(),
             target_id: target_id.into(),

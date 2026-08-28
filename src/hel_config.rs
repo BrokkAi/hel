@@ -11,6 +11,50 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+fn default_phone_bind() -> String {
+    "127.0.0.1:3765".to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhoneConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_phone_bind")]
+    pub bind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
+}
+
+impl Default for PhoneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_phone_bind(),
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+impl PhoneConfig {
+    fn validate(&self) -> Result<()> {
+        let bind: std::net::SocketAddr = self
+            .bind
+            .parse()
+            .with_context(|| format!("parse phone bind address {:?}", self.bind))?;
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            bail!("phone TLS requires both `tls_cert` and `tls_key`");
+        }
+        if !bind.ip().is_loopback() && self.tls_cert.is_none() {
+            bail!("a non-loopback phone bind requires TLS");
+        }
+        Ok(())
+    }
+}
+
 pub const CONFIG_VERSION: u32 = 1;
 pub const PRODUCT_DIR: &str = "hel";
 
@@ -673,6 +717,8 @@ fn validate_environment(owner: &str, environment: &BTreeMap<String, String>) -> 
 #[serde(deny_unknown_fields)]
 pub struct HelConfig {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "PhoneConfig::is_default")]
+    pub phone: PhoneConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, HarnessProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -685,6 +731,7 @@ impl Default for HelConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            phone: PhoneConfig::default(),
             profiles: BTreeMap::new(),
             bundles: BTreeMap::new(),
             targets: BTreeMap::new(),
@@ -700,6 +747,7 @@ impl HelConfig {
                 self.version
             );
         }
+        self.phone.validate()?;
         for (id, profile) in &self.profiles {
             profile.validate(id)?;
         }
@@ -770,6 +818,12 @@ impl HelConfig {
         config.targets.entry("localhost".into()).or_insert(legacy);
         config.save_to(path)?;
         Ok(true)
+    }
+}
+
+impl PhoneConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -974,6 +1028,7 @@ mod tests {
     fn sample_config() -> HelConfig {
         HelConfig {
             version: CONFIG_VERSION,
+            phone: PhoneConfig::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
@@ -1420,6 +1475,19 @@ mod tests {
             HelConfig::load_from(&directory.path().join("missing.toml")).unwrap(),
             HelConfig::default()
         );
+    }
+
+    #[test]
+    fn phone_config_requires_tls_off_loopback_and_complete_key_pairs() {
+        let mut config = HelConfig::default();
+        config.phone.enabled = true;
+        config.phone.bind = "0.0.0.0:3765".into();
+        assert!(config.validate().unwrap_err().to_string().contains("TLS"));
+
+        config.phone.tls_cert = Some(PathBuf::from("certificate.pem"));
+        assert!(config.validate().unwrap_err().to_string().contains("both"));
+        config.phone.tls_key = Some(PathBuf::from("private-key.pem"));
+        config.validate().unwrap();
     }
 
     #[test]

@@ -77,6 +77,7 @@ pub(crate) enum DashboardExit {
     Normal,
     Detached,
     Interrupted,
+    WorkspacePicker,
 }
 
 #[derive(Clone)]
@@ -216,6 +217,8 @@ pub(crate) struct ActiveDashboardImport {
 pub(crate) struct DashboardContext {
     terminal: TerminalGuard,
     pub(crate) controller: Controller,
+    pub(crate) workspace_id: String,
+    pub(crate) client_id: String,
     pub(crate) dashboard: DashboardState,
     /// One notifications bar for the whole process: the dashboard and every
     /// chat view opened from it report through this shared handle.
@@ -244,6 +247,7 @@ pub(crate) struct DashboardContext {
     /// changed.
     pub(crate) controller_changed: bool,
     pub(crate) quit_detached: bool,
+    workspace_switch_requested: bool,
     shutdown_requested: bool,
     pub(crate) critical_operations: CriticalOperationTracker,
     critical_operations_changed: watch::Receiver<u64>,
@@ -334,7 +338,29 @@ fn enqueue_materialized_projection(
     Some((materialized, viewed_through_event_ordinal))
 }
 
-pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
+pub(super) fn retain_workspace_sessions(
+    controller: &mut Controller,
+    workspace_id: &str,
+    client_id: &str,
+) -> Result<()> {
+    let session_ids = hel::hel_database::session_ids_for_workspace(workspace_id)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    controller
+        .state
+        .sessions
+        .retain(|session_id, _| session_ids.contains(session_id));
+    for session in controller.state.sessions.values_mut() {
+        session.viewed_through_event_ordinal =
+            hel::hel_database::client_read_frontier(client_id, workspace_id, &session.id)?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_dashboard_for_workspace(
+    workspace_id: &str,
+    client_id: &str,
+) -> Result<DashboardExit> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin())
         || !std::io::IsTerminal::is_terminal(&std::io::stdout())
     {
@@ -343,7 +369,7 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
         return Ok(DashboardExit::Normal);
     }
 
-    let Some(mut context) = DashboardContext::open()? else {
+    let Some(mut context) = DashboardContext::open(workspace_id, client_id)? else {
         return Ok(DashboardExit::Normal);
     };
     let termination = hel::termination::Coordinator::install().token();
@@ -511,6 +537,7 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
     }
     context.cancel_background_work();
     let quit_detached = context.quit_detached;
+    let workspace_switch_requested = context.workspace_switch_requested;
     // Hand the terminal back before saying anything on it; the warm chat and
     // the background feeds are torn down after, as the rest of the context
     // drops.
@@ -521,7 +548,9 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
             .await
             .context("shut down dashboard session manager")?;
     }
-    Ok(if quit_detached {
+    Ok(if workspace_switch_requested {
+        DashboardExit::WorkspacePicker
+    } else if quit_detached {
         DashboardExit::Detached
     } else if context.shutdown_requested {
         DashboardExit::Interrupted
@@ -533,6 +562,11 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
 impl DashboardContext {
     pub(crate) fn request_shutdown(&mut self) {
         self.begin_shutdown(true);
+    }
+
+    pub(crate) fn request_workspace_switch(&mut self) {
+        self.workspace_switch_requested = true;
+        self.begin_shutdown(false);
     }
 
     fn begin_shutdown(&mut self, detached: bool) {
@@ -609,6 +643,8 @@ impl DashboardContext {
     fn spawn_read_receipt(&mut self, session_id: String, through: u64) {
         self.read_receipt_in_flight = Some(session_id.clone());
         io::spawn_read_receipt_persist(
+            self.client_id.clone(),
+            self.workspace_id.clone(),
             session_id,
             through,
             self.dashboard_io_tx.clone(),
@@ -636,8 +672,9 @@ impl DashboardContext {
     /// Loads state, takes the terminal, and starts every background feed.
     /// `Ok(None)` means first-run setup was cancelled and there is nothing to
     /// run.
-    fn open() -> Result<Option<Self>> {
+    fn open(workspace_id: &str, client_id: &str) -> Result<Option<Self>> {
         let mut controller = Controller::load()?;
+        retain_workspace_sessions(&mut controller, workspace_id, client_id)?;
         let greeting = startup_greeting(&controller);
         let mut dashboard = DashboardState::new(
             controller.config.clone(),
@@ -658,6 +695,7 @@ impl DashboardContext {
             match setup_result? {
                 SetupOutcome::Written => {
                     controller.reload()?;
+                    retain_workspace_sessions(&mut controller, workspace_id, client_id)?;
                     dashboard.set_config(controller.config.clone());
                     dashboard.set_state(controller.state.clone());
                     dashboard
@@ -729,6 +767,8 @@ impl DashboardContext {
         let mut context = Self {
             terminal,
             controller,
+            workspace_id: workspace_id.to_owned(),
+            client_id: client_id.to_owned(),
             dashboard,
             notices,
             events: Some(event::EventStream::new()),
@@ -740,6 +780,7 @@ impl DashboardContext {
             drawn_notice_generation: 0,
             controller_changed: true,
             quit_detached: false,
+            workspace_switch_requested: false,
             shutdown_requested: false,
             critical_operations,
             critical_operations_changed,
@@ -1442,6 +1483,7 @@ impl DashboardContext {
         });
         spawn_dashboard_import(
             &self.controller,
+            self.workspace_id.clone(),
             pending,
             safety,
             self.next_import_task_id,
@@ -1513,6 +1555,8 @@ impl DashboardContext {
         record_chat_detach_state(
             &mut self.controller,
             &mut self.dashboard,
+            &self.client_id,
+            &self.workspace_id,
             &session_id,
             last_seen_event_ordinal,
             &draft,
@@ -1545,6 +1589,8 @@ async fn next_terminal_event(
 fn record_chat_detach_state(
     controller: &mut Controller,
     dashboard: &mut DashboardState,
+    client_id: &str,
+    workspace_id: &str,
     session_id: &str,
     event_ordinal: u64,
     draft: &str,
@@ -1563,6 +1609,8 @@ fn record_chat_detach_state(
     dashboard.set_state(controller.state.clone());
     dashboard.clear_notice();
     Some(io::spawn_detached_session_state_persist(
+        client_id.to_owned(),
+        workspace_id.to_owned(),
         session_id.to_owned(),
         event_ordinal,
         draft.to_owned(),

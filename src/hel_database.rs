@@ -20,7 +20,8 @@ use crate::hel_state::{
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 use crate::hel_workspace::{
-    DEFAULT_WORKSPACE_ID, WorkspaceRecord, new_workspace_id, normalize_workspace_name,
+    DEFAULT_WORKSPACE_ID, DetachedDraft, WorkspaceRecord, new_workspace_id,
+    normalize_workspace_name,
 };
 
 const SCHEMA_VERSION: i64 = 14;
@@ -100,9 +101,10 @@ pub fn list_workspaces_from(path: &Path) -> Result<Vec<WorkspaceRecord>> {
     let mut statement = connection.prepare(
         "SELECT w.workspace_id, w.name, w.created_at, w.last_opened_at,
                 count(c.session_id)
-           FROM workspaces w
+          FROM workspaces w
            LEFT JOIN session_contexts c USING(workspace_id)
           GROUP BY w.workspace_id
+         HAVING w.workspace_id != 'default' OR count(c.session_id) > 0
           ORDER BY w.last_opened_at DESC, w.created_at DESC, w.workspace_id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -219,6 +221,23 @@ pub fn workspace_for_session_at(path: &Path, session_id: &str) -> Result<Option<
         .map_err(Into::into)
 }
 
+pub fn session_ids_for_workspace(workspace_id: &str) -> Result<Vec<String>> {
+    session_ids_for_workspace_at(&database_path(), workspace_id)
+}
+
+pub fn session_ids_for_workspace_at(path: &Path, workspace_id: &str) -> Result<Vec<String>> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT c.session_id
+           FROM session_contexts c
+           JOIN sessions s USING(session_id)
+          WHERE c.workspace_id = ?1
+          ORDER BY c.created_at, c.session_id",
+    )?;
+    let rows = statement.query_map([workspace_id], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
 /// Assign a newly-created session context to a workspace. Existing contexts
 /// are immutable: moving sessions is deliberately outside the v1 model.
 pub fn assign_new_session_workspace(session_id: &str, workspace_id: &str) -> Result<()> {
@@ -258,6 +277,211 @@ pub fn assign_new_session_workspace_at(
     Ok(())
 }
 
+pub fn client_read_frontier(client_id: &str, workspace_id: &str, session_id: &str) -> Result<u64> {
+    client_read_frontier_at(&database_path(), client_id, workspace_id, session_id)
+}
+
+fn client_read_frontier_at(
+    path: &Path,
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<u64> {
+    let connection = open(path)?;
+    let client: Option<u64> = connection
+        .query_row(
+            "SELECT through_event_ordinal
+               FROM client_read_frontiers
+              WHERE client_id = ?1 AND workspace_id = ?2 AND session_id = ?3",
+            params![client_id, workspace_id, session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(frontier) = client {
+        return Ok(frontier);
+    }
+    connection
+        .query_row(
+            "SELECT s.viewed_through_event_ordinal
+               FROM sessions s JOIN session_contexts c USING(session_id)
+              WHERE s.session_id = ?1 AND c.workspace_id = ?2",
+            params![session_id, workspace_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("find session {session_id:?} in workspace {workspace_id:?}"))
+}
+
+pub fn advance_client_read_frontier(
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+    through: u64,
+) -> Result<u64> {
+    advance_client_read_frontier_at(
+        &database_path(),
+        client_id,
+        workspace_id,
+        session_id,
+        through,
+    )
+}
+
+fn advance_client_read_frontier_at(
+    path: &Path,
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+    through: u64,
+) -> Result<u64> {
+    ensure!(!client_id.trim().is_empty(), "client id is empty");
+    let connection = open(path)?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let changed = connection.execute(
+        "INSERT INTO client_read_frontiers(
+             client_id, workspace_id, session_id, through_event_ordinal, updated_at
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE EXISTS(
+              SELECT 1 FROM session_contexts
+               WHERE session_id = ?3 AND workspace_id = ?2
+          )
+         ON CONFLICT(client_id, workspace_id, session_id) DO UPDATE SET
+             through_event_ordinal = max(
+                 client_read_frontiers.through_event_ordinal,
+                 excluded.through_event_ordinal
+             ),
+             updated_at = excluded.updated_at",
+        params![client_id, workspace_id, session_id, through, now],
+    )?;
+    ensure!(
+        changed == 1,
+        "session {session_id:?} is not in workspace {workspace_id:?}"
+    );
+    client_read_frontier_at(path, client_id, workspace_id, session_id)
+}
+
+pub fn save_detached_draft(
+    workspace_id: &str,
+    session_id: Option<&str>,
+    source: &str,
+    owner_pid: Option<u32>,
+    text: &str,
+) -> Result<Option<String>> {
+    save_detached_draft_at(
+        &database_path(),
+        workspace_id,
+        session_id,
+        source,
+        owner_pid,
+        text,
+    )
+}
+
+fn save_detached_draft_at(
+    path: &Path,
+    workspace_id: &str,
+    session_id: Option<&str>,
+    source: &str,
+    owner_pid: Option<u32>,
+    text: &str,
+) -> Result<Option<String>> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    ensure!(!source.trim().is_empty(), "draft source is empty");
+    let id = new_workspace_id()?;
+    let saved_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT INTO detached_drafts(
+             draft_id, workspace_id, session_id, source, owner_pid, saved_at, text
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id,
+            workspace_id,
+            session_id,
+            source,
+            owner_pid,
+            saved_at,
+            text
+        ],
+    )?;
+    Ok(Some(id))
+}
+
+pub fn list_detached_drafts(workspace_id: &str) -> Result<Vec<DetachedDraft>> {
+    list_detached_drafts_at(&database_path(), workspace_id)
+}
+
+fn list_detached_drafts_at(path: &Path, workspace_id: &str) -> Result<Vec<DetachedDraft>> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT draft_id, workspace_id, session_id, source, owner_pid, saved_at, text,
+                recovered_at
+           FROM detached_drafts
+          WHERE workspace_id = ?1 AND recovered_at IS NULL
+          ORDER BY saved_at DESC, draft_id DESC",
+    )?;
+    let rows = statement.query_map([workspace_id], |row| {
+        Ok(DetachedDraft {
+            id: row.get(0)?,
+            workspace_id: row.get(1)?,
+            session_id: row.get(2)?,
+            source: row.get(3)?,
+            owner_pid: row.get(4)?,
+            saved_at: row.get(5)?,
+            text: row.get(6)?,
+            recovered_at: row.get(7)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
+pub fn mark_draft_recovered(draft_id: &str) -> Result<()> {
+    let connection = open(&database_path())?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let changed = connection.execute(
+        "UPDATE detached_drafts SET recovered_at = ?2
+          WHERE draft_id = ?1 AND recovered_at IS NULL",
+        params![draft_id, now],
+    )?;
+    ensure!(
+        changed == 1,
+        "unknown or already recovered draft {draft_id:?}"
+    );
+    Ok(())
+}
+
+/// Explicitly restore a detached draft into its session composer. This is the
+/// only operation that merges client-local draft state back into the legacy
+/// session field, and the transaction marks the source draft recovered at the
+/// same durable boundary.
+pub fn recover_detached_draft(draft_id: &str) -> Result<String> {
+    let mut connection = open(&database_path())?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (session_id, text): (Option<String>, String) = tx
+        .query_row(
+            "SELECT session_id, text FROM detached_drafts
+              WHERE draft_id = ?1 AND recovered_at IS NULL",
+            [draft_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .with_context(|| format!("find recoverable draft {draft_id:?}"))?;
+    let session_id = session_id.context("draft is not associated with a session")?;
+    let changed = tx.execute(
+        "UPDATE sessions SET draft_input = ?2 WHERE session_id = ?1",
+        params![session_id, text],
+    )?;
+    ensure!(changed == 1, "draft session no longer exists");
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    tx.execute(
+        "UPDATE detached_drafts SET recovered_at = ?2 WHERE draft_id = ?1",
+        params![draft_id, now],
+    )?;
+    tx.commit()?;
+    Ok(session_id)
+}
+
 pub fn load_state_from(path: &Path) -> Result<HelState> {
     let connection = open(path)?;
     let mut state = HelState::default();
@@ -268,11 +492,13 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
                 s.viewed_through_event_ordinal, s.last_error, s.resource_allocation,
                 s.last_checkpoint_error, s.project_directory, s.managed_worktree,
                 s.draft_input, s.container_cpus, s.container_memory, s.archived
+                , c.workspace_id
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(SessionRecord {
+            workspace_id: row.get(22)?,
             archived: row.get(21)?,
             container_cpus: row.get(19)?,
             container_memory: row.get(20)?,
@@ -1678,14 +1904,20 @@ pub fn save_state_to(path: &Path, state: &HelState) -> Result<()> {
     }
     tx.execute("DELETE FROM mount_history", [])?;
     for session in state.sessions.values() {
-        if let Some(existing_bundle) = existing_contexts.get(&session.id)
-            && existing_bundle != &session.bundle_id
-        {
-            bail!(
+        if let Some((existing_bundle, existing_workspace)) = existing_contexts.get(&session.id) {
+            ensure!(
+                existing_bundle == &session.bundle_id,
                 "session {} was already associated with bundle {}, not {}",
                 session.id,
                 existing_bundle,
                 session.bundle_id
+            );
+            ensure!(
+                existing_workspace == &session.workspace_id,
+                "session {} was already associated with workspace {}, not {}",
+                session.id,
+                existing_workspace,
+                session.workspace_id
             );
         }
         insert_session(&tx, session)?;
@@ -1702,9 +1934,10 @@ pub fn save_state_to(path: &Path, state: &HelState) -> Result<()> {
     Ok(())
 }
 
-fn existing_contexts(tx: &Transaction<'_>) -> Result<BTreeMap<String, String>> {
-    let mut statement = tx.prepare("SELECT session_id, bundle_id FROM session_contexts")?;
-    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+fn existing_contexts(tx: &Transaction<'_>) -> Result<BTreeMap<String, (String, String)>> {
+    let mut statement =
+        tx.prepare("SELECT session_id, bundle_id, workspace_id FROM session_contexts")?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?;
     rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
 }
 
@@ -1912,10 +2145,35 @@ fn parse_materialized_execution(
 /// orphan adoption — may use this.
 fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
     tx.execute(
-        "INSERT INTO session_contexts(session_id, bundle_id, created_at) VALUES (?1, ?2, ?3)
+        "INSERT INTO session_contexts(session_id, bundle_id, created_at, workspace_id)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(session_id) DO NOTHING",
-        params![session.id, session.bundle_id, session.created_at],
+        params![
+            session.id,
+            session.bundle_id,
+            session.created_at,
+            session.workspace_id
+        ],
     )?;
+    let (stored_bundle, stored_workspace): (String, String) = tx.query_row(
+        "SELECT bundle_id, workspace_id FROM session_contexts WHERE session_id = ?1",
+        [session.id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        stored_bundle == session.bundle_id,
+        "session {} belongs to bundle {}, not {}",
+        session.id,
+        stored_bundle,
+        session.bundle_id
+    );
+    ensure!(
+        stored_workspace == session.workspace_id,
+        "session {} belongs to workspace {}, not {}",
+        session.id,
+        stored_workspace,
+        session.workspace_id
+    );
     tx.execute(
         "INSERT INTO sessions(
              session_id, title, harness_kind, last_profile, target_template_id, state,

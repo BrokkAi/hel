@@ -23,6 +23,23 @@ use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, anyhow};
 
+/// Launch a long-lived background process with no inherited terminal streams.
+/// The child is deliberately not waited here: it owns a singleton lock and
+/// publishes its own endpoint, while callers confirm readiness over IPC.
+pub fn spawn_detached(command: &mut Command) -> Result<u32> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command.spawn().context("spawn detached child process")?;
+    Ok(child.id())
+}
+
 /// Run `command` with `input` written to its stdin, returning the captured
 /// output.
 ///

@@ -1554,6 +1554,7 @@ mod tests {
         hel_state.sessions.insert(
             session_id.into(),
             hel::hel_state::SessionRecord {
+                workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
                 archived: false,
                 container_cpus: None,
                 container_memory: None,

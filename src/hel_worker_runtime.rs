@@ -13,6 +13,8 @@ pub use crate::hel_worker::WORKER_PID_FILE;
 #[serde(deny_unknown_fields)]
 pub struct WorkerOwnership {
     pub version: u32,
+    #[serde(default = "default_worker_workspace_id")]
+    pub workspace_id: String,
     pub session_id: String,
     pub profile_id: String,
     pub bundle_id: String,
@@ -20,12 +22,16 @@ pub struct WorkerOwnership {
 }
 
 impl WorkerOwnership {
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 
     pub fn write(&self, path: &Path) -> Result<()> {
         let body = serde_json::to_vec(self)?;
         crate::hel_config::atomic_write(path, &body)
     }
+}
+
+fn default_worker_workspace_id() -> String {
+    crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

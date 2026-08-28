@@ -717,6 +717,8 @@ impl CheckpointMetadata {
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {
     pub id: String,
+    #[serde(default = "default_session_workspace_id")]
+    pub workspace_id: String,
     pub title: String,
     pub harness_kind: HarnessKind,
     pub last_profile: String,
@@ -768,6 +770,10 @@ pub struct SessionRecord {
     pub last_checkpoint_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CheckpointMetadata>,
+}
+
+fn default_session_workspace_id() -> String {
+    crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned()
 }
 
 impl SessionRecord {
@@ -885,6 +891,7 @@ impl SessionRecord {
                 self.id
             );
         }
+        validate_id("workspace", &self.workspace_id)?;
         validate_id("profile", &self.last_profile)?;
         validate_id("bundle", &self.bundle_id)?;
         if let Some(project_directory) = &self.project_directory
@@ -1241,6 +1248,7 @@ mod tests {
 
     fn sample_state() -> HelState {
         let session = SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -1291,6 +1299,7 @@ mod tests {
     fn sample_config() -> HelConfig {
         HelConfig {
             version: CONFIG_VERSION,
+            phone: Default::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {

@@ -2012,6 +2012,7 @@ mod tests {
     #[test]
     fn failed_resume_rolls_back_only_after_target_cleanup() {
         let previous = SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,

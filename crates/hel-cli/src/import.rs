@@ -90,9 +90,9 @@ impl ImportCommand {
     }
 }
 
-pub(crate) fn import(args: ImportArgs) -> Result<()> {
+pub(crate) fn import(args: ImportArgs, workspace_id: &str) -> Result<()> {
     let (harness, args) = args.command.split();
-    import_native(harness, args)
+    import_native(harness, args, workspace_id)
 }
 
 /// How the CLI names a harness while it reports what it selected.
@@ -243,7 +243,7 @@ fn locate_for_import(
 /// Adopt one native session from the command line. Every harness takes these
 /// same steps; only the locator and the importer bound in [`LocatedImport`]
 /// differ.
-fn import_native(harness: HarnessKind, args: NativeImportArgs) -> Result<()> {
+fn import_native(harness: HarnessKind, args: NativeImportArgs, workspace_id: &str) -> Result<()> {
     let home = harness_config_home(harness)?;
     let selection = match args.session {
         Some(session) => ClaudeSessionSelection::NativeSessionId(session),
@@ -280,12 +280,12 @@ fn import_native(harness: HarnessKind, args: NativeImportArgs) -> Result<()> {
     // `write_archive_atomic`; persist a synthesized config before the state
     // record that references it.
     config.save()?;
-    persist_imported_session(
-        state
-            .sessions
-            .get(&imported.session_id)
-            .context("import did not add its session to controller state")?,
-    )?;
+    let session = state
+        .sessions
+        .get_mut(&imported.session_id)
+        .context("import did not add its session to controller state")?;
+    session.workspace_id = workspace_id.to_owned();
+    persist_imported_session(session)?;
     println!(
         "Imported {} as Hel session {} (bundle {}, archive {})",
         imported.native_session_id,
@@ -496,6 +496,7 @@ fn display_home_relative(path: &std::path::Path) -> String {
 
 pub(crate) fn spawn_dashboard_import(
     controller: &Controller,
+    workspace_id: String,
     pending: PendingDashboardImport,
     safety: DashboardImportSafety,
     task_id: u64,
@@ -552,6 +553,15 @@ pub(crate) fn spawn_dashboard_import(
             &cancelled,
             report,
         );
+        if let Ok(DashboardImportTaskResult::Imported(imported)) = &mut result
+            && let Some(session) = imported
+                .controller
+                .state
+                .sessions
+                .get_mut(&imported.session_id)
+        {
+            session.workspace_id = workspace_id;
+        }
         if cancelled.load(Ordering::Acquire) {
             if let Ok(DashboardImportTaskResult::Imported(imported)) = &result
                 && let Some(path) = imported

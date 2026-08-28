@@ -167,6 +167,7 @@ pub enum DashboardAction {
         additional_mounts: Vec<AdditionalMount>,
         mount_history: Vec<std::path::PathBuf>,
     },
+    OpenWorkspacePicker,
     QuitDetach,
 }
 
@@ -362,6 +363,9 @@ impl DashboardState {
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
         {
             return DashboardAction::QuitDetach;
+        }
+        if dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('w') {
+            return DashboardAction::OpenWorkspacePicker;
         }
 
         // Retire the notice this key press is stepping past, but only once it
@@ -1055,6 +1059,10 @@ mod tests {
         assert_eq!(
             dashboard.handle_key(ctrl_key('s')),
             DashboardAction::OpenResumeDialog
+        );
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('w')),
+            DashboardAction::OpenWorkspacePicker
         );
         assert_eq!(dashboard.handle_key(ctrl_key('t')), DashboardAction::None);
         assert_eq!(dashboard.handle_key(ctrl_key('i')), DashboardAction::None);
