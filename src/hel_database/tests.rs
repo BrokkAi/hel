@@ -10,6 +10,7 @@ fn event_digest(value: u64) -> String {
 
 fn session(id: &str, bundle: &str) -> SessionRecord {
     SessionRecord {
+        workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
         archived: false,
         container_cpus: None,
         container_memory: None,
@@ -1180,7 +1181,8 @@ fn version_seven_database_runs_the_queue_kind_and_grok_harness_migrations() {
 
     connection
         .execute_batch(
-            "INSERT INTO session_contexts VALUES ('session-3', 'project-1', 'now');
+            "INSERT INTO session_contexts(session_id, bundle_id, created_at)
+                 VALUES ('session-3', 'project-1', 'now');
                  INSERT INTO sessions(
                      session_id, title, harness_kind, last_profile, target_template_id,
                      state, updated_at
@@ -1193,7 +1195,8 @@ fn version_seven_database_runs_the_queue_kind_and_grok_harness_migrations() {
 
     connection
         .execute_batch(
-            "INSERT INTO session_contexts VALUES ('session-4', 'project-1', 'now');
+            "INSERT INTO session_contexts(session_id, bundle_id, created_at)
+                 VALUES ('session-4', 'project-1', 'now');
                  INSERT INTO sessions(
                      session_id, title, harness_kind, last_profile, target_template_id,
                      state, updated_at
@@ -1292,7 +1295,8 @@ fn a_fresh_database_accepts_a_session_for_every_harness_kind() {
         let session_id = format!("session-{index}");
         connection
             .execute(
-                "INSERT INTO session_contexts VALUES (?1, 'project-1', 'now')",
+                "INSERT INTO session_contexts(session_id, bundle_id, created_at)
+                 VALUES (?1, 'project-1', 'now')",
                 params![session_id],
             )
             .unwrap();
@@ -2426,4 +2430,111 @@ fn legacy_json_migration_commits_before_retaining_source_backup() {
     assert_eq!(load_state_from(&database).unwrap(), state);
     assert!(!legacy.exists());
     assert!(directory.path().join("state.json.migrated-v1").exists());
+}
+
+#[test]
+fn legacy_sessions_are_migrated_into_the_default_workspace_without_copying_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+    assert_eq!(
+        workspace_for_session_at(&database, "session-1").unwrap(),
+        Some(DEFAULT_WORKSPACE_ID.to_owned())
+    );
+    let workspaces = list_workspaces_from(&database).unwrap();
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].id, DEFAULT_WORKSPACE_ID);
+    assert_eq!(workspaces[0].name, "default");
+    assert_eq!(workspaces[0].session_count, 1);
+}
+
+#[test]
+fn workspace_crud_enforces_unique_names_and_only_deletes_empty_workspaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let workspace = create_workspace_at(&database, "  Bifrost  ").unwrap();
+    assert_eq!(workspace.name, "Bifrost");
+    assert!(create_workspace_at(&database, "bIFROST").is_err());
+
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    assign_new_session_workspace_at(&database, "session-1", &workspace.id).unwrap();
+    assert!(delete_empty_workspace_at(&database, &workspace.id).is_err());
+    assert!(assign_new_session_workspace_at(&database, "session-1", DEFAULT_WORKSPACE_ID).is_err());
+
+    let empty = create_workspace_at(&database, "Empty").unwrap();
+    rename_workspace_at(&database, &empty.id, "Renamed").unwrap();
+    delete_empty_workspace_at(&database, &empty.id).unwrap();
+    assert!(
+        list_workspaces_from(&database)
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.id != empty.id)
+    );
+}
+
+#[test]
+fn read_frontiers_are_independent_per_client_with_the_session_cursor_as_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let workspace = create_workspace_at(&database, "Readers").unwrap();
+    let mut record = session("session-1", "project-1");
+    record.workspace_id = workspace.id.clone();
+    save_session_to(&database, &record).unwrap();
+
+    assert_eq!(
+        client_read_frontier_at(&database, "client-a", &workspace.id, "session-1").unwrap(),
+        7
+    );
+    assert_eq!(
+        advance_client_read_frontier_at(&database, "client-a", &workspace.id, "session-1", 12,)
+            .unwrap(),
+        12
+    );
+    assert_eq!(
+        client_read_frontier_at(&database, "client-b", &workspace.id, "session-1").unwrap(),
+        7
+    );
+}
+
+#[test]
+fn detached_drafts_keep_source_pid_and_workspace_without_overwriting_each_other() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let workspace = create_workspace_at(&database, "Drafts").unwrap();
+    let mut record = session("session-1", "project-1");
+    record.workspace_id = workspace.id.clone();
+    save_session_to(&database, &record).unwrap();
+
+    save_detached_draft_at(
+        &database,
+        &workspace.id,
+        Some("session-1"),
+        "tui-client-a",
+        Some(1234),
+        "first unfinished thought",
+    )
+    .unwrap();
+    save_detached_draft_at(
+        &database,
+        &workspace.id,
+        Some("session-1"),
+        "tui-client-b",
+        Some(5678),
+        "second unfinished thought",
+    )
+    .unwrap();
+
+    let drafts = list_detached_drafts_at(&database, &workspace.id).unwrap();
+    assert_eq!(drafts.len(), 2);
+    assert!(drafts.iter().any(|draft| {
+        draft.source == "tui-client-a"
+            && draft.owner_pid == Some(1234)
+            && draft.text == "first unfinished thought"
+    }));
+    assert!(drafts.iter().any(|draft| {
+        draft.source == "tui-client-b"
+            && draft.owner_pid == Some(5678)
+            && draft.text == "second unfinished thought"
+    }));
 }

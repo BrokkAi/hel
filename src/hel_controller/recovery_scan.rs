@@ -129,6 +129,11 @@ impl Controller {
                     profile_id,
                     profile.kind,
                     bundle_id,
+                    candidate
+                        .ownership
+                        .as_ref()
+                        .map(|ownership| ownership.workspace_id.clone())
+                        .unwrap_or_else(|| crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned()),
                     candidate.locator,
                 );
                 (record, true)
@@ -243,10 +248,12 @@ fn adopted_session_record(
     profile_id: String,
     harness_kind: crate::hel_config::HarnessKind,
     bundle_id: String,
+    workspace_id: String,
     locator: TargetLocator,
 ) -> SessionRecord {
     let now = now();
     SessionRecord {
+        workspace_id,
         archived: false,
         container_cpus: None,
         container_memory: None,
@@ -711,7 +718,7 @@ fn read_recovery_ownership(
             return None;
         }
     };
-    if marker.version != WorkerOwnership::VERSION
+    if !(1..=WorkerOwnership::VERSION).contains(&marker.version)
         || marker.session_id != candidate.session_id
         || marker.target_template_id != candidate.target_template_id
     {
@@ -840,6 +847,7 @@ mod tests {
             "codex".into(),
             HarnessKind::Codex,
             "project".into(),
+            crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             TargetLocator::LocalBare {
                 worker_root: workers.path().join(session_id),
             },
@@ -907,6 +915,7 @@ mod tests {
             "codex".into(),
             HarnessKind::Codex,
             "project".into(),
+            crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             TargetLocator::LocalBare {
                 worker_root: std::path::PathBuf::from("/workers/0123456789abcdef0123456789abcdef"),
             },

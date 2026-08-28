@@ -85,6 +85,7 @@ pub(crate) fn mouse_at_row(kind: MouseEventKind, area: Rect, row_offset: u16) ->
 pub(crate) fn config() -> HelConfig {
     HelConfig {
         version: CONFIG_VERSION,
+        phone: Default::default(),
         profiles: BTreeMap::from([
             (
                 "claude-1".into(),
@@ -148,6 +149,7 @@ pub(crate) fn config() -> HelConfig {
 
 pub(crate) fn stopped_session() -> SessionRecord {
     SessionRecord {
+        workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
         archived: false,
         container_cpus: None,
         container_memory: None,

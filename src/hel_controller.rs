@@ -99,6 +99,7 @@ impl Drop for ControllerStoreGuard {
 }
 
 pub struct SessionLaunchOptions {
+    pub workspace_id: String,
     pub additional_mounts: Vec<AdditionalMount>,
     pub allow_dirty_local: bool,
     pub resource_allocation: Option<SessionResourceAllocation>,
@@ -301,6 +302,7 @@ impl Controller {
         options: SessionLaunchOptions,
     ) -> Result<String> {
         let SessionLaunchOptions {
+            workspace_id,
             additional_mounts,
             allow_dirty_local,
             resource_allocation,
@@ -375,6 +377,7 @@ impl Controller {
             container_cpus: None,
             container_memory: None,
             id: id.clone(),
+            workspace_id,
             title: title.into(),
             harness_kind: profile.kind,
             last_profile: profile_id.to_string(),
@@ -716,6 +719,7 @@ mod tests {
 
     fn launch_options(additional_mounts: Vec<AdditionalMount>) -> SessionLaunchOptions {
         SessionLaunchOptions {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             additional_mounts,
             allow_dirty_local: false,
             resource_allocation: None,

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
 use hel::hel_credentials::CredentialSyncHandle;
@@ -49,8 +49,8 @@ use crate::dashboard::io::{
     spawn_stored_session_summary,
 };
 use crate::import::{
-    DashboardImportTaskResult, DashboardImportUpdate, PendingDashboardImport,
-    spawn_dashboard_import,
+    DashboardImportRequest, DashboardImportTaskResult, DashboardImportUpdate,
+    PendingDashboardImport, spawn_dashboard_import,
 };
 use crate::pollers::{
     CapacityPollUpdate, CredentialSyncNotices, CredentialSyncSignalTracker, Feed, LifecycleUpdate,
@@ -77,6 +77,7 @@ pub(crate) enum DashboardExit {
     Normal,
     Detached,
     Interrupted,
+    WorkspacePicker,
 }
 
 #[derive(Clone)]
@@ -216,6 +217,8 @@ pub(crate) struct ActiveDashboardImport {
 pub(crate) struct DashboardContext {
     terminal: TerminalGuard,
     pub(crate) controller: Controller,
+    pub(crate) workspace_id: String,
+    pub(crate) client_id: String,
     pub(crate) dashboard: DashboardState,
     /// One notifications bar for the whole process: the dashboard and every
     /// chat view opened from it report through this shared handle.
@@ -244,6 +247,7 @@ pub(crate) struct DashboardContext {
     /// changed.
     pub(crate) controller_changed: bool,
     pub(crate) quit_detached: bool,
+    workspace_switch_requested: bool,
     shutdown_requested: bool,
     pub(crate) critical_operations: CriticalOperationTracker,
     critical_operations_changed: watch::Receiver<u64>,
@@ -334,7 +338,36 @@ fn enqueue_materialized_projection(
     Some((materialized, viewed_through_event_ordinal))
 }
 
-pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
+pub(super) fn retain_workspace_sessions(
+    controller: &mut Controller,
+    workspace_id: &str,
+    client_id: &str,
+) -> Result<()> {
+    let session_ids = hel::hel_database::session_ids_for_workspace(workspace_id)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    controller
+        .state
+        .sessions
+        .retain(|session_id, _| session_ids.contains(session_id));
+    for session in controller.state.sessions.values_mut() {
+        let frontier =
+            hel::hel_database::client_read_frontier(client_id, workspace_id, &session.id)?;
+        hel::hel_database::advance_client_read_frontier(
+            client_id,
+            workspace_id,
+            &session.id,
+            frontier,
+        )?;
+        session.viewed_through_event_ordinal = frontier;
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_dashboard_for_workspace(
+    workspace_id: &str,
+    client_id: &str,
+) -> Result<DashboardExit> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin())
         || !std::io::IsTerminal::is_terminal(&std::io::stdout())
     {
@@ -343,7 +376,7 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
         return Ok(DashboardExit::Normal);
     }
 
-    let Some(mut context) = DashboardContext::open()? else {
+    let Some(mut context) = DashboardContext::open(workspace_id, client_id)? else {
         return Ok(DashboardExit::Normal);
     };
     let termination = hel::termination::Coordinator::install().token();
@@ -386,7 +419,11 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
                 // that asks for work ends the batch so that dispatch still
                 // follows input order.
                 loop {
-                    let batched = match (context.view, context.active_chat.as_mut()) {
+                    let batched = if workspace_picker_event(&event) {
+                        action = DashboardAction::OpenWorkspacePicker;
+                        false
+                    } else {
+                        match (context.view, context.active_chat.as_mut()) {
                         (View::Chat, Some(chat)) => {
                             chat_outcome = chat.handle_event(event);
                             matches!(chat_outcome, hel::hel_chat::ChatEventOutcome::None)
@@ -395,6 +432,7 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
                             action = dashboard_event_action(&mut context.dashboard, event);
                             context.controller_changed = true;
                             matches!(action, DashboardAction::None)
+                        }
                         }
                     };
                     if !batched {
@@ -511,6 +549,7 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
     }
     context.cancel_background_work();
     let quit_detached = context.quit_detached;
+    let workspace_switch_requested = context.workspace_switch_requested;
     // Hand the terminal back before saying anything on it; the warm chat and
     // the background feeds are torn down after, as the rest of the context
     // drops.
@@ -521,7 +560,9 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
             .await
             .context("shut down dashboard session manager")?;
     }
-    Ok(if quit_detached {
+    Ok(if workspace_switch_requested {
+        DashboardExit::WorkspacePicker
+    } else if quit_detached {
         DashboardExit::Detached
     } else if context.shutdown_requested {
         DashboardExit::Interrupted
@@ -533,6 +574,11 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
 impl DashboardContext {
     pub(crate) fn request_shutdown(&mut self) {
         self.begin_shutdown(true);
+    }
+
+    pub(crate) fn request_workspace_switch(&mut self) {
+        self.workspace_switch_requested = true;
+        self.begin_shutdown(false);
     }
 
     fn begin_shutdown(&mut self, detached: bool) {
@@ -609,6 +655,8 @@ impl DashboardContext {
     fn spawn_read_receipt(&mut self, session_id: String, through: u64) {
         self.read_receipt_in_flight = Some(session_id.clone());
         io::spawn_read_receipt_persist(
+            self.client_id.clone(),
+            self.workspace_id.clone(),
             session_id,
             through,
             self.dashboard_io_tx.clone(),
@@ -636,9 +684,15 @@ impl DashboardContext {
     /// Loads state, takes the terminal, and starts every background feed.
     /// `Ok(None)` means first-run setup was cancelled and there is nothing to
     /// run.
-    fn open() -> Result<Option<Self>> {
+    fn open(workspace_id: &str, client_id: &str) -> Result<Option<Self>> {
         let mut controller = Controller::load()?;
-        let greeting = startup_greeting(&controller);
+        retain_workspace_sessions(&mut controller, workspace_id, client_id)?;
+        let workspace_name = hel::hel_database::list_workspaces()?
+            .into_iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("unknown workspace {workspace_id:?}"))?
+            .name;
+        let greeting = format!("{workspace_name}  ·  {}", startup_greeting(&controller));
         let mut dashboard = DashboardState::new(
             controller.config.clone(),
             controller.state.clone(),
@@ -658,6 +712,7 @@ impl DashboardContext {
             match setup_result? {
                 SetupOutcome::Written => {
                     controller.reload()?;
+                    retain_workspace_sessions(&mut controller, workspace_id, client_id)?;
                     dashboard.set_config(controller.config.clone());
                     dashboard.set_state(controller.state.clone());
                     dashboard
@@ -729,6 +784,8 @@ impl DashboardContext {
         let mut context = Self {
             terminal,
             controller,
+            workspace_id: workspace_id.to_owned(),
+            client_id: client_id.to_owned(),
             dashboard,
             notices,
             events: Some(event::EventStream::new()),
@@ -740,6 +797,7 @@ impl DashboardContext {
             drawn_notice_generation: 0,
             controller_changed: true,
             quit_detached: false,
+            workspace_switch_requested: false,
             shutdown_requested: false,
             critical_operations,
             critical_operations_changed,
@@ -1334,7 +1392,7 @@ impl DashboardContext {
                         continue;
                     }
                     self.active_import = None;
-                    match result {
+                    match *result {
                         Ok(DashboardImportTaskResult::NeedsBundle(prompt)) => {
                             self.pending_import = Some(pending);
                             self.dashboard.show_import_bundle_confirmation(
@@ -1442,10 +1500,13 @@ impl DashboardContext {
         });
         spawn_dashboard_import(
             &self.controller,
-            pending,
-            safety,
-            self.next_import_task_id,
-            cancelled,
+            DashboardImportRequest {
+                workspace_id: self.workspace_id.clone(),
+                pending,
+                safety,
+                task_id: self.next_import_task_id,
+                cancelled,
+            },
             self.import_task_tx.clone(),
             self.critical_operations.clone(),
         );
@@ -1513,9 +1574,13 @@ impl DashboardContext {
         record_chat_detach_state(
             &mut self.controller,
             &mut self.dashboard,
-            &session_id,
-            last_seen_event_ordinal,
-            &draft,
+            DetachedChatState {
+                client_id: &self.client_id,
+                workspace_id: &self.workspace_id,
+                session_id: &session_id,
+                event_ordinal: last_seen_event_ordinal,
+                draft: &draft,
+            },
             &self.dashboard_io_tx,
             self.critical_operations.clone(),
         )
@@ -1542,30 +1607,40 @@ async fn next_terminal_event(
 ///
 /// The returned handle lets the quit path wait for the write. `None` means
 /// nothing was queued.
+struct DetachedChatState<'a> {
+    client_id: &'a str,
+    workspace_id: &'a str,
+    session_id: &'a str,
+    event_ordinal: u64,
+    draft: &'a str,
+}
+
 fn record_chat_detach_state(
     controller: &mut Controller,
     dashboard: &mut DashboardState,
-    session_id: &str,
-    event_ordinal: u64,
-    draft: &str,
+    detached: DetachedChatState<'_>,
     updates: &UnboundedSender<DashboardIoUpdate>,
     tracker: CriticalOperationTracker,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(session) = controller.state.sessions.get_mut(session_id) else {
+    let Some(session) = controller.state.sessions.get_mut(detached.session_id) else {
         dashboard.set_notice(format!(
             "Could not save draft and read status for {}: unknown session",
-            short_id(session_id)
+            short_id(detached.session_id)
         ));
         return None;
     };
-    session.viewed_through_event_ordinal = session.viewed_through_event_ordinal.max(event_ordinal);
-    session.draft_input = draft.to_owned();
+    session.viewed_through_event_ordinal = session
+        .viewed_through_event_ordinal
+        .max(detached.event_ordinal);
+    session.draft_input = detached.draft.to_owned();
     dashboard.set_state(controller.state.clone());
     dashboard.clear_notice();
     Some(io::spawn_detached_session_state_persist(
-        session_id.to_owned(),
-        event_ordinal,
-        draft.to_owned(),
+        detached.client_id.to_owned(),
+        detached.workspace_id.to_owned(),
+        detached.session_id.to_owned(),
+        detached.event_ordinal,
+        detached.draft.to_owned(),
         updates.clone(),
         tracker,
     ))
@@ -1585,6 +1660,20 @@ fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> Dashb
         // Resize and focus changes only need the redraw.
         _ => DashboardAction::None,
     }
+}
+
+fn workspace_picker_event(event: &Event) -> bool {
+    let Event::Key(key) = event else {
+        return false;
+    };
+    let accelerator = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && key.modifiers.contains(accelerator)
+        && key.code == KeyCode::Char('w')
 }
 
 pub(super) fn apply_recovery_result_loaded(

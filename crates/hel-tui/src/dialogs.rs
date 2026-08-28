@@ -1369,6 +1369,7 @@ mod tests {
         let mut empty = DashboardState::new(
             hel::hel_config::HelConfig {
                 version: hel::hel_config::CONFIG_VERSION,
+                phone: Default::default(),
                 profiles: Default::default(),
                 bundles: Default::default(),
                 targets: Default::default(),

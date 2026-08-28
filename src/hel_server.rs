@@ -1,4 +1,4 @@
-//! Explicit, phone-oriented control surface for Hel.
+//! Daemon-owned, phone-oriented control surface for Hel.
 //!
 //! The server deliberately owns no controller business logic. It publishes a
 //! redacted projection of controller state and forwards validated, typed
@@ -15,7 +15,7 @@ use anyhow::{Context, Result as AnyResult};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HeaderValue, SET_COOKIE};
-use axum::http::{Response, StatusCode};
+use axum::http::{HeaderMap, Response, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -54,7 +54,7 @@ pub fn cookie_key_path() -> PathBuf {
 /// Load the phone cookie signing key, creating it on first use.
 ///
 /// Session cookies are stateless, so this file is the only thing that keeps a
-/// signed-in phone signed in across `hel server` restarts. Deleting it is
+/// signed-in phone signed in across daemon restarts. Deleting it is
 /// therefore the explicit sign-everyone-out gesture: the next start writes a
 /// new key and every outstanding cookie stops validating. A missing file is
 /// ordinary first use; an unreadable or too-short one is replaced loudly,
@@ -80,7 +80,7 @@ pub fn load_or_create_cookie_key(path: &std::path::Path) -> AnyResult<Vec<u8>> {
     Ok(key.to_vec())
 }
 
-/// Options for the explicit `hel server` process.
+/// Options for the daemon's phone service.
 ///
 /// `ServerOptions::new` generates both the six-digit viewer code and an
 /// ephemeral cookie key. A caller that wants cookies to survive server
@@ -199,6 +199,8 @@ pub async fn run_server(options: ServerOptions) -> AnyResult<()> {
 pub struct ViewerSnapshot {
     pub revision: u64,
     pub generated_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<ViewerWorkspace>,
     pub sessions: Vec<ViewerSession>,
     pub profiles: Vec<ViewerProfile>,
     pub targets: Vec<ViewerTarget>,
@@ -215,6 +217,7 @@ impl ViewerSnapshot {
             .values()
             .map(|session| ViewerSession {
                 id: session.id.clone(),
+                workspace_id: session.workspace_id.clone(),
                 title: session.display_title().to_owned(),
                 harness_kind: session.harness_kind.id().into(),
                 profile_id: session.last_profile.clone(),
@@ -280,6 +283,7 @@ impl ViewerSnapshot {
         Self {
             revision,
             generated_at: now_unix().to_string(),
+            workspaces: Vec::new(),
             sessions,
             profiles,
             targets,
@@ -292,6 +296,8 @@ impl ViewerSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct ViewerSession {
     pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace_id: String,
     pub title: String,
     pub harness_kind: String,
     pub profile_id: String,
@@ -313,6 +319,13 @@ pub struct ViewerSession {
     /// projection deliberately keeps on the controller.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incompatible_resume_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerWorkspace {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +396,8 @@ pub struct ViewerRepository {
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControllerAction {
     New {
+        #[serde(default)]
+        workspace_id: String,
         profile_id: String,
         bundle_id: String,
         target_id: String,
@@ -496,6 +511,7 @@ pub struct ControllerRequest {
 /// therefore travels on its own channel and only persists one cursor field.
 #[derive(Debug)]
 pub struct ReadReceiptRequest {
+    pub client_id: String,
     pub session_id: String,
     pub through: u64,
     pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -735,14 +751,21 @@ struct ReadRequest {
 async fn mark_conversation_read(
     State(state): State<ServerState>,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<ReadRequest>,
 ) -> Result<StatusCode, ApiError> {
     validate_public_id(&session_id)?;
     require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
     let (reply, result) = tokio::sync::oneshot::channel();
+    let cookie = headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| cookie_value(header, COOKIE_NAME))
+        .ok_or_else(ApiError::unauthorized)?;
     state
         .receipt_tx
         .send(ReadReceiptRequest {
+            client_id: format!("phone:{cookie}"),
             session_id,
             through: request.through,
             reply,
@@ -794,6 +817,7 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             target_id,
             title,
             project_directory,
+            ..
         } => {
             validate_public_id(profile_id)?;
             validate_public_id(bundle_id)?;
@@ -1196,7 +1220,7 @@ const VIEWER_HTML: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
 <style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
-<main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel server</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
+<main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
 <main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent or use !command" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
 <script>
 const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells');let snapshot,currentSession,cursor=0,acknowledged=0,eventsStarted=false;
@@ -1240,6 +1264,7 @@ mod tests {
     fn sample_config_state() -> (HelConfig, HelState) {
         let config = HelConfig {
             version: CONFIG_VERSION,
+            phone: Default::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
@@ -1285,6 +1310,7 @@ mod tests {
             sessions: BTreeMap::from([(
                 "session-1".into(),
                 SessionRecord {
+                    workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
                     archived: false,
                     container_cpus: None,
                     container_memory: None,
@@ -1582,6 +1608,7 @@ mod tests {
         assert_eq!(
             action.action,
             ControllerAction::New {
+                workspace_id: String::new(),
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
                 target_id: "raw".into(),
@@ -1601,6 +1628,7 @@ mod tests {
         let (config, state) = sample_config_state();
         let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
         let action = |target_id: &str, project_directory: Option<PathBuf>| ControllerAction::New {
+            workspace_id: String::new(),
             profile_id: "codex-1".into(),
             bundle_id: "hel".into(),
             target_id: target_id.into(),

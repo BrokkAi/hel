@@ -90,6 +90,7 @@ impl Controller {
         let ownership_path = staging.path().join("ownership.json");
         WorkerOwnership {
             version: WorkerOwnership::VERSION,
+            workspace_id: session.workspace_id.clone(),
             session_id: session_id.to_string(),
             profile_id: session.last_profile.clone(),
             bundle_id: session.bundle_id.clone(),

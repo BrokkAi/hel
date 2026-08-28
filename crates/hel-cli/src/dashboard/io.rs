@@ -596,6 +596,8 @@ pub(crate) fn spawn_dashboard_container_settings(
 /// draft. They describe the same moment and the same row, so one task keeps
 /// them together and gives the quit path a single handle to await.
 pub(crate) fn spawn_detached_session_state_persist(
+    client_id: String,
+    workspace_id: String,
     session_id: String,
     event_ordinal: u64,
     draft: String,
@@ -608,15 +610,29 @@ pub(crate) fn spawn_detached_session_state_persist(
         format!("saving draft for {}", short_id(&session_id)),
         updates,
         move || {
-            let receipt = hel::hel_database::advance_viewed_through_event_ordinal(
+            let receipt = hel::hel_database::advance_client_read_frontier(
+                &client_id,
+                &workspace_id,
                 &persisted_session_id,
                 event_ordinal,
             )
+            .and_then(|_| {
+                hel::hel_database::advance_viewed_through_event_ordinal(
+                    &persisted_session_id,
+                    event_ordinal,
+                )
+            })
             .map(|_| ());
             // Save the draft even when the receipt was rejected: losing typed
             // text is worse than an out-of-date read marker.
-            let saved_draft =
-                hel::hel_database::set_session_draft_input(&persisted_session_id, &draft);
+            let saved_draft = hel::hel_database::save_detached_draft(
+                &workspace_id,
+                Some(&persisted_session_id),
+                &client_id,
+                Some(std::process::id()),
+                &draft,
+            )
+            .map(|_| ());
             receipt.and(saved_draft)
         },
         move |result| DashboardIoUpdate::DetachedSessionState { session_id, result },
@@ -624,6 +640,8 @@ pub(crate) fn spawn_detached_session_state_persist(
 }
 
 pub(crate) fn spawn_read_receipt_persist(
+    client_id: String,
+    workspace_id: String,
     session_id: String,
     through: u64,
     updates: UnboundedSender<DashboardIoUpdate>,
@@ -635,7 +653,18 @@ pub(crate) fn spawn_read_receipt_persist(
         format!("saving read status for {}", short_id(&session_id)),
         updates,
         move || {
-            hel::hel_database::advance_viewed_through_event_ordinal(&persisted_session_id, through)
+            hel::hel_database::advance_client_read_frontier(
+                &client_id,
+                &workspace_id,
+                &persisted_session_id,
+                through,
+            )
+            .and_then(|_| {
+                hel::hel_database::advance_viewed_through_event_ordinal(
+                    &persisted_session_id,
+                    through,
+                )
+            })
         },
         move |result| DashboardIoUpdate::ReadReceipt { session_id, result },
     );
@@ -765,6 +794,7 @@ pub(crate) fn spawn_checkpoint_archive_size_refresh(
 /// so this stays separate from [`spawn_lifecycle_operation`].
 pub(crate) fn spawn_dashboard_create_session(
     action: DashboardAction,
+    workspace_id: String,
     updates: UnboundedSender<DashboardIoUpdate>,
     lifecycle_updates: UnboundedSender<LifecycleUpdate>,
     runtime: tokio::runtime::Handle,
@@ -828,6 +858,7 @@ pub(crate) fn spawn_dashboard_create_session(
                 &target_template_id,
                 title,
                 SessionLaunchOptions {
+                    workspace_id: workspace_id.clone(),
                     additional_mounts,
                     allow_dirty_local,
                     resource_allocation,
@@ -1625,6 +1656,7 @@ mod tests {
 
     fn archivable_session(id: &str) -> SessionRecord {
         SessionRecord {
+            workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,

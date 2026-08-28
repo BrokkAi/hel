@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::Args;
-use hel::hel_config::HarnessProfile;
+use hel::hel_config::{HarnessProfile, PhoneConfig};
 use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions};
 use hel::hel_quota::ProfileQuota;
 use hel::hel_server::{
@@ -30,17 +29,21 @@ use crate::pollers::{
     spawn_interrupted_close_recovery, spawn_quota_refresher,
 };
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone)]
 pub(crate) struct ServerArgs {
-    /// Address exposed by the explicit phone-control server.
-    #[arg(long, default_value = "127.0.0.1:3765")]
     bind: String,
-    /// PEM certificate for direct HTTPS (for example, from Tailscale).
-    #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
-    /// PEM private key for direct HTTPS.
-    #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
+}
+
+impl From<&PhoneConfig> for ServerArgs {
+    fn from(config: &PhoneConfig) -> Self {
+        Self {
+            bind: config.bind.clone(),
+            tls_cert: config.tls_cert.clone(),
+            tls_key: config.tls_key.clone(),
+        }
+    }
 }
 
 const MAX_CONCURRENT_PHONE_ACTIONS: usize = 4;
@@ -162,6 +165,7 @@ fn request_controller_reload(
 
 /// What one phone read receipt actually needs.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum ReadReceiptPlan {
     UnknownSession,
     /// The cursor has not advanced, so the receipt needs no work at all.
@@ -170,6 +174,7 @@ enum ReadReceiptPlan {
     Persist,
 }
 
+#[cfg(test)]
 fn plan_read_receipt(state: &HelState, session_id: &str, through: u64) -> ReadReceiptPlan {
     let Some(session) = state.sessions.get(session_id) else {
         return ReadReceiptPlan::UnknownSession;
@@ -184,6 +189,7 @@ fn plan_read_receipt(state: &HelState, session_id: &str, through: u64) -> ReadRe
 /// Record a persisted receipt in the in-memory projection, reporting whether
 /// the cursor moved. That is exactly when the snapshot revision has to move,
 /// so surfaces showing unread state refresh and nothing else does.
+#[cfg(test)]
 fn apply_read_receipt(state: &mut HelState, session_id: &str, receipt: u64) -> bool {
     let Some(session) = state.sessions.get_mut(session_id) else {
         return false;
@@ -274,9 +280,16 @@ impl PhoneActionControl {
     }
 }
 
-pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
+pub(crate) async fn run_server(
+    args: ServerArgs,
+    termination: tokio_util::sync::CancellationToken,
+    report_status: impl FnOnce(String),
+) -> Result<()> {
     let bind = args.bind.parse().context("parse --bind socket address")?;
     let mut controller = Controller::load()?;
+    let phone_workspaces = tokio::task::spawn_blocking(hel::hel_database::list_workspaces)
+        .await
+        .context("phone workspace load task panicked")??;
     let mut quotas = std::collections::BTreeMap::new();
     let (quota_profiles_tx, mut quota_updates_rx) = spawn_quota_refresher();
     let mut quota_batch = QuotaRefreshBatch::default();
@@ -293,6 +306,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     let mut active_user_shells = std::collections::BTreeMap::new();
     let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
         &controller,
+        &phone_workspaces,
         &quotas,
         &conversations,
         &queued_prompts,
@@ -328,9 +342,12 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
     let mut credential_sync_signals = CredentialSyncSignalTracker::default();
     let mut credential_sync_notices = CredentialSyncNotices::default();
-    let termination = hel::termination::Coordinator::install().token();
     let mut options =
         ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx, receipt_tx)?;
+    report_status(format!(
+        "starting on {bind}; viewer code {}",
+        options.viewer_code()
+    ));
     options.shutdown = termination.clone();
     // Session cookies are stateless, so a per-process key would sign every
     // phone out on every restart. Delete the key file to sign them out on
@@ -384,6 +401,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
             ($revision:expr) => {
                 if let Err(error) = snapshot_tx.send(viewer_snapshot(
                     &controller,
+                    &phone_workspaces,
                     &quotas,
                     &conversations,
                     &queued_prompts,
@@ -506,33 +524,34 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     );
                 }
                 receipt = receipt_rx.recv() => {
-                    let Some(ReadReceiptRequest { session_id, through, reply }) = receipt else {
+                    let Some(ReadReceiptRequest { client_id, session_id, through, reply }) = receipt else {
                         failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering read receipts");
                         break;
                     };
-                    match plan_read_receipt(&controller.state, &session_id, through) {
-                        ReadReceiptPlan::UnknownSession => {
+                    match controller.state.sessions.get(&session_id) {
+                        None => {
                             if reply.send(Err("unknown session".into())).is_err() {
                                 tracing::debug!(%session_id, "unknown-session read receipt reply dropped after client disconnect");
                             }
                         }
-                        // The viewer re-posts its cursor after every refresh.
-                        // A cursor that has not moved is not work: no database
-                        // write, no revision, and so no refresh to answer.
-                        ReadReceiptPlan::AlreadyRead => {
-                            if reply.send(Ok(())).is_err() {
-                                tracing::debug!(%session_id, "read receipt acknowledgement dropped after client disconnect");
-                            }
-                        }
-                        ReadReceiptPlan::Persist => {
+                        Some(session) => {
+                            let workspace_id = session.workspace_id.clone();
                             let done = receipt_done_tx.clone();
                             let persisted_session_id = session_id.clone();
                             tokio::spawn(async move {
                                 let joined = tokio::task::spawn_blocking(move || {
-                                    hel::hel_database::advance_viewed_through_event_ordinal(
+                                    hel::hel_database::advance_client_read_frontier(
+                                        &client_id,
+                                        &workspace_id,
                                         &persisted_session_id,
                                         through,
                                     )
+                                    .and_then(|_| {
+                                        hel::hel_database::advance_viewed_through_event_ordinal(
+                                            &persisted_session_id,
+                                            through,
+                                        )
+                                    })
                                 })
                                 .await;
                                 let result = match joined {
@@ -550,21 +569,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     let Some(ReadReceiptPersisted { session_id, result, reply }) = persisted else { continue };
                     match result {
                         Ok(receipt) => {
-                            // Only an advanced cursor changes what any surface
-                            // shows, so only then does the revision move.
-                            if apply_read_receipt(&mut controller.state, &session_id, receipt) {
-                                revision += 1;
-                                if let Err(error) = snapshot_tx.send(viewer_snapshot(
-                                    &controller,
-                                    &quotas,
-                                    &conversations,
-                                    &queued_prompts,
-                                    &active_user_shells,
-                                    revision,
-                                )) {
-                                    tracing::debug!(revision, %error, "phone snapshot delivery failed; no viewer is subscribed");
-                                }
-                            }
+                            let _ = receipt;
                             if reply.send(Ok(())).is_err() {
                                 tracing::debug!(%session_id, "phone read receipt reply dropped after client disconnect");
                             }
@@ -690,6 +695,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                         revision += 1;
                         if let Err(error) = snapshot_tx.send(viewer_snapshot(
                             &controller,
+                            &phone_workspaces,
                             &quotas,
                             &conversations,
                             &queued_prompts,
@@ -927,12 +933,23 @@ async fn apply_phone_action(
 ) -> Result<()> {
     match action {
         ControllerAction::New {
+            workspace_id,
             profile_id,
             bundle_id,
             target_id,
             title,
             project_directory,
         } => {
+            let workspace_id = if workspace_id.is_empty() {
+                let workspaces = hel::hel_database::list_workspaces()?;
+                match workspaces.as_slice() {
+                    [workspace] => workspace.id.clone(),
+                    [] => bail!("create a workspace before starting a phone session"),
+                    _ => bail!("phone session creation requires a workspace_id"),
+                }
+            } else {
+                workspace_id
+            };
             let session_title_override = Some(title.clone());
             let session_id = controller.register_session_with_resources(
                 &profile_id,
@@ -940,6 +957,7 @@ async fn apply_phone_action(
                 &target_id,
                 title,
                 SessionLaunchOptions {
+                    workspace_id,
                     additional_mounts: Vec::new(),
                     allow_dirty_local: false,
                     resource_allocation: None,
@@ -1082,6 +1100,7 @@ async fn apply_phone_action(
 
 fn viewer_snapshot(
     controller: &Controller,
+    workspaces: &[hel::hel_workspace::WorkspaceRecord],
     quotas: &std::collections::BTreeMap<String, ProfileQuota>,
     conversations: &std::collections::BTreeMap<String, hel::hel_chat::BrowserTranscript>,
     queued_prompts: &std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>>,
@@ -1090,6 +1109,13 @@ fn viewer_snapshot(
 ) -> ViewerSnapshot {
     let mut snapshot =
         ViewerSnapshot::from_config_state(&controller.config, &controller.state, revision);
+    snapshot.workspaces = workspaces
+        .iter()
+        .map(|workspace| hel::hel_server::ViewerWorkspace {
+            id: workspace.id.clone(),
+            name: workspace.name.clone(),
+        })
+        .collect();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1169,6 +1195,7 @@ mod tests {
         Controller {
             config: HelConfig {
                 version: CONFIG_VERSION,
+                phone: Default::default(),
                 profiles: ids
                     .iter()
                     .map(|id| {
@@ -1200,6 +1227,7 @@ mod tests {
 
     fn new_action() -> ControllerAction {
         ControllerAction::New {
+            workspace_id: String::new(),
             profile_id: "codex".into(),
             bundle_id: "project".into(),
             target_id: "podman".into(),
@@ -1210,6 +1238,7 @@ mod tests {
 
     fn phone_session(id: &str, viewed_through_event_ordinal: u64) -> SessionRecord {
         SessionRecord {
+            workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -1457,6 +1486,7 @@ mod tests {
             )]);
             viewer_snapshot(
                 &controller,
+                &[],
                 &quotas,
                 &std::collections::BTreeMap::new(),
                 &std::collections::BTreeMap::new(),

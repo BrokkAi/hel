@@ -355,6 +355,7 @@ mod tests {
 
     fn session_record(id: &str) -> SessionRecord {
         SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
