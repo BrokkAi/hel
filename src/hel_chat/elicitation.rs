@@ -1,10 +1,11 @@
 //! Modal editor for ACP form elicitations.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -39,6 +40,10 @@ pub(super) struct ElicitationDialog {
     active_custom_fields: BTreeSet<usize>,
     focus: usize,
     error: Option<String>,
+    message_scroll: Cell<u16>,
+    message_page_height: Cell<u16>,
+    message_max_scroll: Cell<u16>,
+    message_area: Cell<Option<Rect>>,
 }
 
 impl ElicitationDialog {
@@ -71,6 +76,10 @@ impl ElicitationDialog {
             active_custom_fields,
             focus: 0,
             error: None,
+            message_scroll: Cell::new(0),
+            message_page_height: Cell::new(0),
+            message_max_scroll: Cell::new(0),
+            message_area: Cell::new(None),
         }
     }
 
@@ -105,6 +114,21 @@ impl ElicitationDialog {
         self.error = None;
         if code == KeyCode::Esc {
             return Some(ElicitationResponse::Cancel);
+        }
+        if self.is_plan_review() {
+            match code {
+                KeyCode::PageUp => {
+                    let page = isize::try_from(self.message_page_step()).unwrap_or(isize::MAX);
+                    self.scroll_message(-page);
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    let page = isize::try_from(self.message_page_step()).unwrap_or(isize::MAX);
+                    self.scroll_message(page);
+                    return None;
+                }
+                _ => {}
+            }
         }
         let field_count = self.display_fields.len();
         let focus_count = field_count + 3;
@@ -143,6 +167,41 @@ impl ElicitationDialog {
             _ => {}
         }
         None
+    }
+
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !self.is_plan_review()
+            || !self
+                .message_area
+                .get()
+                .is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)))
+        {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_message(-3),
+            MouseEventKind::ScrollDown => self.scroll_message(3),
+            _ => {}
+        }
+    }
+
+    fn is_plan_review(&self) -> bool {
+        self.request.id.starts_with("plan-review-")
+    }
+
+    fn message_page_step(&self) -> u16 {
+        self.message_page_height.get().saturating_sub(1).max(1)
+    }
+
+    fn scroll_message(&self, delta: isize) {
+        let current = usize::from(self.message_scroll.get());
+        let maximum = usize::from(self.message_max_scroll.get());
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize).min(maximum)
+        };
+        self.message_scroll.set(next as u16);
     }
 
     fn move_option(&mut self, delta: isize) {
@@ -356,11 +415,13 @@ fn default_value(field: &ElicitationField) -> FieldValue {
             value: default.clone().unwrap_or_default(),
             cursor: default.as_ref().map_or(0, String::len),
         },
-        ElicitationFieldKind::SingleSelect { options, default } => FieldValue::Single(
-            default
-                .as_ref()
-                .and_then(|default| options.iter().position(|option| option.value == *default)),
-        ),
+        ElicitationFieldKind::SingleSelect { options, default } => {
+            let selected = match default {
+                Some(default) => options.iter().position(|option| option.value == *default),
+                None => (!options.is_empty()).then_some(0),
+            };
+            FieldValue::Single(selected)
+        }
         ElicitationFieldKind::MultiSelect {
             options, default, ..
         } => FieldValue::Multi(
@@ -536,25 +597,46 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let message_height = if dialog.request.id.starts_with("plan-review-") {
-        Constraint::Percentage(45)
+    let focus = focus_content(dialog);
+    let natural_focus_height = u16::try_from(
+        Paragraph::new(focus.lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width),
+    )
+    .unwrap_or(u16::MAX)
+    .max(1);
+    let constraints = if dialog.is_plan_review() {
+        let body_height = inner.height.saturating_sub(2);
+        let focus_height = natural_focus_height.min(body_height.saturating_sub(1));
+        let message_height = body_height.saturating_sub(focus_height);
+        [
+            Constraint::Length(message_height),
+            Constraint::Length(focus_height),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
     } else {
-        Constraint::Length(3)
-    };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            message_height,
+        [
+            Constraint::Length(3),
             Constraint::Min(4),
             Constraint::Length(2),
             Constraint::Length(1),
-        ])
+        ]
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(dialog.request.message.as_str()).wrap(Wrap { trim: true }),
-        chunks[0],
-    );
-    render_focus(frame, chunks[1], dialog);
+    let message = Paragraph::new(dialog.request.message.as_str()).wrap(Wrap { trim: true });
+    let total_lines = u16::try_from(message.line_count(chunks[0].width)).unwrap_or(u16::MAX);
+    let maximum_scroll = total_lines.saturating_sub(chunks[0].height);
+    let message_scroll = dialog.message_scroll.get().min(maximum_scroll);
+    dialog.message_scroll.set(message_scroll);
+    dialog.message_page_height.set(chunks[0].height);
+    dialog.message_max_scroll.set(maximum_scroll);
+    dialog.message_area.set(Some(chunks[0]));
+    frame.render_widget(message.scroll((message_scroll, 0)), chunks[0]);
+    render_focus(frame, chunks[1], focus);
     let field_count = dialog.display_fields.len();
     let buttons = ["Submit", "Skip", "Cancel"]
         .into_iter()
@@ -581,10 +663,22 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
         Paragraph::new(Line::from(buttons)).alignment(Alignment::Center),
         chunks[2],
     );
-    let footer = dialog
-        .error
-        .as_deref()
-        .unwrap_or("Tab fields/buttons · ↑/↓ choose · Space toggle · Enter continue · Esc cancel");
+    let scroll_help = if dialog.is_plan_review() && maximum_scroll > 0 {
+        let start = message_scroll.saturating_add(1);
+        let end = message_scroll
+            .saturating_add(chunks[0].height)
+            .min(total_lines);
+        Some(format!(
+            "Plan {start}–{end}/{total_lines} · PgUp/PgDn or wheel scroll · Tab fields/buttons · ↑/↓ choose · Enter continue"
+        ))
+    } else {
+        None
+    };
+    let footer = dialog.error.as_deref().unwrap_or_else(|| {
+        scroll_help.as_deref().unwrap_or(
+            "Tab fields/buttons · ↑/↓ choose · Space toggle · Enter continue · Esc cancel",
+        )
+    });
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(if dialog.error.is_some() {
             Color::Red
@@ -595,15 +689,24 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
     );
 }
 
-fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
+struct FocusContent<'a> {
+    lines: Vec<Line<'a>>,
+    text_cursor: Option<(u16, usize)>,
+    centered: bool,
+}
+
+fn focus_content(dialog: &ElicitationDialog) -> FocusContent<'_> {
     let Some(display) = dialog.display_fields.get(dialog.focus).copied() else {
         let label = match dialog.focus.saturating_sub(dialog.display_fields.len()) {
             0 => "Submit these answers",
             1 => "Skip this question and let the agent continue",
             _ => "Cancel this question",
         };
-        frame.render_widget(Paragraph::new(label).alignment(Alignment::Center), area);
-        return;
+        return FocusContent {
+            lines: vec![Line::from(label)],
+            text_cursor: None,
+            centered: true,
+        };
     };
     let field = &dialog.request.fields[display.field];
     let required = if field.required { " (required)" } else { "" };
@@ -723,8 +826,23 @@ fn render_focus(frame: &mut Frame, area: Rect, dialog: &ElicitationDialog) {
         }
         _ => {}
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-    if let Some((line, column)) = text_cursor
+    FocusContent {
+        lines,
+        text_cursor,
+        centered: false,
+    }
+}
+
+fn render_focus(frame: &mut Frame, area: Rect, content: FocusContent<'_>) {
+    let paragraph = Paragraph::new(content.lines)
+        .wrap(Wrap { trim: false })
+        .alignment(if content.centered {
+            Alignment::Center
+        } else {
+            Alignment::Left
+        });
+    frame.render_widget(paragraph, area);
+    if let Some((line, column)) = content.text_cursor
         && area.width > 2
         && area.height > 0
     {
@@ -928,6 +1046,72 @@ mod tests {
             .join("\n")
     }
 
+    fn plan_review(line_count: usize) -> ElicitationDialog {
+        let mut request = request(
+            ElicitationFieldKind::SingleSelect {
+                options: vec![
+                    ElicitationOption {
+                        value: "implement".into(),
+                        title: "Implement".into(),
+                        description: Some("Approve and continue".into()),
+                        preview: None,
+                    },
+                    ElicitationOption {
+                        value: "revise".into(),
+                        title: "Revise".into(),
+                        description: None,
+                        preview: None,
+                    },
+                ],
+                default: Some("implement".into()),
+            },
+            true,
+        );
+        request.id = "plan-review-test".into();
+        request.title = Some("Plan review".into());
+        request.message = (0..line_count)
+            .map(|line| format!("plan-line-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ElicitationDialog::new(request)
+    }
+
+    #[test]
+    fn plan_review_gives_unused_form_rows_to_the_plan_and_scrolls_to_its_end() {
+        let mut dialog = plan_review(80);
+
+        let first = rendered(&dialog);
+        assert!(first.contains("plan-line-12"));
+        assert!(!first.contains("plan-line-79"));
+        assert!(first.contains("PgUp/PgDn or wheel scroll"));
+
+        for _ in 0..10 {
+            dialog.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+            rendered(&dialog);
+        }
+        let last = rendered(&dialog);
+        assert!(last.contains("plan-line-79"));
+        assert_eq!(dialog.focus, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_plan_without_moving_the_decision() {
+        let mut dialog = plan_review(80);
+        rendered(&dialog);
+        let area = dialog.message_area.get().expect("rendered plan area");
+
+        dialog.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(dialog.message_scroll.get(), 3);
+        assert_eq!(dialog.focus, 0);
+        assert!(rendered(&dialog).contains("plan-line-03"));
+    }
+
     #[test]
     fn selecting_an_option_returns_its_wire_value() {
         let mut dialog = ElicitationDialog::new(request(
@@ -959,6 +1143,45 @@ mod tests {
                 content: BTreeMap::from([(
                     "question_0".into(),
                     ElicitationValue::String("dynamic".into())
+                )])
+            })
+        );
+    }
+
+    #[test]
+    fn first_single_select_option_is_the_visible_and_submitted_default() {
+        let mut dialog = ElicitationDialog::new(request(
+            ElicitationFieldKind::SingleSelect {
+                options: vec![
+                    ElicitationOption {
+                        value: "thin".into(),
+                        title: "Thin callers".into(),
+                        description: None,
+                        preview: None,
+                    },
+                    ElicitationOption {
+                        value: "dynamic".into(),
+                        title: "Dynamic matrix".into(),
+                        description: None,
+                        preview: None,
+                    },
+                ],
+                default: None,
+            },
+            false,
+        ));
+
+        let initial = rendered(&dialog);
+        assert!(initial.contains("● Thin callers"));
+        assert!(initial.contains("○ Dynamic matrix"));
+
+        dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(ElicitationResponse::Accept {
+                content: BTreeMap::from([(
+                    "question_0".into(),
+                    ElicitationValue::String("thin".into())
                 )])
             })
         );
