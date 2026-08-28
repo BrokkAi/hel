@@ -2427,3 +2427,44 @@ fn legacy_json_migration_commits_before_retaining_source_backup() {
     assert!(!legacy.exists());
     assert!(directory.path().join("state.json.migrated-v1").exists());
 }
+
+#[test]
+fn legacy_sessions_are_migrated_into_the_default_workspace_without_copying_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+    assert_eq!(
+        workspace_for_session_at(&database, "session-1").unwrap(),
+        Some(DEFAULT_WORKSPACE_ID.to_owned())
+    );
+    let workspaces = list_workspaces_from(&database).unwrap();
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].id, DEFAULT_WORKSPACE_ID);
+    assert_eq!(workspaces[0].name, "default");
+    assert_eq!(workspaces[0].session_count, 1);
+}
+
+#[test]
+fn workspace_crud_enforces_unique_names_and_only_deletes_empty_workspaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let workspace = create_workspace_at(&database, "  Bifrost  ").unwrap();
+    assert_eq!(workspace.name, "Bifrost");
+    assert!(create_workspace_at(&database, "bIFROST").is_err());
+
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    assign_new_session_workspace_at(&database, "session-1", &workspace.id).unwrap();
+    assert!(delete_empty_workspace_at(&database, &workspace.id).is_err());
+    assert!(assign_new_session_workspace_at(&database, "session-1", DEFAULT_WORKSPACE_ID).is_err());
+
+    let empty = create_workspace_at(&database, "Empty").unwrap();
+    rename_workspace_at(&database, &empty.id, "Renamed").unwrap();
+    delete_empty_workspace_at(&database, &empty.id).unwrap();
+    assert!(
+        list_workspaces_from(&database)
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.id != empty.id)
+    );
+}

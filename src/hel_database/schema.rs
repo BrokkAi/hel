@@ -368,6 +368,69 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 14 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE workspaces (
+                 workspace_id TEXT PRIMARY KEY CHECK(length(trim(workspace_id)) > 0),
+                 name TEXT NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 64),
+                 name_key TEXT NOT NULL UNIQUE CHECK(length(trim(name_key)) BETWEEN 1 AND 64),
+                 created_at TEXT NOT NULL,
+                 last_opened_at TEXT NOT NULL
+             ) STRICT;
+             INSERT INTO workspaces(workspace_id, name, name_key, created_at, last_opened_at)
+             VALUES (
+                 'default', 'default', 'default',
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             );
+             ALTER TABLE session_contexts
+                 ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default';
+             CREATE INDEX session_contexts_workspace
+                 ON session_contexts(workspace_id, session_id);
+             CREATE TRIGGER session_contexts_workspace_insert
+             BEFORE INSERT ON session_contexts
+             WHEN NOT EXISTS(
+                 SELECT 1 FROM workspaces WHERE workspace_id = NEW.workspace_id
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'unknown workspace');
+             END;
+             CREATE TRIGGER session_contexts_workspace_update
+             BEFORE UPDATE OF workspace_id ON session_contexts
+             WHEN NOT EXISTS(
+                 SELECT 1 FROM workspaces WHERE workspace_id = NEW.workspace_id
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'unknown workspace');
+             END;
+             CREATE TABLE client_read_frontiers (
+                 client_id TEXT NOT NULL CHECK(length(trim(client_id)) > 0),
+                 workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                 session_id TEXT NOT NULL REFERENCES session_contexts(session_id) ON DELETE CASCADE,
+                 through_event_ordinal INTEGER NOT NULL DEFAULT 0
+                     CHECK(through_event_ordinal >= 0),
+                 updated_at TEXT NOT NULL,
+                 PRIMARY KEY(client_id, workspace_id, session_id)
+             ) STRICT;
+             CREATE TABLE detached_drafts (
+                 draft_id TEXT PRIMARY KEY CHECK(length(trim(draft_id)) > 0),
+                 workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+                 session_id TEXT REFERENCES session_contexts(session_id),
+                 source TEXT NOT NULL CHECK(length(trim(source)) > 0),
+                 owner_pid INTEGER CHECK(owner_pid IS NULL OR owner_pid > 0),
+                 saved_at TEXT NOT NULL,
+                 text TEXT NOT NULL CHECK(length(text) > 0),
+                 recovered_at TEXT
+             ) STRICT;
+             CREATE INDEX detached_drafts_workspace_recent
+                 ON detached_drafts(workspace_id, saved_at DESC);
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 14;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)

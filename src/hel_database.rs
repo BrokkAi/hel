@@ -19,8 +19,11 @@ use crate::hel_state::{
 };
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
+use crate::hel_workspace::{
+    DEFAULT_WORKSPACE_ID, WorkspaceRecord, new_workspace_id, normalize_workspace_name,
+};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -86,6 +89,173 @@ use schema::{forget_verified_schema, table_has_column};
 
 pub fn load_state() -> Result<HelState> {
     load_state_from(&database_path())
+}
+
+pub fn list_workspaces() -> Result<Vec<WorkspaceRecord>> {
+    list_workspaces_from(&database_path())
+}
+
+pub fn list_workspaces_from(path: &Path) -> Result<Vec<WorkspaceRecord>> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT w.workspace_id, w.name, w.created_at, w.last_opened_at,
+                count(c.session_id)
+           FROM workspaces w
+           LEFT JOIN session_contexts c USING(workspace_id)
+          GROUP BY w.workspace_id
+          ORDER BY w.last_opened_at DESC, w.created_at DESC, w.workspace_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(WorkspaceRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            created_at: row.get(2)?,
+            last_opened_at: row.get(3)?,
+            session_count: row.get(4)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
+pub fn create_workspace(name: &str) -> Result<WorkspaceRecord> {
+    create_workspace_at(&database_path(), name)
+}
+
+pub fn create_workspace_at(path: &Path, name: &str) -> Result<WorkspaceRecord> {
+    let (name, name_key) = normalize_workspace_name(name)?;
+    let id = new_workspace_id()?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let connection = open(path)?;
+    connection
+        .execute(
+            "INSERT INTO workspaces(workspace_id, name, name_key, created_at, last_opened_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![id, name, name_key, now],
+        )
+        .with_context(|| format!("create workspace {name:?}"))?;
+    Ok(WorkspaceRecord {
+        id,
+        name,
+        created_at: now.clone(),
+        last_opened_at: now,
+        session_count: 0,
+    })
+}
+
+pub fn rename_workspace(workspace_id: &str, name: &str) -> Result<()> {
+    rename_workspace_at(&database_path(), workspace_id, name)
+}
+
+pub fn rename_workspace_at(path: &Path, workspace_id: &str, name: &str) -> Result<()> {
+    let (name, name_key) = normalize_workspace_name(name)?;
+    let connection = open(path)?;
+    let changed = connection
+        .execute(
+            "UPDATE workspaces SET name = ?2, name_key = ?3 WHERE workspace_id = ?1",
+            params![workspace_id, name, name_key],
+        )
+        .with_context(|| format!("rename workspace to {name:?}"))?;
+    ensure!(changed == 1, "unknown workspace {workspace_id:?}");
+    Ok(())
+}
+
+pub fn touch_workspace(workspace_id: &str) -> Result<()> {
+    touch_workspace_at(&database_path(), workspace_id)
+}
+
+pub fn touch_workspace_at(path: &Path, workspace_id: &str) -> Result<()> {
+    let connection = open(path)?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let changed = connection.execute(
+        "UPDATE workspaces SET last_opened_at = ?2 WHERE workspace_id = ?1",
+        params![workspace_id, now],
+    )?;
+    ensure!(changed == 1, "unknown workspace {workspace_id:?}");
+    Ok(())
+}
+
+pub fn delete_empty_workspace(workspace_id: &str) -> Result<()> {
+    delete_empty_workspace_at(&database_path(), workspace_id)
+}
+
+pub fn delete_empty_workspace_at(path: &Path, workspace_id: &str) -> Result<()> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let context_count: u64 = tx.query_row(
+        "SELECT count(*) FROM session_contexts WHERE workspace_id = ?1",
+        [workspace_id],
+        |row| row.get(0),
+    )?;
+    let draft_count: u64 = tx.query_row(
+        "SELECT count(*) FROM detached_drafts WHERE workspace_id = ?1",
+        [workspace_id],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        context_count == 0 && draft_count == 0,
+        "workspace is not empty ({context_count} session histories, {draft_count} drafts)"
+    );
+    let changed = tx.execute(
+        "DELETE FROM workspaces WHERE workspace_id = ?1",
+        [workspace_id],
+    )?;
+    ensure!(changed == 1, "unknown workspace {workspace_id:?}");
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn workspace_for_session(session_id: &str) -> Result<Option<String>> {
+    workspace_for_session_at(&database_path(), session_id)
+}
+
+pub fn workspace_for_session_at(path: &Path, session_id: &str) -> Result<Option<String>> {
+    open(path)?
+        .query_row(
+            "SELECT workspace_id FROM session_contexts WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Assign a newly-created session context to a workspace. Existing contexts
+/// are immutable: moving sessions is deliberately outside the v1 model.
+pub fn assign_new_session_workspace(session_id: &str, workspace_id: &str) -> Result<()> {
+    assign_new_session_workspace_at(&database_path(), session_id, workspace_id)
+}
+
+pub fn assign_new_session_workspace_at(
+    path: &Path,
+    session_id: &str,
+    workspace_id: &str,
+) -> Result<()> {
+    let connection = open(path)?;
+    let current: String = connection
+        .query_row(
+            "SELECT workspace_id FROM session_contexts WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("find session context {session_id:?}"))?;
+    if current == workspace_id {
+        return Ok(());
+    }
+    ensure!(
+        current == DEFAULT_WORKSPACE_ID,
+        "session {session_id} already belongs to workspace {current}"
+    );
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
+        [workspace_id],
+        |row| row.get(0),
+    )?;
+    ensure!(exists, "unknown workspace {workspace_id:?}");
+    connection.execute(
+        "UPDATE session_contexts SET workspace_id = ?2 WHERE session_id = ?1",
+        params![session_id, workspace_id],
+    )?;
+    Ok(())
 }
 
 pub fn load_state_from(path: &Path) -> Result<HelState> {
