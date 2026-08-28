@@ -49,9 +49,11 @@ pub(crate) struct SessionDetail {
     pub(crate) last_agent_message_follows_last_user: bool,
     pub(crate) last_acp_activity_at_ms: Option<u64>,
     /// Latest agent-content ordinals retained so a state-only read-cursor
-    /// update can recompute the single unread count exactly.
+    /// update can recompute unread agent messages exactly.
     pub(crate) agent_message_latest_content_ordinals: Vec<u64>,
     pub(crate) unread_agent_messages: usize,
+    pub(crate) session_restart_event_ordinals: Vec<u64>,
+    pub(crate) unread_session_restarts: usize,
     pub(crate) resource_usage: Option<SessionResourceUsage>,
     pub(crate) transcript: Option<TranscriptSnapshot>,
     pub(crate) transcript_hydration: TranscriptHydration,
@@ -59,6 +61,17 @@ pub(crate) struct SessionDetail {
     /// What the last projection derived, so the next one only rescans the
     /// transcript items that changed.
     pub(crate) projection: MaterializedProjectionCache,
+}
+
+impl SessionDetail {
+    pub(crate) fn has_unread(&self) -> bool {
+        self.unread_agent_messages > 0 || self.unread_session_restarts > 0
+    }
+
+    pub(crate) fn clear_unread(&mut self) {
+        self.unread_agent_messages = 0;
+        self.unread_session_restarts = 0;
+    }
 }
 
 /// Per-item results the previous session projection derived, kept so the next
@@ -75,6 +88,8 @@ pub struct MaterializedProjectionCache {
     /// Transcript index and latest content ordinal of every agent message that
     /// has content, in transcript order.
     agent_messages: Vec<(usize, u64)>,
+    /// Transcript index and event ordinal of every session-restart marker.
+    restart_events: Vec<(usize, u64)>,
     /// Transcript index and text of the last agent message with text.
     pub(crate) last_agent_message: Option<(usize, Arc<str>)>,
     /// Exact stats for terminal tool items, keyed by logical identity and
@@ -148,6 +163,8 @@ pub struct PreparedMaterializedSessionDetail {
     pub(crate) last_agent_message_follows_last_user: bool,
     agent_message_latest_content_ordinals: Vec<u64>,
     pub(crate) unread_agent_messages: usize,
+    session_restart_event_ordinals: Vec<u64>,
+    pub(crate) unread_session_restarts: usize,
     pub(crate) transcript: TranscriptSnapshot,
     pub(crate) queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
     pub(crate) projection: MaterializedProjectionCache,
@@ -166,6 +183,8 @@ pub struct PreparedMaterializedSessionSummary {
     last_agent_message_follows_last_user: bool,
     agent_message_latest_content_ordinals: Vec<u64>,
     unread_agent_messages: usize,
+    session_restart_event_ordinals: Vec<u64>,
+    unread_session_restarts: usize,
 }
 
 impl PreparedMaterializedSessionSummary {
@@ -183,6 +202,11 @@ impl PreparedMaterializedSessionSummary {
         };
         let unread_agent_messages = summary
             .agent_message_latest_content_ordinals
+            .iter()
+            .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
+            .count();
+        let unread_session_restarts = summary
+            .session_restart_event_ordinals
             .iter()
             .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
             .count();
@@ -205,6 +229,8 @@ impl PreparedMaterializedSessionSummary {
             last_agent_message_follows_last_user: summary.last_agent_message_follows_last_user,
             agent_message_latest_content_ordinals: summary.agent_message_latest_content_ordinals,
             unread_agent_messages,
+            session_restart_event_ordinals: summary.session_restart_event_ordinals,
+            unread_session_restarts,
         }
     }
 }
@@ -280,6 +306,22 @@ impl PreparedMaterializedSessionDetail {
             .iter()
             .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
             .count();
+        let mut restart_events = previous.restart_events;
+        restart_events
+            .truncate(restart_events.partition_point(|(index, _)| *index < unchanged_prefix));
+        for (index, item) in session.transcript.iter().enumerate().skip(unchanged_prefix) {
+            if item.is_session_restart() {
+                restart_events.push((index, item.position));
+            }
+        }
+        let session_restart_event_ordinals = restart_events
+            .iter()
+            .map(|(_, ordinal)| *ordinal)
+            .collect::<Vec<_>>();
+        let unread_session_restarts = session_restart_event_ordinals
+            .iter()
+            .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
+            .count();
         let queued_prompts = session
             .queued_prompts
             .iter()
@@ -314,11 +356,14 @@ impl PreparedMaterializedSessionDetail {
             last_agent_message_follows_last_user,
             agent_message_latest_content_ordinals,
             unread_agent_messages,
+            session_restart_event_ordinals,
+            unread_session_restarts,
             transcript,
             queued_prompts,
             projection: MaterializedProjectionCache {
                 transcript: session.transcript,
                 agent_messages,
+                restart_events,
                 last_agent_message,
                 tool_diffstats,
             },
@@ -377,6 +422,11 @@ impl DashboardState {
                 .map_or(0, |session| session.viewed_through_event_ordinal);
             detail.unread_agent_messages = detail
                 .agent_message_latest_content_ordinals
+                .iter()
+                .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
+                .count();
+            detail.unread_session_restarts = detail
+                .session_restart_event_ordinals
                 .iter()
                 .filter(|ordinal| **ordinal > viewed_through_event_ordinal)
                 .count();
@@ -652,6 +702,8 @@ impl DashboardState {
         detail.agent_message_latest_content_ordinals =
             prepared.agent_message_latest_content_ordinals;
         detail.unread_agent_messages = prepared.unread_agent_messages;
+        detail.session_restart_event_ordinals = prepared.session_restart_event_ordinals;
+        detail.unread_session_restarts = prepared.unread_session_restarts;
         detail.transcript = Some(prepared.transcript);
         detail.transcript_hydration = TranscriptHydration::Ready;
         detail.queued_prompts = prepared.queued_prompts;
@@ -690,6 +742,8 @@ impl DashboardState {
         detail.agent_message_latest_content_ordinals =
             prepared.agent_message_latest_content_ordinals;
         detail.unread_agent_messages = prepared.unread_agent_messages;
+        detail.session_restart_event_ordinals = prepared.session_restart_event_ordinals;
+        detail.unread_session_restarts = prepared.unread_session_restarts;
         if let Some(title) = prepared.session_title.as_ref()
             && let Some(record) = self.state.sessions.get_mut(&prepared.session_id)
         {
@@ -890,6 +944,33 @@ mod tests {
     }
 
     #[test]
+    fn restart_marker_is_unread_until_the_existing_cursor_passes_it() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        let mut materialized = materialized_session_for("session-1", vec![session_restart(3)]);
+        materialized.execution = MaterializedExecutionState::Idle;
+        dashboard.apply_materialized_session(&materialized);
+
+        let detail = &dashboard.session_details["session-1"];
+        assert_eq!(detail.unread_agent_messages, 0);
+        assert_eq!(detail.unread_session_restarts, 1);
+        assert!(detail.has_unread());
+        assert!(detail.current_turn_started_at.is_none());
+
+        let mut state = dashboard.state.clone();
+        state
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .viewed_through_event_ordinal = 3;
+        dashboard.set_state(state);
+        let detail = &dashboard.session_details["session-1"];
+        assert_eq!(detail.unread_session_restarts, 0);
+        assert!(!detail.has_unread());
+    }
+
+    #[test]
     fn materialized_message_update_does_not_duplicate_unread_count() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
@@ -996,6 +1077,7 @@ mod tests {
             last_user_message: Some("Persisted question".into()),
             last_agent_message_follows_last_user: true,
             agent_message_latest_content_ordinals: vec![2, 5, 7],
+            session_restart_event_ordinals: vec![6],
         };
 
         assert!(dashboard.apply_prepared_materialized_session_summary(
@@ -1012,6 +1094,7 @@ mod tests {
             Some("Persisted answer")
         );
         assert_eq!(detail.unread_agent_messages, 2);
+        assert_eq!(detail.unread_session_restarts, 1);
         assert!(detail.last_agent_message_follows_last_user);
         assert_eq!(detail.current_turn_started_at, Some(4));
         assert_eq!(detail.transcript_hydration, TranscriptHydration::Loading);
@@ -1045,6 +1128,7 @@ mod tests {
             ),
             last_agent_message_follows_last_user: false,
             agent_message_latest_content_ordinals: vec![],
+            session_restart_event_ordinals: vec![],
         };
 
         assert!(dashboard.apply_prepared_materialized_session_summary(
@@ -1102,6 +1186,8 @@ mod tests {
         // An item inside the unchanged prefix changes.
         set_agent_text(&mut transcript[0], "first, corrected", 6);
         updates.push(transcript.clone());
+        transcript.push(session_restart(7));
+        updates.push(transcript.clone());
         // A restore rebuilds every item, sharing no handles.
         transcript = vec![agent_message(1, "restored"), agent_message(2, "and again")];
         updates.push(transcript.clone());
@@ -1134,6 +1220,15 @@ mod tests {
             assert_eq!(
                 incremental.unread_agent_messages, rescanned.unread_agent_messages,
                 "unread count after update {index}"
+            );
+            assert_eq!(
+                incremental.session_restart_event_ordinals,
+                rescanned.session_restart_event_ordinals,
+                "restart ordinals after update {index}"
+            );
+            assert_eq!(
+                incremental.unread_session_restarts, rescanned.unread_session_restarts,
+                "unread restart count after update {index}"
             );
             cache = incremental.projection;
         }

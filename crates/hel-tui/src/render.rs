@@ -911,12 +911,10 @@ fn session_name(session: &SessionRecord) -> &str {
 /// loaded yet keeps the default.
 fn session_band_color(detail: Option<&SessionDetail>) -> Color {
     match detail {
-        Some(detail)
-            if detail.unread_agent_messages > 0 && detail.current_turn_started_at.is_none() =>
-        {
+        Some(detail) if detail.has_unread() && detail.current_turn_started_at.is_none() => {
             Color::LightBlue
         }
-        Some(detail) if detail.unread_agent_messages > 0 => Color::LightYellow,
+        Some(detail) if detail.has_unread() => Color::LightYellow,
         // ANSI yellow is the orange/amber ink in common terminal palettes;
         // bright yellow remains distinct for unread sessions.
         _ => Color::Yellow,
@@ -1753,6 +1751,22 @@ mod tests {
 
         let collapsed = collapsed_session_line("› ", "podman", Some(&unread_idle), 1, 80, None);
         assert_eq!(collapsed.style.fg, Some(Color::LightBlue));
+
+        let restarted_idle = SessionDetail {
+            unread_session_restarts: 1,
+            ..SessionDetail::default()
+        };
+        assert_eq!(session_band_color(Some(&restarted_idle)), Color::LightBlue);
+
+        let restarted_running = SessionDetail {
+            current_turn_started_at: Some(1),
+            unread_session_restarts: 1,
+            ..SessionDetail::default()
+        };
+        assert_eq!(
+            session_band_color(Some(&restarted_running)),
+            Color::LightYellow
+        );
     }
 
     #[test]

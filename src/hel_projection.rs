@@ -680,6 +680,16 @@ fn project_observation(
         RelayObservation::Warning { message } => {
             push_system(mutation, event, format!("warning: {message}"));
         }
+        RelayObservation::SessionRestarted => push_system_with_id(
+            mutation,
+            event,
+            format!(
+                "{}{}",
+                crate::hel_transcript::SESSION_RESTART_ITEM_PREFIX,
+                event.ordinal
+            ),
+            crate::hel_transcript::SESSION_RESTART_TEXT,
+        ),
         // Keyed on the command rather than the event ordinal, and skipped once
         // the line exists: a relay that re-records the same notice after a
         // persistence retry leaves exactly one line in the conversation.
@@ -1547,6 +1557,41 @@ mod tests {
                 .transcript
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn session_restarts_project_as_distinct_durable_system_lines() {
+        let mut session = MaterializedSession::empty("session");
+        apply_observation(&mut session, RelayObservation::SessionRestarted);
+        apply_observation(&mut session, RelayObservation::SessionRestarted);
+
+        assert_eq!(session.transcript.len(), 2);
+        assert!(
+            session
+                .transcript
+                .iter()
+                .all(|item| item.is_session_restart())
+        );
+        assert_eq!(session.unread_session_restarts_after(0), 2);
+        assert!(session.transcript.iter().all(|item| matches!(
+            &item.body,
+            TranscriptBody::System { text }
+                if text == crate::hel_transcript::SESSION_RESTART_TEXT
+        )));
+        assert_ne!(
+            session.transcript[0].stable_id,
+            session.transcript[1].stable_id
+        );
+
+        let canonical = canonical_session_from_materialized(&session).unwrap();
+        let restored = materialized_session_from_canonical("session", &canonical).unwrap();
+        assert_eq!(restored.unread_session_restarts_after(0), 2);
+        assert!(
+            restored
+                .transcript
+                .iter()
+                .all(|item| item.is_session_restart())
         );
     }
 

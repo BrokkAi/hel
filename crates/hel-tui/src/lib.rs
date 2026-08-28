@@ -778,7 +778,7 @@ impl DashboardState {
     fn mark_all_read(&mut self) -> DashboardAction {
         let mut receipts = Vec::new();
         for (session_id, detail) in &mut self.session_details {
-            if detail.unread_agent_messages == 0 {
+            if !detail.has_unread() {
                 continue;
             }
             let Some(through) = detail.materialized_applied_event_ordinal else {
@@ -789,7 +789,7 @@ impl DashboardState {
             };
             if through > session.viewed_through_event_ordinal {
                 session.viewed_through_event_ordinal = through;
-                detail.unread_agent_messages = 0;
+                detail.clear_unread();
                 receipts.push((session_id.clone(), through));
             }
         }
@@ -1307,6 +1307,26 @@ mod tests {
             dashboard.state.sessions["session-1"].viewed_through_event_ordinal,
             4
         );
+    }
+
+    #[test]
+    fn mark_all_read_includes_a_restart_only_session() {
+        let mut dashboard = dashboard_with_session(running_session());
+        apply_materialized_transcript(&mut dashboard, vec![session_restart(3)]);
+        assert_eq!(
+            dashboard.session_details["session-1"].unread_session_restarts,
+            1
+        );
+
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('a')),
+            DashboardAction::MarkAllRead {
+                receipts: vec![("session-1".into(), 3)]
+            }
+        );
+        let detail = &dashboard.session_details["session-1"];
+        assert_eq!(detail.unread_session_restarts, 0);
+        assert!(!detail.has_unread());
     }
 
     #[test]

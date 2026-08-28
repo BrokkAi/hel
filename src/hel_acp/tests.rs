@@ -2495,6 +2495,111 @@ while True:
 
 #[cfg(unix)]
 #[tokio::test]
+async fn planned_bridge_replacement_reports_a_harness_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let prompt_seen = temp.path().join("prompt-seen");
+    let script = temp.path().join("cancelled_acp.py");
+    std::fs::write(
+        &script,
+        format!(
+            r#"
+import json, sys
+prompt_seen = {prompt_seen:?}
+
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+
+def write(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+while True:
+    request = read()
+    if request is None:
+        break
+    method = request.get("method")
+    ident = request.get("id")
+    if method == "initialize":
+        write({{"jsonrpc": "2.0", "id": ident, "result": {{"protocolVersion": 1}}}})
+    elif method in ("session/new", "session/load"):
+        write({{"jsonrpc": "2.0", "id": ident, "result": {{"sessionId": "scripted"}}}})
+    elif method == "session/prompt":
+        open(prompt_seen, "w").close()
+        cancellation = read()
+        assert cancellation.get("method") == "session/cancel", cancellation
+        write({{"jsonrpc": "2.0", "id": ident, "result": {{"stopReason": "cancelled"}}}})
+    elif ident is not None:
+        write({{"jsonrpc": "2.0", "id": ident, "result": {{}}}})
+"#,
+        ),
+    )
+    .unwrap();
+
+    let (request_tx, request_rx) = mpsc::channel(4);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let spec = LaunchSpec {
+        command: "python3".into(),
+        args: vec![script.to_string_lossy().into_owned()],
+        environment: BTreeMap::new(),
+        cwd: temp.path().to_path_buf(),
+        additional_directories: Vec::new(),
+        project_memory: None,
+        resume_session: None,
+        harness: HarnessKind::Kimi,
+        execution_policy: ExecutionPolicy::ConfiguredApprovals,
+        acp_activity: AcpActivityClock::default(),
+    };
+    let runtime = tokio::spawn(run(spec, request_rx, event_tx));
+
+    wait_for_runtime_event(&mut event_rx, |event| {
+        matches!(event, RuntimeEvent::SessionStarted { resumed: false, .. })
+    })
+    .await;
+    request_tx
+        .send(CommandRequest::Prompt {
+            request_id: "prompt-1".into(),
+            prompt: vec![ContentBlock::Text(TextContent::new("go"))],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !prompt_seen.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the prompt reaches the bridge");
+    request_tx
+        .send(CommandRequest::Cancel {
+            request_id: "cancel-1".into(),
+        })
+        .await
+        .unwrap();
+
+    let restart = wait_for_runtime_event(&mut event_rx, |event| {
+        matches!(event, RuntimeEvent::HarnessRestarting { .. })
+    })
+    .await;
+    let RuntimeEvent::HarnessRestarting { message } = restart else {
+        unreachable!();
+    };
+    assert!(message.contains("restarting"), "{message}");
+    wait_for_runtime_event(&mut event_rx, |event| {
+        matches!(event, RuntimeEvent::SessionStarted { resumed: true, .. })
+    })
+    .await;
+
+    drop(request_tx);
+    tokio::time::timeout(std::time::Duration::from_secs(5), runtime)
+        .await
+        .expect("closing the command channel ends the runtime")
+        .expect("runtime task does not panic")
+        .expect("planned bridge replacement remains healthy");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn bridge_exit_during_initialize_returns_an_actionable_error() {
     let (_request_tx, request_rx) = mpsc::channel(1);
     let (event_tx, mut event_rx) = mpsc::channel(16);

@@ -15,11 +15,11 @@ pub(super) const PROXY_INITIAL_INPUT_TIMEOUT: std::time::Duration =
 use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
 use crate::hel_config::HarnessKind;
 use crate::hel_worker::{
-    ClaimedRelayCommand, DeferredRelayAttach, DurableRelay, RelayCommand, RelayCommandOutcome,
-    RelayErrorCode, RelayObservation, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
-    RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
-    incompatible_request_protocol_response, invalid_relay_request_response,
-    unsupported_relay_method_response,
+    ClaimedRelayCommand, DeferredRelayAttach, DurableRelay, RELAY_STATE_FILE,
+    RESTORED_RELAY_SEED_FILE, RelayCommand, RelayCommandOutcome, RelayErrorCode, RelayObservation,
+    RelayProtocolError, RelayRequest, RelayRequestEnvelope, RelayResponseBody,
+    RelayResponseEnvelope, RelayResponsePayload, incompatible_request_protocol_response,
+    invalid_relay_request_response, unsupported_relay_method_response,
 };
 use crate::hel_worker_protocol::{DecodedRelayRequest, decode_relay_request};
 
@@ -90,6 +90,8 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
         std::fs::remove_file(&socket)
             .with_context(|| format!("remove stale socket {}", socket.display()))?;
     }
+    let restarting =
+        root.join(RELAY_STATE_FILE).exists() || root.join(RESTORED_RELAY_SEED_FILE).exists();
     // Validate and recover durable state before publishing a socket. A
     // failed startup must never leave a fresh endpoint that looks live.
     let mut durable_relay =
@@ -125,6 +127,13 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    if restarting
+        && durable_relay.operational_state().execution
+            != crate::hel_worker::RelayExecutionState::Closed
+    {
+        durable_relay.record_observation(RelayObservation::SessionRestarted)?;
     }
 
     let relay = Arc::new(Mutex::new(durable_relay));
@@ -674,6 +683,7 @@ pub(super) fn record_runtime_event(
             for (command_id, _) in std::mem::take(in_flight) {
                 relay.record_command_interrupted(&command_id, message.clone())?;
             }
+            relay.record_observation(RelayObservation::SessionRestarted)?;
         }
         RuntimeEvent::TerminalClosed {
             terminal_id,
@@ -1974,6 +1984,31 @@ pub async fn proxy(root: PathBuf) -> Result<()> {
 /// this supervisor; if the daemon is killed, stdin reaches EOF and the
 /// complete bridge process tree is terminated and reaped.
 pub async fn run_acp_supervisor(spec: AcpSupervisorSpec) -> Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    // This hidden subcommand exclusively owns its stdio pipes. Tokio's global
+    // stdin reader uses a non-cancellable blocking read, which can keep the
+    // supervisor process alive after its ACP child has already been reaped.
+    // SAFETY: ownership of each process fd is transferred exactly once here.
+    let stdin = unsafe { OwnedFd::from_raw_fd(libc::STDIN_FILENO) };
+    // SAFETY: stdout is likewise owned exclusively by this subcommand.
+    let stdout = unsafe { OwnedFd::from_raw_fd(libc::STDOUT_FILENO) };
+    let stdin = tokio::net::unix::pipe::Receiver::from_owned_fd(stdin)
+        .context("open ACP supervisor stdin pipe")?;
+    let stdout = tokio::net::unix::pipe::Sender::from_owned_fd(stdout)
+        .context("open ACP supervisor stdout pipe")?;
+    run_acp_supervisor_with_streams(spec, stdin, stdout).await
+}
+
+pub(super) async fn run_acp_supervisor_with_streams<R, W>(
+    spec: AcpSupervisorSpec,
+    mut parent_stdin: R,
+    mut parent_stdout: W,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
 
     let mut command = tokio::process::Command::new(&spec.command);
@@ -1996,43 +2031,88 @@ pub async fn run_acp_supervisor(spec: AcpSupervisorSpec) -> Result<()> {
         .stdout
         .take()
         .context("ACP bridge stdout unavailable")?;
-    let mut parent_stdin = tokio::io::stdin();
-    let mut parent_stdout = tokio::io::stdout();
+    enum SupervisorCompletion {
+        InputEnded,
+        OutputEnded,
+        ChildExited(std::process::ExitStatus),
+    }
 
-    let child_output_ended = {
+    let completion = {
         let input = tokio::io::copy(&mut parent_stdin, &mut child_stdin);
         let output = tokio::io::copy(&mut child_stdout, &mut parent_stdout);
-        tokio::pin!(input, output);
+        let exited = child.wait();
+        tokio::pin!(input, output, exited);
         tokio::select! {
             result = &mut input => {
                 result.context("forward ACP supervisor input")?;
-                false
+                SupervisorCompletion::InputEnded
             }
             result = &mut output => {
                 result.context("forward ACP supervisor output")?;
-                true
+                SupervisorCompletion::OutputEnded
+            }
+            result = &mut exited => {
+                SupervisorCompletion::ChildExited(
+                    result.context("wait for supervised ACP bridge")?
+                )
             }
         }
     };
-    if let Err(error) = child_stdin.shutdown().await {
-        tracing::debug!(
-            operation = "acp_supervisor_shutdown",
-            %error,
-            "could not close ACP bridge stdin before termination"
-        );
-    }
-    terminate_process_group(pid, libc::SIGTERM);
-    match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
-        Ok(status) => {
-            let status = status.context("wait for supervised ACP bridge")?;
-            if child_output_ended && !status.success() {
-                bail!("supervised ACP bridge exited with {status}");
+    if !matches!(&completion, SupervisorCompletion::ChildExited(_)) {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), child_stdin.shutdown()).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    operation = "acp_supervisor_shutdown",
+                    %error,
+                    "could not close ACP bridge stdin before termination"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    operation = "acp_supervisor_shutdown",
+                    "timed out closing ACP bridge stdin before termination"
+                );
             }
         }
-        Err(_) => {
-            terminate_process_group(pid, libc::SIGKILL);
-            child.wait().await.context("reap supervised ACP bridge")?;
+    }
+    drop(child_stdin);
+    terminate_process_group(pid, libc::SIGTERM);
+    let (bridge_ended, status) = match completion {
+        SupervisorCompletion::ChildExited(status) => (true, Some(status)),
+        SupervisorCompletion::InputEnded => {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+                Ok(status) => {
+                    let status = status.context("wait for supervised ACP bridge")?;
+                    (false, Some(status))
+                }
+                Err(_) => {
+                    terminate_process_group(pid, libc::SIGKILL);
+                    child.wait().await.context("reap supervised ACP bridge")?;
+                    (false, None)
+                }
+            }
         }
+        SupervisorCompletion::OutputEnded => {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+                Ok(status) => {
+                    let status = status.context("wait for supervised ACP bridge")?;
+                    (true, Some(status))
+                }
+                Err(_) => {
+                    terminate_process_group(pid, libc::SIGKILL);
+                    child.wait().await.context("reap supervised ACP bridge")?;
+                    (true, None)
+                }
+            }
+        }
+    };
+    if bridge_ended
+        && let Some(status) = status
+        && !status.success()
+    {
+        bail!("supervised ACP bridge exited with {status}");
     }
     Ok(())
 }

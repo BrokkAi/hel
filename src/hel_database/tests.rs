@@ -1493,6 +1493,16 @@ fn materialized_summary_loads_messages_without_deserializing_full_history() {
             },
         }),
         Arc::new(TranscriptItem {
+            stable_id: format!("{}5", crate::hel_transcript::SESSION_RESTART_ITEM_PREFIX),
+            position: 5,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1_650,
+            last_changed_at_ms: 1_650,
+            body: TranscriptBody::System {
+                text: crate::hel_transcript::SESSION_RESTART_TEXT.into(),
+            },
+        }),
+        Arc::new(TranscriptItem {
             stable_id: "agent:6".into(),
             position: 6,
             latest_content_event_ordinal: Some(7),
@@ -1539,6 +1549,7 @@ fn materialized_summary_loads_messages_without_deserializing_full_history() {
     assert_eq!(summary.last_agent_message.as_deref(), Some("Finished"));
     assert!(!summary.last_agent_message_follows_last_user);
     assert_eq!(summary.agent_message_latest_content_ordinals, vec![2, 7]);
+    assert_eq!(summary.session_restart_event_ordinals, vec![5]);
     assert_eq!(summary.execution, materialized.execution);
     assert!(load_materialized_session_from(&database, "session-1").is_err());
 }
