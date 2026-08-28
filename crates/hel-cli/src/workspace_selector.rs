@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use hel::hel_text_input::TextInput;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -38,7 +39,7 @@ pub(crate) fn select_workspace(
     let mut terminal = TerminalGuard::enter()?;
     let mut selected = 0_usize;
     let mut editing: Option<EditMode> = None;
-    let mut input = String::new();
+    let mut input = TextInput::new().with_max_chars(64);
 
     loop {
         terminal.terminal.draw(|frame| {
@@ -99,8 +100,12 @@ pub(crate) fn select_workspace(
             );
 
             let footer_text = match &editing {
-                Some(EditMode::Create) => format!("Create workspace: {input}▌"),
-                Some(EditMode::Rename { .. }) => format!("Rename workspace: {input}▌"),
+                Some(EditMode::Create) => {
+                    format!("Create workspace: {}", input.with_cursor_marker("▌"))
+                }
+                Some(EditMode::Rename { .. }) => {
+                    format!("Rename workspace: {}", input.with_cursor_marker("▌"))
+                }
                 None => {
                     "↑↓ select  Enter open  N new  R rename  V recover draft  D delete  Esc cancel"
                         .into()
@@ -123,26 +128,24 @@ pub(crate) fn select_workspace(
                 }
                 KeyCode::Enter if !input.trim().is_empty() => {
                     return Ok(match mode {
-                        EditMode::Create => SelectorOutcome::Create(input),
+                        EditMode::Create => SelectorOutcome::Create(input.into_value()),
                         EditMode::Rename { workspace_id } => SelectorOutcome::Rename {
                             workspace_id: workspace_id.clone(),
-                            name: input,
+                            name: input.into_value(),
                         },
                     });
                 }
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Char(character)
-                    if !key
+                KeyCode::Char('c')
+                    if key
                         .modifiers
-                        .intersects(crossterm::event::KeyModifiers::CONTROL)
-                        && input.chars().count() < 64
-                        && !character.is_control() =>
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
-                    input.push(character);
+                    editing = None;
+                    input.clear();
                 }
-                _ => {}
+                _ => {
+                    input.handle_key(key);
+                }
             }
             continue;
         }
@@ -162,13 +165,13 @@ pub(crate) fn select_workspace(
             }
             KeyCode::Enter | KeyCode::Char('n' | 'N') => {
                 editing = Some(EditMode::Create);
-                input = suggested_name.to_owned();
+                input.set_value(suggested_name);
             }
             KeyCode::Char('r' | 'R') if selected < workspaces.len() => {
                 editing = Some(EditMode::Rename {
                     workspace_id: workspaces[selected].listing.workspace.id.clone(),
                 });
-                input = workspaces[selected].listing.workspace.name.clone();
+                input.set_value(&workspaces[selected].listing.workspace.name);
             }
             KeyCode::Char('d' | 'D') if selected < workspaces.len() => {
                 return Ok(SelectorOutcome::Delete(

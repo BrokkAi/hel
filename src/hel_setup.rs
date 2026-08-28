@@ -155,10 +155,10 @@ pub fn run_setup_dialog(config_path: &Path) -> Result<SetupOutcome> {
     // may pull an image, is allowed to take as long as it needs.
     let probes = probe_executor();
     let discovery = discover_current(&probes);
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    run_setup_dialog_with(
-        &mut stdin.lock(),
+    let mut input = ReadlinePrompter::default();
+    run_setup_dialog_inner(
+        &mut input,
         &mut stdout.lock(),
         config_path,
         &discovery,
@@ -566,6 +566,24 @@ pub fn run_setup_dialog_with(
     smoke_executor: &impl CommandExecutor,
     probe_executor: &impl CommandExecutor,
 ) -> Result<SetupOutcome> {
+    run_setup_dialog_inner(
+        input,
+        output,
+        config_path,
+        discovery,
+        smoke_executor,
+        probe_executor,
+    )
+}
+
+fn run_setup_dialog_inner(
+    input: &mut impl SetupPrompter,
+    output: &mut impl Write,
+    config_path: &Path,
+    discovery: &SetupDiscovery,
+    smoke_executor: &impl CommandExecutor,
+    probe_executor: &impl CommandExecutor,
+) -> Result<SetupOutcome> {
     writeln!(output, "Welcome to Hel setup.")?;
     writeln!(output)?;
     write_discovered_homes(output, &discovery.homes)?;
@@ -722,7 +740,7 @@ fn write_runtimes(output: &mut impl Write, runtimes: &[RuntimeProbe]) -> Result<
 /// Offer an AWS EC2 target, but only when this host already has working AWS
 /// credentials. Without them the step prints one line and asks nothing.
 fn prompt_aws_target(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     account: Option<&AwsAccount>,
 ) -> Result<Option<AwsTargetInput>> {
@@ -794,7 +812,7 @@ fn prompt_aws_target(
 /// With no aliases the step prints one line and asks nothing, the same way the
 /// AWS step reports skipping.
 fn prompt_ssh_target(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     aliases: &[String],
     configured: &BTreeMap<String, TargetTemplate>,
@@ -873,7 +891,7 @@ fn prompt_ssh_target(
 /// dialog, and a name that is already taken would silently replace the target
 /// it collides with.
 fn prompt_ssh_target_name(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     host: &str,
     configured: &BTreeMap<String, TargetTemplate>,
@@ -950,7 +968,7 @@ fn write_doctor_report(
 }
 
 fn select_runtime(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     runtimes: &[RuntimeProbe],
     recommended: RuntimeKind,
@@ -982,7 +1000,7 @@ fn select_runtime(
     Ok(selected)
 }
 
-fn prompt(input: &mut impl BufRead, output: &mut impl Write, label: &str) -> Result<String> {
+fn prompt(input: &mut impl SetupPrompter, output: &mut impl Write, label: &str) -> Result<String> {
     Ok(prompt_line(input, output, label)?.unwrap_or_default())
 }
 
@@ -992,17 +1010,35 @@ fn prompt(input: &mut impl BufRead, output: &mut impl Write, label: &str) -> Res
 /// its default. A question that must be asked again until it is answered needs
 /// the difference, or it would loop forever against a closed stdin.
 fn prompt_line(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     label: &str,
 ) -> Result<Option<String>> {
-    write!(output, "{label}")?;
-    output.flush()?;
-    let mut answer = String::new();
-    let read = input
-        .read_line(&mut answer)
-        .context("read setup response")?;
-    Ok((read > 0).then(|| answer.trim().to_owned()))
+    input.read_prompt(output, label)
+}
+
+trait SetupPrompter {
+    fn read_prompt(&mut self, output: &mut dyn Write, label: &str) -> Result<Option<String>>;
+}
+
+impl<R: BufRead> SetupPrompter for R {
+    fn read_prompt(&mut self, output: &mut dyn Write, label: &str) -> Result<Option<String>> {
+        write!(output, "{label}")?;
+        output.flush()?;
+        let mut answer = String::new();
+        let read = self.read_line(&mut answer).context("read setup response")?;
+        Ok((read > 0).then(|| answer.trim().to_owned()))
+    }
+}
+
+#[derive(Default)]
+struct ReadlinePrompter(crate::hel_readline::LineReader);
+
+impl SetupPrompter for ReadlinePrompter {
+    fn read_prompt(&mut self, output: &mut dyn Write, label: &str) -> Result<Option<String>> {
+        output.flush()?;
+        self.0.read_line(label).context("read setup response")
+    }
 }
 
 fn write_summary(

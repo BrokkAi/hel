@@ -352,11 +352,9 @@ fn confirm_import_safety(
         };
         bail!("pass {flags} to acknowledge import safety warnings");
     }
-    print!("Proceed? [y/N]: ");
-    use std::io::Write as _;
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
+    let answer = hel::hel_readline::LineReader::default()
+        .read_line("Proceed? [y/N]: ")?
+        .unwrap_or_default();
     Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"

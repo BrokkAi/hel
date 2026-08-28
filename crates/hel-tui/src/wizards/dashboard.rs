@@ -3,15 +3,16 @@ use super::*;
 impl DashboardState {
     pub(crate) fn handle_new_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut wizard: NewWizard,
     ) -> DashboardAction {
+        let code = key.code;
         if code == KeyCode::Esc {
             self.cancel_modal();
             return DashboardAction::None;
         }
         if wizard.step == WizardStep::Mounts {
-            return self.handle_mount_key(code, wizard);
+            return self.handle_mount_key(key, wizard);
         }
         if wizard.step == WizardStep::Review {
             return self.handle_new_review_key(code, wizard);
@@ -25,7 +26,8 @@ impl DashboardState {
                         .unwrap_or(wizard.project_history.len() - 1);
                     wizard.project_directory = wizard.project_history[wizard.project_history_index]
                         .to_string_lossy()
-                        .into_owned();
+                        .into_owned()
+                        .into();
                     wizard.project_directory_error = None;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
@@ -35,7 +37,8 @@ impl DashboardState {
                         (wizard.project_history_index + 1) % wizard.project_history.len();
                     wizard.project_directory = wizard.project_history[wizard.project_history_index]
                         .to_string_lossy()
-                        .into_owned();
+                        .into_owned()
+                        .into();
                     wizard.project_directory_error = None;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
@@ -45,9 +48,11 @@ impl DashboardState {
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
-                KeyCode::Backspace => {
-                    wizard.project_directory.pop();
-                    wizard.project_directory_error = None;
+                _ if !matches!(code, KeyCode::Enter | KeyCode::Esc) => {
+                    let changed = wizard.project_directory.handle_key(key).changed();
+                    if changed {
+                        wizard.project_directory_error = None;
+                    }
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
@@ -82,12 +87,6 @@ impl DashboardState {
                             directory,
                         }
                     }
-                }
-                KeyCode::Char(character) if wizard.focus == WizardFocus::Content => {
-                    wizard.project_directory.push(character);
-                    wizard.project_directory_error = None;
-                    self.mode = Mode::New(wizard);
-                    DashboardAction::None
                 }
                 _ => {
                     self.mode = Mode::New(wizard);
@@ -135,8 +134,8 @@ impl DashboardState {
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
-                KeyCode::Backspace => {
-                    wizard.new_bundle_source.pop();
+                _ if !matches!(code, KeyCode::Enter | KeyCode::Esc) => {
+                    wizard.new_bundle_source.handle_key(key);
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
@@ -149,11 +148,6 @@ impl DashboardState {
                     let source = wizard.new_bundle_source.trim().to_owned();
                     self.mode = Mode::New(wizard);
                     DashboardAction::CreateBundle { source }
-                }
-                KeyCode::Char(character) if wizard.focus == WizardFocus::Content => {
-                    wizard.new_bundle_source.push(character);
-                    self.mode = Mode::New(wizard);
-                    DashboardAction::None
                 }
                 _ => {
                     self.mode = Mode::New(wizard);
@@ -286,7 +280,7 @@ impl DashboardState {
                     if wizard.project_directory.is_empty()
                         && let Some(directory) = wizard.project_history.first()
                     {
-                        wizard.project_directory = directory.to_string_lossy().into_owned();
+                        wizard.project_directory = directory.to_string_lossy().into_owned().into();
                     }
                     WizardStep::ProjectDirectory
                 } else {
@@ -372,7 +366,8 @@ impl DashboardState {
         DashboardAction::None
     }
 
-    fn handle_mount_key(&mut self, code: KeyCode, mut wizard: NewWizard) -> DashboardAction {
+    fn handle_mount_key(&mut self, key: KeyEvent, mut wizard: NewWizard) -> DashboardAction {
+        let code = key.code;
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         match code {
             KeyCode::Tab
@@ -429,7 +424,8 @@ impl DashboardState {
                 );
                 wizard.mounts.source = wizard.mounts.history[wizard.mounts.history_index]
                     .to_string_lossy()
-                    .into_owned();
+                    .into_owned()
+                    .into();
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
@@ -445,25 +441,28 @@ impl DashboardState {
                 );
                 wizard.mounts.source = wizard.mounts.history[wizard.mounts.history_index]
                     .to_string_lossy()
-                    .into_owned();
+                    .into_owned()
+                    .into();
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
-            KeyCode::Backspace => {
-                match wizard.mounts.focus {
+            _ if matches!(
+                wizard.mounts.focus,
+                MountFocus::Source | MountFocus::Destination
+            ) && !matches!(code, KeyCode::Enter) =>
+            {
+                let changed = match wizard.mounts.focus {
                     MountFocus::Source => {
-                        wizard.mounts.source.pop();
+                        let changed = wizard.mounts.source.handle_key(key).changed();
                         wizard.mounts.completion_candidates.clear();
+                        changed
                     }
-                    MountFocus::Destination => {
-                        wizard.mounts.destination.pop();
-                    }
-                    MountFocus::ReadOnly
-                    | MountFocus::Cancel
-                    | MountFocus::Back
-                    | MountFocus::Add => {}
+                    MountFocus::Destination => wizard.mounts.destination.handle_key(key).changed(),
+                    _ => false,
+                };
+                if changed {
+                    wizard.mounts.error = None;
                 }
-                wizard.mounts.error = None;
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
@@ -474,8 +473,10 @@ impl DashboardState {
             }
             KeyCode::Enter => match wizard.mounts.focus {
                 MountFocus::Source if !wizard.mounts.completion_candidates.is_empty() => {
-                    wizard.mounts.source =
-                        wizard.mounts.completion_candidates[wizard.mounts.completion_index].clone();
+                    wizard.mounts.source = wizard.mounts.completion_candidates
+                        [wizard.mounts.completion_index]
+                        .clone()
+                        .into();
                     wizard.mounts.completion_candidates.clear();
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
@@ -494,7 +495,8 @@ impl DashboardState {
                             &wizard.mounts.mounts,
                         )
                         .to_string_lossy()
-                        .into_owned();
+                        .into_owned()
+                        .into();
                     }
                     wizard.mounts.focus = MountFocus::Destination;
                     self.mode = Mode::New(wizard);
@@ -519,22 +521,6 @@ impl DashboardState {
                     DashboardAction::None
                 }
             },
-            KeyCode::Char(character) => {
-                match wizard.mounts.focus {
-                    MountFocus::Source => {
-                        wizard.mounts.source.push(character);
-                        wizard.mounts.completion_candidates.clear();
-                    }
-                    MountFocus::Destination => wizard.mounts.destination.push(character),
-                    MountFocus::ReadOnly
-                    | MountFocus::Cancel
-                    | MountFocus::Back
-                    | MountFocus::Add => {}
-                }
-                wizard.mounts.error = None;
-                self.mode = Mode::New(wizard);
-                DashboardAction::None
-            }
             _ => {
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
@@ -547,7 +533,7 @@ impl DashboardState {
         mut wizard: NewWizard,
         target_template_id: String,
     ) -> DashboardAction {
-        let prefix = wizard.mounts.source.clone();
+        let prefix = wizard.mounts.source.to_string();
         if prefix.is_empty() {
             self.mode = Mode::New(wizard);
             return DashboardAction::None;
@@ -576,7 +562,7 @@ impl DashboardState {
             self.mode = Mode::New(wizard);
             return DashboardAction::None;
         }
-        let source = wizard.mounts.source.clone();
+        let source = wizard.mounts.source.to_string();
         self.mode = Mode::New(wizard);
         DashboardAction::ValidateMountSource {
             target_template_id,
@@ -906,15 +892,16 @@ impl DashboardState {
 
     pub(crate) fn handle_resume_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut wizard: ResumeWizard,
     ) -> DashboardAction {
+        let code = key.code;
         if code == KeyCode::Esc {
             self.cancel_modal();
             return DashboardAction::None;
         }
         if wizard.step == WizardStep::Mounts {
-            return self.handle_resume_mount_key(code, wizard);
+            return self.handle_resume_mount_key(key, wizard);
         }
         if wizard.step == WizardStep::Review {
             return self.handle_resume_review_key(code, wizard);
@@ -1146,9 +1133,10 @@ impl DashboardState {
 
     fn handle_resume_mount_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut wizard: ResumeWizard,
     ) -> DashboardAction {
+        let code = key.code;
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         match code {
             KeyCode::Tab
@@ -1205,7 +1193,8 @@ impl DashboardState {
                 );
                 wizard.mounts.source = wizard.mounts.history[wizard.mounts.history_index]
                     .to_string_lossy()
-                    .into_owned();
+                    .into_owned()
+                    .into();
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
@@ -1221,25 +1210,8 @@ impl DashboardState {
                 );
                 wizard.mounts.source = wizard.mounts.history[wizard.mounts.history_index]
                     .to_string_lossy()
-                    .into_owned();
-                self.mode = Mode::Resume(wizard);
-                DashboardAction::None
-            }
-            KeyCode::Backspace => {
-                match wizard.mounts.focus {
-                    MountFocus::Source => {
-                        wizard.mounts.source.pop();
-                        wizard.mounts.completion_candidates.clear();
-                    }
-                    MountFocus::Destination => {
-                        wizard.mounts.destination.pop();
-                    }
-                    MountFocus::ReadOnly
-                    | MountFocus::Cancel
-                    | MountFocus::Back
-                    | MountFocus::Add => {}
-                }
-                wizard.mounts.error = None;
+                    .into_owned()
+                    .into();
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
@@ -1250,8 +1222,10 @@ impl DashboardState {
             }
             KeyCode::Enter => match wizard.mounts.focus {
                 MountFocus::Source if !wizard.mounts.completion_candidates.is_empty() => {
-                    wizard.mounts.source =
-                        wizard.mounts.completion_candidates[wizard.mounts.completion_index].clone();
+                    wizard.mounts.source = wizard.mounts.completion_candidates
+                        [wizard.mounts.completion_index]
+                        .clone()
+                        .into();
                     wizard.mounts.completion_candidates.clear();
                     self.mode = Mode::Resume(wizard);
                     DashboardAction::None
@@ -1270,7 +1244,8 @@ impl DashboardState {
                             &wizard.mounts.mounts,
                         )
                         .to_string_lossy()
-                        .into_owned();
+                        .into_owned()
+                        .into();
                     }
                     wizard.mounts.focus = MountFocus::Destination;
                     self.mode = Mode::Resume(wizard);
@@ -1295,19 +1270,26 @@ impl DashboardState {
                     DashboardAction::None
                 }
             },
-            KeyCode::Char(character) => {
-                match wizard.mounts.focus {
+            _ if matches!(
+                wizard.mounts.focus,
+                MountFocus::Source | MountFocus::Destination
+            ) && !matches!(code, KeyCode::Enter) =>
+            {
+                let changed = match wizard.mounts.focus {
                     MountFocus::Source => {
-                        wizard.mounts.source.push(character);
+                        let changed = wizard.mounts.source.handle_key(key).changed();
                         wizard.mounts.completion_candidates.clear();
+                        changed
                     }
-                    MountFocus::Destination => wizard.mounts.destination.push(character),
+                    MountFocus::Destination => wizard.mounts.destination.handle_key(key).changed(),
                     MountFocus::ReadOnly
                     | MountFocus::Cancel
                     | MountFocus::Back
-                    | MountFocus::Add => {}
+                    | MountFocus::Add => false,
+                };
+                if changed {
+                    wizard.mounts.error = None;
                 }
-                wizard.mounts.error = None;
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
@@ -1323,7 +1305,7 @@ impl DashboardState {
         mut wizard: ResumeWizard,
         target_template_id: String,
     ) -> DashboardAction {
-        let prefix = wizard.mounts.source.clone();
+        let prefix = wizard.mounts.source.to_string();
         if prefix.is_empty() {
             self.mode = Mode::Resume(wizard);
             return DashboardAction::None;
@@ -1352,7 +1334,7 @@ impl DashboardState {
             self.mode = Mode::Resume(wizard);
             return DashboardAction::None;
         }
-        let source = wizard.mounts.source.clone();
+        let source = wizard.mounts.source.to_string();
         self.mode = Mode::Resume(wizard);
         DashboardAction::ValidateMountSource {
             target_template_id,
@@ -1462,8 +1444,8 @@ impl DashboardState {
             target,
             mounts: MountWizard::new(Vec::new()),
             review_focus: ReviewFocus::Submit,
-            new_bundle_source: String::new(),
-            project_directory: String::new(),
+            new_bundle_source: hel::hel_text_input::TextInput::new(),
+            project_directory: hel::hel_text_input::TextInput::new(),
             project_directory_error: None,
             project_history: Vec::new(),
             project_history_index: 0,

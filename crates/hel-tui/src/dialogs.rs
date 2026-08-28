@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use hel::hel_config::{HarnessKind, mount_history_host};
 use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_additional_mounts};
+use hel::hel_text_input::TextInput;
 
 use crate::widgets::{action_buttons, centered_rect, focused_buttons, popup_height, truncate_text};
 use crate::wizards::read_only_marker;
@@ -54,7 +55,7 @@ pub struct ImportProfileOption {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenameEditor {
     pub(crate) session_id: String,
-    pub(crate) title: String,
+    pub(crate) title: TextInput,
     pub(crate) focus: RenameFocus,
 }
 
@@ -65,7 +66,7 @@ pub(crate) struct RepositoryOriginDialog {
     pub(crate) missing_commit: String,
     pub(crate) archived_origin: String,
     pub(crate) configured_origin: String,
-    pub(crate) replacement: String,
+    pub(crate) replacement: TextInput,
     pub(crate) error: Option<String>,
     pub(crate) focus: RepositoryOriginFocus,
     pub(crate) launch: Box<DashboardAction>,
@@ -124,7 +125,7 @@ pub(crate) enum Confirmation {
     },
     ForceStop {
         session_id: String,
-        typed: String,
+        typed: TextInput,
     },
     DestroyStopped {
         session_id: String,
@@ -315,14 +316,14 @@ pub(crate) fn render_import_bundle_confirmation(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContainerEditor {
     pub(crate) session_id: String,
-    pub(crate) cpus: String,
-    pub(crate) memory: String,
+    pub(crate) cpus: TextInput,
+    pub(crate) memory: TextInput,
     pub(crate) mounts: Vec<AdditionalMount>,
     /// Remembered mount sources for this session's host, offered as
     /// suggestions and editable so a stale directory can be forgotten.
     pub(crate) suggestions: Vec<PathBuf>,
-    pub(crate) source: String,
-    pub(crate) destination: String,
+    pub(crate) source: TextInput,
+    pub(crate) destination: TextInput,
     /// Read-only setting for the directory being typed, carried into the list
     /// when it is attached.
     pub(crate) read_only: bool,
@@ -370,7 +371,7 @@ impl ContainerEditor {
         order
     }
 
-    fn field_mut(&mut self) -> Option<&mut String> {
+    fn field_mut(&mut self) -> Option<&mut TextInput> {
         match self.focus {
             ContainerEditFocus::Cpus => Some(&mut self.cpus),
             ContainerEditFocus::Memory => Some(&mut self.memory),
@@ -381,6 +382,16 @@ impl ContainerEditor {
             | ContainerEditFocus::Suggestions
             | ContainerEditFocus::Cancel
             | ContainerEditFocus::Save => None,
+        }
+    }
+
+    pub(crate) fn field(&self) -> Option<&TextInput> {
+        match self.focus {
+            ContainerEditFocus::Cpus => Some(&self.cpus),
+            ContainerEditFocus::Memory => Some(&self.memory),
+            ContainerEditFocus::Source => Some(&self.source),
+            ContainerEditFocus::Destination => Some(&self.destination),
+            _ => None,
         }
     }
 
@@ -438,10 +449,11 @@ impl ContainerEditor {
         let Some(source) = self.suggestions.get(self.suggestion_index) else {
             return;
         };
-        self.source = source.to_string_lossy().into_owned();
+        self.source = source.to_string_lossy().into_owned().into();
         self.destination = default_mount_destination(source, &self.mounts)
             .to_string_lossy()
-            .into_owned();
+            .into_owned()
+            .into();
         self.focus = ContainerEditFocus::Source;
     }
 
@@ -484,7 +496,7 @@ impl ContainerEditor {
 }
 
 pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &ContainerEditor) {
-    let field = |label: &str, value: &str, focused: bool| {
+    let field = |label: &str, value: &TextInput, focused: bool| {
         let style = if focused {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else {
@@ -492,7 +504,17 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
         };
         Line::from(vec![
             ratatui::text::Span::raw(format!("{label}: ")),
-            ratatui::text::Span::styled(format!("{value} "), style),
+            ratatui::text::Span::styled(
+                format!(
+                    "{} ",
+                    if focused {
+                        value.with_cursor_marker("▏")
+                    } else {
+                        value.to_string()
+                    }
+                ),
+                style,
+            ),
         ])
     };
     let mut lines = vec![
@@ -550,7 +572,7 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
         ),
         field(
             "Read-only",
-            if editor.read_only { "[x]" } else { "[ ]" },
+            &TextInput::from(if editor.read_only { "[x]" } else { "[ ]" }),
             editor.focus == ContainerEditFocus::ReadOnly,
         ),
     ]);
@@ -599,7 +621,14 @@ pub(crate) fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &Renam
     let paragraph = Paragraph::new(vec![
         Line::raw(format!("Session: {}", editor.session_id)),
         Line::raw(""),
-        Line::styled(editor.title.clone(), Style::default().fg(Color::Cyan)),
+        Line::styled(
+            if editor.focus == RenameFocus::Field {
+                editor.title.with_cursor_marker("▏")
+            } else {
+                editor.title.to_string()
+            },
+            Style::default().fg(Color::Cyan),
+        ),
         Line::raw(""),
         focused_buttons(RENAME_BUTTONS, editor.focus.button_index()),
     ])
@@ -619,7 +648,6 @@ pub(crate) fn render_repository_origin(
     dialog: &RepositoryOriginDialog,
 ) {
     let field_focused = dialog.focus == RepositoryOriginFocus::Field;
-    let field_cursor = if field_focused { "▏" } else { "" };
     let field_style = if field_focused {
         Style::default().fg(Color::Black).bg(Color::Cyan)
     } else {
@@ -642,7 +670,14 @@ pub(crate) fn render_repository_origin(
         Line::from(vec![
             Span::raw("Source: "),
             Span::styled(
-                format!(" {}{field_cursor} ", dialog.replacement),
+                format!(
+                    " {} ",
+                    if field_focused {
+                        dialog.replacement.with_cursor_marker("▏")
+                    } else {
+                        dialog.replacement.to_string()
+                    }
+                ),
                 field_style,
             ),
         ]),
@@ -739,7 +774,10 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
                 Line::raw("The current target will be removed without a new checkpoint."),
                 Line::raw("You can resume from the latest verified recovery archive."),
                 Line::raw(format!("Type {FORCE_STOP_CONFIRMATION}, then press Enter:")),
-                Line::styled(typed.clone(), Style::default().fg(Color::Red)),
+                Line::styled(
+                    typed.with_cursor_marker("▏"),
+                    Style::default().fg(Color::Red),
+                ),
             ],
         ),
     };
@@ -777,7 +815,7 @@ impl DashboardState {
             repository_id,
             missing_commit,
             archived_origin,
-            replacement: String::new(),
+            replacement: TextInput::new(),
             configured_origin,
             error: None,
             focus: RepositoryOriginFocus::Field,
@@ -800,9 +838,10 @@ impl DashboardState {
 
     pub(crate) fn handle_repository_origin_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut dialog: RepositoryOriginDialog,
     ) -> DashboardAction {
+        let code = key.code;
         match code {
             KeyCode::Esc => {
                 self.cancel_modal();
@@ -818,14 +857,6 @@ impl DashboardState {
                     ],
                     code == KeyCode::BackTab,
                 );
-            }
-            KeyCode::Backspace if dialog.focus == RepositoryOriginFocus::Field => {
-                dialog.replacement.pop();
-                dialog.error = None;
-            }
-            KeyCode::Char(character) if dialog.focus == RepositoryOriginFocus::Field => {
-                dialog.replacement.push(character);
-                dialog.error = None;
             }
             KeyCode::Enter if dialog.focus == RepositoryOriginFocus::Cancel => {
                 self.cancel_modal();
@@ -844,12 +875,17 @@ impl DashboardState {
                     let action = DashboardAction::ReplaceResumeRepositoryOrigin {
                         session_id: dialog.session_id.clone(),
                         repository_id: dialog.repository_id.clone(),
-                        replacement: dialog.replacement.clone(),
+                        replacement: dialog.replacement.to_string(),
                         launch: dialog.launch.clone(),
                     };
                     self.mode = Mode::RepositoryOrigin(dialog);
                     return action;
                 }
+            }
+            _ if dialog.focus == RepositoryOriginFocus::Field
+                && dialog.replacement.handle_key(key).changed() =>
+            {
+                dialog.error = None;
             }
             _ => {}
         }
@@ -875,12 +911,12 @@ impl DashboardState {
             .unwrap_or_default();
         self.mode = Mode::EditContainer(ContainerEditor {
             session_id: session.id.clone(),
-            cpus: session.container_cpus.clone().unwrap_or_default(),
-            memory: session.container_memory.clone().unwrap_or_default(),
+            cpus: session.container_cpus.clone().unwrap_or_default().into(),
+            memory: session.container_memory.clone().unwrap_or_default().into(),
             mounts: session.additional_mounts.clone(),
             suggestions,
-            source: String::new(),
-            destination: String::new(),
+            source: TextInput::new(),
+            destination: TextInput::new(),
             read_only: false,
             focus: ContainerEditFocus::Cpus,
             mount_index: 0,
@@ -891,9 +927,10 @@ impl DashboardState {
 
     pub(crate) fn handle_container_edit_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut editor: ContainerEditor,
     ) -> DashboardAction {
+        let code = key.code;
         let action = match code {
             KeyCode::Esc => {
                 self.cancel_modal();
@@ -991,15 +1028,11 @@ impl DashboardState {
                 editor.remove_selected();
                 DashboardAction::None
             }
-            KeyCode::Backspace => {
-                if let Some(field) = editor.field_mut() {
-                    field.pop();
-                }
-                DashboardAction::None
-            }
-            KeyCode::Char(character) => {
-                if let Some(field) = editor.field_mut() {
-                    field.push(character);
+            _ if editor.field().is_some() => {
+                if editor
+                    .field_mut()
+                    .is_some_and(|field| field.handle_key(key).changed())
+                {
                     editor.error = None;
                 }
                 DashboardAction::None
@@ -1076,21 +1109,25 @@ impl DashboardState {
         };
         self.mode = Mode::Rename(RenameEditor {
             session_id: session.id.clone(),
-            title: session
-                .session_title_override
-                .as_ref()
-                .or(session.acp_session_title.as_ref())
-                .cloned()
-                .unwrap_or_default(),
+            title: TextInput::from_value(
+                session
+                    .session_title_override
+                    .as_ref()
+                    .or(session.acp_session_title.as_ref())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .with_max_chars(64),
             focus: RenameFocus::Field,
         });
     }
 
     pub(crate) fn handle_rename_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut editor: RenameEditor,
     ) -> DashboardAction {
+        let code = key.code;
         match code {
             KeyCode::Esc => {
                 self.cancel_modal();
@@ -1102,7 +1139,6 @@ impl DashboardState {
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
-            // The field has no cursor, so horizontal keys only move between buttons.
             KeyCode::Left | KeyCode::Right if editor.focus != RenameFocus::Field => {
                 editor.focus = RenameFocus::from_button_index(cycle_button_focus(
                     editor.focus.button_index(),
@@ -1125,18 +1161,11 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::RenameSession {
                     session_id: editor.session_id,
-                    title: editor.title,
+                    title: editor.title.into_value(),
                 }
             }
-            KeyCode::Backspace if editor.focus == RenameFocus::Field => {
-                editor.title.pop();
-                self.mode = Mode::Rename(editor);
-                DashboardAction::None
-            }
-            KeyCode::Char(character)
-                if editor.focus == RenameFocus::Field && editor.title.chars().count() < 64 =>
-            {
-                editor.title.push(character);
+            _ if editor.focus == RenameFocus::Field => {
+                editor.title.handle_key(key);
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
@@ -1180,16 +1209,17 @@ impl DashboardState {
 
     pub(crate) fn handle_confirmation_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         dialog: ConfirmDialog,
     ) -> DashboardAction {
+        let code = key.code;
         let ConfirmDialog {
             confirmation,
             focus,
         } = dialog;
         let buttons = confirmation_buttons(&confirmation);
         if buttons.is_empty() {
-            return self.handle_typed_confirmation_key(code, confirmation);
+            return self.handle_typed_confirmation_key(key, confirmation);
         }
         let focus = match button_row_key(code, focus, buttons.len()) {
             ButtonKey::Activate(index) => {
@@ -1241,7 +1271,9 @@ impl DashboardState {
             (Confirmation::CloseFailed { session_id, .. }, 1) => {
                 self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
                     session_id,
-                    typed: String::new(),
+                    typed: TextInput::new()
+                        .with_max_chars(FORCE_STOP_CONFIRMATION.len())
+                        .with_filter(hel::hel_text_input::InputFilter::AsciiAlphabeticUppercase),
                 }));
                 DashboardAction::None
             }
@@ -1274,9 +1306,10 @@ impl DashboardState {
 
     fn handle_typed_confirmation_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         confirmation: Confirmation,
     ) -> DashboardAction {
+        let code = key.code;
         match confirmation {
             Confirmation::ForceStop {
                 session_id,
@@ -1286,29 +1319,12 @@ impl DashboardState {
                     self.cancel_modal();
                     DashboardAction::None
                 }
-                KeyCode::Backspace => {
-                    typed.pop();
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-                KeyCode::Char(c) => {
-                    if typed.len() < FORCE_STOP_CONFIRMATION.len() {
-                        typed.push(c.to_ascii_uppercase());
-                    }
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
                 KeyCode::Enter if typed == FORCE_STOP_CONFIRMATION => {
                     self.cancel_modal();
                     DashboardAction::ForceStop { session_id }
                 }
                 _ => {
+                    typed.handle_key(key);
                     self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
                         session_id,
                         typed,
@@ -1550,6 +1566,24 @@ mod tests {
                 title: "ACP pretty name v2".into(),
             }
         );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn focused_text_fields_own_readline_keys_and_control_c_cancels() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.begin_rename();
+        for character in " alpha beta".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+
+        assert_eq!(dashboard.handle_key(ctrl_key('w')), DashboardAction::None);
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor");
+        };
+        assert!(editor.title.ends_with("alpha "));
+
+        assert_eq!(dashboard.handle_key(ctrl_key('c')), DashboardAction::None);
         assert!(matches!(dashboard.mode, Mode::Dashboard));
     }
 

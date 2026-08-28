@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,12 +14,13 @@ use crate::hel_elicitation::{
     ElicitationField, ElicitationFieldKind, ElicitationRequest, ElicitationResponse,
     ElicitationValue,
 };
+use crate::hel_text_input::TextInput;
 
 use super::rendering::sanitize_terminal_text;
 
 #[derive(Debug, Clone)]
 enum FieldValue {
-    Text { value: String, cursor: usize },
+    Text(TextInput),
     Single(Option<usize>),
     Multi(BTreeSet<usize>),
     Boolean(bool),
@@ -104,9 +105,8 @@ impl ElicitationDialog {
         if custom {
             self.active_custom_fields.insert(field);
         }
-        if let Some(FieldValue::Text { value, cursor }) = self.values.get_mut(field) {
-            value.insert_str(*cursor, &text);
-            *cursor += text.len();
+        if let Some(FieldValue::Text(value)) = self.values.get_mut(field) {
+            value.insert_str(&text);
             self.error = None;
         }
     }
@@ -158,18 +158,7 @@ impl ElicitationDialog {
             KeyCode::Up => self.move_option(-1),
             KeyCode::Down => self.move_option(1),
             KeyCode::Char(' ') => self.toggle_current(),
-            KeyCode::Backspace => self.edit_text(TextEdit::Backspace),
-            KeyCode::Delete => self.edit_text(TextEdit::Delete),
-            KeyCode::Left => self.edit_text(TextEdit::MoveLeft),
-            KeyCode::Right => self.edit_text(TextEdit::MoveRight),
-            KeyCode::Home => self.edit_text(TextEdit::Home),
-            KeyCode::End => self.edit_text(TextEdit::End),
-            KeyCode::Char(character)
-                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
-            {
-                self.edit_text(TextEdit::Insert(character));
-            }
-            _ => {}
+            _ => self.edit_text(KeyEvent::new(code, modifiers)),
         }
         None
     }
@@ -249,7 +238,7 @@ impl ElicitationDialog {
 
     fn toggle_current(&mut self) {
         if self.editable_field().is_some() {
-            self.edit_text(TextEdit::Insert(' '));
+            self.edit_text(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
             return;
         }
         let Some(display) = self.display_fields.get(self.focus).copied() else {
@@ -273,40 +262,21 @@ impl ElicitationDialog {
                 }
             }
             FieldValue::Boolean(selected) => *selected = !*selected,
-            FieldValue::Text { .. } => unreachable!("text fields are handled above"),
+            FieldValue::Text(_) => unreachable!("text fields are handled above"),
         }
     }
 
-    fn edit_text(&mut self, edit: TextEdit) {
+    fn edit_text(&mut self, key: KeyEvent) {
         let Some((field, custom)) = self.editable_field() else {
             return;
         };
         if custom {
             self.active_custom_fields.insert(field);
         }
-        let Some(FieldValue::Text { value, cursor }) = self.values.get_mut(field) else {
+        let Some(FieldValue::Text(value)) = self.values.get_mut(field) else {
             unreachable!("editable fields contain text values")
         };
-        match edit {
-            TextEdit::Insert(character) => {
-                value.insert(*cursor, character);
-                *cursor += character.len_utf8();
-            }
-            TextEdit::Backspace if *cursor > 0 => {
-                let previous = previous_char_boundary(value, *cursor);
-                value.replace_range(previous..*cursor, "");
-                *cursor = previous;
-            }
-            TextEdit::Delete if *cursor < value.len() => {
-                let next = next_char_boundary(value, *cursor);
-                value.replace_range(*cursor..next, "");
-            }
-            TextEdit::MoveLeft => *cursor = previous_char_boundary(value, *cursor),
-            TextEdit::MoveRight => *cursor = next_char_boundary(value, *cursor),
-            TextEdit::Home => *cursor = 0,
-            TextEdit::End => *cursor = value.len(),
-            TextEdit::Backspace | TextEdit::Delete => {}
-        }
+        value.handle_key(key);
     }
 
     fn accept(&mut self) -> Option<ElicitationResponse> {
@@ -348,7 +318,7 @@ impl ElicitationDialog {
 
     fn editable_field(&self) -> Option<(usize, bool)> {
         let display = self.display_fields.get(self.focus)?;
-        if matches!(self.values[display.field], FieldValue::Text { .. }) {
+        if matches!(self.values[display.field], FieldValue::Text(_)) {
             return Some((display.field, false));
         }
         let custom = display.custom?;
@@ -409,7 +379,7 @@ fn display_fields(
         .filter(|index| {
             matches!(
                 &values[*index],
-                FieldValue::Text { value, .. } if !value.is_empty()
+                FieldValue::Text(value) if !value.is_empty()
             )
         })
         .collect();
@@ -433,22 +403,11 @@ fn select_option_index(field: &ElicitationField, value: &str) -> Option<usize> {
     }
 }
 
-enum TextEdit {
-    Insert(char),
-    Backspace,
-    Delete,
-    MoveLeft,
-    MoveRight,
-    Home,
-    End,
-}
-
 fn default_value(field: &ElicitationField) -> FieldValue {
     match &field.kind {
-        ElicitationFieldKind::Text { default, .. } => FieldValue::Text {
-            value: default.clone().unwrap_or_default(),
-            cursor: default.as_ref().map_or(0, String::len),
-        },
+        ElicitationFieldKind::Text { default, .. } => {
+            FieldValue::Text(default.clone().unwrap_or_default().into())
+        }
         ElicitationFieldKind::SingleSelect { options, default } => {
             let selected = match default {
                 Some(default) => options.iter().position(|option| option.value == *default),
@@ -466,14 +425,18 @@ fn default_value(field: &ElicitationField) -> FieldValue {
                 .collect(),
         ),
         ElicitationFieldKind::Boolean { default } => FieldValue::Boolean(default.unwrap_or(false)),
-        ElicitationFieldKind::Integer { default, .. } => FieldValue::Text {
-            value: default.map(|value| value.to_string()).unwrap_or_default(),
-            cursor: default.map(|value| value.to_string().len()).unwrap_or(0),
-        },
-        ElicitationFieldKind::Number { default, .. } => FieldValue::Text {
-            value: default.map(|value| value.to_string()).unwrap_or_default(),
-            cursor: default.map(|value| value.to_string().len()).unwrap_or(0),
-        },
+        ElicitationFieldKind::Integer { default, .. } => FieldValue::Text(
+            default
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+                .into(),
+        ),
+        ElicitationFieldKind::Number { default, .. } => FieldValue::Text(
+            default
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+                .into(),
+        ),
     }
 }
 
@@ -491,7 +454,7 @@ fn validated_value(
                 format,
                 ..
             },
-            FieldValue::Text { value, .. },
+            FieldValue::Text(value),
         ) => {
             if value.is_empty() {
                 return if field.required { missing() } else { Ok(None) };
@@ -517,7 +480,7 @@ fn validated_value(
                 validate_text_format(value, format)
                     .map_err(|message| format!("{} {message}", field.title))?;
             }
-            Ok(Some(ElicitationValue::String(value.clone())))
+            Ok(Some(ElicitationValue::String(value.to_string())))
         }
         (ElicitationFieldKind::SingleSelect { options, .. }, FieldValue::Single(selected)) => {
             let Some(index) = selected else {
@@ -562,7 +525,7 @@ fn validated_value(
             ElicitationFieldKind::Integer {
                 minimum, maximum, ..
             },
-            FieldValue::Text { value, .. },
+            FieldValue::Text(value),
         ) => {
             if value.is_empty() {
                 return if field.required { missing() } else { Ok(None) };
@@ -581,7 +544,7 @@ fn validated_value(
             ElicitationFieldKind::Number {
                 minimum, maximum, ..
             },
-            FieldValue::Text { value, .. },
+            FieldValue::Text(value),
         ) => {
             if value.is_empty() {
                 return if field.required { missing() } else { Ok(None) };
@@ -762,11 +725,11 @@ fn focus_content(dialog: &ElicitationDialog) -> FocusContent<'_> {
     }
     let mut text_cursor = None;
     match (&field.kind, &dialog.values[display.field]) {
-        (_, FieldValue::Text { value, .. }) => {
+        (_, FieldValue::Text(value)) => {
             let shown = if field.secret {
                 "•".repeat(value.chars().count())
             } else {
-                value.clone()
+                value.to_string()
             };
             lines.push(Line::raw(""));
             let input_line = lines.len() as u16;
@@ -774,10 +737,7 @@ fn focus_content(dialog: &ElicitationDialog) -> FocusContent<'_> {
                 format!("> {shown}"),
                 Style::default().fg(Color::Cyan),
             ));
-            let FieldValue::Text { cursor, .. } = &dialog.values[display.field] else {
-                unreachable!("text fields contain text values")
-            };
-            text_cursor = Some((input_line, value[..*cursor].chars().count()));
+            text_cursor = Some((input_line, value.value()[..value.cursor()].chars().count()));
         }
         (ElicitationFieldKind::SingleSelect { options, .. }, FieldValue::Single(selected)) => {
             let custom_active = display
@@ -938,7 +898,7 @@ fn render_custom_text(
     custom_index: usize,
 ) {
     let custom = &dialog.request.fields[custom_index];
-    let FieldValue::Text { value, cursor } = &dialog.values[custom_index] else {
+    let FieldValue::Text(value) = &dialog.values[custom_index] else {
         unreachable!("custom answer fields contain text values")
     };
     if let Some(description) = &custom.description {
@@ -950,14 +910,14 @@ fn render_custom_text(
     let shown = if custom.secret {
         "•".repeat(value.chars().count())
     } else {
-        value.clone()
+        value.to_string()
     };
     let input_line = lines.len() as u16;
     lines.push(Line::styled(
         format!("> {shown}"),
         Style::default().fg(Color::Cyan),
     ));
-    *text_cursor = Some((input_line, value[..*cursor].chars().count()));
+    *text_cursor = Some((input_line, value.value()[..value.cursor()].chars().count()));
 }
 
 fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
@@ -977,20 +937,6 @@ fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
             Constraint::Percentage((100 - width_percent) / 2),
         ])
         .split(vertical[1])[1]
-}
-
-fn previous_char_boundary(value: &str, cursor: usize) -> usize {
-    value[..cursor]
-        .char_indices()
-        .next_back()
-        .map_or(0, |(index, _)| index)
-}
-
-fn next_char_boundary(value: &str, cursor: usize) -> usize {
-    value[cursor..]
-        .char_indices()
-        .nth(1)
-        .map_or(value.len(), |(index, _)| cursor + index)
 }
 
 #[cfg(test)]
