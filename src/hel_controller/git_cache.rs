@@ -327,6 +327,11 @@ fi
 rm -rf -- "$snapshot" "$snapshot_partial"
 git clone --mirror --local -- "$mirror" "$snapshot_partial"
 mv -- "$snapshot_partial" "$snapshot"
+# A bind mount can expose the host owner as container root, while the worker
+# runs as an unprivileged user. The private cache parents still protect these
+# files on the host; the mounted session subtree must be readable.
+chmod -R a+rX "$snapshot"
+chmod a+rx "$(dirname "$snapshot")"
 trap - EXIT HUP INT TERM
 rm -rf -- "$lock"
 "#;
@@ -595,7 +600,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_snapshot_hardlinks_objects_but_owns_its_refs() {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
@@ -668,6 +673,18 @@ mod tests {
             mirror.join("HEAD").metadata().unwrap().ino(),
             snapshot.join("HEAD").metadata().unwrap().ino()
         );
+        assert_eq!(
+            snapshot
+                .parent()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o005,
+            0o005
+        );
+        assert_eq!(snapshot_metadata.permissions().mode() & 0o004, 0o004);
 
         let command = CommandSpec::new(
             "git",
