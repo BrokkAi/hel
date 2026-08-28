@@ -48,6 +48,7 @@ use crate::clock::epoch_seconds;
 /// of the screen, so the list stays a window however many sessions are open.
 const CONVERSATIONS_PANE_MAX_ROWS: usize = 7;
 const MAX_DIFFSTAT_TASKS: usize = 2;
+const SESSION_ACTOR_RECONNECT_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 enum ChatIoUpdate {
@@ -70,6 +71,7 @@ enum ChatIoUpdate {
         revision: u64,
         result: std::result::Result<Vec<String>, String>,
     },
+    SessionReconnected(std::result::Result<ManagedSessionHandle, String>),
 }
 
 /// How many times a refused prefix is rebuilt before the view settles for its
@@ -363,6 +365,9 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
             revision,
             result,
         } => chat.apply_diffstats(&tool_call_id, revision, result),
+        ChatIoUpdate::SessionReconnected(_) => {
+            unreachable!("session reconnects are applied by ActiveChat")
+        }
     }
     PrefixRebuild::NotNeeded
 }
@@ -560,8 +565,9 @@ fn spawn_other_session_poller(
     });
 }
 
-/// Applies one session view to the chat. `false` means the session manager has
-/// stopped and can never send again, so its feed must not be awaited any more.
+/// Applies one session view to the chat. `false` means this particular actor's
+/// feed has closed, so it must not be awaited while the chat reacquires the
+/// manager's replacement actor.
 ///
 /// This runs whether or not the chat is on screen: a warm chat behind the
 /// session list stays as current as one the user is watching.
@@ -632,6 +638,7 @@ fn detach_chat(state: &mut ChatState) -> u64 {
 pub struct ActiveChat {
     state: ChatState,
     session: ManagedSessionHandle,
+    session_manager: SessionManagerControl,
     bundle_id: String,
     recovery: Option<RecoveryContext>,
     remote: ChatRemoteSupervisor,
@@ -649,6 +656,7 @@ pub struct ActiveChat {
     /// permanently ready. Each flag retires its own arm instead.
     remote_open: bool,
     session_open: bool,
+    session_reconnect_in_flight: bool,
 }
 
 impl ActiveChat {
@@ -751,7 +759,7 @@ impl ActiveChat {
         if let Some(pending) = pending_prefix {
             spawn_transcript_prefix(pending, 1, chat_io_tx.clone());
         }
-        spawn_other_session_poller(control, header.others, chat_io_tx.clone());
+        spawn_other_session_poller(control.clone(), header.others, chat_io_tx.clone());
         if let Some(detail) = recovery
             .as_ref()
             .and_then(|recovery| recovery.session.last_checkpoint_error.as_deref())
@@ -760,7 +768,7 @@ impl ActiveChat {
         }
         let (voice_updates_tx, voice_updates_rx) =
             tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
-        let remote = ChatRemoteSupervisor::spawn(session.clone());
+        let remote = ChatRemoteSupervisor::spawn(session.clone(), control.clone());
         if needs_initial_sync {
             state.set_transcript_loading(true);
             state.set_notice("Connecting to session relay…");
@@ -771,6 +779,7 @@ impl ActiveChat {
         Self {
             state,
             session,
+            session_manager: control,
             bundle_id: bundle_id.to_owned(),
             recovery,
             remote,
@@ -783,6 +792,7 @@ impl ActiveChat {
             voice_prefix: String::new(),
             remote_open: true,
             session_open: true,
+            session_reconnect_in_flight: false,
         }
     }
 
@@ -793,9 +803,8 @@ impl ActiveChat {
     /// Whether this view is still attached to a live session actor.
     ///
     /// Pause, destroy, and a replaced target retire the actor and close this
-    /// feed. A warm chat whose feed is closed still holds the last snapshot,
-    /// including a Closing/Closed phase, so the dashboard must open a new view
-    /// instead of redrawing this one.
+    /// feed. A visible chat reacquires replacements in place; the flag remains
+    /// useful while that asynchronous handoff is in flight.
     pub fn session_feed_open(&self) -> bool {
         self.session_open
     }
@@ -879,6 +888,13 @@ impl ActiveChat {
     }
 
     fn apply_io_update(&mut self, update: ChatIoUpdate) {
+        let update = match update {
+            ChatIoUpdate::SessionReconnected(result) => {
+                self.finish_session_reconnect(result);
+                return;
+            }
+            update => update,
+        };
         if matches!(&update, ChatIoUpdate::ToolDiffstats { .. }) {
             self.diffstats_in_flight = self.diffstats_in_flight.saturating_sub(1);
         }
@@ -934,11 +950,59 @@ impl ActiveChat {
 
     fn apply_session_view(&mut self, view: Result<ManagedSessionView>) {
         self.session_open = apply_session_view(&mut self.state, view);
+        if !self.session_open {
+            self.begin_session_reconnect();
+        }
         dispatch_diffstat_requests(
             &mut self.state,
             &self.chat_io_tx,
             &mut self.diffstats_in_flight,
         );
+    }
+
+    fn begin_session_reconnect(&mut self) {
+        if self.session_reconnect_in_flight {
+            return;
+        }
+        self.session_reconnect_in_flight = true;
+        let session_id = self.session.session_id().to_owned();
+        let session_manager = self.session_manager.clone();
+        let updates = self.chat_io_tx.clone();
+        tokio::spawn(async move {
+            let result = session_manager
+                .wait_for_session(&session_id, SESSION_ACTOR_RECONNECT_WAIT)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            if let Err(error) = updates.send(ChatIoUpdate::SessionReconnected(result)) {
+                tracing::debug!(
+                    %error,
+                    %session_id,
+                    "session reconnect result dropped because the chat closed"
+                );
+            }
+        });
+    }
+
+    fn finish_session_reconnect(
+        &mut self,
+        result: std::result::Result<ManagedSessionHandle, String>,
+    ) {
+        self.session_reconnect_in_flight = false;
+        match result {
+            Ok(session) => {
+                let view = session.view();
+                self.session = session;
+                self.session_open = apply_session_view(&mut self.state, Ok(view));
+                if self.session_open {
+                    self.state.set_notice("Reconnected to session relay");
+                } else {
+                    self.begin_session_reconnect();
+                }
+            }
+            Err(error) => self
+                .state
+                .set_notice(format!("Could not reconnect to session relay: {error}")),
+        }
     }
 
     /// Applies one terminal event and reports what it asked for.
@@ -1682,6 +1746,38 @@ mod tests {
         assert_eq!(
             chat.notice().as_deref(),
             Some("connection lost: session manager stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_chat_hands_off_to_a_replacement_actor_without_losing_its_draft() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-replaced", 73);
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            None,
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            "half-written prompt".into(),
+            Notices::default(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                ActiveChat::pump(Some(&mut chat)).await;
+                if chat.session_feed_open() && !chat.session.is_stopped() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the replacement actor became the live chat feed");
+
+        assert_eq!(chat.draft(), "half-written prompt");
+        assert_eq!(
+            chat.state.notice().as_deref(),
+            Some("Reconnected to session relay")
         );
     }
 

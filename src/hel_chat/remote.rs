@@ -4,13 +4,14 @@
 use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
 
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
-use crate::hel_session_manager::ManagedSessionHandle;
+use crate::hel_session_manager::{ManagedSessionHandle, SessionManagerControl};
 use crate::hel_state::{QueuedCommandKind, config_command_text};
 use crate::hel_worker::RelayCommand;
 
 use super::{ChatState, PlanControl, PlanReviewFollowup, QueuedPrompt, queued_prompt_preview};
 
 const CHAT_REMOTE_QUEUE_CAPACITY: usize = 32;
+const SESSION_ACTOR_REPLACEMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 pub(super) enum ChatRemoteOperation {
@@ -154,13 +155,17 @@ pub(super) struct ChatRemoteSupervisor {
 }
 
 impl ChatRemoteSupervisor {
-    pub(super) fn spawn(session: ManagedSessionHandle) -> Self {
+    pub(super) fn spawn(
+        session: ManagedSessionHandle,
+        session_manager: SessionManagerControl,
+    ) -> Self {
         let (operations_tx, operations_rx) = tokio::sync::mpsc::channel(CHAT_REMOTE_QUEUE_CAPACITY);
         let (results_tx, results_rx) = tokio::sync::mpsc::unbounded_channel();
         let attached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let worker_attached = attached.clone();
         let worker = tokio::spawn(run_chat_remote_worker(
             session,
+            session_manager,
             operations_rx,
             results_tx,
             worker_attached,
@@ -242,7 +247,8 @@ impl Drop for ChatRemoteSupervisor {
 }
 
 async fn run_chat_remote_worker(
-    session: ManagedSessionHandle,
+    mut session: ManagedSessionHandle,
+    session_manager: SessionManagerControl,
     mut operations: tokio::sync::mpsc::Receiver<ChatRemoteOperation>,
     results: tokio::sync::mpsc::UnboundedSender<ChatRemoteResult>,
     attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -259,6 +265,20 @@ async fn run_chat_remote_worker(
                     accepting = false;
                     continue;
                 };
+                if session.is_stopped() {
+                    let session_id = session.session_id().to_owned();
+                    match session_manager
+                        .wait_for_session(&session_id, SESSION_ACTOR_REPLACEMENT_WAIT)
+                        .await
+                    {
+                        Ok(replacement) => session = replacement,
+                        Err(error) => tracing::warn!(
+                            %session_id,
+                            error = format!("{error:#}"),
+                            "could not reacquire replacement session actor before dispatch"
+                        ),
+                    }
+                }
                 enqueue_chat_remote_operation(
                     &session,
                     operation,
@@ -911,6 +931,36 @@ pub(super) fn queue_chat_remote_operation(
 mod tests {
     use super::*;
     use crate::hel_chat::test_support::snapshot;
+
+    #[tokio::test]
+    async fn prompt_reacquires_replacement_actor_before_dispatch() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-replaced", 73);
+        let mut remote = ChatRemoteSupervisor::spawn(fixture.stopped, fixture.control);
+
+        remote
+            .operations()
+            .send(ChatRemoteOperation::Prompt {
+                command_id: "prompt-1".into(),
+                text: "keep going".into(),
+                session_id: "session-replaced".into(),
+                bundle_id: "bundle-1".into(),
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), remote.recv())
+            .await
+            .expect("replacement dispatch completed")
+            .expect("remote worker stayed open");
+        assert!(matches!(
+            result,
+            ChatRemoteResult::Prompt {
+                text,
+                result: Ok(73)
+            } if text == "keep going"
+        ));
+    }
 
     #[test]
     fn full_remote_queue_restores_unsent_input_without_blocking() {

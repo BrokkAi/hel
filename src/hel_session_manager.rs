@@ -363,7 +363,7 @@ pub struct SessionManagerControl {
     commands: mpsc::Sender<ManagerCommand>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ManagedSessionHandle {
     session_id: String,
     commands: mpsc::Sender<ActorCommand>,
@@ -450,6 +450,13 @@ impl ManagedSessionHandle {
 
     pub fn view(&self) -> ManagedSessionView {
         self.view.borrow().clone()
+    }
+
+    /// Whether the per-session actor behind this handle has retired. The
+    /// manager itself may still be alive with a replacement actor, so callers
+    /// holding long-lived handles use this to reacquire the current one.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.commands.is_closed()
     }
 
     /// Read the current view in place. Pollers that only need a few derived
@@ -2113,6 +2120,76 @@ fn hex(bytes: &[u8]) -> String {
         output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+#[cfg(test)]
+pub(crate) struct ReplacementSessionTestFixture {
+    pub(crate) stopped: ManagedSessionHandle,
+    pub(crate) control: SessionManagerControl,
+}
+
+/// A stopped actor and a manager that resolves its live replacement. Chat
+/// tests use this hand-written actor instead of mocking the session manager
+/// protocol.
+#[cfg(test)]
+pub(crate) fn replacement_session_test_fixture(
+    session_id: &str,
+    accepted_ordinal: u64,
+) -> ReplacementSessionTestFixture {
+    let (stopped_commands, stopped_commands_rx) = mpsc::channel(1);
+    drop(stopped_commands_rx);
+    let (stopped_releases, stopped_releases_rx) = mpsc::unbounded_channel();
+    drop(stopped_releases_rx);
+    let (stopped_view_tx, stopped_view) = watch::channel(ManagedSessionView::default());
+    drop(stopped_view_tx);
+    let stopped = ManagedSessionHandle {
+        session_id: session_id.to_owned(),
+        commands: stopped_commands,
+        releases: stopped_releases,
+        view: stopped_view,
+    };
+
+    let (commands, mut commands_rx) = mpsc::channel(4);
+    let (releases, _releases_rx) = mpsc::unbounded_channel();
+    let (view_tx, view) = watch::channel(ManagedSessionView::default());
+    let replacement = ManagedSessionHandle {
+        session_id: session_id.to_owned(),
+        commands,
+        releases,
+        view,
+    };
+    let actor_session_id = session_id.to_owned();
+    tokio::spawn(async move {
+        let _view_tx = view_tx;
+        while let Some(command) = commands_rx.recv().await {
+            match command {
+                ActorCommand::Submit { reply, .. } => {
+                    let _ = reply.send(Ok(accepted_ordinal));
+                }
+                command => command.reject(&actor_session_id, "unsupported test operation"),
+            }
+        }
+    });
+
+    let (manager_commands, mut manager_commands_rx) = mpsc::channel(4);
+    let manager_replacement = replacement.clone();
+    tokio::spawn(async move {
+        while let Some(ManagerCommand::Session {
+            session_id: requested,
+            reply,
+        }) = manager_commands_rx.recv().await
+        {
+            let resolved =
+                (requested == manager_replacement.session_id).then(|| manager_replacement.clone());
+            let _ = reply.send(resolved);
+        }
+    });
+    ReplacementSessionTestFixture {
+        stopped,
+        control: SessionManagerControl {
+            commands: manager_commands,
+        },
+    }
 }
 
 #[cfg(test)]
