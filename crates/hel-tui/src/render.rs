@@ -1218,65 +1218,101 @@ fn quota_reset_cells(quota: &ProfileQuota, now: u64) -> (String, String) {
     (weekly, quota_reset_cell(quota.five_hour_window(), now))
 }
 
+struct QuotaTableRow {
+    profile: String,
+    harness: String,
+    weekly: Line<'static>,
+    weekly_reset: String,
+    five_hour: Line<'static>,
+    five_hour_reset: String,
+}
+
+impl QuotaTableRow {
+    fn into_row(self) -> Row<'static> {
+        Row::new([
+            Cell::from(self.profile),
+            Cell::from(self.harness),
+            Cell::from(self.weekly),
+            Cell::from(self.weekly_reset),
+            Cell::from(self.five_hour),
+            Cell::from(self.five_hour_reset),
+        ])
+    }
+}
+
+fn quota_column_width(
+    header: &str,
+    content_widths: impl Iterator<Item = usize>,
+    maximum: u16,
+) -> u16 {
+    let width = content_widths.fold(Line::raw(header).width(), usize::max);
+    u16::try_from(width).unwrap_or(u16::MAX).min(maximum)
+}
+
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
-        let (weekly, weekly_reset, five_hour, five_hour_reset) =
-            if profile.kind == HarnessKind::Deepseek {
-                (
-                    api_quota_bar(),
-                    String::new(),
-                    Line::default(),
-                    String::new(),
-                )
-            } else if dashboard.quota_refreshing.contains(id) {
-                (
-                    Line::raw("refreshing…"),
-                    String::new(),
-                    Line::default(),
-                    String::new(),
-                )
-            } else {
-                match dashboard.quotas.get(id) {
-                    Some(quota) if quota.error.is_none() => {
-                        let (weekly_reset, five_hour_reset) = quota_reset_cells(quota, now);
-                        (
-                            quota_bar(quota.weekly_window()),
-                            weekly_reset,
-                            five_hour_quota_bar(quota),
-                            five_hour_reset,
-                        )
-                    }
-                    Some(quota) => (
-                        Line::raw(
-                            quota
-                                .error_label()
-                                .unwrap_or_else(|| "unavailable: unknown error".into()),
-                        ),
+    let rows = dashboard
+        .config
+        .profiles
+        .iter()
+        .map(|(id, profile)| {
+            let (weekly, weekly_reset, five_hour, five_hour_reset) =
+                if profile.kind == HarnessKind::Deepseek {
+                    (
+                        api_quota_bar(),
                         String::new(),
                         Line::default(),
                         String::new(),
-                    ),
-                    None => (
+                    )
+                } else if dashboard.quota_refreshing.contains(id) {
+                    (
                         Line::raw("refreshing…"),
                         String::new(),
                         Line::default(),
                         String::new(),
-                    ),
-                }
-            };
-        Row::new([
-            Cell::from(id.clone()),
-            Cell::from(profile.kind.display_name()),
-            Cell::from(weekly),
-            Cell::from(weekly_reset),
-            Cell::from(five_hour),
-            Cell::from(five_hour_reset),
-        ])
-    });
+                    )
+                } else {
+                    match dashboard.quotas.get(id) {
+                        Some(quota) if quota.error.is_none() => {
+                            let (weekly_reset, five_hour_reset) = quota_reset_cells(quota, now);
+                            (
+                                quota_bar(quota.weekly_window()),
+                                weekly_reset,
+                                five_hour_quota_bar(quota),
+                                five_hour_reset,
+                            )
+                        }
+                        Some(quota) => (
+                            Line::raw(
+                                quota
+                                    .error_label()
+                                    .unwrap_or_else(|| "unavailable: unknown error".into()),
+                            ),
+                            String::new(),
+                            Line::default(),
+                            String::new(),
+                        ),
+                        None => (
+                            Line::raw("refreshing…"),
+                            String::new(),
+                            Line::default(),
+                            String::new(),
+                        ),
+                    }
+                };
+            QuotaTableRow {
+                profile: id.clone(),
+                harness: profile.kind.display_name().into(),
+                weekly,
+                weekly_reset,
+                five_hour,
+                five_hour_reset,
+            }
+        })
+        .collect::<Vec<_>>();
     let refresh_status = if !dashboard.quota_refreshing.is_empty() {
         "refreshing…".to_string()
     } else {
@@ -1301,34 +1337,54 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
     } else {
         BorderType::Plain
     };
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(14),
-            Constraint::Percentage(10),
-            Constraint::Percentage(24),
-            Constraint::Percentage(14),
-            Constraint::Percentage(24),
-            Constraint::Percentage(14),
-        ],
-    )
-    .header(
-        Row::new(["Profile", "Harness", "Weekly", "Resets", "5H", "Resets"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .row_highlight_style(if quotas_focused {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
-    } else {
-        Style::default()
-    })
-    .highlight_symbol(if quotas_focused { "› " } else { "  " })
-    .highlight_spacing(HighlightSpacing::Always)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(border_type)
-            .title(title),
-    );
+    let widths = [
+        quota_column_width(
+            "Profile",
+            rows.iter()
+                .map(|row| Line::raw(row.profile.as_str()).width()),
+            24,
+        ),
+        quota_column_width(
+            "Harness",
+            rows.iter()
+                .map(|row| Line::raw(row.harness.as_str()).width()),
+            12,
+        ),
+        quota_column_width("Weekly", rows.iter().map(|row| row.weekly.width()), 32),
+        quota_column_width(
+            "Resets",
+            rows.iter()
+                .map(|row| Line::raw(row.weekly_reset.as_str()).width()),
+            24,
+        ),
+        quota_column_width("5H", rows.iter().map(|row| row.five_hour.width()), 15),
+        quota_column_width(
+            "Resets",
+            rows.iter()
+                .map(|row| Line::raw(row.five_hour_reset.as_str()).width()),
+            24,
+        ),
+    ]
+    .map(Constraint::Length);
+    let table = Table::new(rows.into_iter().map(QuotaTableRow::into_row), widths)
+        .column_spacing(2)
+        .header(
+            Row::new(["Profile", "Harness", "Weekly", "Resets", "5H", "Resets"])
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .row_highlight_style(if quotas_focused {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if quotas_focused { "› " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .title(title),
+        );
     let mut state = TableState::default()
         .with_selected((!dashboard.config.profiles.is_empty()).then_some(dashboard.quota_index));
     frame.render_stateful_widget(table, area, &mut state);
@@ -2933,13 +2989,8 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let lines = buffer_lines(terminal.backend().buffer());
+        let rendered = lines.join("\n");
 
         assert!(rendered.contains("Weekly"));
         assert!(rendered.contains("5H"));
@@ -2949,5 +3000,17 @@ mod tests {
         assert!(rendered.contains("2d"));
         assert!(rendered.contains("1h5m"));
         assert!(!rendered.contains("09:00 Aug 20"));
+
+        let row = lines
+            .iter()
+            .find(|line| line.contains("codex-1"))
+            .expect("quota row");
+        let weekly_percent = cell_column(row, "73%");
+        let weekly_reset = cell_column(row, "2d");
+        let five_hour_percent = cell_column(row, "70%");
+        let five_hour_reset = cell_column(row, "1h5m");
+        assert_eq!(weekly_reset, weekly_percent + 3 + 2);
+        assert_eq!(five_hour_percent - 12, weekly_reset + 6 + 2);
+        assert_eq!(five_hour_reset, five_hour_percent + 3 + 2);
     }
 }
