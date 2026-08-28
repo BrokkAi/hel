@@ -255,7 +255,7 @@ pub(super) fn preflight_target(
             hel_targets::verify_ssh_podman(&ssh, executor)
                 .map(|preflight| {
                     for warning in preflight.warnings {
-                        executor.notify_notice(&warning);
+                        executor.notify_notice(&warning.notice());
                     }
                 })
                 .map_err(|error| {

@@ -239,7 +239,7 @@ fn ssh_podman_preflight_runs_every_probe_through_noninteractive_ssh() {
             .contains("'/proc/self/uid_map'")
     );
     assert!(seen[3].args.last().unwrap().contains("'loginctl show-user"));
-    assert_eq!(preflight.warnings, Vec::<String>::new());
+    assert!(preflight.warnings.is_empty());
 }
 
 #[test]
@@ -255,13 +255,17 @@ fn ssh_podman_preflight_warns_when_remote_user_lingering_is_disabled() {
 
     assert_eq!(preflight.warnings.len(), 1);
     let warning = &preflight.warnings[0];
-    assert!(warning.contains("lingering is disabled on dev@example.test"));
-    assert!(warning.contains("last SSH connection closes"));
-    assert!(warning.contains("sudo loginctl enable-linger"));
+    assert!(
+        warning
+            .detail
+            .contains("lingering is disabled on dev@example.test")
+    );
+    assert!(warning.detail.contains("last SSH connection closes"));
+    assert!(warning.remediation.contains("sudo loginctl enable-linger"));
 }
 
 #[test]
-fn ssh_podman_preflight_ignores_linger_probe_on_a_non_systemd_host() {
+fn ssh_podman_preflight_warns_when_linger_check_is_unavailable() {
     let executor = PodmanPreflightExecutor::with_outputs([
         podman_output(b"podman version 5.4.2\n"),
         podman_output(b"true\n"),
@@ -275,7 +279,13 @@ fn ssh_podman_preflight_ignores_linger_probe_on_a_non_systemd_host() {
 
     let preflight = verify_ssh_podman(&ssh(), &executor).unwrap();
 
-    assert!(preflight.warnings.is_empty());
+    assert_eq!(preflight.warnings.len(), 1);
+    let warning = &preflight.warnings[0];
+    assert!(warning.detail.contains("durability check is unavailable"));
+    assert!(warning.detail.contains("`loginctl` was not found"));
+    assert!(warning.detail.contains("may not use systemd"));
+    assert!(warning.detail.contains("cannot verify"));
+    assert!(warning.remediation.contains("service manager"));
 }
 
 #[test]

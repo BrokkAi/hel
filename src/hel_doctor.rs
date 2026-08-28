@@ -776,12 +776,10 @@ fn ssh_podman_check(
             check_id,
             title,
             format!(
-                "Remote rootless Podman {} is available via {destination}, but {warning}",
-                preflight.version
+                "Remote rootless Podman {} is available via {destination}, but {}",
+                preflight.version, warning.detail
             ),
-            format!(
-                "On {destination}, run `sudo loginctl enable-linger \"$(id -un)\"`, then verify with `loginctl show-user \"$(id -u)\" --property=Linger --value`."
-            ),
+            &warning.remediation,
         );
     }
     if !smoke {
@@ -809,11 +807,10 @@ fn ssh_podman_check(
                 check_id,
                 title,
                 format!(
-                    "Disposable run/exec/remove smoke test passed for image {image} on {destination}, but {warning}"
+                    "Disposable run/exec/remove smoke test passed for image {image} on {destination}, but {}",
+                    warning.detail
                 ),
-                format!(
-                    "On {destination}, run `sudo loginctl enable-linger \"$(id -un)\"`, then verify with `loginctl show-user \"$(id -u)\" --property=Linger --value`."
-                ),
+                &warning.remediation,
             ),
             None => DoctorCheck::ready(
                 check_id,
@@ -1618,6 +1615,28 @@ mod tests {
                 .unwrap()
                 .contains("sudo loginctl enable-linger")
         );
+    }
+
+    #[test]
+    fn ssh_podman_check_explains_when_durability_cannot_be_verified() {
+        let mut responses = passing_podman_probes();
+        responses.push(Ok(CommandOutput {
+            status: 127,
+            stdout: vec![],
+            stderr: b"sh: loginctl: not found\n".to_vec(),
+        }));
+        let executor = FakeExecutor::new(reachable_then(responses));
+
+        let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
+
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(all_ready(std::slice::from_ref(&check)));
+        assert!(check.detail.contains("durability check is unavailable"));
+        assert!(check.detail.contains("may not use systemd"));
+        assert!(check.detail.contains("cannot verify"));
+        let remediation = check.remediation.as_deref().unwrap();
+        assert!(remediation.contains("service manager"));
+        assert!(!remediation.contains("sudo loginctl enable-linger"));
     }
 
     #[test]
