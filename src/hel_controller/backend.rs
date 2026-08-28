@@ -294,6 +294,7 @@ pub(super) fn backend_bundle(bundle: &ProjectBundle) -> Result<ProjectBundleSpec
                 url: repository.github.as_deref().map(github_url),
                 destination: repository.destination.to_string_lossy().into_owned(),
                 git_ref: repository.git_ref.clone(),
+                reference: None,
             })
             .collect(),
     })
@@ -1127,6 +1128,7 @@ mod tests {
                 url: Some("git@github.com:example/app.git".into()),
                 destination: "app".into(),
                 git_ref: None,
+                reference: None,
             }],
         };
         use_github_https_urls(&mut bundle);

@@ -510,7 +510,7 @@ fn candidates_from_container_json(
         .collect())
 }
 
-fn collect_managed_sessions(value: &serde_json::Value, sessions: &mut Vec<String>) {
+pub(super) fn collect_managed_sessions(value: &serde_json::Value, sessions: &mut Vec<String>) {
     match value {
         serde_json::Value::Array(values) => {
             for value in values {

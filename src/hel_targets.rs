@@ -1238,6 +1238,10 @@ pub struct RepositorySpec {
     pub url: Option<String>,
     pub destination: String,
     pub git_ref: Option<String>,
+    /// Read-only bare repository mounted into the target for Git object reuse.
+    /// A missing or unusable reference is only an optimization miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2490,12 +2494,14 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
                 .purpose("stop the local Hel worker and remove exact local Hel worker state")
         }
         TargetLocator::LocalPodman { container_id } => {
-            CommandSpec::new("podman", ["rm", "--force", "--ignore", container_id])
-                .purpose("remove local Podman session container")
+            let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
+            CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
+                .purpose("remove local Podman session container and Git cache snapshot")
         }
         TargetLocator::AppleContainer { container_id } => {
-            CommandSpec::new("container", ["rm", "--force", container_id])
-                .purpose("remove Apple session container")
+            let script = "status=0; container rm --force \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
+            CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
+                .purpose("remove Apple session container and Git cache snapshot")
         }
         TargetLocator::AwsEc2 {
             profile,
@@ -2535,8 +2541,12 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
             )
         }
         TargetLocator::SshPodman { ssh, container_id } => {
-            ssh_command(ssh, ["podman", "rm", "--force", "--ignore", container_id])
-                .purpose("remove exact remote Podman session container")
+            let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
+            ssh_command(
+                ssh,
+                ["sh", "-c", script, "hel-close", container_id, session_id],
+            )
+            .purpose("remove exact remote Podman session container and Git cache snapshot")
         }
     };
     Ok(CommandPlan {
@@ -2686,6 +2696,9 @@ fn clone_commands(
             continue;
         };
         let mut args = vec!["git".to_owned(), "clone".to_owned()];
+        if let Some(reference) = &repository.reference {
+            args.extend(["--reference-if-able".to_owned(), reference.clone()]);
+        }
         if let Some(git_ref) = &repository.git_ref {
             args.extend(["--branch".to_owned(), git_ref.clone()]);
         }

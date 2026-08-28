@@ -2,6 +2,7 @@
 
 mod backend;
 mod checkpoint;
+mod git_cache;
 mod lifecycle;
 mod provisioning;
 mod readiness;

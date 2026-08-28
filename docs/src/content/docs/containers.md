@@ -22,9 +22,10 @@ through their harnesses; Kimi Code and DeepSeek Harness do not. Hel warns
 against running either unsupported harness on a raw, unsandboxed target.
 
 Closing a session first writes and verifies a recovery archive, then removes
-that exact container. Nothing about the container persists past the session
+that exact container. No mutable session workspace persists past the session
 except what the recovery archive captured and whatever you pushed to a
-remote.
+remote. Hel may retain read-only Git objects in the host clone cache described
+below.
 
 ## Prerequisites
 
@@ -93,6 +94,26 @@ versioned tags remain cached, digest references stay pinned, and
 `localhost/...` images remain local. Set `pull_policy` beside `image` to
 `always`, `newer`, `missing`, or `never` when a target needs an explicit
 policy. Existing running containers are never replaced in place.
+
+## Git clone cache
+
+Local Podman, SSH Podman, and Apple container targets cache GitHub repository
+objects under the container host user's `~/.cache/hel/git`. Before launch, Hel
+refreshes a bare mirror and creates an isolated session snapshot whose
+immutable objects are shared with ordinary filesystem hardlinks. The snapshot
+is mounted read-only and the normal in-container clone borrows its objects, so
+branch selection, checkout filters, and image-specific Git behavior remain
+unchanged.
+
+This is an optimization rather than a prerequisite. If host Git, credentials,
+or local hardlink cloning are unavailable, Hel reports the cache miss and uses
+the ordinary network clone. The first launch still populates the complete
+mirror. Hel removes session snapshots after their container, removes mirrors
+unused for 30 days, and enforces a 20 GiB least-recently-used soft cap. The
+cache can contain objects from private repositories and is created with
+user-only permissions. You can remove `~/.cache/hel/git/mirrors` while no
+launch is updating it; do not remove the `sessions` directory while managed
+containers are running.
 
 It then shows a summary of what it's about to write and asks you to confirm
 before writing `config.toml`. After you confirm, it runs a smoke test: it

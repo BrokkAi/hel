@@ -28,6 +28,7 @@ use super::backend::{
     preflight_target, use_github_https_urls,
 };
 use super::checkpoint::upload_checkpoint_spec;
+use super::git_cache;
 use super::readiness::{connect_started_worker, wait_for_native_session};
 use super::worker_binary::{start_worker, worker_probe_diagnosis};
 use super::{Controller, execute_checked, now, target_kind};
@@ -306,27 +307,50 @@ impl Controller {
             {
                 use_github_https_urls(bundle);
             }
-            let mut provision = if let Some(project_directory) = &session.project_directory {
+            preflight_target(template, executor)?;
+            let prepared_cache = bundle.as_mut().and_then(|bundle| {
+                git_cache::prepare(
+                    &target,
+                    session_id,
+                    bundle,
+                    &mut runtime_mounts,
+                    container_github_token,
+                    executor,
+                )
+            });
+            let provision = if let Some(project_directory) = &session.project_directory {
                 hel_targets::provision_bare_project_plan(
                     &target,
                     session_id,
                     &project_directory.to_string_lossy(),
-                )?
+                )
             } else {
-                hel_targets::provision_plan(
-                    &target,
-                    session_id,
-                    bundle
-                        .as_ref()
-                        .context("project bundle disappeared during provisioning")?,
-                    &runtime_mounts,
-                )?
+                bundle
+                    .as_ref()
+                    .context("project bundle disappeared during provisioning")
+                    .and_then(|bundle| {
+                        hel_targets::provision_plan(&target, session_id, bundle, &runtime_mounts)
+                    })
             };
-            if let Some(token) = container_github_token {
-                provision.provide_target_environment_secret(&target, "GH_TOKEN", token)?;
+            let mut provision = match provision {
+                Ok(provision) => provision,
+                Err(error) => {
+                    if let Some(cache) = &prepared_cache {
+                        let _ = cache.cleanup(executor);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(token) = container_github_token
+                && let Err(error) =
+                    provision.provide_target_environment_secret(&target, "GH_TOKEN", token)
+            {
+                if let Some(cache) = &prepared_cache {
+                    let _ = cache.cleanup(executor);
+                }
+                return Err(error);
             }
 
-            preflight_target(template, executor)?;
             let started = Instant::now();
             let result =
                 provision_target_creation(&provision, &target, session_id, executor, |outputs| {
@@ -339,6 +363,16 @@ impl Controller {
                     )
                 })
                 .map(|(locator, remainder)| (locator, remainder, bundle));
+            if result.is_err()
+                && let Some(cache) = &prepared_cache
+            {
+                if let Some(locator) = provisioned_locator(&target, session_id, None) {
+                    let _ = hel_targets::close_plan(&locator, session_id)
+                        .and_then(|plan| plan.execute(executor).map(|_| ()));
+                } else {
+                    let _ = cache.cleanup(executor);
+                }
+            }
             tracing::debug!(
                 session_id,
                 elapsed_ms = started.elapsed().as_millis(),
@@ -1799,6 +1833,7 @@ mod tests {
                 url: Some("https://github.com/example/app.git".into()),
                 destination: "app".into(),
                 git_ref: None,
+                reference: None,
             }],
         }
     }

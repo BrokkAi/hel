@@ -769,10 +769,11 @@ mod tests {
         impl CommandExecutor for AlreadyRemovedExecutor {
             fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
                 self.commands.borrow_mut().push(command.clone());
-                if command
-                    .args
-                    .first()
-                    .is_some_and(|argument| argument == "rm")
+                if command.program == "sh"
+                    && command
+                        .args
+                        .get(1)
+                        .is_some_and(|script| script.contains("container rm --force"))
                 {
                     Ok(CommandOutput {
                         status: 1,
@@ -834,7 +835,9 @@ mod tests {
 
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 2);
-        assert_eq!(commands[0].args[0], "rm");
+        assert_eq!(commands[0].program, "sh");
+        assert!(commands[0].args[1].contains("container rm --force"));
+        assert!(commands[0].args[1].contains(".cache/hel/git/sessions"));
         assert_eq!(commands[1].args, ["list", "--all", "--quiet"]);
         assert_eq!(persisted.into_inner(), vec![SessionState::Stopped]);
         assert_eq!(
