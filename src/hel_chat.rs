@@ -1513,6 +1513,10 @@ impl ChatState {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChatAction {
+        if let Some(dialog) = self.elicitation.as_mut() {
+            dialog.handle_mouse(mouse);
+            return ChatAction::None;
+        }
         // Hover decides what scrolls; only Tab moves focus.
         let over_conversations = self
             .conversations_area
