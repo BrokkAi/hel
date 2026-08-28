@@ -415,11 +415,13 @@ fn default_value(field: &ElicitationField) -> FieldValue {
             value: default.clone().unwrap_or_default(),
             cursor: default.as_ref().map_or(0, String::len),
         },
-        ElicitationFieldKind::SingleSelect { options, default } => FieldValue::Single(
-            default
-                .as_ref()
-                .and_then(|default| options.iter().position(|option| option.value == *default)),
-        ),
+        ElicitationFieldKind::SingleSelect { options, default } => {
+            let selected = match default {
+                Some(default) => options.iter().position(|option| option.value == *default),
+                None => (!options.is_empty()).then_some(0),
+            };
+            FieldValue::Single(selected)
+        }
         ElicitationFieldKind::MultiSelect {
             options, default, ..
         } => FieldValue::Multi(
@@ -1141,6 +1143,45 @@ mod tests {
                 content: BTreeMap::from([(
                     "question_0".into(),
                     ElicitationValue::String("dynamic".into())
+                )])
+            })
+        );
+    }
+
+    #[test]
+    fn first_single_select_option_is_the_visible_and_submitted_default() {
+        let mut dialog = ElicitationDialog::new(request(
+            ElicitationFieldKind::SingleSelect {
+                options: vec![
+                    ElicitationOption {
+                        value: "thin".into(),
+                        title: "Thin callers".into(),
+                        description: None,
+                        preview: None,
+                    },
+                    ElicitationOption {
+                        value: "dynamic".into(),
+                        title: "Dynamic matrix".into(),
+                        description: None,
+                        preview: None,
+                    },
+                ],
+                default: None,
+            },
+            false,
+        ));
+
+        let initial = rendered(&dialog);
+        assert!(initial.contains("● Thin callers"));
+        assert!(initial.contains("○ Dynamic matrix"));
+
+        dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            dialog.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(ElicitationResponse::Accept {
+                content: BTreeMap::from([(
+                    "question_0".into(),
+                    ElicitationValue::String("thin".into())
                 )])
             })
         );
