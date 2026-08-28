@@ -253,7 +253,11 @@ pub(super) fn preflight_target(
         TargetTemplate::SshPodman { ssh, .. } => {
             let ssh = backend_ssh(ssh);
             hel_targets::verify_ssh_podman(&ssh, executor)
-                .map(|_| ())
+                .map(|preflight| {
+                    for warning in preflight.warnings {
+                        executor.notify_notice(&warning.notice());
+                    }
+                })
                 .map_err(|error| {
                     anyhow::anyhow!(
                         "remote Podman preflight failed for {}; run `hel doctor` for actionable prerequisites: {error:#}",
@@ -1154,19 +1158,20 @@ mod tests {
             },
         );
         let executor = PreflightExecutor {
-                outputs: RefCell::new(vec![
-                    CommandOutput {
-                        status: 0,
-                        stdout: br#"{"LaunchTemplateVersions":[{"LaunchTemplateData":{"InstanceType":"m8i-flex.large"}}]}"#.to_vec(),
-                        stderr: Vec::new(),
-                    },
-                    CommandOutput {
-                        status: 0,
-                        stdout: br#"{"InstanceTypes":[{"InstanceType":"m8i-flex.4xlarge","VCpuInfo":{"DefaultVCpus":16},"MemoryInfo":{"SizeInMiB":65536}},{"InstanceType":"m8i-flex.2xlarge","VCpuInfo":{"DefaultVCpus":8},"MemoryInfo":{"SizeInMiB":32768}}]}"#.to_vec(),
-                        stderr: Vec::new(),
-                    },
-                ]),
-            };
+            outputs: RefCell::new(vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: br#"{"LaunchTemplateVersions":[{"LaunchTemplateData":{"InstanceType":"m8i-flex.large"}}]}"#.to_vec(),
+                    stderr: Vec::new(),
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: br#"{"InstanceTypes":[{"InstanceType":"m8i-flex.4xlarge","VCpuInfo":{"DefaultVCpus":16},"MemoryInfo":{"SizeInMiB":65536}},{"InstanceType":"m8i-flex.2xlarge","VCpuInfo":{"DefaultVCpus":8},"MemoryInfo":{"SizeInMiB":32768}}]}"#.to_vec(),
+                    stderr: Vec::new(),
+                },
+            ]),
+            notices: RefCell::new(vec![]),
+        };
         let controller = Controller {
             config,
             state: HelState::default(),
@@ -1263,10 +1268,15 @@ mod tests {
     }
     struct PreflightExecutor {
         outputs: RefCell<Vec<CommandOutput>>,
+        notices: RefCell<Vec<String>>,
     }
     impl CommandExecutor for PreflightExecutor {
         fn execute(&self, _command: &CommandSpec) -> Result<CommandOutput> {
             Ok(self.outputs.borrow_mut().remove(0))
+        }
+
+        fn notify_notice(&self, notice: &str) {
+            self.notices.borrow_mut().push(notice.to_owned());
         }
     }
     #[test]
@@ -1287,6 +1297,7 @@ mod tests {
                 stdout: b"podman version 3.4.7\n".to_vec(),
                 stderr: vec![],
             }]),
+            notices: RefCell::new(vec![]),
         };
 
         let error = preflight_target(&template, &executor)
@@ -1319,6 +1330,7 @@ mod tests {
                 stdout: b"podman version 3.4.7\n".to_vec(),
                 stderr: vec![],
             }]),
+            notices: RefCell::new(vec![]),
         };
 
         let error = preflight_target(&template, &executor)
@@ -1327,6 +1339,57 @@ mod tests {
         assert!(error.contains("hel doctor"));
         assert!(error.contains("dev@example.test"));
         assert!(error.contains("Podman 4.0.0"));
+    }
+    #[test]
+    fn ssh_podman_preflight_notifies_when_remote_user_lingering_is_disabled() {
+        let template = TargetTemplate::SshPodman {
+            ssh: SshConnection {
+                host: "example.test".into(),
+                user: Some("dev".into()),
+                identity_file: None,
+                extra_args: vec![],
+            },
+            container: ConfigContainer {
+                image: "ubuntu:24.04".into(),
+                pull_policy: Default::default(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: std::collections::BTreeMap::new(),
+            },
+        };
+        let executor = PreflightExecutor {
+            outputs: RefCell::new(vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: b"podman version 5.4.2\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"true\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"0 1000 1\n1 100000 65536\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"no\n".to_vec(),
+                    stderr: vec![],
+                },
+            ]),
+            notices: RefCell::new(vec![]),
+        };
+
+        preflight_target(&template, &executor).unwrap();
+
+        let notices = executor.notices.borrow();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("last SSH connection closes"));
+        assert!(notices[0].contains("sudo loginctl enable-linger"));
     }
     #[test]
     fn apple_container_preflight_failures_recommend_doctor() {
@@ -1346,6 +1409,7 @@ mod tests {
                 stdout: vec![],
                 stderr: b"daemon is not running".to_vec(),
             }]),
+            notices: RefCell::new(vec![]),
         };
 
         let error = preflight_target(&template, &executor)

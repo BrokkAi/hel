@@ -156,7 +156,8 @@ fn podman_preflight_requires_supported_rootless_uid_mapped_runtime() {
     assert_eq!(
         verify_local_podman(&executor).unwrap(),
         PodmanPreflight {
-            version: "5.4.2".into()
+            version: "5.4.2".into(),
+            warnings: vec![],
         }
     );
     let seen = executor.seen.borrow();
@@ -218,19 +219,19 @@ fn ssh_podman_preflight_runs_every_probe_through_noninteractive_ssh() {
         podman_output(b"podman version 5.4.2\n"),
         podman_output(b"true\n"),
         podman_output(b"         0       1000          1\n         1     100000      65536\n"),
+        podman_output(b"yes\n"),
     ]);
 
     let preflight = verify_ssh_podman(&ssh(), &executor).unwrap();
 
     assert_eq!(preflight.version, "5.4.2");
     let seen = executor.seen.borrow();
-    assert_eq!(seen.len(), 3);
+    assert_eq!(seen.len(), 4);
     for command in seen.iter() {
         assert_eq!(command.program, "ssh");
         assert!(command.args.contains(&"BatchMode=yes".to_owned()));
         assert!(command.args.contains(&"ConnectTimeout=3".to_owned()));
         assert!(command.args.contains(&"dev@example.test".to_owned()));
-        assert!(command.args.last().unwrap().starts_with("'podman'"));
     }
     assert!(
         seen[2]
@@ -239,6 +240,54 @@ fn ssh_podman_preflight_runs_every_probe_through_noninteractive_ssh() {
             .unwrap()
             .contains("'/proc/self/uid_map'")
     );
+    assert!(seen[3].args.last().unwrap().contains("'loginctl show-user"));
+    assert!(preflight.warnings.is_empty());
+}
+
+#[test]
+fn ssh_podman_preflight_warns_when_remote_user_lingering_is_disabled() {
+    let executor = PodmanPreflightExecutor::with_outputs([
+        podman_output(b"podman version 5.4.2\n"),
+        podman_output(b"true\n"),
+        podman_output(b"         0       1000          1\n         1     100000      65536\n"),
+        podman_output(b"no\n"),
+    ]);
+
+    let preflight = verify_ssh_podman(&ssh(), &executor).unwrap();
+
+    assert_eq!(preflight.warnings.len(), 1);
+    let warning = &preflight.warnings[0];
+    assert!(
+        warning
+            .detail
+            .contains("lingering is disabled on dev@example.test")
+    );
+    assert!(warning.detail.contains("last SSH connection closes"));
+    assert!(warning.remediation.contains("sudo loginctl enable-linger"));
+}
+
+#[test]
+fn ssh_podman_preflight_warns_when_linger_check_is_unavailable() {
+    let executor = PodmanPreflightExecutor::with_outputs([
+        podman_output(b"podman version 5.4.2\n"),
+        podman_output(b"true\n"),
+        podman_output(b"         0       1000          1\n         1     100000      65536\n"),
+        CommandOutput {
+            status: 127,
+            stdout: vec![],
+            stderr: b"sh: loginctl: not found\n".to_vec(),
+        },
+    ]);
+
+    let preflight = verify_ssh_podman(&ssh(), &executor).unwrap();
+
+    assert_eq!(preflight.warnings.len(), 1);
+    let warning = &preflight.warnings[0];
+    assert!(warning.detail.contains("durability check is unavailable"));
+    assert!(warning.detail.contains("`loginctl` was not found"));
+    assert!(warning.detail.contains("may not use systemd"));
+    assert!(warning.detail.contains("cannot verify"));
+    assert!(warning.remediation.contains("service manager"));
 }
 
 #[test]

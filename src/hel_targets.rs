@@ -825,6 +825,20 @@ impl CommandExecutor for BoundedProcessExecutor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodmanPreflight {
     pub version: String,
+    /// Non-fatal host configuration problems that can make sessions fragile.
+    pub warnings: Vec<PodmanPreflightWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodmanPreflightWarning {
+    pub detail: String,
+    pub remediation: String,
+}
+
+impl PodmanPreflightWarning {
+    pub fn notice(&self) -> String {
+        format!("{} {}", self.detail, self.remediation)
+    }
 }
 
 /// Where the Podman prerequisite probes run.
@@ -892,7 +906,11 @@ pub fn verify_ssh_podman(
             host.failure()
         )
     })?;
-    verify_podman(host, executor)
+    let mut preflight = verify_podman(host, executor)?;
+    if let Some(warning) = ssh_podman_linger_warning(ssh, executor) {
+        preflight.warnings.push(warning);
+    }
+    Ok(preflight)
 }
 
 fn verify_podman(host: PodmanHost<'_>, executor: &impl CommandExecutor) -> Result<PodmanPreflight> {
@@ -940,7 +958,74 @@ fn verify_podman(host: PodmanHost<'_>, executor: &impl CommandExecutor) -> Resul
         );
     }
 
-    Ok(PodmanPreflight { version })
+    Ok(PodmanPreflight {
+        version,
+        warnings: Vec::new(),
+    })
+}
+
+/// Report either an explicitly unsafe systemd setting or an unavailable
+/// durability check. Neither condition makes an otherwise usable target fail.
+fn ssh_podman_linger_warning(
+    ssh: &SshTarget,
+    executor: &impl CommandExecutor,
+) -> Option<PodmanPreflightWarning> {
+    let command = PodmanHost::Ssh(ssh).command(
+        &[
+            "sh",
+            "-lc",
+            "loginctl show-user \"$(id -u)\" --property=Linger --value",
+        ],
+        "check remote user lingering",
+    );
+    let output = match executor.execute(&command) {
+        Ok(output) => output,
+        Err(error) => {
+            return Some(linger_unavailable_warning(
+                ssh,
+                format!("the probe could not run: {error}"),
+            ));
+        }
+    };
+    let linger = String::from_utf8_lossy(&output.stdout);
+    match (output.status, linger.trim().to_ascii_lowercase().as_str()) {
+        (0, "yes") => None,
+        (0, "no") => Some(PodmanPreflightWarning {
+            detail: format!(
+                "Remote user lingering is disabled on {}; SSH-Podman sessions may be terminated when the last SSH connection closes.",
+                ssh.destination
+            ),
+            remediation: format!(
+                "On {}, run `sudo loginctl enable-linger \"$(id -un)\"`.",
+                ssh.destination
+            ),
+        }),
+        (status, _) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let reason = if status == 127 || stderr.contains("loginctl: not found") {
+                "`loginctl` was not found; this host may not use systemd".to_owned()
+            } else if status != 0 {
+                format!("`loginctl` exited with status {status}: {stderr}")
+            } else {
+                format!("`loginctl` returned an unrecognized Linger value {linger:?}")
+            };
+            Some(linger_unavailable_warning(ssh, reason))
+        }
+    }
+}
+
+fn linger_unavailable_warning(ssh: &SshTarget, reason: String) -> PodmanPreflightWarning {
+    PodmanPreflightWarning {
+        detail: format!(
+            "Remote user-manager durability check is unavailable on {} because {reason}. Hel cannot verify whether rootless Podman sessions survive logout.",
+            ssh.destination
+        ),
+        remediation: format!(
+            "Configure {}'s service manager to keep the user and rootless Podman services running after logout; if it uses systemd, make `loginctl` available and enable lingering.",
+            ssh.destination
+        ),
+    }
 }
 
 fn execute_podman_preflight(
