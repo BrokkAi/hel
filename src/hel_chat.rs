@@ -300,6 +300,9 @@ pub struct ChatState {
     effort_values: Vec<ConfigValueChoice>,
     autocomplete: Option<Autocomplete>,
     anchor: TranscriptAnchor,
+    /// On entry, reveal the response advertised by the dashboard when later
+    /// tool activity would otherwise push it above the first viewport.
+    reveal_latest_agent_on_draw: bool,
     last_viewport_height: usize,
     render_mode: TranscriptRenderMode,
     render_cache: TranscriptRenderCache,
@@ -367,6 +370,7 @@ impl ChatState {
             effort_values: Vec::new(),
             autocomplete: None,
             anchor: TranscriptAnchor::Bottom,
+            reveal_latest_agent_on_draw: true,
             last_viewport_height: 0,
             render_mode: TranscriptRenderMode::Rich,
             render_cache: TranscriptRenderCache::default(),
@@ -1011,6 +1015,7 @@ impl ChatState {
         self.queued_prompts.clear();
         self.autocomplete = None;
         self.anchor = TranscriptAnchor::Bottom;
+        self.reveal_latest_agent_on_draw = true;
         self.last_viewport_height = 0;
         self.render_mode = TranscriptRenderMode::Rich;
         self.notices.clear();

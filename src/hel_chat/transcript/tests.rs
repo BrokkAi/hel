@@ -1514,6 +1514,32 @@ fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
 }
 
 #[test]
+fn opening_reveals_the_dashboard_agent_excerpt_above_later_terminal_output() {
+    let mut chat = ChatState::new(&snapshot(), &[]);
+    chat.entries.push(ChatEntry::plain(
+        1,
+        ChatRole::Agent,
+        "response advertised on the dashboard",
+    ));
+    for index in 0..8 {
+        chat.entries.push(ChatEntry::plain(
+            index + 2,
+            ChatRole::System,
+            format!("terminal failure {index}\n{}", "output\n".repeat(12)),
+        ));
+    }
+
+    let opened = drawn_transcript(&mut chat, 60, 24);
+    assert!(shows(&opened, "response advertised on the dashboard"));
+    assert!(shows(&opened, "End to follow"));
+
+    chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+    let tail = drawn_transcript(&mut chat, 60, 24);
+    assert!(shows(&tail, "terminal failure 7"));
+    assert!(!shows(&tail, "End to follow"));
+}
+
+#[test]
 fn mouse_wheel_reaches_the_tail_across_a_large_collapsed_tool_run() {
     let mut chat = ChatState::new(&snapshot(), &[]);
     chat.entries

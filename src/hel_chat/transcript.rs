@@ -964,6 +964,26 @@ impl ChatState {
                 top,
             };
         }
+        if self.reveal_latest_agent_on_draw
+            && self.unconverted_prefix == 0
+            && self.anchor == TranscriptAnchor::Bottom
+        {
+            self.reveal_latest_agent_on_draw = false;
+            let tail = self.tail_viewport(height);
+            let latest_agent = self
+                .entries
+                .iter()
+                .rposition(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty());
+            let agent_is_above_tail = latest_agent.is_some_and(|agent| match tail.top {
+                TranscriptAnchor::Row { entry, row } => agent < entry || agent == entry && row > 0,
+                TranscriptAnchor::Bottom => false,
+            });
+            if let Some(entry) = latest_agent.filter(|_| agent_is_above_tail) {
+                self.anchor = TranscriptAnchor::Row { entry, row: 0 };
+            } else {
+                return tail;
+            }
+        }
         if let TranscriptAnchor::Row { entry, row } = self.anchor
             && entry < self.entries.len()
         {
