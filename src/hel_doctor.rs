@@ -50,6 +50,7 @@ pub const fn probe_executor() -> BoundedProcessExecutor {
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     Ready,
+    Warning,
     Fixable,
     Unsupported,
 }
@@ -58,6 +59,7 @@ impl CheckStatus {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Ready => "ready",
+            Self::Warning => "warning",
             Self::Fixable => "fixable",
             Self::Unsupported => "unsupported",
         }
@@ -81,6 +83,21 @@ impl DoctorCheck {
             status: CheckStatus::Ready,
             detail: detail.into(),
             remediation: None,
+        }
+    }
+
+    fn warning(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            status: CheckStatus::Warning,
+            detail: detail.into(),
+            remediation: Some(remediation.into()),
         }
     }
 
@@ -753,6 +770,20 @@ fn ssh_podman_check(
             return DoctorCheck::fixable(check_id, title, detail, remediation);
         }
     };
+    let linger_warning = preflight.warnings.first();
+    if !smoke && let Some(warning) = linger_warning {
+        return DoctorCheck::warning(
+            check_id,
+            title,
+            format!(
+                "Remote rootless Podman {} is available via {destination}, but {warning}",
+                preflight.version
+            ),
+            format!(
+                "On {destination}, run `sudo loginctl enable-linger \"$(id -un)\"`, then verify with `loginctl show-user \"$(id -u)\" --property=Linger --value`."
+            ),
+        );
+    }
     if !smoke {
         return DoctorCheck::ready(
             check_id,
@@ -773,13 +804,25 @@ fn ssh_podman_check(
         },
     };
     match run_setup_smoke_test(&target, &doctor_smoke_id(), executor) {
-        Ok(()) => DoctorCheck::ready(
-            check_id,
-            title,
-            format!(
-                "Disposable run/exec/remove smoke test passed for image {image} on {destination}."
+        Ok(()) => match linger_warning {
+            Some(warning) => DoctorCheck::warning(
+                check_id,
+                title,
+                format!(
+                    "Disposable run/exec/remove smoke test passed for image {image} on {destination}, but {warning}"
+                ),
+                format!(
+                    "On {destination}, run `sudo loginctl enable-linger \"$(id -un)\"`, then verify with `loginctl show-user \"$(id -u)\" --property=Linger --value`."
+                ),
             ),
-        ),
+            None => DoctorCheck::ready(
+                check_id,
+                title,
+                format!(
+                    "Disposable run/exec/remove smoke test passed for image {image} on {destination}."
+                ),
+            ),
+        },
         Err(error) => DoctorCheck::fixable(
             check_id,
             title,
@@ -1290,15 +1333,20 @@ mod tests {
         }
     }
 
-    /// The three host probes `verify_local_podman`/`verify_ssh_podman` run.
     /// Prefix canned responses with a successful SSH connectivity probe, which
-    /// every SSH-backed check now runs first.
+    /// every SSH-backed check runs first.
     fn reachable_then(
         responses: impl IntoIterator<Item = Result<CommandOutput>>,
     ) -> Vec<Result<CommandOutput>> {
         let mut all = vec![Ok(output(b""))];
         all.extend(responses);
         all
+    }
+
+    fn passing_ssh_podman_probes() -> Vec<Result<CommandOutput>> {
+        let mut responses = passing_podman_probes();
+        responses.push(Ok(output(b"yes\n")));
+        responses
     }
 
     fn passing_podman_probes() -> Vec<Result<CommandOutput>> {
@@ -1526,7 +1574,7 @@ mod tests {
 
     #[test]
     fn ssh_podman_check_is_ready_after_ssh_wrapped_probes_without_smoke() {
-        let executor = FakeExecutor::new(reachable_then(passing_podman_probes()));
+        let executor = FakeExecutor::new(reachable_then(passing_ssh_podman_probes()));
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
 
@@ -1536,13 +1584,40 @@ mod tests {
         assert!(check.detail.contains("Remote rootless Podman 5.4.2"));
         assert!(check.detail.contains("dev@example.test"));
         let commands = executor.commands.borrow();
-        assert_eq!(commands.len(), 4);
+        assert_eq!(commands.len(), 5);
         assert_eq!(commands[0].args.last().unwrap(), "'true'");
         for command in commands.iter().skip(1) {
             assert_eq!(command.program, "ssh");
             assert!(command.args.contains(&"dev@example.test".to_owned()));
-            assert!(command.args.last().unwrap().starts_with("'podman'"));
         }
+        assert!(
+            commands[4]
+                .args
+                .last()
+                .unwrap()
+                .contains("'loginctl show-user")
+        );
+    }
+
+    #[test]
+    fn ssh_podman_check_warns_when_remote_user_lingering_is_disabled() {
+        let mut responses = passing_podman_probes();
+        responses.push(Ok(output(b"no\n")));
+        let executor = FakeExecutor::new(reachable_then(responses));
+
+        let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
+
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(all_ready(std::slice::from_ref(&check)));
+        assert!(check.detail.contains("Podman 5.4.2 is available"));
+        assert!(check.detail.contains("last SSH connection closes"));
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("sudo loginctl enable-linger")
+        );
     }
 
     #[test]
@@ -1581,7 +1656,7 @@ mod tests {
 
     #[test]
     fn ssh_podman_check_smoke_runs_an_ssh_wrapped_disposable_container() {
-        let mut responses = passing_podman_probes();
+        let mut responses = passing_ssh_podman_probes();
         responses.extend([
             Ok(output(b"created\n")),
             Ok(output(b"ok\n")),
@@ -1593,14 +1668,14 @@ mod tests {
 
         assert_eq!(check.status, CheckStatus::Ready);
         let commands = executor.commands.borrow();
-        assert_eq!(commands.len(), 7);
-        for command in commands.iter().skip(4) {
+        assert_eq!(commands.len(), 8);
+        for command in commands.iter().skip(5) {
             assert_eq!(command.program, "ssh");
             assert!(command.args.contains(&"dev@example.test".to_owned()));
         }
-        assert!(commands[4].args.last().unwrap().contains("'run' '--init'"));
-        assert!(commands[5].args.last().unwrap().ends_with("'true'"));
-        assert!(commands[6].args.last().unwrap().contains("'rm' '--force'"));
+        assert!(commands[5].args.last().unwrap().contains("'run' '--init'"));
+        assert!(commands[6].args.last().unwrap().ends_with("'true'"));
+        assert!(commands[7].args.last().unwrap().contains("'rm' '--force'"));
     }
 
     #[test]

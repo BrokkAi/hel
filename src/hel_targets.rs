@@ -795,6 +795,8 @@ impl CommandExecutor for BoundedProcessExecutor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodmanPreflight {
     pub version: String,
+    /// Non-fatal host configuration problems that can make sessions fragile.
+    pub warnings: Vec<String>,
 }
 
 /// Where the Podman prerequisite probes run.
@@ -862,7 +864,11 @@ pub fn verify_ssh_podman(
             host.failure()
         )
     })?;
-    verify_podman(host, executor)
+    let mut preflight = verify_podman(host, executor)?;
+    if let Some(warning) = ssh_podman_linger_warning(ssh, executor) {
+        preflight.warnings.push(warning);
+    }
+    Ok(preflight)
 }
 
 fn verify_podman(host: PodmanHost<'_>, executor: &impl CommandExecutor) -> Result<PodmanPreflight> {
@@ -910,7 +916,46 @@ fn verify_podman(host: PodmanHost<'_>, executor: &impl CommandExecutor) -> Resul
         );
     }
 
-    Ok(PodmanPreflight { version })
+    Ok(PodmanPreflight {
+        version,
+        warnings: Vec::new(),
+    })
+}
+
+/// Warn only when systemd explicitly reports that the remote user's manager
+/// will be torn down after its last login. A missing `loginctl` is valid on a
+/// non-systemd host and must not make an otherwise usable Podman target fail.
+fn ssh_podman_linger_warning(ssh: &SshTarget, executor: &impl CommandExecutor) -> Option<String> {
+    let command = PodmanHost::Ssh(ssh).command(
+        &[
+            "sh",
+            "-lc",
+            "loginctl show-user \"$(id -u)\" --property=Linger --value",
+        ],
+        "check remote user lingering",
+    );
+    let output = match executor.execute(&command) {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(
+                destination = %ssh.destination,
+                %error,
+                "could not check remote user lingering"
+            );
+            return None;
+        }
+    };
+    if output.status != 0
+        || !String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .eq_ignore_ascii_case("no")
+    {
+        return None;
+    }
+    Some(format!(
+        "Remote user lingering is disabled on {}; SSH-Podman sessions may be terminated when the last SSH connection closes. On {}, run `sudo loginctl enable-linger \"$(id -un)\"`.",
+        ssh.destination, ssh.destination
+    ))
 }
 
 fn execute_podman_preflight(
