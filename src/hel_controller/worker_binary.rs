@@ -106,6 +106,7 @@ impl Controller {
                 "profile staging completed"
             );
             result?;
+            append_hel_target_environment(profile.kind, &profile_stage, backend)?;
             stage_memory_replica(
                 &project_memory,
                 Path::new(&target_profile_home),
@@ -919,7 +920,7 @@ fn ensure_node_22_script() -> String {
     )
 }
 
-const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel container environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories (`/workspace/...`), including committed work, staged and unstaged changes, and untracked files.\n\nEverything outside the workspace, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost when the session ends. Keep durable results in the workspace or push them to a remote.\n";
+const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel disposable environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories under `/workspace`, including committed work, staged and unstaged changes, and untracked files. Hel then removes the container.\n\nEverything outside `/workspace`, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n";
 
 fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path) -> Result<()> {
     let harness = profile.kind;
@@ -979,18 +980,29 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
         }
         Ok(())
     })?;
-    append_hel_container_environment(profile.kind, destination)
+    Ok(())
 }
 
-/// Add the Hel lifecycle guidance only to the staged per-session profile.
-fn append_hel_container_environment(
+/// Add lifecycle guidance only for targets that Hel destroys as a whole.
+fn append_hel_target_environment(
     harness: crate::hel_config::HarnessKind,
     destination: &Path,
+    target: &hel_targets::TargetLocator,
 ) -> Result<()> {
+    let environment = match target {
+        hel_targets::TargetLocator::LocalPodman { .. }
+        | hel_targets::TargetLocator::AppleContainer { .. }
+        | hel_targets::TargetLocator::SshPodman { .. } => HEL_CONTAINER_ENVIRONMENT.to_owned(),
+        hel_targets::TargetLocator::AwsEc2 { workspace, .. } => format!(
+            "## Hel disposable environment\n\nThis session runs on a disposable Hel EC2 instance. When the session closes, Hel checkpoints everything in project workspace directories under `$HOME/{workspace}`, including committed work, staged and unstaged changes, and untracked files. Hel then terminates the instance.\n\nEverything outside `$HOME/{workspace}`, including installed packages, the rest of `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n"
+        ),
+        hel_targets::TargetLocator::LocalBare { .. }
+        | hel_targets::TargetLocator::SshBare { .. } => return Ok(()),
+    };
     let instructions = match harness {
         crate::hel_config::HarnessKind::Codex => "AGENTS.md",
         crate::hel_config::HarnessKind::Claude => "CLAUDE.md",
-        crate::hel_config::HarnessKind::Kimi => "SYSTEM.md",
+        crate::hel_config::HarnessKind::Kimi => "AGENTS.md",
         crate::hel_config::HarnessKind::Grok => "AGENTS.md",
         crate::hel_config::HarnessKind::Deepseek => "AGENTS.md",
     };
@@ -1010,7 +1022,7 @@ fn append_hel_container_environment(
         .open(&path)
         .with_context(|| format!("open staged harness instructions {}", path.display()))?;
     file.write_all(separator.as_bytes())?;
-    file.write_all(HEL_CONTAINER_ENVIRONMENT.as_bytes())?;
+    file.write_all(environment.as_bytes())?;
     Ok(())
 }
 
@@ -2735,18 +2747,16 @@ mod tests {
         assert!(staged.path().join("settings.yaml").is_file());
         assert!(!staged.path().join("sessions").exists());
         assert!(!staged.path().join("profiles").exists());
-        assert!(
-            std::fs::read_to_string(staged.path().join("AGENTS.md"))
-                .unwrap()
-                .contains("Hel container environment")
-        );
     }
     #[test]
-    fn stage_profile_appends_container_environment_for_each_harness_without_touching_home() {
+    fn disposable_container_guidance_reaches_each_harness_without_touching_home() {
+        let target = hel_targets::TargetLocator::LocalPodman {
+            container_id: "container".into(),
+        };
         for (kind, instructions) in [
             (crate::hel_config::HarnessKind::Codex, "AGENTS.md"),
             (crate::hel_config::HarnessKind::Claude, "CLAUDE.md"),
-            (crate::hel_config::HarnessKind::Kimi, "SYSTEM.md"),
+            (crate::hel_config::HarnessKind::Kimi, "AGENTS.md"),
             (crate::hel_config::HarnessKind::Grok, "AGENTS.md"),
             (crate::hel_config::HarnessKind::Deepseek, "AGENTS.md"),
         ] {
@@ -2764,6 +2774,7 @@ mod tests {
             };
 
             stage_profile(&profile, staged.path()).unwrap();
+            append_hel_target_environment(kind, staged.path(), &target).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(staged.path().join(instructions)).unwrap(),
@@ -2778,8 +2789,10 @@ mod tests {
         }
     }
     #[test]
-    fn stage_profile_creates_missing_staged_container_instructions() {
+    fn kimi_guidance_uses_agents_md_without_mutating_the_system_override() {
         let home = tempfile::tempdir().unwrap();
+        let system_override = "# Custom Kimi system prompt\n";
+        std::fs::write(home.path().join("SYSTEM.md"), system_override).unwrap();
         let staged = tempfile::tempdir().unwrap();
         let profile = crate::hel_config::HarnessProfile {
             kind: crate::hel_config::HarnessKind::Kimi,
@@ -2790,12 +2803,68 @@ mod tests {
         };
 
         stage_profile(&profile, staged.path()).unwrap();
+        append_hel_target_environment(
+            profile.kind,
+            staged.path(),
+            &hel_targets::TargetLocator::LocalPodman {
+                container_id: "container".into(),
+            },
+        )
+        .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(staged.path().join("SYSTEM.md")).unwrap(),
+            std::fs::read_to_string(staged.path().join("AGENTS.md")).unwrap(),
             HEL_CONTAINER_ENVIRONMENT
         );
-        assert!(!home.path().join("SYSTEM.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(staged.path().join("SYSTEM.md")).unwrap(),
+            system_override
+        );
+        assert!(!home.path().join("AGENTS.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("SYSTEM.md")).unwrap(),
+            system_override
+        );
+    }
+
+    #[test]
+    fn ec2_guidance_names_its_real_workspace_and_ssh_bare_gets_none() {
+        let ec2 = tempfile::tempdir().unwrap();
+        append_hel_target_environment(
+            crate::hel_config::HarnessKind::Codex,
+            ec2.path(),
+            &hel_targets::TargetLocator::AwsEc2 {
+                profile: "profile".into(),
+                region: "region".into(),
+                instance_id: "instance".into(),
+                ssh: hel_targets::SshTarget {
+                    destination: "host".into(),
+                    ssh_args: Vec::new(),
+                },
+                workspace: ".local/share/hel/workspaces/session".into(),
+            },
+        )
+        .unwrap();
+        let guidance = std::fs::read_to_string(ec2.path().join("AGENTS.md")).unwrap();
+        assert!(guidance.contains("disposable Hel EC2 instance"));
+        assert!(guidance.contains("`$HOME/.local/share/hel/workspaces/session`"));
+        assert!(!guidance.contains("disposable Hel container"));
+        assert!(!guidance.contains("`/workspace`"));
+
+        let ssh_bare = tempfile::tempdir().unwrap();
+        append_hel_target_environment(
+            crate::hel_config::HarnessKind::Codex,
+            ssh_bare.path(),
+            &hel_targets::TargetLocator::SshBare {
+                ssh: hel_targets::SshTarget {
+                    destination: "host".into(),
+                    ssh_args: Vec::new(),
+                },
+                workspace: ".local/share/hel/workspaces/session".into(),
+            },
+        )
+        .unwrap();
+        assert!(!ssh_bare.path().join("AGENTS.md").exists());
     }
 
     #[test]
