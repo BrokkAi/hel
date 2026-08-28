@@ -1161,28 +1161,61 @@ fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
     quota_bar(five_hour)
 }
 
-fn quota_reset_summary(quota: &ProfileQuota) -> String {
-    let weekly = quota
-        .weekly_window()
-        .and_then(|window| window.resets.as_deref());
-    let five_hour = quota
-        .five_hour_projects_exhaustion()
-        .then(|| quota.five_hour_window())
-        .flatten()
-        .and_then(|window| window.resets.as_deref());
-    let mut summary = match (weekly, five_hour) {
-        (Some(weekly), Some(five_hour)) => format!("{weekly} / {five_hour}"),
-        (Some(weekly), None) => weekly.to_string(),
-        (None, Some(five_hour)) => five_hour.to_string(),
-        (None, None) => String::new(),
+fn quota_reset_countdown(now: u64, reset_at_epoch_seconds: i64) -> String {
+    let Ok(reset) = u64::try_from(reset_at_epoch_seconds) else {
+        return "now".into();
     };
-    if let Some(extra) = quota.extra.as_deref() {
-        if !summary.is_empty() {
-            summary.push_str(" · ");
-        }
-        summary.push_str(extra);
+    let remaining = reset.saturating_sub(now);
+    if remaining == 0 {
+        return "now".into();
     }
-    summary
+
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if remaining >= DAY {
+        let days = remaining / DAY;
+        let hours = remaining % DAY / HOUR;
+        if days == 1 && hours > 0 {
+            format!("{days}d{hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if remaining >= HOUR {
+        let hours = remaining / HOUR;
+        let minutes = remaining % HOUR / MINUTE;
+        if hours == 1 && minutes > 0 {
+            format!("{hours}h{minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if remaining >= MINUTE {
+        format!("{}m", remaining / MINUTE)
+    } else {
+        "<1m".into()
+    }
+}
+
+fn quota_reset_cell(window: Option<&QuotaWindow>, now: u64) -> String {
+    let Some(window) = window else {
+        return String::new();
+    };
+    window
+        .resets_at_epoch_seconds
+        .map(|reset| quota_reset_countdown(now, reset))
+        .or_else(|| window.resets.clone())
+        .unwrap_or_default()
+}
+
+fn quota_reset_cells(quota: &ProfileQuota, now: u64) -> (String, String) {
+    let mut weekly = quota_reset_cell(quota.weekly_window(), now);
+    if let Some(extra) = quota.extra.as_deref() {
+        if !weekly.is_empty() {
+            weekly.push_str(" · ");
+        }
+        weekly.push_str(extra);
+    }
+    (weekly, quota_reset_cell(quota.five_hour_window(), now))
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -1191,35 +1224,57 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         .unwrap_or_default()
         .as_secs();
     let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
-        let (weekly, five_hour, resets) = if profile.kind == HarnessKind::Deepseek {
-            (api_quota_bar(), Line::default(), String::new())
-        } else if dashboard.quota_refreshing.contains(id) {
-            (Line::raw("refreshing…"), Line::default(), String::new())
-        } else {
-            match dashboard.quotas.get(id) {
-                Some(quota) if quota.error.is_none() => (
-                    quota_bar(quota.weekly_window()),
-                    five_hour_quota_bar(quota),
-                    quota_reset_summary(quota),
-                ),
-                Some(quota) => (
-                    Line::raw(
-                        quota
-                            .error_label()
-                            .unwrap_or_else(|| "unavailable: unknown error".into()),
-                    ),
+        let (weekly, weekly_reset, five_hour, five_hour_reset) =
+            if profile.kind == HarnessKind::Deepseek {
+                (
+                    api_quota_bar(),
+                    String::new(),
                     Line::default(),
                     String::new(),
-                ),
-                None => (Line::raw("refreshing…"), Line::default(), String::new()),
-            }
-        };
+                )
+            } else if dashboard.quota_refreshing.contains(id) {
+                (
+                    Line::raw("refreshing…"),
+                    String::new(),
+                    Line::default(),
+                    String::new(),
+                )
+            } else {
+                match dashboard.quotas.get(id) {
+                    Some(quota) if quota.error.is_none() => {
+                        let (weekly_reset, five_hour_reset) = quota_reset_cells(quota, now);
+                        (
+                            quota_bar(quota.weekly_window()),
+                            weekly_reset,
+                            five_hour_quota_bar(quota),
+                            five_hour_reset,
+                        )
+                    }
+                    Some(quota) => (
+                        Line::raw(
+                            quota
+                                .error_label()
+                                .unwrap_or_else(|| "unavailable: unknown error".into()),
+                        ),
+                        String::new(),
+                        Line::default(),
+                        String::new(),
+                    ),
+                    None => (
+                        Line::raw("refreshing…"),
+                        String::new(),
+                        Line::default(),
+                        String::new(),
+                    ),
+                }
+            };
         Row::new([
             Cell::from(id.clone()),
             Cell::from(profile.kind.display_name()),
             Cell::from(weekly),
+            Cell::from(weekly_reset),
             Cell::from(five_hour),
-            Cell::from(resets),
+            Cell::from(five_hour_reset),
         ])
     });
     let refresh_status = if !dashboard.quota_refreshing.is_empty() {
@@ -1251,13 +1306,14 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         [
             Constraint::Percentage(14),
             Constraint::Percentage(10),
-            Constraint::Percentage(22),
-            Constraint::Percentage(22),
-            Constraint::Percentage(32),
+            Constraint::Percentage(24),
+            Constraint::Percentage(14),
+            Constraint::Percentage(24),
+            Constraint::Percentage(14),
         ],
     )
     .header(
-        Row::new(["Profile", "Harness", "Weekly", "5H", "Resets"])
+        Row::new(["Profile", "Harness", "Weekly", "Resets", "5H", "Resets"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(if quotas_focused {
@@ -2775,8 +2831,39 @@ mod tests {
     }
 
     #[test]
-    fn quota_resets_add_five_hour_only_when_projected_to_exhaust() {
-        let mut quota = ProfileQuota {
+    fn quota_reset_countdowns_use_a_second_unit_only_after_one_first_unit() {
+        const MINUTE: u64 = 60;
+        const HOUR: u64 = 60 * MINUTE;
+        const DAY: u64 = 24 * HOUR;
+        let now = 100;
+
+        assert_eq!(
+            quota_reset_countdown(now, (now + 2 * DAY + 5 * HOUR) as i64),
+            "2d"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + DAY + 5 * HOUR) as i64),
+            "1d5h"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + 2 * HOUR + 5 * MINUTE) as i64),
+            "2h"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + HOUR + 5 * MINUTE) as i64),
+            "1h5m"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + 35 * MINUTE) as i64),
+            "35m"
+        );
+        assert_eq!(quota_reset_countdown(now, (now + 30) as i64), "<1m");
+        assert_eq!(quota_reset_countdown(now, now as i64), "now");
+    }
+
+    #[test]
+    fn weekly_and_five_hour_resets_are_independent() {
+        let quota = ProfileQuota {
             profile_id: "codex-1".into(),
             harness: HarnessKind::Codex,
             windows: vec![
@@ -2802,13 +2889,16 @@ mod tests {
             refreshed_at_epoch_seconds: 0,
         };
 
-        assert_eq!(quota_reset_summary(&quota), "09:00 Aug 20");
-        quota.windows[1].remaining_percent = Some(70);
-        assert_eq!(quota_reset_summary(&quota), "09:00 Aug 20 / 14:00 Aug 13");
+        assert_eq!(quota_reset_cells(&quota, 0), ("7d".into(), "4h".into()));
     }
 
     #[test]
     fn quota_render_uses_weekly_five_hour_and_reset_columns() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now = i64::try_from(now).unwrap();
         let quota = ProfileQuota {
             profile_id: "codex-1".into(),
             harness: HarnessKind::Codex,
@@ -2819,7 +2909,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: Some("09:00 Aug 20".into()),
-                    resets_at_epoch_seconds: Some(604_800),
+                    resets_at_epoch_seconds: Some(now + 2 * 24 * 60 * 60 + 30),
                 },
                 QuotaWindow {
                     label: "5H".into(),
@@ -2827,7 +2917,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: Some("14:00 Aug 13".into()),
-                    resets_at_epoch_seconds: Some(14_400),
+                    resets_at_epoch_seconds: Some(now + 60 * 60 + 5 * 60 + 30),
                 },
             ],
             extra: None,
@@ -2853,9 +2943,11 @@ mod tests {
 
         assert!(rendered.contains("Weekly"));
         assert!(rendered.contains("5H"));
-        assert!(rendered.contains("Resets"));
+        assert_eq!(rendered.matches("Resets").count(), 2);
         assert!(rendered.contains("73%"));
         assert!(rendered.contains("70%"));
-        assert!(rendered.contains("09:00 Aug 20 / 14:00 Aug 13"));
+        assert!(rendered.contains("2d"));
+        assert!(rendered.contains("1h5m"));
+        assert!(!rendered.contains("09:00 Aug 20"));
     }
 }
