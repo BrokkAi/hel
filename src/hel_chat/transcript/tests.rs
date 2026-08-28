@@ -1967,6 +1967,31 @@ fn standalone_terminal_session(record: TerminalOutputRecord) -> MaterializedSess
     session
 }
 
+fn fallback_terminal_session(record: TerminalOutputRecord) -> MaterializedSession {
+    let mut call =
+        crate::hel_acp::fallback_terminal_tool_call(&record.terminal_id, "cargo build".into());
+    call.status = if record.exited_cleanly() {
+        ToolCallStatus::Completed
+    } else {
+        ToolCallStatus::Failed
+    };
+    let mut session = MaterializedSession::empty("session-fallback-terminal");
+    session.applied_event_ordinal = 1;
+    session.transcript = vec![Arc::new(TranscriptItem {
+        stable_id: format!("tool:{}", call.tool_call_id),
+        position: 1,
+        latest_content_event_ordinal: None,
+        created_at_ms: 1,
+        last_changed_at_ms: 2,
+        body: TranscriptBody::Tool {
+            call: serde_json::to_value(call).unwrap(),
+            terminal_refs: vec![record.terminal_id.clone()],
+            terminal_outputs: vec![record],
+        },
+    })];
+    session
+}
+
 fn browser_lines(session: &MaterializedSession) -> Vec<String> {
     TranscriptSnapshot::from_materialized(session)
         .browser_transcript(None)
@@ -2017,6 +2042,34 @@ fn a_cleanly_exited_standalone_terminal_item_renders_only_in_raw_mode() {
         raw.iter().any(|line| line.contains("exited 0")),
         "raw rows keep how the terminal ended: {raw:?}"
     );
+}
+
+#[test]
+fn a_clean_fallback_terminal_tool_renders_only_in_raw_mode() {
+    let session = fallback_terminal_session(terminal_record(Some(0), None));
+    let entries = materialized_chat_entries(&session);
+    assert!(entries[0].raw_only);
+
+    let mut chat = ChatState::from_materialized(&session, &[], &[]);
+    let rich = transcript_text(&mut chat, 80);
+    assert!(!rich.iter().any(|line| line.contains("cargo build")));
+    assert!(!rich.iter().any(|line| line.contains(STANDALONE_OUTPUT)));
+    chat.render_mode = TranscriptRenderMode::Raw;
+    let raw = transcript_text(&mut chat, 80);
+    assert!(raw.iter().any(|line| line.contains("cargo build")));
+    assert!(raw.iter().any(|line| line.contains(STANDALONE_OUTPUT)));
+}
+
+#[test]
+fn a_failed_fallback_terminal_tool_remains_visible() {
+    let session = fallback_terminal_session(terminal_record(Some(3), None));
+    let entries = materialized_chat_entries(&session);
+    assert!(!entries[0].raw_only);
+
+    let mut chat = ChatState::from_materialized(&session, &[], &[]);
+    let rich = transcript_text(&mut chat, 80);
+    assert!(rich.iter().any(|line| line.contains("cargo build")));
+    assert!(rich.iter().any(|line| line.contains(STANDALONE_OUTPUT)));
 }
 
 #[test]

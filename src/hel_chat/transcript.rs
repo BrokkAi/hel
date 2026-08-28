@@ -468,12 +468,28 @@ fn materialized_chat_entry_with_diffstats(
                     .map_or(ToolStatus::Pending, |call| tool_status(&call.status)),
             );
             if let Some(call) = call {
+                let fallback_terminal = crate::hel_acp::is_fallback_terminal_tool_call(&call);
                 entry.tool_content =
                     tool_content_details(&call.content, terminal_outputs, call.raw_output.as_ref());
                 entry.tool_diffstats = exact_diffstats
                     .cloned()
                     .unwrap_or_else(|| tool_diff_paths(&call.content));
                 entry.tool_locations = tool_location_details(&call.locations);
+                // Successful fallback calls replace the successful standalone
+                // terminal blocks Rich already omitted. Raw mode still keeps
+                // every command, while failures remain visible everywhere.
+                entry.raw_only = fallback_terminal
+                    && !terminal_outputs.is_empty()
+                    && terminal_outputs
+                        .iter()
+                        .all(TerminalOutputRecord::exited_cleanly);
+                if fallback_terminal && call.status == ToolCallStatus::Failed {
+                    let details = std::mem::take(&mut entry.tool_content);
+                    if !details.is_empty() {
+                        entry.text.push('\n');
+                        entry.text.push_str(&details.join("\n"));
+                    }
+                }
             }
             entry
         }

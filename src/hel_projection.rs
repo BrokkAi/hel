@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallUpdateFields,
+    ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdateFields,
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -640,16 +641,57 @@ fn project_observation(
                 exit_code: *exit_code,
                 signal: signal.clone(),
             };
+            let raw_owner = uniquely_matching_raw_tool(index, &record);
+            let referrers = index
+                .terminal_referrers(terminal_id)
+                .cloned()
+                .collect::<Vec<_>>();
             let mut attached = false;
-            for existing in index.terminal_referrers(terminal_id) {
+            for existing in &referrers {
+                if raw_owner.as_ref().is_some_and(|owner| {
+                    owner.stable_id != existing.stable_id
+                        && fallback_tool_item(existing).unwrap_or(false)
+                }) {
+                    mutation.transcript.push(TranscriptMutation::Remove {
+                        stable_id: existing.stable_id.clone(),
+                    });
+                    attached = true;
+                    continue;
+                }
                 let mut item = TranscriptItem::clone(existing);
                 let TranscriptBody::Tool {
-                    terminal_outputs, ..
+                    terminal_outputs,
+                    terminal_refs,
+                    ..
                 } = &mut item.body
                 else {
                     unreachable!("matched a tool body above");
                 };
                 replace_or_push_terminal_record(terminal_outputs, record.clone());
+                if !terminal_refs.contains(terminal_id) {
+                    terminal_refs.push(terminal_id.clone());
+                }
+                finalize_fallback_terminal_tool(&mut item)?;
+                item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                upsert(mutation, item);
+                attached = true;
+            }
+            if let Some(existing) = raw_owner
+                && !referrers
+                    .iter()
+                    .any(|referrer| referrer.stable_id == existing.stable_id)
+            {
+                let mut item = TranscriptItem::clone(&existing);
+                let TranscriptBody::Tool {
+                    terminal_outputs,
+                    terminal_refs,
+                    ..
+                } = &mut item.body
+                else {
+                    unreachable!("matched a tool body above");
+                };
+                replace_or_push_terminal_record(terminal_outputs, record.clone());
+                terminal_refs.push(terminal_id.clone());
                 item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
                 upsert(mutation, item);
                 attached = true;
@@ -799,6 +841,9 @@ fn project_session_update(
         SessionUpdate::UserMessageChunk(_) => {}
         SessionUpdate::ToolCall(call) => {
             close_streams(index, mutation, event.recorded_at_ms);
+            if fallback_terminal_already_claimed(index, call)? {
+                return Ok(());
+            }
             let stable_id = format!("tool:{}", call.tool_call_id);
             // Agents re-send a whole `tool_call` for an id they already
             // reported, both when they revise a call and when a resumed
@@ -817,6 +862,8 @@ fn project_session_update(
                 *existing = serde_json::to_value(call)?;
                 item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
                 attach_terminal_outputs(current, index, mutation, &mut item);
+                consume_fallback_terminal_tools(index, mutation, &mut item, false)?;
+                finalize_fallback_terminal_tool(&mut item)?;
                 upsert(mutation, item);
             } else {
                 let mut item = TranscriptItem {
@@ -832,6 +879,8 @@ fn project_session_update(
                     },
                 };
                 attach_terminal_outputs(current, index, mutation, &mut item);
+                consume_fallback_terminal_tools(index, mutation, &mut item, true)?;
+                finalize_fallback_terminal_tool(&mut item)?;
                 upsert(mutation, item);
             }
         }
@@ -870,6 +919,8 @@ fn project_session_update(
             *call = serde_json::to_value(materialized_call)?;
             item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
             attach_terminal_outputs(current, index, mutation, &mut item);
+            consume_fallback_terminal_tools(index, mutation, &mut item, false)?;
+            finalize_fallback_terminal_tool(&mut item)?;
             upsert(mutation, item);
         }
         SessionUpdate::Plan(plan) => {
@@ -1112,13 +1163,175 @@ fn replace_or_push_terminal_record(
     }
 }
 
+fn fallback_terminal_tool_item_id(terminal_id: &str) -> String {
+    format!(
+        "tool:{}",
+        crate::hel_acp::fallback_terminal_tool_call_id(terminal_id)
+    )
+}
+
+fn fallback_tool_item(item: &TranscriptItem) -> Result<bool> {
+    let TranscriptBody::Tool { call, .. } = &item.body else {
+        return Ok(false);
+    };
+    let call = serde_json::from_value(call.clone()).context("parse fallback terminal tool call")?;
+    Ok(crate::hel_acp::is_fallback_terminal_tool_call(&call))
+}
+
+/// The one provider tool demonstrably owning a result through its raw value.
+/// Identical concurrent results are deliberately left with the fallback tool.
+fn uniquely_matching_raw_tool(
+    index: &ProjectionIndex,
+    record: &TerminalOutputRecord,
+) -> Option<Arc<TranscriptItem>> {
+    let mut matching = index.transcript.values().filter_map(|item| {
+        let TranscriptBody::Tool { call, .. } = &item.body else {
+            return None;
+        };
+        if fallback_tool_item(item).ok()? {
+            return None;
+        }
+        record
+            .matches_tool_raw_result(call)
+            .then(|| Arc::clone(item))
+    });
+    let item = matching.next()?;
+    matching.next().is_none().then_some(item)
+}
+
+/// A provider may publish its real tool before it asks the client to create
+/// the terminal. In that ordering the existing call already provides the
+/// durable start item, so the compatibility call would only duplicate it.
+fn fallback_terminal_already_claimed(index: &ProjectionIndex, call: &ToolCall) -> Result<bool> {
+    if !crate::hel_acp::is_fallback_terminal_tool_call(call) {
+        return Ok(false);
+    }
+    let value = serde_json::to_value(call)?;
+    Ok(tool_call_terminal_ids(&value)
+        .into_iter()
+        .any(|terminal_id| {
+            index.terminal_referrers(&terminal_id).any(|item| {
+                let TranscriptBody::Tool { call, .. } = &item.body else {
+                    return false;
+                };
+                serde_json::from_value::<ToolCall>(call.clone())
+                    .is_ok_and(|call| !crate::hel_acp::is_fallback_terminal_tool_call(&call))
+            })
+        }))
+}
+
+/// Replace Hel's interim terminal tool with the real ACP tool once the agent
+/// supplies one. Output may already have landed on the interim item, so move
+/// it along. A newly created real item can also adopt the interim item's start
+/// identity; an existing tool keeps its immutable position and timestamp.
+fn consume_fallback_terminal_tools(
+    index: &ProjectionIndex,
+    mutation: &mut MaterializedSessionMutation,
+    item: &mut TranscriptItem,
+    may_adopt_identity: bool,
+) -> Result<()> {
+    let TranscriptBody::Tool {
+        call,
+        terminal_outputs,
+        terminal_refs,
+    } = &mut item.body
+    else {
+        return Ok(());
+    };
+    let materialized: ToolCall = serde_json::from_value(call.clone())
+        .context("parse ACP tool call while claiming fallback terminal tools")?;
+    if crate::hel_acp::is_fallback_terminal_tool_call(&materialized) {
+        return Ok(());
+    }
+
+    let mut terminal_ids = tool_call_terminal_ids(call);
+    terminal_ids.extend(terminal_refs.iter().cloned());
+    for terminal_id in terminal_ids {
+        let stable_id = fallback_terminal_tool_item_id(&terminal_id);
+        if stable_id == item.stable_id {
+            continue;
+        }
+        let Some(fallback) = index.get(&stable_id) else {
+            continue;
+        };
+        let TranscriptBody::Tool {
+            call: fallback_call,
+            terminal_outputs: fallback_outputs,
+            terminal_refs: fallback_refs,
+        } = &fallback.body
+        else {
+            continue;
+        };
+        let fallback_call: ToolCall = serde_json::from_value(fallback_call.clone())
+            .context("parse fallback terminal tool call")?;
+        if !crate::hel_acp::is_fallback_terminal_tool_call(&fallback_call) {
+            continue;
+        }
+        for record in fallback_outputs {
+            replace_or_push_terminal_record(terminal_outputs, record.clone());
+        }
+        for terminal_ref in fallback_refs {
+            if !terminal_refs.contains(terminal_ref) {
+                terminal_refs.push(terminal_ref.clone());
+            }
+        }
+        if !terminal_refs.contains(&terminal_id) {
+            terminal_refs.push(terminal_id);
+        }
+        if may_adopt_identity {
+            item.position = item.position.min(fallback.position);
+            item.created_at_ms = item.created_at_ms.min(fallback.created_at_ms);
+        }
+        item.last_changed_at_ms = item.last_changed_at_ms.max(fallback.last_changed_at_ms);
+        mutation
+            .transcript
+            .push(TranscriptMutation::Remove { stable_id });
+    }
+    Ok(())
+}
+
+/// Terminal close is a Hel event rather than an ACP tool update. Complete only
+/// the interim call Hel created; a provider-owned call keeps its own status.
+fn finalize_fallback_terminal_tool(item: &mut TranscriptItem) -> Result<()> {
+    let TranscriptBody::Tool {
+        call,
+        terminal_outputs,
+        ..
+    } = &mut item.body
+    else {
+        return Ok(());
+    };
+    if terminal_outputs.is_empty() {
+        return Ok(());
+    }
+    let mut materialized: ToolCall = serde_json::from_value(call.clone())
+        .context("parse ACP tool call while finalizing fallback terminal tool")?;
+    if !crate::hel_acp::is_fallback_terminal_tool_call(&materialized) {
+        return Ok(());
+    }
+    materialized.status = if terminal_outputs
+        .iter()
+        .all(TerminalOutputRecord::exited_cleanly)
+    {
+        ToolCallStatus::Completed
+    } else {
+        ToolCallStatus::Failed
+    };
+    *call = serde_json::to_value(materialized)?;
+    Ok(())
+}
+
 /// The one parked terminal result an ACP tool demonstrably owns through its
 /// raw result. Ambiguous identical results stay standalone rather than being
 /// assigned to an arbitrary concurrent tool.
 fn uniquely_matching_raw_terminal(current: &MaterializedSession, call: &Value) -> Option<String> {
     let mut matching = current.transcript.iter().filter_map(|item| {
-        let TranscriptBody::TerminalOutput { record } = &item.body else {
-            return None;
+        let record = match &item.body {
+            TranscriptBody::TerminalOutput { record } => record,
+            TranscriptBody::Tool {
+                terminal_outputs, ..
+            } if fallback_tool_item(item).ok()? => terminal_outputs.first()?,
+            _ => return None,
         };
         record
             .matches_tool_raw_result(call)
@@ -2183,6 +2396,14 @@ mod tests {
         }
     }
 
+    fn fallback_terminal_tool(terminal_id: &str, command: &str) -> RelayObservation {
+        RelayObservation::SessionUpdate {
+            update: Box::new(SessionUpdate::ToolCall(
+                crate::hel_acp::fallback_terminal_tool_call(terminal_id, command.into()),
+            )),
+        }
+    }
+
     fn attached_terminal_outputs(item: &TranscriptItem) -> &[TerminalOutputRecord] {
         let TranscriptBody::Tool {
             terminal_outputs, ..
@@ -2191,6 +2412,131 @@ mod tests {
             panic!("expected a tool item, got {:?}", item.body);
         };
         terminal_outputs
+    }
+
+    #[test]
+    fn fallback_terminal_tool_completes_in_place_instead_of_parking_output() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert_eq!(item.stable_id, "tool:hel-terminal:term-1");
+        assert_eq!(item.position, 1, "the terminal retains its start order");
+        assert_eq!(attached_terminal_outputs(item).len(), 1);
+        let TranscriptBody::Tool { call, .. } = &item.body else {
+            panic!("the fallback stays a tool");
+        };
+        let call: ToolCall = serde_json::from_value(call.clone()).unwrap();
+        assert_eq!(call.status, ToolCallStatus::Completed);
+    }
+
+    #[test]
+    fn real_tool_call_replaces_fallback_and_keeps_its_start_order() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(&mut session, terminal_tool_call("call-1", "term-1"));
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1, "the fallback was consumed");
+        let item = &session.transcript[0];
+        assert_eq!(item.stable_id, "tool:call-1");
+        assert_eq!(item.position, 1);
+        assert_eq!(attached_terminal_outputs(item).len(), 1);
+    }
+
+    #[test]
+    fn fallback_is_suppressed_when_real_tool_already_claims_terminal() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, terminal_tool_call("call-1", "term-1"));
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        assert_eq!(attached_terminal_outputs(&session.transcript[0]).len(), 1);
+    }
+
+    fn kimi_raw_tool_update(call_id: &'static str, output: &'static str) -> RelayObservation {
+        RelayObservation::SessionUpdate {
+            update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .raw_output(json!({
+                        "type": "Bash",
+                        "output": output.as_bytes(),
+                        "exit_code": 0,
+                        "command": "cargo test"
+                    })),
+            ))),
+        }
+    }
+
+    #[test]
+    fn raw_result_before_terminal_close_claims_the_fallback() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "Execute `cargo test`",
+                ))),
+            },
+        );
+        apply_observation(
+            &mut session,
+            kimi_raw_tool_update("call-1", "build finished\n"),
+        );
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        assert_eq!(session.transcript[0].position, 2);
+        assert_eq!(attached_terminal_outputs(&session.transcript[0]).len(), 1);
+    }
+
+    #[test]
+    fn raw_result_after_terminal_close_claims_the_fallback() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "Execute `cargo test`",
+                ))),
+            },
+        );
+        apply_observation(&mut session, terminal_output("term-1"));
+        apply_observation(
+            &mut session,
+            kimi_raw_tool_update("call-1", "build finished\n"),
+        );
+
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        assert_eq!(session.transcript[0].position, 2);
+        assert_eq!(attached_terminal_outputs(&session.transcript[0]).len(), 1);
+    }
+
+    #[test]
+    fn late_fallback_claims_output_from_a_fast_terminal() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, terminal_output("term-1"));
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "true"));
+
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "tool:hel-terminal:term-1");
+        let TranscriptBody::Tool { call, .. } = &session.transcript[0].body else {
+            panic!("the parked output became a fallback tool");
+        };
+        let call: ToolCall = serde_json::from_value(call.clone()).unwrap();
+        assert_eq!(call.status, ToolCallStatus::Completed);
     }
 
     #[test]

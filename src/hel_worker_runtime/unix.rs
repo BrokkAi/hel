@@ -714,10 +714,13 @@ pub(super) fn record_runtime_event(
             started_at_ms,
         } => {
             relay.agent_terminal_started(crate::hel_worker::ActiveAgentTerminal {
-                terminal_id,
-                command,
+                terminal_id: terminal_id.clone(),
+                command: command.clone(),
                 started_at_ms,
             });
+            relay.record_session_update(SessionUpdate::ToolCall(
+                crate::hel_acp::fallback_terminal_tool_call(&terminal_id, command),
+            ))?;
         }
         RuntimeEvent::UserShellOutput {
             request_id,

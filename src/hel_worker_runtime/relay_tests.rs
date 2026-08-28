@@ -1990,7 +1990,7 @@ fn harness_restarting_interrupts_in_flight_commands() {
 }
 
 #[test]
-fn terminal_close_journals_a_tail_capped_terminal_output_observation() {
+fn terminal_lifecycle_journals_a_fallback_tool_and_tail_capped_output() {
     let temp = tempfile::tempdir().unwrap();
     let relay = Arc::new(Mutex::new(
         DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
@@ -2009,7 +2009,7 @@ fn terminal_close_journals_a_tail_capped_terminal_output_observation() {
     )
     .unwrap();
     let operational = relay.lock().unwrap().operational_state();
-    assert_eq!(operational.latest_ordinal, ordinal_before_start);
+    assert_eq!(operational.latest_ordinal, ordinal_before_start + 1);
     assert_eq!(
         operational.active_agent_terminals,
         [crate::hel_worker::ActiveAgentTerminal {
@@ -2017,8 +2017,20 @@ fn terminal_close_journals_a_tail_capped_terminal_output_observation() {
             command: "cargo test".into(),
             started_at_ms: 1_000,
         }],
-        "starting a terminal is visible but never journaled"
+        "starting a terminal remains visible operationally"
     );
+    let started_events = relay
+        .lock()
+        .unwrap()
+        .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+        .unwrap();
+    assert!(started_events.iter().any(|event| matches!(
+        &event.observation,
+        RelayObservation::SessionUpdate { update }
+            if matches!(update.as_ref(), SessionUpdate::ToolCall(call)
+                if crate::hel_acp::is_fallback_terminal_tool_call(call)
+                    && call.title == "cargo test")
+    )));
 
     // A build log the size of a real one: far past both the pipe buffer and
     // the journal cap, so only the tail can survive.

@@ -6,7 +6,11 @@
 
 mod dialect;
 pub(crate) mod surface;
+mod terminal_compat;
 pub use surface::PlanControl;
+pub(crate) use terminal_compat::{
+    fallback_terminal_tool_call, fallback_terminal_tool_call_id, is_fallback_terminal_tool_call,
+};
 
 use dialect::grok;
 
@@ -271,8 +275,9 @@ pub enum RuntimeEvent {
     Warning {
         message: String,
     },
-    /// A client terminal started successfully. This is operational activity,
-    /// not a durable transcript item: a later ACP tool call may claim it.
+    /// A client terminal started successfully. The worker records an interim
+    /// tool call so agents that omit the ACP association do not strand its
+    /// eventual result as a standalone transcript item.
     TerminalStarted {
         terminal_id: String,
         command: String,
