@@ -3091,5 +3091,4 @@ fn timestamp() -> String {
 }
 
 #[cfg(test)]
-#[path = "hel_import/tests.rs"]
 mod tests;

@@ -2111,5 +2111,4 @@ use git::{build_untracked_tar, restore_untracked_tar};
 use git::{validate_untracked_tar, validate_untracked_tar_reader};
 
 #[cfg(test)]
-#[path = "hel_archive/tests.rs"]
 mod tests;

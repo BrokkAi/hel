@@ -260,5 +260,4 @@ pub async fn run_acp_supervisor(_spec: AcpSupervisorSpec) -> anyhow::Result<()> 
 }
 
 #[cfg(all(test, unix))]
-#[path = "hel_worker_runtime/relay_tests.rs"]
 mod relay_tests;

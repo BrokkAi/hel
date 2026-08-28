@@ -2776,5 +2776,4 @@ impl<'a> ValueRefExt<'a> for rusqlite::types::ValueRef<'a> {
 }
 
 #[cfg(test)]
-#[path = "hel_database/tests.rs"]
 mod tests;
