@@ -378,6 +378,7 @@ struct BridgeRestart {
     native_session_id: String,
     unexpected: bool,
     session_age: Duration,
+    message: &'static str,
 }
 
 async fn run_inner(
@@ -402,6 +403,13 @@ async fn run_inner(
                         rapid_deaths = 0;
                     }
                 }
+                emit_runtime_event(
+                    &events,
+                    RuntimeEvent::HarnessRestarting {
+                        message: restart.message.to_owned(),
+                    },
+                )
+                .await?;
                 spec.resume_session = Some(restart.native_session_id);
             }
         }
@@ -539,23 +547,16 @@ async fn run_bridge(
             session_age: opened_now
                 .map(|opened| opened.started_at.elapsed())
                 .unwrap_or(Duration::ZERO),
+            message: ACP_BRIDGE_RESTART_WARNING,
         })),
         Err(error) => match opened_now {
             None => Err(error),
-            Some(opened) => {
-                emit_runtime_event(
-                    events,
-                    RuntimeEvent::HarnessRestarting {
-                        message: ACP_BRIDGE_LOST_WARNING.to_owned(),
-                    },
-                )
-                .await?;
-                Ok(Some(BridgeRestart {
-                    native_session_id: opened.native_session_id,
-                    unexpected: true,
-                    session_age: opened.started_at.elapsed(),
-                }))
-            }
+            Some(opened) => Ok(Some(BridgeRestart {
+                native_session_id: opened.native_session_id,
+                unexpected: true,
+                session_age: opened.started_at.elapsed(),
+                message: ACP_BRIDGE_LOST_WARNING,
+            })),
         },
     }
 }
@@ -643,6 +644,7 @@ fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationR
                 required: true,
                 secret: false,
                 custom_answer_for: None,
+                custom_answer_option: None,
                 kind: ElicitationFieldKind::SingleSelect {
                     options: vec![
                         ElicitationOption {
@@ -678,10 +680,11 @@ fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationR
             ElicitationField {
                 id: PLAN_REVIEW_FEEDBACK.into(),
                 title: "Revision feedback".into(),
-                description: Some("Used only when Revise is selected".into()),
+                description: Some("Describe what the agent should change.".into()),
                 required: false,
                 secret: false,
-                custom_answer_for: None,
+                custom_answer_for: Some(PLAN_REVIEW_ACTION.into()),
+                custom_answer_option: Some("revise".into()),
                 kind: ElicitationFieldKind::Text {
                     default: None,
                     min_length: None,
@@ -845,6 +848,7 @@ const CANCEL_UNACKED_WARNING: &str =
     "cancel was not acknowledged within 60s; restarting the harness";
 
 const ACP_BRIDGE_LOST_WARNING: &str = "ACP bridge exited; reloading the native session";
+const ACP_BRIDGE_RESTART_WARNING: &str = "ACP bridge restarting; reloading the native session";
 
 /// Kimi may start an internal background-task notification turn as a cancelled
 /// `session/prompt` settles. Reusing that connection lets the next ACP prompt be

@@ -81,11 +81,13 @@ fn bundle() -> ProjectBundleSpec {
                 url: Some("git@github.com:example/app.git".to_owned()),
                 destination: "app".to_owned(),
                 git_ref: Some("main".to_owned()),
+                reference: None,
             },
             RepositorySpec {
                 url: Some("https://github.com/example/lib.git".to_owned()),
                 destination: "libs/lib".to_owned(),
                 git_ref: None,
+                reference: None,
             },
         ],
     }
@@ -634,6 +636,40 @@ fn podman_plan_uses_owned_name_label_and_argv_clones() {
             .last()
             .unwrap()
             .contains("gh auth git-credential")
+    );
+}
+
+#[test]
+fn container_clone_borrows_from_an_optional_read_only_reference() {
+    let mut cached = bundle();
+    cached.repositories[0].reference = Some("/run/hel/git-cache/app.git".to_owned());
+    let plan = provision_plan(
+        &TargetTemplate::AppleContainer(ContainerTemplate {
+            image: "ubuntu:24.04".to_owned(),
+            pull_policy: ImagePullPolicy::Auto,
+            extra_run_args: vec![],
+        }),
+        SESSION,
+        &cached,
+        &[],
+    )
+    .unwrap();
+
+    let clone = plan
+        .commands
+        .iter()
+        .find(|command| command.purpose == "clone app")
+        .unwrap();
+    assert!(
+        clone.args.windows(2).any(|arguments| {
+            arguments == ["--reference-if-able", "/run/hel/git-cache/app.git"]
+        })
+    );
+    assert!(clone.args.contains(&"--branch".to_owned()));
+    assert!(
+        clone
+            .args
+            .contains(&"git@github.com:example/app.git".to_owned())
     );
 }
 
@@ -1930,10 +1966,12 @@ fn podman_cleanup_ignores_an_already_absent_container() {
         SESSION,
     )
     .unwrap();
-    assert_eq!(
-        local.commands[0].args,
-        ["rm", "--force", "--ignore", name.as_str()]
-    );
+    assert_eq!(local.commands[0].program, "sh");
+    let local_script = &local.commands[0].args[1];
+    let remove_container = local_script.find("podman rm --force --ignore").unwrap();
+    let remove_cache = local_script.find(".cache/hel/git/sessions").unwrap();
+    assert!(remove_container < remove_cache);
+    assert_eq!(local.commands[0].args.last().unwrap(), SESSION);
 
     let remote = close_plan(
         &TargetLocator::SshPodman {
@@ -1943,13 +1981,11 @@ fn podman_cleanup_ignores_an_already_absent_container() {
         SESSION,
     )
     .unwrap();
-    assert!(
-        remote.commands[0]
-            .args
-            .last()
-            .unwrap()
-            .contains("'podman' 'rm' '--force' '--ignore'")
-    );
+    let remote = remote.commands[0].args.last().unwrap();
+    let remove_container = remote.find("podman rm --force --ignore").unwrap();
+    let remove_cache = remote.find(".cache/hel/git/sessions").unwrap();
+    assert!(remove_container < remove_cache);
+    assert!(remote.contains(SESSION));
 }
 
 #[test]

@@ -658,15 +658,7 @@ fn session_top_line(
             )
         });
     let status_columns = if let Some(operation) = operation {
-        let (label, started_at) = match (operation.stage, operation.kind) {
-            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
-                stage.label(),
-                operation
-                    .stage_started_at_epoch_seconds
-                    .unwrap_or(operation.started_at_epoch_seconds),
-            ),
-            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
-        };
+        let (label, started_at) = operation_status(operation);
         Some(vec![format!(
             "{label} {}",
             format_elapsed(now_epoch_seconds.saturating_sub(started_at))
@@ -844,15 +836,7 @@ fn session_values(
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let clock = if let Some(operation) = operation {
-        let (label, started_at) = match (operation.stage, operation.kind) {
-            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
-                stage.label(),
-                operation
-                    .stage_started_at_epoch_seconds
-                    .unwrap_or(operation.started_at_epoch_seconds),
-            ),
-            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
-        };
+        let (label, started_at) = operation_status(operation);
         let elapsed = now_epoch_seconds.saturating_sub(started_at);
         format!("{label} {elapsed}s")
     } else if session.state == SessionState::Provisioning {
@@ -884,6 +868,33 @@ fn session_values(
     )
 }
 
+fn operation_status(operation: &SessionOperationDisplay) -> (String, u64) {
+    if matches!(
+        operation.kind,
+        SessionOperationKind::Launching | SessionOperationKind::Resuming
+    ) && !operation.active_stages.is_empty()
+    {
+        let label = operation
+            .active_stages
+            .keys()
+            .map(|stage| stage.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let started_at = operation
+            .active_stages
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(operation.started_at_epoch_seconds);
+        (label, started_at)
+    } else {
+        (
+            operation.kind.label().to_owned(),
+            operation.started_at_epoch_seconds,
+        )
+    }
+}
+
 fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
     chrono::DateTime::parse_from_rfc3339(&session.updated_at)
         .ok()?
@@ -900,12 +911,10 @@ fn session_name(session: &SessionRecord) -> &str {
 /// loaded yet keeps the default.
 fn session_band_color(detail: Option<&SessionDetail>) -> Color {
     match detail {
-        Some(detail)
-            if detail.unread_agent_messages > 0 && detail.current_turn_started_at.is_none() =>
-        {
+        Some(detail) if detail.has_unread() && detail.current_turn_started_at.is_none() => {
             Color::LightBlue
         }
-        Some(detail) if detail.unread_agent_messages > 0 => Color::LightYellow,
+        Some(detail) if detail.has_unread() => Color::LightYellow,
         // ANSI yellow is the orange/amber ink in common terminal palettes;
         // bright yellow remains distinct for unread sessions.
         _ => Color::Yellow,
@@ -1161,28 +1170,92 @@ fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
     quota_bar(five_hour)
 }
 
-fn quota_reset_summary(quota: &ProfileQuota) -> String {
-    let weekly = quota
-        .weekly_window()
-        .and_then(|window| window.resets.as_deref());
-    let five_hour = quota
-        .five_hour_projects_exhaustion()
-        .then(|| quota.five_hour_window())
-        .flatten()
-        .and_then(|window| window.resets.as_deref());
-    let mut summary = match (weekly, five_hour) {
-        (Some(weekly), Some(five_hour)) => format!("{weekly} / {five_hour}"),
-        (Some(weekly), None) => weekly.to_string(),
-        (None, Some(five_hour)) => five_hour.to_string(),
-        (None, None) => String::new(),
+fn quota_reset_countdown(now: u64, reset_at_epoch_seconds: i64) -> String {
+    let Ok(reset) = u64::try_from(reset_at_epoch_seconds) else {
+        return "now".into();
     };
-    if let Some(extra) = quota.extra.as_deref() {
-        if !summary.is_empty() {
-            summary.push_str(" · ");
-        }
-        summary.push_str(extra);
+    let remaining = reset.saturating_sub(now);
+    if remaining == 0 {
+        return "now".into();
     }
-    summary
+
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if remaining >= DAY {
+        let days = remaining / DAY;
+        let hours = remaining % DAY / HOUR;
+        if days == 1 && hours > 0 {
+            format!("{days}d{hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if remaining >= HOUR {
+        let hours = remaining / HOUR;
+        let minutes = remaining % HOUR / MINUTE;
+        if hours == 1 && minutes > 0 {
+            format!("{hours}h{minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if remaining >= MINUTE {
+        format!("{}m", remaining / MINUTE)
+    } else {
+        "<1m".into()
+    }
+}
+
+fn quota_reset_cell(window: Option<&QuotaWindow>, now: u64) -> String {
+    let Some(window) = window else {
+        return String::new();
+    };
+    window
+        .resets_at_epoch_seconds
+        .map(|reset| quota_reset_countdown(now, reset))
+        .or_else(|| window.resets.clone())
+        .unwrap_or_default()
+}
+
+fn quota_reset_cells(quota: &ProfileQuota, now: u64) -> (String, String) {
+    let mut weekly = quota_reset_cell(quota.weekly_window(), now);
+    if let Some(extra) = quota.extra.as_deref() {
+        if !weekly.is_empty() {
+            weekly.push_str(" · ");
+        }
+        weekly.push_str(extra);
+    }
+    (weekly, quota_reset_cell(quota.five_hour_window(), now))
+}
+
+struct QuotaTableRow {
+    profile: String,
+    harness: String,
+    weekly: Line<'static>,
+    weekly_reset: String,
+    five_hour: Line<'static>,
+    five_hour_reset: String,
+}
+
+impl QuotaTableRow {
+    fn into_row(self) -> Row<'static> {
+        Row::new([
+            Cell::from(self.profile),
+            Cell::from(self.harness),
+            Cell::from(self.weekly),
+            Cell::from(self.weekly_reset),
+            Cell::from(self.five_hour),
+            Cell::from(self.five_hour_reset),
+        ])
+    }
+}
+
+fn quota_column_width(
+    header: &str,
+    content_widths: impl Iterator<Item = usize>,
+    maximum: u16,
+) -> u16 {
+    let width = content_widths.fold(Line::raw(header).width(), usize::max);
+    u16::try_from(width).unwrap_or(u16::MAX).min(maximum)
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -1190,38 +1263,65 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
-        let (weekly, five_hour, resets) = if profile.kind == HarnessKind::Deepseek {
-            (api_quota_bar(), Line::default(), String::new())
-        } else if dashboard.quota_refreshing.contains(id) {
-            (Line::raw("refreshing…"), Line::default(), String::new())
-        } else {
-            match dashboard.quotas.get(id) {
-                Some(quota) if quota.error.is_none() => (
-                    quota_bar(quota.weekly_window()),
-                    five_hour_quota_bar(quota),
-                    quota_reset_summary(quota),
-                ),
-                Some(quota) => (
-                    Line::raw(
-                        quota
-                            .error_label()
-                            .unwrap_or_else(|| "unavailable: unknown error".into()),
-                    ),
-                    Line::default(),
-                    String::new(),
-                ),
-                None => (Line::raw("refreshing…"), Line::default(), String::new()),
+    let rows = dashboard
+        .config
+        .profiles
+        .iter()
+        .map(|(id, profile)| {
+            let (weekly, weekly_reset, five_hour, five_hour_reset) =
+                if profile.kind == HarnessKind::Deepseek {
+                    (
+                        api_quota_bar(),
+                        String::new(),
+                        Line::default(),
+                        String::new(),
+                    )
+                } else if dashboard.quota_refreshing.contains(id) {
+                    (
+                        Line::raw("refreshing…"),
+                        String::new(),
+                        Line::default(),
+                        String::new(),
+                    )
+                } else {
+                    match dashboard.quotas.get(id) {
+                        Some(quota) if quota.error.is_none() => {
+                            let (weekly_reset, five_hour_reset) = quota_reset_cells(quota, now);
+                            (
+                                quota_bar(quota.weekly_window()),
+                                weekly_reset,
+                                five_hour_quota_bar(quota),
+                                five_hour_reset,
+                            )
+                        }
+                        Some(quota) => (
+                            Line::raw(
+                                quota
+                                    .error_label()
+                                    .unwrap_or_else(|| "unavailable: unknown error".into()),
+                            ),
+                            String::new(),
+                            Line::default(),
+                            String::new(),
+                        ),
+                        None => (
+                            Line::raw("refreshing…"),
+                            String::new(),
+                            Line::default(),
+                            String::new(),
+                        ),
+                    }
+                };
+            QuotaTableRow {
+                profile: id.clone(),
+                harness: profile.kind.display_name().into(),
+                weekly,
+                weekly_reset,
+                five_hour,
+                five_hour_reset,
             }
-        };
-        Row::new([
-            Cell::from(id.clone()),
-            Cell::from(profile.kind.display_name()),
-            Cell::from(weekly),
-            Cell::from(five_hour),
-            Cell::from(resets),
-        ])
-    });
+        })
+        .collect::<Vec<_>>();
     let refresh_status = if !dashboard.quota_refreshing.is_empty() {
         "refreshing…".to_string()
     } else {
@@ -1246,33 +1346,54 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
     } else {
         BorderType::Plain
     };
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(14),
-            Constraint::Percentage(10),
-            Constraint::Percentage(22),
-            Constraint::Percentage(22),
-            Constraint::Percentage(32),
-        ],
-    )
-    .header(
-        Row::new(["Profile", "Harness", "Weekly", "5H", "Resets"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .row_highlight_style(if quotas_focused {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
-    } else {
-        Style::default()
-    })
-    .highlight_symbol(if quotas_focused { "› " } else { "  " })
-    .highlight_spacing(HighlightSpacing::Always)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(border_type)
-            .title(title),
-    );
+    let widths = [
+        quota_column_width(
+            "Profile",
+            rows.iter()
+                .map(|row| Line::raw(row.profile.as_str()).width()),
+            24,
+        ),
+        quota_column_width(
+            "Harness",
+            rows.iter()
+                .map(|row| Line::raw(row.harness.as_str()).width()),
+            12,
+        ),
+        quota_column_width("Weekly", rows.iter().map(|row| row.weekly.width()), 32),
+        quota_column_width(
+            "Resets",
+            rows.iter()
+                .map(|row| Line::raw(row.weekly_reset.as_str()).width()),
+            24,
+        ),
+        quota_column_width("5H", rows.iter().map(|row| row.five_hour.width()), 15),
+        quota_column_width(
+            "Resets",
+            rows.iter()
+                .map(|row| Line::raw(row.five_hour_reset.as_str()).width()),
+            24,
+        ),
+    ]
+    .map(Constraint::Length);
+    let table = Table::new(rows.into_iter().map(QuotaTableRow::into_row), widths)
+        .column_spacing(2)
+        .header(
+            Row::new(["Profile", "Harness", "Weekly", "Resets", "5H", "Resets"])
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .row_highlight_style(if quotas_focused {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if quotas_focused { "› " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .title(title),
+        );
     let mut state = TableState::default()
         .with_selected((!dashboard.config.profiles.is_empty()).then_some(dashboard.quota_index));
     frame.render_stateful_widget(table, area, &mut state);
@@ -1630,6 +1751,22 @@ mod tests {
 
         let collapsed = collapsed_session_line("› ", "podman", Some(&unread_idle), 1, 80, None);
         assert_eq!(collapsed.style.fg, Some(Color::LightBlue));
+
+        let restarted_idle = SessionDetail {
+            unread_session_restarts: 1,
+            ..SessionDetail::default()
+        };
+        assert_eq!(session_band_color(Some(&restarted_idle)), Color::LightBlue);
+
+        let restarted_running = SessionDetail {
+            current_turn_started_at: Some(1),
+            unread_session_restarts: 1,
+            ..SessionDetail::default()
+        };
+        assert_eq!(
+            session_band_color(Some(&restarted_running)),
+            Color::LightYellow
+        );
     }
 
     #[test]
@@ -2398,11 +2535,29 @@ mod tests {
         );
         // The operation started at 1_000 but the stage only began at 1_040;
         // the clock must count from the stage, not the whole operation.
-        operation.stage_started_at_epoch_seconds = Some(1_040);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Booting, 1_040);
 
         let (clock, _, _, _, _) =
             session_values(&session, None, Some(&operation), 1_052, &config());
         assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn launch_clock_names_concurrent_stages_in_lifecycle_order() {
+        let session = stopped_session();
+        let mut operation = operation(SessionOperationKind::Launching, None);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Syncing, 1_003);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Cloning, 1_002);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Clone, Sync 10s");
     }
 
     #[test]
@@ -2775,8 +2930,39 @@ mod tests {
     }
 
     #[test]
-    fn quota_resets_add_five_hour_only_when_projected_to_exhaust() {
-        let mut quota = ProfileQuota {
+    fn quota_reset_countdowns_use_a_second_unit_only_after_one_first_unit() {
+        const MINUTE: u64 = 60;
+        const HOUR: u64 = 60 * MINUTE;
+        const DAY: u64 = 24 * HOUR;
+        let now = 100;
+
+        assert_eq!(
+            quota_reset_countdown(now, (now + 2 * DAY + 5 * HOUR) as i64),
+            "2d"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + DAY + 5 * HOUR) as i64),
+            "1d5h"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + 2 * HOUR + 5 * MINUTE) as i64),
+            "2h"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + HOUR + 5 * MINUTE) as i64),
+            "1h5m"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + 35 * MINUTE) as i64),
+            "35m"
+        );
+        assert_eq!(quota_reset_countdown(now, (now + 30) as i64), "<1m");
+        assert_eq!(quota_reset_countdown(now, now as i64), "now");
+    }
+
+    #[test]
+    fn weekly_and_five_hour_resets_are_independent() {
+        let quota = ProfileQuota {
             profile_id: "codex-1".into(),
             harness: HarnessKind::Codex,
             windows: vec![
@@ -2802,13 +2988,16 @@ mod tests {
             refreshed_at_epoch_seconds: 0,
         };
 
-        assert_eq!(quota_reset_summary(&quota), "09:00 Aug 20");
-        quota.windows[1].remaining_percent = Some(70);
-        assert_eq!(quota_reset_summary(&quota), "09:00 Aug 20 / 14:00 Aug 13");
+        assert_eq!(quota_reset_cells(&quota, 0), ("7d".into(), "4h".into()));
     }
 
     #[test]
     fn quota_render_uses_weekly_five_hour_and_reset_columns() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now = i64::try_from(now).unwrap();
         let quota = ProfileQuota {
             profile_id: "codex-1".into(),
             harness: HarnessKind::Codex,
@@ -2819,7 +3008,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: Some("09:00 Aug 20".into()),
-                    resets_at_epoch_seconds: Some(604_800),
+                    resets_at_epoch_seconds: Some(now + 2 * 24 * 60 * 60 + 30),
                 },
                 QuotaWindow {
                     label: "5H".into(),
@@ -2827,7 +3016,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: Some("14:00 Aug 13".into()),
-                    resets_at_epoch_seconds: Some(14_400),
+                    resets_at_epoch_seconds: Some(now + 60 * 60 + 5 * 60 + 30),
                 },
             ],
             extra: None,
@@ -2843,19 +3032,28 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let lines = buffer_lines(terminal.backend().buffer());
+        let rendered = lines.join("\n");
 
         assert!(rendered.contains("Weekly"));
         assert!(rendered.contains("5H"));
-        assert!(rendered.contains("Resets"));
+        assert_eq!(rendered.matches("Resets").count(), 2);
         assert!(rendered.contains("73%"));
         assert!(rendered.contains("70%"));
-        assert!(rendered.contains("09:00 Aug 20 / 14:00 Aug 13"));
+        assert!(rendered.contains("2d"));
+        assert!(rendered.contains("1h5m"));
+        assert!(!rendered.contains("09:00 Aug 20"));
+
+        let row = lines
+            .iter()
+            .find(|line| line.contains("codex-1"))
+            .expect("quota row");
+        let weekly_percent = cell_column(row, "73%");
+        let weekly_reset = cell_column(row, "2d");
+        let five_hour_percent = cell_column(row, "70%");
+        let five_hour_reset = cell_column(row, "1h5m");
+        assert_eq!(weekly_reset, weekly_percent + 3 + 2);
+        assert_eq!(five_hour_percent - 12, weekly_reset + 6 + 2);
+        assert_eq!(five_hour_reset, five_hour_percent + 3 + 2);
     }
 }

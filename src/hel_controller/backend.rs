@@ -298,6 +298,7 @@ pub(super) fn backend_bundle(bundle: &ProjectBundle) -> Result<ProjectBundleSpec
                 url: repository.github.as_deref().map(github_url),
                 destination: repository.destination.to_string_lossy().into_owned(),
                 git_ref: repository.git_ref.clone(),
+                reference: None,
             })
             .collect(),
     })
@@ -562,7 +563,6 @@ pub(super) fn locator_after_provision(
     session_id: &str,
     first_output: Option<&CommandOutput>,
     executor: &(impl CommandExecutor + Sync),
-    bundle: Option<&ProjectBundleSpec>,
 ) -> Result<TargetLocator> {
     let generated = hel_targets::resource_name(session_id)?;
     Ok(match canonical {
@@ -669,19 +669,6 @@ pub(super) fn locator_after_provision(
                 Instant::now,
                 std::thread::sleep,
             )?;
-            let backend_locator = hel_targets::TargetLocator::AwsEc2 {
-                profile: profile.clone(),
-                region: region.clone(),
-                instance_id: instance_id.clone(),
-                ssh,
-                workspace: format!(".local/share/hel/workspaces/{session_id}"),
-            };
-            hel_targets::provision_on_locator_plan(
-                &backend_locator,
-                session_id,
-                bundle.context("AWS provisioning requires a project bundle")?,
-            )?
-            .execute_concurrent(executor)?;
             TargetLocator::AwsEc2 {
                 instance_id,
                 address: Some(address),
@@ -1145,6 +1132,7 @@ mod tests {
                 url: Some("git@github.com:example/app.git".into()),
                 destination: "app".into(),
                 git_ref: None,
+                reference: None,
             }],
         };
         use_github_https_urls(&mut bundle);

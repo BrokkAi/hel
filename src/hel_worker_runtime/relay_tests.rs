@@ -1973,6 +1973,20 @@ fn harness_restarting_interrupts_in_flight_commands() {
         &event.observation,
         RelayObservation::CommandInterrupted { command_id, .. } if command_id == "prompt-1"
     )));
+    let interrupted = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.observation,
+                RelayObservation::CommandInterrupted { .. }
+            )
+        })
+        .unwrap();
+    let restarted = events
+        .iter()
+        .position(|event| matches!(event.observation, RelayObservation::SessionRestarted))
+        .unwrap();
+    assert!(interrupted < restarted);
 }
 
 #[test]
@@ -3322,6 +3336,138 @@ async fn daemon_restart_serves_a_closed_relay_without_starting_acp() {
     writer.shutdown().await.unwrap();
     daemon.abort();
     assert!(daemon.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn daemon_restart_records_one_marker_after_recovering_in_flight_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_owned();
+    let mut relay = DurableRelay::open(&root, SESSION_ID, "1.0.0").unwrap();
+    submit(&mut relay, "prompt-before-restart", prompt("keep working"));
+    assert_eq!(relay.claim_pending_commands(true).unwrap().len(), 1);
+    drop(relay);
+
+    let mut config = launch_config(temp.path().join("profile").to_str().unwrap());
+    config.cwd = temp.path().to_owned();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        unix::run_daemon(root.clone(), config),
+    )
+    .await
+    .expect("the scripted worker child must stop")
+    .expect_err("the test executable is not an ACP supervisor");
+    assert!(!format!("{result:#}").is_empty());
+
+    let reopened = DurableRelay::open(&root, SESSION_ID, "1.0.0").unwrap();
+    let events = reopened
+        .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+        .unwrap();
+    let interrupted = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.observation,
+                RelayObservation::CommandInterrupted { command_id, .. }
+                    if command_id == "prompt-before-restart"
+            )
+        })
+        .expect("restart recovery interrupts the old prompt");
+    let markers = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event.observation, RelayObservation::SessionRestarted))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 1);
+    assert!(interrupted < markers[0]);
+    assert_eq!(
+        reopened.operational_state().execution,
+        RelayExecutionState::Idle
+    );
+}
+
+#[tokio::test]
+async fn first_daemon_start_does_not_record_a_restart_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_owned();
+    let mut config = launch_config(temp.path().join("profile").to_str().unwrap());
+    config.cwd = temp.path().to_owned();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        unix::run_daemon(root.clone(), config),
+    )
+    .await
+    .expect("the scripted worker child must stop")
+    .expect_err("the test executable is not an ACP supervisor");
+    assert!(!format!("{result:#}").is_empty());
+
+    let reopened = DurableRelay::open(&root, SESSION_ID, "1.0.0").unwrap();
+    assert!(
+        !reopened
+            .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.observation, RelayObservation::SessionRestarted))
+    );
+}
+
+#[tokio::test]
+async fn restored_relay_seed_records_a_restart_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_owned();
+    std::fs::write(
+        crate::hel_worker::restored_relay_seed_path(&root),
+        serde_json::to_vec(&crate::hel_worker::RestoredRelaySeed {
+            event_frontier: 0,
+            event_frontier_digest: RELAY_EVENT_GENESIS_DIGEST.into(),
+            queued_prompts: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut config = launch_config(temp.path().join("profile").to_str().unwrap());
+    config.cwd = temp.path().to_owned();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        unix::run_daemon(root.clone(), config),
+    )
+    .await
+    .expect("the scripted worker child must stop")
+    .expect_err("the test executable is not an ACP supervisor");
+    assert!(!format!("{result:#}").is_empty());
+
+    let reopened = DurableRelay::open(&root, SESSION_ID, "1.0.0").unwrap();
+    let markers = reopened
+        .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+        .unwrap()
+        .into_iter()
+        .filter(|event| matches!(event.observation, RelayObservation::SessionRestarted))
+        .count();
+    assert_eq!(markers, 1);
+}
+
+#[tokio::test]
+async fn acp_supervisor_notices_child_exit_while_a_descendant_holds_stdout_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = AcpSupervisorSpec {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 30 & exit 17".into()],
+        environment: Default::default(),
+        cwd: temp.path().to_owned(),
+    };
+    let (supervisor_stdin, _held_stdin) = tokio::io::duplex(64);
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        unix::run_acp_supervisor_with_streams(spec, supervisor_stdin, tokio::io::sink()),
+    )
+    .await
+    .expect("the supervisor must observe the bridge process itself")
+    .expect_err("the bridge exits unsuccessfully");
+    assert!(
+        format!("{error:#}").contains("exit status: 17"),
+        "unexpected supervisor error: {error:#}"
+    );
 }
 
 /// Opening the relay recovers its journal in place, so a second daemon has

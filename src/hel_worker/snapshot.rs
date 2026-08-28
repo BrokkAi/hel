@@ -435,6 +435,10 @@ pub enum RelayObservation {
     Warning {
         message: String,
     },
+    /// The target-side session control plane was replaced. This is a typed
+    /// transcript event so clients can surface it as unread attention without
+    /// interpreting arbitrary system text.
+    SessionRestarted,
     /// What a client-run terminal produced, journaled once when its child was
     /// reaped. The agent already read the full output over `terminal/output`;
     /// this copy is tail-capped for the person reading the transcript.
@@ -926,6 +930,7 @@ pub(crate) fn observation_changes_state(observation: &RelayObservation) -> bool 
         | RelayObservation::ElicitationResolved { .. }
         | RelayObservation::ElicitationsCleared
         | RelayObservation::Warning { .. }
+        | RelayObservation::SessionRestarted
         | RelayObservation::UserShellOutput { .. }
         | RelayObservation::TerminalOutput { .. }
         | RelayObservation::Notice { .. } => false,
@@ -1401,6 +1406,7 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
         | RelayObservation::ElicitationResolved { .. }
         | RelayObservation::ElicitationsCleared
         | RelayObservation::Warning { .. }
+        | RelayObservation::SessionRestarted
         | RelayObservation::UserShellOutput { .. }
         | RelayObservation::TerminalOutput { .. }
         | RelayObservation::Notice { .. } => {}
@@ -1573,6 +1579,7 @@ mod tests {
             RelayObservation::Notice {
                 message: "noticed".into(),
             },
+            RelayObservation::SessionRestarted,
             RelayObservation::TerminalOutput {
                 terminal_id: "terminal-1".into(),
                 output: "output".into(),

@@ -133,6 +133,7 @@ pub struct MaterializedSessionSummary {
     /// nonempty user message in transcript order.
     pub last_agent_message_follows_last_user: bool,
     pub agent_message_latest_content_ordinals: Vec<u64>,
+    pub session_restart_event_ordinals: Vec<u64>,
 }
 
 impl MaterializedSession {
@@ -162,6 +163,15 @@ impl MaterializedSession {
                 item.latest_content_event_ordinal
                     .is_some_and(|ordinal| ordinal > viewed_through_event_ordinal)
                     && item.is_nonempty_agent_message()
+            })
+            .count() as u64
+    }
+
+    pub fn unread_session_restarts_after(&self, viewed_through_event_ordinal: u64) -> u64 {
+        self.transcript
+            .iter()
+            .filter(|item| {
+                item.position > viewed_through_event_ordinal && item.is_session_restart()
             })
             .count() as u64
     }

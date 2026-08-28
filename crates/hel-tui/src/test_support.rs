@@ -264,6 +264,21 @@ pub(crate) fn thought(position: u64, text: impl Into<String>) -> Arc<TranscriptI
     )
 }
 
+pub(crate) fn session_restart(position: u64) -> Arc<TranscriptItem> {
+    let mut item = transcript_item(
+        position,
+        TranscriptBody::System {
+            text: hel::hel_transcript::SESSION_RESTART_TEXT.into(),
+        },
+    );
+    Arc::make_mut(&mut item).stable_id = format!(
+        "{}{}",
+        hel::hel_transcript::SESSION_RESTART_ITEM_PREFIX,
+        position
+    );
+    item
+}
+
 pub(crate) fn materialized_session_for(
     session_id: &str,
     transcript: Vec<Arc<TranscriptItem>>,
@@ -331,12 +346,14 @@ pub(crate) fn operation(
     kind: SessionOperationKind,
     stage: Option<ProvisionStage>,
 ) -> SessionOperationDisplay {
+    let active_stages = stage
+        .map(|stage| [(stage, 1_000)].into_iter().collect())
+        .unwrap_or_default();
     SessionOperationDisplay {
         kind,
         started_at_epoch_seconds: 1_000,
         placeholder: None,
-        stage,
-        stage_started_at_epoch_seconds: stage.map(|_| 1_000),
+        active_stages,
         resume_destination: None,
     }
 }

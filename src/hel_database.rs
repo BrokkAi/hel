@@ -1050,6 +1050,16 @@ fn load_materialized_session_summary_from(
     let agent_message_latest_content_ordinals = ordinal_statement
         .query_map([session_id], |row| row.get::<_, u64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let restart_pattern = format!("{}*", crate::hel_transcript::SESSION_RESTART_ITEM_PREFIX);
+    let mut restart_statement = connection.prepare(
+        "SELECT position
+         FROM materialized_transcript_items
+         WHERE session_id = ?1 AND stable_id GLOB ?2
+         ORDER BY position, stable_id",
+    )?;
+    let session_restart_event_ordinals = restart_statement
+        .query_map((session_id, restart_pattern), |row| row.get::<_, u64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(Some(MaterializedSessionSummary {
         session_id: session_id.to_owned(),
@@ -1061,6 +1071,7 @@ fn load_materialized_session_summary_from(
         last_user_message: last_user_message.map(|(_, message)| message),
         last_agent_message_follows_last_user,
         agent_message_latest_content_ordinals,
+        session_restart_event_ordinals,
     }))
 }
 

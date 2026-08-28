@@ -53,11 +53,13 @@ fn managed_resource_identity_args(kind: ManagedResourceKind, session_id: &str) -
 }
 
 /// The launch phase a command belongs to, reported as launch progress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ProvisionStage {
     Provisioning,
     Booting,
+    Cloning,
     Syncing,
+    Restoring,
     Starting,
     Compacting,
 }
@@ -67,7 +69,9 @@ impl ProvisionStage {
         match self {
             Self::Provisioning => "Provision",
             Self::Booting => "Boot",
+            Self::Cloning => "Clone",
             Self::Syncing => "Sync",
+            Self::Restoring => "Restore",
             Self::Starting => "Start",
             Self::Compacting => "Compact",
         }
@@ -412,9 +416,14 @@ pub trait CommandExecutor {
         false
     }
 
-    /// Report a lifecycle stage for work that is not a command execution, so
-    /// long in-process phases still name themselves on the session clock.
-    fn notify_stage(&self, _stage: ProvisionStage) {}
+    /// Report entry into a lifecycle stage. Callers that cover more than one
+    /// command should hold a [`ProvisionStageGuard`] for the whole operation
+    /// so concurrent stages remain visible between subprocesses.
+    fn stage_started(&self, _stage: ProvisionStage) {}
+
+    /// Report exit from a lifecycle stage previously passed to
+    /// [`Self::stage_started`].
+    fn stage_finished(&self, _stage: ProvisionStage) {}
 
     /// Report a decision an operation made on the user's behalf. This is not a
     /// failure: the work continues, and the user is told what changed.
@@ -426,6 +435,27 @@ pub trait CommandExecutor {
         _input: &mut (dyn Read + Send),
     ) -> Result<CommandOutput> {
         bail!("this command executor does not support streamed stdin")
+    }
+}
+
+/// A scoped lifecycle-stage report for controller-side work or a sequence of
+/// commands. Dropping the guard reports completion even when the work returns
+/// early with an error.
+pub struct ProvisionStageGuard<'a, E: CommandExecutor + ?Sized> {
+    executor: &'a E,
+    stage: ProvisionStage,
+}
+
+impl<'a, E: CommandExecutor + ?Sized> ProvisionStageGuard<'a, E> {
+    pub fn new(executor: &'a E, stage: ProvisionStage) -> Self {
+        executor.stage_started(stage);
+        Self { executor, stage }
+    }
+}
+
+impl<E: CommandExecutor + ?Sized> Drop for ProvisionStageGuard<'_, E> {
+    fn drop(&mut self) {
+        self.executor.stage_finished(self.stage);
     }
 }
 
@@ -1293,6 +1323,10 @@ pub struct RepositorySpec {
     pub url: Option<String>,
     pub destination: String,
     pub git_ref: Option<String>,
+    /// Read-only bare repository mounted into the target for Git object reuse.
+    /// A missing or unusable reference is only an optimization miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1781,7 +1815,7 @@ pub fn provision_on_locator_plan(
     let mut commands = vec![
         ssh_command(ssh, ["mkdir", "-p", workspace])
             .purpose("create EC2 session workspace")
-            .stage(ProvisionStage::Syncing),
+            .stage(ProvisionStage::Cloning),
     ];
     commands.extend(install_git_plan(ExecutionBoundary::Ssh(ssh)).commands);
     commands.extend(clone_commands(bundle, workspace, |args| {
@@ -2545,12 +2579,14 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
                 .purpose("stop the local Hel worker and remove exact local Hel worker state")
         }
         TargetLocator::LocalPodman { container_id } => {
-            CommandSpec::new("podman", ["rm", "--force", "--ignore", container_id])
-                .purpose("remove local Podman session container")
+            let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
+            CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
+                .purpose("remove local Podman session container and Git cache snapshot")
         }
         TargetLocator::AppleContainer { container_id } => {
-            CommandSpec::new("container", ["rm", "--force", container_id])
-                .purpose("remove Apple session container")
+            let script = "status=0; container rm --force \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
+            CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
+                .purpose("remove Apple session container and Git cache snapshot")
         }
         TargetLocator::AwsEc2 {
             profile,
@@ -2590,8 +2626,12 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
             )
         }
         TargetLocator::SshPodman { ssh, container_id } => {
-            ssh_command(ssh, ["podman", "rm", "--force", "--ignore", container_id])
-                .purpose("remove exact remote Podman session container")
+            let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
+            ssh_command(
+                ssh,
+                ["sh", "-c", script, "hel-close", container_id, session_id],
+            )
+            .purpose("remove exact remote Podman session container and Git cache snapshot")
         }
     };
     Ok(CommandPlan {
@@ -2705,7 +2745,7 @@ pub fn install_git_plan(boundary: ExecutionBoundary<'_>) -> CommandPlan {
                 vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
             )
             .purpose("install Git")
-            .stage(ProvisionStage::Syncing),
+            .stage(ProvisionStage::Cloning),
         ],
     }
 }
@@ -2727,7 +2767,7 @@ fn clone_commands(
             workspace.to_owned(),
         ])
         .purpose("create bundle workspace")
-        .stage(ProvisionStage::Syncing),
+        .stage(ProvisionStage::Cloning),
     ];
     for repository in &bundle.repositories {
         let destination = format!("{workspace}/{}", repository.destination);
@@ -2735,12 +2775,15 @@ fn clone_commands(
             commands.push(
                 wrap(vec!["git".into(), "init".into(), "--".into(), destination])
                     .purpose(format!("initialize {}", repository.destination))
-                    .stage(ProvisionStage::Syncing)
+                    .stage(ProvisionStage::Cloning)
                     .parallel_group(BUNDLE_REPOSITORIES_PARALLEL_GROUP),
             );
             continue;
         };
         let mut args = vec!["git".to_owned(), "clone".to_owned()];
+        if let Some(reference) = &repository.reference {
+            args.extend(["--reference-if-able".to_owned(), reference.clone()]);
+        }
         if let Some(git_ref) = &repository.git_ref {
             args.extend(["--branch".to_owned(), git_ref.clone()]);
         }
@@ -2750,7 +2793,7 @@ fn clone_commands(
         commands.push(
             wrap(args)
                 .purpose(format!("clone {}", repository.destination))
-                .stage(ProvisionStage::Syncing)
+                .stage(ProvisionStage::Cloning)
                 .parallel_group(BUNDLE_REPOSITORIES_PARALLEL_GROUP),
         );
     }
