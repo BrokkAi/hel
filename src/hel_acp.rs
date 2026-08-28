@@ -1,7 +1,8 @@
-//! Minimal ACP runtime used by a Hel session worker.
+//! ACP runtime and normalized session controls used by a Hel session worker.
 //!
 //! The worker owns exactly one harness process and one foreground session.  It
-//! deliberately does not know about orchestration, review lanes, or subagents.
+//! deliberately does not know about orchestration, review lanes, or subagents;
+//! [`surface`] projects protocol capabilities for the chat control surface.
 
 mod dialect;
 pub(crate) mod surface;
@@ -48,6 +49,10 @@ use crate::hel_terminal::{
 };
 use crate::hel_worker::AcpActivityClock;
 use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery};
+
+pub(crate) fn plan_review_carries_native_feedback(id: &str) -> bool {
+    grok::is_plan_review_id(id)
+}
 
 /// Private ACP metadata is provider-local and has no Hel projection. In
 /// particular, Codex can replay terminal-output metadata for old tool calls on
@@ -887,6 +892,7 @@ where
     let permission_activity = spec.acp_activity.clone();
     let ext_events = events.clone();
     let ext_activity = spec.acp_activity.clone();
+    let ext_harness = spec.harness;
     let elicitation_events = events.clone();
     let pending_elicitations = PendingElicitations::default();
     let handler_elicitations = pending_elicitations.clone();
@@ -1317,11 +1323,8 @@ where
                     });
                     return Ok(());
                 }
-                if grok::is_exit_plan_mode_method(&method) {
-                    let id = format!(
-                        "plan-review-grok-{}",
-                        ext_review_ids.fetch_add(1, Ordering::Relaxed)
-                    );
+                if grok::handles_exit_plan_mode(ext_harness, &method) {
+                    let id = grok::plan_review_id(ext_review_ids.fetch_add(1, Ordering::Relaxed));
                     let review = normalized_plan_review(id.clone(), request.params());
                     let (answer, answer_rx) = oneshot::channel();
                     handler_elicitations
@@ -1613,6 +1616,11 @@ async fn serve_session(
             .await;
         spec.acp_activity.mark();
         let loaded = loaded.with_context(|| format!("load ACP session {existing}"))?;
+        if let Some(state) = grok_models.as_mut()
+            && let Some(fresh) = grok::model_state(loaded.meta.as_ref())
+        {
+            *state = fresh;
+        }
         // The response is the boundary between provider replay and future
         // live updates for this connection.
         session_updates_enabled.store(true, Ordering::Release);
@@ -1668,12 +1676,11 @@ async fn serve_session(
         )
         .await?;
     }
-    // Grok Build never returns `configOptions`; present its catalogue in the
-    // shape the rest of Hel reads so `/model` and `/effort` work unchanged.
-    if let Some(state) = &grok_models
-        && config_options.is_empty()
-    {
-        config_options = grok::config_options(state);
+    // Grok Build publishes model selection through its legacy catalogue. Keep
+    // any standard selectors it also returns while projecting model/effort
+    // into the shape the rest of Hel reads.
+    if let Some(state) = &grok_models {
+        grok::merge_config_options(&mut config_options, state);
     }
     emit_runtime_event(
         events,
@@ -1943,13 +1950,14 @@ async fn serve_session(
                 key,
                 value,
             } => {
+                let grok_model_change = grok_models.is_some() && grok::handles_config_key(&key);
                 let applied = match grok_models.as_mut() {
-                    Some(state) => {
+                    Some(state) if grok::handles_config_key(&key) => {
                         grok::apply_model_change(connection, &session_id, state, &key, &value)
                             .await
-                            .inspect(|()| config_options = grok::config_options(state))
+                            .inspect(|()| grok::merge_config_options(&mut config_options, state))
                     }
-                    None => {
+                    _ => {
                         set_session_config(
                             connection,
                             &session_id,
@@ -1974,6 +1982,11 @@ async fn serve_session(
                         .await?;
                     }
                     Err(error) => {
+                        if grok_model_change && grok::response_was_lost(&error) {
+                            return Err(error.context(
+                                "Grok model change response was lost; reload the session to reconcile its model state",
+                            ));
+                        }
                         emit_runtime_event(
                             events,
                             RuntimeEvent::CommandRejected {
@@ -1996,7 +2009,7 @@ async fn serve_session(
                         .any(|mode| mode.id.to_string() == mode_id)
                 });
                 let grok_plan_fallback =
-                    spec.harness == HarnessKind::Grok && grok::permits_unadvertised_mode(&mode_id);
+                    grok::permits_unadvertised_plan_mode(spec.harness, &mode_id);
                 let applied = if advertised || grok_plan_fallback {
                     connection
                         .send_request(SetSessionModeRequest::new(

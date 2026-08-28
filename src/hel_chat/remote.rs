@@ -36,10 +36,6 @@ pub(super) enum ChatRemoteOperation {
         key: String,
         value: String,
     },
-    SetSessionMode {
-        command_id: String,
-        mode_id: String,
-    },
     PlanCommand {
         command_id: String,
         original: String,
@@ -86,10 +82,6 @@ pub(super) enum ChatRemoteResult {
         value: String,
         result: std::result::Result<(), String>,
     },
-    SetSessionMode {
-        mode_id: String,
-        result: std::result::Result<(), String>,
-    },
     PlanCommand {
         original: String,
         requested_active: bool,
@@ -120,9 +112,6 @@ impl ChatRemoteResult {
                 result: Err(error), ..
             }
             | Self::SetConfig {
-                result: Err(error), ..
-            }
-            | Self::SetSessionMode {
                 result: Err(error), ..
             }
             | Self::PlanCommand {
@@ -525,47 +514,6 @@ async fn enqueue_chat_remote_operation(
                 }
             }
         }
-        ChatRemoteOperation::SetSessionMode {
-            command_id,
-            mode_id,
-        } => {
-            let response = session
-                .enqueue_submit(
-                    command_id,
-                    RelayCommand::SetSessionMode {
-                        mode_id: mode_id.clone(),
-                    },
-                )
-                .await;
-            match response {
-                Ok(response) => {
-                    let results = results.clone();
-                    let attached = attached.clone();
-                    pending.spawn(async move {
-                        let result = response
-                            .wait()
-                            .await
-                            .map(|_| ())
-                            .map_err(|error| format!("{error:#}"));
-                        publish_chat_remote_result(
-                            &results,
-                            &attached,
-                            ChatRemoteResult::SetSessionMode { mode_id, result },
-                        );
-                    });
-                }
-                Err(error) => {
-                    publish_chat_remote_result(
-                        results,
-                        attached,
-                        ChatRemoteResult::SetSessionMode {
-                            mode_id,
-                            result: Err(format!("{error:#}")),
-                        },
-                    );
-                }
-            }
-        }
         ChatRemoteOperation::PlanCommand {
             command_id,
             original,
@@ -867,27 +815,13 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             restore_unsent_input(chat, &config_command_text(&key, &value));
             chat.set_notice(format!("Configuration was not changed: {error}"));
         }
-        ChatRemoteResult::SetSessionMode { result: Ok(()), .. } => {
-            chat.set_notice("Session mode update accepted")
-        }
-        ChatRemoteResult::SetSessionMode {
-            mode_id,
-            result: Err(error),
-        } => {
-            // The optimistic toggle never happened, so drop it rather than
-            // leave the status line claiming a mode the agent is not in.
-            chat.acp_surface.clear_current_mode();
-            chat.set_notice(format!(
-                "Session mode was not changed to {mode_id}: {error}"
-            ));
-        }
         ChatRemoteResult::PlanCommand {
             requested_active,
             result: Ok(ordinal),
             ..
         } => {
             chat.plan_command_pending = false;
-            chat.acp_surface.set_optimistic_plan_mode(requested_active);
+            chat.finish_plan_mode_change(requested_active);
             chat.set_notice(match ordinal {
                 Some(ordinal) => format!("Prompt accepted by relay at {ordinal}"),
                 None if requested_active => "Plan mode on".to_owned(),
@@ -901,8 +835,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             result: Err(error),
         } => {
             chat.plan_command_pending = false;
-            chat.acp_surface
-                .set_optimistic_plan_mode(control_applied == requested_active);
+            chat.finish_plan_mode_change(control_applied == requested_active);
             restore_unsent_input(chat, &original);
             chat.set_notice(format!("Plan command was not completed: {error}"));
         }
@@ -916,7 +849,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             ..
         } => {
             if let Some(active) = desired_plan_active {
-                chat.acp_surface.set_optimistic_plan_mode(active);
+                chat.finish_plan_mode_change(active);
             }
             chat.set_notice("Answer sent")
         }
@@ -956,14 +889,13 @@ pub(super) fn queue_chat_remote_operation(
             ChatRemoteOperation::SetConfig { key, value, .. } => {
                 restore_unsent_input(chat, &config_command_text(&key, &value));
             }
-            ChatRemoteOperation::SetSessionMode { .. } => chat.acp_surface.clear_current_mode(),
             ChatRemoteOperation::PlanCommand {
                 original,
                 requested_active,
                 ..
             } => {
                 chat.plan_command_pending = false;
-                chat.acp_surface.set_optimistic_plan_mode(!requested_active);
+                chat.finish_plan_mode_change(!requested_active);
                 restore_unsent_input(chat, &original);
             }
             ChatRemoteOperation::RespondElicitation { request, .. } => {
@@ -1009,7 +941,7 @@ mod tests {
     #[test]
     fn failed_plan_control_restores_the_full_command_and_rolls_back_mode() {
         let mut chat = crate::hel_chat::test_support::grok_chat();
-        chat.acp_surface.set_optimistic_plan_mode(true);
+        chat.finish_plan_mode_change(true);
         chat.plan_command_pending = true;
 
         apply_chat_remote_result(
@@ -1022,7 +954,7 @@ mod tests {
             },
         );
 
-        assert_eq!(chat.acp_surface.current_mode(), Some("default"));
+        assert_eq!(chat.current_mode(), Some("default"));
         assert_eq!(chat.input, "/plan inspect this");
         assert!(!chat.plan_command_pending);
     }
@@ -1042,7 +974,7 @@ mod tests {
             },
         );
 
-        assert_eq!(chat.acp_surface.current_mode(), Some("plan"));
+        assert_eq!(chat.current_mode(), Some("plan"));
         assert_eq!(chat.input, "/plan inspect this");
     }
 

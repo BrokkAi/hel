@@ -13,12 +13,20 @@ use serde_json::Value;
 
 use crate::hel_config::HarnessKind;
 
-use super::{find_session_config_option, select_contains};
+use super::{dialect::grok, find_session_config_option, select_contains};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanControl {
     SetConfig { key: String, value: String },
     SetSessionMode { mode_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanControlError {
+    DeepseekUnsupported,
+    CodexIncompatible,
+    GrokIncompatible,
+    Incompatible,
 }
 
 /// ACP controls and commands available to one live session.
@@ -31,13 +39,15 @@ pub(crate) struct AcpSessionSurface {
     agent_commands: Vec<AvailableCommand>,
     current_model: Option<String>,
     current_effort: Option<String>,
+    plan_mode_change_pending: bool,
 }
 
 impl AcpSessionSurface {
     pub(crate) fn from_configuration(configuration: &BTreeMap<String, Value>) -> Self {
         Self {
             current_mode: configuration
-                .get("mode")
+                .get("collaboration_mode")
+                .or_else(|| configuration.get("mode"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             current_model: configuration
@@ -57,28 +67,20 @@ impl AcpSessionSurface {
         self.sync_plan_mode();
     }
 
-    pub(crate) fn set_config_options(&mut self, options: &[SessionConfigOption]) -> bool {
-        let changed = self.config_options != options;
+    pub(crate) fn set_config_options(&mut self, options: &[SessionConfigOption]) {
         self.config_options = options.to_vec();
         self.current_model = config_current_value(options, "model");
         self.current_effort = config_current_value(options, "effort");
-        if changed || self.current_mode.is_none() {
-            self.sync_plan_mode();
-        }
-        changed
+        self.sync_plan_mode();
     }
 
-    pub(crate) fn set_session_modes(&mut self, modes: Option<SessionModeState>) -> bool {
-        let changed = self.session_modes != modes;
+    pub(crate) fn set_session_modes(&mut self, modes: Option<SessionModeState>) {
         self.session_modes = modes;
-        if changed || self.current_mode.is_none() {
-            self.sync_plan_mode();
-        }
-        changed
+        self.sync_plan_mode();
     }
 
     pub(crate) fn apply_current_mode_update(&mut self, mode: String) {
-        if self.harness_kind == Some(HarnessKind::Codex) {
+        if self.mode_config_key() == "collaboration_mode" {
             return;
         }
         self.current_mode = Some(mode.clone());
@@ -91,12 +93,10 @@ impl AcpSessionSurface {
         &mut self,
         configuration: &BTreeMap<String, Value>,
     ) {
-        let plan_mode_key = if self.harness_kind == Some(HarnessKind::Codex) {
-            "collaboration_mode"
-        } else {
-            "mode"
-        };
-        if let Some(mode) = configuration.get(plan_mode_key).and_then(Value::as_str) {
+        if let Some(mode) = configuration
+            .get(self.mode_config_key())
+            .and_then(Value::as_str)
+        {
             self.current_mode = Some(mode.to_owned());
         }
         self.current_model = configuration
@@ -122,14 +122,7 @@ impl AcpSessionSurface {
     pub(crate) fn advertises_command(&self, name: &str) -> bool {
         self.agent_commands
             .iter()
-            .any(|command| command.name.eq_ignore_ascii_case(name))
-    }
-
-    pub(crate) fn prompt_invokes(prompt: &str, command: &str) -> bool {
-        prompt
-            .strip_prefix('/')
-            .and_then(|prompt| prompt.strip_prefix(command))
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .any(|command| command.name == name)
     }
 
     pub(crate) fn current_model(&self) -> Option<&str> {
@@ -144,12 +137,14 @@ impl AcpSessionSurface {
         self.current_mode.as_deref()
     }
 
-    pub(crate) fn set_optimistic_plan_mode(&mut self, active: bool) {
+    pub(crate) fn begin_plan_mode_change(&mut self, active: bool) {
+        self.plan_mode_change_pending = true;
         self.current_mode = Some(if active { "plan" } else { "default" }.into());
     }
 
-    pub(crate) fn clear_current_mode(&mut self) {
-        self.current_mode = None;
+    pub(crate) fn finish_plan_mode_change(&mut self, active: bool) {
+        self.plan_mode_change_pending = false;
+        self.current_mode = Some(if active { "plan" } else { "default" }.into());
     }
 
     pub(crate) fn supports_plan_mode(&self) -> bool {
@@ -160,19 +155,17 @@ impl AcpSessionSurface {
         self.supports_plan_mode() && self.current_mode() == Some("plan")
     }
 
-    pub(crate) fn plan_control(&self, active: bool) -> Result<PlanControl, &'static str> {
+    pub(crate) fn plan_control(&self, active: bool) -> Result<PlanControl, PlanControlError> {
         let value = if active { "plan" } else { "default" };
         match self.harness_kind {
-            Some(HarnessKind::Deepseek) => Err("Plan mode is unsupported in DSH."),
+            Some(HarnessKind::Deepseek) => Err(PlanControlError::DeepseekUnsupported),
             Some(HarnessKind::Codex) => self
                 .exact_config_has_plan_pair("collaboration_mode")
                 .then(|| PlanControl::SetConfig {
                     key: "collaboration_mode".into(),
                     value: value.into(),
                 })
-                .ok_or(
-                    "This Codex ACP version does not expose collaboration_mode with plan/default values.",
-                ),
+                .ok_or(PlanControlError::CodexIncompatible),
             Some(HarnessKind::Claude | HarnessKind::Kimi) => {
                 if self.exact_config_has_plan_pair("mode") {
                     Ok(PlanControl::SetConfig {
@@ -184,12 +177,17 @@ impl AcpSessionSurface {
                         mode_id: value.into(),
                     })
                 } else {
-                    Err("This ACP harness does not expose compatible plan/default modes.")
+                    Err(PlanControlError::Incompatible)
                 }
             }
-            Some(HarnessKind::Grok) => Ok(PlanControl::SetSessionMode {
-                mode_id: value.into(),
-            }),
+            Some(harness @ HarnessKind::Grok)
+                if grok::permits_unadvertised_plan_mode(harness, value) =>
+            {
+                Ok(PlanControl::SetSessionMode {
+                    mode_id: value.into(),
+                })
+            }
+            Some(HarnessKind::Grok) => Err(PlanControlError::GrokIncompatible),
             None => {
                 if self.config_has_plan_pair("mode") {
                     Ok(PlanControl::SetConfig {
@@ -201,25 +199,30 @@ impl AcpSessionSurface {
                         mode_id: value.into(),
                     })
                 } else {
-                    Err("This ACP harness does not expose compatible plan/default modes.")
+                    Err(PlanControlError::Incompatible)
                 }
             }
         }
     }
 
     fn sync_plan_mode(&mut self) {
-        let config_key = if self.harness_kind == Some(HarnessKind::Codex) {
-            "collaboration_mode"
-        } else {
-            "mode"
-        };
-        if let Some(value) = config_current_value(&self.config_options, config_key) {
+        if self.plan_mode_change_pending {
+            return;
+        }
+        if let Some(value) = config_current_value(&self.config_options, self.mode_config_key()) {
             self.current_mode = Some(value);
         } else if self.harness_kind != Some(HarnessKind::Codex) {
             self.current_mode = self
                 .session_modes
                 .as_ref()
                 .map(|modes| modes.current_mode_id.to_string());
+        }
+    }
+
+    fn mode_config_key(&self) -> &'static str {
+        match self.harness_kind {
+            Some(HarnessKind::Codex) => "collaboration_mode",
+            _ => "mode",
         }
     }
 
@@ -255,4 +258,62 @@ pub(crate) fn config_current_value(options: &[SessionConfigOption], key: &str) -
         return None;
     };
     Some(select.current_value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_client_protocol::schema::v1::{
+        SessionConfigId, SessionConfigSelect, SessionConfigSelectOption,
+        SessionConfigSelectOptions, SessionConfigValueId,
+    };
+
+    use super::*;
+
+    fn mode_option(key: &str, current: &str) -> SessionConfigOption {
+        SessionConfigOption::new(
+            SessionConfigId::new(key),
+            "Mode",
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                SessionConfigValueId::new(current),
+                SessionConfigSelectOptions::Ungrouped(vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("plan", "Plan"),
+                ]),
+            )),
+        )
+    }
+
+    #[test]
+    fn config_churn_does_not_revert_an_in_flight_plan_change() {
+        let mut surface = AcpSessionSurface::default();
+        surface.set_harness_kind(HarnessKind::Claude);
+        surface.set_config_options(&[mode_option("mode", "default")]);
+        surface.begin_plan_mode_change(true);
+
+        let mut churned = mode_option("mode", "default");
+        churned.description = Some("metadata changed".into());
+        surface.set_config_options(&[churned]);
+
+        assert_eq!(surface.current_mode(), Some("plan"));
+        surface.finish_plan_mode_change(true);
+        assert_eq!(surface.current_mode(), Some("plan"));
+    }
+
+    #[test]
+    fn codex_uses_one_mode_key_for_snapshots_options_and_projection() {
+        let mut surface = AcpSessionSurface::from_configuration(&BTreeMap::from([
+            ("mode".into(), Value::String("default".into())),
+            ("collaboration_mode".into(), Value::String("plan".into())),
+        ]));
+        surface.set_harness_kind(HarnessKind::Codex);
+        assert_eq!(surface.current_mode(), Some("plan"));
+
+        surface.set_config_options(&[mode_option("collaboration_mode", "default")]);
+        assert_eq!(surface.current_mode(), Some("default"));
+        surface.apply_projected_configuration(&BTreeMap::from([(
+            "collaboration_mode".into(),
+            Value::String("plan".into()),
+        )]));
+        assert_eq!(surface.current_mode(), Some("plan"));
+    }
 }

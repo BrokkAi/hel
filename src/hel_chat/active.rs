@@ -1039,20 +1039,6 @@ impl ActiveChat {
                     &mut self.state,
                 );
             }
-            ChatAction::SetSessionMode { mode_id } => {
-                let Some(command_id) = self.command_id("set-session-mode") else {
-                    self.state.acp_surface.clear_current_mode();
-                    return ChatEventOutcome::Handled;
-                };
-                queue_chat_remote_operation(
-                    self.remote.operations(),
-                    ChatRemoteOperation::SetSessionMode {
-                        command_id,
-                        mode_id,
-                    },
-                    &mut self.state,
-                );
-            }
             ChatAction::PlanCommand {
                 original,
                 control,
@@ -1061,6 +1047,7 @@ impl ActiveChat {
             } => {
                 let Some(command_id) = self.command_id("plan-mode") else {
                     self.state.plan_command_pending = false;
+                    self.state.finish_plan_mode_change(!requested_active);
                     restore_unsent_input(&mut self.state, &original);
                     return ChatEventOutcome::Handled;
                 };
@@ -1395,14 +1382,11 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
 }
 
 fn prompt_title(chat: &ChatState, queued: usize) -> String {
-    let mut parts = [
-        chat.acp_surface.current_model(),
-        chat.acp_surface.current_effort(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
+    let mut parts = [chat.current_model(), chat.current_effort()]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     if chat.recovery_busy {
         parts.push("Saving checkpoint…".into());
         parts.push(format!("{queued} queued"));
@@ -1818,7 +1802,7 @@ mod tests {
     #[test]
     fn composer_title_names_plan_mode_even_during_a_turn() {
         let mut chat = crate::hel_chat::test_support::grok_chat();
-        chat.acp_surface.set_optimistic_plan_mode(true);
+        chat.finish_plan_mode_change(true);
         chat.phase = WorkerPhase::Running;
 
         assert!(prompt_title(&chat, 0).contains("Prompt — PLAN MODE"));

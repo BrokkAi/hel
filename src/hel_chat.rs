@@ -35,8 +35,9 @@ use ratatui::style::Color;
 use sha2::{Digest, Sha256};
 
 use crate::clock::epoch_seconds;
-use crate::hel_acp::surface::AcpSessionSurface;
-use crate::hel_acp::{PlanControl, RuntimeEvent};
+pub use crate::hel_acp::PlanControl;
+use crate::hel_acp::surface::{AcpSessionSurface, PlanControlError};
+use crate::hel_acp::{RuntimeEvent, plan_review_carries_native_feedback};
 use crate::hel_config::HarnessKind;
 use crate::hel_elicitation::ElicitationValue;
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
@@ -54,7 +55,7 @@ use crate::hel_worker::{
 
 use autocomplete::{
     Autocomplete, CommandChoice, ConfigValueChoice, LocalCommand, builtin_command_choices,
-    parse_local_command,
+    parse_local_command, prompt_invokes_command,
 };
 use elicitation::ElicitationDialog;
 use history::{HistorySearch, HistorySearchRequest};
@@ -110,9 +111,6 @@ pub enum ChatAction {
     SetConfig {
         key: String,
         value: String,
-    },
-    SetSessionMode {
-        mode_id: String,
     },
     PlanCommand {
         original: String,
@@ -361,7 +359,7 @@ impl ChatState {
             goal_prompt_active: snapshot
                 .active_prompt
                 .as_ref()
-                .is_some_and(|prompt| AcpSessionSurface::prompt_invokes(&prompt.text, "goal")),
+                .is_some_and(|prompt| prompt_invokes_command(&prompt.text, "goal")),
             acp_surface: AcpSessionSurface::from_configuration(&snapshot.config),
             plan_command_pending: false,
             command_choices: builtin_command_choices(),
@@ -638,11 +636,34 @@ impl ChatState {
     }
 
     fn plan_control(&self, active: bool) -> Result<PlanControl, &'static str> {
-        self.acp_surface.plan_control(active)
+        self.acp_surface
+            .plan_control(active)
+            .map_err(plan_control_error_message)
     }
 
     fn plan_mode_active(&self) -> bool {
         self.acp_surface.plan_mode_active()
+    }
+
+    pub(super) fn begin_plan_mode_change(&mut self, active: bool) {
+        self.acp_surface.begin_plan_mode_change(active);
+    }
+
+    pub(super) fn finish_plan_mode_change(&mut self, active: bool) {
+        self.acp_surface.finish_plan_mode_change(active);
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_mode(&self) -> Option<&str> {
+        self.acp_surface.current_mode()
+    }
+
+    pub(super) fn current_model(&self) -> Option<&str> {
+        self.acp_surface.current_model()
+    }
+
+    pub(super) fn current_effort(&self) -> Option<&str> {
+        self.acp_surface.current_effort()
     }
 
     fn plan_review_followup(
@@ -686,7 +707,7 @@ impl ChatState {
                 control: None,
                 // Grok carries feedback in its native response. Standard ACP
                 // permission responses cannot, so send it as the next planning turn.
-                prompt: (!request.id.starts_with("plan-review-grok-"))
+                prompt: (!plan_review_carries_native_feedback(&request.id))
                     .then_some(feedback)
                     .flatten(),
             },
@@ -729,7 +750,7 @@ impl ChatState {
 
     fn mark_prompt_submitted(&mut self, prompt: &str) {
         self.phase = WorkerPhase::Running;
-        self.goal_prompt_active = AcpSessionSurface::prompt_invokes(prompt, "goal");
+        self.goal_prompt_active = prompt_invokes_command(prompt, "goal");
         self.notices.clear();
         // Local echo: start the clock now so the header moves with the send.
         // The next materialized update replaces this with the recorded start.
@@ -1128,7 +1149,7 @@ impl ChatState {
                     };
                     self.record_prompt_history(&prompt);
                     self.clear_input();
-                    self.acp_surface.set_optimistic_plan_mode(requested);
+                    self.begin_plan_mode_change(requested);
                     self.plan_command_pending = true;
                     self.set_notice(if requested {
                         "Plan mode on"
@@ -1168,7 +1189,7 @@ impl ChatState {
                     };
                     self.record_prompt_history(&prompt);
                     self.clear_input();
-                    self.acp_surface.set_optimistic_plan_mode(false);
+                    self.begin_plan_mode_change(false);
                     self.plan_command_pending = true;
                     ChatAction::PlanCommand {
                         original: prompt,
@@ -1754,6 +1775,21 @@ impl ChatState {
         let mut entry = ChatEntry::plain(seq, role, text).with_recorded_at(recorded_at_ms);
         entry.message_id = message_id;
         self.entries.push(entry);
+    }
+}
+
+fn plan_control_error_message(error: PlanControlError) -> &'static str {
+    match error {
+        PlanControlError::DeepseekUnsupported => "Plan mode is unsupported in DSH.",
+        PlanControlError::CodexIncompatible => {
+            "This Codex ACP version does not expose collaboration_mode with plan/default values."
+        }
+        PlanControlError::GrokIncompatible => {
+            "This Grok Build version does not expose compatible plan/default modes."
+        }
+        PlanControlError::Incompatible => {
+            "This ACP harness does not expose compatible plan/default modes."
+        }
     }
 }
 
@@ -2715,7 +2751,7 @@ mod tests {
     #[test]
     fn implement_exits_plan_mode_before_submitting_the_instruction() {
         let mut chat = grok_chat();
-        chat.acp_surface.set_optimistic_plan_mode(true);
+        chat.finish_plan_mode_change(true);
         chat.set_input("/implement start with the parser".into());
         assert_eq!(
             chat.submit_input(),
@@ -2733,7 +2769,7 @@ mod tests {
     #[test]
     fn plan_review_choices_have_distinct_followup_directions() {
         let mut chat = grok_chat();
-        chat.acp_surface.set_optimistic_plan_mode(true);
+        chat.finish_plan_mode_change(true);
         let standard = ElicitationRequest {
             id: "plan-review-1".into(),
             message: "review".into(),

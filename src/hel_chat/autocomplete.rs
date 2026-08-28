@@ -292,10 +292,7 @@ pub(super) fn builtin_command_choices() -> Vec<CommandChoice> {
 }
 
 pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
-    let command = prompt.strip_prefix('/')?;
-    let (name, args) = command
-        .split_once(char::is_whitespace)
-        .map_or((command, ""), |(name, args)| (name, args.trim()));
+    let (name, args) = parse_slash_command(prompt)?;
     let command = match name {
         "help" => LocalCommand::Help,
         "detach" => LocalCommand::Detach,
@@ -306,6 +303,19 @@ pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> 
         _ => return None,
     };
     Some((command, args))
+}
+
+pub(super) fn prompt_invokes_command(prompt: &str, expected: &str) -> bool {
+    parse_slash_command(prompt).is_some_and(|(name, _)| name == expected)
+}
+
+fn parse_slash_command(prompt: &str) -> Option<(&str, &str)> {
+    let command = prompt.strip_prefix('/')?;
+    Some(
+        command
+            .split_once(char::is_whitespace)
+            .map_or((command, ""), |(name, args)| (name, args.trim())),
+    )
 }
 
 fn find_config_option<'a>(
@@ -439,6 +449,9 @@ mod tests {
         assert_eq!(parse_local_command("/checkpoint before refactor"), None);
         assert_eq!(parse_local_command("/checkpointing"), None);
         assert_eq!(parse_local_command("explain /checkpoint"), None);
+        assert!(prompt_invokes_command("/goal finish it", "goal"));
+        assert!(!prompt_invokes_command("/Goal finish it", "goal"));
+        assert!(!prompt_invokes_command("/goalkeeper", "goal"));
     }
 
     #[test]

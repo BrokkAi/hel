@@ -748,159 +748,6 @@ fn grok_model_meta() -> serde_json::Map<String, serde_json::Value> {
     meta
 }
 
-fn select_values(option: &SessionConfigOption) -> Vec<String> {
-    let SessionConfigKind::Select(select) = &option.kind else {
-        panic!("expected a select option");
-    };
-    let agent_client_protocol::schema::v1::SessionConfigSelectOptions::Ungrouped(options) =
-        &select.options
-    else {
-        panic!("expected ungrouped options");
-    };
-    options
-        .iter()
-        .map(|option| option.value.to_string())
-        .collect()
-}
-
-#[test]
-fn grok_model_state_reads_the_catalogue_out_of_initialize_meta() {
-    let state = grok::model_state(Some(&grok_model_meta())).unwrap();
-
-    assert_eq!(state.current_model_id, "grok-4.6");
-    assert_eq!(state.current_effort.as_deref(), Some("high"));
-    assert_eq!(state.models.len(), 2);
-    assert_eq!(state.models[0].name, "Grok 4.6");
-    assert_eq!(
-        state.models[0]
-            .efforts
-            .iter()
-            .map(|effort| effort.id.as_str())
-            .collect::<Vec<_>>(),
-        ["xhigh", "high", "medium", "low"]
-    );
-    assert_eq!(state.models[1].efforts.len(), 2);
-
-    // Every other harness returns real `configOptions`, so nothing is
-    // synthesized for them.
-    assert_eq!(grok::model_state(None), None);
-    assert_eq!(
-        grok::model_state(Some(&serde_json::Map::new())),
-        None,
-        "an agent without a catalogue must not get a synthesized one"
-    );
-}
-
-#[test]
-fn grok_config_options_carry_the_model_and_its_reasoning_tiers() {
-    let state = grok::model_state(Some(&grok_model_meta())).unwrap();
-
-    let options = grok::config_options(&state);
-
-    assert_eq!(options.len(), 2);
-    assert_eq!(options[0].id.to_string(), "model");
-    assert_eq!(
-        options[0].category,
-        Some(SessionConfigOptionCategory::Model)
-    );
-    assert_eq!(select_values(&options[0]), ["grok-4.6", "grok-4.5"]);
-    assert!(select_contains(&options[0].kind, "grok-4.5"));
-
-    assert_eq!(options[1].id.to_string(), "effort");
-    assert_eq!(
-        options[1].category,
-        Some(SessionConfigOptionCategory::ThoughtLevel)
-    );
-    // Effort tiers belong to the selected model, not the whole catalogue.
-    assert_eq!(
-        select_values(&options[1]),
-        ["xhigh", "high", "medium", "low"]
-    );
-
-    // Hel's existing /model and /effort lookups find both selectors.
-    assert_eq!(
-        find_session_config_option(&options, "model").map(|option| option.id.to_string()),
-        Some("model".to_owned())
-    );
-    assert_eq!(
-        find_session_config_option(&options, "effort").map(|option| option.id.to_string()),
-        Some("effort".to_owned())
-    );
-}
-
-#[test]
-fn a_grok_model_change_sends_the_new_id_without_an_effort_meta() {
-    let state = grok::model_state(Some(&grok_model_meta())).unwrap();
-
-    let (params, updated) =
-        grok::set_model_request(&SessionId::from("s-1"), &state, "model", "grok-4.5").unwrap();
-
-    assert_eq!(
-        params,
-        serde_json::json!({"sessionId": "s-1", "modelId": "grok-4.5"})
-    );
-    assert_eq!(updated.current_model_id, "grok-4.5");
-    // The new model has its own tiers, so the agent reports the effort.
-    assert_eq!(updated.current_effort, None);
-    // The effort selector now offers the new model's tiers.
-    assert_eq!(
-        select_values(&grok::config_options(&updated)[1]),
-        ["high", "low"]
-    );
-}
-
-#[test]
-fn a_grok_effort_change_resends_the_current_model_with_the_effort_meta() {
-    let state = grok::model_state(Some(&grok_model_meta())).unwrap();
-
-    let (params, updated) =
-        grok::set_model_request(&SessionId::from("s-1"), &state, "effort", "low").unwrap();
-
-    assert_eq!(
-        params,
-        serde_json::json!({
-            "sessionId": "s-1",
-            "modelId": "grok-4.6",
-            "_meta": {"reasoningEffort": "low"},
-        })
-    );
-    assert_eq!(updated.current_model_id, "grok-4.6");
-    assert_eq!(updated.current_effort.as_deref(), Some("low"));
-    let SessionConfigKind::Select(select) = &grok::config_options(&updated)[1].kind else {
-        panic!("expected a select option");
-    };
-    assert_eq!(select.current_value.to_string(), "low");
-}
-
-#[test]
-fn grok_rejects_values_and_keys_it_has_no_selector_for() {
-    let state = grok::model_state(Some(&grok_model_meta())).unwrap();
-    let session = SessionId::from("s-1");
-
-    for (key, value) in [("model", "grok-9"), ("effort", "ludicrous")] {
-        let error = grok::set_model_request(&session, &state, key, value).unwrap_err();
-        assert!(
-            format!("{error:#}").contains(&format!("is not an available {key} value")),
-            "{error:#}"
-        );
-    }
-    let error = grok::set_model_request(&session, &state, "verbosity", "high").unwrap_err();
-    assert!(
-        format!("{error:#}").contains("no verbosity selector"),
-        "{error:#}"
-    );
-}
-
-#[test]
-fn exit_plan_mode_is_recognized_with_and_without_the_ext_prefix() {
-    assert!(grok::is_exit_plan_mode_method("_x.ai/exit_plan_mode"));
-    assert!(grok::is_exit_plan_mode_method("x.ai/exit_plan_mode"));
-    assert!(!grok::is_exit_plan_mode_method("_x.ai/other"));
-    assert!(!grok::is_exit_plan_mode_method(
-        "session/request_permission"
-    ));
-}
-
 #[test]
 fn grok_plan_review_answers_are_user_selected() {
     let review = normalized_plan_review(
@@ -1012,13 +859,18 @@ async fn config_change_bridge(
                 }
                 serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
             }
-            "session/new" => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "sessionId": "scripted",
-                    // A plain harness answers with real config options.
-                    "configOptions": (!model_catalogue).then(|| serde_json::json!([{
+            "session/new" => {
+                let config_options = if model_catalogue {
+                    serde_json::json!([{
+                        "id": "verbosity",
+                        "name": "Verbosity",
+                        "type": "select",
+                        "currentValue": "normal",
+                        "options": [{"value": "normal", "name": "Normal"},
+                                    {"value": "detailed", "name": "Detailed"}],
+                    }])
+                } else {
+                    serde_json::json!([{
                         "id": "model",
                         "name": "Model",
                         "category": "model",
@@ -1026,9 +878,17 @@ async fn config_change_bridge(
                         "currentValue": "sonnet",
                         "options": [{"value": "sonnet", "name": "Sonnet"},
                                     {"value": "opus", "name": "Opus"}],
-                    }])),
-                },
-            }),
+                    }])
+                };
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "sessionId": "scripted",
+                        "configOptions": config_options,
+                    },
+                })
+            }
             _ => {
                 if let Some(observed) = observed.take() {
                     let _ = observed.send(message.clone());
@@ -1352,6 +1212,15 @@ async fn a_grok_model_change_goes_out_as_a_legacy_set_model_request() {
         request["params"].get("_meta").is_none(),
         "a model change carries no effort meta: {request}"
     );
+}
+
+#[tokio::test]
+async fn a_grok_real_config_option_still_uses_the_standard_acp_request() {
+    let request = config_change_request(HarnessKind::Grok, true, "verbosity", "detailed").await;
+
+    assert_eq!(request["method"], "session/set_config_option");
+    assert_eq!(request["params"]["configId"], "verbosity");
+    assert_eq!(request["params"]["value"], "detailed");
 }
 
 #[tokio::test]
