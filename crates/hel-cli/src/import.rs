@@ -416,8 +416,16 @@ pub(crate) enum DashboardImportUpdate {
     Finished {
         task_id: u64,
         pending: PendingDashboardImport,
-        result: Result<DashboardImportTaskResult>,
+        result: Box<Result<DashboardImportTaskResult>>,
     },
+}
+
+pub(crate) struct DashboardImportRequest {
+    pub(crate) workspace_id: String,
+    pub(crate) pending: PendingDashboardImport,
+    pub(crate) safety: DashboardImportSafety,
+    pub(crate) task_id: u64,
+    pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 pub(crate) fn discover_import_profile(
@@ -496,14 +504,17 @@ fn display_home_relative(path: &std::path::Path) -> String {
 
 pub(crate) fn spawn_dashboard_import(
     controller: &Controller,
-    workspace_id: String,
-    pending: PendingDashboardImport,
-    safety: DashboardImportSafety,
-    task_id: u64,
-    cancelled: Arc<AtomicBool>,
+    request: DashboardImportRequest,
     updates: tokio::sync::mpsc::Sender<DashboardImportUpdate>,
     tracker: crate::dashboard::CriticalOperationTracker,
 ) {
+    let DashboardImportRequest {
+        workspace_id,
+        pending,
+        safety,
+        task_id,
+        cancelled,
+    } = request;
     let guard = tracker.begin_cancellable("importing session", cancelled.clone());
     let worker_controller = Controller {
         config: controller.config.clone(),
@@ -580,7 +591,7 @@ pub(crate) fn spawn_dashboard_import(
         if let Err(error) = updates.blocking_send(DashboardImportUpdate::Finished {
             task_id,
             pending,
-            result,
+            result: Box::new(result),
         }) {
             tracing::debug!(task_id, %error, "import completion consumer closed");
         }

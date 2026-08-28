@@ -136,11 +136,11 @@ pub(crate) fn select_workspace(
                 KeyCode::Char(character)
                     if !key
                         .modifiers
-                        .intersects(crossterm::event::KeyModifiers::CONTROL) =>
+                        .intersects(crossterm::event::KeyModifiers::CONTROL)
+                        && input.chars().count() < 64
+                        && !character.is_control() =>
                 {
-                    if input.chars().count() < 64 && !character.is_control() {
-                        input.push(character);
-                    }
+                    input.push(character);
                 }
                 _ => {}
             }

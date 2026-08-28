@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -156,6 +157,7 @@ struct Attachment {
 struct RuntimeState {
     attachments: Mutex<BTreeMap<String, Attachment>>,
     phone_status: Mutex<String>,
+    ever_attached: AtomicBool,
 }
 
 impl RuntimeState {
@@ -232,16 +234,21 @@ fn write_metadata(path: &Path, metadata: &DaemonMetadata) -> Result<()> {
 }
 
 fn read_metadata() -> Result<DaemonMetadata> {
-    let path = metadata_path();
-    let body = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let metadata: DaemonMetadata =
-        serde_json::from_slice(&body).with_context(|| format!("parse {}", path.display()))?;
+    let metadata = read_metadata_any()?;
     ensure!(
         metadata.protocol_version == PROTOCOL_VERSION,
         "daemon protocol {} is incompatible with client protocol {}",
         metadata.protocol_version,
         PROTOCOL_VERSION
     );
+    Ok(metadata)
+}
+
+fn read_metadata_any() -> Result<DaemonMetadata> {
+    let path = metadata_path();
+    let body = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let metadata: DaemonMetadata =
+        serde_json::from_slice(&body).with_context(|| format!("parse {}", path.display()))?;
     Ok(metadata)
 }
 
@@ -413,6 +420,11 @@ pub(crate) async fn connect_existing() -> Result<DaemonClient> {
 }
 
 pub(crate) async fn connect_or_start() -> Result<DaemonClient> {
+    if let Ok(metadata) = read_metadata_any()
+        && metadata.protocol_version != PROTOCOL_VERSION
+    {
+        stop_incompatible_daemon(&metadata).await?;
+    }
     if let Ok(mut client) = connect_existing().await
         && matches!(
             client.request(DaemonAction::Ping).await,
@@ -425,7 +437,7 @@ pub(crate) async fn connect_or_start() -> Result<DaemonClient> {
     let executable = std::env::current_exe().context("find current Hel executable")?;
     let mut command = std::process::Command::new(executable);
     command.arg("daemon-run");
-    let _pid = hel::hel_subprocess::spawn_detached(&mut command)?;
+    let _pid = hel::hel_subprocess::spawn_detached(&mut command, &data_dir().join("daemon.log"))?;
 
     let deadline = Instant::now() + START_TIMEOUT;
     let mut last_error = None;
@@ -440,8 +452,61 @@ pub(crate) async fn connect_or_start() -> Result<DaemonClient> {
         }
         tokio::time::sleep(RETRY_DELAY).await;
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("Hel daemon did not become ready")))
-        .context("start Hel daemon")
+    Err(last_error.unwrap_or_else(|| anyhow!("Hel daemon did not become ready"))).with_context(
+        || {
+            format!(
+                "start Hel daemon; details are in {}",
+                data_dir().join("daemon.log").display()
+            )
+        },
+    )
+}
+
+async fn stop_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(metadata.pid)]),
+            true,
+        );
+        let daemon_executable = system
+            .process(sysinfo::Pid::from_u32(metadata.pid))
+            .and_then(sysinfo::Process::exe)
+            .and_then(|path| fs::canonicalize(path).ok());
+        let current_executable = std::env::current_exe()
+            .ok()
+            .and_then(|path| fs::canonicalize(path).ok());
+        ensure!(
+            daemon_executable.is_some() && daemon_executable == current_executable,
+            "refusing to signal stale daemon PID {} because it is not this Hel executable",
+            metadata.pid
+        );
+        // SAFETY: the PID comes from owner-only daemon metadata and SIGTERM is
+        // handled as graceful cancellation by every supported daemon.
+        let result = unsafe { libc::kill(metadata.pid as libc::pid_t, libc::SIGTERM) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).context("stop incompatible Hel daemon");
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_is_alive(metadata.pid) {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+        ensure!(
+            !process_is_alive(metadata.pid),
+            "incompatible Hel daemon {} did not stop",
+            metadata.pid
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        bail!("stop the incompatible Hel daemon, then retry")
+    }
 }
 
 pub(crate) fn maintain_attachment(
@@ -500,6 +565,9 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
 
     let state = Arc::new(RuntimeState::default());
     let cancellation = hel::termination::Coordinator::install().token();
+    let exit_when_idle = std::env::var_os("HEL_DAEMON_EXIT_WHEN_IDLE").is_some();
+    let mut idle_tick = tokio::time::interval(Duration::from_millis(100));
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if config.phone.enabled {
         spawn_phone_server(config.phone, cancellation.clone(), state.clone());
     } else {
@@ -508,6 +576,12 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => break,
+            _ = idle_tick.tick(), if exit_when_idle && state.ever_attached.load(Ordering::Acquire) => {
+                state.prune_dead_clients();
+                if state.attachments().is_empty() {
+                    break;
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("accept Hel daemon client")?;
                 if !peer.ip().is_loopback() {
@@ -540,8 +614,12 @@ fn spawn_phone_server(
 ) {
     tokio::spawn(async move {
         loop {
-            state.set_phone_status(format!("starting on {}", config.bind));
-            match crate::server::run_server((&config).into(), cancellation.clone()).await {
+            let reporter = {
+                let state = state.clone();
+                move |status| state.set_phone_status(status)
+            };
+            match crate::server::run_server((&config).into(), cancellation.clone(), reporter).await
+            {
                 Ok(()) if cancellation.is_cancelled() => return,
                 Ok(()) => state.set_phone_status("stopped unexpectedly"),
                 Err(error) => {
@@ -699,6 +777,7 @@ async fn handle_action(
                 .is_none_or(|previous| {
                     previous.workspace_id != workspace_id || previous.pid != pid
                 });
+            state.ever_attached.store(true, Ordering::Release);
             if changed {
                 blocking(move || hel::hel_database::touch_workspace(&workspace_id)).await?;
             }

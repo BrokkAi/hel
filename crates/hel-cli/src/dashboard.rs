@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
 use hel::hel_credentials::CredentialSyncHandle;
@@ -49,8 +49,8 @@ use crate::dashboard::io::{
     spawn_stored_session_summary,
 };
 use crate::import::{
-    DashboardImportTaskResult, DashboardImportUpdate, PendingDashboardImport,
-    spawn_dashboard_import,
+    DashboardImportRequest, DashboardImportTaskResult, DashboardImportUpdate,
+    PendingDashboardImport, spawn_dashboard_import,
 };
 use crate::pollers::{
     CapacityPollUpdate, CredentialSyncNotices, CredentialSyncSignalTracker, Feed, LifecycleUpdate,
@@ -351,8 +351,15 @@ pub(super) fn retain_workspace_sessions(
         .sessions
         .retain(|session_id, _| session_ids.contains(session_id));
     for session in controller.state.sessions.values_mut() {
-        session.viewed_through_event_ordinal =
+        let frontier =
             hel::hel_database::client_read_frontier(client_id, workspace_id, &session.id)?;
+        hel::hel_database::advance_client_read_frontier(
+            client_id,
+            workspace_id,
+            &session.id,
+            frontier,
+        )?;
+        session.viewed_through_event_ordinal = frontier;
     }
     Ok(())
 }
@@ -412,7 +419,11 @@ pub(crate) async fn run_dashboard_for_workspace(
                 // that asks for work ends the batch so that dispatch still
                 // follows input order.
                 loop {
-                    let batched = match (context.view, context.active_chat.as_mut()) {
+                    let batched = if workspace_picker_event(&event) {
+                        action = DashboardAction::OpenWorkspacePicker;
+                        false
+                    } else {
+                        match (context.view, context.active_chat.as_mut()) {
                         (View::Chat, Some(chat)) => {
                             chat_outcome = chat.handle_event(event);
                             matches!(chat_outcome, hel::hel_chat::ChatEventOutcome::None)
@@ -421,6 +432,7 @@ pub(crate) async fn run_dashboard_for_workspace(
                             action = dashboard_event_action(&mut context.dashboard, event);
                             context.controller_changed = true;
                             matches!(action, DashboardAction::None)
+                        }
                         }
                     };
                     if !batched {
@@ -675,7 +687,12 @@ impl DashboardContext {
     fn open(workspace_id: &str, client_id: &str) -> Result<Option<Self>> {
         let mut controller = Controller::load()?;
         retain_workspace_sessions(&mut controller, workspace_id, client_id)?;
-        let greeting = startup_greeting(&controller);
+        let workspace_name = hel::hel_database::list_workspaces()?
+            .into_iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("unknown workspace {workspace_id:?}"))?
+            .name;
+        let greeting = format!("{workspace_name}  ·  {}", startup_greeting(&controller));
         let mut dashboard = DashboardState::new(
             controller.config.clone(),
             controller.state.clone(),
@@ -1375,7 +1392,7 @@ impl DashboardContext {
                         continue;
                     }
                     self.active_import = None;
-                    match result {
+                    match *result {
                         Ok(DashboardImportTaskResult::NeedsBundle(prompt)) => {
                             self.pending_import = Some(pending);
                             self.dashboard.show_import_bundle_confirmation(
@@ -1483,11 +1500,13 @@ impl DashboardContext {
         });
         spawn_dashboard_import(
             &self.controller,
-            self.workspace_id.clone(),
-            pending,
-            safety,
-            self.next_import_task_id,
-            cancelled,
+            DashboardImportRequest {
+                workspace_id: self.workspace_id.clone(),
+                pending,
+                safety,
+                task_id: self.next_import_task_id,
+                cancelled,
+            },
             self.import_task_tx.clone(),
             self.critical_operations.clone(),
         );
@@ -1555,11 +1574,13 @@ impl DashboardContext {
         record_chat_detach_state(
             &mut self.controller,
             &mut self.dashboard,
-            &self.client_id,
-            &self.workspace_id,
-            &session_id,
-            last_seen_event_ordinal,
-            &draft,
+            DetachedChatState {
+                client_id: &self.client_id,
+                workspace_id: &self.workspace_id,
+                session_id: &session_id,
+                event_ordinal: last_seen_event_ordinal,
+                draft: &draft,
+            },
             &self.dashboard_io_tx,
             self.critical_operations.clone(),
         )
@@ -1586,34 +1607,40 @@ async fn next_terminal_event(
 ///
 /// The returned handle lets the quit path wait for the write. `None` means
 /// nothing was queued.
+struct DetachedChatState<'a> {
+    client_id: &'a str,
+    workspace_id: &'a str,
+    session_id: &'a str,
+    event_ordinal: u64,
+    draft: &'a str,
+}
+
 fn record_chat_detach_state(
     controller: &mut Controller,
     dashboard: &mut DashboardState,
-    client_id: &str,
-    workspace_id: &str,
-    session_id: &str,
-    event_ordinal: u64,
-    draft: &str,
+    detached: DetachedChatState<'_>,
     updates: &UnboundedSender<DashboardIoUpdate>,
     tracker: CriticalOperationTracker,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(session) = controller.state.sessions.get_mut(session_id) else {
+    let Some(session) = controller.state.sessions.get_mut(detached.session_id) else {
         dashboard.set_notice(format!(
             "Could not save draft and read status for {}: unknown session",
-            short_id(session_id)
+            short_id(detached.session_id)
         ));
         return None;
     };
-    session.viewed_through_event_ordinal = session.viewed_through_event_ordinal.max(event_ordinal);
-    session.draft_input = draft.to_owned();
+    session.viewed_through_event_ordinal = session
+        .viewed_through_event_ordinal
+        .max(detached.event_ordinal);
+    session.draft_input = detached.draft.to_owned();
     dashboard.set_state(controller.state.clone());
     dashboard.clear_notice();
     Some(io::spawn_detached_session_state_persist(
-        client_id.to_owned(),
-        workspace_id.to_owned(),
-        session_id.to_owned(),
-        event_ordinal,
-        draft.to_owned(),
+        detached.client_id.to_owned(),
+        detached.workspace_id.to_owned(),
+        detached.session_id.to_owned(),
+        detached.event_ordinal,
+        detached.draft.to_owned(),
         updates.clone(),
         tracker,
     ))
@@ -1633,6 +1660,20 @@ fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> Dashb
         // Resize and focus changes only need the redraw.
         _ => DashboardAction::None,
     }
+}
+
+fn workspace_picker_event(event: &Event) -> bool {
+    let Event::Key(key) = event else {
+        return false;
+    };
+    let accelerator = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && key.modifiers.contains(accelerator)
+        && key.code == KeyCode::Char('w')
 }
 
 pub(super) fn apply_recovery_result_loaded(

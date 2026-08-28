@@ -283,6 +283,7 @@ impl PhoneActionControl {
 pub(crate) async fn run_server(
     args: ServerArgs,
     termination: tokio_util::sync::CancellationToken,
+    report_status: impl FnOnce(String),
 ) -> Result<()> {
     let bind = args.bind.parse().context("parse --bind socket address")?;
     let mut controller = Controller::load()?;
@@ -343,6 +344,10 @@ pub(crate) async fn run_server(
     let mut credential_sync_notices = CredentialSyncNotices::default();
     let mut options =
         ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx, receipt_tx)?;
+    report_status(format!(
+        "starting on {bind}; viewer code {}",
+        options.viewer_code()
+    ));
     options.shutdown = termination.clone();
     // Session cookies are stateless, so a per-process key would sign every
     // phone out on every restart. Delete the key file to sign them out on
@@ -541,6 +546,12 @@ pub(crate) async fn run_server(
                                         &persisted_session_id,
                                         through,
                                     )
+                                    .and_then(|_| {
+                                        hel::hel_database::advance_viewed_through_event_ordinal(
+                                            &persisted_session_id,
+                                            through,
+                                        )
+                                    })
                                 })
                                 .await;
                                 let result = match joined {

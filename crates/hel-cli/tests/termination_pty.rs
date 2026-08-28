@@ -136,6 +136,7 @@ struct DashboardPty {
     _storage: tempfile::TempDir,
     master: File,
     slave: File,
+    original_termios: libc::termios,
     child: ReapChild,
 }
 
@@ -188,8 +189,9 @@ image = "ubuntu:24.04"
         0,
         "create PTY"
     );
-    let master = unsafe { File::from_raw_fd(master_fd) };
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let original_termios = termios(slave.as_raw_fd());
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "read PTY master flags");
     assert_eq!(
@@ -204,7 +206,8 @@ image = "ubuntu:24.04"
         .stdout(Stdio::from(duplicate(slave.as_raw_fd())))
         .stderr(Stdio::from(duplicate(slave.as_raw_fd())))
         .env("HEL_CONFIG_DIR", config_root.join("hel"))
-        .env("HEL_DATA_DIR", storage.path().join("data/hel"));
+        .env("HEL_DATA_DIR", storage.path().join("data/hel"))
+        .env("HEL_DAEMON_EXIT_WHEN_IDLE", "1");
     // Libtest may alter its signal mask. A real `hel` invocation should start
     // with SIGTERM unmasked, so establish that condition across exec.
     unsafe {
@@ -224,10 +227,21 @@ image = "ubuntu:24.04"
         });
     }
     let child = command.spawn().expect("spawn hel PTY helper");
+    let mut startup = Vec::new();
+    wait_for_output(
+        &mut master,
+        &mut startup,
+        b"Workspaces",
+        Instant::now() + TIMEOUT,
+    );
+    master
+        .write_all(b"\r\r")
+        .expect("accept suggested workspace name");
     DashboardPty {
         _storage: storage,
         master,
         slave,
+        original_termios,
         child: ReapChild(Some(child)),
     }
 }
@@ -238,9 +252,9 @@ fn sigterm_restores_real_pty_terminal() {
         _storage,
         mut master,
         slave,
+        original_termios: before,
         mut child,
     } = spawn_dashboard_pty();
-    let before = termios(slave.as_raw_fd());
 
     let mut output = Vec::new();
     wait_for_output(
@@ -291,9 +305,9 @@ fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
         _storage,
         mut master,
         slave,
+        original_termios: before,
         mut child,
     } = spawn_dashboard_pty();
-    let before = termios(slave.as_raw_fd());
     let mut output = Vec::new();
     wait_for_output(
         &mut master,

@@ -2,7 +2,7 @@
 //!
 //! This file owns the command-line surface and the one-shot subcommands. The
 //! long-running surfaces live beside it: [`dashboard`] drives the terminal UI,
-//! [`server`] the phone-oriented remote control, [`pollers`] the background
+//! [`server`] implements the daemon-owned phone control, [`pollers`] the background
 //! feeds both of them read, and [`import`] session adoption.
 
 mod daemon;
@@ -451,10 +451,12 @@ async fn run_workspace_dashboard(
 ) -> Result<DashboardExit> {
     let mut daemon = daemon::connect_or_start().await?;
     let mut workspaces = daemon.list_workspaces().await?;
-    let selected = if let Some(requested) = requested_workspace {
+    let selected = if let Some(requested) = requested_workspace.filter(|_| !force_selector) {
         workspaces
             .iter()
-            .find(|candidate| candidate.workspace.name.eq_ignore_ascii_case(requested))
+            .find(|candidate| {
+                candidate.workspace.name.to_lowercase() == requested.trim().to_lowercase()
+            })
             .map(|candidate| candidate.workspace.id.clone())
             .with_context(|| format!("unknown workspace {requested:?}"))?
     } else if !force_selector && workspaces.len() == 1 && workspaces[0].attached_pids.is_empty() {
@@ -547,7 +549,9 @@ async fn resolve_store_workspace(requested: Option<&str>) -> Result<String> {
     if let Some(requested) = requested {
         return workspaces
             .iter()
-            .find(|candidate| candidate.workspace.name.eq_ignore_ascii_case(requested))
+            .find(|candidate| {
+                candidate.workspace.name.to_lowercase() == requested.trim().to_lowercase()
+            })
             .map(|candidate| candidate.workspace.id.clone())
             .with_context(|| format!("unknown workspace {requested:?}"));
     }
@@ -679,7 +683,7 @@ async fn login(args: LoginArgs) -> Result<()> {
     let (after, _) = hel::hel_credentials::read_credential_file(profile.kind, &marker)?;
     if after.present && after.fingerprint != before.fingerprint {
         println!(
-            "Credentials updated for profile {profile_id}. Live sessions pick them up within about a minute while the Hel TUI or server is running."
+            "Credentials updated for profile {profile_id}. Live sessions pick them up within about a minute while the Hel daemon is running."
         );
     } else {
         println!("Credentials for profile {profile_id} are unchanged.");

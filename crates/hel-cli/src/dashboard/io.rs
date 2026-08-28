@@ -616,6 +616,12 @@ pub(crate) fn spawn_detached_session_state_persist(
                 &persisted_session_id,
                 event_ordinal,
             )
+            .and_then(|_| {
+                hel::hel_database::advance_viewed_through_event_ordinal(
+                    &persisted_session_id,
+                    event_ordinal,
+                )
+            })
             .map(|_| ());
             // Save the draft even when the receipt was rejected: losing typed
             // text is worse than an out-of-date read marker.
@@ -653,6 +659,12 @@ pub(crate) fn spawn_read_receipt_persist(
                 &persisted_session_id,
                 through,
             )
+            .and_then(|_| {
+                hel::hel_database::advance_viewed_through_event_ordinal(
+                    &persisted_session_id,
+                    through,
+                )
+            })
         },
         move |result| DashboardIoUpdate::ReadReceipt { session_id, result },
     );

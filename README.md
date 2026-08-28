@@ -25,7 +25,7 @@ Hel exists for the second case.
   rotating OAuth tokens across every live session within about a minute, and
   structurally excludes credentials from event streams and recovery archives.
 - **One view of capacity.** Sessions, per-profile quota and usage, and host
-  capacity in one dashboard — and on your phone through `hel server`.
+  capacity in one dashboard — and on your phone through the persistent Hel daemon.
 - **Agents can operate it.** `hel doctor --json` and `hel setup instructions`
   are designed so your coding agent can converge a host to session-ready by
   looping on machine-readable checks.
@@ -128,7 +128,7 @@ to build your own.
 
 ## Quickstart
 
-1. Run `hel`. The first run opens a plain-terminal setup dialog: it finds your
+1. Run `hel`. The first run creates a named workspace and opens a plain-terminal setup dialog: it finds your
    local harness homes, checks that credentials look present, detects the
    current GitHub repository, recommends a container runtime, and writes
    `config.toml` after you confirm.
@@ -138,8 +138,8 @@ to build your own.
 3. In the dashboard, create a session: pick a profile, a repository bundle,
    and a target, then send your first prompt.
 4. Detach whenever you like (`Ctrl+Q`). The session keeps running and your
-   queued prompts keep executing. Reattach from the dashboard, or run
-   `hel server` and drive it from your phone.
+   queued prompts keep executing. Reattach from the dashboard, or enable
+   `[phone]` and drive every workspace from the daemon's phone viewer.
 
 In an attached TUI or the phone viewer, start a message with `!` to run the
 rest as `bash -lc` inside that session's target. Shell commands run in the
@@ -154,6 +154,10 @@ setup; everything beyond that is edited in TOML. A minimal example:
 
 ```toml
 version = 1
+
+[phone]
+enabled = true
+bind = "127.0.0.1:3765"
 
 [profiles.codex-1]
 kind = "codex"
@@ -214,9 +218,9 @@ Target prerequisites and full option lists are covered in
   LFS is not supported through the bridge.
 - Attached directories reject symbolic links, so an attachment cannot escape
   its source or destination tree.
-- `hel server` binds only to loopback unless you configure TLS directly. The
-  phone viewer authenticates with a code shown at server start, exchanged for
-  a signed session cookie.
+- The daemon's phone service binds only to loopback unless `tls_cert` and
+  `tls_key` are configured. `hel daemon status` shows its viewer code; the code
+  is exchanged for a signed session cookie.
 
 ## Durability
 
