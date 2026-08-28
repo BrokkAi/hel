@@ -21,14 +21,15 @@ use crate::hel_state::{
 };
 use crate::hel_targets::{
     self, AdditionalMount, CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec,
-    ProcessExecutor, ProvisionStage,
+    ProcessExecutor, ProvisionStage, ProvisionStageGuard,
 };
 use crate::hel_worker::RelayCommand;
 
 use super::backend::{backend_locator, controller_github_token, validate_resource_allocation};
 use super::checkpoint::upload_checkpoint_spec;
 use super::provisioning::{
-    LocalBootstrap, ProvisioningFailureDisposition, StagedExecutor, install_attached_resources,
+    LocalBootstrap, ProvisioningFailureDisposition, StagedExecutor, execute_concurrent_lanes,
+    install_attached_resources,
 };
 use super::readiness::{connect_started_worker, wait_for_native_session};
 use super::worker_binary::{start_worker, worker_probe_diagnosis};
@@ -882,9 +883,6 @@ impl Controller {
                 ProvisioningFailureDisposition::Preserve,
             )
             .await?;
-            // Everything from here to the daemon launch moves data into the
-            // target, so it reports as Sync. Start begins at start_worker.
-            let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
             let (backend, worker_root) = self.worker_placement(session_id)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &resumed_project_directory {
@@ -942,19 +940,22 @@ impl Controller {
             // frontier no journal can support. This runs before the worker
             // binary is installed: a surviving daemon still holds the old one
             // open, and the install would land on a running executable.
-            if let Some(command) = hel_targets::clear_relay_state_plan(&backend, session_id)? {
-                execute_checked(syncing, command)?;
+            {
+                let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
+                if let Some(command) = hel_targets::clear_relay_state_plan(&backend, session_id)? {
+                    execute_checked(syncing, command)?;
+                }
+                // Both lanes below write into the worker root, so it exists first.
+                execute_checked(
+                    syncing,
+                    hel_targets::command_on_locator(
+                        &backend,
+                        session_id,
+                        vec!["mkdir".into(), "-p".into(), worker_root.clone()],
+                        "create the session worker root",
+                    )?,
+                )?;
             }
-            // Both lanes below write into the worker root, so it exists first.
-            execute_checked(
-                syncing,
-                hel_targets::command_on_locator(
-                    &backend,
-                    session_id,
-                    vec!["mkdir".into(), "-p".into(), worker_root.clone()],
-                    "create the session worker root",
-                )?,
-            )?;
             let staging = tempfile::tempdir().context("create restore staging")?;
             let local_spec = staging.path().join("restore-spec.json");
             std::fs::write(&local_spec, serde_json::to_vec_pretty(&restore)?)?;
@@ -972,11 +973,18 @@ impl Controller {
             let local_spec_ref = local_spec.as_path();
             execute_concurrent_lanes(
                 || {
+                    let syncing =
+                        &StagedExecutor::new(executor, ProvisionStage::Syncing);
                     controller.prepare_worker_files(
                         session_id,
                         backend_ref,
                         worker_root_ref,
                         syncing,
+                    )?;
+                    super::provisioning::install_inherited_git_settings(
+                        syncing,
+                        backend_ref,
+                        session_id,
                     )?;
                     // The restore needs the fetched objects: a committed delta
                     // bundle cannot be applied without its prerequisites, and a
@@ -992,15 +1000,17 @@ impl Controller {
                     )
                 },
                 || {
+                    let restoring =
+                        &StagedExecutor::new(executor, ProvisionStage::Restoring);
                     upload_checkpoint_spec(
-                        syncing,
+                        restoring,
                         backend_ref,
                         session_id,
                         &checkpoint.archive_path,
                         &remote_archive,
                     )?;
                     upload_checkpoint_spec(
-                        syncing,
+                        restoring,
                         backend_ref,
                         session_id,
                         local_spec_ref,
@@ -1008,21 +1018,33 @@ impl Controller {
                     )
                 },
             )?;
-            execute_checked(
-                syncing,
-                restore_command(&backend, session_id, &remote_spec)?,
-            )?;
-            install_attached_resources(&self.state, session_id, &backend, &worker_root, syncing)?;
-            self.connect_local_repositories(
-                session_id,
-                &backend,
-                &worker_root,
-                syncing,
-                match conversion.as_ref().and_then(ResumeConversion::raw_to_workspace) {
-                    Some(conversion) => LocalBootstrap::SeedFrom(conversion.checkout.clone()),
-                    None => LocalBootstrap::Seed,
-                },
-            )?;
+            {
+                let restoring = &StagedExecutor::new(executor, ProvisionStage::Restoring);
+                execute_checked(
+                    restoring,
+                    restore_command(&backend, session_id, &remote_spec)?,
+                )?;
+            }
+            {
+                let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
+                install_attached_resources(
+                    &self.state,
+                    session_id,
+                    &backend,
+                    &worker_root,
+                    syncing,
+                )?;
+                self.connect_local_repositories(
+                    session_id,
+                    &backend,
+                    &worker_root,
+                    syncing,
+                    match conversion.as_ref().and_then(ResumeConversion::raw_to_workspace) {
+                        Some(conversion) => LocalBootstrap::SeedFrom(conversion.checkout.clone()),
+                        None => LocalBootstrap::Seed,
+                    },
+                )?;
+            }
             match projection_build {
                 Some(build) => {
                     let mut restored_projection = build
@@ -1064,7 +1086,8 @@ impl Controller {
             } else {
                 // The new harness compacts the prior transcript itself, in a
                 // scratch session on this relay, before its first real prompt.
-                executor.notify_stage(ProvisionStage::Compacting);
+                let _compacting =
+                    ProvisionStageGuard::new(executor, ProvisionStage::Compacting);
                 let context = compact_while_cancellable(
                     &canonical_session,
                     context_bytes,
@@ -1312,38 +1335,6 @@ pub(super) fn apply_failed_resume_rollback(
             anyhow::anyhow!(failure)
         }
     }
-}
-
-/// Run two independent sequences of target work at the same time.
-///
-/// [`hel_targets::CommandPlan::execute_concurrent`] overlaps commands inside
-/// one plan. This overlaps two lanes that each interleave target commands with
-/// controller-side work, which a flat plan cannot express. Both lanes share the
-/// caller's executor, so every command keeps the executor's cancellation and
-/// stage reporting.
-///
-/// A failure in the first lane is reported ahead of a failure in the second, so
-/// the error a caller sees never depends on which lane lost the race. Both
-/// lanes always run to completion: neither can be interrupted mid-transfer, and
-/// leaving one running past the return would race the recovery that follows.
-fn execute_concurrent_lanes(
-    first: impl FnOnce() -> Result<()> + Send,
-    second: impl FnOnce() -> Result<()> + Send,
-) -> Result<()> {
-    std::thread::scope(|scope| {
-        // The second lane gets the new thread and the first runs here, so a
-        // panic in the first propagates exactly as it would without the
-        // overlap.
-        let second = scope.spawn(second);
-        let first = first();
-        let second = second.join().unwrap_or_else(|panic| {
-            Err(anyhow::anyhow!(
-                "concurrent target lane panicked: {}",
-                hel_targets::command_thread_panic_message(panic.as_ref())
-            ))
-        });
-        first.and(second)
-    })
 }
 
 /// Whether a resume has to rebuild the durable projection from its archive.
@@ -1961,11 +1952,11 @@ mod tests {
         // The first lane fails slowly and the second immediately, so a
         // completion-order report could only pick the second.
         let error = execute_concurrent_lanes(
-            || {
+            || -> Result<()> {
                 std::thread::sleep(Duration::from_millis(50));
                 bail!("worker install failed")
             },
-            || {
+            || -> Result<()> {
                 reached.lock().unwrap().push("second");
                 bail!("checkpoint upload failed")
             },
@@ -1979,8 +1970,11 @@ mod tests {
             "a failing first lane must not cut the second one short"
         );
 
-        let error =
-            execute_concurrent_lanes(|| Ok(()), || bail!("checkpoint upload failed")).unwrap_err();
+        let error = execute_concurrent_lanes(
+            || Ok(()),
+            || -> Result<()> { bail!("checkpoint upload failed") },
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), "checkpoint upload failed");
     }
     #[test]

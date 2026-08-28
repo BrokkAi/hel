@@ -331,12 +331,14 @@ pub(crate) fn operation(
     kind: SessionOperationKind,
     stage: Option<ProvisionStage>,
 ) -> SessionOperationDisplay {
+    let active_stages = stage
+        .map(|stage| [(stage, 1_000)].into_iter().collect())
+        .unwrap_or_default();
     SessionOperationDisplay {
         kind,
         started_at_epoch_seconds: 1_000,
         placeholder: None,
-        stage,
-        stage_started_at_epoch_seconds: stage.map(|_| 1_000),
+        active_stages,
         resume_destination: None,
     }
 }

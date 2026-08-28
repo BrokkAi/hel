@@ -22,7 +22,6 @@ use crate::hel_worker_runtime::{
 };
 
 use super::backend::backend_locator;
-use super::provisioning::install_inherited_git_settings;
 use super::readiness::WORKER_EXIT_RECORD_MARKER;
 use super::{Controller, execute_checked, scp_command_spec, ssh_command_spec, target_profile_home};
 
@@ -131,8 +130,7 @@ impl Controller {
             &launch_path,
             &ownership_path,
             &profile_stage,
-        )?;
-        install_inherited_git_settings(executor, backend, session_id)
+        )
     }
 
     /// Collect the dead worker's exit record and log tail for a session whose

@@ -658,15 +658,7 @@ fn session_top_line(
             )
         });
     let status_columns = if let Some(operation) = operation {
-        let (label, started_at) = match (operation.stage, operation.kind) {
-            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
-                stage.label(),
-                operation
-                    .stage_started_at_epoch_seconds
-                    .unwrap_or(operation.started_at_epoch_seconds),
-            ),
-            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
-        };
+        let (label, started_at) = operation_status(operation);
         Some(vec![format!(
             "{label} {}",
             format_elapsed(now_epoch_seconds.saturating_sub(started_at))
@@ -844,15 +836,7 @@ fn session_values(
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let clock = if let Some(operation) = operation {
-        let (label, started_at) = match (operation.stage, operation.kind) {
-            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
-                stage.label(),
-                operation
-                    .stage_started_at_epoch_seconds
-                    .unwrap_or(operation.started_at_epoch_seconds),
-            ),
-            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
-        };
+        let (label, started_at) = operation_status(operation);
         let elapsed = now_epoch_seconds.saturating_sub(started_at);
         format!("{label} {elapsed}s")
     } else if session.state == SessionState::Provisioning {
@@ -882,6 +866,33 @@ fn session_values(
         session.project_name(config),
         session_name(session).to_string(),
     )
+}
+
+fn operation_status(operation: &SessionOperationDisplay) -> (String, u64) {
+    if matches!(
+        operation.kind,
+        SessionOperationKind::Launching | SessionOperationKind::Resuming
+    ) && !operation.active_stages.is_empty()
+    {
+        let label = operation
+            .active_stages
+            .keys()
+            .map(|stage| stage.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let started_at = operation
+            .active_stages
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(operation.started_at_epoch_seconds);
+        (label, started_at)
+    } else {
+        (
+            operation.kind.label().to_owned(),
+            operation.started_at_epoch_seconds,
+        )
+    }
 }
 
 fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
@@ -2510,11 +2521,29 @@ mod tests {
         );
         // The operation started at 1_000 but the stage only began at 1_040;
         // the clock must count from the stage, not the whole operation.
-        operation.stage_started_at_epoch_seconds = Some(1_040);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Booting, 1_040);
 
         let (clock, _, _, _, _) =
             session_values(&session, None, Some(&operation), 1_052, &config());
         assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn launch_clock_names_concurrent_stages_in_lifecycle_order() {
+        let session = stopped_session();
+        let mut operation = operation(SessionOperationKind::Launching, None);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Syncing, 1_003);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Cloning, 1_002);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Clone, Sync 10s");
     }
 
     #[test]

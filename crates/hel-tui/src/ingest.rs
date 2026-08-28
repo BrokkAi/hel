@@ -26,10 +26,9 @@ pub(crate) struct SessionOperationDisplay {
     pub(crate) kind: SessionOperationKind,
     pub(crate) started_at_epoch_seconds: u64,
     pub(crate) placeholder: Option<SessionRecord>,
-    pub(crate) stage: Option<ProvisionStage>,
-    /// When the current `stage` began, so the clock can count that stage's
-    /// progress instead of the whole operation's.
-    pub(crate) stage_started_at_epoch_seconds: Option<u64>,
+    /// Launch stages currently in flight and when each began. More than one
+    /// entry means independent setup lanes are overlapping.
+    pub(crate) active_stages: BTreeMap<ProvisionStage, u64>,
     /// The (profile, target) a resume is moving the session TO. The
     /// controller updates the session record's own profile/target as soon as
     /// a resume starts, but that update lands in a separate, disk-persisted
@@ -402,8 +401,7 @@ impl DashboardState {
                     .unwrap_or_default()
                     .as_secs(),
                 placeholder,
-                stage: None,
-                stage_started_at_epoch_seconds: None,
+                active_stages: BTreeMap::new(),
                 resume_destination: None,
             },
         );
@@ -427,20 +425,26 @@ impl DashboardState {
         }
     }
 
-    /// Name the launch phase in flight; a finished or unknown operation is
-    /// left alone. Only a stage change resets the per-stage clock, so a
-    /// repeated report of the same stage can't restart its counter.
-    pub fn set_session_operation_stage(&mut self, session_id: &str, stage: ProvisionStage) {
-        if let Some(operation) = self.session_operations.get_mut(session_id)
-            && operation.stage != Some(stage)
-        {
-            operation.stage = Some(stage);
-            operation.stage_started_at_epoch_seconds = Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
+    /// Record one launch stage entering or leaving the active set. Repeated
+    /// starts retain the original clock, and finishing one concurrent lane
+    /// leaves the others visible.
+    pub fn set_session_operation_stage(
+        &mut self,
+        session_id: &str,
+        stage: ProvisionStage,
+        active: bool,
+    ) {
+        if let Some(operation) = self.session_operations.get_mut(session_id) {
+            if active {
+                operation.active_stages.entry(stage).or_insert_with(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                });
+            } else {
+                operation.active_stages.remove(&stage);
+            }
         }
     }
 
@@ -1304,7 +1308,7 @@ mod tests {
     #[test]
     fn setting_a_stage_for_an_unknown_session_is_ignored() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        dashboard.set_session_operation_stage("missing", ProvisionStage::Booting);
+        dashboard.set_session_operation_stage("missing", ProvisionStage::Booting, true);
         assert!(dashboard.session_operations.is_empty());
     }
 
@@ -1335,18 +1339,41 @@ mod tests {
             SessionOperationKind::Launching,
             None,
         );
-        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting);
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting, true);
         dashboard
             .session_operations
             .get_mut("session-1")
             .expect("operation")
-            .stage_started_at_epoch_seconds = Some(1_000);
+            .active_stages
+            .insert(ProvisionStage::Booting, 1_000);
 
-        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting);
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting, true);
 
         assert_eq!(
-            dashboard.session_operations["session-1"].stage_started_at_epoch_seconds,
-            Some(1_000)
+            dashboard.session_operations["session-1"].active_stages[&ProvisionStage::Booting],
+            1_000
+        );
+    }
+
+    #[test]
+    fn finishing_one_stage_keeps_a_concurrent_stage_active() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.begin_session_operation(
+            "session-1".into(),
+            SessionOperationKind::Launching,
+            None,
+        );
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Cloning, true);
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Syncing, true);
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Cloning, false);
+
+        assert_eq!(
+            dashboard.session_operations["session-1"]
+                .active_stages
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![ProvisionStage::Syncing]
         );
     }
 }

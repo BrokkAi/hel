@@ -23,6 +23,7 @@ use hel::hel_state::{
 };
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec, ProvisionStage,
+    ProvisionStageGuard,
 };
 use hel_tui::{
     DashboardAction, PreparedMaterializedSessionDetail, PreparedMaterializedSessionSummary,
@@ -127,6 +128,7 @@ pub(crate) enum DashboardIoUpdate {
     LifecycleStage {
         session_id: String,
         stage: ProvisionStage,
+        active: bool,
     },
     /// Something a lifecycle operation decided on the user's behalf, such as
     /// attaching a directory read-only because its filesystem cannot overlay.
@@ -922,7 +924,7 @@ pub(crate) struct StageReportingExecutor<E: CommandExecutor> {
     inner: E,
     session_id: String,
     updates: UnboundedSender<DashboardIoUpdate>,
-    reported: std::sync::Mutex<Option<ProvisionStage>>,
+    active: std::sync::Mutex<BTreeMap<ProvisionStage, usize>>,
 }
 
 impl<E: CommandExecutor> StageReportingExecutor<E> {
@@ -935,31 +937,41 @@ impl<E: CommandExecutor> StageReportingExecutor<E> {
             inner,
             session_id,
             updates,
-            reported: std::sync::Mutex::new(None),
+            active: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
-    fn report(&self, command: &CommandSpec) {
-        let Some(stage) = command.stage else {
-            return;
-        };
-        self.report_stage(stage);
-    }
-
-    /// The single place a stage reaches the dashboard, so command-driven and
-    /// explicit reports dedupe against the same last-reported stage.
-    fn report_stage(&self, stage: ProvisionStage) {
-        let mut reported = self
-            .reported
+    /// The single place stage activity reaches the dashboard. Counts keep a
+    /// stage active while concurrent commands or an enclosing controller
+    /// scope both name it.
+    fn change_stage(&self, stage: ProvisionStage, active: bool) {
+        let mut stages = self
+            .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *reported == Some(stage) {
+        let publish = if active {
+            let count = stages.entry(stage).or_default();
+            *count += 1;
+            *count == 1
+        } else {
+            let Some(count) = stages.get_mut(&stage) else {
+                return;
+            };
+            *count -= 1;
+            if *count == 0 {
+                stages.remove(&stage);
+                true
+            } else {
+                false
+            }
+        };
+        if !publish {
             return;
         }
-        *reported = Some(stage);
         if let Err(error) = self.updates.send(DashboardIoUpdate::LifecycleStage {
             session_id: self.session_id.clone(),
             stage,
+            active,
         }) {
             tracing::debug!(%error, "lifecycle stage result dropped after dashboard shutdown");
         }
@@ -968,7 +980,9 @@ impl<E: CommandExecutor> StageReportingExecutor<E> {
 
 impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
-        self.report(command);
+        let _stage = command
+            .stage
+            .map(|stage| ProvisionStageGuard::new(self, stage));
         self.inner.execute(command)
     }
 
@@ -976,8 +990,12 @@ impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
         self.inner.cancellation_requested()
     }
 
-    fn notify_stage(&self, stage: ProvisionStage) {
-        self.report_stage(stage);
+    fn stage_started(&self, stage: ProvisionStage) {
+        self.change_stage(stage, true);
+    }
+
+    fn stage_finished(&self, stage: ProvisionStage) {
+        self.change_stage(stage, false);
     }
 
     fn notify_notice(&self, notice: &str) {
@@ -993,7 +1011,9 @@ impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
         command: &CommandSpec,
         input: &mut (dyn std::io::Read + Send),
     ) -> Result<CommandOutput> {
-        self.report(command);
+        let _stage = command
+            .stage
+            .map(|stage| ProvisionStageGuard::new(self, stage));
         self.inner.execute_with_stdin(command, input)
     }
 }
@@ -1063,9 +1083,13 @@ impl DashboardContext {
                     }
                 }
             }
-            DashboardIoUpdate::LifecycleStage { session_id, stage } => {
+            DashboardIoUpdate::LifecycleStage {
+                session_id,
+                stage,
+                active,
+            } => {
                 self.dashboard
-                    .set_session_operation_stage(&session_id, stage);
+                    .set_session_operation_stage(&session_id, stage, active);
             }
             DashboardIoUpdate::LifecycleNotice { notice } => self.dashboard.set_notice(notice),
             DashboardIoUpdate::HiddenNativeSessions { result } => match result {
@@ -1591,11 +1615,9 @@ fn quick_config_id(value: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Compaction is not a command execution, so the resume path names its
-    /// stage explicitly. The explicit report must reach the dashboard and
-    /// dedupe against the same last-reported stage a staged command sets.
+    /// Independent setup lanes must remain active until their own work ends.
     #[test]
-    fn notify_stage_reports_a_lifecycle_stage_and_dedupes_a_repeat() {
+    fn stage_activity_reports_overlapping_lanes_and_balances_nested_scopes() {
         struct UnusedExecutor;
 
         impl CommandExecutor for UnusedExecutor {
@@ -1607,22 +1629,31 @@ mod tests {
         let (updates, mut reported) = tokio::sync::mpsc::unbounded_channel();
         let executor = StageReportingExecutor::new(UnusedExecutor, "session-1".to_owned(), updates);
 
-        executor.notify_stage(ProvisionStage::Compacting);
-        executor.notify_stage(ProvisionStage::Compacting);
-        executor.notify_stage(ProvisionStage::Starting);
+        executor.stage_started(ProvisionStage::Cloning);
+        executor.stage_started(ProvisionStage::Cloning);
+        executor.stage_started(ProvisionStage::Syncing);
+        executor.stage_finished(ProvisionStage::Cloning);
+        executor.stage_finished(ProvisionStage::Cloning);
+        executor.stage_finished(ProvisionStage::Syncing);
         drop(executor);
 
         let stages = std::iter::from_fn(|| reported.try_recv().ok())
             .map(|update| match update {
-                DashboardIoUpdate::LifecycleStage { session_id, stage } => (session_id, stage),
+                DashboardIoUpdate::LifecycleStage {
+                    session_id,
+                    stage,
+                    active,
+                } => (session_id, stage, active),
                 _ => panic!("a stage notification must publish a lifecycle stage"),
             })
             .collect::<Vec<_>>();
         assert_eq!(
             stages,
             vec![
-                ("session-1".to_owned(), ProvisionStage::Compacting),
-                ("session-1".to_owned(), ProvisionStage::Starting),
+                ("session-1".to_owned(), ProvisionStage::Cloning, true),
+                ("session-1".to_owned(), ProvisionStage::Syncing, true),
+                ("session-1".to_owned(), ProvisionStage::Cloning, false),
+                ("session-1".to_owned(), ProvisionStage::Syncing, false),
             ]
         );
     }
