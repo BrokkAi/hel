@@ -1090,8 +1090,10 @@ impl ChatState {
         ))
     }
 
-    /// Rendered row count for one entry, filling the cache on demand.
-    fn entry_rows(&mut self, index: usize) -> usize {
+    /// Bring the row cache in line with the current entries before a scroll
+    /// traversal. A collapsed run can cross hundreds of entries, so doing the
+    /// whole collapse pass again for every zero-row member would be quadratic.
+    fn prepare_entry_rows(&mut self) {
         let width = self.render_cache.width;
         prepare_render_cache(
             &self.entries,
@@ -1099,6 +1101,10 @@ impl ChatState {
             width,
             self.render_mode,
         );
+    }
+
+    /// Rendered row count for one entry after [`Self::prepare_entry_rows`].
+    fn entry_rows(&mut self, index: usize) -> usize {
         cached_entry_lines(&self.entries, &mut self.render_cache, index).len()
     }
 
@@ -1125,6 +1131,7 @@ impl ChatState {
             // the viewport and has nothing above it.
             return;
         };
+        self.prepare_entry_rows();
         let mut remaining = rows;
         while remaining > 0 {
             if row > 0 {
@@ -1145,9 +1152,24 @@ impl ChatState {
         let Some(TranscriptAnchor::Row { mut entry, mut row }) = self.resolved_anchor() else {
             return;
         };
+        self.prepare_entry_rows();
         let mut remaining = rows;
         while remaining > 0 {
-            let below = self.entry_rows(entry).saturating_sub(row + 1);
+            let entry_rows = self.entry_rows(entry);
+            if entry_rows == 0 || row >= entry_rows {
+                // Rich rendering collapses a tool run into one summary entry
+                // and gives its other entries zero rows. They are not scroll
+                // distance: upward traversal already skips them, and charging
+                // for them here can strand the viewport in a long tool run.
+                if entry + 1 >= self.entries.len() {
+                    self.anchor = TranscriptAnchor::Bottom;
+                    return;
+                }
+                entry += 1;
+                row = 0;
+                continue;
+            }
+            let below = entry_rows - row - 1;
             if below >= remaining {
                 row += remaining;
                 break;
@@ -1160,7 +1182,16 @@ impl ChatState {
             entry += 1;
             row = 0;
         }
-        self.anchor = TranscriptAnchor::Row { entry, row };
+        let anchor = TranscriptAnchor::Row { entry, row };
+        // A wheel step can land exactly on the first row of the final
+        // screenful. That page fills the viewport, but it is still the live
+        // tail and must resume following new output. Resolve this on input so
+        // ordinary render frames do not have to scan the tail twice.
+        self.anchor = if self.tail_viewport(self.last_viewport_height.max(1)).top == anchor {
+            TranscriptAnchor::Bottom
+        } else {
+            anchor
+        };
     }
 }
 

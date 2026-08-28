@@ -1514,6 +1514,41 @@ fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
 }
 
 #[test]
+fn mouse_wheel_reaches_the_tail_across_a_large_collapsed_tool_run() {
+    let mut chat = ChatState::new(&snapshot(), &[]);
+    chat.entries
+        .push(ChatEntry::plain(1, ChatRole::User, "before tools"));
+    chat.entries
+        .extend((2..102).map(|seq| completed_tool(seq, &format!("command {seq}"))));
+    chat.entries.extend((0..20).map(|index| {
+        ChatEntry::plain(102 + index, ChatRole::User, format!("tail message {index}"))
+    }));
+    let wheel = |kind| mouse_in(kind, Rect::new(0, 10, 60, 1));
+    let mut rows = drawn_transcript(&mut chat, 60, 24);
+
+    let mut upward_steps = 0;
+    while !shows(&rows, "before tools") && upward_steps < 40 {
+        chat.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        rows = drawn_transcript(&mut chat, 60, 24);
+        upward_steps += 1;
+    }
+    assert!(shows(&rows, "before tools"), "wheel up reached old history");
+
+    for _ in 0..=upward_steps {
+        chat.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        rows = drawn_transcript(&mut chat, 60, 24);
+    }
+    assert!(
+        shows(&rows, "tail message 19"),
+        "wheel down reached the tail"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("End to follow")),
+        "the conversation resumed following after crossing hidden tool entries"
+    );
+}
+
+#[test]
 fn the_wheel_over_an_empty_transcript_has_nothing_to_scroll() {
     let mut chat = ChatState::new(&snapshot(), &[]);
     let rows = drawn_transcript(&mut chat, 40, 24);
