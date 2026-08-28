@@ -760,6 +760,14 @@ fn grok_plan_review_answers_are_user_selected() {
         review,
         "normalized reviews must survive the durable relay journal"
     );
+    assert_eq!(
+        review.fields[1].custom_answer_for.as_deref(),
+        Some("action")
+    );
+    assert_eq!(
+        review.fields[1].custom_answer_option.as_deref(),
+        Some("revise")
+    );
     let mut content = BTreeMap::new();
     content.insert(
         PLAN_REVIEW_ACTION.into(),

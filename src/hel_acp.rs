@@ -644,6 +644,7 @@ fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationR
                 required: true,
                 secret: false,
                 custom_answer_for: None,
+                custom_answer_option: None,
                 kind: ElicitationFieldKind::SingleSelect {
                     options: vec![
                         ElicitationOption {
@@ -679,10 +680,11 @@ fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationR
             ElicitationField {
                 id: PLAN_REVIEW_FEEDBACK.into(),
                 title: "Revision feedback".into(),
-                description: Some("Used only when Revise is selected".into()),
+                description: Some("Describe what the agent should change.".into()),
                 required: false,
                 secret: false,
-                custom_answer_for: None,
+                custom_answer_for: Some(PLAN_REVIEW_ACTION.into()),
+                custom_answer_option: Some("revise".into()),
                 kind: ElicitationFieldKind::Text {
                     default: None,
                     min_length: None,

@@ -2309,6 +2309,7 @@ mod tests {
                 required: false,
                 secret: false,
                 custom_answer_for: None,
+                custom_answer_option: None,
                 kind: crate::hel_elicitation::ElicitationFieldKind::Text {
                     default: None,
                     min_length: None,

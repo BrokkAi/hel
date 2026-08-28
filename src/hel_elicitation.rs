@@ -93,6 +93,8 @@ pub struct ElicitationField {
     pub secret: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_answer_for: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_answer_option: Option<String>,
     #[serde(flatten)]
     pub kind: ElicitationFieldKind,
 }
@@ -278,6 +280,7 @@ fn parse_field(field_id: &str, value: &Value, required: bool) -> Result<Elicitat
         required,
         secret,
         custom_answer_for,
+        custom_answer_option: None,
         kind,
     })
 }
