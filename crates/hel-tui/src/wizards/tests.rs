@@ -6,7 +6,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use hel::hel_config::{HarnessKind, HarnessProfile, SshConnection, TargetTemplate};
-use hel::hel_state::{HelState, STATE_VERSION, SessionResourceAllocation};
+use hel::hel_state::{HelState, HostContainerSize, STATE_VERSION, SessionResourceAllocation};
 use hel::hel_targets::AdditionalMount;
 
 use super::*;
@@ -122,6 +122,7 @@ fn opening_session_wizards_prefetches_all_aws_sizes() {
             version: STATE_VERSION,
             sessions: BTreeMap::from([("session-1".into(), stopped_session())]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         },
         BTreeMap::new(),
     );
@@ -375,6 +376,7 @@ fn new_session_bundles_are_ordered_by_latest_session_creation() {
         version: STATE_VERSION,
         sessions: BTreeMap::from([(older.id.clone(), older), (recent.id.clone(), recent)]),
         mount_history: BTreeMap::new(),
+        container_sizes: BTreeMap::new(),
     };
     assert_eq!(
         bundle_ids_by_recent_creation(&config, &state),
@@ -421,6 +423,7 @@ fn new_session_defaults_to_the_most_recent_configured_choices() {
         version: STATE_VERSION,
         sessions: BTreeMap::from([(recent.id.clone(), recent)]),
         mount_history: BTreeMap::new(),
+        container_sizes: BTreeMap::new(),
     };
     let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
 
@@ -1043,6 +1046,7 @@ fn raw_resume_review_names_the_exact_reused_project_directory() {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(session.id.clone(), session)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         },
         BTreeMap::new(),
     );
@@ -1092,6 +1096,7 @@ fn resume_target_step_minus_halves_container_size_through_the_key_path() {
             version: STATE_VERSION,
             sessions: BTreeMap::from([("session-1".into(), stopped_session())]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         },
         BTreeMap::new(),
     );
@@ -1166,6 +1171,86 @@ fn new_target_step_minus_halves_container_size_when_focus_is_off_content() {
     dashboard.handle_key(key(KeyCode::Char('-')));
     let Mode::New(wizard) = &dashboard.mode else {
         panic!("expected new wizard after '-'");
+    };
+    assert_eq!(
+        wizard.resource_allocation,
+        Some(SessionResourceAllocation::Container {
+            cpus: 4,
+            memory_bytes: 16 * gib,
+        })
+    );
+}
+
+#[test]
+fn new_session_defaults_to_the_latest_size_on_its_host_and_clamps_to_capacity() {
+    let gib = 1024 * 1024 * 1024;
+    let mut state = HelState::default();
+    state.container_sizes.insert(
+        "local".into(),
+        HostContainerSize {
+            cpus: 24,
+            memory_bytes: 96 * gib,
+        },
+    );
+    let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+    dashboard.set_deployment_capacity_targets(vec![hel::hel_targets::DeploymentCapacityTarget {
+        id: "local".into(),
+        host: "local".into(),
+        target_ids: vec!["podman".into()],
+        kind: hel::hel_targets::DeploymentCapacityKind::Host,
+        local: true,
+        probes: Vec::new(),
+        probe_error: None,
+    }]);
+    dashboard.apply_deployment_capacity(
+        "local",
+        Ok(Some(hel::hel_targets::DeploymentCapacityUsage {
+            cpu_percent: None,
+            memory_used_bytes: 0,
+            memory_total_bytes: 48 * gib,
+            logical_cores: 12,
+            disk_total_bytes: None,
+        })),
+        0,
+    );
+
+    dashboard.handle_key(ctrl_key('n'));
+    dashboard.handle_key(key(KeyCode::Enter));
+    let Mode::New(wizard) = &dashboard.mode else {
+        panic!("expected new wizard on target step");
+    };
+    assert_eq!(
+        wizard.resource_allocation,
+        Some(SessionResourceAllocation::Container {
+            cpus: 12,
+            memory_bytes: 48 * gib,
+        })
+    );
+}
+
+#[test]
+fn resume_keeps_the_sessions_size_instead_of_the_hosts_latest_size() {
+    let gib = 1024 * 1024 * 1024;
+    let mut session = stopped_session();
+    session.resource_allocation = Some(SessionResourceAllocation::Container {
+        cpus: 4,
+        memory_bytes: 16 * gib,
+    });
+    let mut state = HelState::default();
+    state.sessions.insert(session.id.clone(), session);
+    state.container_sizes.insert(
+        "local".into(),
+        HostContainerSize {
+            cpus: 12,
+            memory_bytes: 48 * gib,
+        },
+    );
+    let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+
+    dashboard.begin_resume_for("session-1");
+    dashboard.handle_key(key(KeyCode::Enter));
+    let Mode::Resume(wizard) = &dashboard.mode else {
+        panic!("expected resume wizard on target step");
     };
     assert_eq!(
         wizard.resource_allocation,

@@ -739,9 +739,15 @@ impl DashboardState {
                 if limits.is_none() {
                     *sizing_error = Some("host totals unavailable; + disabled".into());
                 }
+                let remembered = container_size_host(target)
+                    .and_then(|host| self.state.container_sizes.get(host));
                 let (cpus, memory_bytes) = match previous {
                     Some(SessionResourceAllocation::Container { cpus, memory_bytes }) => {
                         clamp_resources(*cpus, *memory_bytes, limits)
+                    }
+                    _ if remembered.is_some() => {
+                        let remembered = remembered.expect("remembered size checked above");
+                        clamp_resources(remembered.cpus, remembered.memory_bytes, limits)
                     }
                     _ => clamp_resources(BASELINE_CPUS, BASELINE_MEMORY_BYTES, limits),
                 };

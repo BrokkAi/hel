@@ -1339,6 +1339,7 @@ mod tests {
                 },
             )]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         (config, state)
     }

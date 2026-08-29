@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::hel_config::data_dir;
 use crate::hel_state::{
-    CheckpointMetadata, HelState, ManagedWorktree, MaterializedExecutionState,
+    CheckpointMetadata, HelState, HostContainerSize, ManagedWorktree, MaterializedExecutionState,
     MaterializedQueuedPrompt, MaterializedSession, MaterializedSessionSummary, SessionRecord,
     SessionResourceAllocation, SessionState, TargetLocator, TranscriptBody, TranscriptItem,
     validate_relay_event_digest, validate_relay_event_frontier,
@@ -24,7 +24,7 @@ use crate::hel_workspace::{
     normalize_workspace_name,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -574,6 +574,21 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
         let (host, source) = row?;
         state.mount_history.entry(host).or_default().push(source);
     }
+    let mut statement = connection
+        .prepare("SELECT host, cpus, memory_bytes FROM host_container_sizes ORDER BY host")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            HostContainerSize {
+                cpus: row.get::<_, i64>(1)? as u64,
+                memory_bytes: row.get::<_, i64>(2)? as u64,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (host, size) = row?;
+        state.container_sizes.insert(host, size);
+    }
     state.validate()?;
     Ok(state)
 }
@@ -587,6 +602,16 @@ pub fn save_state(state: &HelState) -> Result<()> {
 /// commit concurrently without restoring stale copies of other sessions.
 pub fn save_session(session: &SessionRecord) -> Result<()> {
     save_session_to(&database_path(), session)
+}
+
+/// Persist a session and the container size it most recently launched on its
+/// host in one transaction.
+pub fn save_session_with_container_size(
+    session: &SessionRecord,
+    host: &str,
+    size: HostContainerSize,
+) -> Result<()> {
+    save_session_with_container_size_to(&database_path(), session, Some((host, size)))
 }
 
 /// Update only the fields a lifecycle transition owns on a session that
@@ -902,6 +927,14 @@ fn recover_interrupted_checkpointing_sessions_to(path: &Path, updated_at: &str) 
 }
 
 fn save_session_to(path: &Path, session: &SessionRecord) -> Result<()> {
+    save_session_with_container_size_to(path, session, None)
+}
+
+fn save_session_with_container_size_to(
+    path: &Path,
+    session: &SessionRecord,
+    container_size: Option<(&str, HostContainerSize)>,
+) -> Result<()> {
     validate_session_record(session)?;
 
     let mut connection = open(path)?;
@@ -923,6 +956,9 @@ fn save_session_to(path: &Path, session: &SessionRecord) -> Result<()> {
         );
     }
     insert_session(&tx, session)?;
+    if let Some((host, size)) = container_size {
+        write_host_container_size(&tx, host, size)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1806,6 +1842,28 @@ fn write_mount_history(tx: &Transaction<'_>, host: &str, sources: &[PathBuf]) ->
     Ok(())
 }
 
+fn write_host_container_size(
+    tx: &Transaction<'_>,
+    host: &str,
+    size: HostContainerSize,
+) -> Result<()> {
+    ensure!(!host.trim().is_empty(), "container size host is empty");
+    let cpus = i64::try_from(size.cpus).context("container CPU count exceeds SQLite range")?;
+    let memory =
+        i64::try_from(size.memory_bytes).context("container memory exceeds SQLite range")?;
+    ensure!(
+        cpus > 0 && memory > 0,
+        "container size values must be positive"
+    );
+    tx.execute(
+        "INSERT INTO host_container_sizes(host, cpus, memory_bytes)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(host) DO UPDATE SET cpus = excluded.cpus, memory_bytes = excluded.memory_bytes",
+        params![host, cpus, memory],
+    )?;
+    Ok(())
+}
+
 pub fn remember_project_directory(host: &str, directory: &Path) -> Result<()> {
     remember_sources(
         &database_path(),
@@ -1914,6 +1972,7 @@ pub fn save_state_to(path: &Path, state: &HelState) -> Result<()> {
         }
     }
     tx.execute("DELETE FROM mount_history", [])?;
+    tx.execute("DELETE FROM host_container_sizes", [])?;
     for session in state.sessions.values() {
         if let Some((existing_bundle, existing_workspace)) = existing_contexts.get(&session.id) {
             ensure!(
@@ -1940,6 +1999,9 @@ pub fn save_state_to(path: &Path, state: &HelState) -> Result<()> {
                 params![host, path_to_blob(source), ordinal as i64],
             )?;
         }
+    }
+    for (host, size) in &state.container_sizes {
+        write_host_container_size(&tx, host, *size)?;
     }
     tx.commit()?;
     Ok(())

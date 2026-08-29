@@ -1220,6 +1220,7 @@ mod tests {
                 (lost.id.clone(), lost),
             ]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let (active, terminal) = partition_sessions(state.sessions.values());
         assert_eq!(
@@ -1292,6 +1293,7 @@ mod tests {
                 .map(|session| (session.id.clone(), session))
                 .collect(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         let source =
@@ -1388,6 +1390,7 @@ mod tests {
                     (archived.id.clone(), archived),
                 ]),
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1431,6 +1434,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1468,6 +1472,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1509,6 +1514,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1672,6 +1678,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1700,6 +1707,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions: BTreeMap::from([(other.id.clone(), other)]),
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );

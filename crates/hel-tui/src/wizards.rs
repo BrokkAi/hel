@@ -10,7 +10,9 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use sha2::{Digest, Sha256};
 
-use hel::hel_config::{HelConfig, TargetTemplate, is_bare_project_target, mount_history_host};
+use hel::hel_config::{
+    HelConfig, TargetTemplate, container_size_host, is_bare_project_target, mount_history_host,
+};
 use hel::hel_state::{
     HelState, SessionRecord, SessionResourceAllocation, SessionState, allocation_cpus,
     allocation_memory,

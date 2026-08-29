@@ -703,6 +703,17 @@ pub fn mount_history_host(template: &TargetTemplate) -> Option<&str> {
     }
 }
 
+/// Stable physical-host key for reusable container CPU and memory defaults.
+pub fn container_size_host(template: &TargetTemplate) -> Option<&str> {
+    match template {
+        TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => Some("local"),
+        TargetTemplate::SshPodman { ssh, .. } => Some(&ssh.host),
+        TargetTemplate::LocalBare
+        | TargetTemplate::SshBare { .. }
+        | TargetTemplate::AwsEc2 { .. } => None,
+    }
+}
+
 fn validate_environment(owner: &str, environment: &BTreeMap<String, String>) -> Result<()> {
     if environment
         .keys()
@@ -1528,5 +1539,37 @@ mod tests {
                 .to_string()
                 .contains("must use `home`")
         );
+    }
+
+    #[test]
+    fn container_size_hosts_group_local_runtimes_and_exact_ssh_hosts() {
+        let container = ContainerTemplate {
+            image: "agent:latest".into(),
+            pull_policy: Default::default(),
+            platform: None,
+            cpus: None,
+            memory: None,
+            environment: BTreeMap::new(),
+        };
+        let podman = TargetTemplate::LocalPodman {
+            container: container.clone(),
+        };
+        let apple = TargetTemplate::AppleContainer {
+            container: container.clone(),
+        };
+        let ssh = TargetTemplate::SshPodman {
+            ssh: SshConnection {
+                host: "builder.example.test".into(),
+                user: Some("dev".into()),
+                identity_file: None,
+                extra_args: Vec::new(),
+            },
+            container,
+        };
+
+        assert_eq!(container_size_host(&podman), Some("local"));
+        assert_eq!(container_size_host(&apple), Some("local"));
+        assert_eq!(container_size_host(&ssh), Some("builder.example.test"));
+        assert_eq!(container_size_host(&TargetTemplate::LocalBare), None);
     }
 }

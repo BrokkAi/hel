@@ -1116,6 +1116,7 @@ mod tests {
                 .map(|session| (session.id.clone(), session))
                 .collect(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         }
     }
 
