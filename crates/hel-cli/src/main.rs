@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -956,6 +957,18 @@ impl TerminalGuard {
             terminal,
             keyboard_enhancement,
         })
+    }
+
+    /// Hands `text` to the terminal's own clipboard with OSC 52.
+    ///
+    /// This is the path that works over SSH and inside multiplexers, where
+    /// the desktop clipboard the process can reach is the wrong machine's.
+    pub(crate) fn copy_to_terminal_clipboard(&mut self, text: &str) -> Result<()> {
+        execute!(
+            self.terminal.backend_mut(),
+            CopyToClipboard::to_clipboard_from(text)
+        )
+        .context("copy selection to the terminal clipboard")
     }
 
     pub(crate) fn suspend(&mut self) -> Result<()> {

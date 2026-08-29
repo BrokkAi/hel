@@ -125,6 +125,10 @@ pub(crate) enum DashboardIoUpdate {
     /// Clipboard providers may use a blocking desktop IPC call. The result
     /// is delivered here after that work finishes on a blocking task.
     ClipboardText(std::result::Result<String, String>),
+    /// A copied selection reached the desktop clipboard, or did not. Only a
+    /// failure needs reporting: the notice for a successful copy is already
+    /// on screen.
+    ClipboardWritten(std::result::Result<(), String>),
     LifecycleStage {
         session_id: String,
         stage: ProvisionStage,
@@ -682,6 +686,19 @@ pub(crate) fn spawn_clipboard_read(updates: UnboundedSender<DashboardIoUpdate>) 
     )
 }
 
+/// Writes copied text to the desktop clipboard off the render loop.
+pub(crate) fn spawn_clipboard_write(
+    text: String,
+    updates: UnboundedSender<DashboardIoUpdate>,
+) -> JoinHandle<()> {
+    spawn_io(
+        "write clipboard",
+        updates,
+        move || hel::hel_clipboard::write_text(&text),
+        DashboardIoUpdate::ClipboardWritten,
+    )
+}
+
 pub(crate) fn spawn_create_bundle(
     source: String,
     updates: UnboundedSender<DashboardIoUpdate>,
@@ -1231,6 +1248,13 @@ impl DashboardContext {
                         .set_notice(format!("Could not reload setup changes: {error}"));
                 }
             },
+            DashboardIoUpdate::ClipboardWritten(result) => {
+                if let Err(error) = result {
+                    self.dashboard.set_failure_notice(format!(
+                        "Copy to the system clipboard failed: {error}"
+                    ));
+                }
+            }
             DashboardIoUpdate::ClipboardText(result) => {
                 self.clipboard_read_in_flight = false;
                 match result {

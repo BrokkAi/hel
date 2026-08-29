@@ -22,13 +22,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 
 use hel::hel_config::{HarnessKind, HelConfig};
+use hel::hel_selection::{FrameSurfaces, SurfaceFrame, SurfaceId};
 use hel::hel_state::{HelState, SessionRecord, SessionState};
 use hel::hel_text_input::TextInput;
 
 use crate::dialogs::{ConfirmDialog, Confirmation, ImportProfileOption};
 use crate::render::render_session_scrollbar;
 use crate::widgets::{
-    action_buttons, centered_rect, focus_border, format_resource_bytes, truncate_text,
+    action_buttons, centered_modal, centered_rect, focus_border, format_resource_bytes,
+    truncate_text,
 };
 use crate::{DashboardAction, DashboardState, Mode, cycle_control, move_index};
 
@@ -792,8 +794,9 @@ pub(crate) fn render_resume_dialog(
     area: Rect,
     dashboard: &DashboardState,
     dialog: &ResumeDialog,
+    surfaces: &mut FrameSurfaces,
 ) {
-    let popup = centered_rect(84, 24, area);
+    let popup = centered_modal(surfaces, 84, 24, area);
     frame.render_widget(Clear, popup);
     let (scanned, total) = dialog.scan_progress();
     let title = if dialog.is_scanning() {
@@ -864,6 +867,9 @@ pub(crate) fn render_resume_dialog(
             ResumeTab::Import => " Importable sessions · newest first ",
         });
     let list_area = block.inner(rows[2]);
+    // Registered after the dialog body so a drag over the rows selects the
+    // list rather than the popup around it.
+    surfaces.push(SurfaceFrame::fixed(SurfaceId::ResumeList, list_area));
     frame.render_widget(block, rows[2]);
     let table_rows = Layout::default()
         .direction(Direction::Vertical)

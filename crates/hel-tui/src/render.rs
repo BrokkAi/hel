@@ -16,6 +16,7 @@ use hel::hel_chat::render_agent_message_head;
 use hel::hel_chat::render_agent_message_tail;
 use hel::hel_config::{HarnessKind, HelConfig, PermissionMode};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
+use hel::hel_selection::{SurfaceFrame, SurfaceId};
 use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
 
@@ -25,7 +26,7 @@ use crate::dialogs::{
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::{render_resume_dialog, resume_sessions_pane};
-use crate::widgets::{focus_border, format_resource_bytes};
+use crate::widgets::{bordered_content, focus_border, format_resource_bytes};
 use crate::wizards::{render_new_wizard, render_resume_wizard};
 use crate::{DASHBOARD_PANE_COUNT, DashboardState, Focus, Mode, SessionOperationKind};
 
@@ -44,6 +45,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
     dashboard.active_row_areas.clear();
     dashboard.project_heading_areas.clear();
+    dashboard.frame_surfaces.clear();
     let area = frame.area();
     if area.width < MINIMUM_TERMINAL_WIDTH {
         render_terminal_too_small(
@@ -81,21 +83,30 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
 
 /// Draws the active modal over the dashboard already on the frame. Each modal
 /// clears its own centered rect, so the panes stay visible around it.
-fn render_modal(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
+///
+/// The registry moves out for the call because the modal renderers read the
+/// rest of the dashboard while they register their own surfaces.
+fn render_modal(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
+    let mut surfaces = std::mem::take(&mut dashboard.frame_surfaces);
     match &dashboard.mode {
-        Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
-        Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
-        Mode::ResumeDialog(dialog) => render_resume_dialog(frame, area, dashboard, dialog),
-        Mode::RepositoryOrigin(dialog) => render_repository_origin(frame, area, dialog),
-        Mode::Rename(editor) => render_rename_editor(frame, area, editor),
-        Mode::EditContainer(editor) => render_container_editor(frame, area, editor),
-        Mode::Importing(progress) => render_import_progress(frame, area, progress),
-        Mode::ConfirmImportBundle(confirmation) => {
-            render_import_bundle_confirmation(frame, area, confirmation)
+        Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard, &mut surfaces),
+        Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard, &mut surfaces),
+        Mode::ResumeDialog(dialog) => {
+            render_resume_dialog(frame, area, dashboard, dialog, &mut surfaces)
         }
-        Mode::Confirm(dialog) => render_confirmation(frame, area, dialog),
+        Mode::RepositoryOrigin(dialog) => {
+            render_repository_origin(frame, area, dialog, &mut surfaces)
+        }
+        Mode::Rename(editor) => render_rename_editor(frame, area, editor, &mut surfaces),
+        Mode::EditContainer(editor) => render_container_editor(frame, area, editor, &mut surfaces),
+        Mode::Importing(progress) => render_import_progress(frame, area, progress, &mut surfaces),
+        Mode::ConfirmImportBundle(confirmation) => {
+            render_import_bundle_confirmation(frame, area, confirmation, &mut surfaces)
+        }
+        Mode::Confirm(dialog) => render_confirmation(frame, area, dialog, &mut surfaces),
         Mode::Dashboard => {}
     }
+    dashboard.frame_surfaces = surfaces;
 }
 
 fn render_dashboard_title(frame: &mut Frame, area: Rect, greeting: &str) {
@@ -258,6 +269,14 @@ fn render_adaptive_dashboard(
         )
         .split(fixed[1]);
     dashboard.pane_areas = Some([panes[0], panes[1], panes[2]]);
+    for (index, pane) in panes.iter().take(DASHBOARD_PANE_COUNT).enumerate() {
+        // The selectable area is the text inside the border, so a selection
+        // never picks up border glyphs or the scrollbar column.
+        dashboard.frame_surfaces.push(SurfaceFrame::fixed(
+            SurfaceId::DashboardPane(index as u8),
+            bordered_content(*pane),
+        ));
+    }
     let rendered_rows = render_sessions(frame, panes[0], dashboard, &active);
     dashboard.active_row_areas = rendered_rows.active_row_areas;
     dashboard.project_heading_areas = rendered_rows.project_heading_areas;
@@ -1526,6 +1545,77 @@ mod tests {
         // centred popup does not cover.
         assert!(row_of("UNDERLYING DASHBOARD SENTINEL") < popup_top);
         assert!(row_of(" Active ") < popup_top);
+    }
+
+    #[test]
+    fn drawing_the_dashboard_registers_each_pane_interior_for_selection() {
+        let mut dashboard = dashboard_with_session(running_session());
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+
+        let panes = dashboard.pane_areas.expect("dashboard pane hitboxes");
+        let surfaces = dashboard.frame_surfaces();
+        for (index, pane) in panes.iter().enumerate() {
+            let id = SurfaceId::DashboardPane(index as u8);
+            let surface = surfaces
+                .surface(id)
+                .unwrap_or_else(|| panic!("pane {index} registered"));
+            assert_eq!(surface.rect, bordered_content(*pane));
+            assert_eq!(
+                surfaces
+                    .surface_at(surface.rect.x, surface.rect.y)
+                    .map(|surface| surface.id),
+                Some(id)
+            );
+        }
+        // The border rows and the scrollbar column stay out of every surface,
+        // so a selection can never pick up their glyphs.
+        assert!(surfaces.surface_at(panes[0].x, panes[0].y).is_none());
+        assert!(
+            surfaces
+                .surface_at(panes[0].right() - 1, panes[0].y + 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_open_dialog_registers_its_body_and_list_above_the_panes() {
+        let mut dashboard = dashboard_with_session(stopped_session());
+        dashboard.show_resume_dialog(1, Vec::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw resume dialog");
+
+        let surfaces = dashboard.frame_surfaces();
+        let body = surfaces.surface(SurfaceId::ModalBody).expect("dialog body");
+        let list = surfaces
+            .surface(SurfaceId::ResumeList)
+            .expect("session list");
+        // The dialog covers the panes, and its list covers the dialog.
+        assert_eq!(
+            surfaces
+                .surface_at(body.rect.x, body.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::ModalBody)
+        );
+        assert_eq!(
+            surfaces
+                .surface_at(list.rect.x, list.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::ResumeList)
+        );
+        // Beside the popup the pane underneath still owns its cells.
+        assert_eq!(
+            surfaces
+                .surface_at(body.rect.x - 2, body.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::DashboardPane(0))
+        );
     }
 
     #[test]

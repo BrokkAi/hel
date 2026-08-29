@@ -14,6 +14,7 @@ use ratatui::layout::Rect;
 use hel::hel_chat::Notices;
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate as HelTargetTemplate};
 use hel::hel_quota::ProfileQuota;
+use hel::hel_selection::FrameSurfaces;
 use hel::hel_state::{
     HelState, ProjectSourceIdentity, SessionRecord, SessionResourceAllocation, SessionState,
 };
@@ -278,6 +279,9 @@ pub struct DashboardState {
     pub(crate) focus: Focus,
     pub(crate) pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
     pub(crate) resume_sessions_area: Option<Rect>,
+    /// Selectable surfaces, rebuilt by every frame in render order so the
+    /// selection engine can hit-test the screen the user is looking at.
+    pub(crate) frame_surfaces: FrameSurfaces,
     /// Native sessions the resume dialog hides, loaded from Hel's database.
     pub(crate) hidden_native_sessions: BTreeSet<(HarnessKind, String)>,
     /// The rows the open resume dialog shows, derived from the records, the
@@ -317,6 +321,7 @@ impl DashboardState {
             focus: Focus::Active,
             pane_areas: None,
             resume_sessions_area: None,
+            frame_surfaces: FrameSurfaces::new(),
             hidden_native_sessions: BTreeSet::new(),
             resume_rows: Vec::new(),
             active_row_areas: Vec::new(),
@@ -473,6 +478,11 @@ impl DashboardState {
             }
             _ => {}
         }
+    }
+
+    /// The surfaces the last frame registered, for the selection engine.
+    pub fn frame_surfaces(&self) -> &FrameSurfaces {
+        &self.frame_surfaces
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> DashboardAction {

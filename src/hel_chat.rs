@@ -41,6 +41,7 @@ use crate::hel_acp::{RuntimeEvent, plan_review_carries_native_feedback};
 use crate::hel_config::HarnessKind;
 use crate::hel_elicitation::ElicitationValue;
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
+use crate::hel_selection::FrameSurfaces;
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
     RecoveryCheckpointPhase, TranscriptBody, TranscriptItem,
@@ -323,6 +324,9 @@ pub struct ChatState {
     /// The pane's hitbox, recorded each frame so the wheel knows what it is
     /// over. `None` before the first draw.
     conversations_area: Option<Rect>,
+    /// Selectable surfaces, rebuilt by every frame in render order so the
+    /// selection engine can hit-test the screen the user is looking at.
+    pub(super) frame_surfaces: FrameSurfaces,
 }
 
 impl ChatState {
@@ -385,6 +389,7 @@ impl ChatState {
             focus: ChatFocus::Prompt,
             conversations_window_start: None,
             conversations_area: None,
+            frame_surfaces: FrameSurfaces::new(),
         };
         state.apply_events(events);
         // Bootstrap replays the full canonical log for transcript projection,
@@ -1523,6 +1528,11 @@ impl ChatState {
             TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
             TranscriptRenderMode::Raw => "Raw transcript source enabled",
         });
+    }
+
+    /// The surfaces the last frame registered, for the selection engine.
+    pub fn frame_surfaces(&self) -> &FrameSurfaces {
+        &self.frame_surfaces
     }
 
     /// Capture is on for every surface, so the app owns the wheel: terminal

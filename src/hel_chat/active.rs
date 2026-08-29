@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
+use crate::hel_selection::{FrameSurfaces, SurfaceFrame, SurfaceId};
 use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
 };
@@ -1253,6 +1254,11 @@ impl ActiveChat {
         self.state.focus_conversations();
     }
 
+    /// The surfaces the last frame registered, for the selection engine.
+    pub fn frame_surfaces(&self) -> &FrameSurfaces {
+        self.state.frame_surfaces()
+    }
+
     /// Draws the view. The recovery phase is read here rather than tracked,
     /// because the checkpoint gate moves without telling the dashboard.
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -1291,6 +1297,7 @@ impl Drop for ActiveChat {
 }
 
 pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
+    chat.frame_surfaces.clear();
     let inner = frame.area();
     // The pane never takes more than a third of the screen. Its border eats
     // two columns, so the text inside wraps to that narrower width.
@@ -1344,6 +1351,10 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
     // Consumers (mouse hover/click/scroll) map a screen row against this
     // rect, so it must be the pane's inner area, not the bordered outline.
     chat.conversations_area = Some(conversations_inner);
+    chat.frame_surfaces.push(SurfaceFrame::fixed(
+        SurfaceId::Conversations,
+        conversations_inner,
+    ));
     frame.render_widget(conversations_block, conversations_area);
     frame.render_widget(Paragraph::new(pane.lines), conversations_inner);
     if chat.focus == ChatFocus::Conversations
@@ -1411,6 +1422,8 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
             .block(prompt_block),
         prompt_area,
     );
+    chat.frame_surfaces
+        .push(SurfaceFrame::fixed(SurfaceId::PromptInput, prompt_inner));
     // The cursor belongs to whatever has focus, so the composer only shows one
     // while the keyboard is driving it.
     if chat.history_search.is_none() && chat.focus == ChatFocus::Prompt {
@@ -1459,8 +1472,17 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
             footer_area.y,
         ));
     }
-    render_autocomplete(frame, prompt_area, chat);
+    // The popup overlays the prompt and whatever sits above it, so it
+    // registers last and wins the cells it covers.
+    if let Some(popup) = render_autocomplete(frame, prompt_area, chat) {
+        chat.frame_surfaces
+            .push(SurfaceFrame::fixed(SurfaceId::AutocompletePopup, popup));
+    }
     if let Some(dialog) = chat.elicitation.as_ref() {
+        // The dialog owns the frame's interaction while it is up, and its own
+        // surfaces are not registered yet, so nothing behind it stays
+        // selectable.
+        chat.frame_surfaces.clear();
         render_elicitation(frame, dialog);
     }
 }
@@ -1780,6 +1802,81 @@ mod tests {
         // dialog's centred popup.
         assert!(row_of("UNDERLYING CHAT SENTINEL") < popup_top);
         assert!(row_of("Ctrl-G dashboard") > popup_top);
+    }
+
+    #[test]
+    fn drawing_the_chat_registers_the_conversations_and_prompt_interiors() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        drawn_transcript(&mut chat, 80, 24);
+
+        let surfaces = chat.frame_surfaces();
+        let conversations = surfaces
+            .surface(SurfaceId::Conversations)
+            .expect("conversations pane registered");
+        let prompt = surfaces
+            .surface(SurfaceId::PromptInput)
+            .expect("prompt registered");
+        // The registered rect is the text inside each border, which is what
+        // the wheel already hit-tests against.
+        assert_eq!(Some(conversations.rect), chat.conversations_area);
+        assert_eq!(
+            surfaces
+                .surface_at(conversations.rect.x, conversations.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::Conversations)
+        );
+        assert_eq!(
+            surfaces
+                .surface_at(prompt.rect.x, prompt.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::PromptInput)
+        );
+        // The border above the conversations text belongs to no surface.
+        assert!(
+            surfaces
+                .surface_at(conversations.rect.x, conversations.rect.y - 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_autocomplete_popup_takes_the_cells_it_covers() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("/".into());
+
+        drawn_transcript(&mut chat, 80, 24);
+
+        let surfaces = chat.frame_surfaces();
+        let popup = surfaces
+            .surface(SurfaceId::AutocompletePopup)
+            .expect("popup registered");
+        assert_eq!(
+            surfaces
+                .surface_at(popup.rect.x, popup.rect.bottom() - 1)
+                .map(|surface| surface.id),
+            Some(SurfaceId::AutocompletePopup)
+        );
+    }
+
+    #[test]
+    fn an_open_elicitation_leaves_nothing_behind_it_selectable() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.elicitation = Some(super::super::elicitation::ElicitationDialog::new(
+            ElicitationRequest {
+                id: "question-1".into(),
+                message: "Visible dialog message".into(),
+                title: Some("Overlaid dialog".into()),
+                description: None,
+                fields: Vec::new(),
+            },
+        ));
+
+        drawn_transcript(&mut chat, 80, 24);
+
+        // The dialog owns the frame while it is up; its own surfaces are not
+        // registered yet, so no drag reaches the chat underneath it.
+        assert!(chat.frame_surfaces().is_empty());
     }
 
     #[test]

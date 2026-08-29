@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use hel::hel_config::{
     HelConfig, TargetTemplate, container_size_host, is_bare_project_target, mount_history_host,
 };
+use hel::hel_selection::FrameSurfaces;
 use hel::hel_state::{
     HelState, SessionRecord, SessionResourceAllocation, SessionState, allocation_cpus,
     allocation_memory,
@@ -20,7 +21,7 @@ use hel::hel_state::{
 use hel::hel_targets::{AdditionalMount, default_mount_destination, path_completion};
 use hel::hel_text_input::TextInput;
 
-use crate::widgets::{action_buttons, centered_rect, format_resource_bytes};
+use crate::widgets::{action_buttons, centered_modal, format_resource_bytes};
 use crate::{DashboardAction, DashboardState, Mode, cycle_control, move_index, nth_key};
 
 const BASELINE_CPUS: u64 = 8;
@@ -490,6 +491,8 @@ impl ResumeWizard {
 pub(crate) struct PickerNavigation {
     pub(crate) focus: WizardFocus,
     pub(crate) has_back: bool,
+    /// Row the keyboard is on, highlighted while the content has focus.
+    pub(crate) selected: usize,
 }
 
 /// One picker row. A disabled row stays in the list so row numbers keep
@@ -514,12 +517,13 @@ pub(crate) fn render_picker(
     area: Rect,
     title: &str,
     choices: Vec<PickerChoice>,
-    selected: usize,
     help: &[&str],
     navigation: PickerNavigation,
+    surfaces: &mut FrameSurfaces,
 ) {
     let width_percent = if area.width < 64 { 100 } else { 68 };
-    let popup = centered_rect(
+    let popup = centered_modal(
+        surfaces,
         width_percent,
         (choices.len() as u16 + help.len() as u16 + 6).clamp(9, 19),
         area,
@@ -529,7 +533,7 @@ pub(crate) fn render_picker(
         .into_iter()
         .enumerate()
         .map(|(index, choice)| {
-            let focused = index == selected && navigation.focus == WizardFocus::Content;
+            let focused = index == navigation.selected && navigation.focus == WizardFocus::Content;
             let marker = if focused { "› " } else { "  " };
             let style = match (focused, choice.disabled) {
                 (true, _) => Style::default().bg(Color::DarkGray).fg(Color::White),
@@ -578,6 +582,7 @@ pub(crate) fn render_new_wizard(
     area: Rect,
     dashboard: &DashboardState,
     wizard: &NewWizard,
+    surfaces: &mut FrameSurfaces,
 ) {
     if wizard.step == WizardStep::Review {
         let target_id = nth_key(&dashboard.config.targets, wizard.target);
@@ -609,6 +614,7 @@ pub(crate) fn render_new_wizard(
                 submit_label: "Create",
                 queue: None,
             },
+            surfaces,
         );
         return;
     }
@@ -668,7 +674,7 @@ pub(crate) fn render_new_wizard(
             "Enter validates · Backspace on empty goes back · Esc cancels",
             Style::default().fg(Color::Gray),
         ));
-        let popup = centered_rect(76, (lines.len() as u16 + 2).clamp(9, 16), area);
+        let popup = centered_modal(surfaces, 76, (lines.len() as u16 + 2).clamp(9, 16), area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(if local {
@@ -688,11 +694,12 @@ pub(crate) fn render_new_wizard(
             wizard.target,
             &wizard.mounts,
             " Add attached directory ",
+            surfaces,
         );
         return;
     }
     if wizard.step == WizardStep::NewBundle {
-        let popup = centered_rect(76, 9, area);
+        let popup = centered_modal(surfaces, 76, 9, area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(vec![
@@ -786,12 +793,13 @@ pub(crate) fn render_new_wizard(
         area,
         title,
         choices.into_iter().map(PickerChoice::from).collect(),
-        selected,
         &[help],
         PickerNavigation {
             focus: wizard.focus,
             has_back: wizard.step != WizardStep::Profile,
+            selected,
         },
+        surfaces,
     );
 }
 
@@ -814,6 +822,7 @@ fn render_review_wizard(
     area: Rect,
     dashboard: &DashboardState,
     view: ReviewWizardView<'_>,
+    surfaces: &mut FrameSurfaces,
 ) {
     let ReviewWizardView {
         profile_id,
@@ -922,7 +931,7 @@ fn render_review_wizard(
     }
     buttons.push((submit_label, focus == ReviewFocus::Submit));
     lines.push(action_buttons(&buttons));
-    let popup = centered_rect(84, (lines.len() as u16 + 2).clamp(13, 24), area);
+    let popup = centered_modal(surfaces, 84, (lines.len() as u16 + 2).clamp(13, 24), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -968,6 +977,7 @@ fn render_mount_wizard(
     target_index: usize,
     mounts: &MountWizard,
     title: &str,
+    surfaces: &mut FrameSurfaces,
 ) {
     let target_id = nth_key(&dashboard.config.targets, target_index);
     let target = dashboard
@@ -1103,7 +1113,7 @@ fn render_mount_wizard(
         ]),
     ]);
     // One row taller than before the read-only checkbox joined the editor.
-    let popup = centered_rect(84, (lines.len() as u16 + 2).clamp(13, 25), area);
+    let popup = centered_modal(surfaces, 84, (lines.len() as u16 + 2).clamp(13, 25), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1118,6 +1128,7 @@ pub(crate) fn render_resume_wizard(
     area: Rect,
     dashboard: &DashboardState,
     wizard: &ResumeWizard,
+    surfaces: &mut FrameSurfaces,
 ) {
     if wizard.step == WizardStep::Review {
         let profile_id = dashboard
@@ -1165,6 +1176,7 @@ pub(crate) fn render_resume_wizard(
                     .filter(|count| *count > 0)
                     .map(|count| (count, wizard.discard_queue)),
             },
+            surfaces,
         );
         return;
     }
@@ -1176,6 +1188,7 @@ pub(crate) fn render_resume_wizard(
             wizard.target,
             &wizard.mounts,
             " Add attached directory ",
+            surfaces,
         );
         return;
     }
@@ -1242,12 +1255,13 @@ pub(crate) fn render_resume_wizard(
         area,
         title,
         choices,
-        selected,
         help,
         PickerNavigation {
             focus: wizard.focus,
             has_back: wizard.step != WizardStep::Profile,
+            selected,
         },
+        surfaces,
     );
 }
 

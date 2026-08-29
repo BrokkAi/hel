@@ -350,13 +350,17 @@ fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueC
         .collect()
 }
 
-pub(super) fn render_autocomplete(frame: &mut Frame, prompt_area: Rect, chat: &ChatState) {
-    let Some(autocomplete) = chat.autocomplete.as_ref() else {
-        return;
-    };
+/// Draws the popup over the prompt and reports the rows it covers, so the
+/// caller can register them as a selectable surface.
+pub(super) fn render_autocomplete(
+    frame: &mut Frame,
+    prompt_area: Rect,
+    chat: &ChatState,
+) -> Option<Rect> {
+    let autocomplete = chat.autocomplete.as_ref()?;
     let visible = autocomplete.matches.len().min(8);
     if visible == 0 {
-        return;
+        return None;
     }
     let height = (visible as u16).saturating_add(2);
     let area = Rect::new(
@@ -397,6 +401,7 @@ pub(super) fn render_autocomplete(frame: &mut Frame, prompt_area: Rect, chat: &C
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items), inner);
+    Some(inner)
 }
 
 fn autocomplete_row(chat: &ChatState, kind: AutocompleteKind, index: usize) -> Option<String> {

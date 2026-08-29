@@ -20,11 +20,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
 use hel::hel_credentials::CredentialSyncHandle;
 use hel::hel_recovery::RecoveryCoordinator;
+use hel::hel_selection::{
+    FrameSurfaces, SelectionAction, SelectionRange, SelectionState, SurfaceId,
+};
 use hel::hel_session_manager::{
     SessionManagerControl, SessionManagerShutdown, SessionManagerUpdates, ViewError,
 };
@@ -44,7 +49,7 @@ use tokio_stream::StreamExt as _;
 
 use crate::dashboard::io::{
     ActiveLifecycleOperation, DashboardIoUpdate, LifecycleReload, checkpoint_archive_targets,
-    spawn_checkpoint_archive_size_refresh, spawn_lifecycle_reload,
+    spawn_checkpoint_archive_size_refresh, spawn_clipboard_write, spawn_lifecycle_reload,
     spawn_materialized_session_projection, spawn_project_source_resolution, spawn_recovery_reload,
     spawn_stored_session_summary,
 };
@@ -297,6 +302,12 @@ pub(crate) struct DashboardContext {
     /// request itself runs on a blocking worker; this flag keeps repeated
     /// Ctrl-V key repeats from creating an unbounded queue of reads.
     pub(crate) clipboard_read_in_flight: bool,
+    /// Pane-scoped text selection, driven by the mouse events this loop
+    /// intercepts before the views see them.
+    selection: SelectionState,
+    /// Text under the selection, read out of the buffer the last draw
+    /// produced. Copy redraws first, so it never reads a stale frame.
+    selection_text: Option<String>,
 
     pub(crate) dashboard_io_tx: UnboundedSender<DashboardIoUpdate>,
     dashboard_io: Feed<UnboundedReceiver<DashboardIoUpdate>>,
@@ -423,16 +434,21 @@ pub(crate) async fn run_dashboard_for_workspace(
                         action = DashboardAction::OpenWorkspacePicker;
                         false
                     } else {
-                        match (context.view, context.active_chat.as_mut()) {
-                        (View::Chat, Some(chat)) => {
-                            chat_outcome = chat.handle_event(event);
-                            matches!(chat_outcome, hel::hel_chat::ChatEventOutcome::None)
-                        }
-                        _ => {
-                            action = dashboard_event_action(&mut context.dashboard, event);
-                            context.controller_changed = true;
-                            matches!(action, DashboardAction::None)
-                        }
+                        // Selection sees mouse and Esc first: a drag inside a
+                        // pane belongs to the engine, and everything else
+                        // comes back out for the view.
+                        match context.route_selection(event) {
+                            SelectionRouting::Consumed => true,
+                            SelectionRouting::Copy { surface, range } => {
+                                context.copy_selection(surface, range)?;
+                                true
+                            }
+                            SelectionRouting::Forward(event) => dispatch_to_view(
+                                &mut context,
+                                event,
+                                &mut action,
+                                &mut chat_outcome,
+                            ),
                         }
                     };
                     if !batched {
@@ -835,6 +851,8 @@ impl DashboardContext {
             next_import_task_id: 0,
             active_import: None,
             clipboard_read_in_flight: false,
+            selection: SelectionState::new(),
+            selection_text: None,
             dashboard_io_tx,
             dashboard_io: Feed::new(dashboard_io_rx),
             materialized_projection_permits: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -963,16 +981,69 @@ impl DashboardContext {
             dashboard,
             active_chat,
             view,
+            selection,
+            selection_text,
             ..
         } = self;
+        // The highlight and the extraction both run inside the draw closure,
+        // once the view has drawn: the surfaces are registered by that render
+        // and the cells the selection covers only exist in this frame.
         match (*view, active_chat.as_mut()) {
             (View::Chat, Some(chat)) => {
-                terminal.terminal.draw(|frame| chat.draw(frame))?;
+                terminal.terminal.draw(|frame| {
+                    chat.draw(frame);
+                    *selection_text = draw_selection(frame, selection, chat.frame_surfaces());
+                })?;
             }
             _ => {
-                terminal.terminal.draw(|frame| render(frame, dashboard))?;
+                terminal.terminal.draw(|frame| {
+                    render(frame, dashboard);
+                    *selection_text = draw_selection(frame, selection, dashboard.frame_surfaces());
+                })?;
             }
         }
+        Ok(())
+    }
+
+    /// Routes one terminal event through the selection engine, hit-testing
+    /// against the surfaces the view on screen registered.
+    fn route_selection(&mut self, event: Event) -> SelectionRouting {
+        let surfaces = match (self.view, self.active_chat.as_ref()) {
+            (View::Chat, Some(chat)) => chat.frame_surfaces(),
+            _ => self.dashboard.frame_surfaces(),
+        };
+        route_selection_event(&mut self.selection, surfaces, event)
+    }
+
+    /// Copies the finished selection to the system and terminal clipboards.
+    ///
+    /// The frame on screen predates the release that finished the drag, so
+    /// this redraws before reading: the stash is filled during the draw.
+    fn copy_selection(&mut self, surface: SurfaceId, range: SelectionRange) -> Result<()> {
+        self.dirty = true;
+        self.draw()?;
+        let Some(text) = self
+            .selection_text
+            .take()
+            .filter(|text| !text.trim().is_empty())
+        else {
+            tracing::debug!(?surface, ?range, "selection covered no text");
+            return Ok(());
+        };
+        // The desktop clipboard opens a blocking platform connection, so it
+        // runs on a blocking task; OSC 52 is one escape sequence and also
+        // reaches a terminal Hel is talking to over SSH.
+        spawn_clipboard_write(text.clone(), self.dashboard_io_tx.clone());
+        if let Err(error) = self.terminal.copy_to_terminal_clipboard(&text) {
+            self.dashboard
+                .set_failure_notice(format!("Copy to the terminal clipboard failed: {error:#}"));
+            return Ok(());
+        }
+        let lines = text.lines().count().max(1);
+        self.dashboard.set_notice(format!(
+            "Copied {lines} line{}",
+            if lines == 1 { "" } else { "s" }
+        ));
         Ok(())
     }
 
@@ -1646,6 +1717,124 @@ fn record_chat_detach_state(
     ))
 }
 
+/// Hands one event to the view on screen and reports whether the loop may keep
+/// batching, which it may while the event asked for no work.
+fn dispatch_to_view(
+    context: &mut DashboardContext,
+    event: Event,
+    action: &mut DashboardAction,
+    chat_outcome: &mut hel::hel_chat::ChatEventOutcome,
+) -> bool {
+    match (context.view, context.active_chat.as_mut()) {
+        (View::Chat, Some(chat)) => {
+            *chat_outcome = chat.handle_event(event);
+            matches!(*chat_outcome, hel::hel_chat::ChatEventOutcome::None)
+        }
+        _ => {
+            *action = dashboard_event_action(&mut context.dashboard, event);
+            context.controller_changed = true;
+            matches!(*action, DashboardAction::None)
+        }
+    }
+}
+
+/// Highlights the live selection on the frame the view just drew and returns
+/// the text it covers.
+///
+/// Both halves read the same frame, so the copied text is exactly what the
+/// highlight marks. Surfaces that scroll their own content are not registered
+/// yet; when they are, their text comes from their row cache instead.
+fn draw_selection(
+    frame: &mut ratatui::Frame,
+    selection: &SelectionState,
+    surfaces: &FrameSurfaces,
+) -> Option<String> {
+    let id = selection.active_surface()?;
+    let range = selection.range()?;
+    let surface = *surfaces.surface(id)?;
+    hel::hel_selection::highlight(frame.buffer_mut(), &surface, &range);
+    Some(hel::hel_selection::extract_rows(
+        frame.buffer_mut(),
+        &surface,
+        &range,
+    ))
+}
+
+/// What the selection engine decided about one terminal event.
+#[derive(Debug, PartialEq, Eq)]
+enum SelectionRouting {
+    /// The engine took the event; the frame only needs redrawing.
+    Consumed,
+    /// The engine wants nothing to do with this event; hand it to the view.
+    /// A release that never dragged arrives here as the press the view's
+    /// click handling expects.
+    Forward(Event),
+    /// A drag finished. The caller extracts the selected text and copies it.
+    Copy {
+        surface: SurfaceId,
+        range: SelectionRange,
+    },
+}
+
+/// Routes one terminal event between the selection engine and the view.
+///
+/// The engine only claims left-button gestures that start on a registered
+/// surface: a press elsewhere, the wheel, and every other mouse kind stay the
+/// view's. Esc drops a finished selection instead of reaching the view, so the
+/// key that clears the highlight cannot also quit or cancel.
+fn route_selection_event(
+    selection: &mut SelectionState,
+    surfaces: &FrameSurfaces,
+    event: Event,
+) -> SelectionRouting {
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                selection.on_mouse_down(mouse.column, mouse.row, surfaces);
+                if selection.active_surface().is_some() {
+                    SelectionRouting::Consumed
+                } else {
+                    SelectionRouting::Forward(Event::Mouse(mouse))
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if selection.active_surface().is_some() => {
+                selection.on_mouse_drag(mouse.column, mouse.row, surfaces);
+                SelectionRouting::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) if selection.active_surface().is_some() => {
+                match selection.on_mouse_up(mouse.column, mouse.row, surfaces) {
+                    // The views key their click and double-click handling on
+                    // presses, so a click that the engine held back is
+                    // replayed as one when the button comes up.
+                    SelectionAction::Click { column, row } => {
+                        SelectionRouting::Forward(Event::Mouse(MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row,
+                            modifiers: KeyModifiers::NONE,
+                        }))
+                    }
+                    SelectionAction::CopyRequested { surface, range } => {
+                        SelectionRouting::Copy { surface, range }
+                    }
+                    SelectionAction::None => SelectionRouting::Consumed,
+                }
+            }
+            _ => SelectionRouting::Forward(Event::Mouse(mouse)),
+        },
+        Event::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == KeyCode::Esc
+                && key.modifiers == KeyModifiers::NONE
+                && selection.range().is_some() =>
+        {
+            selection.clear();
+            SelectionRouting::Consumed
+        }
+        event => SelectionRouting::Forward(event),
+    }
+}
+
 /// Applies one terminal event to the dashboard and reports the work it asks
 /// for. Every event redraws, so events that carry no action still return
 /// `None` rather than being skipped.
@@ -1724,7 +1913,322 @@ fn configuration_needs_setup(config: &HelConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hel::hel_selection::SurfaceFrame;
     use hel::hel_state::HelState;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::Modifier;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn escape() -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))
+    }
+
+    /// A dashboard with profiles and a target, so the adaptive layout draws
+    /// its three panes with text in them.
+    fn populated_dashboard() -> DashboardState {
+        let mut config = HelConfig::default();
+        for (id, kind) in [
+            ("claude-1", hel::hel_config::HarnessKind::Claude),
+            ("codex-1", hel::hel_config::HarnessKind::Codex),
+        ] {
+            config.profiles.insert(
+                id.into(),
+                hel::hel_config::HarnessProfile {
+                    context_window_bytes: None,
+                    kind,
+                    home: std::path::PathBuf::from("/profiles").join(id),
+                    executable: None,
+                    environment: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+        config.targets.insert(
+            "podman".into(),
+            hel::hel_config::TargetTemplate::LocalPodman {
+                container: hel::hel_config::ContainerTemplate {
+                    image: "ubuntu:24.04".into(),
+                    pull_policy: Default::default(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: std::collections::BTreeMap::new(),
+                },
+            },
+        );
+        let mut state = HelState::default();
+        for (id, title) in [("session-1", "First"), ("session-2", "Second")] {
+            state.sessions.insert(
+                id.into(),
+                hel::hel_state::SessionRecord {
+                    workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
+                    archived: false,
+                    container_cpus: None,
+                    container_memory: None,
+                    id: id.into(),
+                    title: title.into(),
+                    harness_kind: hel::hel_config::HarnessKind::Codex,
+                    last_profile: "codex-1".into(),
+                    bundle_id: "hel".into(),
+                    project_directory: None,
+                    managed_worktree: None,
+                    target_template_id: "podman".into(),
+                    resource_allocation: None,
+                    additional_mounts: Vec::new(),
+                    state: SessionState::Running,
+                    target: None,
+                    native_session_id: None,
+                    acp_session_title: None,
+                    session_title_override: None,
+                    created_at: "2026-08-14T00:00:00Z".into(),
+                    updated_at: "2026-08-14T00:00:00Z".into(),
+                    viewed_through_event_ordinal: 0,
+                    draft_input: String::new(),
+                    last_error: None,
+                    last_checkpoint_error: None,
+                    checkpoint: None,
+                },
+            );
+        }
+        DashboardState::new(config, state, std::collections::BTreeMap::new())
+    }
+
+    /// Draws the dashboard exactly as the loop does, so the highlight and the
+    /// extraction see the frame the view just produced.
+    fn draw_with_selection(
+        terminal: &mut Terminal<TestBackend>,
+        dashboard: &mut DashboardState,
+        selection: &SelectionState,
+    ) -> Option<String> {
+        let mut text = None;
+        terminal
+            .draw(|frame| {
+                render(frame, dashboard);
+                text = draw_selection(frame, selection, dashboard.frame_surfaces());
+            })
+            .expect("draw dashboard");
+        text
+    }
+
+    fn reversed_cells(terminal: &Terminal<TestBackend>) -> Vec<(u16, u16)> {
+        let buffer = terminal.backend().buffer();
+        (buffer.area.y..buffer.area.bottom())
+            .flat_map(|y| (buffer.area.x..buffer.area.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buffer
+                    .cell(Position::new(x, y))
+                    .expect("cell")
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect()
+    }
+
+    /// Screen row of the first line holding `needle`.
+    fn row_containing(terminal: &Terminal<TestBackend>, needle: &str) -> u16 {
+        let buffer = terminal.backend().buffer();
+        (buffer.area.y..buffer.area.bottom())
+            .find(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("missing {needle} on screen"))
+    }
+
+    /// A drag inside a pane belongs to that pane: the range stops at its last
+    /// row even though the pointer left it, and the copied text is the pane's
+    /// own rows without borders or anything drawn around it.
+    #[test]
+    fn dragging_inside_a_pane_copies_only_that_panes_rows() {
+        let mut dashboard = populated_dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        let mut selection = SelectionState::new();
+        draw_with_selection(&mut terminal, &mut dashboard, &selection);
+        let quotas = *dashboard
+            .frame_surfaces()
+            .surface(SurfaceId::DashboardPane(2))
+            .expect("quotas pane registered");
+
+        let press = (quotas.rect.x, quotas.rect.y + 1);
+        // Drag out past the pane's bottom-right corner, into the footer.
+        let release = (quotas.rect.right() + 10, quotas.rect.bottom() + 5);
+        assert_eq!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Down(MouseButton::Left), press.0, press.1),
+            ),
+            SelectionRouting::Consumed
+        );
+        assert_eq!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    release.0,
+                    release.1
+                ),
+            ),
+            SelectionRouting::Consumed
+        );
+        assert_eq!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Up(MouseButton::Left), release.0, release.1),
+            ),
+            SelectionRouting::Copy {
+                surface: SurfaceId::DashboardPane(2),
+                range: SelectionRange {
+                    start: hel::hel_selection::ContentPos::new(1, 0),
+                    end: hel::hel_selection::ContentPos::new(2, quotas.rect.width - 1),
+                },
+            }
+        );
+
+        let text = draw_with_selection(&mut terminal, &mut dashboard, &selection)
+            .expect("the selection covers text");
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec![
+                "  claude-1  Claude Code  refreshing…",
+                "  codex-1   Codex        refreshing…",
+            ]
+        );
+        // Exactly the two selected pane rows are reversed, border columns and
+        // the pane above included.
+        let expected = (quotas.rect.y + 1..quotas.rect.bottom())
+            .flat_map(|y| (quotas.rect.x..quotas.rect.right()).map(move |x| (x, y)))
+            .collect::<Vec<_>>();
+        assert_eq!(reversed_cells(&terminal), expected);
+    }
+
+    /// A press is held back until the button comes up, then replayed to the
+    /// view, so clicking still selects and a second gesture still opens.
+    #[test]
+    fn click_gestures_reach_the_view_as_presses_and_still_double_click() {
+        let mut dashboard = populated_dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        let mut selection = SelectionState::new();
+        draw_with_selection(&mut terminal, &mut dashboard, &selection);
+        let row = row_containing(&terminal, "session-2");
+        let column = dashboard
+            .frame_surfaces()
+            .surface(SurfaceId::DashboardPane(0))
+            .expect("active pane registered")
+            .rect
+            .x;
+
+        let mut click = || {
+            assert_eq!(
+                route_selection_event(
+                    &mut selection,
+                    dashboard.frame_surfaces(),
+                    mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+                ),
+                SelectionRouting::Consumed,
+                "the press waits for the release"
+            );
+            let SelectionRouting::Forward(event) = route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Up(MouseButton::Left), column, row),
+            ) else {
+                panic!("a release without movement forwards a press");
+            };
+            assert_eq!(
+                event,
+                mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+            );
+            dashboard_event_action(&mut dashboard, event)
+        };
+
+        assert_eq!(click(), DashboardAction::None, "the first click selects");
+        assert_eq!(
+            click(),
+            DashboardAction::Open {
+                session_id: "session-2".into(),
+            },
+            "a second gesture on the same row opens it"
+        );
+    }
+
+    #[test]
+    fn presses_off_every_surface_and_wheel_events_reach_the_view() {
+        let mut surfaces = FrameSurfaces::new();
+        surfaces.push(SurfaceFrame::fixed(
+            SurfaceId::ModalBody,
+            Rect::new(10, 5, 20, 4),
+        ));
+        let mut selection = SelectionState::new();
+
+        let outside = mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, outside.clone()),
+            SelectionRouting::Forward(outside)
+        );
+        assert_eq!(selection.active_surface(), None);
+
+        // The wheel scrolls whatever it is over, even inside a surface.
+        let wheel = mouse(MouseEventKind::ScrollDown, 12, 6);
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, wheel.clone()),
+            SelectionRouting::Forward(wheel)
+        );
+        // A drag that never started on a surface is the view's too.
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 12, 6);
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, drag.clone()),
+            SelectionRouting::Forward(drag)
+        );
+    }
+
+    #[test]
+    fn escape_clears_a_finished_selection_before_the_view_sees_it() {
+        let mut surfaces = FrameSurfaces::new();
+        surfaces.push(SurfaceFrame::fixed(
+            SurfaceId::ModalBody,
+            Rect::new(10, 5, 20, 4),
+        ));
+        let mut selection = SelectionState::new();
+        route_selection_event(
+            &mut selection,
+            &surfaces,
+            mouse(MouseEventKind::Down(MouseButton::Left), 11, 6),
+        );
+        route_selection_event(
+            &mut selection,
+            &surfaces,
+            mouse(MouseEventKind::Up(MouseButton::Left), 15, 7),
+        );
+        assert!(selection.range().is_some(), "the drag left a selection");
+
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, escape()),
+            SelectionRouting::Consumed
+        );
+        assert_eq!(selection.range(), None);
+        // With nothing selected, Esc is the view's key again.
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, escape()),
+            SelectionRouting::Forward(escape())
+        );
+    }
 
     /// The dashboard loop batches buffered input and stops at the first event
     /// that asks for work, so events that only need a redraw must report no

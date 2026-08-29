@@ -12,10 +12,13 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::path::PathBuf;
 
 use hel::hel_config::{HarnessKind, mount_history_host};
+use hel::hel_selection::FrameSurfaces;
 use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_additional_mounts};
 use hel::hel_text_input::TextInput;
 
-use crate::widgets::{action_buttons, centered_rect, focused_buttons, popup_height, truncate_text};
+use crate::widgets::{
+    action_buttons, centered_modal, focused_buttons, popup_height, truncate_text,
+};
 use crate::wizards::read_only_marker;
 use crate::{
     ButtonKey, DashboardAction, DashboardState, Mode, button_row_key, cycle_button_focus,
@@ -193,7 +196,12 @@ fn primary_button(labels: &[&str]) -> usize {
     labels.len().saturating_sub(1)
 }
 
-pub(crate) fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
+pub(crate) fn render_import_progress(
+    frame: &mut Frame,
+    area: Rect,
+    progress: &ImportProgress,
+    surfaces: &mut FrameSurfaces,
+) {
     let total = progress
         .total
         .map_or_else(|| "?".into(), |total| total.to_string());
@@ -229,7 +237,7 @@ pub(crate) fn render_import_progress(frame: &mut Frame, area: Rect, progress: &I
     )))
     // `trim: false` keeps the padding inside the leftmost button background.
     .wrap(Wrap { trim: false });
-    let popup = centered_rect(76, popup_height(&paragraph, 76, 10, area), area);
+    let popup = centered_modal(surfaces, 76, popup_height(&paragraph, 76, 10, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
@@ -238,6 +246,7 @@ pub(crate) fn render_import_bundle_confirmation(
     frame: &mut Frame,
     area: Rect,
     confirmation: &ImportBundleConfirmation,
+    surfaces: &mut FrameSurfaces,
 ) {
     let mut lines = Vec::new();
     if !confirmation.dirty_git_roots.is_empty() {
@@ -306,7 +315,7 @@ pub(crate) fn render_import_bundle_confirmation(
         )
         // `trim: false` keeps the padding inside the leftmost button background.
         .wrap(Wrap { trim: false });
-    let popup = centered_rect(76, popup_height(&paragraph, 76, 12, area), area);
+    let popup = centered_modal(surfaces, 76, popup_height(&paragraph, 76, 12, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
@@ -495,7 +504,12 @@ impl ContainerEditor {
     }
 }
 
-pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &ContainerEditor) {
+pub(crate) fn render_container_editor(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &ContainerEditor,
+    surfaces: &mut FrameSurfaces,
+) {
     let field = |label: &str, value: &TextInput, focused: bool| {
         let style = if focused {
             Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -612,12 +626,17 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
             .borders(Borders::ALL)
             .title(" Edit container size and mounts "),
     );
-    let popup = centered_rect(70, popup_height(&paragraph, 70, 18, area), area);
+    let popup = centered_modal(surfaces, 70, popup_height(&paragraph, 70, 18, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
 
-pub(crate) fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &RenameEditor) {
+pub(crate) fn render_rename_editor(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &RenameEditor,
+    surfaces: &mut FrameSurfaces,
+) {
     let paragraph = Paragraph::new(vec![
         Line::raw(format!("Session: {}", editor.session_id)),
         Line::raw(""),
@@ -637,7 +656,7 @@ pub(crate) fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &Renam
             .borders(Borders::ALL)
             .title(" Rename session "),
     );
-    let popup = centered_rect(60, popup_height(&paragraph, 60, 8, area), area);
+    let popup = centered_modal(surfaces, 60, popup_height(&paragraph, 60, 8, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
@@ -646,6 +665,7 @@ pub(crate) fn render_repository_origin(
     frame: &mut Frame,
     area: Rect,
     dialog: &RepositoryOriginDialog,
+    surfaces: &mut FrameSurfaces,
 ) {
     let field_focused = dialog.focus == RepositoryOriginFocus::Field;
     let field_style = if field_focused {
@@ -709,12 +729,17 @@ pub(crate) fn render_repository_origin(
                 .title(" Repository history is missing "),
         )
         .wrap(Wrap { trim: false });
-    let popup = centered_rect(76, popup_height(&paragraph, 76, 14, area), area);
+    let popup = centered_modal(surfaces, 76, popup_height(&paragraph, 76, 14, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
 
-pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &ConfirmDialog) {
+pub(crate) fn render_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &ConfirmDialog,
+    surfaces: &mut FrameSurfaces,
+) {
     let confirmation = &dialog.confirmation;
     // Minimum height per dialog; `popup_height` grows it to fit wrapped content.
     let nominal = match confirmation {
@@ -795,7 +820,12 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
         )
         // `trim: false` keeps the padding inside the leftmost button background.
         .wrap(Wrap { trim: false });
-    let popup = centered_rect(72, popup_height(&paragraph, 72, nominal, area), area);
+    let popup = centered_modal(
+        surfaces,
+        72,
+        popup_height(&paragraph, 72, nominal, area),
+        area,
+    );
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
