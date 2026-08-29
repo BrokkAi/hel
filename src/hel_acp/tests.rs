@@ -823,6 +823,76 @@ fn supported_permission_plan_reviews_are_detected_and_mapped_to_native_options()
     }
 }
 
+/// The exact `session/request_permission` Claude Code's ACP bridge sends when
+/// ExitPlanMode fires: a `switch_mode` tool call carrying the plan and a
+/// `planFilePath`, titled "Ready to code?", with generic permission-mode option
+/// ids. Captured from a live worker.log. None of the title/option heuristics
+/// match it, so the classifier must key on the tool kind and plan payload.
+#[test]
+fn claude_exit_plan_mode_request_is_detected_and_mapped() {
+    let request: RequestPermissionRequest = serde_json::from_value(serde_json::json!({
+        "sessionId": "7c4ce22d-9b3a-421b-b9f9-f2b8d3b73bb8",
+        "toolCall": {
+            "toolCallId": "toolu_01L8aaLyXndAiFoQM9yhpsRy",
+            "kind": "switch_mode",
+            "title": "Ready to code?",
+            "content": [{
+                "type": "content",
+                "content": {"type": "text", "text": "# Add --version flag\n\nDo the work."}
+            }],
+            "rawInput": {
+                "plan": "# Add --version flag\n\nDo the work.",
+                "planFilePath": "/home/jonathan/.claude/plans/add-a-version-flag.md"
+            }
+        },
+        "options": [
+            {"optionId": "bypassPermissions", "name": "Yes, and bypass permissions", "kind": "allow_always"},
+            {"optionId": "auto", "name": "Yes, and use \"auto\" mode", "kind": "allow_always"},
+            {"optionId": "acceptEdits", "name": "Yes, and auto-accept edits", "kind": "allow_always"},
+            {"optionId": "default", "name": "Yes, and manually approve edits", "kind": "allow_once"},
+            {"optionId": "plan", "name": "No, keep planning", "kind": "reject_once"}
+        ]
+    }))
+    .expect("captured Claude ExitPlanMode payload deserializes");
+
+    assert!(
+        is_plan_permission(&request),
+        "Claude's switch_mode request must be classified as a plan review"
+    );
+
+    let review =
+        normalized_plan_review("plan-review-1".into(), &serde_json::to_value(&request).unwrap());
+    assert!(review.message.contains("Add --version flag"));
+
+    // Implement approves with the least-privileged edit option, never a
+    // bypass-permissions option.
+    let mut implement = BTreeMap::new();
+    implement.insert(
+        PLAN_REVIEW_ACTION.into(),
+        ElicitationValue::String("implement".into()),
+    );
+    let approved =
+        permission_plan_response(&request, ElicitationResponse::Accept { content: implement });
+    assert_eq!(
+        serde_json::to_value(approved).unwrap()["outcome"]["optionId"],
+        "default"
+    );
+
+    // Declining keeps planning by selecting the reject option instead of
+    // cancelling the turn.
+    let mut keep = BTreeMap::new();
+    keep.insert(
+        PLAN_REVIEW_ACTION.into(),
+        ElicitationValue::String("keep_planning".into()),
+    );
+    let declined =
+        permission_plan_response(&request, ElicitationResponse::Accept { content: keep });
+    assert_eq!(
+        serde_json::to_value(declined).unwrap()["outcome"]["optionId"],
+        "plan"
+    );
+}
+
 #[tokio::test]
 async fn an_unknown_client_request_is_answered_with_an_error_rather_than_silence() {
     let answer =
