@@ -456,13 +456,23 @@ fn render_sessions(
                 "You: ",
                 detail.and_then(|detail| detail.last_user_message.as_deref()),
                 usize::from(active_area.width.saturating_sub(4)),
+                detail.is_some_and(|detail| detail.last_agent_message_follows_last_user),
             ));
+            let agent_excerpt = detail.and_then(|detail| {
+                if detail.last_user_message.is_none() || detail.last_agent_message_follows_last_user
+                {
+                    detail.last_agent_message.as_deref()
+                } else {
+                    detail.latest_agent_activity_after_last_user.as_deref()
+                }
+            });
             let show_agent_excerpt = detail.is_none_or(|detail| {
-                detail.last_user_message.is_none() || detail.last_agent_message_follows_last_user
+                detail.last_user_message.is_none()
+                    || detail.last_agent_message_follows_last_user
+                    || detail.latest_agent_activity_after_last_user.is_some()
             });
             if show_agent_excerpt {
-                let mut agent = detail
-                    .and_then(|detail| detail.last_agent_message.as_deref())
+                let mut agent = agent_excerpt
                     .map(|message| {
                         render_agent_message_head(
                             message,
@@ -710,11 +720,12 @@ fn prefixed_summary_line(
     label: &str,
     message: Option<&str>,
     width: usize,
+    muted: bool,
 ) -> Line<'static> {
     let message = message.unwrap_or("No messages yet");
     let flattened = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let lead = format!("{prefix}{label}");
-    Line::from(vec![
+    let line = Line::from(vec![
         Span::raw(prefix.to_owned()),
         Span::styled(
             label.to_owned(),
@@ -724,7 +735,12 @@ fn prefixed_summary_line(
             &flattened,
             width.saturating_sub(lead.chars().count()),
         )),
-    ])
+    ]);
+    if muted {
+        line.style(Style::default().fg(Color::DarkGray))
+    } else {
+        line
+    }
 }
 
 fn format_elapsed(elapsed: u64) -> String {
@@ -1442,6 +1458,18 @@ mod tests {
         assert!(rendered.contains("You: question 1"));
         assert!(rendered.contains("Agent: "));
         assert!(rendered.contains("answer 1"));
+
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let (user_row, user_line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("You: question 1"))
+            .expect("user transcript line");
+        let user_column = cell_column(user_line, "You: question 1");
+        assert!((user_column..user_column + 15).all(|column| {
+            buffer[(buffer.area.x + column, buffer.area.y + user_row as u16)].fg == Color::DarkGray
+        }));
     }
 
     #[test]
@@ -1465,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_dashboard_omits_an_agent_excerpt_older_than_the_last_user_message() {
+    fn unanswered_user_line_stays_bright_and_shows_the_latest_agent_activity() {
         let mut dashboard = dashboard_with_session(running_session());
         let mut transcript = numbered_conversation(1);
         transcript.push(transcript_item(
@@ -1477,17 +1505,33 @@ mod tests {
                 })],
             },
         ));
+        transcript.push(thought(4, "Checking the workspace"));
         apply_materialized_transcript(&mut dashboard, transcript);
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
 
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw dashboard");
-        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let rendered = lines.join("\n");
 
         assert!(rendered.contains("You: unanswered follow-up"));
-        assert!(!rendered.contains("Agent:"));
+        assert!(
+            rendered.contains("Agent: │ Checking the workspace"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("answer 0"));
+        let (user_row, user_line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("You: unanswered follow-up"))
+            .expect("user transcript line");
+        let user_column = cell_column(user_line, "You: unanswered follow-up");
+        assert_ne!(
+            buffer[(buffer.area.x + user_column, buffer.area.y + user_row as u16)].fg,
+            Color::DarkGray
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ pub(crate) struct SessionDetail {
     pub(crate) last_agent_message: Option<Arc<str>>,
     pub(crate) last_user_message: Option<Arc<str>>,
     pub(crate) last_agent_message_follows_last_user: bool,
+    pub(crate) latest_agent_activity_after_last_user: Option<Arc<str>>,
     pub(crate) last_acp_activity_at_ms: Option<u64>,
     /// Latest agent-content ordinals retained so a state-only read-cursor
     /// update can recompute unread agent messages exactly.
@@ -92,6 +93,8 @@ pub struct MaterializedProjectionCache {
     restart_events: Vec<(usize, u64)>,
     /// Transcript index and text of the last agent message with text.
     pub(crate) last_agent_message: Option<(usize, Arc<str>)>,
+    /// Transcript index and text of the latest thought or tool activity.
+    latest_agent_activity: Option<(usize, Arc<str>)>,
     /// Exact stats for terminal tool items, keyed by logical identity and
     /// revision so unrelated transcript updates never repeat their diff.
     tool_diffstats: BTreeMap<(String, i64), Vec<String>>,
@@ -152,6 +155,46 @@ pub(crate) fn last_agent_message(
     }
 }
 
+fn agent_activity_text(item: &TranscriptItem) -> Option<Arc<str>> {
+    let text = match &item.body {
+        TranscriptBody::Thought { chunks, .. } => hel::hel_chat::materialized_chunks_text(chunks),
+        TranscriptBody::Tool { call, .. } => call
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("[invalid tool call]")
+            .to_owned(),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then(|| Arc::from(text))
+}
+
+fn latest_agent_activity_in(
+    transcript: &[Arc<TranscriptItem>],
+    range: std::ops::Range<usize>,
+) -> Option<(usize, Arc<str>)> {
+    let start = range.start;
+    transcript[range]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(offset, item)| agent_activity_text(item).map(|text| (start + offset, text)))
+}
+
+fn latest_agent_activity(
+    transcript: &[Arc<TranscriptItem>],
+    unchanged_prefix: usize,
+    previous: &MaterializedProjectionCache,
+) -> Option<(usize, Arc<str>)> {
+    if let Some(found) = latest_agent_activity_in(transcript, unchanged_prefix..transcript.len()) {
+        return Some(found);
+    }
+    match &previous.latest_agent_activity {
+        Some((index, text)) if *index < unchanged_prefix => Some((*index, text.clone())),
+        Some(_) => latest_agent_activity_in(transcript, 0..unchanged_prefix),
+        None => None,
+    }
+}
+
 pub struct PreparedMaterializedSessionDetail {
     pub(crate) session_id: String,
     pub(crate) applied_event_ordinal: u64,
@@ -161,6 +204,7 @@ pub struct PreparedMaterializedSessionDetail {
     pub(crate) last_agent_message: Option<Arc<str>>,
     pub(crate) last_user_message: Option<Arc<str>>,
     pub(crate) last_agent_message_follows_last_user: bool,
+    pub(crate) latest_agent_activity_after_last_user: Option<Arc<str>>,
     agent_message_latest_content_ordinals: Vec<u64>,
     pub(crate) unread_agent_messages: usize,
     session_restart_event_ordinals: Vec<u64>,
@@ -254,6 +298,8 @@ impl PreparedMaterializedSessionDetail {
         let unchanged_prefix = previous.unchanged_prefix(&session.transcript);
         let last_agent_message =
             last_agent_message(&session.transcript, unchanged_prefix, &previous);
+        let latest_agent_activity =
+            latest_agent_activity(&session.transcript, unchanged_prefix, &previous);
         let last_user_message =
             session
                 .transcript
@@ -273,6 +319,14 @@ impl PreparedMaterializedSessionDetail {
                     .as_ref()
                     .is_none_or(|(user_index, _)| agent_index > user_index)
             });
+        let latest_agent_activity_after_last_user = latest_agent_activity
+            .as_ref()
+            .filter(|(activity_index, _)| {
+                last_user_message
+                    .as_ref()
+                    .is_some_and(|(user_index, _)| activity_index > user_index)
+            })
+            .map(|(_, text)| Arc::clone(text));
         let mut cached_tool_diffstats = previous.tool_diffstats;
         let mut tool_diffstats = BTreeMap::new();
         let mut current_tool_diffstats = BTreeMap::new();
@@ -354,6 +408,7 @@ impl PreparedMaterializedSessionDetail {
                 .map(|(_, text)| Arc::clone(text)),
             last_user_message: last_user_message.map(|(_, message)| message),
             last_agent_message_follows_last_user,
+            latest_agent_activity_after_last_user,
             agent_message_latest_content_ordinals,
             unread_agent_messages,
             session_restart_event_ordinals,
@@ -365,6 +420,7 @@ impl PreparedMaterializedSessionDetail {
                 agent_messages,
                 restart_events,
                 last_agent_message,
+                latest_agent_activity,
                 tool_diffstats,
             },
         }
@@ -699,6 +755,8 @@ impl DashboardState {
         detail.last_agent_message = prepared.last_agent_message;
         detail.last_user_message = prepared.last_user_message;
         detail.last_agent_message_follows_last_user = prepared.last_agent_message_follows_last_user;
+        detail.latest_agent_activity_after_last_user =
+            prepared.latest_agent_activity_after_last_user;
         detail.agent_message_latest_content_ordinals =
             prepared.agent_message_latest_content_ordinals;
         detail.unread_agent_messages = prepared.unread_agent_messages;
@@ -739,6 +797,7 @@ impl DashboardState {
         detail.last_agent_message = prepared.last_agent_message;
         detail.last_user_message = prepared.last_user_message;
         detail.last_agent_message_follows_last_user = prepared.last_agent_message_follows_last_user;
+        detail.latest_agent_activity_after_last_user = None;
         detail.agent_message_latest_content_ordinals =
             prepared.agent_message_latest_content_ordinals;
         detail.unread_agent_messages = prepared.unread_agent_messages;
@@ -1353,6 +1412,7 @@ mod tests {
                 })],
             },
         ));
+        transcript.push(thought(4, "checking the workspace"));
         apply_materialized_transcript(&mut dashboard, transcript.clone());
 
         let detail = &dashboard.session_details["session-1"];
@@ -1362,8 +1422,32 @@ mod tests {
             Some("follow-up question")
         );
         assert!(!detail.last_agent_message_follows_last_user);
+        assert_eq!(
+            detail.latest_agent_activity_after_last_user.as_deref(),
+            Some("checking the workspace")
+        );
 
-        transcript.push(agent_message(4, "follow-up answer"));
+        transcript.push(transcript_item(
+            5,
+            TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "test",
+                    "title": "Inspect src/lib.rs",
+                    "status": "in_progress"
+                }),
+                terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
+            },
+        ));
+        apply_materialized_transcript(&mut dashboard, transcript.clone());
+        assert_eq!(
+            dashboard.session_details["session-1"]
+                .latest_agent_activity_after_last_user
+                .as_deref(),
+            Some("Inspect src/lib.rs")
+        );
+
+        transcript.push(agent_message(6, "follow-up answer"));
         apply_materialized_transcript(&mut dashboard, transcript);
         assert!(dashboard.session_details["session-1"].last_agent_message_follows_last_user);
     }
