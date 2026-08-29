@@ -378,6 +378,20 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 15 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE host_container_sizes (
+                 host TEXT PRIMARY KEY CHECK(length(trim(host)) > 0),
+                 cpus INTEGER NOT NULL CHECK(cpus > 0),
+                 memory_bytes INTEGER NOT NULL CHECK(memory_bytes > 0)
+             ) STRICT;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (15, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 15;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)

@@ -190,6 +190,7 @@ pub(crate) struct ActiveLifecycleOperation {
 
 pub(crate) struct RegisteredDashboardSession {
     session: SessionRecord,
+    remembered_container_size: Option<(String, hel::hel_state::HostContainerSize)>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -874,8 +875,22 @@ pub(crate) fn spawn_dashboard_create_session(
                 .get(&session_id)
                 .expect("newly registered session exists")
                 .clone();
+            let remembered_container_size = controller
+                .config
+                .targets
+                .get(&target_template_id)
+                .and_then(hel::hel_config::container_size_host)
+                .and_then(|host| {
+                    controller
+                        .state
+                        .container_sizes
+                        .get(host)
+                        .copied()
+                        .map(|size| (host.to_owned(), size))
+                });
             Ok(Some(RegisteredDashboardSession {
                 session,
+                remembered_container_size,
                 cancelled: cancelled.clone(),
             }))
         })();
@@ -1401,6 +1416,9 @@ impl DashboardContext {
             DashboardCreateSessionUpdate::Registered(registered) => {
                 let registered = *registered;
                 let session_id = registered.session.id.clone();
+                if let Some((host, size)) = registered.remembered_container_size {
+                    self.controller.state.remember_container_size(&host, size);
+                }
                 self.controller
                     .state
                     .sessions

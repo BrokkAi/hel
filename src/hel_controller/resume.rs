@@ -39,7 +39,10 @@ use super::worktree::{
     managed_worktree_checkout_exists, plan_raw_to_workspace, raw_checkout_divergence_notice,
     raw_checkout_position, restore_managed_worktree, resume_compatibility, retire_managed_worktree,
 };
-use super::{Controller, SessionResumeOptions, execute_checked, now, target_profile_home};
+use super::{
+    Controller, SessionResumeOptions, execute_checked, now, selected_host_container_size,
+    target_profile_home,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeRepositorySourceMismatch {
@@ -672,6 +675,8 @@ impl Controller {
         let additional_mounts =
             additional_mounts.unwrap_or_else(|| previous.additional_mounts.clone());
         validate_resource_allocation(target_template, resource_allocation.as_ref())?;
+        let selected_container_size =
+            selected_host_container_size(target_template, resource_allocation.as_ref());
         if !additional_mounts.is_empty() && mount_history_host(target_template).is_none() {
             bail!("attached resources are unsupported for this target");
         }
@@ -841,7 +846,18 @@ impl Controller {
         }
         // Resume rewrites the record it resumes, including the attached
         // directories and the harness session id, so it writes the whole row.
-        crate::hel_database::save_session(&self.state.sessions[session_id])?;
+        if let Some((host, size)) = selected_container_size.as_ref() {
+            crate::hel_database::save_session_with_container_size(
+                &self.state.sessions[session_id],
+                host,
+                *size,
+            )?;
+        } else {
+            crate::hel_database::save_session(&self.state.sessions[session_id])?;
+        }
+        if let Some((host, size)) = selected_container_size {
+            self.state.remember_container_size(&host, size);
+        }
 
         let mut recreated_managed_worktree = false;
         let result = async {

@@ -359,12 +359,21 @@ impl DashboardState {
         if is_paste_shortcut(key) {
             return DashboardAction::PasteFromClipboard;
         }
-        if dashboard_accelerator(key.modifiers)
-            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
+        let text_focused = self.text_input_focused();
+        if text_focused
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
         {
+            self.cancel_modal();
+            return DashboardAction::None;
+        }
+        if dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('q') {
             return DashboardAction::QuitDetach;
         }
-        if dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('w') {
+        if !text_focused && dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('c') {
+            return DashboardAction::QuitDetach;
+        }
+        if !text_focused && dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('w') {
             return DashboardAction::OpenWorkspacePicker;
         }
 
@@ -379,12 +388,12 @@ impl DashboardState {
         }
         match self.mode.clone() {
             Mode::Dashboard => self.handle_dashboard_key(key),
-            Mode::New(wizard) => self.handle_new_key(key.code, wizard),
-            Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
+            Mode::New(wizard) => self.handle_new_key(key, wizard),
+            Mode::Resume(wizard) => self.handle_resume_key(key, wizard),
             Mode::ResumeDialog(_) => unreachable!("the resume dialog is handled in place"),
-            Mode::RepositoryOrigin(dialog) => self.handle_repository_origin_key(key.code, dialog),
-            Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
-            Mode::EditContainer(editor) => self.handle_container_edit_key(key.code, editor),
+            Mode::RepositoryOrigin(dialog) => self.handle_repository_origin_key(key, dialog),
+            Mode::Rename(editor) => self.handle_rename_key(key, editor),
+            Mode::EditContainer(editor) => self.handle_container_edit_key(key, editor),
             // The only control is the Cancel button, so Enter presses it too.
             Mode::Importing(_) => match key.code {
                 KeyCode::Esc | KeyCode::Enter => DashboardAction::CancelImport,
@@ -393,7 +402,23 @@ impl DashboardState {
             Mode::ConfirmImportBundle(confirmation) => {
                 self.handle_import_bundle_key(key.code, confirmation)
             }
-            Mode::Confirm(dialog) => self.handle_confirmation_key(key.code, dialog),
+            Mode::Confirm(dialog) => self.handle_confirmation_key(key, dialog),
+        }
+    }
+
+    fn text_input_focused(&self) -> bool {
+        match &self.mode {
+            Mode::Rename(editor) => editor.focus == RenameFocus::Field,
+            Mode::RepositoryOrigin(dialog) => dialog.focus == dialogs::RepositoryOriginFocus::Field,
+            Mode::EditContainer(editor) => editor.field().is_some(),
+            Mode::ResumeDialog(dialog) => dialog.focus == crate::resume::ResumeFocus::Search,
+            Mode::New(wizard) => wizard.text_input_focused(),
+            Mode::Resume(wizard) => wizard.text_input_focused(),
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::ForceStop { .. },
+                ..
+            }) => true,
+            _ => false,
         }
     }
 
@@ -1195,6 +1220,7 @@ mod tests {
                 (lost.id.clone(), lost),
             ]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let (active, terminal) = partition_sessions(state.sessions.values());
         assert_eq!(
@@ -1267,6 +1293,7 @@ mod tests {
                 .map(|session| (session.id.clone(), session))
                 .collect(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         let source =
@@ -1363,6 +1390,7 @@ mod tests {
                     (archived.id.clone(), archived),
                 ]),
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1406,6 +1434,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1443,6 +1472,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1484,6 +1514,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1647,6 +1678,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1675,6 +1707,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions: BTreeMap::from([(other.id.clone(), other)]),
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );

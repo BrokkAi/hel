@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,6 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use hel::hel_config::{HarnessKind, HelConfig};
 use hel::hel_state::{HelState, SessionRecord, SessionState};
+use hel::hel_text_input::TextInput;
 
 use crate::dialogs::{ConfirmDialog, Confirmation, ImportProfileOption};
 use crate::render::render_session_scrollbar;
@@ -166,7 +167,7 @@ pub(crate) struct ResumeDialog {
     pub(crate) tab: ResumeTab,
     pub(crate) selected: Option<ResumeRowKey>,
     pub(crate) row_index: usize,
-    pub(crate) search: String,
+    pub(crate) search: TextInput,
     pub(crate) focus: ResumeFocus,
     pub(crate) show_archived: bool,
     pub(crate) opened_at: Instant,
@@ -435,7 +436,7 @@ impl DashboardState {
             tab: ResumeTab::Hel,
             selected: None,
             row_index: 0,
-            search: String::new(),
+            search: TextInput::new(),
             focus: ResumeFocus::Sessions,
             show_archived: false,
             opened_at: Instant::now(),
@@ -581,27 +582,17 @@ impl DashboardState {
                     cycle_control(focus, &RESUME_FOCUS_ORDER, key.code == KeyCode::BackTab);
                 DashboardAction::None
             }
-            KeyCode::Backspace if typing => {
-                dialog.search.pop();
-                self.rebuild_resume_rows();
-                self.select_resume_row(0);
-                DashboardAction::None
-            }
-            KeyCode::Char(character)
-                if typing
-                    && !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                    ) =>
-            {
-                dialog.search.push(character);
-                self.rebuild_resume_rows();
-                self.select_resume_row(0);
-                DashboardAction::None
-            }
             // Down leaves search for the list, so typing a query and walking
             // its results needs no Tab in between.
             KeyCode::Down if typing => {
                 dialog.focus = ResumeFocus::Sessions;
+                DashboardAction::None
+            }
+            _ if typing => {
+                if dialog.search.handle_key(key).changed() {
+                    self.rebuild_resume_rows();
+                    self.select_resume_row(0);
+                }
                 DashboardAction::None
             }
             KeyCode::Up | KeyCode::Char('k') if !typing => {
@@ -836,11 +827,15 @@ pub(crate) fn render_resume_dialog(
     );
 
     let search_focused = dialog.focus == ResumeFocus::Search;
-    let cursor = if search_focused { "▏" } else { "" };
+    let search = if search_focused {
+        dialog.search.with_cursor_marker("▏")
+    } else {
+        dialog.search.to_string()
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                format!("Search: {}{cursor}", dialog.search),
+                format!("Search: {search}"),
                 if search_focused {
                     Style::default().bg(Color::DarkGray).fg(Color::White)
                 } else {
@@ -1121,6 +1116,7 @@ mod tests {
                 .map(|session| (session.id.clone(), session))
                 .collect(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         }
     }
 
@@ -1140,7 +1136,7 @@ mod tests {
         let Mode::ResumeDialog(dialog) = &mut dashboard.mode else {
             panic!("expected the resume dialog");
         };
-        dialog.search = search.to_owned();
+        dialog.search = search.to_owned().into();
         dashboard.rebuild_resume_rows();
     }
 

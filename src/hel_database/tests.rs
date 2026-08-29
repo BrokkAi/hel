@@ -1,6 +1,8 @@
 use super::*;
 use crate::hel_config::HarnessKind;
-use crate::hel_state::{ManagedWorktreeTarget, QueuedCommandKind, TranscriptBody};
+use crate::hel_state::{
+    HostContainerSize, ManagedWorktreeTarget, QueuedCommandKind, TranscriptBody,
+};
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 use rusqlite::OptionalExtension;
 
@@ -182,6 +184,13 @@ fn normalized_state_round_trip_preserves_children_and_order() {
         "local".into(),
         vec![PathBuf::from("/recent"), PathBuf::from("/older")],
     );
+    state.container_sizes.insert(
+        "local".into(),
+        HostContainerSize {
+            cpus: 12,
+            memory_bytes: 48 * 1024 * 1024 * 1024,
+        },
+    );
 
     save_state_to(&database, &state).unwrap();
 
@@ -199,6 +208,83 @@ fn normalized_state_round_trip_preserves_children_and_order() {
             .optional()
             .unwrap(),
         None
+    );
+}
+
+#[test]
+fn session_and_host_container_size_commit_together_and_latest_wins() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let record = session("session-1", "project-1");
+    save_session_with_container_size_to(
+        &database,
+        &record,
+        Some((
+            "builder",
+            HostContainerSize {
+                cpus: 8,
+                memory_bytes: 32,
+            },
+        )),
+    )
+    .unwrap();
+    save_session_with_container_size_to(
+        &database,
+        &record,
+        Some((
+            "builder",
+            HostContainerSize {
+                cpus: 16,
+                memory_bytes: 64,
+            },
+        )),
+    )
+    .unwrap();
+
+    let loaded = load_state_from(&database).unwrap();
+    assert_eq!(
+        loaded.container_sizes["builder"],
+        HostContainerSize {
+            cpus: 16,
+            memory_bytes: 64,
+        }
+    );
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM host_container_sizes", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn version_fourteen_database_gains_empty_host_container_sizes() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let connection = open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE host_container_sizes;
+             DELETE FROM schema_migrations WHERE version = 15;
+             PRAGMA user_version = 14;",
+        )
+        .unwrap();
+    drop(connection);
+    forget_verified_schema(&database);
+
+    let loaded = load_state_from(&database).unwrap();
+    assert!(loaded.container_sizes.is_empty());
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
     );
 }
 
@@ -433,7 +519,8 @@ fn version_thirteen_restores_checkpointed_lost_sessions_to_recoverable_errors() 
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "DELETE FROM schema_migrations WHERE version = 13;
+            "DROP TABLE host_container_sizes;
+             DELETE FROM schema_migrations WHERE version >= 13;
                  PRAGMA user_version = 12;",
         )
         .unwrap();

@@ -815,6 +815,13 @@ pub struct SessionRecord {
     pub checkpoint: Option<CheckpointMetadata>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostContainerSize {
+    pub cpus: u64,
+    pub memory_bytes: u64,
+}
+
 fn default_session_workspace_id() -> String {
     crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned()
 }
@@ -1076,6 +1083,9 @@ pub struct HelState {
     /// Recently used source directories, keyed by `local` or SSH host name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mount_history: BTreeMap<String, Vec<PathBuf>>,
+    /// Most recently launched container size on each physical target host.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub container_sizes: BTreeMap<String, HostContainerSize>,
 }
 
 impl Default for HelState {
@@ -1084,6 +1094,7 @@ impl Default for HelState {
             version: STATE_VERSION,
             sessions: BTreeMap::new(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         }
     }
 }
@@ -1107,6 +1118,17 @@ impl HelState {
                 bail!("mount history for {host:?} contains a non-absolute source path");
             }
         }
+        for (host, size) in &self.container_sizes {
+            if host.trim().is_empty() {
+                bail!("container size history contains an empty host key");
+            }
+            if size.cpus == 0 || size.memory_bytes == 0 {
+                bail!("container size history for {host:?} contains a zero value");
+            }
+            if size.cpus > i64::MAX as u64 || size.memory_bytes > i64::MAX as u64 {
+                bail!("container size history for {host:?} exceeds SQLite integer range");
+            }
+        }
         Ok(())
     }
 
@@ -1120,6 +1142,10 @@ impl HelState {
             sources.insert(0, mount.source.clone());
         }
         sources.truncate(20);
+    }
+
+    pub fn remember_container_size(&mut self, host: &str, size: HostContainerSize) {
+        self.container_sizes.insert(host.to_owned(), size);
     }
 
     pub fn project_directories(&self, host: &str) -> &[PathBuf] {
@@ -1336,6 +1362,7 @@ mod tests {
                 "local".into(),
                 vec![PathBuf::from("/home/test/cache")],
             )]),
+            container_sizes: BTreeMap::new(),
         }
     }
 
@@ -1409,6 +1436,34 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&edited).expect("serialize"))
                 .expect("reload edited session");
         assert_eq!(round_tripped, edited);
+    }
+
+    #[test]
+    fn container_size_history_rejects_invalid_keys_and_values() {
+        let mut state = HelState::default();
+        state.container_sizes.insert(
+            String::new(),
+            HostContainerSize {
+                cpus: 8,
+                memory_bytes: 32,
+            },
+        );
+        assert!(
+            state
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("empty host")
+        );
+
+        state.container_sizes = BTreeMap::from([(
+            "local".into(),
+            HostContainerSize {
+                cpus: 0,
+                memory_bytes: 32,
+            },
+        )]);
+        assert!(state.validate().unwrap_err().to_string().contains("zero"));
     }
 
     #[test]

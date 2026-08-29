@@ -979,6 +979,7 @@ mod tests {
             version: crate::hel_state::STATE_VERSION,
             sessions: BTreeMap::from([(session_id.into(), record)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let backend = hel_targets::TargetLocator::AwsEc2 {
             profile: "default".into(),

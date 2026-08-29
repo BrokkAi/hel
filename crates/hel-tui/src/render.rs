@@ -1550,6 +1550,7 @@ mod tests {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
@@ -1600,6 +1601,7 @@ mod tests {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
@@ -1631,6 +1633,7 @@ mod tests {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         dashboard.apply_materialized_session(&materialized_session_for(
@@ -1697,6 +1700,7 @@ mod tests {
                 .map(|session| (session.id.clone(), session))
                 .collect(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         dashboard.apply_materialized_session(&materialized_session_for(
@@ -2136,6 +2140,7 @@ mod tests {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(session.id.clone(), session)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
         let capacity_target =
@@ -2283,6 +2288,7 @@ mod tests {
             version: STATE_VERSION,
             sessions,
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         for index in 0..6 {
@@ -2643,6 +2649,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );

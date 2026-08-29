@@ -209,6 +209,7 @@ pub(crate) fn dashboard_with_session(mut session: SessionRecord) -> DashboardSta
             version: STATE_VERSION,
             sessions: BTreeMap::from([(session.id.clone(), session)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         },
         BTreeMap::new(),
     )

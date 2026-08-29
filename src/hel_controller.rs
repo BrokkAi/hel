@@ -20,12 +20,13 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 
 use crate::hel_config::{
-    HelConfig, SshConnection, TargetTemplate, data_dir, is_bare_project_target, mount_history_host,
+    HelConfig, SshConnection, TargetTemplate, container_size_host, data_dir,
+    is_bare_project_target, mount_history_host,
 };
 use crate::hel_local_git::dirty_local_repositories;
 use crate::hel_state::{
-    HelState, SessionRecord, SessionResourceAllocation, SessionState, new_session_id,
-    normalize_session_title,
+    HelState, HostContainerSize, SessionRecord, SessionResourceAllocation, SessionState,
+    new_session_id, normalize_session_title,
 };
 use crate::hel_targets::{
     self, AdditionalMount, CommandExecutor, CommandOutput, CommandSpec, SshTarget,
@@ -112,6 +113,23 @@ pub struct SessionResumeOptions {
     pub additional_mounts: Option<Vec<AdditionalMount>>,
     pub resource_allocation: Option<SessionResourceAllocation>,
     pub discard_queue: bool,
+}
+
+fn selected_host_container_size(
+    template: &TargetTemplate,
+    allocation: Option<&SessionResourceAllocation>,
+) -> Option<(String, HostContainerSize)> {
+    let host = container_size_host(template)?;
+    let SessionResourceAllocation::Container { cpus, memory_bytes } = allocation? else {
+        return None;
+    };
+    Some((
+        host.to_owned(),
+        HostContainerSize {
+            cpus: *cpus,
+            memory_bytes: *memory_bytes,
+        },
+    ))
 }
 
 impl Controller {
@@ -367,6 +385,8 @@ impl Controller {
             );
         }
         validate_resource_allocation(template, resource_allocation.as_ref())?;
+        let selected_container_size =
+            selected_host_container_size(template, resource_allocation.as_ref());
         if !additional_mounts.is_empty() && mount_history_host(template).is_none() {
             bail!("attached resources are unsupported for this target");
         }
@@ -404,8 +424,15 @@ impl Controller {
         // Creation authors the whole record, so it writes the whole row. The
         // record reaches memory only once it is durable: a session this process
         // alone knows about is one the database can never resume or clean up.
-        crate::hel_database::save_session(&record)?;
+        if let Some((host, size)) = selected_container_size.as_ref() {
+            crate::hel_database::save_session_with_container_size(&record, host, *size)?;
+        } else {
+            crate::hel_database::save_session(&record)?;
+        }
         self.state.sessions.insert(id.clone(), record);
+        if let Some((host, size)) = selected_container_size {
+            self.state.remember_container_size(&host, size);
+        }
         if let Some(host) = mount_history_host(template) {
             // Mount history only seeds the attach dialog's suggestions. The
             // session row is already committed, so a failed suggestion write is
@@ -824,6 +851,51 @@ mod tests {
     }
 
     const MOUNT_HISTORY_FAILURE_CHILD: &str = "HEL_TEST_MOUNT_HISTORY_FAILURE_CHILD";
+
+    const CONTAINER_SIZE_HISTORY_CHILD: &str = "HEL_TEST_CONTAINER_SIZE_HISTORY_CHILD";
+
+    #[test]
+    fn registration_remembers_launch_size_but_session_overrides_do_not_replace_it() {
+        if std::env::var_os(CONTAINER_SIZE_HISTORY_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            run_registration_child(
+                CONTAINER_SIZE_HISTORY_CHILD,
+                "registration_remembers_launch_size_but_session_overrides_do_not_replace_it",
+                directory.path(),
+            );
+            return;
+        }
+
+        let mut controller = Controller {
+            config: registration_config(),
+            state: HelState::default(),
+        };
+        let mut options = launch_options(Vec::new());
+        options.resource_allocation = Some(SessionResourceAllocation::Container {
+            cpus: 12,
+            memory_bytes: 48 * 1024 * 1024 * 1024,
+        });
+        let id = controller
+            .register_session_with_resources("codex", "project", "podman", "sized", options)
+            .unwrap();
+        let expected = HostContainerSize {
+            cpus: 12,
+            memory_bytes: 48 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(controller.state.container_sizes["local"], expected);
+        assert_eq!(HelState::load().unwrap().container_sizes["local"], expected);
+
+        controller
+            .update_session_container_settings(
+                &id,
+                Some("2".into()),
+                Some("4g".into()),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(HelState::load().unwrap().container_sizes["local"], expected);
+    }
 
     #[test]
     fn a_failed_mount_history_write_does_not_fail_the_registered_session() {

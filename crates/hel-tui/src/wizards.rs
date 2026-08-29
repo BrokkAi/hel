@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -10,12 +10,15 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use sha2::{Digest, Sha256};
 
-use hel::hel_config::{HelConfig, TargetTemplate, is_bare_project_target, mount_history_host};
+use hel::hel_config::{
+    HelConfig, TargetTemplate, container_size_host, is_bare_project_target, mount_history_host,
+};
 use hel::hel_state::{
     HelState, SessionRecord, SessionResourceAllocation, SessionState, allocation_cpus,
     allocation_memory,
 };
 use hel::hel_targets::{AdditionalMount, default_mount_destination, path_completion};
+use hel::hel_text_input::TextInput;
 
 use crate::widgets::{action_buttons, centered_rect, format_resource_bytes};
 use crate::{DashboardAction, DashboardState, Mode, cycle_control, move_index, nth_key};
@@ -53,8 +56,8 @@ pub(crate) struct NewWizard {
     pub(crate) target: usize,
     pub(crate) mounts: MountWizard,
     review_focus: ReviewFocus,
-    pub(crate) new_bundle_source: String,
-    pub(crate) project_directory: String,
+    pub(crate) new_bundle_source: TextInput,
+    pub(crate) project_directory: TextInput,
     pub(crate) project_directory_error: Option<String>,
     project_history: Vec<std::path::PathBuf>,
     project_history_index: usize,
@@ -94,8 +97,8 @@ enum ReviewFocus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MountWizard {
-    pub(crate) source: String,
-    pub(crate) destination: String,
+    pub(crate) source: TextInput,
+    pub(crate) destination: TextInput,
     pub(crate) focus: MountFocus,
     pub(crate) read_only: bool,
     pub(crate) mounts: Vec<AdditionalMount>,
@@ -114,8 +117,8 @@ pub(crate) struct MountWizard {
 impl MountWizard {
     pub(crate) fn new(history: Vec<std::path::PathBuf>) -> Self {
         Self {
-            source: String::new(),
-            destination: String::new(),
+            source: TextInput::new(),
+            destination: TextInput::new(),
             focus: MountFocus::Source,
             read_only: false,
             mounts: Vec::new(),
@@ -154,8 +157,8 @@ impl MountWizard {
 
     fn add_validated_mount(&mut self) {
         let mount = AdditionalMount {
-            source: self.source.clone().into(),
-            destination: self.destination.clone().into(),
+            source: self.source.to_string().into(),
+            destination: self.destination.to_string().into(),
             read_only: self.read_only,
         };
         if let Some(index) = self.editing_mount.take() {
@@ -169,6 +172,29 @@ impl MountWizard {
         self.focus = MountFocus::Source;
         self.completion_candidates.clear();
         self.error = None;
+    }
+}
+
+impl NewWizard {
+    pub(crate) fn text_input_focused(&self) -> bool {
+        matches!(
+            self.step,
+            WizardStep::ProjectDirectory | WizardStep::NewBundle
+        ) || self.step == WizardStep::Mounts
+            && matches!(
+                self.mounts.focus,
+                MountFocus::Source | MountFocus::Destination
+            )
+    }
+}
+
+impl ResumeWizard {
+    pub(crate) fn text_input_focused(&self) -> bool {
+        self.step == WizardStep::Mounts
+            && matches!(
+                self.mounts.focus,
+                MountFocus::Source | MountFocus::Destination
+            )
     }
 }
 
@@ -248,8 +274,8 @@ fn prepare_selected_mount_editor(step: &mut WizardStep, mounts: &mut MountWizard
     }
     let index = mounts.history_index;
     let mount = mounts.mounts[index].clone();
-    mounts.source = mount.source.to_string_lossy().into_owned();
-    mounts.destination = mount.destination.to_string_lossy().into_owned();
+    mounts.source = mount.source.to_string_lossy().into_owned().into();
+    mounts.destination = mount.destination.to_string_lossy().into_owned().into();
     mounts.read_only = mount.read_only || mounts.forced_read_only().is_some();
     mounts.focus = MountFocus::Source;
     mounts.error = None;
@@ -276,8 +302,8 @@ fn edit_selected_resume_mount(wizard: &mut ResumeWizard) {
 
 fn validate_mount_entry(mounts: &MountWizard) -> Option<String> {
     let mount = AdditionalMount {
-        source: mounts.source.clone().into(),
-        destination: mounts.destination.clone().into(),
+        source: mounts.source.to_string().into(),
+        destination: mounts.destination.to_string().into(),
         read_only: mounts.read_only,
     };
     if let Err(error) = hel::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount)) {
@@ -600,7 +626,7 @@ pub(crate) fn render_new_wizard(
             }),
             Line::raw(""),
             Line::styled(
-                format!("> {}▏", wizard.project_directory),
+                format!("> {}", wizard.project_directory.with_cursor_marker("▏")),
                 Style::default().bg(Color::DarkGray).fg(Color::White),
             ),
         ];
@@ -674,12 +700,11 @@ pub(crate) fn render_new_wizard(
                 Line::raw(""),
                 Line::styled(
                     format!(
-                        "> {}{}",
-                        wizard.new_bundle_source,
+                        "> {}",
                         if wizard.focus == WizardFocus::Content {
-                            "▏"
+                            wizard.new_bundle_source.with_cursor_marker("▏")
                         } else {
-                            ""
+                            wizard.new_bundle_source.to_string()
                         }
                     ),
                     if wizard.focus == WizardFocus::Content {
@@ -974,22 +999,22 @@ fn render_mount_wizard(
     } else {
         "  "
     };
-    let source_caret = if mounts.focus == MountFocus::Source {
-        "▏"
+    let source = if mounts.focus == MountFocus::Source {
+        mounts.source.with_cursor_marker("▏")
     } else {
-        ""
+        mounts.source.to_string()
     };
-    let destination_caret = if mounts.focus == MountFocus::Destination {
-        "▏"
+    let destination = if mounts.focus == MountFocus::Destination {
+        mounts.destination.with_cursor_marker("▏")
     } else {
-        ""
+        mounts.destination.to_string()
     };
     let mut lines = vec![
         Line::raw(format!("Target: {target_id} ({})", target_label(target))),
         Line::styled(protection, Style::default().fg(Color::Yellow)),
         Line::raw(""),
         Line::styled(
-            format!("{source_marker}Source: {}{source_caret}", mounts.source),
+            format!("{source_marker}Source: {source}"),
             if mounts.focus == MountFocus::Source {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
@@ -997,10 +1022,7 @@ fn render_mount_wizard(
             },
         ),
         Line::styled(
-            format!(
-                "{destination_marker}Destination: {}{destination_caret}",
-                mounts.destination
-            ),
+            format!("{destination_marker}Destination: {destination}"),
             if mounts.focus == MountFocus::Destination {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
@@ -1371,7 +1393,7 @@ fn apply_mount_completions(wizard: &mut MountWizard, prefix: &str, candidates: V
         .completion_cache
         .insert(prefix.to_owned(), candidates.clone());
     if let Some(completed) = path_completion(prefix, &candidates) {
-        wizard.source = completed;
+        wizard.source = completed.into();
     }
     if candidates.len() > 1 {
         wizard.completion_candidates = candidates.into_iter().take(5).collect();
