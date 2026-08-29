@@ -584,6 +584,7 @@ pub struct ActiveChat {
     remote_open: bool,
     session_open: bool,
     session_reconnect_in_flight: bool,
+    session_reconnected: bool,
 }
 
 impl ActiveChat {
@@ -720,6 +721,7 @@ impl ActiveChat {
             remote_open: true,
             session_open: true,
             session_reconnect_in_flight: false,
+            session_reconnected: false,
         }
     }
 
@@ -773,7 +775,7 @@ impl ActiveChat {
             view = chat.session.changed(), if chat.session_open => Wakeup::View(Box::new(view)),
         };
         match wakeup {
-            Wakeup::Remote(Some(result)) => apply_chat_remote_result(&mut chat.state, result),
+            Wakeup::Remote(Some(result)) => chat.apply_remote_result(result),
             Wakeup::Remote(None) => chat.remote_open = false,
             Wakeup::Io(update) => chat.apply_io_update(update),
             Wakeup::Voice(update) => chat.apply_voice_update(update),
@@ -785,7 +787,7 @@ impl ActiveChat {
 
     async fn drain(&mut self) {
         while let Ok(result) = self.remote.try_recv() {
-            apply_chat_remote_result(&mut self.state, result);
+            self.apply_remote_result(result);
         }
         while let Ok(update) = self.chat_io_rx.try_recv() {
             self.apply_io_update(update);
@@ -812,6 +814,16 @@ impl ActiveChat {
             self.state
                 .set_notice("Chat background worker stopped unexpectedly");
         }
+    }
+
+    fn apply_remote_result(&mut self, result: ChatRemoteResult) {
+        if self.session_reconnected && matches!(&result, ChatRemoteResult::Sync(Ok(()))) {
+            // The initial sync and the session-feed replacement run independently.
+            // A late sync completion must not overwrite the newer handoff notice.
+            self.state.set_transcript_loading(false);
+            return;
+        }
+        apply_chat_remote_result(&mut self.state, result);
     }
 
     fn apply_io_update(&mut self, update: ChatIoUpdate) {
@@ -921,6 +933,7 @@ impl ActiveChat {
                 self.session = session;
                 self.session_open = apply_session_view(&mut self.state, Ok(view));
                 if self.session_open {
+                    self.session_reconnected = true;
                     self.state.set_notice("Reconnected to session relay");
                 } else {
                     self.begin_session_reconnect();
