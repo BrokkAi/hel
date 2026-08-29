@@ -10,6 +10,7 @@ use crate::hel_config::{ExecutionPolicy, HarnessKind};
 pub use crate::hel_worker::WORKER_PID_FILE;
 
 pub(crate) const GITHUB_CLI_BIN_ENV: &str = "HEL_GITHUB_CLI_BIN";
+pub(crate) const DISCOVER_LOGIN_PATH_ENV: &str = "HEL_DISCOVER_LOGIN_PATH";
 
 pub(crate) fn github_cli_login_shell_command(command: &str) -> String {
     format!(

@@ -18,7 +18,8 @@ use crate::hel_targets::{
     self, CommandExecutor, CommandPlan, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
 };
 use crate::hel_worker_runtime::{
-    ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery, WorkerLaunchConfig, WorkerOwnership,
+    DISCOVER_LOGIN_PATH_ENV, ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery,
+    WorkerLaunchConfig, WorkerOwnership,
 };
 
 use super::backend::backend_locator;
@@ -300,6 +301,7 @@ fn worker_launch_config(
     profile
         .kind
         .configure_execution_environment(execution_policy, &mut environment);
+    configure_login_path_discovery(&mut environment, backend);
     let mut project_memory =
         project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
     project_memory.mcp_delivery = project_memory_mcp_delivery(profile.kind, backend);
@@ -325,6 +327,23 @@ fn worker_launch_config(
         project_memory,
         target_profile_home,
     ))
+}
+
+fn configure_login_path_discovery(
+    environment: &mut std::collections::BTreeMap<String, String>,
+    backend: &hel_targets::TargetLocator,
+) {
+    environment.remove(DISCOVER_LOGIN_PATH_ENV);
+    if !environment.contains_key("PATH")
+        && matches!(
+            backend,
+            hel_targets::TargetLocator::LocalBare { .. }
+                | hel_targets::TargetLocator::AwsEc2 { .. }
+                | hel_targets::TargetLocator::SshBare { .. }
+        )
+    {
+        environment.insert(DISCOVER_LOGIN_PATH_ENV.into(), "1".into());
+    }
 }
 
 fn project_memory_launch(
@@ -863,22 +882,22 @@ fn bridge_launch(
         crate::hel_config::HarnessKind::Codex => (
             "sh".into(),
             vec![
-                "-lc".into(),
+                "-c".into(),
                 format!("if command -v codex-acp >/dev/null 2>&1 && [ \"$(codex-acp --version 2>/dev/null)\" = \"@agentclientprotocol/codex-acp {CODEX_ACP_FALLBACK_VERSION}\" ]; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@{CODEX_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Claude => (
             "sh".into(),
             vec![
-                "-lc".into(),
+                "-c".into(),
                 format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Kimi => (
             "sh".into(),
             vec![
-                "-lc".into(),
-                "if command -v kimi >/dev/null 2>&1; then exec kimi acp; elif [ -x \"$HOME/.kimi-code/bin/kimi\" ]; then exec \"$HOME/.kimi-code/bin/kimi\" acp; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash && exec \"$HOME/.kimi-code/bin/kimi\" acp; else echo 'Hel needs compatible Kimi Code or curl for its official installer' >&2; exit 127; fi".into(),
+                "-c".into(),
+                "if command -v kimi >/dev/null 2>&1; then exec kimi acp; elif [ -x \"$HOME/.kimi-code/bin/kimi\" ]; then exec \"$HOME/.kimi-code/bin/kimi\" acp; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash && exec \"$HOME/.kimi-code/bin/kimi\" acp; else echo 'Hel needs compatible Kimi Code or curl for its official installer; configure the profile executable or environment PATH when the tool is installed elsewhere' >&2; exit 127; fi".into(),
             ],
         ),
         crate::hel_config::HarnessKind::Grok => {
@@ -888,9 +907,9 @@ fn bridge_launch(
             (
                 "sh".into(),
                 vec![
-                    "-lc".into(),
+                    "-c".into(),
                     format!(
-                        "if command -v grok >/dev/null 2>&1; then exec grok {acp}; elif [ -x \"$GROK_HOME/bin/grok\" ]; then exec \"$GROK_HOME/bin/grok\" {acp}; elif [ -x \"$HOME/.grok/bin/grok\" ]; then exec \"$HOME/.grok/bin/grok\" {acp}; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://x.ai/cli/install.sh | bash && exec \"$HOME/.grok/bin/grok\" {acp}; else echo 'Hel needs compatible Grok Build or curl for its official installer' >&2; exit 127; fi"
+                        "if command -v grok >/dev/null 2>&1; then exec grok {acp}; elif [ -x \"$GROK_HOME/bin/grok\" ]; then exec \"$GROK_HOME/bin/grok\" {acp}; elif [ -x \"$HOME/.grok/bin/grok\" ]; then exec \"$HOME/.grok/bin/grok\" {acp}; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://x.ai/cli/install.sh | bash && exec \"$HOME/.grok/bin/grok\" {acp}; else echo 'Hel needs compatible Grok Build or curl for its official installer; configure the profile executable or environment PATH when the tool is installed elsewhere' >&2; exit 127; fi"
                     ),
                 ],
             )
@@ -898,9 +917,9 @@ fn bridge_launch(
         crate::hel_config::HarnessKind::Deepseek => (
             "sh".into(),
             vec![
-                "-lc".into(),
+                "-c".into(),
                 format!(
-                    "{}; if command -v dsh >/dev/null 2>&1 && command -v dsh-acp-server >/dev/null 2>&1; then exec dsh-acp-server; fi; echo 'Hel needs @deepseek-ai/dsh@{DEEPSEEK_HARNESS_FALLBACK_VERSION} and dsh-acp-server@{DEEPSEEK_ACP_FALLBACK_VERSION} installed on PATH' >&2; exit 127",
+                    "{}; if command -v dsh >/dev/null 2>&1 && command -v dsh-acp-server >/dev/null 2>&1; then exec dsh-acp-server; fi; echo 'Hel needs @deepseek-ai/dsh@{DEEPSEEK_HARNESS_FALLBACK_VERSION} and dsh-acp-server@{DEEPSEEK_ACP_FALLBACK_VERSION} installed on PATH; configure the profile executable or environment PATH when they are installed elsewhere' >&2; exit 127",
                     ensure_node_22_script(),
                 ),
             ],
@@ -909,7 +928,7 @@ fn bridge_launch(
 }
 
 fn ensure_node_script() -> &'static str {
-    "if ! command -v npx >/dev/null 2>&1; then if [ \"$(id -u)\" = 0 ]; then SUDO=''; elif command -v sudo >/dev/null 2>&1 && sudo -n true; then SUDO='sudo'; else echo 'Hel needs Node/npx or passwordless sudo to install it' >&2; exit 127; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y nodejs npm; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y nodejs npm; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y nodejs npm; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache nodejs npm; else echo 'Hel cannot install Node on this image; bake npx or a compatible ACP bridge into it' >&2; exit 127; fi; fi"
+    "if ! command -v npx >/dev/null 2>&1; then if [ \"$(id -u)\" = 0 ]; then SUDO=''; elif command -v sudo >/dev/null 2>&1 && sudo -n true; then SUDO='sudo'; else echo 'Hel needs Node/npx or passwordless sudo to install it; configure the profile executable or environment PATH when the tool is installed elsewhere' >&2; exit 127; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y nodejs npm; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y nodejs npm; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y nodejs npm; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache nodejs npm; else echo 'Hel cannot install Node on this image; bake npx or a compatible ACP bridge into it, or configure the profile executable or environment PATH' >&2; exit 127; fi; fi"
 }
 
 fn ensure_node_22_script() -> String {
@@ -1589,7 +1608,7 @@ fn worker_launch_refresh_plan(
         ),
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &script])
+            ssh_command_spec(ssh, ["sh", "-c", &script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => ssh_command_spec(
             ssh,
@@ -1689,7 +1708,7 @@ fn stop_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) 
         }
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &script])
+            ssh_command_spec(ssh, ["sh", "-c", &script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
@@ -1710,7 +1729,7 @@ fn worker_liveness_command(locator: &hel_targets::TargetLocator, worker_root: &s
         }
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &script])
+            ssh_command_spec(ssh, ["sh", "-c", &script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
@@ -1782,7 +1801,7 @@ fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str)
         ),
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &detached_script])
+            ssh_command_spec(ssh, ["sh", "-c", &detached_script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => ssh_command_spec(
             ssh,
@@ -1875,7 +1894,7 @@ pub(super) fn worker_last_words(
         }
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &script])
+            ssh_command_spec(ssh, ["sh", "-c", &script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
@@ -2038,6 +2057,13 @@ mod tests {
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].purpose, "stop Hel worker daemon");
+        assert!(
+            commands[0]
+                .args
+                .last()
+                .is_some_and(|remote| remote.starts_with("'sh' '-c' ")),
+            "raw SSH worker management must not source login profiles: {commands:?}"
+        );
         let script = commands[0]
             .args
             .iter()
@@ -2340,26 +2366,32 @@ mod tests {
     }
     #[test]
     fn default_bridges_pin_command_capable_adapter_versions() {
-        let (_, codex_arguments) = bridge_launch(
+        let (codex_command, codex_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Codex,
             None,
             ExecutionPolicy::Unconstrained,
         );
+        assert_eq!(codex_command, "sh");
+        assert_eq!(codex_arguments[0], "-c");
         assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.6.2"));
         assert!(codex_arguments[1].contains("codex-acp --version"));
 
-        let (_, claude_arguments) = bridge_launch(
+        let (claude_command, claude_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Claude,
             None,
             ExecutionPolicy::Unconstrained,
         );
+        assert_eq!(claude_command, "sh");
+        assert_eq!(claude_arguments[0], "-c");
         assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.68.0"));
 
-        let (_, deepseek_arguments) = bridge_launch(
+        let (deepseek_command, deepseek_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Deepseek,
             None,
             ExecutionPolicy::Unconstrained,
         );
+        assert_eq!(deepseek_command, "sh");
+        assert_eq!(deepseek_arguments[0], "-c");
         assert!(deepseek_arguments[1].contains("@deepseek-ai/dsh@0.1.1-rc.2"));
         assert!(deepseek_arguments[1].contains("dsh-acp-server@0.10.0"));
         assert!(!deepseek_arguments[1].contains("npx -y -p @deepseek-ai/dsh"));
@@ -2393,6 +2425,38 @@ mod tests {
             Some("read-only"),
             "raw localhost must preserve the profile's configured mode"
         );
+    }
+    #[test]
+    fn only_raw_targets_without_an_explicit_path_request_login_path_discovery() {
+        let raw = hel_targets::TargetLocator::LocalBare {
+            worker_root: "/worker".into(),
+        };
+        let managed = hel_targets::TargetLocator::LocalPodman {
+            container_id: "container".into(),
+        };
+
+        let mut environment = BTreeMap::new();
+        configure_login_path_discovery(&mut environment, &raw);
+        assert_eq!(
+            environment.get(DISCOVER_LOGIN_PATH_ENV).map(String::as_str),
+            Some("1")
+        );
+
+        let mut explicit = BTreeMap::from([
+            ("PATH".into(), "/configured/bin".into()),
+            (DISCOVER_LOGIN_PATH_ENV.into(), "stale".into()),
+        ]);
+        configure_login_path_discovery(&mut explicit, &raw);
+        assert_eq!(
+            explicit.get("PATH").map(String::as_str),
+            Some("/configured/bin")
+        );
+        assert!(!explicit.contains_key(DISCOVER_LOGIN_PATH_ENV));
+
+        let mut managed_environment =
+            BTreeMap::from([(DISCOVER_LOGIN_PATH_ENV.into(), "stale".into())]);
+        configure_login_path_discovery(&mut managed_environment, &managed);
+        assert!(!managed_environment.contains_key(DISCOVER_LOGIN_PATH_ENV));
     }
     #[test]
     fn grok_sandbox_environment_follows_the_target_policy() {
@@ -2444,26 +2508,26 @@ mod tests {
         }
     }
     #[test]
-    fn kimi_default_bridge_uses_bash_for_the_official_installer() {
+    fn kimi_default_bridge_is_non_login_and_uses_bash_for_the_official_installer() {
         let (command, arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Kimi,
             None,
             ExecutionPolicy::Unconstrained,
         );
         assert_eq!(command, "sh");
-        assert_eq!(arguments[0], "-lc");
+        assert_eq!(arguments[0], "-c");
         assert!(arguments[1].contains("install.sh | bash &&"));
         assert!(arguments[1].contains("$HOME/.kimi-code/bin/kimi"));
     }
     #[test]
-    fn grok_default_bridge_uses_bash_for_the_official_installer() {
+    fn grok_default_bridge_is_non_login_and_uses_bash_for_the_official_installer() {
         let (command, arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Grok,
             None,
             ExecutionPolicy::ConfiguredApprovals,
         );
         assert_eq!(command, "sh");
-        assert_eq!(arguments[0], "-lc");
+        assert_eq!(arguments[0], "-c");
         let script = &arguments[1];
         assert!(script.contains("https://x.ai/cli/install.sh | bash &&"));
         assert!(script.contains("command -v grok"));

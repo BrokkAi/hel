@@ -973,7 +973,7 @@ fn ssh_podman_linger_warning(
     let command = PodmanHost::Ssh(ssh).command(
         &[
             "sh",
-            "-lc",
+            "-c",
             "loginctl show-user \"$(id -u)\" --property=Linger --value",
         ],
         "check remote user lingering",

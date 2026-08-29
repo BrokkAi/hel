@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use super::{AcpSupervisorSpec, CredentialEndpoint, WorkerLaunchConfig};
+use super::{AcpSupervisorSpec, CredentialEndpoint, DISCOVER_LOGIN_PATH_ENV, WorkerLaunchConfig};
 
 pub(super) const PROXY_INITIAL_INPUT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
@@ -24,6 +24,8 @@ use crate::hel_worker::{
 use crate::hel_worker_protocol::{DecodedRelayRequest, decode_relay_request};
 
 pub(super) const ACP_EVENT_CHANNEL_CAPACITY: usize = 256;
+const LOGIN_PATH_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LOGIN_PATH_MARKER: &str = "__HEL_LOGIN_PATH__=";
 
 #[derive(Clone)]
 pub(super) struct ProjectMemoryEndpoint {
@@ -75,6 +77,12 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
     let credentials = super::credential_endpoint(&config);
     std::fs::create_dir_all(&root)
         .with_context(|| format!("create worker root {}", root.display()))?;
+    if config.environment.remove(DISCOVER_LOGIN_PATH_ENV).is_some()
+        && !config.environment.contains_key("PATH")
+        && let Some(path) = discover_login_path(&config.session_id).await
+    {
+        config.environment.insert("PATH".into(), path);
+    }
     configure_github_cli(&root, &mut config.environment)?;
     let socket = root.join("control.sock");
     // Refuse a second daemon before touching durable state: opening the
@@ -308,6 +316,73 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
         fatal_rx,
     )
     .await
+}
+
+async fn discover_login_path(session_id: &str) -> Option<String> {
+    use crate::hel_targets::{BoundedProcessExecutor, CommandExecutor};
+
+    let result = tokio::task::spawn_blocking(|| {
+        BoundedProcessExecutor::new(LOGIN_PATH_DISCOVERY_TIMEOUT)
+            .execute(&login_path_discovery_command())
+    })
+    .await;
+    let output = match result {
+        Ok(Ok(output)) if output.status == 0 => output,
+        Ok(Ok(output)) => {
+            tracing::warn!(
+                session_id,
+                status = output.status,
+                "login PATH discovery failed; using the worker base PATH"
+            );
+            return None;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                session_id,
+                error = format!("{error:#}"),
+                "login PATH discovery failed; using the worker base PATH"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                %error,
+                "login PATH discovery task stopped; using the worker base PATH"
+            );
+            return None;
+        }
+    };
+    match parse_login_path(&output.stdout) {
+        Some(path) => Some(path),
+        None => {
+            tracing::warn!(
+                session_id,
+                "login PATH discovery returned an invalid PATH; using the worker base PATH"
+            );
+            None
+        }
+    }
+}
+
+pub(super) fn login_path_discovery_command() -> crate::hel_targets::CommandSpec {
+    crate::hel_targets::CommandSpec::new(
+        "sh",
+        [
+            "-lc",
+            &format!("printf '\\n{LOGIN_PATH_MARKER}%s\\n' \"$PATH\""),
+        ],
+    )
+    .purpose("discover the target login PATH")
+}
+
+pub(super) fn parse_login_path(stdout: &[u8]) -> Option<String> {
+    let output = std::str::from_utf8(stdout).ok()?;
+    let path = output
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(LOGIN_PATH_MARKER))?;
+    (!path.is_empty() && !path.chars().any(char::is_control)).then(|| path.to_owned())
 }
 
 pub(super) async fn abort_peer_and_return<T>(
@@ -2008,7 +2083,7 @@ pub async fn run_acp_supervisor(spec: AcpSupervisorSpec) -> Result<()> {
 }
 
 pub(super) async fn run_acp_supervisor_with_streams<R, W>(
-    mut spec: AcpSupervisorSpec,
+    spec: AcpSupervisorSpec,
     mut parent_stdin: R,
     mut parent_stdout: W,
 ) -> Result<()>
@@ -2018,11 +2093,6 @@ where
 {
     use tokio::io::AsyncWriteExt;
 
-    if spec.args.first().is_some_and(|argument| argument == "-lc")
-        && let Some(command) = spec.args.get_mut(1)
-    {
-        *command = super::github_cli_login_shell_command(command);
-    }
     let mut command = tokio::process::Command::new(&spec.command);
     command
         .args(&spec.args)

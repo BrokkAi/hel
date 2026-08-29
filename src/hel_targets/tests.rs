@@ -241,6 +241,8 @@ fn ssh_podman_preflight_runs_every_probe_through_noninteractive_ssh() {
             .contains("'/proc/self/uid_map'")
     );
     assert!(seen[3].args.last().unwrap().contains("'loginctl show-user"));
+    assert!(seen[3].args.last().unwrap().contains("'sh' '-c'"));
+    assert!(!seen[3].args.last().unwrap().contains("'-lc'"));
     assert!(preflight.warnings.is_empty());
 }
 

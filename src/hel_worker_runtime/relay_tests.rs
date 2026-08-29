@@ -32,6 +32,49 @@ fn runtime_event_channel() -> (TestRuntimeEventSender, mpsc::Receiver<RuntimeEve
     (TestRuntimeEventSender(sender), receiver)
 }
 
+#[test]
+fn login_path_discovery_uses_the_marked_result_after_profile_chatter() {
+    assert_eq!(
+        unix::parse_login_path(
+            b"profile greeting\n__HEL_LOGIN_PATH__=/old/bin\nmore chatter\n__HEL_LOGIN_PATH__=/opt/node/bin:/usr/bin\n"
+        )
+        .as_deref(),
+        Some("/opt/node/bin:/usr/bin")
+    );
+    assert!(unix::parse_login_path(b"profile greeting only\n").is_none());
+    assert!(unix::parse_login_path(b"__HEL_LOGIN_PATH__=\n").is_none());
+    assert!(unix::parse_login_path(b"__HEL_LOGIN_PATH__=/bin\t/other\n").is_none());
+    assert!(unix::parse_login_path(b"__HEL_LOGIN_PATH__=\xff\n").is_none());
+}
+
+#[test]
+fn login_path_discovery_sources_the_profile_but_captures_only_path() {
+    use crate::hel_targets::{BoundedProcessExecutor, CommandExecutor};
+
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".profile"),
+        b"printf 'profile chatter\\n'\nPATH=/profile-only/bin:$PATH\nexport PATH\n",
+    )
+    .unwrap();
+    let mut command = unix::login_path_discovery_command();
+    command
+        .env
+        .insert("HOME".into(), home.path().to_string_lossy().into_owned());
+
+    let output = BoundedProcessExecutor::new(std::time::Duration::from_secs(5))
+        .execute(&command)
+        .unwrap();
+
+    assert_eq!(output.status, 0);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("profile chatter"));
+    assert!(
+        unix::parse_login_path(&output.stdout)
+            .as_deref()
+            .is_some_and(|path| path.starts_with("/profile-only/bin:"))
+    );
+}
+
 /// Channel a served client uses to report that durable state became
 /// unwritable. Most fixtures only need somewhere for that report to go.
 fn fatal_reports() -> (mpsc::Sender<anyhow::Error>, mpsc::Receiver<anyhow::Error>) {
@@ -3479,6 +3522,43 @@ async fn acp_supervisor_notices_child_exit_while_a_descendant_holds_stdout_open(
     assert!(
         format!("{error:#}").contains("exit status: 17"),
         "unexpected supervisor error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn acp_bridge_keeps_the_configured_github_wrapper_and_drops_inherited_tokens() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let wrapper = bin.join("gh");
+    std::fs::write(&wrapper, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let observed = temp.path().join("observed");
+    let script = format!(
+        "printf '%s\\n%s|%s\\n' \"$(command -v gh)\" \"${{GH_TOKEN-unset}}\" \"${{GITHUB_TOKEN-unset}}\" > {}",
+        crate::hel_targets::posix_quote(&observed.to_string_lossy())
+    );
+    let spec = AcpSupervisorSpec {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), script],
+        environment: BTreeMap::from([
+            ("PATH".into(), format!("{}:/usr/bin:/bin", bin.display())),
+            ("GH_TOKEN".into(), "stale-token".into()),
+            ("GITHUB_TOKEN".into(), "also-stale".into()),
+        ]),
+        cwd: temp.path().to_owned(),
+    };
+    let (supervisor_stdin, _held_stdin) = tokio::io::duplex(64);
+
+    unix::run_acp_supervisor_with_streams(spec, supervisor_stdin, tokio::io::sink())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(observed).unwrap(),
+        format!("{}\nunset|unset\n", wrapper.display())
     );
 }
 
