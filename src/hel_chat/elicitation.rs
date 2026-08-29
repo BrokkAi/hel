@@ -3,9 +3,9 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -45,7 +45,6 @@ pub(super) struct ElicitationDialog {
     message_scroll: Cell<u16>,
     message_page_height: Cell<u16>,
     message_max_scroll: Cell<u16>,
-    message_area: Cell<Option<Rect>>,
 }
 
 impl ElicitationDialog {
@@ -85,7 +84,6 @@ impl ElicitationDialog {
             message_scroll: Cell::new(0),
             message_page_height: Cell::new(0),
             message_max_scroll: Cell::new(0),
-            message_area: Cell::new(None),
         }
     }
 
@@ -161,22 +159,6 @@ impl ElicitationDialog {
             _ => self.edit_text(KeyEvent::new(code, modifiers)),
         }
         None
-    }
-
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if !self.is_plan_review()
-            || !self
-                .message_area
-                .get()
-                .is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)))
-        {
-            return;
-        }
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_message(-3),
-            MouseEventKind::ScrollDown => self.scroll_message(3),
-            _ => {}
-        }
     }
 
     fn is_plan_review(&self) -> bool {
@@ -631,7 +613,6 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
     dialog.message_scroll.set(message_scroll);
     dialog.message_page_height.set(chunks[0].height);
     dialog.message_max_scroll.set(maximum_scroll);
-    dialog.message_area.set(Some(chunks[0]));
     frame.render_widget(message.scroll((message_scroll, 0)), chunks[0]);
     render_focus(frame, chunks[1], focus);
     let field_count = dialog.display_fields.len();
@@ -666,7 +647,7 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
             .saturating_add(chunks[0].height)
             .min(total_lines);
         Some(format!(
-            "Plan {start}–{end}/{total_lines} · PgUp/PgDn or wheel scroll · Tab fields/buttons · ↑/↓ choose · Enter continue"
+            "Plan {start}–{end}/{total_lines} · PgUp/PgDn scroll · Tab fields/buttons · ↑/↓ choose · Enter continue"
         ))
     } else {
         None
@@ -1102,7 +1083,7 @@ mod tests {
         let first = rendered(&dialog);
         assert!(first.contains("plan-line-12"));
         assert!(!first.contains("plan-line-79"));
-        assert!(first.contains("PgUp/PgDn or wheel scroll"));
+        assert!(first.contains("PgUp/PgDn scroll"));
 
         for _ in 0..10 {
             dialog.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
@@ -1111,24 +1092,6 @@ mod tests {
         let last = rendered(&dialog);
         assert!(last.contains("plan-line-79"));
         assert_eq!(dialog.focus, 0);
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_the_plan_without_moving_the_decision() {
-        let mut dialog = plan_review(80);
-        rendered(&dialog);
-        let area = dialog.message_area.get().expect("rendered plan area");
-
-        dialog.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: area.x,
-            row: area.y,
-            modifiers: KeyModifiers::NONE,
-        });
-
-        assert_eq!(dialog.message_scroll.get(), 3);
-        assert_eq!(dialog.focus, 0);
-        assert!(rendered(&dialog).contains("plan-line-03"));
     }
 
     #[test]

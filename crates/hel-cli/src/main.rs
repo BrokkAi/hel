@@ -24,13 +24,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{Command as CrosstermCommand, execute};
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
@@ -920,6 +920,49 @@ pub(crate) fn short_id(id: &str) -> &str {
 pub(crate) struct TerminalGuard {
     pub(crate) terminal: Terminal<CrosstermBackend<io::Stdout>>,
     keyboard_enhancement: bool,
+    alternate_scroll_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableAlternateScroll;
+
+impl CrosstermCommand for EnableAlternateScroll {
+    fn write_ansi(&self, output: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(output, "\x1b[?1007h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "alternate scroll must be sent as an ANSI sequence",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableAlternateScroll;
+
+impl CrosstermCommand for DisableAlternateScroll {
+    fn write_ansi(&self, output: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(output, "\x1b[?1007l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "alternate scroll must be sent as an ANSI sequence",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
 }
 
 impl TerminalGuard {
@@ -942,7 +985,7 @@ impl TerminalGuard {
         execute!(
             stdout,
             EnterAlternateScreen,
-            EnableMouseCapture,
+            EnableAlternateScroll,
             EnableBracketedPaste
         )
         .context("enter alternate screen and enable terminal input modes")?;
@@ -950,7 +993,23 @@ impl TerminalGuard {
         Ok(Self {
             terminal,
             keyboard_enhancement,
+            alternate_scroll_enabled: true,
         })
+    }
+
+    pub(crate) fn set_alternate_scroll(&mut self, enabled: bool) -> Result<()> {
+        if self.alternate_scroll_enabled == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableAlternateScroll)
+                .context("enable alternate-screen wheel navigation")?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableAlternateScroll)
+                .context("disable alternate-screen wheel navigation")?;
+        }
+        self.alternate_scroll_enabled = enabled;
+        Ok(())
     }
 
     pub(crate) fn suspend(&mut self) -> Result<()> {
@@ -961,10 +1020,11 @@ impl TerminalGuard {
         execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
-            DisableMouseCapture,
+            DisableAlternateScroll,
             LeaveAlternateScreen
         )
         .context("disable terminal input modes and leave alternate screen for setup")?;
+        self.alternate_scroll_enabled = false;
         disable_raw_mode().context("disable terminal raw mode for setup")?;
         self.terminal
             .show_cursor()
@@ -984,10 +1044,11 @@ impl TerminalGuard {
         execute!(
             self.terminal.backend_mut(),
             EnterAlternateScreen,
-            EnableMouseCapture,
+            EnableAlternateScroll,
             EnableBracketedPaste
         )
         .context("re-enter alternate screen and enable terminal input modes after setup")?;
+        self.alternate_scroll_enabled = true;
         self.terminal
             .clear()
             .context("clear dashboard after setup")?;
@@ -1005,7 +1066,7 @@ impl Drop for TerminalGuard {
         if let Err(error) = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
-            DisableMouseCapture,
+            DisableAlternateScroll,
             LeaveAlternateScreen
         ) {
             tracing::warn!(%error, "could not restore terminal screen and input modes");

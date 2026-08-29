@@ -24,7 +24,7 @@ use crate::dialogs::{
     render_import_progress, render_rename_editor, render_repository_origin,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
-use crate::resume::{render_resume_dialog, resume_sessions_pane};
+use crate::resume::render_resume_dialog;
 use crate::widgets::{focus_border, format_resource_bytes};
 use crate::wizards::{render_new_wizard, render_resume_wizard};
 use crate::{DASHBOARD_PANE_COUNT, DashboardState, Focus, Mode, SessionOperationKind};
@@ -41,9 +41,6 @@ pub(crate) const SUMMARY_RULE: &str = "─";
 const DASHBOARD_FIXED_HEIGHT: u16 = 3;
 
 pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
-    dashboard.pane_areas = None;
-    dashboard.active_row_areas.clear();
-    dashboard.project_heading_areas.clear();
     let area = frame.area();
     if area.width < MINIMUM_TERMINAL_WIDTH {
         render_terminal_too_small(
@@ -53,8 +50,11 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         );
         return;
     }
-    dashboard.resume_sessions_area =
-        matches!(dashboard.mode, Mode::ResumeDialog(_)).then(|| resume_sessions_pane(area));
+    if !matches!(dashboard.mode, Mode::Dashboard) {
+        frame.render_widget(Clear, area);
+        render_modal(frame, area, dashboard);
+        return;
+    }
     if !dashboard.config_is_empty() {
         render_adaptive_dashboard(frame, area, area, dashboard);
         return;
@@ -76,7 +76,9 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     render_capacity(frame, layout[2], dashboard);
     render_quotas(frame, layout[3], dashboard);
     render_footer(frame, layout[4], dashboard);
+}
 
+fn render_modal(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     match &dashboard.mode {
         Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
         Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
@@ -89,7 +91,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
             render_import_bundle_confirmation(frame, area, confirmation)
         }
         Mode::Confirm(dialog) => render_confirmation(frame, area, dialog),
-        Mode::Dashboard => {}
+        Mode::Dashboard => unreachable!("modal renderer requires an active modal"),
     }
 }
 
@@ -252,28 +254,10 @@ fn render_adaptive_dashboard(
                 .collect::<Vec<_>>(),
         )
         .split(fixed[1]);
-    dashboard.pane_areas = Some([panes[0], panes[1], panes[2]]);
-    let rendered_rows = render_sessions(frame, panes[0], dashboard, &active);
-    dashboard.active_row_areas = rendered_rows.active_row_areas;
-    dashboard.project_heading_areas = rendered_rows.project_heading_areas;
+    render_sessions(frame, panes[0], dashboard, &active);
     render_capacity(frame, panes[1], dashboard);
     render_quotas(frame, panes[2], dashboard);
     render_footer(frame, fixed[2], dashboard);
-
-    match &dashboard.mode {
-        Mode::New(wizard) => render_new_wizard(frame, frame_area, dashboard, wizard),
-        Mode::Resume(wizard) => render_resume_wizard(frame, frame_area, dashboard, wizard),
-        Mode::ResumeDialog(dialog) => render_resume_dialog(frame, frame_area, dashboard, dialog),
-        Mode::RepositoryOrigin(dialog) => render_repository_origin(frame, frame_area, dialog),
-        Mode::Rename(editor) => render_rename_editor(frame, frame_area, editor),
-        Mode::EditContainer(editor) => render_container_editor(frame, frame_area, editor),
-        Mode::Importing(progress) => render_import_progress(frame, frame_area, progress),
-        Mode::ConfirmImportBundle(confirmation) => {
-            render_import_bundle_confirmation(frame, frame_area, confirmation)
-        }
-        Mode::Confirm(dialog) => render_confirmation(frame, frame_area, dialog),
-        Mode::Dashboard => {}
-    }
 }
 
 fn plain_table_height(rows: usize) -> u16 {
@@ -354,14 +338,6 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
     );
 }
 
-/// Session-row rendering results that the caller folds back into the
-/// dashboard's mouse hitboxes once the borrow of `active` (which aliases
-/// `dashboard.state.sessions`) has ended.
-struct SessionRowsRendered {
-    active_row_areas: Vec<(usize, Rect)>,
-    project_heading_areas: Vec<(String, Rect)>,
-}
-
 fn session_row_spacing(
     dashboard: &DashboardState,
     active: &[String],
@@ -377,14 +353,12 @@ fn session_row_spacing(
     )
 }
 
-/// Draws the Active pane and reports the selected session's preview hitbox and
-/// the per-row mouse hitboxes.
 fn render_sessions(
     frame: &mut Frame,
     active_area: Rect,
     dashboard: &DashboardState,
     active: &[String],
-) -> SessionRowsRendered {
+) {
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -416,7 +390,7 @@ fn render_sessions(
     let mut target_occurrences = BTreeMap::<(String, String), usize>::new();
     let mut previous_project = None;
     let mut project_number = 0;
-    let mut row_meta = Vec::new();
+    let mut row_heights = Vec::new();
     let active_rows = active.iter().enumerate().filter_map(|(index, id)| {
         let session = dashboard.state.sessions.get(id)?;
         let source = dashboard.project_source(session);
@@ -525,15 +499,9 @@ fn render_sessions(
                 permission,
             ));
         }
-        let heading = usize::from(first);
         let content_height = lines.len() as u16;
         let spacing = session_row_spacing(dashboard, active, index, &source.key, expanded);
-        row_meta.push((
-            source.key,
-            heading,
-            content_height,
-            content_height + spacing,
-        ));
+        row_heights.push(content_height + spacing);
         Some(
             Row::new([Cell::from(Text::from(lines))])
                 .height(content_height)
@@ -551,43 +519,15 @@ fn render_sessions(
         .with_selected((dashboard.session_index < active.len()).then_some(dashboard.session_index));
     frame.render_stateful_widget(active_table, active_area, &mut active_state);
     let active_offset = active_state.offset();
-    let mut row_y = active_area.y + 1;
+    let available_height = active_area.height.saturating_sub(2);
+    let mut used_height = 0;
     let mut visible_sessions = 0;
-    let mut active_row_areas = Vec::new();
-    let mut project_heading_areas = Vec::new();
-    for (index, (project_key, heading, content_height, total_height)) in
-        row_meta.iter().enumerate().skip(active_offset)
-    {
-        if row_y >= active_area.bottom().saturating_sub(1) {
+    for row_height in row_heights.iter().skip(active_offset) {
+        if used_height >= available_height {
             break;
         }
         visible_sessions += 1;
-        if *heading > 0 {
-            project_heading_areas.push((
-                project_key.clone(),
-                Rect::new(
-                    active_area.x + 1,
-                    row_y,
-                    active_area.width.saturating_sub(2),
-                    1,
-                ),
-            ));
-        }
-        let session_y = row_y.saturating_add(*heading as u16);
-        let session_height = content_height.saturating_sub(*heading as u16);
-        let row_rect = Rect::new(
-            active_area.x.saturating_add(1),
-            session_y,
-            active_area.width.saturating_sub(2),
-            session_height.min(
-                active_area
-                    .bottom()
-                    .saturating_sub(1)
-                    .saturating_sub(session_y),
-            ),
-        );
-        active_row_areas.push((index, row_rect));
-        row_y = row_y.saturating_add(*total_height);
+        used_height = used_height.saturating_add(*row_height);
     }
     render_session_scrollbar(
         frame,
@@ -596,11 +536,6 @@ fn render_sessions(
         active_offset,
         visible_sessions,
     );
-
-    SessionRowsRendered {
-        active_row_areas,
-        project_heading_areas,
-    }
 }
 
 fn collapsed_session_line(
@@ -1510,6 +1445,26 @@ mod tests {
     }
 
     #[test]
+    fn modal_replaces_the_dashboard_instead_of_overlaying_it() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_greeting("UNDERLYING DASHBOARD SENTINEL".into());
+        assert_eq!(
+            dashboard.handle_key(crate::test_support::ctrl_key('r')),
+            DashboardAction::None
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw rename dialog");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("Rename session"));
+        assert!(!rendered.contains("UNDERLYING DASHBOARD SENTINEL"));
+        assert!(!rendered.contains("Active Sessions"));
+    }
+
+    #[test]
     fn expanded_dashboard_omits_an_agent_excerpt_older_than_the_last_user_message() {
         let mut dashboard = dashboard_with_session(running_session());
         let mut transcript = numbered_conversation(1);
@@ -1559,32 +1514,32 @@ mod tests {
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw dashboard");
 
-        let first_area = dashboard.active_row_areas[0].1;
         let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let first_y = lines
+            .iter()
+            .position(|line| line.contains("podman [1]"))
+            .expect("first session row") as u16;
+        let second_y = lines
+            .iter()
+            .position(|line| line.contains("podman [2]"))
+            .expect("second session row") as u16;
         assert!(
-            (first_area.y..first_area.bottom()).all(|y| {
-                (first_area.x..first_area.right()).all(|x| buffer[(x, y)].bg != Color::DarkGray)
+            (first_y..first_y + 4).all(|y| {
+                (buffer.area.x + 1..buffer.area.right() - 1)
+                    .all(|x| buffer[(x, y)].bg != Color::DarkGray)
             }),
             "selection must not paint a background"
         );
-        assert_eq!(buffer[(first_area.x, first_area.y)].symbol(), "›");
-        let first_line = (first_area.x..first_area.right())
-            .map(|x| buffer[(x, first_area.y)].symbol())
-            .collect::<String>();
-        let second_area = dashboard.active_row_areas[1].1;
-        let second_line = (second_area.x..second_area.right())
-            .map(|x| buffer[(x, second_area.y)].symbol())
-            .collect::<String>();
-        assert!(first_line.contains("podman [1]"));
-        assert!(second_line.contains("podman [2]"));
+        assert!(lines[first_y as usize].contains("› podman [1]"));
         assert_eq!(
-            second_area.y,
-            first_area.bottom() + 1,
+            second_y,
+            first_y + 5,
             "sessions in an expanded project have one blank row between them"
         );
         assert!(
-            (first_area.x..first_area.right())
-                .all(|x| buffer[(x, first_area.bottom())].symbol().trim().is_empty())
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .all(|x| buffer[(x, first_y + 4)].symbol().trim().is_empty())
         );
     }
 
@@ -1610,10 +1565,18 @@ mod tests {
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw dashboard");
 
-        let first_bottom = dashboard.active_row_areas[0].1.bottom();
-        let second_heading_y = dashboard.project_heading_areas[1].1.y;
-        assert_eq!(second_heading_y, first_bottom + 1);
         let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let first_y = lines
+            .iter()
+            .position(|line| line.contains("› podman"))
+            .expect("first session row") as u16;
+        let second_heading_y = lines
+            .iter()
+            .position(|line| line.contains("beta"))
+            .expect("second project heading") as u16;
+        let first_bottom = first_y + 4;
+        assert_eq!(second_heading_y, first_bottom + 1);
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .all(|x| buffer[(x, first_bottom)].symbol().trim().is_empty())

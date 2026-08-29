@@ -292,6 +292,32 @@ fn sigterm_restores_real_pty_terminal() {
         "missing alternate-screen leave: {output:?}"
     );
     assert!(
+        output.contains("\x1b[?1007h"),
+        "missing alternate-scroll enable: {output:?}"
+    );
+    let disable_alternate_scroll = output
+        .rfind("\x1b[?1007l")
+        .unwrap_or_else(|| panic!("missing alternate-scroll disable: {output:?}"));
+    let leave_screen = output
+        .rfind("\x1b[?1049l")
+        .unwrap_or_else(|| panic!("missing alternate-screen leave: {output:?}"));
+    assert!(
+        disable_alternate_scroll < leave_screen,
+        "alternate scroll was disabled after leaving the alternate screen: {output:?}"
+    );
+    for sequence in [
+        "\x1b[?1000h",
+        "\x1b[?1002h",
+        "\x1b[?1003h",
+        "\x1b[?1006h",
+        "\x1b[?1015h",
+    ] {
+        assert!(
+            !output.contains(sequence),
+            "mouse capture was enabled with {sequence:?}: {output:?}"
+        );
+    }
+    assert!(
         output.contains("\x1b[?25h"),
         "missing cursor restoration: {output:?}"
     );
@@ -346,6 +372,13 @@ fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
     let leave_screen = output
         .rfind("\x1b[?1049l")
         .unwrap_or_else(|| panic!("missing alternate-screen leave: {output:?}"));
+    let disable_alternate_scroll = output
+        .rfind("\x1b[?1007l")
+        .unwrap_or_else(|| panic!("missing alternate-scroll disable: {output:?}"));
+    assert!(
+        disable_alternate_scroll < leave_screen,
+        "alternate scroll was disabled after leaving the alternate screen: {output:?}"
+    );
     let message = output
         .find(REATTACH_MESSAGE)
         .unwrap_or_else(|| panic!("missing reattachment message: {output:?}"));

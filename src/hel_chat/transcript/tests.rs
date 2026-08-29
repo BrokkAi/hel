@@ -1,11 +1,11 @@
 use super::*;
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_chat::test_support::{
-    agent_message_item, agent_transcript_item, drawn_transcript, key, line_text, mouse_in, queued,
-    snapshot, transcript_text,
+    agent_message_item, agent_transcript_item, drawn_transcript, key, line_text, queued, snapshot,
+    transcript_text,
 };
 use crate::hel_worker::{SequencedEvent, WorkerEvent};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn completed_tool(seq: u64, title: &str) -> ChatEntry {
     ChatEntry::tool(seq, title, None, ToolStatus::Completed)
@@ -152,15 +152,6 @@ fn numbered_chat(count: usize) -> ChatState {
         .map(|index| ChatEntry::plain(index as u64, ChatRole::User, format!("message {index}")))
         .collect();
     chat
-}
-
-fn mouse(kind: MouseEventKind) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: 0,
-        row: 0,
-        modifiers: KeyModifiers::NONE,
-    }
 }
 
 fn user_transcript_item(position: u64, text: &str) -> Arc<TranscriptItem> {
@@ -1497,23 +1488,6 @@ fn control_home_and_end_reach_both_ends_of_a_long_transcript() {
 }
 
 #[test]
-fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
-    let mut chat = numbered_chat(40);
-    let _ = drawn_transcript(&mut chat, 40, 24);
-    // Away from the conversations pane, so the wheel reaches the transcript.
-    let mouse = |kind| mouse_in(kind, Rect::new(0, 10, 40, 1));
-
-    chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
-    let scrolled = drawn_transcript(&mut chat, 40, 24);
-    assert!(!shows(&scrolled, "message 39"), "wheel up leaves the tail");
-
-    chat.handle_mouse(mouse(MouseEventKind::ScrollDown));
-    let rows = drawn_transcript(&mut chat, 40, 24);
-    assert!(shows(&rows, "message 39"), "wheel down resumes following");
-    assert!(!rows.iter().any(|row| row.contains("End to follow")));
-}
-
-#[test]
 fn opening_reveals_the_dashboard_agent_excerpt_above_later_terminal_output() {
     let mut chat = ChatState::new(&snapshot(), &[]);
     chat.entries.push(ChatEntry::plain(
@@ -1540,7 +1514,7 @@ fn opening_reveals_the_dashboard_agent_excerpt_above_later_terminal_output() {
 }
 
 #[test]
-fn mouse_wheel_reaches_the_tail_across_a_large_collapsed_tool_run() {
+fn page_navigation_reaches_the_tail_across_a_large_collapsed_tool_run() {
     let mut chat = ChatState::new(&snapshot(), &[]);
     chat.entries
         .push(ChatEntry::plain(1, ChatRole::User, "before tools"));
@@ -1549,43 +1523,28 @@ fn mouse_wheel_reaches_the_tail_across_a_large_collapsed_tool_run() {
     chat.entries.extend((0..20).map(|index| {
         ChatEntry::plain(102 + index, ChatRole::User, format!("tail message {index}"))
     }));
-    let wheel = |kind| mouse_in(kind, Rect::new(0, 10, 60, 1));
     let mut rows = drawn_transcript(&mut chat, 60, 24);
 
     let mut upward_steps = 0;
     while !shows(&rows, "before tools") && upward_steps < 40 {
-        chat.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        chat.handle_key(key(KeyCode::PageUp));
         rows = drawn_transcript(&mut chat, 60, 24);
         upward_steps += 1;
     }
-    assert!(shows(&rows, "before tools"), "wheel up reached old history");
+    assert!(shows(&rows, "before tools"), "page up reached old history");
 
     for _ in 0..=upward_steps {
-        chat.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        chat.handle_key(key(KeyCode::PageDown));
         rows = drawn_transcript(&mut chat, 60, 24);
     }
     assert!(
         shows(&rows, "tail message 19"),
-        "wheel down reached the tail"
+        "page down reached the tail"
     );
     assert!(
         !rows.iter().any(|row| row.contains("End to follow")),
         "the conversation resumed following after crossing hidden tool entries"
     );
-}
-
-#[test]
-fn the_wheel_over_an_empty_transcript_has_nothing_to_scroll() {
-    let mut chat = ChatState::new(&snapshot(), &[]);
-    let rows = drawn_transcript(&mut chat, 40, 24);
-
-    chat.handle_mouse(mouse_in(MouseEventKind::ScrollUp, Rect::new(0, 10, 40, 1)));
-    chat.handle_mouse(mouse_in(
-        MouseEventKind::ScrollDown,
-        Rect::new(0, 10, 40, 1),
-    ));
-
-    assert_eq!(drawn_transcript(&mut chat, 40, 24), rows);
 }
 
 #[test]
@@ -1617,7 +1576,6 @@ fn a_transcript_shorter_than_the_viewport_cannot_scroll() {
     let mut chat = numbered_chat(2);
     let rows = drawn_transcript(&mut chat, 40, 24);
 
-    chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
     chat.handle_key(key(KeyCode::PageUp));
 
     assert_eq!(rows, drawn_transcript(&mut chat, 40, 24));

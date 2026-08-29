@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use hel::hel_config::{
     CONFIG_VERSION, ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, ProjectBundle,
@@ -59,27 +58,6 @@ pub(crate) fn ctrl_key(character: char) -> KeyEvent {
             KeyModifiers::CONTROL
         },
     )
-}
-
-pub(crate) fn mouse_in(kind: MouseEventKind, area: Rect) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: area.x.saturating_add(1),
-        row: area.y.saturating_add(1),
-        modifiers: KeyModifiers::NONE,
-    }
-}
-
-/// Like `mouse_in`, but clicks a specific row within `area` instead of
-/// always the top-left cell, so tests can hit tail lines further down a
-/// multi-line hitbox.
-pub(crate) fn mouse_at_row(kind: MouseEventKind, area: Rect, row_offset: u16) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: area.x.saturating_add(1),
-        row: area.y.saturating_add(row_offset),
-        modifiers: KeyModifiers::NONE,
-    }
 }
 
 pub(crate) fn config() -> HelConfig {

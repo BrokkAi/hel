@@ -4,12 +4,9 @@
 //! Input is reduced to [`DashboardAction`] values for the controller to run.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use ratatui::layout::Rect;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use hel::hel_chat::Notices;
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate as HelTargetTemplate};
@@ -48,12 +45,6 @@ pub use crate::resume::resume_profile_placeholders;
 /// Active sessions, capacity, and quotas. Sessions that are not live live in
 /// the resume dialog instead of a dashboard pane.
 pub(crate) const DASHBOARD_PANE_COUNT: usize = 3;
-
-pub(crate) const MOUSE_SCROLL_ROWS: isize = 3;
-
-/// Maximum gap between two left clicks on the same session row for the pair
-/// to count as a double click.
-const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A side effect requested by the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,24 +267,13 @@ pub struct DashboardState {
     pub(crate) capacity_index: usize,
     pub(crate) quota_index: usize,
     pub(crate) focus: Focus,
-    pub(crate) pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
-    pub(crate) resume_sessions_area: Option<Rect>,
     /// Native sessions the resume dialog hides, loaded from Hel's database.
     pub(crate) hidden_native_sessions: BTreeSet<(HarnessKind, String)>,
     /// The rows the open resume dialog shows, derived from the records, the
     /// scans, and the dialog's own search. Rebuilt where those change and once
     /// a second for the activity labels; empty when no dialog is open.
     pub(crate) resume_rows: Vec<crate::resume::ResumeRow>,
-    /// Row hitboxes for the Active pane, keyed by the row's index into the
-    /// active session list. Each rect spans the summary line and every
-    /// visible preview line beneath it, so a click anywhere on the row
-    /// selects it.
-    pub(crate) active_row_areas: Vec<(usize, Rect)>,
-    pub(crate) project_heading_areas: Vec<(String, Rect)>,
     pub(crate) expanded_project_key: Option<String>,
-    /// The pane, row index, and time of the most recent left click on a
-    /// session row, so the next click can be recognized as a double click.
-    last_row_click: Option<(Focus, usize, Instant)>,
     pub(crate) mode: Mode,
     pub(crate) notices: Notices,
     pub(crate) greeting: String,
@@ -315,14 +295,9 @@ impl DashboardState {
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Active,
-            pane_areas: None,
-            resume_sessions_area: None,
             hidden_native_sessions: BTreeSet::new(),
             resume_rows: Vec::new(),
-            active_row_areas: Vec::new(),
-            project_heading_areas: Vec::new(),
             expanded_project_key: None,
-            last_row_click: None,
             mode: Mode::Dashboard,
             notices: Notices::default(),
             greeting: "Welcome to Hel".into(),
@@ -472,96 +447,6 @@ impl DashboardState {
                 dialog.error = None;
             }
             _ => {}
-        }
-    }
-
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> DashboardAction {
-        if matches!(self.mode, Mode::ResumeDialog(_)) {
-            let Some(area) = self.resume_sessions_area else {
-                return DashboardAction::None;
-            };
-            if !rect_contains(area, mouse.column, mouse.row) {
-                return DashboardAction::None;
-            }
-            let delta = match mouse.kind {
-                MouseEventKind::ScrollUp => -MOUSE_SCROLL_ROWS,
-                MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
-                _ => return DashboardAction::None,
-            };
-            let len = self.resume_rows().len();
-            let Mode::ResumeDialog(dialog) = &mut self.mode else {
-                return DashboardAction::None;
-            };
-            dialog.focus = crate::resume::ResumeFocus::Sessions;
-            let index = offset_index(dialog.row_index, len, delta);
-            self.select_resume_row(index);
-            return DashboardAction::None;
-        }
-        if !matches!(self.mode, Mode::Dashboard) {
-            return DashboardAction::None;
-        }
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            if let Some((project_key, _)) = self
-                .project_heading_areas
-                .iter()
-                .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
-            {
-                let project_key = project_key.clone();
-                self.expand_project(&project_key);
-                return DashboardAction::None;
-            }
-            if let Some(&(index, _)) = self
-                .active_row_areas
-                .iter()
-                .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
-            {
-                return self.handle_row_click(Focus::Active, index);
-            }
-            // The click missed every row; forget any pending double click so
-            // a stray click elsewhere can't pair up with the next row click.
-            self.last_row_click = None;
-        }
-        let hovered = self.pane_areas.and_then(|areas| {
-            areas
-                .into_iter()
-                .position(|area| rect_contains(area, mouse.column, mouse.row))
-                .map(|index| match index {
-                    0 => Focus::Active,
-                    1 => Focus::Capacity,
-                    2 => Focus::Quotas,
-                    _ => unreachable!("dashboard has exactly three panes"),
-                })
-        });
-        let Some(hovered) = hovered else {
-            return DashboardAction::None;
-        };
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_selection_for(hovered, -MOUSE_SCROLL_ROWS),
-            MouseEventKind::ScrollDown => self.scroll_selection_for(hovered, MOUSE_SCROLL_ROWS),
-            _ => {}
-        }
-        DashboardAction::None
-    }
-
-    /// Selects the clicked row and, if it's the second click on the same row
-    /// within `DOUBLE_CLICK_INTERVAL`, performs the same action Enter would.
-    fn handle_row_click(&mut self, focus: Focus, index: usize) -> DashboardAction {
-        self.focus = focus;
-        self.set_selection_for(focus, index);
-        let now = Instant::now();
-        let is_double_click = matches!(
-            self.last_row_click,
-            Some((last_focus, last_index, last_time))
-                if last_focus == focus
-                    && last_index == index
-                    && now.saturating_duration_since(last_time) <= DOUBLE_CLICK_INTERVAL
-        );
-        if is_double_click {
-            self.last_row_click = None;
-            self.open_or_resume()
-        } else {
-            self.last_row_click = Some((focus, index, now));
-            DashboardAction::None
         }
     }
 
@@ -908,27 +793,6 @@ impl DashboardState {
         }
     }
 
-    fn scroll_selection_for(&mut self, focus: Focus, delta: isize) {
-        let len = self.focus_len_for(focus);
-        if len == 0 {
-            self.set_selection_for(focus, 0);
-            return;
-        }
-        let current = match focus {
-            Focus::Active => self.session_index,
-            Focus::Capacity => self.capacity_index,
-            Focus::Quotas => self.quota_index,
-        };
-        let next = if delta.is_negative() {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            current
-                .saturating_add(delta as usize)
-                .min(len.saturating_sub(1))
-        };
-        self.set_selection_for(focus, next);
-    }
-
     fn cycle_focus(&mut self, reverse: bool) {
         self.focus = match (self.focus, reverse) {
             (Focus::Active, false) | (Focus::Quotas, true) => Focus::Capacity,
@@ -987,23 +851,6 @@ pub(crate) fn partition_sessions<'a>(
     (active, terminal)
 }
 
-fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
-    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
-}
-
-fn offset_index(index: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    if delta.is_negative() {
-        index.saturating_sub(delta.unsigned_abs())
-    } else {
-        index
-            .saturating_add(delta as usize)
-            .min(len.saturating_sub(1))
-    }
-}
-
 pub(crate) fn move_index(index: &mut usize, len: usize, delta: isize) {
     if len == 0 {
         *index = 0;
@@ -1050,16 +897,11 @@ fn single_line_paste(pasted: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
+    use crossterm::event::KeyCode;
     use hel::hel_state::{HelState, STATE_VERSION, SessionState};
 
     use super::*;
     use crate::test_support::*;
-
-    use crate::render::render;
 
     #[test]
     fn dashboard_actions_require_control_while_navigation_does_not() {
@@ -1496,201 +1338,6 @@ mod tests {
         assert_eq!(dashboard.session_index, selected_index);
         assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
         assert!(dashboard.selected_project_is_expanded());
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_the_hovered_pane_without_changing_focus() {
-        let sessions = (0..5)
-            .map(|index| {
-                let mut session = stopped_session();
-                session.id = format!("session-{index}");
-                session.state = SessionState::Running;
-                (session.id.clone(), session)
-            })
-            .collect();
-        let mut dashboard = DashboardState::new(
-            config(),
-            HelState {
-                version: STATE_VERSION,
-                sessions,
-                mount_history: BTreeMap::new(),
-                container_sizes: BTreeMap::new(),
-            },
-            BTreeMap::new(),
-        );
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw pane hitboxes");
-        let pane_areas = dashboard.pane_areas.expect("dashboard pane hitboxes");
-
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[0]));
-        assert_eq!(dashboard.session_index, 3);
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane_areas[0]));
-        assert_eq!(dashboard.session_index, 0);
-
-        assert_eq!(dashboard.focus, Focus::Active);
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[2]));
-        assert_eq!(dashboard.quota_index, 2);
-        assert_eq!(dashboard.session_index, 0);
-        assert_eq!(dashboard.focus, Focus::Active);
-    }
-
-    #[test]
-    fn clicking_an_active_rows_tail_line_selects_that_session() {
-        let mut dashboard = dashboard_with_conversations(3);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw active row hitboxes");
-        assert_eq!(dashboard.session_index, 0, "starts on the first session");
-
-        let (_, row) = *dashboard
-            .active_row_areas
-            .iter()
-            .find(|(index, _)| *index == 2)
-            .expect("the third active row has a recorded hitbox");
-        assert!(
-            row.height > 1,
-            "an unselected row still spans its preview lines"
-        );
-        // Click the row's bottom line, i.e. its conversation tail, not the
-        // one-line summary at the top.
-        dashboard.handle_mouse(mouse_at_row(
-            MouseEventKind::Down(MouseButton::Left),
-            row,
-            row.height - 1,
-        ));
-
-        assert_eq!(
-            dashboard.session_index, 2,
-            "clicking the tail line selected the row, not just its summary line"
-        );
-        assert_eq!(dashboard.focus, Focus::Active);
-    }
-
-    #[test]
-    fn a_single_click_on_a_row_selects_but_reports_no_action() {
-        let mut dashboard = dashboard_with_conversations(3);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw active row hitboxes");
-
-        let (_, row) = *dashboard
-            .active_row_areas
-            .iter()
-            .find(|(index, _)| *index == 1)
-            .expect("the second active row has a recorded hitbox");
-        let action = dashboard.handle_mouse(mouse_at_row(
-            MouseEventKind::Down(MouseButton::Left),
-            row,
-            0,
-        ));
-
-        assert_eq!(action, DashboardAction::None);
-        assert_eq!(dashboard.session_index, 1);
-    }
-
-    #[test]
-    fn a_double_click_on_an_active_row_opens_it_like_enter() {
-        let mut dashboard = dashboard_with_conversations(3);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw active row hitboxes");
-
-        let (_, row) = *dashboard
-            .active_row_areas
-            .iter()
-            .find(|(index, _)| *index == 1)
-            .expect("the second active row has a recorded hitbox");
-        let click = || mouse_at_row(MouseEventKind::Down(MouseButton::Left), row, 0);
-
-        let first = dashboard.handle_mouse(click());
-        assert_eq!(first, DashboardAction::None, "the first click just selects");
-
-        let second = dashboard.handle_mouse(click());
-        assert_eq!(
-            second,
-            DashboardAction::Open {
-                session_id: "session-1".into(),
-            },
-            "a quick second click on the same row opens it, matching Enter"
-        );
-        assert_eq!(dashboard.session_index, 1);
-    }
-
-    #[test]
-    fn clicks_on_different_rows_do_not_count_as_a_double_click() {
-        let mut dashboard = dashboard_with_conversations(3);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw active row hitboxes");
-
-        let row_for = |index: usize| {
-            *dashboard
-                .active_row_areas
-                .iter()
-                .find(|(row_index, _)| *row_index == index)
-                .map(|(_, area)| area)
-                .expect("row has a recorded hitbox")
-        };
-        let first_row = row_for(0);
-        let second_row = row_for(1);
-
-        let first = dashboard.handle_mouse(mouse_at_row(
-            MouseEventKind::Down(MouseButton::Left),
-            first_row,
-            0,
-        ));
-        assert_eq!(first, DashboardAction::None);
-
-        // A click on a different row is a fresh first click, not the second
-        // half of a double click on row 0.
-        let second = dashboard.handle_mouse(mouse_at_row(
-            MouseEventKind::Down(MouseButton::Left),
-            second_row,
-            0,
-        ));
-        assert_eq!(second, DashboardAction::None);
-        assert_eq!(
-            dashboard.session_index, 1,
-            "the second click's row is selected"
-        );
-    }
-
-    /// A dashboard with `count` running sessions, each carrying a numbered
-    /// conversation long enough to scroll.
-    fn dashboard_with_conversations(count: usize) -> DashboardState {
-        let sessions = (0..count)
-            .map(|index| {
-                let mut session = stopped_session();
-                session.id = format!("session-{index}");
-                session.state = SessionState::Running;
-                (session.id.clone(), session)
-            })
-            .collect();
-        let mut dashboard = DashboardState::new(
-            config(),
-            HelState {
-                version: STATE_VERSION,
-                sessions,
-                mount_history: BTreeMap::new(),
-                container_sizes: BTreeMap::new(),
-            },
-            BTreeMap::new(),
-        );
-        let transcript = numbered_conversation(14);
-        for index in 0..count {
-            apply_materialized_transcript_for(
-                &mut dashboard,
-                &format!("session-{index}"),
-                transcript.clone(),
-            );
-        }
-        dashboard
     }
 
     #[test]

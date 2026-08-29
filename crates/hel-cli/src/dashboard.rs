@@ -951,6 +951,12 @@ impl DashboardContext {
     /// even when nothing else marked the view dirty; without it a notice could
     /// be replaced or dismissed having rendered zero frames.
     fn draw(&mut self) -> Result<()> {
+        let alternate_scroll = self.view == View::Dashboard
+            || self
+                .active_chat
+                .as_ref()
+                .is_some_and(hel::hel_chat::ActiveChat::has_elicitation);
+        self.terminal.set_alternate_scroll(alternate_scroll)?;
         let notice_generation = self.notices.generation();
         self.dirty |= notice_generation != self.drawn_notice_generation;
         if !self.dirty {
@@ -1656,8 +1662,7 @@ fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> Dashb
             dashboard.handle_paste(&pasted);
             DashboardAction::None
         }
-        Event::Mouse(mouse) => dashboard.handle_mouse(mouse),
-        // Resize and focus changes only need the redraw.
+        // Resize, focus, and mouse changes only need the redraw.
         _ => DashboardAction::None,
     }
 }

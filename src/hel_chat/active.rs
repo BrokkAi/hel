@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_session_manager::{
@@ -126,8 +126,6 @@ impl ChatState {
             None
         };
         if let Some(step) = step {
-            // Walking the list re-centres it, whatever the wheel left behind.
-            self.conversations_window_start = None;
             // No wrap: the ends of the list stay put.
             return match self.neighbour_session(step) {
                 Some(session_id) => ChatAction::SwitchSession { session_id },
@@ -142,7 +140,6 @@ impl ChatState {
 
     pub(super) fn focus_conversations(&mut self) {
         self.focus = ChatFocus::Conversations;
-        self.conversations_window_start = None;
     }
 
     /// The session `step` rows from the current one in the pane's order.
@@ -152,66 +149,6 @@ impl ChatState {
         let current = rows.iter().position(|row| row.current)?;
         let target = current.checked_add_signed(step)?;
         rows.get(target).map(|row| row.session_id.clone())
-    }
-
-    /// A left click inside the conversations pane switches to the clicked
-    /// session, mirroring keyboard selection. Focus is left alone, the same
-    /// as the wheel: only Tab moves focus.
-    pub(super) fn click_conversation_row(&mut self, mouse: MouseEvent) -> ChatAction {
-        let Some(area) = self.conversations_area else {
-            return ChatAction::None;
-        };
-        let height = usize::from(area.height);
-        if height == 0 {
-            return ChatAction::None;
-        }
-        let rows = conversation_rows(self);
-        let current = rows.iter().position(|row| row.current).unwrap_or(0);
-        let start = conversations_window_start(
-            rows.len(),
-            current,
-            height,
-            self.conversations_window_start,
-        );
-        let clicked = usize::from(mouse.row.saturating_sub(area.y));
-        if clicked >= height {
-            return ChatAction::None;
-        }
-        let Some(row) = rows.get(start + clicked) else {
-            return ChatAction::None;
-        };
-        if row.current {
-            return ChatAction::None;
-        }
-        self.conversations_window_start = None;
-        ChatAction::SwitchSession {
-            session_id: row.session_id.clone(),
-        }
-    }
-
-    /// Moves the conversations window by `rows`, leaving the current session
-    /// where it is. Clamped to the list, so the window cannot run off either
-    /// end.
-    pub(super) fn scroll_conversations(&mut self, rows: isize) {
-        let entries = conversation_rows(self);
-        let height = self
-            .conversations_area
-            .map_or(0, |area| usize::from(area.height));
-        if height == 0 || entries.len() <= height {
-            return;
-        }
-        let current = entries.iter().position(|entry| entry.current).unwrap_or(0);
-        let start = conversations_window_start(
-            entries.len(),
-            current,
-            height,
-            self.conversations_window_start,
-        );
-        self.conversations_window_start = Some(
-            start
-                .saturating_add_signed(rows)
-                .min(entries.len() - height),
-        );
     }
 }
 
@@ -393,8 +330,7 @@ struct ConversationRow {
 #[derive(Debug)]
 struct ConversationsPane {
     lines: Vec<Line<'static>>,
-    /// Row of the current session within the window. `None` once the wheel has
-    /// scrolled it out of view.
+    /// Row of the current session within the visible window.
     current_row: Option<usize>,
 }
 
@@ -419,20 +355,11 @@ fn conversation_rows(chat: &ChatState) -> Vec<ConversationRow> {
     rows
 }
 
-/// Where a `height`-row window onto `rows` starts. Without an override the
-/// window centres on the current session; the wheel supplies one. Both are
-/// clamped, so the window never runs past either end of the list.
-fn conversations_window_start(
-    rows: usize,
-    current: usize,
-    height: usize,
-    override_start: Option<usize>,
-) -> usize {
+/// Where a `height`-row window onto `rows` starts, centred on the current
+/// session and clamped so it never runs past either end of the list.
+fn conversations_window_start(rows: usize, current: usize, height: usize) -> usize {
     let last_start = rows.saturating_sub(height);
-    match override_start {
-        Some(start) => start.min(last_start),
-        None => current.saturating_sub(height / 2).min(last_start),
-    }
+    current.saturating_sub(height / 2).min(last_start)
 }
 
 /// The rows the pane shows, at most `max_rows` of them.
@@ -445,8 +372,7 @@ fn conversations_pane(
     let rows = conversation_rows(chat);
     let height = max_rows.max(1).min(rows.len());
     let current = rows.iter().position(|row| row.current).unwrap_or(0);
-    let start =
-        conversations_window_start(rows.len(), current, height, chat.conversations_window_start);
+    let start = conversations_window_start(rows.len(), current, height);
     ConversationsPane {
         lines: rows
             .iter()
@@ -1014,8 +940,7 @@ impl ActiveChat {
                 self.state.handle_paste(&pasted);
                 ChatAction::None
             }
-            Event::Mouse(mouse) => self.state.handle_mouse(mouse),
-            // Resize and focus changes only need the redraw.
+            // Resize, focus, and mouse changes only need the redraw.
             _ => ChatAction::None,
         };
         let outcome = self.dispatch(action);
@@ -1234,6 +1159,11 @@ impl ActiveChat {
         self.state.focus_conversations();
     }
 
+    /// Whether the chat is currently showing its modal elicitation surface.
+    pub fn has_elicitation(&self) -> bool {
+        self.state.elicitation.is_some()
+    }
+
     /// Draws the view. The recovery phase is read here rather than tracked,
     /// because the checkpoint gate moves without telling the dashboard.
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -1272,6 +1202,11 @@ impl Drop for ActiveChat {
 }
 
 pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
+    if let Some(dialog) = chat.elicitation.as_ref() {
+        frame.render_widget(Clear, frame.area());
+        render_elicitation(frame, dialog);
+        return;
+    }
     let inner = frame.area();
     // The pane never takes more than a third of the screen. Its border eats
     // two columns, so the text inside wraps to that narrower width.
@@ -1322,9 +1257,6 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
         .border_type(conversations_border)
         .title("Active");
     let conversations_inner = conversations_block.inner(conversations_area);
-    // Consumers (mouse hover/click/scroll) map a screen row against this
-    // rect, so it must be the pane's inner area, not the bordered outline.
-    chat.conversations_area = Some(conversations_inner);
     frame.render_widget(conversations_block, conversations_area);
     frame.render_widget(Paragraph::new(pane.lines), conversations_inner);
     if chat.focus == ChatFocus::Conversations
@@ -1405,13 +1337,13 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
         );
     }
     let default_footer = if chat.focus == ChatFocus::Conversations {
-        "j/k or ↑/↓ switch conversation · Enter/Tab prompt · Ctrl-G dashboard"
+        "Ctrl-G dashboard · j/k or ↑/↓ switch conversation · PgUp/PgDn transcript · Enter/Tab prompt"
     } else if chat.voice_active {
-        "Listening… Alt-V stop · Ctrl-G dashboard"
+        "Ctrl-G dashboard · Listening… Alt-V stop · PgUp/PgDn transcript"
     } else if !chat.queued_prompts.is_empty() {
-        "Up/Ctrl-P edit last queued · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel · Ctrl-G dashboard"
+        "Ctrl-G dashboard · Up/Ctrl-P edit last queued · PgUp/PgDn transcript · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel"
     } else {
-        "Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T transcript · Esc cancel · Ctrl-G dashboard"
+        "Ctrl-G dashboard · PgUp/PgDn transcript · Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T rendering · Esc cancel"
     };
     let search_footer = chat.history_search.as_ref().map(history_search_footer);
     let notice = chat.notices.current();
@@ -1441,9 +1373,6 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
         ));
     }
     render_autocomplete(frame, prompt_area, chat);
-    if let Some(dialog) = chat.elicitation.as_ref() {
-        render_elicitation(frame, dialog);
-    }
 }
 
 fn prompt_title(chat: &ChatState, queued: usize) -> String {
@@ -1551,17 +1480,16 @@ mod tests {
         assert_eq!(line.style.fg, Some(Color::Yellow));
     }
     use crate::hel_chat::test_support::{
-        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, key, mouse_at_row,
-        mouse_in, queued, snapshot,
+        agent_message_item, agent_transcript_item, ctrl, key, queued, snapshot,
     };
+    use crate::hel_elicitation::ElicitationRequest;
     use crate::hel_state::MaterializedExecutionState;
+    use crate::hel_transcript::ChatRole;
     use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
     use crate::hel_worker::{SequencedEvent, WorkerEvent};
     use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigOptionCategory};
-    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::layout::Rect;
     use std::collections::BTreeMap;
 
     fn managed_view(session: MaterializedSession) -> ManagedSessionView {
@@ -1673,12 +1601,8 @@ mod tests {
     fn window_projects(chat: &ChatState, max_rows: usize) -> Vec<String> {
         let rows = conversation_rows(chat);
         let current = rows.iter().position(|row| row.current).unwrap_or(0);
-        let start = conversations_window_start(
-            rows.len(),
-            current,
-            max_rows.max(1).min(rows.len()),
-            chat.conversations_window_start,
-        );
+        let start =
+            conversations_window_start(rows.len(), current, max_rows.max(1).min(rows.len()));
         rows.iter()
             .skip(start)
             .take(max_rows)
@@ -1714,6 +1638,41 @@ mod tests {
         detach_chat(&mut chat);
 
         assert_eq!(chat.input, "");
+    }
+
+    #[test]
+    fn elicitation_replaces_the_chat_instead_of_overlaying_it() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(ChatEntry::plain(
+            1,
+            ChatRole::Agent,
+            "UNDERLYING CHAT SENTINEL",
+        ));
+        chat.elicitation = Some(super::super::elicitation::ElicitationDialog::new(
+            ElicitationRequest {
+                id: "question-1".into(),
+                message: "Visible dialog message".into(),
+                title: Some("Isolated dialog".into()),
+                description: None,
+                fields: Vec::new(),
+            },
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw elicitation");
+        let buffer = terminal.backend().buffer();
+        let rendered = (buffer.area.y..buffer.area.bottom())
+            .flat_map(|y| {
+                (buffer.area.x..buffer.area.right()).map(move |x| buffer[(x, y)].symbol())
+            })
+            .collect::<String>();
+
+        assert!(rendered.contains("Isolated dialog"));
+        assert!(rendered.contains("Visible dialog message"));
+        assert!(!rendered.contains("UNDERLYING CHAT SENTINEL"));
+        assert!(!rendered.contains("Ctrl-G dashboard"));
     }
 
     #[test]
@@ -2197,131 +2156,6 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_moves_the_conversations_window_without_switching_or_taking_focus() {
-        let mut chat = windowed_chat(10, 5);
-        let _ = drawn_transcript(&mut chat, 60, 24);
-        let pane = chat
-            .conversations_area
-            .expect("the pane records its hitbox");
-        // The border consumes the outer top row, so the hitbox other
-        // consumers (mouse mapping, the band) use starts one row lower.
-        assert_eq!(pane.y, 1, "the pane's border pushes its hitbox down a row");
-
-        chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane));
-
-        assert_eq!(window_projects(&chat, 7)[0], "project-3");
-        assert_eq!(conversations_pane(&chat, 0, 80, 7).current_row, Some(2));
-        // Hover decides what scrolls, so the wheel leaves focus where Tab put
-        // it, and the current session is still this one.
-        assert_eq!(chat.focus, ChatFocus::Prompt);
-        assert_eq!(chat.session_id, snapshot().session_id);
-
-        // The window stops at the end of the list, and at its start.
-        chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane));
-        assert_eq!(window_projects(&chat, 7)[0], "project-3");
-        for _ in 0..5 {
-            chat.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane));
-        }
-        assert_eq!(window_projects(&chat, 7)[0], "project-0");
-
-        // The border row just above the hitbox belongs to the frame, not the
-        // pane, so hovering it does not move the pane's window.
-        chat.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: pane.x,
-            row: pane.y - 1,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(window_projects(&chat, 7)[0], "project-0");
-
-        // Below the pane the wheel is the transcript's again.
-        let transcript = Rect::new(0, pane.bottom(), 60, 1);
-        chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, transcript));
-        assert_eq!(window_projects(&chat, 7)[0], "project-0");
-    }
-
-    #[test]
-    fn clicking_a_conversation_line_switches_to_it_and_resets_the_window() {
-        let mut chat = windowed_chat(10, 5);
-        let _ = drawn_transcript(&mut chat, 60, 24);
-        let pane = chat
-            .conversations_area
-            .expect("the pane records its hitbox");
-        // Centred on session 5, the window shows project-2..project-8, so row
-        // 0 is project-2 (session id "session-2").
-        assert_eq!(window_projects(&chat, 7)[0], "project-2");
-
-        // Scroll the window first, so a successful click has to reset it.
-        chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane));
-        assert!(chat.conversations_window_start.is_some());
-
-        let action = chat.handle_mouse(mouse_at_row(
-            MouseEventKind::Down(MouseButton::Left),
-            pane,
-            0,
-        ));
-
-        assert_eq!(
-            action,
-            ChatAction::SwitchSession {
-                session_id: other_session_id(3)
-            },
-            "row 0 after the scroll is project-3 (session-3)"
-        );
-        assert!(
-            chat.conversations_window_start.is_none(),
-            "a click resets the window like keyboard selection does"
-        );
-        assert_eq!(
-            chat.focus,
-            ChatFocus::Prompt,
-            "a click selects without taking focus, same as the wheel"
-        );
-    }
-
-    #[test]
-    fn clicking_the_current_conversation_line_is_a_no_op() {
-        let mut chat = windowed_chat(10, 5);
-        let _ = drawn_transcript(&mut chat, 60, 24);
-        let pane = chat
-            .conversations_area
-            .expect("the pane records its hitbox");
-        // The current session (position 5) sits at window row 3.
-        assert_eq!(conversations_pane(&chat, 0, 80, 7).current_row, Some(3));
-
-        let action = chat.handle_mouse(mouse_at_row(
-            MouseEventKind::Down(MouseButton::Left),
-            pane,
-            3,
-        ));
-
-        assert_eq!(action, ChatAction::None);
-        assert_eq!(chat.focus, ChatFocus::Prompt);
-    }
-
-    #[test]
-    fn walking_the_conversation_list_recentres_a_wheel_scrolled_window() {
-        let mut chat = windowed_chat(10, 5);
-        chat.focus_conversations();
-        let _ = drawn_transcript(&mut chat, 60, 24);
-        let pane = chat
-            .conversations_area
-            .expect("the pane records its hitbox");
-        chat.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane));
-        assert_eq!(window_projects(&chat, 7)[0], "project-1");
-
-        assert_eq!(
-            chat.handle_key(key(KeyCode::Char('j'))),
-            ChatAction::SwitchSession {
-                session_id: other_session_id(6)
-            }
-        );
-
-        assert!(chat.conversations_window_start.is_none());
-        assert_eq!(window_projects(&chat, 7)[0], "project-2");
-    }
-
-    #[test]
     fn a_focused_conversations_pane_bands_its_row_and_leaves_the_cursor_out_of_the_composer() {
         use ratatui::backend::Backend as _;
 
@@ -2332,14 +2166,9 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut chat))
             .expect("draw chat");
-        // The band only covers the pane's inner hitbox: the border columns to
-        // either side keep drawing border characters, not the band.
-        let pane = chat
-            .conversations_area
-            .expect("the pane records its hitbox");
         let banded = |terminal: &Terminal<TestBackend>, y: u16| {
             let buffer = terminal.backend().buffer();
-            (pane.x..pane.right()).all(|x| buffer[(x, y)].bg == Color::DarkGray)
+            (1..buffer.area.right() - 1).all(|x| buffer[(x, y)].bg == Color::DarkGray)
         };
         // Row 0 is the pane's top border; rows 1-3 are the three sessions,
         // with the current one (index 1 in the list) at y = 2.

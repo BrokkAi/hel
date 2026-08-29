@@ -1219,7 +1219,7 @@ impl ChatState {
             row = 0;
         }
         let anchor = TranscriptAnchor::Row { entry, row };
-        // A wheel step can land exactly on the first row of the final
+        // A scroll step can land exactly on the first row of the final
         // screenful. That page fills the viewport, but it is still the live
         // tail and must resume following new output. Resolve this on input so
         // ordinary render frames do not have to scan the tail twice.
