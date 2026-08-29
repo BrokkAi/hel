@@ -8,25 +8,25 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use hel::hel_config::{HarnessProfile, PhoneConfig};
-use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions};
+use hel::hel_controller::{Controller, SessionLaunchOptions};
 use hel::hel_quota::ProfileQuota;
 use hel::hel_server::{
     ActionOutcome, ControllerAction, ControllerRequest, ReadReceiptRequest, ResumeQueueDisposition,
     ServerOptions, ViewerQueuedPrompt, ViewerQuota, ViewerSnapshot, ViewerUserShell,
 };
-use hel::hel_session_manager::{SessionManagerControl, new_command_id};
+use hel::hel_session_manager::{SessionManagerChannels, SessionManagerControl, new_command_id};
 use hel::hel_state::{HelState, SessionRecord};
 use hel::hel_targets::{CancellableProcessExecutor, CommandExecutor};
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 
+use crate::daemon::{ResumeSessionRequest, RuntimeState};
 use crate::pollers::{
     CredentialSyncNotices, CredentialSyncSignalTracker, LifecycleUpdate, QUOTA_STALE_AFTER,
     QuotaRefreshBatch, QuotaUpdate, apply_worker_record_update, credential_sync_targets,
-    dashboard_worker_targets, interrupted_close_session_ids, merge_recovery_result,
-    projected_queued_prompts, queued_prompt_projection, quota_refresh_profiles,
-    reserve_recovery_or_cancel, schedule_due_credential_syncs, spawn_dashboard_worker_poller,
-    spawn_interrupted_close_recovery, spawn_quota_refresher,
+    dashboard_worker_targets, merge_recovery_result, projected_queued_prompts,
+    queued_prompt_projection, quota_refresh_profiles, reserve_recovery_or_cancel,
+    schedule_due_credential_syncs, spawn_quota_refresher,
 };
 
 #[derive(Debug, Clone)]
@@ -284,6 +284,8 @@ pub(crate) async fn run_server(
     args: ServerArgs,
     termination: tokio_util::sync::CancellationToken,
     report_status: impl FnOnce(String),
+    worker: SessionManagerChannels,
+    daemon_runtime: Arc<RuntimeState>,
 ) -> Result<()> {
     let bind = args.bind.parse().context("parse --bind socket address")?;
     let mut controller = Controller::load()?;
@@ -316,27 +318,18 @@ pub(crate) async fn run_server(
     let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
     let (receipt_tx, mut receipt_rx) = tokio::sync::mpsc::channel(32);
-    let (worker_targets_tx, mut worker_updates_rx, worker_commands_tx, worker_shutdown) =
-        spawn_dashboard_worker_poller()?;
+    let SessionManagerChannels {
+        targets: worker_targets_tx,
+        control: worker_commands_tx,
+        updates: mut worker_updates_rx,
+        shutdown: worker_shutdown,
+    } = worker;
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
     let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn(worker_commands_tx.clone());
     let recovery_observer = recovery.observer();
-    let interrupted_close_ids = interrupted_close_session_ids(&controller);
-    let (interrupted_close_tx, mut interrupted_close_rx) =
+    let (_interrupted_close_tx, mut interrupted_close_rx) =
         tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
     let mut interrupted_close_cancellations = std::collections::BTreeMap::new();
-    for session_id in &interrupted_close_ids {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        interrupted_close_cancellations.insert(session_id.clone(), cancelled.clone());
-        spawn_interrupted_close_recovery(
-            session_id.clone(),
-            worker_commands_tx.clone(),
-            recovery_observer.clone(),
-            cancelled,
-            interrupted_close_tx.clone(),
-            None,
-        );
-    }
     let mut credential_sync = CredentialSyncCoordinator::spawn();
     let credential_sync_handle = credential_sync.handle();
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
@@ -385,9 +378,7 @@ pub(crate) async fn run_server(
         let mut controller_reload_in_flight = false;
         let mut controller_reload_requested = false;
         let mut pending_action_errors = std::collections::BTreeMap::<String, String>::new();
-        let mut active_actions = interrupted_close_ids
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
+        let mut active_actions = std::collections::BTreeSet::new();
         let mut next_action_id = 0_u64;
         let mut action_cancellations = std::collections::BTreeMap::<u64, PhoneActionControl>::new();
         let mut action_sessions = std::collections::BTreeMap::<u64, String>::new();
@@ -463,17 +454,6 @@ pub(crate) async fn run_server(
                             update.session_id.clone(),
                             snapshot.operational.active_user_shells.clone(),
                         );
-                        if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
-                            recovery_observer.observe(hel::hel_state::RecoveryObservation {
-                                session,
-                                config: controller.config.clone(),
-                                latest_completed_turn_ordinal:
-                                    hel::hel_state::latest_completed_turn_ordinal(
-                                        &snapshot.materialized,
-                                    ),
-                                execution: snapshot.materialized.execution,
-                            });
-                        }
                         conversations.insert(
                             update.session_id.clone(),
                             hel::hel_chat::TranscriptSnapshot::from_materialized(
@@ -595,6 +575,7 @@ pub(crate) async fn run_server(
                             &action_cancellations,
                             &interrupted_close_cancellations,
                         ) {
+                            daemon_runtime.cancel_lifecycle_if_active(session_id);
                             ActionOutcome::Accepted
                         } else {
                             ActionOutcome::NotCancellable
@@ -621,6 +602,7 @@ pub(crate) async fn run_server(
                     let done = action_done_tx.clone();
                     let observer = recovery_observer.clone();
                     let session_control = worker_commands_tx.clone();
+                    let daemon_runtime = daemon_runtime.clone();
                     let started = action_started_tx.clone();
                     next_action_id = next_action_id.wrapping_add(1).max(1);
                     let action_id = next_action_id;
@@ -659,7 +641,10 @@ pub(crate) async fn run_server(
                                     CancellableProcessExecutor::new(control.cancelled.clone());
                                 runtime.block_on(apply_phone_action(
                                     &mut operation_controller,
-                                    &session_control,
+                                    PhoneActionServices {
+                                        sessions: &session_control,
+                                        daemon_runtime: &daemon_runtime,
+                                    },
                                     action,
                                     &executor,
                                     action_id,
@@ -923,9 +908,14 @@ fn track_started_phone_session(
     Ok(())
 }
 
+struct PhoneActionServices<'a> {
+    sessions: &'a SessionManagerControl,
+    daemon_runtime: &'a Arc<RuntimeState>,
+}
+
 async fn apply_phone_action(
     controller: &mut Controller,
-    sessions: &SessionManagerControl,
+    services: PhoneActionServices<'_>,
     action: ControllerAction,
     executor: &(impl CommandExecutor + Sync),
     action_id: u64,
@@ -1010,7 +1000,8 @@ async fn apply_phone_action(
                 .await
         }
         ControllerAction::Prompt { session_id, text } => {
-            sessions
+            services
+                .sessions
                 .session(&session_id)
                 .await?
                 .submit(
@@ -1028,7 +1019,8 @@ async fn apply_phone_action(
             session_id,
             command,
         } => {
-            sessions
+            services
+                .sessions
                 .session(&session_id)
                 .await?
                 .submit(
@@ -1042,7 +1034,8 @@ async fn apply_phone_action(
             session_id,
             shell_command_id,
         } => {
-            sessions
+            services
+                .sessions
                 .session(&session_id)
                 .await?
                 .submit(
@@ -1053,27 +1046,24 @@ async fn apply_phone_action(
             Ok(())
         }
         ControllerAction::Close { session_id } => {
-            controller
-                .close_session_managed_controlled(&session_id, executor, sessions)
-                .await
+            services.daemon_runtime.close_session(session_id).await
         }
         ControllerAction::Resume {
             session_id,
             profile_id,
             target_id,
             queue,
-        } => controller
-            .resume_session_controlled(
-                &session_id,
-                &profile_id,
-                &target_id,
-                SessionResumeOptions {
-                    additional_mounts: None,
-                    resource_allocation: None,
-                    discard_queue: queue == ResumeQueueDisposition::Discard,
-                },
-                executor,
-            )
+        } => services
+            .daemon_runtime
+            .resume_session(ResumeSessionRequest {
+                session_id,
+                profile_id,
+                target_template_id: target_id,
+                additional_mounts: None,
+                resource_allocation: None,
+                discard_queue: queue == ResumeQueueDisposition::Discard,
+                repository_preflight: None,
+            })
             .await
             .map(|_| ()),
         ControllerAction::Open { .. } => Ok(()),
@@ -1084,7 +1074,8 @@ async fn apply_phone_action(
             session_id,
             queue_id,
         } => {
-            sessions
+            services
+                .sessions
                 .session(&session_id)
                 .await?
                 .submit(

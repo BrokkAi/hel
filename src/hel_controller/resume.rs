@@ -7,6 +7,7 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1::ContentBlock;
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::hel_archive::{
     CanonicalQueuedCommandKind, CanonicalSessionSnapshot, CheckpointRepositoryBundle, SystemGit,
@@ -54,7 +55,8 @@ pub struct ResumeRepositorySourceMismatch {
     pub configured_origin: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResumeRepositorySourceReceipt {
     session_id: String,
     bundle_id: String,

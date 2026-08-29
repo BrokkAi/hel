@@ -23,11 +23,13 @@ use hel::hel_credentials::{
 use hel::hel_quota::{QuotaManager, QuotaRefreshOutcome, QuotaRefreshRequest};
 use hel::hel_recovery::{RecoveryCoordinator, RecoveryResult};
 use hel::hel_session_manager::{
-    RelaySessionTarget, SessionManagerControl, SessionManagerShutdown, SessionManagerUpdate,
-    SessionManagerUpdates, ViewError, spawn_session_manager,
+    ManagedSessionView, RelaySessionTarget, RemoteSessionRequest, SessionManagerControl,
+    SessionManagerShutdown, SessionManagerUpdate, SessionManagerUpdates, ViewError,
+    spawn_remote_session_manager,
 };
 use hel::hel_state::{
-    HelState, MaterializedSession, SessionResourceAllocation, SessionState, normalize_session_title,
+    HelState, ManagedSessionSnapshot, MaterializedSession, SessionResourceAllocation, SessionState,
+    normalize_session_title,
 };
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
@@ -36,6 +38,7 @@ use hel::hel_targets::{
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::DashboardState;
 
+use crate::daemon;
 use crate::dashboard::io::DashboardIoUpdate;
 use crate::short_id;
 
@@ -1134,19 +1137,174 @@ async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput
     Ok(command_output)
 }
 
-pub(crate) fn spawn_dashboard_worker_poller() -> Result<(
+pub(crate) fn spawn_remote_dashboard_worker_poller(
+    workspace_id: String,
+) -> Result<(
     tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
     SessionManagerUpdates,
     SessionManagerControl,
     SessionManagerShutdown,
 )> {
-    let channels = spawn_session_manager()?;
-    Ok((
-        channels.targets,
-        channels.updates,
-        channels.control,
-        channels.shutdown,
-    ))
+    let channels = spawn_remote_session_manager()?;
+    let hel::hel_session_manager::RemoteSessionManagerChannels {
+        targets,
+        control,
+        updates,
+        shutdown,
+        publisher,
+        mut requests,
+    } = channels;
+    tokio::spawn(async move {
+        let mut revision = 0_u64;
+        let mut requests_open = true;
+        loop {
+            tokio::select! {
+                request = requests.recv(), if requests_open => {
+                    let Some(request) = request else {
+                        requests_open = false;
+                        continue;
+                    };
+                    tokio::spawn(forward_remote_session_request(request));
+                }
+                snapshot = poll_daemon_runtime(workspace_id.clone(), revision) => {
+                    match snapshot {
+                        Ok(snapshot) => {
+                            revision = revision.max(snapshot.revision);
+                            for runtime in snapshot.sessions {
+                                let session_id = runtime.session_id.clone();
+                                let view = match runtime.operational {
+                                    Some(operational) => {
+                                        let loaded = tokio::task::spawn_blocking({
+                                            let session_id = session_id.clone();
+                                            move || hel::hel_database::load_materialized_session(&session_id)
+                                        }).await;
+                                        match loaded {
+                                            Ok(Ok(Some(materialized)))
+                                                if materialized.applied_event_ordinal >= runtime.projection_ordinal =>
+                                            {
+                                                ManagedSessionView {
+                                                    snapshot: Some(ManagedSessionSnapshot {
+                                                        materialized,
+                                                        operational,
+                                                        latest_credential_sync_signal:
+                                                            runtime.latest_credential_sync_signal,
+                                                    }),
+                                                    connected: runtime.connected,
+                                                    error: runtime.error,
+                                                }
+                                            }
+                                            Ok(Ok(Some(materialized))) => ManagedSessionView {
+                                                snapshot: None,
+                                                connected: false,
+                                                error: Some(ViewError::ProjectionIntegrity(format!(
+                                                    "daemon published projection {} but SQLite contains only {}",
+                                                    runtime.projection_ordinal,
+                                                    materialized.applied_event_ordinal,
+                                                ))),
+                                            },
+                                            Ok(Ok(None)) => ManagedSessionView {
+                                                snapshot: None,
+                                                connected: false,
+                                                error: Some(ViewError::ProjectionIntegrity(
+                                                    "daemon published a session with no durable projection".into(),
+                                                )),
+                                            },
+                                            Ok(Err(error)) => ManagedSessionView {
+                                                snapshot: None,
+                                                connected: false,
+                                                error: Some(ViewError::ProjectionIntegrity(format!(
+                                                    "load daemon-owned projection: {error:#}",
+                                                ))),
+                                            },
+                                            Err(error) => ManagedSessionView {
+                                                snapshot: None,
+                                                connected: false,
+                                                error: Some(ViewError::ProjectionIntegrity(format!(
+                                                    "projection load task failed: {error}",
+                                                ))),
+                                            },
+                                        }
+                                    }
+                                    None => ManagedSessionView {
+                                        snapshot: None,
+                                        connected: runtime.connected,
+                                        error: runtime.error,
+                                    },
+                                };
+                                if publisher.publish(session_id, view).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "could not refresh sessions from controller daemon");
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    }
+                }
+            }
+            if !requests_open {
+                return;
+            }
+        }
+    });
+    Ok((targets, updates, control, shutdown))
+}
+
+async fn poll_daemon_runtime(
+    workspace_id: String,
+    after_revision: u64,
+) -> Result<daemon::RuntimeSnapshot> {
+    let mut daemon = daemon::connect_or_start().await?;
+    daemon.runtime_snapshot(workspace_id, after_revision).await
+}
+
+async fn forward_remote_session_request(request: RemoteSessionRequest) {
+    match request {
+        RemoteSessionRequest::Submit {
+            session_id,
+            command_id,
+            command,
+            reply,
+        } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .submit_session_command(session_id, command_id, command)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+        RemoteSessionRequest::Sync { session_id, reply } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .sync_session(session_id)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+        RemoteSessionRequest::RespondElicitation {
+            session_id,
+            elicitation_id,
+            response,
+            reply,
+        } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .respond_elicitation(session_id, elicitation_id, response)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+    }
 }
 
 pub(crate) fn apply_worker_poll_update(

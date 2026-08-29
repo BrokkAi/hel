@@ -34,14 +34,12 @@ use hel::hel_session_manager::{
     SessionManagerControl, SessionManagerShutdown, SessionManagerUpdates, ViewError,
 };
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_state::{
-    MaterializedSession, RecoveryObserver, SessionResourceAllocation, SessionState,
-};
+use hel::hel_state::{MaterializedSession, RecoveryObserver, SessionResourceAllocation};
 use hel::hel_targets::DeploymentCapacityTarget;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, PreparedMaterializedSessionDetail,
-    SessionOperationKind, render, resume_profile_placeholders,
+    render, resume_profile_placeholders,
 };
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -61,11 +59,10 @@ use crate::pollers::{
     CapacityPollUpdate, CredentialSyncNotices, CredentialSyncSignalTracker, Feed, LifecycleUpdate,
     QuotaRefreshBatch, QuotaUpdate, ResourcePollTarget, ResourcePollUpdate, WorkerDiagnosisTracker,
     WorkerPollTarget, apply_worker_poll_update, complete_manual_quota_refresh,
-    dashboard_worker_targets, interrupted_close_session_ids, merge_recovery_result_loaded,
-    projected_queued_prompts, quota_refresh_profiles, refresh_dashboard_poll_targets,
-    schedule_due_credential_syncs, spawn_dashboard_capacity_poller,
-    spawn_dashboard_resource_poller, spawn_dashboard_worker_poller,
-    spawn_interrupted_close_recovery, spawn_quota_refresher, spawn_worker_diagnosis,
+    dashboard_worker_targets, merge_recovery_result_loaded, projected_queued_prompts,
+    quota_refresh_profiles, refresh_dashboard_poll_targets, schedule_due_credential_syncs,
+    spawn_dashboard_capacity_poller, spawn_dashboard_resource_poller, spawn_quota_refresher,
+    spawn_remote_dashboard_worker_poller, spawn_worker_diagnosis,
 };
 use crate::{TerminalGuard, short_id, startup_greeting};
 
@@ -752,39 +749,14 @@ impl DashboardContext {
 
         let (quota_profiles_tx, quota_updates_rx) = spawn_quota_refresher();
         let (worker_targets_tx, worker_updates_rx, worker_commands_tx, worker_shutdown) =
-            spawn_dashboard_worker_poller()?;
+            spawn_remote_dashboard_worker_poller(workspace_id.to_owned())?;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
         let recovery = RecoveryCoordinator::spawn(worker_commands_tx.clone());
         let recovery_observer = recovery.observer();
         let (lifecycle_updates_tx, lifecycle_updates_rx) =
             tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
         let (critical_operations, critical_operations_changed) = CriticalOperationTracker::new();
-        let mut lifecycle_operations = BTreeMap::<String, ActiveLifecycleOperation>::new();
-        for session_id in interrupted_close_session_ids(&controller) {
-            let state = controller.state.sessions[&session_id].state;
-            let kind = if state == SessionState::Destroying {
-                SessionOperationKind::Destroying
-            } else {
-                SessionOperationKind::Stopping
-            };
-            let cancelled = Arc::new(AtomicBool::new(false));
-            lifecycle_operations.insert(
-                session_id.clone(),
-                ActiveLifecycleOperation {
-                    cancelled: cancelled.clone(),
-                    kind,
-                },
-            );
-            dashboard.begin_session_operation(session_id.clone(), kind, None);
-            spawn_interrupted_close_recovery(
-                session_id,
-                worker_commands_tx.clone(),
-                recovery_observer.clone(),
-                cancelled,
-                lifecycle_updates_tx.clone(),
-                Some(critical_operations.clone()),
-            );
-        }
+        let lifecycle_operations = BTreeMap::<String, ActiveLifecycleOperation>::new();
         let credential_sync = CredentialSyncCoordinator::spawn();
         let credential_sync_handle = credential_sync.handle();
         let (resource_targets_tx, resource_triggers_tx, resource_updates_rx) =
@@ -1400,24 +1372,10 @@ impl DashboardContext {
             };
             if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = self.controller.state.sessions.get(&session_id).cloned()
+                && let Some(signal) = snapshot.latest_credential_sync_signal.clone()
             {
-                if let Some(signal) = snapshot.latest_credential_sync_signal.clone() {
-                    self.credential_sync_signals.observe(
-                        &session_id,
-                        &session.last_profile,
-                        signal,
-                    );
-                }
-                // Queued, never awaited: the copy decision belongs to the
-                // coordinator, and the dashboard loop must stay free to draw.
-                self.recovery_observer
-                    .observe(hel::hel_state::RecoveryObservation {
-                        session,
-                        config: self.controller.config.clone(),
-                        latest_completed_turn_ordinal:
-                            hel::hel_state::latest_completed_turn_ordinal(&snapshot.materialized),
-                        execution: snapshot.materialized.execution,
-                    });
+                self.credential_sync_signals
+                    .observe(&session_id, &session.last_profile, signal);
             }
             let materialized = update
                 .view
@@ -2078,7 +2036,7 @@ mod tests {
                     target_template_id: "podman".into(),
                     resource_allocation: None,
                     additional_mounts: Vec::new(),
-                    state: SessionState::Running,
+                    state: hel::hel_state::SessionState::Running,
                     target: None,
                     native_session_id: None,
                     acp_session_title: None,

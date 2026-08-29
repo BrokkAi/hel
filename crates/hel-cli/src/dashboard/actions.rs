@@ -7,15 +7,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
-use hel::hel_controller::{Controller, ResumeRepositorySourceReceipt, SessionResumeOptions};
+use hel::hel_controller::{Controller, ResumeRepositorySourceReceipt};
 use hel::hel_setup::SetupOutcome;
 use hel::hel_targets::CancellableProcessExecutor;
 use hel_tui::{DashboardAction, SessionOperationKind};
 
+use crate::daemon;
 use crate::dashboard::io::{
     ArchiveWriteTarget, ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest,
-    ResumeRepositoryPreflightApply, StageReportingExecutor, config_only_controller,
-    spawn_archive_write, spawn_cancellable_io, spawn_clipboard_read, spawn_create_bundle,
+    ResumeRepositoryPreflightApply, config_only_controller, spawn_archive_write,
+    spawn_cancellable_io, spawn_clipboard_read, spawn_create_bundle,
     spawn_dashboard_container_settings, spawn_dashboard_create_session, spawn_dashboard_rename,
     spawn_io, spawn_lifecycle_operation,
 };
@@ -341,18 +342,17 @@ pub(crate) async fn apply_dashboard_action(
                 SessionOperationKind::Stopping,
                 true,
             );
-            let session_manager = context.worker_commands_tx.clone();
             let runtime = tokio::runtime::Handle::current();
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    runtime.block_on(controller.close_session_managed_controlled(
-                        &session_id,
-                        &executor,
-                        &session_manager,
-                    ))?;
+                move |_controller, _cancelled| {
+                    runtime.block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .close_session(session_id)
+                            .await
+                    })?;
                     Ok(LifecycleSuccess::Closed)
                 },
             );
@@ -377,9 +377,13 @@ pub(crate) async fn apply_dashboard_action(
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.force_stop(&session_id, &executor)?;
+                move |_controller, _cancelled| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .force_stop_session(session_id)
+                            .await
+                    })?;
                     Ok(LifecycleSuccess::ForceStopped)
                 },
             );
@@ -395,12 +399,13 @@ pub(crate) async fn apply_dashboard_action(
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    if cancelled.load(Ordering::Acquire) {
-                        bail!("operation cancelled");
-                    }
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.destroy_session_controlled(&session_id, &executor)?;
+                move |_controller, _cancelled| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .destroy_stopped_session(session_id)
+                            .await
+                    })?;
                     Ok(LifecycleSuccess::DestroyedStopped)
                 },
             );
@@ -408,6 +413,21 @@ pub(crate) async fn apply_dashboard_action(
         DashboardAction::CancelOperation { session_id } => {
             if let Some(operation) = context.lifecycle_operations.get(&session_id) {
                 operation.cancelled.store(true, Ordering::Release);
+                if operation.kind != SessionOperationKind::Launching {
+                    let daemon_session_id = session_id.clone();
+                    tokio::spawn(async move {
+                        let result = async {
+                            daemon::connect_or_start()
+                                .await?
+                                .cancel_lifecycle(daemon_session_id)
+                                .await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "could not cancel daemon lifecycle operation");
+                        }
+                    });
+                }
                 context.dashboard.set_notice(format!(
                     "Cancelling {} for {}…",
                     operation.kind.label().to_ascii_lowercase(),
@@ -518,31 +538,25 @@ fn start_session_launch_with_repository_preflight(
                 profile_id.clone(),
                 target_template_id.clone(),
             );
-            let stage_updates = context.dashboard_io_tx.clone();
             let runtime = tokio::runtime::Handle::current();
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    let executor = StageReportingExecutor::new(
-                        CancellableProcessExecutor::new(cancelled),
-                        session_id.clone(),
-                        stage_updates,
-                    );
-                    let materialized = runtime.block_on(
-                        controller.resume_session_controlled_with_repository_preflight(
-                            &session_id,
-                            &profile_id,
-                            &target_template_id,
-                            SessionResumeOptions {
+                move |_controller, _cancelled| {
+                    let materialized = runtime.block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .resume_session(daemon::ResumeSessionRequest {
+                                session_id: session_id.clone(),
+                                profile_id: profile_id.clone(),
+                                target_template_id: target_template_id.clone(),
                                 additional_mounts: Some(additional_mounts),
                                 resource_allocation,
                                 discard_queue,
-                            },
-                            repository_preflight,
-                            &executor,
-                        ),
-                    )?;
+                                repository_preflight,
+                            })
+                            .await
+                    })?;
                     Ok(LifecycleSuccess::Resumed {
                         profile_id,
                         target_id: target_template_id,

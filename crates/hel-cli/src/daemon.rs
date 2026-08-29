@@ -11,15 +11,33 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hel::hel_config::{HelConfig, data_dir};
-use hel::hel_controller::{Controller, ControllerStoreGuard};
-use hel::hel_state::SessionState;
+use hel::hel_controller::{
+    Controller, ControllerStoreGuard, ResumeRepositorySourceReceipt, SessionResumeOptions,
+};
+use hel::hel_credentials::CredentialSyncSignal;
+use hel::hel_elicitation::ElicitationResponse;
+use hel::hel_session_manager::{
+    ManagedSessionView, RemoteSessionPublisher, RemoteSessionRequest, SessionManagerChannels,
+    SessionManagerControl, ViewError, spawn_remote_session_manager, spawn_session_manager,
+};
+use hel::hel_state::{
+    MaterializedSession, RecoveryObservation, RecoveryObserver, SessionResourceAllocation,
+    SessionState,
+};
+use hel::hel_targets::{AdditionalMount, CancellableProcessExecutor};
+use hel::hel_worker::{RelayCommand, RelayOperationalState};
 use hel::hel_workspace::WorkspaceRecord;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-const PROTOCOL_VERSION: u32 = 1;
+use crate::pollers::{
+    dashboard_worker_targets, interrupted_close_session_ids, reserve_recovery_or_cancel,
+    spawn_interrupted_close_recovery,
+};
+
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -68,6 +86,61 @@ pub(crate) struct WorkspaceSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeSessionView {
+    pub session_id: String,
+    pub projection_ordinal: u64,
+    pub projection_digest: String,
+    pub operational: Option<RelayOperationalState>,
+    pub latest_credential_sync_signal: Option<CredentialSyncSignal>,
+    pub connected: bool,
+    pub error: Option<ViewError>,
+}
+
+impl RuntimeSessionView {
+    fn from_managed(session_id: String, view: ManagedSessionView) -> Self {
+        let (projection_ordinal, projection_digest, operational, signal) =
+            view.snapshot
+                .map_or((0, String::new(), None, None), |snapshot| {
+                    (
+                        snapshot.materialized.applied_event_ordinal,
+                        snapshot.materialized.applied_event_digest,
+                        Some(snapshot.operational),
+                        snapshot.latest_credential_sync_signal,
+                    )
+                });
+        Self {
+            session_id,
+            projection_ordinal,
+            projection_digest,
+            operational,
+            latest_credential_sync_signal: signal,
+            connected: view.connected,
+            error: view.error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeSnapshot {
+    pub revision: u64,
+    pub sessions: Vec<RuntimeSessionView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResumeSessionRequest {
+    pub session_id: String,
+    pub profile_id: String,
+    pub target_template_id: String,
+    pub additional_mounts: Option<Vec<AdditionalMount>>,
+    pub resource_allocation: Option<SessionResourceAllocation>,
+    pub discard_queue: bool,
+    pub repository_preflight: Option<ResumeRepositorySourceReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DraftPreview {
     pub id: String,
     pub session_id: Option<String>,
@@ -103,6 +176,36 @@ enum DaemonAction {
     Snapshot {
         workspace_id: String,
     },
+    RuntimeSnapshot {
+        workspace_id: String,
+        after_revision: u64,
+    },
+    SubmitSessionCommand {
+        session_id: String,
+        command_id: String,
+        command: RelayCommand,
+    },
+    SyncSession {
+        session_id: String,
+    },
+    RespondElicitation {
+        session_id: String,
+        elicitation_id: String,
+        response: ElicitationResponse,
+    },
+    CloseSession {
+        session_id: String,
+    },
+    ResumeSession(ResumeSessionRequest),
+    ForceStopSession {
+        session_id: String,
+    },
+    DestroyStoppedSession {
+        session_id: String,
+    },
+    CancelLifecycle {
+        session_id: String,
+    },
     RecoverDraft {
         draft_id: String,
     },
@@ -134,6 +237,9 @@ enum DaemonReply {
     Workspaces(Vec<WorkspaceListing>),
     Workspace(WorkspaceRecord),
     Snapshot(WorkspaceSnapshot),
+    RuntimeSnapshot(RuntimeSnapshot),
+    MaterializedSession(MaterializedSession),
+    Ordinal(u64),
     Done,
 }
 
@@ -153,14 +259,61 @@ struct Attachment {
     pid: u32,
 }
 
-#[derive(Default)]
-struct RuntimeState {
+pub(crate) struct RuntimeState {
     attachments: Mutex<BTreeMap<String, Attachment>>,
     phone_status: Mutex<String>,
     ever_attached: AtomicBool,
+    sessions: Mutex<BTreeMap<String, RuntimeSessionView>>,
+    revision: std::sync::atomic::AtomicU64,
+    revision_tx: tokio::sync::watch::Sender<u64>,
+    session_manager: SessionManagerControl,
+    lifecycle: Mutex<BTreeMap<String, ActiveLifecycle>>,
+    controller: Mutex<Controller>,
+    recovery_observer: RecoveryObserver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleKind {
+    Close,
+    Resume,
+    ForceStop,
+    DestroyStopped,
+}
+
+struct ActiveLifecycle {
+    kind: LifecycleKind,
+    cancelled: Arc<AtomicBool>,
+    result:
+        tokio::sync::watch::Receiver<Option<std::result::Result<DaemonLifecycleResult, String>>>,
+}
+
+#[derive(Debug, Clone)]
+enum DaemonLifecycleResult {
+    Done,
+    Materialized(Box<MaterializedSession>),
 }
 
 impl RuntimeState {
+    fn new(
+        session_manager: SessionManagerControl,
+        controller: Controller,
+        recovery_observer: RecoveryObserver,
+    ) -> Self {
+        let (revision_tx, _) = tokio::sync::watch::channel(0);
+        Self {
+            attachments: Mutex::new(BTreeMap::new()),
+            phone_status: Mutex::new(String::new()),
+            ever_attached: AtomicBool::new(false),
+            sessions: Mutex::new(BTreeMap::new()),
+            revision: std::sync::atomic::AtomicU64::new(0),
+            revision_tx,
+            session_manager,
+            lifecycle: Mutex::new(BTreeMap::new()),
+            controller: Mutex::new(controller),
+            recovery_observer,
+        }
+    }
+
     fn attachments(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Attachment>> {
         self.attachments
             .lock()
@@ -184,6 +337,312 @@ impl RuntimeState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    fn publish_session(&self, session_id: String, view: ManagedSessionView) {
+        if let Some(snapshot) = view.snapshot.as_ref() {
+            let controller = self
+                .controller
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(session) = controller.state.sessions.get(&session_id).cloned() {
+                self.recovery_observer.observe(RecoveryObservation {
+                    session,
+                    config: controller.config.clone(),
+                    latest_completed_turn_ordinal: hel::hel_state::latest_completed_turn_ordinal(
+                        &snapshot.materialized,
+                    ),
+                    execution: snapshot.materialized.execution,
+                });
+            }
+        }
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                session_id.clone(),
+                RuntimeSessionView::from_managed(session_id, view),
+            );
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        self.revision_tx.send_replace(revision);
+    }
+
+    async fn runtime_snapshot(
+        &self,
+        workspace_id: &str,
+        after_revision: u64,
+    ) -> Result<RuntimeSnapshot> {
+        let mut revisions = self.revision_tx.subscribe();
+        if *revisions.borrow_and_update() <= after_revision {
+            let _ = tokio::time::timeout(Duration::from_secs(30), revisions.changed()).await;
+        }
+        let revision = self.revision.load(Ordering::Acquire);
+        let session_ids = blocking({
+            let workspace_id = workspace_id.to_owned();
+            move || hel::hel_database::session_ids_for_workspace(&workspace_id)
+        })
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(session_id, _)| session_ids.contains(*session_id))
+            .map(|(_, view)| view.clone())
+            .collect();
+        Ok(RuntimeSnapshot { revision, sessions })
+    }
+
+    async fn run_lifecycle<F, Fut>(
+        self: &Arc<Self>,
+        session_id: String,
+        kind: LifecycleKind,
+        work: F,
+    ) -> Result<DaemonLifecycleResult>
+    where
+        F: FnOnce(Arc<Self>, String, Arc<AtomicBool>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<DaemonLifecycleResult>> + Send + 'static,
+    {
+        let mut work = Some(work);
+        let mut result = {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(active) = lifecycle.get(&session_id) {
+                ensure!(
+                    active.kind == kind,
+                    "another lifecycle operation is already running for session {session_id}"
+                );
+                active.result.clone()
+            } else {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let (result_tx, result_rx) = tokio::sync::watch::channel(None);
+                lifecycle.insert(
+                    session_id.clone(),
+                    ActiveLifecycle {
+                        kind,
+                        cancelled: cancelled.clone(),
+                        result: result_rx.clone(),
+                    },
+                );
+                let state = Arc::clone(self);
+                let operation_session_id = session_id.clone();
+                let operation = work.take().expect("new lifecycle operation has work");
+                tokio::spawn(async move {
+                    let result = operation(state.clone(), operation_session_id.clone(), cancelled)
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                    result_tx.send_replace(Some(result));
+                    state
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&operation_session_id);
+                    refresh_runtime_controller(&state).await;
+                });
+                result_rx
+            }
+        };
+
+        loop {
+            if let Some(result) = result.borrow_and_update().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            result
+                .changed()
+                .await
+                .context("daemon lifecycle operation stopped without a result")?;
+        }
+    }
+
+    pub(crate) async fn close_session(self: &Arc<Self>, session_id: String) -> Result<()> {
+        let already_stopped = blocking({
+            let session_id = session_id.clone();
+            move || {
+                let controller = Controller::load()?;
+                Ok(controller
+                    .state
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.state == SessionState::Stopped))
+            }
+        })
+        .await?;
+        if already_stopped {
+            return Ok(());
+        }
+        self.run_lifecycle(
+            session_id,
+            LifecycleKind::Close,
+            |state, session_id, cancelled| async move {
+                let _recovery_reservation = tokio::task::spawn_blocking({
+                    let observer = state.recovery_observer.clone();
+                    let session_id = session_id.clone();
+                    let cancelled = cancelled.clone();
+                    move || reserve_recovery_or_cancel(&observer, &session_id, &cancelled)
+                })
+                .await
+                .context("reserve recovery for daemon close task")??;
+                let mut controller = tokio::task::spawn_blocking(Controller::load)
+                    .await
+                    .context("load controller for daemon close task")??;
+                let executor = CancellableProcessExecutor::new(cancelled);
+                controller
+                    .close_session_managed_controlled(
+                        &session_id,
+                        &executor,
+                        &state.session_manager,
+                    )
+                    .await?;
+                Ok(DaemonLifecycleResult::Done)
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn resume_session(
+        self: &Arc<Self>,
+        request: ResumeSessionRequest,
+    ) -> Result<MaterializedSession> {
+        let session_id = request.session_id.clone();
+        let already_running = blocking({
+            let session_id = session_id.clone();
+            move || {
+                let controller = Controller::load()?;
+                if controller
+                    .state
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.state == SessionState::Running)
+                {
+                    Ok(Some(
+                        hel::hel_database::load_materialized_session(&session_id)?.with_context(
+                            || {
+                                format!(
+                                    "running session {session_id} has no materialized projection"
+                                )
+                            },
+                        )?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        })
+        .await?;
+        if let Some(materialized) = already_running {
+            return Ok(materialized);
+        }
+        let result = self
+            .run_lifecycle(
+                session_id,
+                LifecycleKind::Resume,
+                move |state, session_id, cancelled| async move {
+                    let _recovery_reservation = tokio::task::spawn_blocking({
+                        let observer = state.recovery_observer.clone();
+                        let session_id = session_id.clone();
+                        let cancelled = cancelled.clone();
+                        move || reserve_recovery_or_cancel(&observer, &session_id, &cancelled)
+                    })
+                    .await
+                    .context("reserve recovery for daemon resume task")??;
+                    let mut controller = tokio::task::spawn_blocking(Controller::load)
+                        .await
+                        .context("load controller for daemon resume task")??;
+                    let executor = CancellableProcessExecutor::new(cancelled);
+                    let materialized = controller
+                        .resume_session_controlled_with_repository_preflight(
+                            &session_id,
+                            &request.profile_id,
+                            &request.target_template_id,
+                            SessionResumeOptions {
+                                additional_mounts: request.additional_mounts,
+                                resource_allocation: request.resource_allocation,
+                                discard_queue: request.discard_queue,
+                            },
+                            request.repository_preflight,
+                            &executor,
+                        )
+                        .await?;
+                    Ok(DaemonLifecycleResult::Materialized(Box::new(materialized)))
+                },
+            )
+            .await?;
+        match result {
+            DaemonLifecycleResult::Materialized(materialized) => Ok(*materialized),
+            DaemonLifecycleResult::Done => bail!("daemon resume completed without a projection"),
+        }
+    }
+
+    async fn force_stop_session(self: &Arc<Self>, session_id: String) -> Result<()> {
+        self.run_lifecycle(
+            session_id,
+            LifecycleKind::ForceStop,
+            |_state, session_id, cancelled| async move {
+                blocking(move || {
+                    let mut controller = Controller::load()?;
+                    let executor = CancellableProcessExecutor::new(cancelled);
+                    controller.force_stop(&session_id, &executor)?;
+                    Ok(DaemonLifecycleResult::Done)
+                })
+                .await
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn destroy_stopped_session(self: &Arc<Self>, session_id: String) -> Result<()> {
+        let exists = blocking({
+            let session_id = session_id.clone();
+            move || Ok(Controller::load()?.state.sessions.contains_key(&session_id))
+        })
+        .await?;
+        if !exists {
+            return Ok(());
+        }
+        self.run_lifecycle(
+            session_id,
+            LifecycleKind::DestroyStopped,
+            |_state, session_id, cancelled| async move {
+                blocking(move || {
+                    let mut controller = Controller::load()?;
+                    let executor = CancellableProcessExecutor::new(cancelled);
+                    controller.destroy_session_controlled(&session_id, &executor)?;
+                    Ok(DaemonLifecycleResult::Done)
+                })
+                .await
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn cancel_lifecycle(&self, session_id: &str) -> Result<()> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let active = lifecycle.get(session_id).with_context(|| {
+            format!("no lifecycle operation is running for session {session_id}")
+        })?;
+        active.cancelled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn cancel_lifecycle_if_active(&self, session_id: &str) {
+        if let Some(active) = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(session_id)
+        {
+            active.cancelled.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -397,6 +856,121 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) async fn runtime_snapshot(
+        &mut self,
+        workspace_id: String,
+        after_revision: u64,
+    ) -> Result<RuntimeSnapshot> {
+        match self
+            .request(DaemonAction::RuntimeSnapshot {
+                workspace_id,
+                after_revision,
+            })
+            .await?
+        {
+            DaemonReply::RuntimeSnapshot(snapshot) => Ok(snapshot),
+            reply => bail!("unexpected runtime snapshot reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn submit_session_command(
+        &mut self,
+        session_id: String,
+        command_id: String,
+        command: RelayCommand,
+    ) -> Result<u64> {
+        match self
+            .request(DaemonAction::SubmitSessionCommand {
+                session_id,
+                command_id,
+                command,
+            })
+            .await?
+        {
+            DaemonReply::Ordinal(ordinal) => Ok(ordinal),
+            reply => bail!("unexpected session command reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn sync_session(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::SyncSession { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected session sync reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn respond_elicitation(
+        &mut self,
+        session_id: String,
+        elicitation_id: String,
+        response: ElicitationResponse,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::RespondElicitation {
+                session_id,
+                elicitation_id,
+                response,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected elicitation reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn close_session(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::CloseSession { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected close-session reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn resume_session(
+        &mut self,
+        request: ResumeSessionRequest,
+    ) -> Result<MaterializedSession> {
+        match self.request(DaemonAction::ResumeSession(request)).await? {
+            DaemonReply::MaterializedSession(materialized) => Ok(materialized),
+            reply => bail!("unexpected resume-session reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn force_stop_session(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::ForceStopSession { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected force-stop reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn destroy_stopped_session(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::DestroyStoppedSession { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected destroy-stopped reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn cancel_lifecycle(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::CancelLifecycle { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected cancel-lifecycle reply {reply:?}"),
+        }
+    }
+
     pub(crate) async fn recover_draft(&mut self, draft_id: String) -> Result<()> {
         match self
             .request(DaemonAction::RecoverDraft { draft_id })
@@ -550,6 +1124,16 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
     )?;
     hel::hel_controller::reconcile_managed_checkpoint_archives()?;
 
+    let controller = Controller::load()?;
+    let manager = spawn_session_manager()?;
+    let manager_targets = manager.targets;
+    manager_targets.send_replace(dashboard_worker_targets(&controller));
+    let mut manager_updates = manager.updates;
+    let manager_control = manager.control.clone();
+    let manager_shutdown = manager.shutdown;
+    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn(manager_control.clone());
+    let recovery_observer = recovery.observer();
+
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .context("bind Hel daemon loopback endpoint")?;
@@ -563,13 +1147,55 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
     };
     write_metadata(&metadata_path(), &metadata)?;
 
-    let state = Arc::new(RuntimeState::default());
+    let state = Arc::new(RuntimeState::new(
+        manager_control.clone(),
+        Controller {
+            config: controller.config.clone(),
+            state: controller.state.clone(),
+        },
+        recovery_observer.clone(),
+    ));
     let cancellation = hel::termination::Coordinator::install().token();
+    let target_refresh = spawn_manager_target_refresher(
+        manager_targets.clone(),
+        cancellation.clone(),
+        state.clone(),
+    );
     let exit_when_idle = std::env::var_os("HEL_DAEMON_EXIT_WHEN_IDLE").is_some();
     let mut idle_tick = tokio::time::interval(Duration::from_millis(100));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut recovery_tick = tokio::time::interval(Duration::from_millis(250));
+    recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (interrupted_close_tx, mut interrupted_close_rx) = tokio::sync::mpsc::unbounded_channel();
+    for session_id in interrupted_close_session_ids(&controller) {
+        spawn_interrupted_close_recovery(
+            session_id,
+            manager_control.clone(),
+            recovery_observer.clone(),
+            Arc::new(AtomicBool::new(false)),
+            interrupted_close_tx.clone(),
+            None,
+        );
+    }
+    let mut phone_publisher: Option<RemoteSessionPublisher> = None;
     if config.phone.enabled {
-        spawn_phone_server(config.phone, cancellation.clone(), state.clone());
+        let remote = spawn_remote_session_manager()?;
+        remote
+            .targets
+            .send_replace(dashboard_worker_targets(&controller));
+        phone_publisher = Some(remote.publisher.clone());
+        spawn_remote_request_bridge(remote.requests, manager_control.clone());
+        spawn_phone_server(
+            config.phone,
+            cancellation.clone(),
+            state.clone(),
+            SessionManagerChannels {
+                targets: remote.targets,
+                control: remote.control,
+                updates: remote.updates,
+                shutdown: remote.shutdown,
+            },
+        );
     } else {
         state.set_phone_status("disabled");
     }
@@ -580,6 +1206,22 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
                 state.prune_dead_clients();
                 if state.attachments().is_empty() {
                     break;
+                }
+            }
+            _ = recovery_tick.tick() => {
+                while let Some(result) = recovery.try_result() {
+                    if let Err(error) = &result.outcome {
+                        tracing::warn!(session_id = %result.session_id, %error, "daemon recovery checkpoint failed");
+                    }
+                    refresh_runtime_controller(&state).await;
+                }
+            }
+            completed = interrupted_close_rx.recv() => {
+                if let Some(completed) = completed {
+                    if let Err(error) = completed.result {
+                        tracing::warn!(session_id = %completed.session_id, %error, "daemon could not resume interrupted close");
+                    }
+                    refresh_runtime_controller(&state).await;
                 }
             }
             accepted = listener.accept() => {
@@ -597,7 +1239,32 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
                     }
                 });
             }
+            update = manager_updates.recv() => {
+                let Some(update) = update else {
+                    bail!("controller daemon session manager stopped");
+                };
+                if let Some(publisher) = phone_publisher.as_ref()
+                    && let Err(error) = publisher.try_publish(
+                        update.session_id.clone(),
+                        update.view.clone(),
+                    )
+                {
+                    tracing::warn!(%error, "phone session view bridge stopped");
+                    phone_publisher = None;
+                }
+                state.publish_session(update.session_id, update.view);
+            }
         }
+    }
+    // The idle-exit path does not arrive through the termination coordinator,
+    // so explicitly stop every daemon-owned background task before awaiting it.
+    cancellation.cancel();
+    manager_shutdown
+        .shutdown()
+        .await
+        .context("shut down controller daemon session manager")?;
+    if let Err(error) = target_refresh.await {
+        tracing::warn!(%error, "controller target refresher failed while shutting down");
     }
     if let Err(error) = fs::remove_file(metadata_path())
         && error.kind() != std::io::ErrorKind::NotFound
@@ -607,32 +1274,152 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
     Ok(())
 }
 
+fn spawn_manager_target_refresher(
+    targets: tokio::sync::watch::Sender<Vec<hel::hel_session_manager::RelaySessionTarget>>,
+    cancellation: CancellationToken,
+    state: Arc<RuntimeState>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = interval.tick() => {
+                    match tokio::task::spawn_blocking(|| {
+                        Controller::load().map(|controller| {
+                            let targets = dashboard_worker_targets(&controller);
+                            (controller, targets)
+                        })
+                    }).await {
+                        Ok(Ok((controller, refreshed))) => {
+                            *state.controller.lock().unwrap_or_else(PoisonError::into_inner) = controller;
+                            targets.send_replace(refreshed);
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(error = format!("{error:#}"), "could not refresh daemon session targets");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "daemon target refresh task failed");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn refresh_runtime_controller(state: &RuntimeState) {
+    match tokio::task::spawn_blocking(Controller::load).await {
+        Ok(Ok(controller)) => {
+            *state
+                .controller
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = controller;
+            let revision = state.revision.fetch_add(1, Ordering::AcqRel) + 1;
+            state.revision_tx.send_replace(revision);
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "could not refresh daemon controller state"
+            );
+        }
+        Err(error) => tracing::error!(%error, "daemon controller refresh task failed"),
+    }
+}
+
 fn spawn_phone_server(
     config: hel::hel_config::PhoneConfig,
     cancellation: CancellationToken,
     state: Arc<RuntimeState>,
+    worker: SessionManagerChannels,
 ) {
     tokio::spawn(async move {
-        loop {
-            let reporter = {
-                let state = state.clone();
-                move |status| state.set_phone_status(status)
-            };
-            match crate::server::run_server((&config).into(), cancellation.clone(), reporter).await
-            {
-                Ok(()) if cancellation.is_cancelled() => return,
-                Ok(()) => state.set_phone_status("stopped unexpectedly"),
-                Err(error) => {
-                    tracing::warn!(error = format!("{error:#}"), "phone server stopped");
-                    state.set_phone_status(format!("error: {error:#}"));
-                }
-            }
-            tokio::select! {
-                _ = cancellation.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+        let reporter = {
+            let state = state.clone();
+            move |status| state.set_phone_status(status)
+        };
+        match crate::server::run_server(
+            (&config).into(),
+            cancellation.clone(),
+            reporter,
+            worker,
+            state.clone(),
+        )
+        .await
+        {
+            Ok(()) if cancellation.is_cancelled() => {}
+            Ok(()) => state.set_phone_status("stopped unexpectedly"),
+            Err(error) => {
+                tracing::warn!(error = format!("{error:#}"), "phone server stopped");
+                state.set_phone_status(format!("error: {error:#}"));
             }
         }
     });
+}
+
+fn spawn_remote_request_bridge(
+    mut requests: hel::hel_session_manager::RemoteSessionRequests,
+    manager: SessionManagerControl,
+) {
+    tokio::spawn(async move {
+        while let Some(request) = requests.recv().await {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                forward_in_process_session_request(request, manager).await;
+            });
+        }
+    });
+}
+
+async fn forward_in_process_session_request(
+    request: RemoteSessionRequest,
+    manager: SessionManagerControl,
+) {
+    match request {
+        RemoteSessionRequest::Submit {
+            session_id,
+            command_id,
+            command,
+            reply,
+        } => {
+            let result = async {
+                manager
+                    .session(session_id)
+                    .await?
+                    .submit(command_id, command)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+        RemoteSessionRequest::Sync { session_id, reply } => {
+            let result = async { manager.session(session_id).await?.sync_now().await }
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+        RemoteSessionRequest::RespondElicitation {
+            session_id,
+            elicitation_id,
+            response,
+            reply,
+        } => {
+            let result = async {
+                manager
+                    .session(session_id)
+                    .await?
+                    .respond_elicitation(elicitation_id, response)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+    }
 }
 
 async fn serve_client(
@@ -694,7 +1481,7 @@ async fn blocking<T: Send + 'static>(
 async fn handle_action(
     action: DaemonAction,
     metadata: &DaemonMetadata,
-    state: &RuntimeState,
+    state: &Arc<RuntimeState>,
     cancellation: &CancellationToken,
 ) -> Result<DaemonReply> {
     match action {
@@ -790,6 +1577,65 @@ async fn handle_action(
         DaemonAction::Snapshot { workspace_id } => {
             let snapshot = blocking(move || workspace_snapshot(&workspace_id)).await?;
             Ok(DaemonReply::Snapshot(snapshot))
+        }
+        DaemonAction::RuntimeSnapshot {
+            workspace_id,
+            after_revision,
+        } => Ok(DaemonReply::RuntimeSnapshot(
+            state
+                .runtime_snapshot(&workspace_id, after_revision)
+                .await?,
+        )),
+        DaemonAction::SubmitSessionCommand {
+            session_id,
+            command_id,
+            command,
+        } => {
+            let session = state.session_manager.session(session_id).await?;
+            Ok(DaemonReply::Ordinal(
+                session.submit(command_id, command).await?,
+            ))
+        }
+        DaemonAction::SyncSession { session_id } => {
+            state
+                .session_manager
+                .session(session_id)
+                .await?
+                .sync_now()
+                .await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::RespondElicitation {
+            session_id,
+            elicitation_id,
+            response,
+        } => {
+            state
+                .session_manager
+                .session(session_id)
+                .await?
+                .respond_elicitation(elicitation_id, response)
+                .await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::CloseSession { session_id } => {
+            state.close_session(session_id).await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::ResumeSession(request) => Ok(DaemonReply::MaterializedSession(
+            state.resume_session(request).await?,
+        )),
+        DaemonAction::ForceStopSession { session_id } => {
+            state.force_stop_session(session_id).await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::DestroyStoppedSession { session_id } => {
+            state.destroy_stopped_session(session_id).await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::CancelLifecycle { session_id } => {
+            state.cancel_lifecycle(&session_id)?;
+            Ok(DaemonReply::Done)
         }
         DaemonAction::RecoverDraft { draft_id } => {
             blocking(move || hel::hel_database::recover_detached_draft(&draft_id)).await?;
@@ -896,6 +1742,16 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_rejects_a_request_with_the_wrong_owner_token() {
+        let remote = spawn_remote_session_manager().unwrap();
+        let recovery = hel::hel_recovery::RecoveryCoordinator::spawn(remote.control.clone());
+        let state = Arc::new(RuntimeState::new(
+            remote.control,
+            Controller {
+                config: HelConfig::default(),
+                state: hel::hel_state::HelState::default(),
+            },
+            recovery.observer(),
+        ));
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let metadata = DaemonMetadata {
@@ -909,14 +1765,9 @@ mod tests {
         let server_metadata = metadata.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_client(
-                stream,
-                server_metadata,
-                Arc::new(RuntimeState::default()),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+            serve_client(stream, server_metadata, state, CancellationToken::new())
+                .await
+                .unwrap();
         });
         let mut stream = TcpStream::connect(address).await.unwrap();
         write_frame(

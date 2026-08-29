@@ -222,7 +222,8 @@ async fn recover_worker(
 /// Why a managed session stopped producing fresh views. The kind matters to
 /// callers: an unreachable relay is worth retrying and diagnosing, while a
 /// projection integrity failure is deterministic and needs a different report.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum ViewError {
     Unreachable(String),
     TargetMissing(String),
@@ -257,6 +258,68 @@ pub struct SessionManagerChannels {
     pub control: SessionManagerControl,
     pub updates: SessionManagerUpdates,
     pub shutdown: SessionManagerShutdown,
+}
+
+/// Client-side half of a remotely owned session manager.
+///
+/// The daemon remains the only process with relay connections. A control
+/// surface publishes the daemon's latest views here and forwards requests from
+/// [`RemoteSessionRequests`] over its authenticated transport.
+pub struct RemoteSessionManagerChannels {
+    pub targets: watch::Sender<Vec<RelaySessionTarget>>,
+    pub control: SessionManagerControl,
+    pub updates: SessionManagerUpdates,
+    pub shutdown: SessionManagerShutdown,
+    pub publisher: RemoteSessionPublisher,
+    pub requests: RemoteSessionRequests,
+}
+
+#[derive(Clone)]
+pub struct RemoteSessionPublisher {
+    updates: mpsc::UnboundedSender<RemoteManagerUpdate>,
+}
+
+impl RemoteSessionPublisher {
+    pub async fn publish(&self, session_id: String, view: ManagedSessionView) -> Result<()> {
+        self.updates
+            .send(RemoteManagerUpdate::Publish { session_id, view })
+            .context("remote session manager stopped")
+    }
+
+    pub fn try_publish(&self, session_id: String, view: ManagedSessionView) -> Result<()> {
+        self.updates
+            .send(RemoteManagerUpdate::Publish { session_id, view })
+            .context("remote session manager update queue is unavailable")
+    }
+}
+
+pub struct RemoteSessionRequests {
+    requests: mpsc::Receiver<RemoteSessionRequest>,
+}
+
+impl RemoteSessionRequests {
+    pub async fn recv(&mut self) -> Option<RemoteSessionRequest> {
+        self.requests.recv().await
+    }
+}
+
+pub enum RemoteSessionRequest {
+    Submit {
+        session_id: String,
+        command_id: String,
+        command: RelayCommand,
+        reply: oneshot::Sender<std::result::Result<u64, String>>,
+    },
+    Sync {
+        session_id: String,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    RespondElicitation {
+        session_id: String,
+        elicitation_id: String,
+        response: ElicitationResponse,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
 }
 
 /// Exclusive owner of the manager task and every relay actor below it.
@@ -758,6 +821,21 @@ struct ActorRegistration {
     abort: tokio::task::AbortHandle,
 }
 
+struct RemoteActorRegistration {
+    commands: mpsc::Sender<ActorCommand>,
+    releases: mpsc::UnboundedSender<ReturnedConnection>,
+    view: watch::Receiver<ManagedSessionView>,
+    view_tx: watch::Sender<ManagedSessionView>,
+    abort: tokio::task::AbortHandle,
+}
+
+enum RemoteManagerUpdate {
+    Publish {
+        session_id: String,
+        view: ManagedSessionView,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReconcileAction {
     Idle,
@@ -865,6 +943,189 @@ fn reconcile_actors(
             },
         );
     }
+}
+
+async fn run_remote_session_actor(
+    session_id: String,
+    mut commands: mpsc::Receiver<ActorCommand>,
+    requests: mpsc::Sender<RemoteSessionRequest>,
+) {
+    while let Some(command) = commands.recv().await {
+        let request = match command {
+            ActorCommand::Submit {
+                command_id,
+                command,
+                reply,
+            } => RemoteSessionRequest::Submit {
+                session_id: session_id.clone(),
+                command_id,
+                command,
+                reply,
+            },
+            ActorCommand::Sync { reply } => RemoteSessionRequest::Sync {
+                session_id: session_id.clone(),
+                reply,
+            },
+            ActorCommand::RespondElicitation {
+                elicitation_id,
+                response,
+                reply,
+            } => RemoteSessionRequest::RespondElicitation {
+                session_id: session_id.clone(),
+                elicitation_id,
+                response,
+                reply,
+            },
+            ActorCommand::Lease { reply } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "relay connection leases are available only inside the controller daemon"
+                )));
+                continue;
+            }
+        };
+        if let Err(error) = requests.send(request).await {
+            match error.0 {
+                RemoteSessionRequest::Submit { reply, .. } => {
+                    let _ = reply.send(Err("controller daemon request bridge stopped".into()));
+                }
+                RemoteSessionRequest::Sync { reply, .. }
+                | RemoteSessionRequest::RespondElicitation { reply, .. } => {
+                    let _ = reply.send(Err("controller daemon request bridge stopped".into()));
+                }
+            }
+            break;
+        }
+    }
+}
+
+fn spawn_remote_actor(
+    session_id: String,
+    view: ManagedSessionView,
+    requests: &mpsc::Sender<RemoteSessionRequest>,
+    actors: &mut BTreeMap<String, RemoteActorRegistration>,
+    updates: &CoalescedUpdateSender,
+) {
+    let (actor_tx, actor_rx) = mpsc::channel(32);
+    let (release_tx, _release_rx) = mpsc::unbounded_channel();
+    let (view_tx, view_rx) = watch::channel(view.clone());
+    let abort = tokio::spawn(run_remote_session_actor(
+        session_id.clone(),
+        actor_rx,
+        requests.clone(),
+    ))
+    .abort_handle();
+    actors.insert(
+        session_id.clone(),
+        RemoteActorRegistration {
+            commands: actor_tx,
+            releases: release_tx,
+            view: view_rx,
+            view_tx,
+            abort,
+        },
+    );
+    updates.send(SessionManagerUpdate { session_id, view });
+}
+
+/// Build the read/control facade used by a control surface whose relay actors
+/// live in another process. Target updates still decide which session handles
+/// exist, while [`RemoteSessionPublisher`] supplies their latest views.
+pub fn spawn_remote_session_manager() -> Result<RemoteSessionManagerChannels> {
+    let (targets_tx, mut targets_rx) = watch::channel(Vec::<RelaySessionTarget>::new());
+    let (commands_tx, mut commands_rx) = mpsc::channel(32);
+    let (updates_tx, updates_rx) = coalesced_update_channel();
+    let (published_tx, mut published_rx) = mpsc::unbounded_channel();
+    let (requests_tx, requests_rx) = mpsc::channel(64);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut actors = BTreeMap::<String, RemoteActorRegistration>::new();
+        let mut latest = BTreeMap::<String, ManagedSessionView>::new();
+        let mut desired = BTreeMap::<String, RelaySessionTarget>::new();
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                changed = targets_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    desired = target_map(&targets_rx.borrow_and_update());
+                    actors.retain(|session_id, actor| {
+                        if desired.contains_key(session_id) {
+                            true
+                        } else {
+                            actor.abort.abort();
+                            false
+                        }
+                    });
+                    for session_id in desired.keys() {
+                        if !actors.contains_key(session_id)
+                            && let Some(view) = latest.get(session_id).cloned()
+                        {
+                            spawn_remote_actor(
+                                session_id.clone(),
+                                view,
+                                &requests_tx,
+                                &mut actors,
+                                &updates_tx,
+                            );
+                        }
+                    }
+                }
+                command = commands_rx.recv() => {
+                    let Some(ManagerCommand::Session { session_id, reply }) = command else {
+                        break;
+                    };
+                    let handle = actors.get(&session_id).map(|actor| ManagedSessionHandle {
+                        session_id: session_id.clone(),
+                        commands: actor.commands.clone(),
+                        releases: actor.releases.clone(),
+                        view: actor.view.clone(),
+                    });
+                    let _ = reply.send(handle);
+                }
+                published = published_rx.recv() => {
+                    let Some(RemoteManagerUpdate::Publish { session_id, view }) = published else {
+                        break;
+                    };
+                    latest.insert(session_id.clone(), view.clone());
+                    if !desired.contains_key(&session_id) {
+                        continue;
+                    }
+                    if let Some(actor) = actors.get(&session_id) {
+                        publish_view(&session_id, view, &actor.view_tx, &updates_tx);
+                        continue;
+                    }
+                    spawn_remote_actor(
+                        session_id,
+                        view,
+                        &requests_tx,
+                        &mut actors,
+                        &updates_tx,
+                    );
+                }
+            }
+        }
+        for actor in actors.into_values() {
+            actor.abort.abort();
+        }
+    });
+    Ok(RemoteSessionManagerChannels {
+        targets: targets_tx,
+        control: SessionManagerControl {
+            commands: commands_tx,
+        },
+        updates: updates_rx,
+        shutdown: SessionManagerShutdown {
+            signal: Some(shutdown_tx),
+            task: Some(task),
+        },
+        publisher: RemoteSessionPublisher {
+            updates: published_tx,
+        },
+        requests: RemoteSessionRequests {
+            requests: requests_rx,
+        },
+    })
 }
 
 pub fn spawn_session_manager() -> Result<SessionManagerChannels> {
@@ -1997,10 +2258,11 @@ impl StandaloneSession {
                                     }
                                 }
                                 ProjectionApplyOutcome::AlreadyApplied => {
-                                    bail!(
+                                    return Err(ProjectionIntegrityError(format!(
                                         "session actor received relay event {} after its projection had already applied it",
                                         event.ordinal
-                                    );
+                                    ))
+                                    .into());
                                 }
                             }
                         }
@@ -3549,5 +3811,53 @@ mod tests {
         assert_eq!(updates["session-1"].detail(), "revision-999");
         assert_eq!(updates["session-2"].detail(), "other");
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_session_manager_fans_out_views_and_forwards_commands() {
+        let mut remote = spawn_remote_session_manager().unwrap();
+        remote.targets.send_replace(vec![target("unused")]);
+        remote
+            .publisher
+            .publish("session-1".into(), view_at_ordinal(7))
+            .await
+            .unwrap();
+
+        let session = remote
+            .control
+            .wait_for_session("session-1", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .view()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .materialized
+                .applied_event_ordinal,
+            7
+        );
+
+        let submitted = session
+            .enqueue_submit("prompt-1".into(), RelayCommand::Cancel)
+            .await
+            .unwrap();
+        let request = remote.requests.recv().await.unwrap();
+        match request {
+            RemoteSessionRequest::Submit {
+                session_id,
+                command_id,
+                command: RelayCommand::Cancel,
+                reply,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(command_id, "prompt-1");
+                reply.send(Ok(8)).unwrap();
+            }
+            _ => panic!("unexpected remote session request"),
+        }
+        assert_eq!(submitted.wait().await.unwrap(), 8);
+        remote.shutdown.shutdown().await.unwrap();
     }
 }
