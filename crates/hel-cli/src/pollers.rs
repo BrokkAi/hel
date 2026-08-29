@@ -620,6 +620,17 @@ pub(crate) struct CredentialSyncNotices {
     last_failures: std::collections::BTreeMap<(String, Option<String>), String>,
 }
 
+pub(crate) fn log_credential_sync_actions(result: &hel::hel_credentials::CredentialSyncResult) {
+    let sessions = result.credential_sessions();
+    if sessions > 0 {
+        tracing::info!(
+            profile_id = %result.profile_id,
+            sessions,
+            "refreshed harness credentials"
+        );
+    }
+}
+
 impl CredentialSyncNotices {
     /// Healthy no-op cycles stay out of the UI; only actions, new failures, and
     /// answers to an event-triggered reconciliation are worth a notice.
@@ -715,13 +726,6 @@ impl CredentialSyncNotices {
         }
 
         let mut parts = Vec::new();
-        let credentials = result.credential_sessions();
-        if credentials > 0 {
-            parts.push(format!(
-                "Refreshed harness credentials for profile {} across {credentials} session(s).",
-                result.profile_id
-            ));
-        }
         let skills = result.skills_sessions();
         if skills > 0 {
             parts.push(format!(
@@ -1957,11 +1961,7 @@ mod tests {
                 outcome: Ok(vec![CredentialSyncAction::Pushed]),
             }],
         };
-        let refreshed = notices.notice(&healthy).unwrap();
-        assert!(
-            refreshed.contains("Refreshed harness credentials"),
-            "{refreshed}"
-        );
+        assert_eq!(notices.notice(&healthy), None);
         assert!(notices.notice(&failed("container is gone")).is_some());
     }
 
@@ -1986,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_credentials_and_github_syncs_each_speak_in_the_notice() {
+    fn skills_and_github_syncs_speak_while_harness_credentials_stay_out_of_the_notice() {
         use hel::hel_credentials::{
             CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
         };
@@ -2014,10 +2014,7 @@ mod tests {
             ],
         };
         let notice = CredentialSyncNotices::default().notice(&result).unwrap();
-        assert!(
-            notice.contains("Refreshed harness credentials for profile work across 1 session(s)."),
-            "{notice}"
-        );
+        assert!(!notice.contains("harness credentials"), "{notice}");
         assert!(
             notice.contains("Synced skills for profile work to 2 session(s)."),
             "{notice}"

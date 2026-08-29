@@ -1482,6 +1482,7 @@ impl DashboardContext {
 
     fn drain_credential_results(&mut self) {
         while let Some(result) = self.credential_sync.next_ready() {
+            crate::pollers::log_credential_sync_actions(&result);
             if let Some(notice) = self.credential_sync_notices.notice(&result) {
                 self.dashboard.set_notice(notice);
             }
