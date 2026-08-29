@@ -43,7 +43,7 @@ use crate::hel_elicitation::ElicitationValue;
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
-    TranscriptBody, TranscriptItem,
+    RecoveryCheckpointPhase, TranscriptBody, TranscriptItem,
 };
 use crate::hel_transcript::{
     ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
@@ -291,7 +291,7 @@ pub struct ChatState {
     active_agent_terminals: Vec<ActiveAgentTerminal>,
     claimed_agent_terminals: BTreeMap<String, i64>,
     elicitation: Option<ElicitationDialog>,
-    recovery_busy: bool,
+    recovery_phase: Option<RecoveryCheckpointPhase>,
     goal_prompt_active: bool,
     acp_surface: AcpSessionSurface,
     plan_command_pending: bool,
@@ -358,7 +358,7 @@ impl ChatState {
             active_agent_terminals: Vec::new(),
             claimed_agent_terminals: BTreeMap::new(),
             elicitation: None,
-            recovery_busy: false,
+            recovery_phase: None,
             goal_prompt_active: snapshot
                 .active_prompt
                 .as_ref()

@@ -279,6 +279,13 @@ pub struct RecoveryObserver {
     pub(crate) gate: Arc<RecoveryGate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryCheckpointPhase {
+    Prestaging,
+    Snapshotting,
+    Saving,
+}
+
 /// A per-session reservation held by a foreground lifecycle operation. The
 /// coordinator cannot start another recovery copy until this value is dropped.
 pub struct RecoveryReservation {
@@ -302,6 +309,7 @@ struct RecoveryGateState {
     /// In-flight copies, each with the cancel flag its executor watches, so a
     /// foreground lifecycle operation can preempt one instead of waiting.
     busy: BTreeMap<String, Arc<AtomicBool>>,
+    phases: BTreeMap<String, RecoveryCheckpointPhase>,
     reservations: BTreeMap<String, usize>,
 }
 
@@ -335,15 +343,32 @@ impl RecoveryGate {
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         state.busy.insert(session_id.to_owned(), cancelled.clone());
+        state
+            .phases
+            .insert(session_id.to_owned(), RecoveryCheckpointPhase::Prestaging);
         Some(cancelled)
     }
 
-    pub(crate) fn finish(&self, session_id: &str) {
+    pub(crate) fn set_phase(&self, session_id: &str, phase: RecoveryCheckpointPhase) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.busy.contains_key(session_id) {
+            state.phases.insert(session_id.to_owned(), phase);
+        }
+    }
+
+    pub(crate) fn phase(&self, session_id: &str) -> Option<RecoveryCheckpointPhase> {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .busy
-            .remove(session_id);
+            .phases
+            .get(session_id)
+            .copied()
+    }
+
+    pub(crate) fn finish(&self, session_id: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.busy.remove(session_id);
+        state.phases.remove(session_id);
     }
 
     pub(crate) fn is_busy(&self, session_id: &str) -> bool {
@@ -413,6 +438,10 @@ impl RecoveryContext {
     pub fn is_busy(&self) -> bool {
         self.observer.is_busy(&self.session.id)
     }
+
+    pub fn phase(&self) -> Option<RecoveryCheckpointPhase> {
+        self.observer.phase(&self.session.id)
+    }
 }
 
 impl RecoveryObserver {
@@ -431,6 +460,10 @@ impl RecoveryObserver {
 
     pub fn is_busy(&self, session_id: &str) -> bool {
         self.gate.is_busy(session_id)
+    }
+
+    pub fn phase(&self, session_id: &str) -> Option<RecoveryCheckpointPhase> {
+        self.gate.phase(session_id)
     }
 
     /// Holds off any recovery copy for this session until the returned

@@ -2166,6 +2166,9 @@ pub(crate) fn replacement_session_test_fixture(
                 ActorCommand::Submit { reply, .. } => {
                     let _ = reply.send(Ok(accepted_ordinal));
                 }
+                ActorCommand::Sync { reply } => {
+                    let _ = reply.send(Ok(()));
+                }
                 command => command.reject(&actor_session_id, "unsupported test operation"),
             }
         }

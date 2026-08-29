@@ -99,3 +99,12 @@ http-body-util = "0.1"
 # binary; links and test builds get materially faster. Use a temporary
 # `debug = 2` override when a debugger needs full variable info.
 debug = "line-tables-only"
+
+# Checkpoint packaging runs in the target's development worker during normal
+# local use. Optimize the measured compression and digest hot loops without
+# changing the rest of the development build.
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

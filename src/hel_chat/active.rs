@@ -18,7 +18,8 @@ use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
 };
 use crate::hel_state::{
-    MaterializedSession, RecoveryContext, TranscriptBody, TranscriptItem, config_command_text,
+    MaterializedSession, RecoveryCheckpointPhase, RecoveryContext, TranscriptBody, TranscriptItem,
+    config_command_text,
 };
 use crate::hel_transcript::ChatEntry;
 use crate::hel_worker::WorkerPhase;
@@ -1233,20 +1234,20 @@ impl ActiveChat {
         self.state.focus_conversations();
     }
 
-    /// Draws the view. The recovery flag is read here rather than tracked,
+    /// Draws the view. The recovery phase is read here rather than tracked,
     /// because the checkpoint gate moves without telling the dashboard.
     pub fn draw(&mut self, frame: &mut Frame) {
-        self.state.recovery_busy = self.recovery_busy();
+        self.state.recovery_phase = self.recovery_phase();
         render(frame, &mut self.state);
     }
 
-    fn recovery_busy(&self) -> bool {
-        self.recovery.as_ref().is_some_and(RecoveryContext::is_busy)
+    fn recovery_phase(&self) -> Option<RecoveryCheckpointPhase> {
+        self.recovery.as_ref().and_then(RecoveryContext::phase)
     }
 
     /// Whether the checkpoint title on screen is stale.
     pub fn recovery_title_is_stale(&self) -> bool {
-        self.recovery_busy() != self.state.recovery_busy
+        self.recovery_phase() != self.state.recovery_phase
     }
 
     /// Whether a clock tick has anything to redraw for: a running turn in the
@@ -1451,9 +1452,18 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
         .flatten()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if chat.recovery_busy {
-        parts.push("Saving checkpoint…".into());
-        parts.push(format!("{queued} queued"));
+    if let Some(recovery_phase) = chat.recovery_phase {
+        parts.push(
+            match recovery_phase {
+                RecoveryCheckpointPhase::Prestaging => "Preparing checkpoint…",
+                RecoveryCheckpointPhase::Snapshotting => "Snapshotting checkpoint…",
+                RecoveryCheckpointPhase::Saving => "Saving checkpoint…",
+            }
+            .into(),
+        );
+        if queued > 0 {
+            parts.push(format!("{queued} queued"));
+        }
     } else {
         if chat.plan_mode_active() {
             parts.push("Prompt — PLAN MODE".into());
@@ -1902,6 +1912,21 @@ mod tests {
         chat.phase = WorkerPhase::Running;
 
         assert!(prompt_title(&chat, 0).contains("Prompt — PLAN MODE"));
+    }
+
+    #[test]
+    fn composer_title_distinguishes_blocking_checkpoint_capture_from_background_save() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.recovery_phase = Some(RecoveryCheckpointPhase::Prestaging);
+        assert!(prompt_title(&chat, 0).contains("Preparing checkpoint…"));
+
+        chat.recovery_phase = Some(RecoveryCheckpointPhase::Snapshotting);
+        assert!(prompt_title(&chat, 2).contains("Snapshotting checkpoint…"));
+        assert!(prompt_title(&chat, 2).contains("2 queued"));
+
+        chat.recovery_phase = Some(RecoveryCheckpointPhase::Saving);
+        assert!(prompt_title(&chat, 0).contains("Saving checkpoint…"));
+        assert!(!prompt_title(&chat, 0).contains("queued"));
     }
 
     #[test]

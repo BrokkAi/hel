@@ -77,6 +77,7 @@ impl Controller {
                 manager,
                 LatchExclusivity::HoldThroughClose,
                 CheckpointExportPolicy::ReuseUnchangedArchive,
+                None,
             )
             .await
         {

@@ -220,6 +220,12 @@ enum WorkerCommand {
         #[arg(long)]
         spec: PathBuf,
     },
+    /// Seal target-owned checkpoint inputs while ACP dispatch is frozen.
+    #[command(hide = true)]
+    CaptureCheckpoint,
+    /// Package a sealed checkpoint after ACP dispatch has resumed.
+    #[command(hide = true)]
+    PackCheckpoint,
     /// Restore a verified archive into a freshly cloned target.
     RestoreCheckpoint {
         #[arg(long)]
@@ -397,6 +403,18 @@ async fn run_command(
             }
             WorkerCommand::ExportCheckpoint { spec } => {
                 let checkpoint = hel::hel_checkpoint::export_from_spec_file(&spec)?;
+                println!("{}", serde_json::to_string(&checkpoint)?);
+                Ok(())
+            }
+            WorkerCommand::CaptureCheckpoint => {
+                let checkpoint =
+                    hel::hel_checkpoint::capture_from_spec_reader(&mut std::io::stdin().lock())?;
+                println!("{}", serde_json::to_string(&checkpoint)?);
+                Ok(())
+            }
+            WorkerCommand::PackCheckpoint => {
+                let checkpoint =
+                    hel::hel_checkpoint::pack_from_spec_reader(&mut std::io::stdin().lock())?;
                 println!("{}", serde_json::to_string(&checkpoint)?);
                 Ok(())
             }
@@ -1043,6 +1061,27 @@ mod tests {
             panic!("export-checkpoint did not parse as a worker command");
         };
         assert_eq!(spec, PathBuf::from("-"));
+    }
+
+    #[test]
+    fn two_phase_checkpoint_worker_commands_parse_without_file_arguments() {
+        for (name, expected) in [
+            ("capture-checkpoint", "capture"),
+            ("pack-checkpoint", "pack"),
+        ] {
+            let cli = Cli::try_parse_from(["hel", "worker", name]).unwrap();
+            let Some(Command::Worker(WorkerArgs { command })) = cli.command else {
+                panic!("{name} did not parse as a worker command");
+            };
+            assert!(
+                matches!(
+                    (command, expected),
+                    (WorkerCommand::CaptureCheckpoint, "capture")
+                        | (WorkerCommand::PackCheckpoint, "pack")
+                ),
+                "{name} parsed as the wrong worker command"
+            );
+        }
     }
 
     #[test]
