@@ -951,12 +951,14 @@ impl DashboardContext {
     /// even when nothing else marked the view dirty; without it a notice could
     /// be replaced or dismissed having rendered zero frames.
     fn draw(&mut self) -> Result<()> {
-        let alternate_scroll = self.view == View::Dashboard
-            || self
+        let conversation_mouse = self.view == View::Chat
+            && self
                 .active_chat
                 .as_ref()
-                .is_some_and(hel::hel_chat::ActiveChat::has_elicitation);
+                .is_some_and(|chat| !chat.has_elicitation());
+        let alternate_scroll = !conversation_mouse;
         self.terminal.set_alternate_scroll(alternate_scroll)?;
+        self.terminal.set_mouse_capture(conversation_mouse)?;
         let notice_generation = self.notices.generation();
         self.dirty |= notice_generation != self.drawn_notice_generation;
         if !self.dirty {

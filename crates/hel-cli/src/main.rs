@@ -24,8 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -921,6 +921,7 @@ pub(crate) struct TerminalGuard {
     pub(crate) terminal: Terminal<CrosstermBackend<io::Stdout>>,
     keyboard_enhancement: bool,
     alternate_scroll_enabled: bool,
+    mouse_capture_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -994,6 +995,7 @@ impl TerminalGuard {
             terminal,
             keyboard_enhancement,
             alternate_scroll_enabled: true,
+            mouse_capture_enabled: false,
         })
     }
 
@@ -1012,6 +1014,24 @@ impl TerminalGuard {
         Ok(())
     }
 
+    /// Capture the wheel only while the conversation needs application-owned
+    /// scrolling. Other dashboard surfaces leave mouse capture off so native
+    /// terminal selection remains available without a modifier.
+    pub(crate) fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+        if self.mouse_capture_enabled == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)
+                .context("enable conversation mouse input")?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)
+                .context("disable conversation mouse input")?;
+        }
+        self.mouse_capture_enabled = enabled;
+        Ok(())
+    }
+
     pub(crate) fn suspend(&mut self) -> Result<()> {
         if self.keyboard_enhancement {
             execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags)
@@ -1020,11 +1040,13 @@ impl TerminalGuard {
         execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             DisableAlternateScroll,
             LeaveAlternateScreen
         )
         .context("disable terminal input modes and leave alternate screen for setup")?;
         self.alternate_scroll_enabled = false;
+        self.mouse_capture_enabled = false;
         disable_raw_mode().context("disable terminal raw mode for setup")?;
         self.terminal
             .show_cursor()
@@ -1049,6 +1071,7 @@ impl TerminalGuard {
         )
         .context("re-enter alternate screen and enable terminal input modes after setup")?;
         self.alternate_scroll_enabled = true;
+        self.mouse_capture_enabled = false;
         self.terminal
             .clear()
             .context("clear dashboard after setup")?;
@@ -1066,6 +1089,7 @@ impl Drop for TerminalGuard {
         if let Err(error) = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             DisableAlternateScroll,
             LeaveAlternateScreen
         ) {

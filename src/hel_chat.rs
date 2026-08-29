@@ -27,7 +27,7 @@ use agent_client_protocol::schema::v1::{
     PlanEntryStatus, SessionConfigOption, SessionModeState, SessionUpdate, TextContent, ToolCall,
     ToolCallContent, ToolCallStatus,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::style::Color;
 use sha2::{Digest, Sha256};
 
@@ -62,6 +62,8 @@ use transcript::{
     content_block_text, materialized_chat_entries_reusing, plan_status, tool_content_details,
     tool_diff_paths, tool_location_details, tool_status,
 };
+
+const MOUSE_SCROLL_ROWS: usize = 3;
 
 pub use active::ActiveChat;
 pub use transcript::{
@@ -479,6 +481,10 @@ impl ChatState {
                 self.unconverted_prefix,
                 std::mem::take(&mut self.entries),
             );
+            // Reusing entry rows is safe only after the collapse topology is
+            // recomputed. A tool can become completed without changing the
+            // transcript length, joining or splitting a collapsed streak.
+            self.invalidate_render_cache();
             // Re-read the seam from the projection that produced this tail, so
             // a prefix converted against replaced history is refused.
             self.prefix_seam = self
@@ -983,12 +989,16 @@ impl ChatState {
     }
 
     pub fn apply_events(&mut self, events: &[SequencedEvent]) {
+        let original_seq = self.latest_seq;
         for event in events {
             if event.seq <= self.latest_seq {
                 continue;
             }
             self.apply_event(event);
             self.latest_seq = event.seq;
+        }
+        if self.latest_seq != original_seq {
+            self.invalidate_render_cache();
         }
     }
 
@@ -1500,6 +1510,19 @@ impl ChatState {
             TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
             TranscriptRenderMode::Raw => "Raw transcript source enabled",
         });
+    }
+
+    /// Mouse capture is enabled only for the conversation surface, so every
+    /// wheel event delivered here belongs to the transcript. This bypasses
+    /// terminal-emulator scrollback, which redraws full-screen TUI frames and
+    /// becomes unusably slow for long sessions.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChatAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_history_up(MOUSE_SCROLL_ROWS),
+            MouseEventKind::ScrollDown => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+            _ => {}
+        }
+        ChatAction::None
     }
 
     fn apply_event(&mut self, event: &SequencedEvent) {

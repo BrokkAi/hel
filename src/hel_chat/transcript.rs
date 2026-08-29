@@ -668,12 +668,16 @@ fn prepare_render_cache(
     width: u16,
     mode: TranscriptRenderMode,
 ) {
-    if cache.width != width || cache.mode != mode {
+    let mode_changed = cache.mode != mode;
+    if cache.width != width || mode_changed {
         cache.width = width;
         cache.mode = mode;
         cache.entries.clear();
     }
     cache.entries.resize(entries.len(), None);
+    if !mode_changed && cache.collapse.len() == entries.len() {
+        return;
+    }
     let collapse = entry_collapse_states(entries, mode);
     for (index, state) in collapse.iter().enumerate() {
         if cache.collapse.get(index) != Some(state) {
@@ -685,6 +689,12 @@ fn prepare_render_cache(
 
 fn is_completed_tool(entry: &ChatEntry) -> bool {
     entry.role == ChatRole::Tool && entry.tool_status == Some(ToolStatus::Completed)
+}
+
+fn collapse_revision_fingerprint(entries: &[ChatEntry]) -> u64 {
+    entries.iter().fold(0u64, |accumulated, entry| {
+        accumulated.wrapping_mul(31).wrapping_add(entry.revision)
+    })
 }
 
 /// The newest completed tool keeps its full detail until a later user request,
@@ -765,9 +775,7 @@ fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> V
             // A member's update does not bump the head's revision, so fold the
             // streak's revisions into the head's state: its cached rows then
             // drop whenever any member changes.
-            let fingerprint = members.iter().fold(0u64, |accumulated, entry| {
-                accumulated.wrapping_mul(31).wrapping_add(entry.revision)
-            });
+            let fingerprint = collapse_revision_fingerprint(members);
             states[start] = EntryCollapse::Summary { end, fingerprint };
             // Omitted members render nothing either way, so one state covers
             // everything the head speaks for.
@@ -845,18 +853,32 @@ fn cached_entry_lines<'cache>(
     index: usize,
 ) -> &'cache [Line<'static>] {
     let entry = &entries[index];
-    let stale = cache.entries[index]
-        .as_ref()
-        .is_none_or(|cached| cached.revision != entry.revision);
+    let collapse = cache.collapse[index];
+    let stale_summary_fingerprint = match collapse {
+        EntryCollapse::Summary { end, fingerprint } => {
+            collapse_revision_fingerprint(&entries[index..end]) != fingerprint
+        }
+        _ => false,
+    };
+    let stale = stale_summary_fingerprint
+        || cache.entries[index]
+            .as_ref()
+            .is_none_or(|cached| cached.revision != entry.revision);
     if stale {
         let width = usize::from(cache.width);
-        let lines = match cache.collapse[index] {
+        let lines = match collapse {
             EntryCollapse::None => render_transcript_entry(entry, width, cache.mode),
             EntryCollapse::Hidden | EntryCollapse::Omitted => Vec::new(),
             EntryCollapse::Summary { end, .. } => {
                 collapsed_streak_lines(&entries[index..end], width, cache.mode)
             }
         };
+        if let EntryCollapse::Summary { end, .. } = collapse {
+            cache.collapse[index] = EntryCollapse::Summary {
+                end,
+                fingerprint: collapse_revision_fingerprint(&entries[index..end]),
+            };
+        }
         cache.entries[index] = Some(CachedEntry {
             revision: entry.revision,
             lines,
@@ -1624,7 +1646,7 @@ pub(super) fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'st
 fn empty_transcript_row(loading: bool) -> Line<'static> {
     Line::from(Span::styled(
         if loading {
-            "[Loading]"
+            "Loading…"
         } else {
             "No messages yet — send a prompt to begin."
         },

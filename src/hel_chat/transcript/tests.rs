@@ -5,10 +5,19 @@ use crate::hel_chat::test_support::{
     transcript_text,
 };
 use crate::hel_worker::{SequencedEvent, WorkerEvent};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 fn completed_tool(seq: u64, title: &str) -> ChatEntry {
     ChatEntry::tool(seq, title, None, ToolStatus::Completed)
+}
+
+fn wheel(kind: MouseEventKind) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    }
 }
 
 #[test]
@@ -16,13 +25,33 @@ fn an_empty_conversation_identifies_initial_relay_loading() {
     let mut chat = ChatState::new(&snapshot(), &[]);
     chat.set_transcript_loading(true);
 
-    assert_eq!(transcript_text(&mut chat, 80), ["[Loading]"]);
+    assert_eq!(transcript_text(&mut chat, 80), ["Loading…"]);
 
     chat.set_transcript_loading(false);
     assert_eq!(
         transcript_text(&mut chat, 80),
         ["No messages yet — send a prompt to begin."]
     );
+}
+
+#[test]
+fn captured_mouse_wheel_scrolls_history_and_returns_to_following() {
+    let mut chat = ChatState::new(&snapshot(), &[]);
+    chat.entries.extend(
+        (0..40)
+            .map(|index| ChatEntry::plain(index + 1, ChatRole::User, format!("message {index}"))),
+    );
+    let tail = drawn_transcript(&mut chat, 40, 24);
+    assert!(tail.iter().any(|line| line.contains("message 39")));
+
+    chat.handle_mouse(wheel(MouseEventKind::ScrollUp));
+    let scrolled = drawn_transcript(&mut chat, 40, 24);
+    assert!(!scrolled.iter().any(|line| line.contains("message 39")));
+
+    chat.handle_mouse(wheel(MouseEventKind::ScrollDown));
+    let followed = drawn_transcript(&mut chat, 40, 24);
+    assert!(followed.iter().any(|line| line.contains("message 39")));
+    assert!(!followed.iter().any(|line| line.contains("End to follow")));
 }
 
 #[test]

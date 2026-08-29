@@ -505,12 +505,14 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
             // Keep the transcript readable rather than tearing the dashboard
             // down around a stopped manager.
             tracing::warn!(error = format!("{error:#}"), "chat session view failed");
-            state.set_transcript_loading(false);
             state.set_notice(format!("connection lost: {error:#}"));
             return false;
         }
     };
-    if view.snapshot.is_some() || view.error.is_some() {
+    // A transient connection error does not make an as-yet-unavailable
+    // transcript empty. The actor keeps retrying, so retain the loading row
+    // until a real projection arrives; the error still appears in the notice.
+    if view.snapshot.is_some() {
         state.set_transcript_loading(false);
     }
     if let Some(snapshot) = view.snapshot {
@@ -584,7 +586,9 @@ pub struct ActiveChat {
     remote_open: bool,
     session_open: bool,
     session_reconnect_in_flight: bool,
-    session_reconnected: bool,
+    /// Preserve the stronger reconnect result when the initial sync, which
+    /// independently reacquires the same actor, finishes just afterwards.
+    reconnect_notice_pending_sync: bool,
 }
 
 impl ActiveChat {
@@ -721,7 +725,7 @@ impl ActiveChat {
             remote_open: true,
             session_open: true,
             session_reconnect_in_flight: false,
-            session_reconnected: false,
+            reconnect_notice_pending_sync: false,
         }
     }
 
@@ -816,16 +820,6 @@ impl ActiveChat {
         }
     }
 
-    fn apply_remote_result(&mut self, result: ChatRemoteResult) {
-        if self.session_reconnected && matches!(&result, ChatRemoteResult::Sync(Ok(()))) {
-            // The initial sync and the session-feed replacement run independently.
-            // A late sync completion must not overwrite the newer handoff notice.
-            self.state.set_transcript_loading(false);
-            return;
-        }
-        apply_chat_remote_result(&mut self.state, result);
-    }
-
     fn apply_io_update(&mut self, update: ChatIoUpdate) {
         let update = match update {
             ChatIoUpdate::SessionReconnected(result) => {
@@ -899,6 +893,18 @@ impl ActiveChat {
         );
     }
 
+    fn apply_remote_result(&mut self, result: ChatRemoteResult) {
+        let sync_succeeded = matches!(&result, ChatRemoteResult::Sync(Ok(())));
+        let sync_finished = matches!(&result, ChatRemoteResult::Sync(_));
+        apply_chat_remote_result(&mut self.state, result);
+        if sync_finished {
+            if sync_succeeded && self.reconnect_notice_pending_sync {
+                self.state.set_notice("Reconnected to session relay");
+            }
+            self.reconnect_notice_pending_sync = false;
+        }
+    }
+
     fn begin_session_reconnect(&mut self) {
         if self.session_reconnect_in_flight {
             return;
@@ -933,7 +939,7 @@ impl ActiveChat {
                 self.session = session;
                 self.session_open = apply_session_view(&mut self.state, Ok(view));
                 if self.session_open {
-                    self.session_reconnected = true;
+                    self.reconnect_notice_pending_sync = true;
                     self.state.set_notice("Reconnected to session relay");
                 } else {
                     self.begin_session_reconnect();
@@ -953,7 +959,8 @@ impl ActiveChat {
                 self.state.handle_paste(&pasted);
                 ChatAction::None
             }
-            // Resize, focus, and mouse changes only need the redraw.
+            Event::Mouse(mouse) => self.state.handle_mouse(mouse),
+            // Resize and focus changes only need the redraw.
             _ => ChatAction::None,
         };
         let outcome = self.dispatch(action);
@@ -1719,12 +1726,36 @@ mod tests {
     }
 
     #[test]
+    fn a_transient_error_before_the_first_snapshot_keeps_the_loading_row() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
+        let view = ManagedSessionView {
+            snapshot: None,
+            connected: false,
+            error: Some(ViewError::Unreachable("database is busy".into())),
+        };
+
+        assert!(apply_session_view(&mut chat, Ok(view)));
+        assert!(chat.transcript_loading);
+        assert_eq!(
+            chat.notice().as_deref(),
+            Some("connection lost: database is busy")
+        );
+        assert_eq!(
+            super::super::test_support::transcript_text(&mut chat, 80),
+            ["Loading…"]
+        );
+    }
+
+    #[test]
     fn a_stopped_session_manager_retires_its_feed_and_says_so() {
         let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
 
         let open = apply_session_view(&mut chat, Err(anyhow::anyhow!("session manager stopped")));
 
         assert!(!open);
+        assert!(chat.transcript_loading);
         assert_eq!(
             chat.notice().as_deref(),
             Some("connection lost: session manager stopped")
