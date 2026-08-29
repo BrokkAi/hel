@@ -30,6 +30,7 @@ pub mod hel_quota;
 pub mod hel_readline;
 pub mod hel_recovery;
 pub mod hel_resources;
+pub mod hel_selection;
 pub mod hel_server;
 pub mod hel_session_manager;
 pub mod hel_setup;
