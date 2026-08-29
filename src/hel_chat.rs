@@ -71,9 +71,9 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 
 pub use active::ActiveChat;
 pub use transcript::{
-    BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, materialized_chunks_text,
-    materialized_content_text, materialized_tool_diffstats, render_agent_message_head,
-    render_agent_message_tail,
+    BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, format_event_time,
+    materialized_chunks_text, materialized_content_text, materialized_tool_diffstats,
+    render_agent_message_head, render_agent_message_tail,
 };
 
 /// What one terminal event asked the chat to do.
