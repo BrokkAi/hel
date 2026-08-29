@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
@@ -768,6 +768,23 @@ fn native_project_target(project_directory: &str) -> String {
             || LOCAL_ORIGIN.to_owned(),
             |project| format!("{LOCAL_ORIGIN}/{}", project.to_string_lossy()),
         )
+}
+
+pub(crate) fn resume_sessions_pane(area: Rect) -> Rect {
+    let popup = centered_rect(84, 24, area);
+    let inner = popup.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(4),
+        ])
+        .split(inner)[2]
 }
 
 pub(crate) fn render_resume_dialog(

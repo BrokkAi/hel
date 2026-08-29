@@ -27,7 +27,10 @@ use agent_client_protocol::schema::v1::{
     PlanEntryStatus, SessionConfigOption, SessionModeState, SessionUpdate, TextContent, ToolCall,
     ToolCallContent, ToolCallStatus,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;
 use sha2::{Digest, Sha256};
 
@@ -313,6 +316,13 @@ pub struct ChatState {
     last_acp_activity_at_ms: Option<u64>,
     other_sessions: Vec<OtherSessionActivity>,
     focus: ChatFocus,
+    /// Where the conversations pane's window starts. `None` centres it on the
+    /// current session; the wheel pins it somewhere else until the keyboard
+    /// moves through the list again.
+    conversations_window_start: Option<usize>,
+    /// The pane's hitbox, recorded each frame so the wheel knows what it is
+    /// over. `None` before the first draw.
+    conversations_area: Option<Rect>,
 }
 
 impl ChatState {
@@ -373,6 +383,8 @@ impl ChatState {
             last_acp_activity_at_ms: None,
             other_sessions: Vec::new(),
             focus: ChatFocus::Prompt,
+            conversations_window_start: None,
+            conversations_area: None,
         };
         state.apply_events(events);
         // Bootstrap replays the full canonical log for transcript projection,
@@ -1017,6 +1029,7 @@ impl ChatState {
         self.notices.clear();
         self.voice_active = false;
         self.focus = ChatFocus::Prompt;
+        self.conversations_window_start = None;
     }
 
     fn set_input(&mut self, input: String) {
@@ -1512,14 +1525,26 @@ impl ChatState {
         });
     }
 
-    /// Mouse capture is enabled only for the conversation surface, so every
-    /// wheel event delivered here belongs to the transcript. This bypasses
-    /// terminal-emulator scrollback, which redraws full-screen TUI frames and
-    /// becomes unusably slow for long sessions.
+    /// Capture is on for every surface, so the app owns the wheel: terminal
+    /// scrollback repaints whole TUI frames and is unusably slow on long
+    /// sessions.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChatAction {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_history_up(MOUSE_SCROLL_ROWS),
-            MouseEventKind::ScrollDown => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+        if let Some(dialog) = self.elicitation.as_mut() {
+            dialog.handle_mouse(mouse);
+            return ChatAction::None;
+        }
+        // Hover decides what scrolls; only Tab moves focus.
+        let over_conversations = self
+            .conversations_area
+            .is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)));
+        match (mouse.kind, over_conversations) {
+            (MouseEventKind::ScrollUp, true) => self.scroll_conversations(-1),
+            (MouseEventKind::ScrollDown, true) => self.scroll_conversations(1),
+            (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
+            (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+            (MouseEventKind::Down(MouseButton::Left), true) => {
+                return self.click_conversation_row(mouse);
+            }
             _ => {}
         }
         ChatAction::None

@@ -16,6 +16,34 @@ use std::{
 const READY_MARKER: &[u8] = b"Active";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The DECSET pair crossterm 0.29 writes for `EnableMouseCapture` and
+/// `DisableMouseCapture`. Both are single writes, so any one sequence stands
+/// for the whole switch.
+const MOUSE_CAPTURE_ENABLE: [&str; 5] = [
+    "\x1b[?1000h",
+    "\x1b[?1002h",
+    "\x1b[?1003h",
+    "\x1b[?1015h",
+    "\x1b[?1006h",
+];
+const MOUSE_CAPTURE_DISABLE: [&str; 5] = [
+    "\x1b[?1006l",
+    "\x1b[?1015l",
+    "\x1b[?1003l",
+    "\x1b[?1002l",
+    "\x1b[?1000l",
+];
+
+/// The last offset at which any of `sequences` appears, so ordering against
+/// the alternate-screen leave does not depend on which one the write ended on.
+fn last_index(output: &str, sequences: [&str; 5]) -> usize {
+    sequences
+        .iter()
+        .filter_map(|sequence| output.rfind(sequence))
+        .max()
+        .unwrap_or_else(|| panic!("missing mouse capture disable: {output:?}"))
+}
+
 struct ReapChild(Option<Child>);
 
 impl ReapChild {
@@ -291,32 +319,22 @@ fn sigterm_restores_real_pty_terminal() {
         output.contains("\x1b[?1049l"),
         "missing alternate-screen leave: {output:?}"
     );
-    assert!(
-        output.contains("\x1b[?1007h"),
-        "missing alternate-scroll enable: {output:?}"
-    );
-    let disable_alternate_scroll = output
-        .rfind("\x1b[?1007l")
-        .unwrap_or_else(|| panic!("missing alternate-scroll disable: {output:?}"));
+    // Mouse capture is unconditional, and crossterm 0.29 turns it on with
+    // button, drag, and SGR tracking in one write.
+    for sequence in MOUSE_CAPTURE_ENABLE {
+        assert!(
+            output.contains(sequence),
+            "missing mouse capture enable {sequence:?}: {output:?}"
+        );
+    }
+    let disable_mouse_capture = last_index(&output, MOUSE_CAPTURE_DISABLE);
     let leave_screen = output
         .rfind("\x1b[?1049l")
         .unwrap_or_else(|| panic!("missing alternate-screen leave: {output:?}"));
     assert!(
-        disable_alternate_scroll < leave_screen,
-        "alternate scroll was disabled after leaving the alternate screen: {output:?}"
+        disable_mouse_capture < leave_screen,
+        "mouse capture was disabled after leaving the alternate screen: {output:?}"
     );
-    for sequence in [
-        "\x1b[?1000h",
-        "\x1b[?1002h",
-        "\x1b[?1003h",
-        "\x1b[?1006h",
-        "\x1b[?1015h",
-    ] {
-        assert!(
-            !output.contains(sequence),
-            "mouse capture was enabled with {sequence:?}: {output:?}"
-        );
-    }
     assert!(
         output.contains("\x1b[?25h"),
         "missing cursor restoration: {output:?}"
@@ -372,12 +390,10 @@ fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
     let leave_screen = output
         .rfind("\x1b[?1049l")
         .unwrap_or_else(|| panic!("missing alternate-screen leave: {output:?}"));
-    let disable_alternate_scroll = output
-        .rfind("\x1b[?1007l")
-        .unwrap_or_else(|| panic!("missing alternate-scroll disable: {output:?}"));
+    let disable_mouse_capture = last_index(&output, MOUSE_CAPTURE_DISABLE);
     assert!(
-        disable_alternate_scroll < leave_screen,
-        "alternate scroll was disabled after leaving the alternate screen: {output:?}"
+        disable_mouse_capture < leave_screen,
+        "mouse capture was disabled after leaving the alternate screen: {output:?}"
     );
     let message = output
         .find(REATTACH_MESSAGE)

@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use crate::hel_state::{QueuedCommandKind, TranscriptBody, TranscriptItem};
@@ -37,6 +38,27 @@ pub(super) fn key(code: KeyCode) -> KeyEvent {
 
 pub(super) fn ctrl(character: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+}
+
+/// A wheel event over `area`, which is what decides where it scrolls.
+/// Like `mouse_in`, but clicks a specific row within `area` instead of
+/// always the top row, so tests can target a particular session line.
+pub(super) fn mouse_at_row(kind: MouseEventKind, area: Rect, row_offset: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: area.x.saturating_add(1),
+        row: area.y.saturating_add(row_offset),
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+pub(super) fn mouse_in(kind: MouseEventKind, area: Rect) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: area.x.saturating_add(1),
+        row: area.y.saturating_add(1),
+        modifiers: KeyModifiers::NONE,
+    }
 }
 
 pub(super) fn queued(id: &str, text: &str) -> QueuedPrompt {
