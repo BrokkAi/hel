@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,10 @@ use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected, RelayTransportDead};
 
 const SESSION_SYNC_INTERVAL: Duration = Duration::from_millis(150);
+/// Release SQLite's single writer between bounded pieces of a large relay
+/// catch-up. One transport page can contain thousands of terminal events and
+/// must not prevent every other session actor from publishing its view.
+const PROJECTION_TRANSACTION_EVENT_BUDGET: usize = 128;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// Ceiling for reconnect backoff. A worker that exited stays gone until the
 /// user acts, so retrying it every second only burns process spawns.
@@ -1932,18 +1936,26 @@ impl StandaloneSession {
         self.client.install_prompt_context(text).await
     }
 
-    /// Apply one relay page. The whole page commits in a single projection
-    /// transaction, so a failure part-way leaves both the durable and the
-    /// in-memory projection at the previous frontier and the relay redelivers
-    /// the page. Catch-up advances the relay GC watermark after its last page.
+    /// Apply one relay transport page in bounded durable chunks. A transport
+    /// page can contain thousands of events, but SQLite has one global writer;
+    /// regularly releasing it lets other session actors keep their views
+    /// current. The relay GC watermark advances only after the complete page.
     async fn apply_event_page(&mut self, page: RelayEventPage) -> Result<RelayCursor> {
-        if !page.events.is_empty() {
+        let RelayEventPage {
+            events,
+            through_ordinal,
+            through_digest,
+        } = page;
+        let event_count = events.len();
+        let transaction_count = event_count.div_ceil(PROJECTION_TRANSACTION_EVENT_BUDGET);
+        let started = Instant::now();
+        for events in events.chunks(PROJECTION_TRANSACTION_EVENT_BUDGET) {
             let session_id = self.materialized.session_id.clone();
-            let events = page.events;
+            let events = events.to_vec();
             let projection = self.materialized.clone();
             // Projection is CPU work and its durable page uses synchronous
             // SQLite. Keep both off the async actor runtime so independent
-            // sessions stay responsive during a large catch-up.
+            // sessions stay responsive during each bounded catch-up chunk.
             let (projection, credential_sync_signal) = tokio::task::spawn_blocking(
                 move || -> Result<(MaterializedSession, Option<CredentialSyncSignal>)> {
                     // The in-memory projection advances on a working copy and
@@ -2004,14 +2016,23 @@ impl StandaloneSession {
                 self.latest_credential_sync_signal = Some(signal);
             }
         }
+        if transaction_count > 1 {
+            tracing::debug!(
+                session_id = self.materialized.session_id,
+                event_count,
+                transaction_count,
+                elapsed_ms = started.elapsed().as_millis(),
+                "applied a large relay page in bounded projection transactions"
+            );
+        }
         let delivered_through = self.materialized.applied_event_ordinal;
         ensure!(
-            delivered_through == page.through_ordinal,
+            delivered_through == through_ordinal,
             "relay page claimed frontier {} but delivered through {delivered_through}",
-            page.through_ordinal
+            through_ordinal
         );
         ensure!(
-            self.materialized.applied_event_digest == page.through_digest,
+            self.materialized.applied_event_digest == through_digest,
             "relay page digest does not match its claimed frontier"
         );
         Ok(RelayCursor {
