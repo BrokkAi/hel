@@ -498,14 +498,25 @@ impl DashboardState {
         kind: SessionOperationKind,
         placeholder: Option<SessionRecord>,
     ) {
+        let started_at_epoch_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.begin_session_operation_at(session_id, kind, placeholder, started_at_epoch_seconds);
+    }
+
+    pub fn begin_session_operation_at(
+        &mut self,
+        session_id: String,
+        kind: SessionOperationKind,
+        placeholder: Option<SessionRecord>,
+        started_at_epoch_seconds: u64,
+    ) {
         self.session_operations.insert(
             session_id,
             SessionOperationDisplay {
                 kind,
-                started_at_epoch_seconds: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                started_at_epoch_seconds,
                 placeholder,
                 active_stages: BTreeMap::new(),
                 resume_destination: None,
@@ -514,6 +525,16 @@ impl DashboardState {
         self.apply_operation_projection();
         self.rebuild_resume_rows();
         self.clamp_selections();
+    }
+
+    pub fn replace_session_operation_stages(
+        &mut self,
+        session_id: &str,
+        stages: impl IntoIterator<Item = (ProvisionStage, u64)>,
+    ) {
+        if let Some(operation) = self.session_operations.get_mut(session_id) {
+            operation.active_stages = stages.into_iter().collect();
+        }
     }
 
     /// Record the profile/target a resume is moving `session_id` to, so its
@@ -1489,6 +1510,29 @@ mod tests {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         dashboard.set_session_operation_stage("missing", ProvisionStage::Booting, true);
         assert!(dashboard.session_operations.is_empty());
+    }
+
+    #[test]
+    fn daemon_operation_snapshot_preserves_remote_clocks_and_stages() {
+        let mut dashboard = dashboard_with_session(stopped_session());
+        dashboard.begin_session_operation_at(
+            "session-1".into(),
+            SessionOperationKind::Resuming,
+            None,
+            123,
+        );
+        dashboard.replace_session_operation_stages(
+            "session-1",
+            [
+                (ProvisionStage::Cloning, 456),
+                (ProvisionStage::Syncing, 789),
+            ],
+        );
+
+        let operation = &dashboard.session_operations["session-1"];
+        assert_eq!(operation.started_at_epoch_seconds, 123);
+        assert_eq!(operation.active_stages[&ProvisionStage::Cloning], 456);
+        assert_eq!(operation.active_stages[&ProvisionStage::Syncing], 789);
     }
 
     #[test]

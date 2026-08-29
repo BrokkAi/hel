@@ -413,21 +413,19 @@ pub(crate) async fn apply_dashboard_action(
         DashboardAction::CancelOperation { session_id } => {
             if let Some(operation) = context.lifecycle_operations.get(&session_id) {
                 operation.cancelled.store(true, Ordering::Release);
-                if operation.kind != SessionOperationKind::Launching {
-                    let daemon_session_id = session_id.clone();
-                    tokio::spawn(async move {
-                        let result = async {
-                            daemon::connect_or_start()
-                                .await?
-                                .cancel_lifecycle(daemon_session_id)
-                                .await
-                        }
-                        .await;
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "could not cancel daemon lifecycle operation");
-                        }
-                    });
-                }
+                let daemon_session_id = session_id.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        daemon::connect_or_start()
+                            .await?
+                            .cancel_lifecycle(daemon_session_id)
+                            .await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "could not cancel daemon lifecycle operation");
+                    }
+                });
                 context.dashboard.set_notice(format!(
                     "Cancelling {} for {}…",
                     operation.kind.label().to_ascii_lowercase(),

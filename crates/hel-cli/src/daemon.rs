@@ -7,12 +7,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hel::hel_config::{HelConfig, data_dir};
 use hel::hel_controller::{
-    Controller, ControllerStoreGuard, ResumeRepositorySourceReceipt, SessionResumeOptions,
+    Controller, ControllerStoreGuard, ResumeRepositorySourceReceipt, SessionLaunchOptions,
+    SessionResumeOptions,
 };
 use hel::hel_credentials::CredentialSyncSignal;
 use hel::hel_elicitation::ElicitationResponse;
@@ -21,10 +22,13 @@ use hel::hel_session_manager::{
     SessionManagerControl, ViewError, spawn_remote_session_manager, spawn_session_manager,
 };
 use hel::hel_state::{
-    MaterializedSession, RecoveryObservation, RecoveryObserver, SessionResourceAllocation,
-    SessionState,
+    HostContainerSize, MaterializedSession, RecoveryObservation, RecoveryObserver, SessionRecord,
+    SessionResourceAllocation, SessionState,
 };
-use hel::hel_targets::{AdditionalMount, CancellableProcessExecutor};
+use hel::hel_targets::{
+    AdditionalMount, CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec,
+    ProvisionStage, ProvisionStageGuard,
+};
 use hel::hel_worker::{RelayCommand, RelayOperationalState};
 use hel::hel_workspace::WorkspaceRecord;
 use serde::{Deserialize, Serialize};
@@ -125,6 +129,28 @@ impl RuntimeSessionView {
 pub(crate) struct RuntimeSnapshot {
     pub revision: u64,
     pub sessions: Vec<RuntimeSessionView>,
+    pub lifecycles: Vec<RuntimeLifecycleView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeLifecycleKind {
+    Create,
+    Close,
+    Resume,
+    ForceStop,
+    DestroyStopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeLifecycleView {
+    pub session_id: String,
+    pub kind: RuntimeLifecycleKind,
+    pub started_at_epoch_seconds: u64,
+    pub active_stages: Vec<(ProvisionStage, u64)>,
+    pub resume_destination: Option<(String, String)>,
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +163,28 @@ pub(crate) struct ResumeSessionRequest {
     pub resource_allocation: Option<SessionResourceAllocation>,
     pub discard_queue: bool,
     pub repository_preflight: Option<ResumeRepositorySourceReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateSessionRequest {
+    pub workspace_id: String,
+    pub profile_id: String,
+    pub bundle_id: String,
+    pub project_directory: Option<PathBuf>,
+    pub target_template_id: String,
+    pub additional_mounts: Vec<AdditionalMount>,
+    pub allow_dirty_local: bool,
+    pub resource_allocation: Option<SessionResourceAllocation>,
+    pub title: String,
+    pub session_title_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RegisteredSession {
+    pub session: SessionRecord,
+    pub remembered_container_size: Option<(String, HostContainerSize)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +244,10 @@ enum DaemonAction {
     CloseSession {
         session_id: String,
     },
+    StartCreateSession(CreateSessionRequest),
+    WaitCreateSession {
+        session_id: String,
+    },
     ResumeSession(ResumeSessionRequest),
     ForceStopSession {
         session_id: String,
@@ -239,6 +291,7 @@ enum DaemonReply {
     Snapshot(WorkspaceSnapshot),
     RuntimeSnapshot(RuntimeSnapshot),
     MaterializedSession(MaterializedSession),
+    RegisteredSession(Box<RegisteredSession>),
     Ordinal(u64),
     Done,
 }
@@ -274,6 +327,7 @@ pub(crate) struct RuntimeState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleKind {
+    Create,
     Close,
     Resume,
     ForceStop,
@@ -283,6 +337,10 @@ enum LifecycleKind {
 struct ActiveLifecycle {
     kind: LifecycleKind,
     cancelled: Arc<AtomicBool>,
+    started_at_epoch_seconds: u64,
+    active_stages: BTreeMap<ProvisionStage, (usize, u64)>,
+    resume_destination: Option<(String, String)>,
+    notice: Option<String>,
     result:
         tokio::sync::watch::Receiver<Option<std::result::Result<DaemonLifecycleResult, String>>>,
 }
@@ -291,6 +349,18 @@ struct ActiveLifecycle {
 enum DaemonLifecycleResult {
     Done,
     Materialized(Box<MaterializedSession>),
+}
+
+impl From<LifecycleKind> for RuntimeLifecycleKind {
+    fn from(kind: LifecycleKind) -> Self {
+        match kind {
+            LifecycleKind::Create => Self::Create,
+            LifecycleKind::Close => Self::Close,
+            LifecycleKind::Resume => Self::Resume,
+            LifecycleKind::ForceStop => Self::ForceStop,
+            LifecycleKind::DestroyStopped => Self::DestroyStopped,
+        }
+    }
 }
 
 impl RuntimeState {
@@ -392,25 +462,58 @@ impl RuntimeState {
             .filter(|(session_id, _)| session_ids.contains(*session_id))
             .map(|(_, view)| view.clone())
             .collect();
-        Ok(RuntimeSnapshot { revision, sessions })
+        let lifecycles = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(session_id, active)| {
+                session_ids.contains(*session_id) && active.result.borrow().is_none()
+            })
+            .map(|(session_id, active)| RuntimeLifecycleView {
+                session_id: session_id.clone(),
+                kind: active.kind.into(),
+                started_at_epoch_seconds: active.started_at_epoch_seconds,
+                active_stages: active
+                    .active_stages
+                    .iter()
+                    .map(|(stage, (_, started_at))| (*stage, *started_at))
+                    .collect(),
+                resume_destination: active.resume_destination.clone(),
+                notice: active.notice.clone(),
+            })
+            .collect();
+        Ok(RuntimeSnapshot {
+            revision,
+            sessions,
+            lifecycles,
+        })
     }
 
-    async fn run_lifecycle<F, Fut>(
+    fn start_or_join_lifecycle<F, Fut>(
         self: &Arc<Self>,
         session_id: String,
         kind: LifecycleKind,
         work: F,
-    ) -> Result<DaemonLifecycleResult>
+    ) -> Result<
+        tokio::sync::watch::Receiver<Option<std::result::Result<DaemonLifecycleResult, String>>>,
+    >
     where
         F: FnOnce(Arc<Self>, String, Arc<AtomicBool>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<DaemonLifecycleResult>> + Send + 'static,
     {
         let mut work = Some(work);
-        let mut result = {
+        let result = {
             let mut lifecycle = self
                 .lifecycle
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let completed_other_kind = lifecycle
+                .get(&session_id)
+                .is_some_and(|active| active.kind != kind && active.result.borrow().is_some());
+            if completed_other_kind {
+                lifecycle.remove(&session_id);
+            }
             if let Some(active) = lifecycle.get(&session_id) {
                 ensure!(
                     active.kind == kind,
@@ -425,9 +528,15 @@ impl RuntimeState {
                     ActiveLifecycle {
                         kind,
                         cancelled: cancelled.clone(),
+                        started_at_epoch_seconds: epoch_seconds(),
+                        active_stages: BTreeMap::new(),
+                        resume_destination: None,
+                        notice: None,
                         result: result_rx.clone(),
                     },
                 );
+                let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                self.revision_tx.send_replace(revision);
                 let state = Arc::clone(self);
                 let operation_session_id = session_id.clone();
                 let operation = work.take().expect("new lifecycle operation has work");
@@ -436,17 +545,20 @@ impl RuntimeState {
                         .await
                         .map_err(|error| format!("{error:#}"));
                     result_tx.send_replace(Some(result));
-                    state
-                        .lifecycle
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&operation_session_id);
-                    refresh_runtime_controller(&state).await;
+                    let revision = state.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                    state.revision_tx.send_replace(revision);
                 });
                 result_rx
             }
         };
+        Ok(result)
+    }
 
+    async fn wait_lifecycle_result(
+        mut result: tokio::sync::watch::Receiver<
+            Option<std::result::Result<DaemonLifecycleResult, String>>,
+        >,
+    ) -> Result<DaemonLifecycleResult> {
         loop {
             if let Some(result) = result.borrow_and_update().clone() {
                 return result.map_err(anyhow::Error::msg);
@@ -455,6 +567,130 @@ impl RuntimeState {
                 .changed()
                 .await
                 .context("daemon lifecycle operation stopped without a result")?;
+        }
+    }
+
+    async fn run_lifecycle<F, Fut>(
+        self: &Arc<Self>,
+        session_id: String,
+        kind: LifecycleKind,
+        work: F,
+    ) -> Result<DaemonLifecycleResult>
+    where
+        F: FnOnce(Arc<Self>, String, Arc<AtomicBool>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<DaemonLifecycleResult>> + Send + 'static,
+    {
+        let result = self.start_or_join_lifecycle(session_id, kind, work)?;
+        let channel = result.clone();
+        let outcome = Self::wait_lifecycle_result(result).await;
+        self.remove_completed_lifecycle(&channel);
+        outcome
+    }
+
+    fn remove_completed_lifecycle(
+        &self,
+        channel: &tokio::sync::watch::Receiver<
+            Option<std::result::Result<DaemonLifecycleResult, String>>,
+        >,
+    ) {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, active| {
+                !active.result.same_channel(channel) || active.result.borrow().is_none()
+            });
+    }
+
+    async fn start_create_session(
+        self: &Arc<Self>,
+        request: CreateSessionRequest,
+    ) -> Result<RegisteredSession> {
+        let registered = blocking(move || {
+            let mut controller = Controller::load()?;
+            let session_id = controller.register_session_with_resources(
+                &request.profile_id,
+                &request.bundle_id,
+                &request.target_template_id,
+                request.title,
+                SessionLaunchOptions {
+                    workspace_id: request.workspace_id,
+                    additional_mounts: request.additional_mounts,
+                    allow_dirty_local: request.allow_dirty_local,
+                    resource_allocation: request.resource_allocation,
+                    project_directory: request.project_directory,
+                    session_title_override: request.session_title_override,
+                },
+            )?;
+            let session = controller
+                .state
+                .sessions
+                .get(&session_id)
+                .expect("newly registered session exists")
+                .clone();
+            let remembered_container_size = controller
+                .config
+                .targets
+                .get(&request.target_template_id)
+                .and_then(hel::hel_config::container_size_host)
+                .and_then(|host| {
+                    controller
+                        .state
+                        .container_sizes
+                        .get(host)
+                        .copied()
+                        .map(|size| (host.to_owned(), size))
+                });
+            Ok(RegisteredSession {
+                session,
+                remembered_container_size,
+            })
+        })
+        .await?;
+        let session_id = registered.session.id.clone();
+        self.start_or_join_lifecycle(
+            session_id,
+            LifecycleKind::Create,
+            |state, session_id, cancelled| async move {
+                let mut controller = tokio::task::spawn_blocking(Controller::load)
+                    .await
+                    .context("load controller for daemon create task")??;
+                let executor = DaemonStageReportingExecutor::new(
+                    CancellableProcessExecutor::new(cancelled),
+                    state,
+                    session_id.clone(),
+                );
+                controller
+                    .provision_session_controlled(&session_id, &executor)
+                    .await?;
+                Ok(DaemonLifecycleResult::Done)
+            },
+        )?;
+        Ok(registered)
+    }
+
+    async fn wait_create_session(&self, session_id: &str) -> Result<()> {
+        let result = {
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let active = lifecycle
+                .get(session_id)
+                .with_context(|| format!("no create operation exists for session {session_id}"))?;
+            ensure!(
+                active.kind == LifecycleKind::Create,
+                "session {session_id} is no longer being created"
+            );
+            active.result.clone()
+        };
+        let channel = result.clone();
+        let outcome = Self::wait_lifecycle_result(result).await;
+        self.remove_completed_lifecycle(&channel);
+        match outcome? {
+            DaemonLifecycleResult::Done => Ok(()),
+            DaemonLifecycleResult::Materialized(_) => {
+                bail!("daemon create completed with an unexpected projection")
+            }
         }
     }
 
@@ -489,7 +725,11 @@ impl RuntimeState {
                 let mut controller = tokio::task::spawn_blocking(Controller::load)
                     .await
                     .context("load controller for daemon close task")??;
-                let executor = CancellableProcessExecutor::new(cancelled);
+                let executor = DaemonStageReportingExecutor::new(
+                    CancellableProcessExecutor::new(cancelled),
+                    state.clone(),
+                    session_id.clone(),
+                );
                 controller
                     .close_session_managed_controlled(
                         &session_id,
@@ -537,41 +777,55 @@ impl RuntimeState {
         if let Some(materialized) = already_running {
             return Ok(materialized);
         }
-        let result = self
-            .run_lifecycle(
-                session_id,
-                LifecycleKind::Resume,
-                move |state, session_id, cancelled| async move {
-                    let _recovery_reservation = tokio::task::spawn_blocking({
-                        let observer = state.recovery_observer.clone();
-                        let session_id = session_id.clone();
-                        let cancelled = cancelled.clone();
-                        move || reserve_recovery_or_cancel(&observer, &session_id, &cancelled)
-                    })
+        let profile_id = request.profile_id.clone();
+        let target_template_id = request.target_template_id.clone();
+        let operation_session_id = session_id.clone();
+        let result = self.start_or_join_lifecycle(
+            session_id,
+            LifecycleKind::Resume,
+            move |state, session_id, cancelled| async move {
+                let _recovery_reservation = tokio::task::spawn_blocking({
+                    let observer = state.recovery_observer.clone();
+                    let session_id = session_id.clone();
+                    let cancelled = cancelled.clone();
+                    move || reserve_recovery_or_cancel(&observer, &session_id, &cancelled)
+                })
+                .await
+                .context("reserve recovery for daemon resume task")??;
+                let mut controller = tokio::task::spawn_blocking(Controller::load)
                     .await
-                    .context("reserve recovery for daemon resume task")??;
-                    let mut controller = tokio::task::spawn_blocking(Controller::load)
-                        .await
-                        .context("load controller for daemon resume task")??;
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    let materialized = controller
-                        .resume_session_controlled_with_repository_preflight(
-                            &session_id,
-                            &request.profile_id,
-                            &request.target_template_id,
-                            SessionResumeOptions {
-                                additional_mounts: request.additional_mounts,
-                                resource_allocation: request.resource_allocation,
-                                discard_queue: request.discard_queue,
-                            },
-                            request.repository_preflight,
-                            &executor,
-                        )
-                        .await?;
-                    Ok(DaemonLifecycleResult::Materialized(Box::new(materialized)))
-                },
-            )
-            .await?;
+                    .context("load controller for daemon resume task")??;
+                let executor = DaemonStageReportingExecutor::new(
+                    CancellableProcessExecutor::new(cancelled),
+                    state.clone(),
+                    session_id.clone(),
+                );
+                let materialized = controller
+                    .resume_session_controlled_with_repository_preflight(
+                        &session_id,
+                        &request.profile_id,
+                        &request.target_template_id,
+                        SessionResumeOptions {
+                            additional_mounts: request.additional_mounts,
+                            resource_allocation: request.resource_allocation,
+                            discard_queue: request.discard_queue,
+                        },
+                        request.repository_preflight,
+                        &executor,
+                    )
+                    .await?;
+                Ok(DaemonLifecycleResult::Materialized(Box::new(materialized)))
+            },
+        )?;
+        self.set_lifecycle_resume_destination(
+            &operation_session_id,
+            profile_id,
+            target_template_id,
+        );
+        let channel = result.clone();
+        let result = Self::wait_lifecycle_result(result).await;
+        self.remove_completed_lifecycle(&channel);
+        let result = result?;
         match result {
             DaemonLifecycleResult::Materialized(materialized) => Ok(*materialized),
             DaemonLifecycleResult::Done => bail!("daemon resume completed without a projection"),
@@ -582,10 +836,14 @@ impl RuntimeState {
         self.run_lifecycle(
             session_id,
             LifecycleKind::ForceStop,
-            |_state, session_id, cancelled| async move {
+            |state, session_id, cancelled| async move {
                 blocking(move || {
                     let mut controller = Controller::load()?;
-                    let executor = CancellableProcessExecutor::new(cancelled);
+                    let executor = DaemonStageReportingExecutor::new(
+                        CancellableProcessExecutor::new(cancelled),
+                        state,
+                        session_id.clone(),
+                    );
                     controller.force_stop(&session_id, &executor)?;
                     Ok(DaemonLifecycleResult::Done)
                 })
@@ -608,10 +866,14 @@ impl RuntimeState {
         self.run_lifecycle(
             session_id,
             LifecycleKind::DestroyStopped,
-            |_state, session_id, cancelled| async move {
+            |state, session_id, cancelled| async move {
                 blocking(move || {
                     let mut controller = Controller::load()?;
-                    let executor = CancellableProcessExecutor::new(cancelled);
+                    let executor = DaemonStageReportingExecutor::new(
+                        CancellableProcessExecutor::new(cancelled),
+                        state,
+                        session_id.clone(),
+                    );
                     controller.destroy_session_controlled(&session_id, &executor)?;
                     Ok(DaemonLifecycleResult::Done)
                 })
@@ -644,6 +906,133 @@ impl RuntimeState {
             active.cancelled.store(true, Ordering::Release);
         }
     }
+
+    fn set_lifecycle_resume_destination(
+        &self,
+        session_id: &str,
+        profile_id: String,
+        target_id: String,
+    ) {
+        if let Some(active) = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(session_id)
+        {
+            active.resume_destination = Some((profile_id, target_id));
+            let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+            self.revision_tx.send_replace(revision);
+        }
+    }
+
+    fn change_lifecycle_stage(&self, session_id: &str, stage: ProvisionStage, active: bool) {
+        let changed = {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(operation) = lifecycle.get_mut(session_id) else {
+                return;
+            };
+            if active {
+                let entry = operation
+                    .active_stages
+                    .entry(stage)
+                    .or_insert_with(|| (0, epoch_seconds()));
+                entry.0 += 1;
+                entry.0 == 1
+            } else {
+                let Some((count, _)) = operation.active_stages.get_mut(&stage) else {
+                    return;
+                };
+                *count -= 1;
+                if *count == 0 {
+                    operation.active_stages.remove(&stage);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if changed {
+            let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+            self.revision_tx.send_replace(revision);
+        }
+    }
+
+    fn set_lifecycle_notice(&self, session_id: &str, notice: &str) {
+        if let Some(active) = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(session_id)
+        {
+            active.notice = Some(notice.to_owned());
+            let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+            self.revision_tx.send_replace(revision);
+        }
+    }
+}
+
+struct DaemonStageReportingExecutor<E> {
+    inner: E,
+    state: Arc<RuntimeState>,
+    session_id: String,
+}
+
+impl<E> DaemonStageReportingExecutor<E> {
+    fn new(inner: E, state: Arc<RuntimeState>, session_id: String) -> Self {
+        Self {
+            inner,
+            state,
+            session_id,
+        }
+    }
+}
+
+impl<E: CommandExecutor> CommandExecutor for DaemonStageReportingExecutor<E> {
+    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        let _stage = command
+            .stage
+            .map(|stage| ProvisionStageGuard::new(self, stage));
+        self.inner.execute(command)
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut (dyn std::io::Read + Send),
+    ) -> Result<CommandOutput> {
+        let _stage = command
+            .stage
+            .map(|stage| ProvisionStageGuard::new(self, stage));
+        self.inner.execute_with_stdin(command, input)
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.inner.cancellation_requested()
+    }
+
+    fn stage_started(&self, stage: ProvisionStage) {
+        self.state
+            .change_lifecycle_stage(&self.session_id, stage, true);
+    }
+
+    fn stage_finished(&self, stage: ProvisionStage) {
+        self.state
+            .change_lifecycle_stage(&self.session_id, stage, false);
+    }
+
+    fn notify_notice(&self, notice: &str) {
+        self.state.set_lifecycle_notice(&self.session_id, notice);
+    }
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -928,6 +1317,29 @@ impl DaemonClient {
         {
             DaemonReply::Done => Ok(()),
             reply => bail!("unexpected close-session reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn start_create_session(
+        &mut self,
+        request: CreateSessionRequest,
+    ) -> Result<RegisteredSession> {
+        match self
+            .request(DaemonAction::StartCreateSession(request))
+            .await?
+        {
+            DaemonReply::RegisteredSession(registered) => Ok(*registered),
+            reply => bail!("unexpected start-create reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn wait_create_session(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::WaitCreateSession { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected wait-create reply {reply:?}"),
         }
     }
 
@@ -1622,6 +2034,13 @@ async fn handle_action(
             state.close_session(session_id).await?;
             Ok(DaemonReply::Done)
         }
+        DaemonAction::StartCreateSession(request) => Ok(DaemonReply::RegisteredSession(Box::new(
+            state.start_create_session(request).await?,
+        ))),
+        DaemonAction::WaitCreateSession { session_id } => {
+            state.wait_create_session(&session_id).await?;
+            Ok(DaemonReply::Done)
+        }
         DaemonAction::ResumeSession(request) => Ok(DaemonReply::MaterializedSession(
             state.resume_session(request).await?,
         )),
@@ -1708,6 +2127,19 @@ fn session_state_label(state: SessionState) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_runtime_state() -> Arc<RuntimeState> {
+        let remote = spawn_remote_session_manager().unwrap();
+        let recovery = hel::hel_recovery::RecoveryCoordinator::spawn(remote.control.clone());
+        Arc::new(RuntimeState::new(
+            remote.control,
+            Controller {
+                config: HelConfig::default(),
+                state: hel::hel_state::HelState::default(),
+            },
+            recovery.observer(),
+        ))
+    }
+
     #[tokio::test]
     async fn framing_round_trips_payloads_larger_than_a_pipe_buffer() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -1742,16 +2174,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_rejects_a_request_with_the_wrong_owner_token() {
-        let remote = spawn_remote_session_manager().unwrap();
-        let recovery = hel::hel_recovery::RecoveryCoordinator::spawn(remote.control.clone());
-        let state = Arc::new(RuntimeState::new(
-            remote.control,
-            Controller {
-                config: HelConfig::default(),
-                state: hel::hel_state::HelState::default(),
-            },
-            recovery.observer(),
-        ));
+        let state = test_runtime_state();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let metadata = DaemonMetadata {
@@ -1786,5 +2209,109 @@ mod tests {
         assert_eq!(response.result.unwrap_err(), "daemon authentication failed");
         drop(stream);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn equivalent_lifecycle_requests_join_one_daemon_operation() {
+        let state = test_runtime_state();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first = state
+            .start_or_join_lifecycle("session-1".into(), LifecycleKind::Close, {
+                let starts = starts.clone();
+                let release = release.clone();
+                move |_state, _session_id, _cancelled| async move {
+                    starts.fetch_add(1, Ordering::AcqRel);
+                    release.notified().await;
+                    Ok(DaemonLifecycleResult::Done)
+                }
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        let second = state
+            .start_or_join_lifecycle(
+                "session-1".into(),
+                LifecycleKind::Close,
+                |_state, _session_id, _cancelled| async move {
+                    panic!("joined lifecycle request started duplicate work")
+                },
+            )
+            .unwrap();
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+        assert!(
+            state
+                .start_or_join_lifecycle(
+                    "session-1".into(),
+                    LifecycleKind::Resume,
+                    |_state, _session_id, _cancelled| async move {
+                        Ok(DaemonLifecycleResult::Done)
+                    },
+                )
+                .is_err()
+        );
+
+        // The daemon task is independent of either client waiter.
+        drop(first);
+        release.notify_one();
+        assert!(matches!(
+            RuntimeState::wait_lifecycle_result(second).await.unwrap(),
+            DaemonLifecycleResult::Done
+        ));
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn daemon_lifecycle_reports_balanced_concurrent_stages() {
+        struct UnusedExecutor;
+
+        impl CommandExecutor for UnusedExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                panic!("a stage notification must not run {}", command.program)
+            }
+        }
+
+        let state = test_runtime_state();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let result = state
+            .start_or_join_lifecycle("session-1".into(), LifecycleKind::Create, {
+                let release = release.clone();
+                move |_state, _session_id, _cancelled| async move {
+                    release.notified().await;
+                    Ok(DaemonLifecycleResult::Done)
+                }
+            })
+            .unwrap();
+        let executor =
+            DaemonStageReportingExecutor::new(UnusedExecutor, state.clone(), "session-1".into());
+        executor.stage_started(ProvisionStage::Cloning);
+        executor.stage_started(ProvisionStage::Cloning);
+        executor.stage_started(ProvisionStage::Syncing);
+        executor.stage_finished(ProvisionStage::Cloning);
+        {
+            let lifecycle = state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let stages = &lifecycle.get("session-1").unwrap().active_stages;
+            assert_eq!(stages.get(&ProvisionStage::Cloning).unwrap().0, 1);
+            assert_eq!(stages.get(&ProvisionStage::Syncing).unwrap().0, 1);
+        }
+        executor.stage_finished(ProvisionStage::Cloning);
+        executor.stage_finished(ProvisionStage::Syncing);
+        assert!(
+            state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get("session-1")
+                .unwrap()
+                .active_stages
+                .is_empty()
+        );
+        release.notify_one();
+        assert!(matches!(
+            RuntimeState::wait_lifecycle_result(result).await.unwrap(),
+            DaemonLifecycleResult::Done
+        ));
     }
 }

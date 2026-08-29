@@ -39,7 +39,7 @@ use hel::hel_targets::DeploymentCapacityTarget;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, PreparedMaterializedSessionDetail,
-    render, resume_profile_placeholders,
+    SessionOperationKind, render, resume_profile_placeholders,
 };
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -262,6 +262,8 @@ pub(crate) struct DashboardContext {
 
     worker_targets_tx: watch::Sender<Vec<WorkerPollTarget>>,
     worker: Feed<SessionManagerUpdates>,
+    runtime_lifecycles: Feed<watch::Receiver<Vec<crate::daemon::RuntimeLifecycleView>>>,
+    remote_lifecycle_sessions: BTreeSet<String>,
     pub(crate) worker_commands_tx: SessionManagerControl,
     worker_shutdown: Option<SessionManagerShutdown>,
     worker_diagnoses: WorkerDiagnosisTracker,
@@ -488,6 +490,10 @@ pub(crate) async fn run_dashboard_for_workspace(
             }
             update = context.worker.wait(), if context.worker.is_open() => {
                 let woke = context.worker.accept(update);
+                context.dirty |= woke;
+            }
+            update = context.runtime_lifecycles.wait(), if context.runtime_lifecycles.is_open() => {
+                let woke = context.runtime_lifecycles.accept(update);
                 context.dirty |= woke;
             }
             result = context.recovery.wait(), if context.recovery.is_open() => {
@@ -748,8 +754,12 @@ impl DashboardContext {
         }
 
         let (quota_profiles_tx, quota_updates_rx) = spawn_quota_refresher();
-        let (worker_targets_tx, worker_updates_rx, worker_commands_tx, worker_shutdown) =
-            spawn_remote_dashboard_worker_poller(workspace_id.to_owned())?;
+        let remote_worker = spawn_remote_dashboard_worker_poller(workspace_id.to_owned())?;
+        let worker_targets_tx = remote_worker.targets;
+        let worker_updates_rx = remote_worker.updates;
+        let worker_commands_tx = remote_worker.control;
+        let worker_shutdown = remote_worker.shutdown;
+        let runtime_lifecycles_rx = remote_worker.lifecycles;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
         let recovery = RecoveryCoordinator::spawn(worker_commands_tx.clone());
         let recovery_observer = recovery.observer();
@@ -806,6 +816,8 @@ impl DashboardContext {
             manual_quota_refresh_generation: None,
             worker_targets_tx,
             worker: Feed::new(worker_updates_rx),
+            runtime_lifecycles: Feed::new(runtime_lifecycles_rx),
+            remote_lifecycle_sessions: BTreeSet::new(),
             worker_commands_tx,
             worker_shutdown: Some(worker_shutdown),
             worker_diagnoses: WorkerDiagnosisTracker::default(),
@@ -1316,6 +1328,7 @@ impl DashboardContext {
     fn drain_feeds(&mut self) {
         self.drain_quota_updates();
         self.drain_worker_updates();
+        self.drain_runtime_lifecycles();
         schedule_due_credential_syncs(
             &mut self.credential_sync_signals,
             &self.credential_sync_handle,
@@ -1430,6 +1443,64 @@ impl DashboardContext {
                 );
             }
         }
+    }
+
+    fn drain_runtime_lifecycles(&mut self) {
+        let mut latest = None;
+        while let Some(lifecycles) = self.runtime_lifecycles.next_ready() {
+            latest = Some(lifecycles);
+        }
+        let Some(lifecycles) = latest else {
+            return;
+        };
+        let active = lifecycles
+            .iter()
+            .map(|lifecycle| lifecycle.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        for session_id in self
+            .remote_lifecycle_sessions
+            .difference(&active)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.dashboard.finish_session_operation(&session_id);
+            self.remote_lifecycle_sessions.remove(&session_id);
+        }
+        for lifecycle in lifecycles {
+            let kind = match lifecycle.kind {
+                crate::daemon::RuntimeLifecycleKind::Create => SessionOperationKind::Launching,
+                crate::daemon::RuntimeLifecycleKind::Close
+                | crate::daemon::RuntimeLifecycleKind::ForceStop => SessionOperationKind::Stopping,
+                crate::daemon::RuntimeLifecycleKind::Resume => SessionOperationKind::Resuming,
+                crate::daemon::RuntimeLifecycleKind::DestroyStopped => {
+                    SessionOperationKind::Destroying
+                }
+            };
+            if !self
+                .lifecycle_operations
+                .contains_key(&lifecycle.session_id)
+                && self
+                    .remote_lifecycle_sessions
+                    .insert(lifecycle.session_id.clone())
+            {
+                self.dashboard.begin_session_operation_at(
+                    lifecycle.session_id.clone(),
+                    kind,
+                    None,
+                    lifecycle.started_at_epoch_seconds,
+                );
+            }
+            self.dashboard
+                .replace_session_operation_stages(&lifecycle.session_id, lifecycle.active_stages);
+            if let Some((profile_id, target_id)) = lifecycle.resume_destination {
+                self.dashboard
+                    .set_resume_destination(&lifecycle.session_id, profile_id, target_id);
+            }
+            if let Some(notice) = lifecycle.notice {
+                self.dashboard.set_notice(notice);
+            }
+        }
+        self.controller_changed = true;
     }
 
     fn drain_recovery_results(&mut self) {

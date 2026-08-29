@@ -90,6 +90,22 @@ impl<T> FeedSource for tokio::sync::mpsc::UnboundedReceiver<T> {
     }
 }
 
+impl<T: Clone> FeedSource for tokio::sync::watch::Receiver<T> {
+    type Item = T;
+
+    async fn wait(&mut self) -> Option<T> {
+        self.changed().await.ok()?;
+        Some(self.borrow_and_update().clone())
+    }
+
+    fn poll_now(&mut self) -> Option<T> {
+        self.has_changed()
+            .ok()
+            .filter(|changed| *changed)
+            .map(|_| self.borrow_and_update().clone())
+    }
+}
+
 impl FeedSource for SessionManagerUpdates {
     type Item = SessionManagerUpdate;
 
@@ -1137,14 +1153,17 @@ async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput
     Ok(command_output)
 }
 
+pub(crate) struct RemoteDashboardWorkerPoller {
+    pub(crate) targets: tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
+    pub(crate) updates: SessionManagerUpdates,
+    pub(crate) control: SessionManagerControl,
+    pub(crate) shutdown: SessionManagerShutdown,
+    pub(crate) lifecycles: tokio::sync::watch::Receiver<Vec<daemon::RuntimeLifecycleView>>,
+}
+
 pub(crate) fn spawn_remote_dashboard_worker_poller(
     workspace_id: String,
-) -> Result<(
-    tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
-    SessionManagerUpdates,
-    SessionManagerControl,
-    SessionManagerShutdown,
-)> {
+) -> Result<RemoteDashboardWorkerPoller> {
     let channels = spawn_remote_session_manager()?;
     let hel::hel_session_manager::RemoteSessionManagerChannels {
         targets,
@@ -1154,6 +1173,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         publisher,
         mut requests,
     } = channels;
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::watch::channel(Vec::new());
     tokio::spawn(async move {
         let mut revision = 0_u64;
         let mut requests_open = true;
@@ -1170,6 +1190,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                     match snapshot {
                         Ok(snapshot) => {
                             revision = revision.max(snapshot.revision);
+                            lifecycle_tx.send_replace(snapshot.lifecycles);
                             for runtime in snapshot.sessions {
                                 let session_id = runtime.session_id.clone();
                                 let view = match runtime.operational {
@@ -1248,7 +1269,13 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
             }
         }
     });
-    Ok((targets, updates, control, shutdown))
+    Ok(RemoteDashboardWorkerPoller {
+        targets,
+        updates,
+        control,
+        shutdown,
+        lifecycles: lifecycle_rx,
+    })
 }
 
 async fn poll_daemon_runtime(

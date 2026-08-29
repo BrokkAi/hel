@@ -13,18 +13,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hel::hel_config::{HarnessKind, HelConfig, ProjectBundle, ProjectRepository};
+use hel::hel_controller::Controller;
 use hel::hel_controller::ResumeRepositorySourcePreflight;
-use hel::hel_controller::{Controller, SessionLaunchOptions};
 use hel::hel_import::{configured_bundle_for_local, configured_bundle_for_origin};
 use hel::hel_setup::github_repository_from_origin;
 use hel::hel_state::{
     HelState, MaterializedSession, ProjectSourceIdentity, RecoveryObserver, SessionRecord,
     SessionState,
 };
-use hel::hel_targets::{
-    CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec, ProvisionStage,
-    ProvisionStageGuard,
-};
+use hel::hel_targets::CancellableProcessExecutor;
 use hel_tui::{
     DashboardAction, PreparedMaterializedSessionDetail, PreparedMaterializedSessionSummary,
     SessionOperationKind,
@@ -32,6 +29,7 @@ use hel_tui::{
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
+use crate::daemon;
 use crate::dashboard::{CriticalOperationTracker, DashboardContext};
 use crate::import::{DashboardImportSuccess, PendingDashboardImport, persist_imported_session};
 use crate::pollers::{
@@ -129,16 +127,6 @@ pub(crate) enum DashboardIoUpdate {
     /// failure needs reporting: the notice for a successful copy is already
     /// on screen.
     ClipboardWritten(std::result::Result<(), String>),
-    LifecycleStage {
-        session_id: String,
-        stage: ProvisionStage,
-        active: bool,
-    },
-    /// Something a lifecycle operation decided on the user's behalf, such as
-    /// attaching a directory read-only because its filesystem cannot overlay.
-    LifecycleNotice {
-        notice: String,
-    },
     /// The set of native sessions the resume dialog hides, read from Hel's
     /// database.
     HiddenNativeSessions {
@@ -836,7 +824,7 @@ pub(crate) fn spawn_dashboard_create_session(
             return;
         };
         let registered = (|| -> Result<Option<RegisteredDashboardSession>> {
-            let mut controller = Controller::load()?;
+            let controller = Controller::load()?;
             if !allow_dirty_local && project_directory.is_none() {
                 let dirty = controller
                     .config
@@ -872,42 +860,26 @@ pub(crate) fn spawn_dashboard_create_session(
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| bundle_id.clone())
             );
-            let session_id = controller.register_session_with_resources(
-                &profile_id,
-                &bundle_id,
-                &target_template_id,
-                title,
-                SessionLaunchOptions {
-                    workspace_id: workspace_id.clone(),
-                    additional_mounts,
-                    allow_dirty_local,
-                    resource_allocation,
-                    project_directory,
-                    session_title_override: None,
-                },
-            )?;
-            let session = controller
-                .state
-                .sessions
-                .get(&session_id)
-                .expect("newly registered session exists")
-                .clone();
-            let remembered_container_size = controller
-                .config
-                .targets
-                .get(&target_template_id)
-                .and_then(hel::hel_config::container_size_host)
-                .and_then(|host| {
-                    controller
-                        .state
-                        .container_sizes
-                        .get(host)
-                        .copied()
-                        .map(|size| (host.to_owned(), size))
-                });
+            let registered = runtime.block_on(async {
+                daemon::connect_or_start()
+                    .await?
+                    .start_create_session(daemon::CreateSessionRequest {
+                        workspace_id: workspace_id.clone(),
+                        profile_id,
+                        bundle_id,
+                        project_directory,
+                        target_template_id,
+                        additional_mounts,
+                        allow_dirty_local,
+                        resource_allocation,
+                        title,
+                        session_title_override: None,
+                    })
+                    .await
+            })?;
             Ok(Some(RegisteredDashboardSession {
-                session,
-                remembered_container_size,
+                session: registered.session,
+                remembered_container_size: registered.remembered_container_size,
                 cancelled: cancelled.clone(),
             }))
         })();
@@ -925,129 +897,25 @@ pub(crate) fn spawn_dashboard_create_session(
             return;
         };
         let session_id = registered.session.id.clone();
-        let cancelled = registered.cancelled.clone();
         if let Err(error) = updates.send(DashboardIoUpdate::CreateSession(Box::new(
             DashboardCreateSessionUpdate::Registered(Box::new(registered)),
         ))) {
             tracing::debug!(%error, "registered session result dropped after dashboard shutdown");
-            cancelled.store(true, Ordering::Release);
         }
-        let result = (|| -> Result<()> {
-            let mut controller = Controller::load()?;
-            let executor = StageReportingExecutor::new(
-                CancellableProcessExecutor::new(cancelled),
-                session_id.clone(),
-                updates,
-            );
-            runtime.block_on(controller.provision_session_controlled(&session_id, &executor))
-        })()
-        .map(|()| LifecycleSuccess::Created)
-        .map_err(|error| format!("{error:#}"));
+        let result = runtime
+            .block_on(async {
+                daemon::connect_or_start()
+                    .await?
+                    .wait_create_session(session_id.clone())
+                    .await
+            })
+            .map(|()| LifecycleSuccess::Created)
+            .map_err(|error| format!("{error:#}"));
         if let Err(error) = lifecycle_updates.send(LifecycleUpdate { session_id, result }) {
             tracing::debug!(%error, "session creation lifecycle result dropped after dashboard shutdown");
         }
         drop(guard);
     });
-}
-
-/// Reports the launch stage of each command a lifecycle operation runs, so the
-/// session clock can name the work in flight.
-pub(crate) struct StageReportingExecutor<E: CommandExecutor> {
-    inner: E,
-    session_id: String,
-    updates: UnboundedSender<DashboardIoUpdate>,
-    active: std::sync::Mutex<BTreeMap<ProvisionStage, usize>>,
-}
-
-impl<E: CommandExecutor> StageReportingExecutor<E> {
-    pub(crate) fn new(
-        inner: E,
-        session_id: String,
-        updates: UnboundedSender<DashboardIoUpdate>,
-    ) -> Self {
-        Self {
-            inner,
-            session_id,
-            updates,
-            active: std::sync::Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    /// The single place stage activity reaches the dashboard. Counts keep a
-    /// stage active while concurrent commands or an enclosing controller
-    /// scope both name it.
-    fn change_stage(&self, stage: ProvisionStage, active: bool) {
-        let mut stages = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let publish = if active {
-            let count = stages.entry(stage).or_default();
-            *count += 1;
-            *count == 1
-        } else {
-            let Some(count) = stages.get_mut(&stage) else {
-                return;
-            };
-            *count -= 1;
-            if *count == 0 {
-                stages.remove(&stage);
-                true
-            } else {
-                false
-            }
-        };
-        if !publish {
-            return;
-        }
-        if let Err(error) = self.updates.send(DashboardIoUpdate::LifecycleStage {
-            session_id: self.session_id.clone(),
-            stage,
-            active,
-        }) {
-            tracing::debug!(%error, "lifecycle stage result dropped after dashboard shutdown");
-        }
-    }
-}
-
-impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
-    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
-        let _stage = command
-            .stage
-            .map(|stage| ProvisionStageGuard::new(self, stage));
-        self.inner.execute(command)
-    }
-
-    fn cancellation_requested(&self) -> bool {
-        self.inner.cancellation_requested()
-    }
-
-    fn stage_started(&self, stage: ProvisionStage) {
-        self.change_stage(stage, true);
-    }
-
-    fn stage_finished(&self, stage: ProvisionStage) {
-        self.change_stage(stage, false);
-    }
-
-    fn notify_notice(&self, notice: &str) {
-        if let Err(error) = self.updates.send(DashboardIoUpdate::LifecycleNotice {
-            notice: notice.to_owned(),
-        }) {
-            tracing::debug!(%error, "lifecycle notice dropped after dashboard shutdown");
-        }
-    }
-
-    fn execute_with_stdin(
-        &self,
-        command: &CommandSpec,
-        input: &mut (dyn std::io::Read + Send),
-    ) -> Result<CommandOutput> {
-        let _stage = command
-            .stage
-            .map(|stage| ProvisionStageGuard::new(self, stage));
-        self.inner.execute_with_stdin(command, input)
-    }
 }
 
 impl DashboardContext {
@@ -1115,15 +983,6 @@ impl DashboardContext {
                     }
                 }
             }
-            DashboardIoUpdate::LifecycleStage {
-                session_id,
-                stage,
-                active,
-            } => {
-                self.dashboard
-                    .set_session_operation_stage(&session_id, stage, active);
-            }
-            DashboardIoUpdate::LifecycleNotice { notice } => self.dashboard.set_notice(notice),
             DashboardIoUpdate::HiddenNativeSessions { result } => match result {
                 Ok(hidden) => self.dashboard.set_hidden_native_sessions(hidden),
                 Err(error) => self
@@ -1656,49 +1515,6 @@ fn quick_config_id(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Independent setup lanes must remain active until their own work ends.
-    #[test]
-    fn stage_activity_reports_overlapping_lanes_and_balances_nested_scopes() {
-        struct UnusedExecutor;
-
-        impl CommandExecutor for UnusedExecutor {
-            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
-                panic!("a stage notification must not run {}", command.program)
-            }
-        }
-
-        let (updates, mut reported) = tokio::sync::mpsc::unbounded_channel();
-        let executor = StageReportingExecutor::new(UnusedExecutor, "session-1".to_owned(), updates);
-
-        executor.stage_started(ProvisionStage::Cloning);
-        executor.stage_started(ProvisionStage::Cloning);
-        executor.stage_started(ProvisionStage::Syncing);
-        executor.stage_finished(ProvisionStage::Cloning);
-        executor.stage_finished(ProvisionStage::Cloning);
-        executor.stage_finished(ProvisionStage::Syncing);
-        drop(executor);
-
-        let stages = std::iter::from_fn(|| reported.try_recv().ok())
-            .map(|update| match update {
-                DashboardIoUpdate::LifecycleStage {
-                    session_id,
-                    stage,
-                    active,
-                } => (session_id, stage, active),
-                _ => panic!("a stage notification must publish a lifecycle stage"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            stages,
-            vec![
-                ("session-1".to_owned(), ProvisionStage::Cloning, true),
-                ("session-1".to_owned(), ProvisionStage::Syncing, true),
-                ("session-1".to_owned(), ProvisionStage::Cloning, false),
-                ("session-1".to_owned(), ProvisionStage::Syncing, false),
-            ]
-        );
-    }
 
     #[test]
     fn quick_github_bundle_uses_collision_suffix_and_reuses_matching_source() {
