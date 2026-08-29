@@ -9,6 +9,14 @@ use crate::hel_config::{ExecutionPolicy, HarnessKind};
 
 pub use crate::hel_worker::WORKER_PID_FILE;
 
+pub(crate) const GITHUB_CLI_BIN_ENV: &str = "HEL_GITHUB_CLI_BIN";
+
+pub(crate) fn github_cli_login_shell_command(command: &str) -> String {
+    format!(
+        "if [ -n \"${{{GITHUB_CLI_BIN_ENV}:-}}\" ]; then PATH=\"${GITHUB_CLI_BIN_ENV}:$PATH\"; export PATH; fi; unset {GITHUB_CLI_BIN_ENV} GH_TOKEN GITHUB_TOKEN; {command}"
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerOwnership {

@@ -1731,6 +1731,10 @@ exec gh "$@"
             format!("{}:{inherited_path}", bin.to_string_lossy())
         },
     );
+    environment.insert(
+        super::GITHUB_CLI_BIN_ENV.into(),
+        bin.to_string_lossy().into_owned(),
+    );
 
     let inherited_token = std::env::var("GH_TOKEN")
         .ok()
@@ -2004,7 +2008,7 @@ pub async fn run_acp_supervisor(spec: AcpSupervisorSpec) -> Result<()> {
 }
 
 pub(super) async fn run_acp_supervisor_with_streams<R, W>(
-    spec: AcpSupervisorSpec,
+    mut spec: AcpSupervisorSpec,
     mut parent_stdin: R,
     mut parent_stdout: W,
 ) -> Result<()>
@@ -2014,10 +2018,17 @@ where
 {
     use tokio::io::AsyncWriteExt;
 
+    if spec.args.first().is_some_and(|argument| argument == "-lc")
+        && let Some(command) = spec.args.get_mut(1)
+    {
+        *command = super::github_cli_login_shell_command(command);
+    }
     let mut command = tokio::process::Command::new(&spec.command);
     command
         .args(&spec.args)
         .envs(&spec.environment)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
         .current_dir(&spec.cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

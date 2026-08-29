@@ -132,9 +132,13 @@ fn spawn_user_shell(
     let mut command = tokio::process::Command::new("bash");
     command
         .arg("-lc")
-        .arg(&spec.command)
+        .arg(crate::hel_worker_runtime::github_cli_login_shell_command(
+            &spec.command,
+        ))
         .current_dir(&spec.cwd)
         .envs(&spec.environment)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -402,6 +406,53 @@ fn status_parts(status: std::process::ExitStatus) -> (Option<i32>, Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn user_shell_restores_github_wrapper_after_login_profile() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let worker = tempfile::tempdir().unwrap();
+        let bin = worker.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let wrapper = bin.join("gh");
+        std::fs::write(&wrapper, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut environment = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("GH_TOKEN".into(), "stale-token".into()),
+            ("GITHUB_TOKEN".into(), "also-stale".into()),
+        ]);
+        environment.insert(
+            crate::hel_worker_runtime::GITHUB_CLI_BIN_ENV.into(),
+            bin.to_string_lossy().into_owned(),
+        );
+        let (events, mut received) = mpsc::channel(16);
+        let mut shells = UserShellRegistry::new(cwd.path().to_path_buf(), environment, events);
+        shells
+            .start(
+                "shell-github-path".into(),
+                "printf '%s\\n%s|%s\\n' \"$(command -v gh)\" \"${GH_TOKEN-unset}\" \"${GITHUB_TOKEN-unset}\""
+                    .into(),
+            )
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(RuntimeEvent::UserShellFinished { result, .. }) = received.recv().await
+                {
+                    break result;
+                }
+            }
+        })
+        .await
+        .expect("user shell did not finish");
+        assert_eq!(result.status, UserShellStatus::Exited);
+        assert_eq!(
+            result.stdout,
+            format!("{}\nunset|unset\n", wrapper.display())
+        );
+    }
 
     #[test]
     fn output_keeps_head_and_tail_without_unbounded_growth() {
