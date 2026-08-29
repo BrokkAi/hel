@@ -515,7 +515,7 @@ fn render_sessions(
                         render_agent_message_head(
                             message,
                             usize::from(active_area.width.saturating_sub(
-                                u16::try_from(prefix_width + 7).unwrap_or(u16::MAX),
+                                u16::try_from(prefix_width + 5).unwrap_or(u16::MAX),
                             )),
                             2,
                         )
@@ -528,7 +528,7 @@ fn render_sessions(
                 for (agent_index, mut line) in agent.into_iter().take(2).enumerate() {
                     let mut spans = vec![Span::raw("  ")];
                     spans.push(Span::styled(
-                        format!("{} | ", prefixes[agent_index]),
+                        format!("{} ", prefixes[agent_index]),
                         Style::default().add_modifier(Modifier::BOLD),
                     ));
                     spans.append(&mut line.spans);
@@ -1707,7 +1707,7 @@ mod tests {
 
         assert!(rendered.contains("You: unanswered follow-up"));
         assert!(
-            rendered.contains("| │ Checking the workspace"),
+            rendered.contains("│ Checking the workspace"),
             "{rendered}"
         );
         assert!(!rendered.contains("Agent:"));
@@ -1766,9 +1766,9 @@ mod tests {
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
         assert!(!rendered.contains("[idle]"), "{rendered}");
-        assert!(rendered.contains("Agent: | │ Finished work"), "{rendered}");
+        assert!(rendered.contains("Agent: │ Finished work"), "{rendered}");
         assert!(
-            rendered.contains(&format!("{activity_time}  |")),
+            rendered.contains(&format!("{activity_time}  ")),
             "{rendered}"
         );
     }
