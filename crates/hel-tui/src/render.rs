@@ -472,11 +472,15 @@ fn render_sessions(
                     || detail.latest_agent_activity_after_last_user.is_some()
             });
             if show_agent_excerpt {
+                let prefixes = dashboard_agent_prefixes(now_epoch_seconds, detail);
+                let prefix_width = prefixes.iter().map(String::len).max().unwrap_or_default();
                 let mut agent = agent_excerpt
                     .map(|message| {
                         render_agent_message_head(
                             message,
-                            usize::from(active_area.width.saturating_sub(11)),
+                            usize::from(active_area.width.saturating_sub(
+                                u16::try_from(prefix_width + 7).unwrap_or(u16::MAX),
+                            )),
                             2,
                         )
                     })
@@ -488,11 +492,7 @@ fn render_sessions(
                 for (agent_index, mut line) in agent.into_iter().take(2).enumerate() {
                     let mut spans = vec![Span::raw("  ")];
                     spans.push(Span::styled(
-                        if agent_index == 0 {
-                            "Agent: "
-                        } else {
-                            "       "
-                        },
+                        format!("{} | ", prefixes[agent_index]),
                         Style::default().add_modifier(Modifier::BOLD),
                     ));
                     spans.append(&mut line.spans);
@@ -618,23 +618,17 @@ fn session_top_line(
         None
     };
     let queued_prompts = detail.map_or(0, |detail| detail.queued_prompts.len());
+    let mut columns = vec![target.to_owned()];
+    if queued_prompts > 0 {
+        columns.push(format!("[Q {queued_prompts}]"));
+    }
     let summary = if let Some(status_columns) = status_columns {
-        let mut columns = vec![target.to_owned()];
-        if queued_prompts > 0 {
-            columns.push(format!("[Q {queued_prompts}]"));
-        }
         columns.extend(status_columns);
         columns.push(profile.clone());
         columns.join("  ")
     } else {
-        hel::usage_format::format_session_summary(
-            target,
-            queued_prompts,
-            now_epoch_seconds,
-            detail.and_then(|detail| detail.current_turn_started_at),
-            detail.and_then(|detail| detail.last_acp_activity_at_ms),
-            &profile,
-        )
+        columns.push(profile.clone());
+        columns.join("  ")
     };
     let session_name =
         recovery_warning_name(session, session_name(session).to_owned(), now_epoch_seconds);
@@ -652,6 +646,45 @@ fn session_top_line(
         style,
     ));
     Line::from(spans).style(style)
+}
+
+const DASHBOARD_CLOCK_WIDTH: usize = 6;
+
+fn compact_dashboard_clock(elapsed_seconds: u64) -> String {
+    let minutes = elapsed_seconds / 60;
+    if minutes > 99 {
+        format!("{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{:02}s", elapsed_seconds % 60)
+    } else {
+        format!("{}s", elapsed_seconds % 60)
+    }
+}
+
+fn dashboard_agent_prefixes(now_epoch_seconds: u64, detail: Option<&SessionDetail>) -> [String; 2] {
+    let Some(turn_started) = detail.and_then(|detail| detail.current_turn_started_at) else {
+        let time = detail
+            .and_then(|detail| detail.last_activity_at_ms)
+            .and_then(|value| i64::try_from(value).ok())
+            .and_then(|value| hel::hel_chat::format_event_time(Some(value)))
+            .unwrap_or_default();
+        return ["Agent:".into(), format!("{time:<6}")];
+    };
+    let step_started = detail
+        .and_then(|detail| detail.last_acp_activity_at_ms)
+        .map(|value| value / 1_000)
+        .unwrap_or(turn_started)
+        .max(turn_started);
+    [
+        format!(
+            "T {:>DASHBOARD_CLOCK_WIDTH$}",
+            compact_dashboard_clock(now_epoch_seconds.saturating_sub(turn_started))
+        ),
+        format!(
+            "S {:>DASHBOARD_CLOCK_WIDTH$}",
+            compact_dashboard_clock(now_epoch_seconds.saturating_sub(step_started))
+        ),
+    ]
 }
 
 fn session_target_label(
@@ -1451,12 +1484,14 @@ mod tests {
         assert!(!rendered.contains("[1] hel"));
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
-        assert!(rendered.contains("podman  [Q 1]  Turn "));
-        assert!(rendered.contains("  Step "));
+        assert!(rendered.contains("podman  [Q 1]  codex-1  ACP pretty name"));
+        assert!(!rendered.contains("  Turn "));
+        assert!(!rendered.contains("  Step "));
         assert!(rendered.contains("  codex-1  ACP pretty name"));
         assert!(!rendered.contains("queued]"));
         assert!(rendered.contains("You: question 1"));
-        assert!(rendered.contains("Agent: "));
+        assert!(rendered.contains("T "));
+        assert!(rendered.contains("S "));
         assert!(rendered.contains("answer 1"));
 
         let buffer = terminal.backend().buffer();
@@ -1518,9 +1553,10 @@ mod tests {
 
         assert!(rendered.contains("You: unanswered follow-up"));
         assert!(
-            rendered.contains("Agent: │ Checking the workspace"),
+            rendered.contains("| │ Checking the workspace"),
             "{rendered}"
         );
+        assert!(!rendered.contains("Agent:"));
         assert!(!rendered.contains("answer 0"));
         let (user_row, user_line) = lines
             .iter()
@@ -1531,6 +1567,55 @@ mod tests {
         assert_ne!(
             buffer[(buffer.area.x + user_column, buffer.area.y + user_row as u16)].fg,
             Color::DarkGray
+        );
+    }
+
+    #[test]
+    fn dashboard_agent_prefixes_show_active_clocks_and_idle_activity_time() {
+        let detail = SessionDetail {
+            current_turn_started_at: Some(1_000),
+            last_acp_activity_at_ms: Some(1_297_000),
+            ..SessionDetail::default()
+        };
+
+        assert_eq!(
+            dashboard_agent_prefixes(1_330, Some(&detail)),
+            ["T  5m30s", "S    33s"]
+        );
+        assert_eq!(compact_dashboard_clock(99 * 60 + 59), "99m59s");
+        assert_eq!(compact_dashboard_clock(100 * 60 + 59), "100m");
+
+        let idle = SessionDetail {
+            last_activity_at_ms: Some(1_297_000),
+            ..SessionDetail::default()
+        };
+        let activity_time = hel::hel_chat::format_event_time(Some(1_297_000)).unwrap();
+        assert_eq!(
+            dashboard_agent_prefixes(1_330, Some(&idle)),
+            ["Agent:".to_owned(), format!("{activity_time:<6}")]
+        );
+    }
+
+    #[test]
+    fn idle_dashboard_moves_state_and_activity_time_beside_the_agent_excerpt() {
+        let mut dashboard = dashboard_with_session(running_session());
+        let mut materialized =
+            materialized_session_for("session-1", vec![agent_message(2, "Finished work")]);
+        materialized.execution = MaterializedExecutionState::Idle;
+        dashboard.apply_materialized_session(&materialized);
+        let activity_time = hel::hel_chat::format_event_time(Some(2_000)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(!rendered.contains("[idle]"), "{rendered}");
+        assert!(rendered.contains("Agent: | │ Finished work"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("{activity_time}  |")),
+            "{rendered}"
         );
     }
 

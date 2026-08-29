@@ -1711,7 +1711,8 @@ fn entry_body_rows(
         .collect()
 }
 
-fn format_event_time(recorded_at_ms: Option<i64>) -> Option<String> {
+/// Format an optional transcript event timestamp as local 24-hour time.
+pub fn format_event_time(recorded_at_ms: Option<i64>) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(recorded_at_ms?).map(|time| {
         time.with_timezone(&chrono::Local)
             .format("%H:%M")
