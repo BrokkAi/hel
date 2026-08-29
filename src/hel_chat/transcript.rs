@@ -11,13 +11,15 @@ use agent_client_protocol::schema::v1::{
     ToolCallContent, ToolCallLocation, ToolCallStatus,
 };
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
+use crate::hel_selection::{ContentPos, SelectionRange, SurfaceFrame, SurfaceId};
 use crate::hel_state::{MaterializedSession, TerminalOutputRecord, TranscriptBody, TranscriptItem};
 use crate::hel_transcript::{
     ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
@@ -660,6 +662,75 @@ pub(super) enum TranscriptAnchor {
     Row { entry: usize, row: usize },
 }
 
+/// A concrete transcript position: `row` rendered rows into `entry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct AnchorRow {
+    entry: usize,
+    row: usize,
+}
+
+impl AnchorRow {
+    const fn anchor(self) -> TranscriptAnchor {
+        TranscriptAnchor::Row {
+            entry: self.entry,
+            row: self.row,
+        }
+    }
+}
+
+/// Content row the frozen base anchor of a transcript selection sits at.
+///
+/// Absolute transcript rows would need the rendered row count of every entry
+/// above the viewport, and those rows only exist once something renders them.
+/// A selection therefore lives in a drag-local row space whose origin is this
+/// constant, with enough headroom either side to scroll a long way in both
+/// directions without the space going negative.
+const SELECTION_BASE_ROW: i64 = 1 << 32;
+
+/// How far past the last visible row a scrolled-back transcript claims to
+/// reach. The engine only needs more rows than the viewport is tall to keep a
+/// drag's edge auto-scroll armed; the visible band is what clamps the cursor.
+const SELECTION_SCROLL_MARGIN_ROWS: usize = 4_096;
+
+/// Rows, or entries, one selection walk may cross before the row space is
+/// declared untrustworthy. A drag moves a few rows per frame; anything at this
+/// scale is a jump across history the selection cannot describe, and dropping
+/// it is cheaper and more honest than rendering the deep past to measure it.
+const SELECTION_WALK_BUDGET: usize = 20_000;
+
+/// The row space a transcript selection is measured in.
+///
+/// While no gesture is running the base is re-pinned to the viewport top every
+/// frame. A gesture freezes it, and each later frame reports its own top as
+/// the running sum of per-frame deltas — a handful of rows each, all warm in
+/// the render cache.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TranscriptSelectionSpace {
+    /// Viewport top when the base was pinned; content row [`SELECTION_BASE_ROW`].
+    base: AnchorRow,
+    /// Rows the current viewport top sits below `base`.
+    offset_rows: i64,
+    /// Viewport top the previous frame registered, to walk the delta from.
+    prev_top: AnchorRow,
+    /// Row layout the space was pinned against.
+    layout: TranscriptRowLayout,
+}
+
+/// What the transcript's rendered rows depend on wholesale. Any change moves
+/// rows under a frozen selection, so the space is re-pinned and the caller
+/// drops the selection instead of copying the wrong text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptRowLayout {
+    width: u16,
+    mode: TranscriptRenderMode,
+    generation: u64,
+}
+
+/// The content row `offset` rows from the base of a selection's row space.
+fn selection_row(offset: i64) -> usize {
+    usize::try_from(SELECTION_BASE_ROW.saturating_add(offset)).unwrap_or(0)
+}
+
 /// Drop cached rows that a width or mode change invalidated, and size the cache
 /// to the current entry count.
 fn prepare_render_cache(
@@ -927,6 +998,7 @@ impl ChatState {
     /// positions rather than editing one in place.
     pub(super) fn invalidate_render_cache(&mut self) {
         self.render_cache.clear();
+        self.render_cache_generation = self.render_cache_generation.wrapping_add(1);
     }
 
     /// How many leading transcript items this view has not converted yet. Zero
@@ -994,7 +1066,7 @@ impl ChatState {
             width,
             self.render_mode,
         );
-        let top = TranscriptAnchor::Row { entry: 0, row: 0 };
+        let top = AnchorRow { entry: 0, row: 0 };
         if self.entries.is_empty() && fallback.is_none() {
             return TranscriptViewport {
                 rows: vec![empty_transcript_row(self.transcript_loading)],
@@ -1012,9 +1084,8 @@ impl ChatState {
                 .entries
                 .iter()
                 .rposition(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty());
-            let agent_is_above_tail = latest_agent.is_some_and(|agent| match tail.top {
-                TranscriptAnchor::Row { entry, row } => agent < entry || agent == entry && row > 0,
-                TranscriptAnchor::Bottom => false,
+            let agent_is_above_tail = latest_agent.is_some_and(|agent| {
+                agent < tail.top.entry || agent == tail.top.entry && tail.top.row > 0
             });
             if let Some(entry) = latest_agent.filter(|_| agent_is_above_tail) {
                 self.anchor = TranscriptAnchor::Row { entry, row: 0 };
@@ -1053,11 +1124,11 @@ impl ChatState {
             // views already reach the newest row, so follow the tail instead of
             // painting a short page.
             if rows.len() == height {
-                let anchor = TranscriptAnchor::Row { entry, row };
+                let top = AnchorRow { entry, row };
                 return TranscriptViewport {
                     rows,
-                    anchor,
-                    top: anchor,
+                    anchor: top.anchor(),
+                    top,
                 };
             }
         }
@@ -1068,7 +1139,7 @@ impl ChatState {
     /// rows always reach the newest row, so the anchor to store is `Bottom`.
     fn tail_viewport(&mut self, height: usize) -> TranscriptViewport {
         let mut rows: VecDeque<Line<'static>> = VecDeque::with_capacity(height);
-        let mut top = TranscriptAnchor::Row { entry: 0, row: 0 };
+        let mut top = AnchorRow { entry: 0, row: 0 };
         if height == 0 {
             return TranscriptViewport {
                 rows: rows.into(),
@@ -1097,7 +1168,7 @@ impl ChatState {
             for line in lines[start..].iter().rev() {
                 rows.push_front(line.clone());
             }
-            top = TranscriptAnchor::Row {
+            top = AnchorRow {
                 entry: index,
                 row: start,
             };
@@ -1179,7 +1250,10 @@ impl ChatState {
             TranscriptAnchor::Row { entry, row } if entry < self.entries.len() => {
                 TranscriptAnchor::Row { entry, row }
             }
-            _ => self.tail_viewport(self.last_viewport_height.max(1)).top,
+            _ => self
+                .tail_viewport(self.last_viewport_height.max(1))
+                .top
+                .anchor(),
         })
     }
 
@@ -1240,7 +1314,7 @@ impl ChatState {
             entry += 1;
             row = 0;
         }
-        let anchor = TranscriptAnchor::Row { entry, row };
+        let anchor = AnchorRow { entry, row };
         // A scroll step can land exactly on the first row of the final
         // screenful. That page fills the viewport, but it is still the live
         // tail and must resume following new output. Resolve this on input so
@@ -1248,9 +1322,267 @@ impl ChatState {
         self.anchor = if self.tail_viewport(self.last_viewport_height.max(1)).top == anchor {
             TranscriptAnchor::Bottom
         } else {
-            anchor
+            anchor.anchor()
         };
     }
+
+    /// What the current rendered rows depend on wholesale.
+    fn transcript_row_layout(&self) -> TranscriptRowLayout {
+        TranscriptRowLayout {
+            width: self.render_cache.width,
+            mode: self.render_mode,
+            generation: self.render_cache_generation,
+        }
+    }
+
+    /// Registers the transcript's selectable surface for this frame.
+    ///
+    /// `gesture_active` says whether the engine still owns a transcript
+    /// selection. While it does the base anchor stays frozen and this frame's
+    /// top is reported as an offset walked from the previous frame's; when it
+    /// does not, the base is re-pinned here so the next gesture starts from a
+    /// space that matches the screen.
+    fn register_transcript_surface(
+        &mut self,
+        inner: Rect,
+        top: AnchorRow,
+        visible_rows: usize,
+        at_tail: bool,
+        gesture_active: bool,
+    ) {
+        let layout = self.transcript_row_layout();
+        let frozen = self.transcript_selection.filter(|space| {
+            gesture_active && space.layout == layout && space.base.entry < self.entries.len()
+        });
+        if gesture_active && frozen.is_none() && self.transcript_selection.is_some() {
+            self.transcript_selection_invalid = true;
+        }
+        let top_row = match frozen {
+            Some(mut space) => match self.rows_between(space.prev_top, top) {
+                Some(delta) => {
+                    space.offset_rows = space.offset_rows.saturating_add(delta);
+                    space.prev_top = top;
+                    self.transcript_selection = Some(space);
+                    selection_row(space.offset_rows)
+                }
+                None => {
+                    self.transcript_selection_invalid = true;
+                    self.pin_transcript_selection(top, layout)
+                }
+            },
+            None => self.pin_transcript_selection(top, layout),
+        };
+        // A viewport that reaches the newest row reports its exact end, so a
+        // drag held below it stops extending; anything above the tail claims
+        // room beyond the screen, which is what keeps auto-scroll armed.
+        let total_rows = if at_tail {
+            top_row.saturating_add(visible_rows)
+        } else {
+            top_row
+                .saturating_add(visible_rows)
+                .saturating_add(SELECTION_SCROLL_MARGIN_ROWS)
+        };
+        self.frame_surfaces.push(SurfaceFrame::scrollable(
+            SurfaceId::Transcript,
+            inner,
+            top_row,
+            total_rows,
+        ));
+    }
+
+    /// Restarts the row space at the viewport top, and reports the content row
+    /// that top now sits at.
+    fn pin_transcript_selection(&mut self, top: AnchorRow, layout: TranscriptRowLayout) -> usize {
+        self.transcript_selection = Some(TranscriptSelectionSpace {
+            base: top,
+            offset_rows: 0,
+            prev_top: top,
+            layout,
+        });
+        selection_row(0)
+    }
+
+    /// Whether the transcript's selection row space stopped describing the
+    /// rows on screen since the last call, so the caller drops the selection.
+    pub fn transcript_selection_invalidated(&mut self) -> bool {
+        std::mem::take(&mut self.transcript_selection_invalid)
+    }
+
+    /// Rendered rows from `from` to `to`, negative when `to` sits above it.
+    ///
+    /// `None` when the walk would cross more rows or entries than
+    /// [`SELECTION_WALK_BUDGET`] allows: only a drag's own movement belongs in
+    /// this row space, and a jump across the deep past is not worth rendering
+    /// every entry in between to measure.
+    fn rows_between(&mut self, from: AnchorRow, to: AnchorRow) -> Option<i64> {
+        if from == to {
+            return Some(0);
+        }
+        let (start, end, sign) = if from < to {
+            (from, to, 1)
+        } else {
+            (to, from, -1)
+        };
+        if end.entry >= self.entries.len() || end.entry - start.entry > SELECTION_WALK_BUDGET {
+            return None;
+        }
+        self.prepare_entry_rows();
+        let rows = if start.entry == end.entry {
+            end.row.saturating_sub(start.row)
+        } else {
+            let mut rows = self.entry_rows(start.entry).saturating_sub(start.row);
+            for index in start.entry + 1..end.entry {
+                rows = rows.saturating_add(self.entry_rows(index));
+                if rows > SELECTION_WALK_BUDGET {
+                    return None;
+                }
+            }
+            rows.saturating_add(end.row)
+        };
+        if rows > SELECTION_WALK_BUDGET {
+            return None;
+        }
+        i64::try_from(rows).ok().map(|rows| sign * rows)
+    }
+
+    /// The position `offset` rendered rows from `from`, clamped to the ends of
+    /// the transcript. `None` when the walk exceeds the budget.
+    fn anchor_offset_by(&mut self, from: AnchorRow, offset: i64) -> Option<AnchorRow> {
+        if from.entry >= self.entries.len() {
+            return None;
+        }
+        let mut remaining = usize::try_from(offset.unsigned_abs()).ok()?;
+        if remaining > SELECTION_WALK_BUDGET {
+            return None;
+        }
+        self.prepare_entry_rows();
+        let mut entry = from.entry;
+        let mut row = from.row;
+        let mut steps = 0usize;
+        while remaining > 0 {
+            steps += 1;
+            if steps > SELECTION_WALK_BUDGET {
+                return None;
+            }
+            if offset > 0 {
+                let rows = self.entry_rows(entry);
+                let available = rows.saturating_sub(row);
+                if available > remaining {
+                    row += remaining;
+                    remaining = 0;
+                } else {
+                    remaining -= available;
+                    if entry + 1 >= self.entries.len() {
+                        row = rows;
+                        break;
+                    }
+                    entry += 1;
+                    row = 0;
+                }
+            } else if row > 0 {
+                let step = remaining.min(row);
+                row -= step;
+                remaining -= step;
+            } else if entry > 0 {
+                entry -= 1;
+                row = self.entry_rows(entry);
+            } else {
+                break;
+            }
+        }
+        Some(AnchorRow { entry, row })
+    }
+
+    /// `count` rendered rows starting at `start`, from the render cache.
+    fn transcript_rows_from(
+        &mut self,
+        start: AnchorRow,
+        count: usize,
+    ) -> Option<Vec<Line<'static>>> {
+        if start.entry >= self.entries.len() || count > SELECTION_WALK_BUDGET {
+            return None;
+        }
+        self.prepare_entry_rows();
+        let mut rows = Vec::with_capacity(count);
+        let mut skip = start.row;
+        for index in start.entry..self.entries.len() {
+            if index - start.entry > SELECTION_WALK_BUDGET {
+                return None;
+            }
+            let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
+            for line in lines.iter().skip(skip) {
+                if rows.len() == count {
+                    break;
+                }
+                rows.push(line.clone());
+            }
+            skip = 0;
+            if rows.len() == count {
+                break;
+            }
+        }
+        Some(rows)
+    }
+
+    /// The transcript text a finished selection covers.
+    ///
+    /// Rows come from the render cache, so rows scrolled out of the viewport
+    /// are copied without the frame buffer holding them. Only endpoints that
+    /// cut a row mid-column go back through a one-row render, which is what
+    /// gives the engine the cells it needs to slice wide characters.
+    pub fn transcript_selection_text(&mut self, range: &SelectionRange) -> Option<String> {
+        let space = self.transcript_selection?;
+        let width = self.render_cache.width;
+        if width == 0 {
+            return None;
+        }
+        let offset = i64::try_from(range.start.row).ok()? - SELECTION_BASE_ROW;
+        let start = self.anchor_offset_by(space.base, offset)?;
+        let count = range.end.row.checked_sub(range.start.row)?.checked_add(1)?;
+        let rows = self.transcript_rows_from(start, count)?;
+        let text = rows
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let row = range.start.row.saturating_add(index);
+                match range.columns_on(row, width) {
+                    Some((first, last)) if first > 0 || last + 1 < width => {
+                        sliced_row_text(line, width, first, last)
+                    }
+                    _ => row_text(line),
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(text.join("\n"))
+    }
+}
+
+/// One cached transcript row as plain text.
+fn row_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// One cached transcript row cut to `first..=last`.
+///
+/// The row is drawn the way the transcript draws it, so the engine slices the
+/// same cells that are on screen rather than a second column model.
+fn sliced_row_text(line: &Line<'static>, width: u16, first: u16, last: u16) -> String {
+    let area = Rect::new(0, 0, width, 1);
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(line.clone()).render(area, &mut buffer);
+    crate::hel_selection::extract_rows(
+        &buffer,
+        &SurfaceFrame::fixed(SurfaceId::Transcript, area),
+        &SelectionRange {
+            start: ContentPos::new(0, first),
+            end: ContentPos::new(0, last),
+        },
+    )
 }
 
 const TERMINAL_COMMAND_PREVIEW_CHARACTERS: usize = 160;
@@ -1513,13 +1845,20 @@ pub(super) fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<Strin
         .collect()
 }
 
-pub(super) fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
+pub(super) fn render_transcript(
+    frame: &mut Frame,
+    area: Rect,
+    chat: &mut ChatState,
+    gesture_active: bool,
+) {
     let viewport_height = usize::from(area.height.saturating_sub(2));
     chat.last_viewport_height = viewport_height;
     let window = chat.viewport(area.width, viewport_height);
     // The window resolves and clamps the anchor: an anchor inside the last
     // screenful snaps back to following the tail.
     chat.anchor = window.anchor;
+    let at_tail = window.anchor == TranscriptAnchor::Bottom;
+    let top = window.top;
     let title = transcript_title(chat, crate::clock::epoch_seconds());
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -1532,7 +1871,9 @@ pub(super) fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatSt
         .into_iter()
         .take(usize::from(inner.height))
         .collect::<Vec<_>>();
+    let visible_rows = visible.len();
     frame.render_widget(Paragraph::new(visible), inner);
+    chat.register_transcript_surface(inner, top, visible_rows, at_tail, gesture_active);
 }
 
 fn transcript_title(chat: &ChatState, now_epoch_seconds: u64) -> String {
@@ -1663,7 +2004,7 @@ struct TranscriptViewport {
     /// The anchor to store: `Bottom` whenever these rows reach the newest row.
     anchor: TranscriptAnchor,
     /// The entry and row the first visible row came from.
-    top: TranscriptAnchor,
+    top: AnchorRow,
 }
 
 fn render_transcript_entry(

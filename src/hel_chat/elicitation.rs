@@ -5,18 +5,28 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
 use crate::hel_elicitation::{
     ElicitationField, ElicitationFieldKind, ElicitationRequest, ElicitationResponse,
     ElicitationValue,
 };
+use crate::hel_selection::{
+    ContentPos, FrameSurfaces, SelectionRange, SurfaceFrame, SurfaceId, extract_rows,
+};
 use crate::hel_text_input::TextInput;
 
 use super::rendering::sanitize_terminal_text;
+
+/// How many wrapped rows of one logical line the extractor is willing to
+/// render off screen when a selection cuts it. A plan line long enough to wrap
+/// past this is pathological; the rows beyond it are dropped rather than
+/// allowed to allocate an unbounded buffer.
+const MAXIMUM_OFFSCREEN_ROWS: usize = 4_096;
 
 #[derive(Debug, Clone)]
 enum FieldValue {
@@ -183,11 +193,54 @@ impl ElicitationDialog {
         self.request.id.starts_with("plan-review-")
     }
 
+    /// The message pane's content area, recorded by the last frame.
+    pub(super) fn message_area(&self) -> Option<Rect> {
+        self.message_area.get()
+    }
+
+    /// The message text a selection covers, reconstructed as source lines.
+    ///
+    /// Wrapping is a rendering artifact, so a logical line the range covers
+    /// whole comes back exactly as the message wrote it, without the newlines
+    /// word wrap introduced. Only the range's partial endpoints are cut, and
+    /// those go back through the same `Paragraph` pipeline the pane renders
+    /// with, so wide characters are sliced on the cells they actually occupy.
+    pub(super) fn selection_text(&self, range: &SelectionRange, width: u16) -> String {
+        if width == 0 {
+            return String::new();
+        }
+        let mut selected = Vec::new();
+        let mut base = 0usize;
+        for line in self.request.message.split('\n') {
+            let rows = wrapped_row_count(line, width);
+            let last_row = base.saturating_add(rows.saturating_sub(1));
+            if rows == 0 || base > range.end.row || last_row < range.start.row {
+                base = base.saturating_add(rows);
+                continue;
+            }
+            let first = range.start.row.max(base);
+            let last = range.end.row.min(last_row);
+            let whole = first == base
+                && last == last_row
+                && (first..=last).all(|row| range.columns_on(row, width) == Some((0, width - 1)));
+            selected.push(if whole {
+                line.to_owned()
+            } else {
+                partial_line_text(line, width, base, (first, last), range)
+            });
+            base = base.saturating_add(rows);
+            if base > range.end.row {
+                break;
+            }
+        }
+        selected.join("\n")
+    }
+
     fn message_page_step(&self) -> u16 {
         self.message_page_height.get().saturating_sub(1).max(1)
     }
 
-    fn scroll_message(&self, delta: isize) {
+    pub(super) fn scroll_message(&self, delta: isize) {
         let current = usize::from(self.message_scroll.get());
         let maximum = usize::from(self.message_max_scroll.get());
         let next = if delta.is_negative() {
@@ -326,6 +379,69 @@ impl ElicitationDialog {
         let custom_cursor = display.custom_option.unwrap_or(option_count);
         (self.option_cursors[display.field] == custom_cursor).then_some((custom, true))
     }
+}
+
+/// Rows one source line takes when the message pane wraps it.
+///
+/// ratatui wraps each input line on its own, so these counts compose: their
+/// prefix sums are the visual rows of the whole message.
+fn wrapped_row_count(line: &str, width: u16) -> usize {
+    Paragraph::new(line)
+        .wrap(Wrap { trim: true })
+        .line_count(width)
+}
+
+/// The part of one logical line a range covers, cut on cell boundaries.
+///
+/// The line is re-rendered alone, scrolled to the first covered row, so the
+/// engine can slice the same cells the pane drew. Word wrap consumed the
+/// spaces it broke on, so the covered rows rejoin with one space.
+fn partial_line_text(
+    line: &str,
+    width: u16,
+    base: usize,
+    covered: (usize, usize),
+    range: &SelectionRange,
+) -> String {
+    let (first, mut last) = covered;
+    // Clamping `last` rather than the height keeps the row the range ends on
+    // and the rows rendered for it the same rows, so a capped line takes the
+    // full-width branch below instead of cutting a row it never drew.
+    last = last.min(first.saturating_add(MAXIMUM_OFFSCREEN_ROWS - 1));
+    let Ok(height) = u16::try_from(last.saturating_sub(first).saturating_add(1)) else {
+        return String::new();
+    };
+    let skip = u16::try_from(first.saturating_sub(base)).unwrap_or(u16::MAX);
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(line)
+        .wrap(Wrap { trim: true })
+        .scroll((skip, 0))
+        .render(area, &mut buffer);
+    let cut = SelectionRange {
+        start: ContentPos::new(
+            0,
+            if first == range.start.row {
+                range.start.col
+            } else {
+                0
+            },
+        ),
+        end: ContentPos::new(
+            usize::from(height - 1),
+            if last == range.end.row {
+                range.end.col
+            } else {
+                width - 1
+            },
+        ),
+    };
+    let frame = SurfaceFrame::fixed(SurfaceId::ElicitationMessage, area);
+    extract_rows(&buffer, &frame, &cut)
+        .split('\n')
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn display_fields(
@@ -584,7 +700,11 @@ fn validate_text_format(value: &str, format: &str) -> Result<(), &'static str> {
     }
 }
 
-pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) {
+pub(super) fn render_elicitation(
+    frame: &mut Frame,
+    dialog: &ElicitationDialog,
+    surfaces: &mut FrameSurfaces,
+) {
     let area = centered_rect(frame.area(), 82, 78);
     frame.render_widget(Clear, area);
     let title = dialog.request.title.as_deref().unwrap_or("Agent question");
@@ -633,6 +753,15 @@ pub(super) fn render_elicitation(frame: &mut Frame, dialog: &ElicitationDialog) 
     dialog.message_max_scroll.set(maximum_scroll);
     dialog.message_area.set(Some(chunks[0]));
     frame.render_widget(message.scroll((message_scroll, 0)), chunks[0]);
+    // The message pane scrolls its own rows, so it registers in content space:
+    // a drag can reach the plan text above and below the viewport.
+    surfaces.push(SurfaceFrame::scrollable(
+        SurfaceId::ElicitationMessage,
+        chunks[0],
+        usize::from(message_scroll),
+        usize::from(total_lines),
+    ));
+    surfaces.push(SurfaceFrame::fixed(SurfaceId::ModalBody, chunks[1]));
     render_focus(frame, chunks[1], focus);
     let field_count = dialog.display_fields.len();
     let buttons = ["Submit", "Skip", "Cancel"]
@@ -1034,9 +1163,13 @@ mod tests {
     }
 
     fn rendered(dialog: &ElicitationDialog) -> String {
+        rendered_with_surfaces(dialog, &mut FrameSurfaces::new())
+    }
+
+    fn rendered_with_surfaces(dialog: &ElicitationDialog, surfaces: &mut FrameSurfaces) -> String {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
         terminal
-            .draw(|frame| render_elicitation(frame, dialog))
+            .draw(|frame| render_elicitation(frame, dialog, surfaces))
             .expect("render elicitation");
         let buffer = terminal.backend().buffer();
         (buffer.area.y..buffer.area.bottom())
@@ -1050,6 +1183,15 @@ mod tests {
     }
 
     fn plan_review(line_count: usize) -> ElicitationDialog {
+        plan_review_message(
+            &(0..line_count)
+                .map(|line| format!("plan-line-{line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    fn plan_review_message(message: &str) -> ElicitationDialog {
         let mut request = request(
             ElicitationFieldKind::SingleSelect {
                 options: vec![
@@ -1088,11 +1230,100 @@ mod tests {
                 format: None,
             },
         });
-        request.message = (0..line_count)
-            .map(|line| format!("plan-line-{line:02}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        request.message = message.to_owned();
         ElicitationDialog::new(request)
+    }
+
+    /// The pane a plan-review dialog registered on its last frame.
+    fn message_pane(dialog: &ElicitationDialog) -> SurfaceFrame {
+        let mut surfaces = FrameSurfaces::new();
+        rendered_with_surfaces(dialog, &mut surfaces);
+        *surfaces
+            .surface(SurfaceId::ElicitationMessage)
+            .expect("the message pane is registered")
+    }
+
+    fn range(start: (usize, u16), end: (usize, u16)) -> SelectionRange {
+        SelectionRange {
+            start: ContentPos::new(start.0, start.1),
+            end: ContentPos::new(end.0, end.1),
+        }
+    }
+
+    /// The extractor maps a selection through per-line row counts, so those
+    /// counts have to add up to what the pane's own paragraph reports.
+    #[test]
+    fn wrapped_row_counts_of_source_lines_sum_to_the_paragraphs_line_count() {
+        let message = concat!(
+            "a short line\n",
+            "\n",
+            "a considerably longer line that the plan pane has to wrap over several rows ",
+            "before it finally runs out of words to place\n",
+            "tiny\n",
+            "\n",
+            "\n",
+            "another long one, long enough that it also wraps more than once at any of ",
+            "these widths"
+        );
+
+        for width in [17u16, 33, 80] {
+            let composed = message
+                .split('\n')
+                .map(|line| wrapped_row_count(line, width))
+                .sum::<usize>();
+            let whole = Paragraph::new(message)
+                .wrap(Wrap { trim: true })
+                .line_count(width);
+            assert_eq!(
+                composed, whole,
+                "per-line rows must compose at width {width}"
+            );
+        }
+    }
+
+    /// The point of the feature: a range over whole logical lines comes back
+    /// as the plan wrote them, without the newlines word wrap introduced, even
+    /// though most of those rows were scrolled out of the pane.
+    #[test]
+    fn copying_a_plan_range_past_the_viewport_returns_the_unwrapped_source_lines() {
+        let paragraph = "This step is long enough that the plan pane wraps it over several rows, which is exactly the fugliness copying is meant to undo.";
+        let message = (0..6)
+            .map(|step| format!("Step {step}: {paragraph}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let dialog = plan_review_message(&message);
+        let pane = message_pane(&dialog);
+        assert!(
+            pane.total_rows > usize::from(pane.rect.height),
+            "the fixture has to outgrow the pane"
+        );
+
+        let selection = range((0, 0), (pane.total_rows - 1, pane.rect.width - 1));
+
+        assert_eq!(dialog.selection_text(&selection, pane.rect.width), message);
+    }
+
+    #[test]
+    fn partial_first_and_last_plan_lines_are_cut_at_the_selected_columns() {
+        let dialog = plan_review_message("alpha beta gamma\n世界 wide row\nomega");
+        // At this width the pane draws "alpha beta" / "gamma" / "世界 wide" /
+        // "row" / "omega"; the wide graphemes take two cells each.
+        let width = 10;
+
+        assert_eq!(
+            dialog.selection_text(&range((0, 6), (3, 2)), width),
+            "beta gamma\n世界 wide row"
+        );
+    }
+
+    #[test]
+    fn a_range_inside_one_wrapped_line_rejoins_the_rows_word_wrap_split() {
+        let dialog = plan_review_message("alpha beta gamma\n世界 wide row\nomega");
+
+        assert_eq!(
+            dialog.selection_text(&range((0, 6), (1, 2)), 10),
+            "beta gam"
+        );
     }
 
     #[test]

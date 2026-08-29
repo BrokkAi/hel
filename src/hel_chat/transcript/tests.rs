@@ -1,9 +1,10 @@
 use super::*;
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_chat::test_support::{
-    agent_message_item, agent_transcript_item, drawn_transcript, key, line_text, mouse_in, queued,
-    snapshot, transcript_text,
+    agent_message_item, agent_transcript_item, drawn_transcript, drawn_transcript_selecting, key,
+    line_text, mouse_in, queued, snapshot, transcript_text,
 };
+use crate::hel_selection::SelectionState;
 use crate::hel_worker::{SequencedEvent, WorkerEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
@@ -2382,4 +2383,182 @@ fn raw_mode_preserves_markdown_markers_and_exposes_tool_details() {
         .push(ChatEntry::plain(1, ChatRole::Agent, "**bold**"));
     chat.render_mode = TranscriptRenderMode::Raw;
     assert!(transcript_text(&mut chat, 30).contains(&"│ **bold**".into()));
+}
+
+/// The transcript pane the last frame registered.
+fn transcript_pane(chat: &ChatState) -> SurfaceFrame {
+    *chat
+        .frame_surfaces()
+        .surface(SurfaceId::Transcript)
+        .expect("the transcript is registered")
+}
+
+/// One auto-scroll tick: scroll the transcript, redraw so the registry
+/// describes the rows now on screen, and re-resolve the still pointer against
+/// it. This is the sequence the dashboard loop runs on its interval.
+fn autoscroll_tick(chat: &mut ChatState, selection: &mut SelectionState, direction: i8) {
+    if direction < 0 {
+        chat.scroll_history_up(3);
+    } else {
+        chat.scroll_history_down(3);
+    }
+    drawn_transcript_selecting(chat, 40, 12, true);
+    selection.retrack(chat.frame_surfaces());
+}
+
+/// A drag held at the transcript's top edge keeps pulling older rows into the
+/// selection, and the copied text is the cached rows for the whole span —
+/// including the rows the viewport has scrolled past.
+#[test]
+fn autoscrolling_a_transcript_drag_selects_rows_the_viewport_scrolled_past() {
+    let mut chat = numbered_chat(60);
+    drawn_transcript(&mut chat, 40, 12);
+    let rows = transcript_text(&mut chat, 40);
+    let pane = transcript_pane(&chat);
+    let height = usize::from(pane.rect.height);
+    let mut selection = SelectionState::new();
+
+    // Press on the last visible row, then drag onto the top edge, which is
+    // where a held pointer asks for auto-scroll.
+    selection.on_mouse_down(
+        pane.rect.right() - 1,
+        pane.rect.bottom() - 1,
+        chat.frame_surfaces(),
+    );
+    selection.on_mouse_drag(pane.rect.x, pane.rect.y, chat.frame_surfaces());
+    let mut span = selection.range().expect("dragging").end.row
+        - selection.range().expect("dragging").start.row;
+    assert_eq!(span + 1, height, "the drag starts covering the viewport");
+    assert_eq!(
+        selection.autoscroll_request(chat.frame_surfaces()),
+        Some((SurfaceId::Transcript, -1))
+    );
+
+    for _ in 0..4 {
+        autoscroll_tick(&mut chat, &mut selection, -1);
+        let range = selection.range().expect("still dragging");
+        let grown = range.end.row - range.start.row;
+        assert_eq!(grown, span + 3, "each tick pulls three more rows in");
+        span = grown;
+    }
+
+    let range = selection.range().expect("still dragging");
+    assert!(
+        span + 1 > height,
+        "the selection outgrew the viewport it started in"
+    );
+    let copied = chat
+        .transcript_selection_text(&range)
+        .expect("the selection has text");
+    let start = rows.len() - (span + 1);
+    assert_eq!(
+        copied.split('\n').collect::<Vec<_>>(),
+        rows[start..]
+            .iter()
+            .map(|row| row.trim_end())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn scrolling_under_a_frozen_base_moves_the_registered_top_row_by_the_rows_crossed() {
+    let mut chat = numbered_chat(60);
+    drawn_transcript(&mut chat, 40, 12);
+    let pinned = transcript_pane(&chat).top_row;
+
+    chat.scroll_history_up(3);
+    drawn_transcript_selecting(&mut chat, 40, 12, true);
+    assert_eq!(pinned - transcript_pane(&chat).top_row, 3);
+
+    chat.scroll_history_up(7);
+    drawn_transcript_selecting(&mut chat, 40, 12, true);
+    assert_eq!(pinned - transcript_pane(&chat).top_row, 10);
+
+    chat.scroll_history_down(4);
+    drawn_transcript_selecting(&mut chat, 40, 12, true);
+    assert_eq!(pinned - transcript_pane(&chat).top_row, 6);
+
+    // With no selection to hold it, the base re-pins to whatever is on screen.
+    drawn_transcript(&mut chat, 40, 12);
+    assert_eq!(transcript_pane(&chat).top_row, pinned);
+}
+
+#[test]
+fn a_width_change_or_a_rebuilt_cache_invalidates_a_frozen_row_space() {
+    let mut chat = numbered_chat(60);
+    drawn_transcript(&mut chat, 40, 12);
+    drawn_transcript_selecting(&mut chat, 40, 12, true);
+    assert!(
+        !chat.transcript_selection_invalidated(),
+        "a steady layout keeps the row space"
+    );
+
+    drawn_transcript_selecting(&mut chat, 60, 12, true);
+    assert!(
+        chat.transcript_selection_invalidated(),
+        "rewrapped rows are not the rows the selection was measured in"
+    );
+
+    drawn_transcript_selecting(&mut chat, 60, 12, true);
+    assert!(!chat.transcript_selection_invalidated());
+    chat.invalidate_render_cache();
+    drawn_transcript_selecting(&mut chat, 60, 12, true);
+    assert!(chat.transcript_selection_invalidated());
+}
+
+#[test]
+fn a_jump_across_the_deep_past_invalidates_instead_of_walking_it() {
+    let mut chat = ChatState::new(&snapshot(), &[]);
+    chat.render_mode = TranscriptRenderMode::Raw;
+    chat.entries = (0..40)
+        .map(|index| {
+            ChatEntry::plain(
+                index,
+                ChatRole::User,
+                (0..700)
+                    .map(|row| format!("entry {index} row {row}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        })
+        .collect();
+    drawn_transcript(&mut chat, 40, 12);
+    drawn_transcript_selecting(&mut chat, 40, 12, true);
+    assert!(!chat.transcript_selection_invalidated());
+
+    chat.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+    drawn_transcript_selecting(&mut chat, 40, 12, true);
+
+    assert!(
+        chat.transcript_selection_invalidated(),
+        "a jump past the walk budget drops the selection instead of rendering the history"
+    );
+}
+
+/// A range that stops mid-row is cut on the cells the row occupies, so a wide
+/// grapheme is never split into half a character.
+#[test]
+fn a_transcript_endpoint_row_is_cut_on_the_cells_it_occupies() {
+    let mut chat = ChatState::new(&snapshot(), &[]);
+    chat.entries
+        .push(ChatEntry::plain(1, ChatRole::Agent, "世界 wide row"));
+    drawn_transcript(&mut chat, 40, 24);
+    // The body row follows the entry's header; its gutter takes two columns
+    // and each of the wide graphemes after it takes two more.
+    let body = transcript_pane(&chat).top_row + 1;
+
+    assert_eq!(
+        chat.transcript_selection_text(&SelectionRange {
+            start: ContentPos::new(body, 2),
+            end: ContentPos::new(body, 5),
+        }),
+        Some("世界".into())
+    );
+    assert_eq!(
+        chat.transcript_selection_text(&SelectionRange {
+            start: ContentPos::new(body, 3),
+            end: ContentPos::new(body, 8),
+        }),
+        Some("界 wi".into())
+    );
 }

@@ -41,7 +41,7 @@ use crate::hel_acp::{RuntimeEvent, plan_review_carries_native_feedback};
 use crate::hel_config::HarnessKind;
 use crate::hel_elicitation::ElicitationValue;
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
-use crate::hel_selection::FrameSurfaces;
+use crate::hel_selection::{FrameSurfaces, SelectionRange};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
     RecoveryCheckpointPhase, TranscriptBody, TranscriptItem,
@@ -63,8 +63,8 @@ use history::{HistorySearch, HistorySearchRequest};
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
 use transcript::{
     TAIL_SEED_ITEMS, ToolDiffstatRequest, TranscriptAnchor, TranscriptRenderCache,
-    content_block_text, materialized_chat_entries_reusing, plan_status, tool_content_details,
-    tool_diff_paths, tool_location_details, tool_status,
+    TranscriptSelectionSpace, content_block_text, materialized_chat_entries_reusing, plan_status,
+    tool_content_details, tool_diff_paths, tool_location_details, tool_status,
 };
 
 const MOUSE_SCROLL_ROWS: usize = 3;
@@ -327,6 +327,15 @@ pub struct ChatState {
     /// Selectable surfaces, rebuilt by every frame in render order so the
     /// selection engine can hit-test the screen the user is looking at.
     pub(super) frame_surfaces: FrameSurfaces,
+    /// The row space transcript selections are measured in, re-pinned by every
+    /// frame the engine is not holding a transcript selection through.
+    transcript_selection: Option<TranscriptSelectionSpace>,
+    /// The frozen row space stopped describing the rows on screen. Read and
+    /// cleared after each draw; the caller drops the selection.
+    transcript_selection_invalid: bool,
+    /// Bumped whenever the cached rows are dropped wholesale, so a frozen row
+    /// space can tell that the rows it was pinned against are gone.
+    render_cache_generation: u64,
 }
 
 impl ChatState {
@@ -390,6 +399,9 @@ impl ChatState {
             conversations_window_start: None,
             conversations_area: None,
             frame_surfaces: FrameSurfaces::new(),
+            transcript_selection: None,
+            transcript_selection_invalid: false,
+            render_cache_generation: 0,
         };
         state.apply_events(events);
         // Bootstrap replays the full canonical log for transcript projection,
@@ -1533,6 +1545,20 @@ impl ChatState {
     /// The surfaces the last frame registered, for the selection engine.
     pub fn frame_surfaces(&self) -> &FrameSurfaces {
         &self.frame_surfaces
+    }
+
+    /// Scrolls the elicitation message pane, for a drag held at its edge.
+    pub(super) fn scroll_elicitation_message(&self, rows: isize) {
+        if let Some(dialog) = self.elicitation.as_ref() {
+            dialog.scroll_message(rows);
+        }
+    }
+
+    /// The message text a selection in the elicitation pane covers.
+    pub fn elicitation_selection_text(&self, range: &SelectionRange) -> Option<String> {
+        let dialog = self.elicitation.as_ref()?;
+        let width = dialog.message_area()?.width;
+        Some(dialog.selection_text(range, width))
     }
 
     /// Capture is on for every surface, so the app owns the wheel: terminal

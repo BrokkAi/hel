@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
-use crate::hel_selection::{FrameSurfaces, SurfaceFrame, SurfaceId};
+use crate::hel_selection::{FrameSurfaces, SelectionRange, SurfaceFrame, SurfaceId};
 use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
 };
@@ -39,9 +39,9 @@ use super::transcript::{
     render_transcript,
 };
 use super::{
-    ChatAction, ChatEventOutcome, ChatFocus, ChatState, Notices, OtherSessionActivity,
-    OtherSessionIdentity, SessionHeaderIdentity, last_nonempty_line, queued_prompt_preview,
-    turn_band_color, turn_started_at_epoch_seconds,
+    ChatAction, ChatEventOutcome, ChatFocus, ChatState, MOUSE_SCROLL_ROWS, Notices,
+    OtherSessionActivity, OtherSessionIdentity, SessionHeaderIdentity, last_nonempty_line,
+    queued_prompt_preview, turn_band_color, turn_started_at_epoch_seconds,
 };
 
 use crate::clock::epoch_seconds;
@@ -1261,9 +1261,46 @@ impl ActiveChat {
 
     /// Draws the view. The recovery phase is read here rather than tracked,
     /// because the checkpoint gate moves without telling the dashboard.
-    pub fn draw(&mut self, frame: &mut Frame) {
+    ///
+    /// `transcript_selected` says whether the engine still owns a selection on
+    /// the transcript. The transcript measures selections in a row space
+    /// pinned to the viewport top, and that base has to stay frozen for as
+    /// long as a selection is measured against it.
+    pub fn draw(&mut self, frame: &mut Frame, transcript_selected: bool) {
         self.state.recovery_phase = self.recovery_phase();
-        render(frame, &mut self.state);
+        render(frame, &mut self.state, transcript_selected);
+    }
+
+    /// The transcript text a finished selection covers.
+    pub fn transcript_selection_text(&mut self, range: &SelectionRange) -> Option<String> {
+        self.state.transcript_selection_text(range)
+    }
+
+    /// The message text a selection in the elicitation pane covers.
+    pub fn elicitation_selection_text(&self, range: &SelectionRange) -> Option<String> {
+        self.state.elicitation_selection_text(range)
+    }
+
+    /// Whether the transcript's selection row space stopped describing the
+    /// rows on screen since the last call.
+    pub fn transcript_selection_invalidated(&mut self) -> bool {
+        self.state.transcript_selection_invalidated()
+    }
+
+    /// Scrolls the surface a drag is holding against one of its edges.
+    /// `direction` is negative for up and positive for down.
+    pub fn autoscroll_selection(&mut self, surface: SurfaceId, direction: i8) {
+        let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(1);
+        match surface {
+            SurfaceId::Transcript if direction < 0 => {
+                self.state.scroll_history_up(MOUSE_SCROLL_ROWS)
+            }
+            SurfaceId::Transcript => self.state.scroll_history_down(MOUSE_SCROLL_ROWS),
+            SurfaceId::ElicitationMessage => self
+                .state
+                .scroll_elicitation_message(if direction < 0 { -rows } else { rows }),
+            _ => {}
+        }
     }
 
     fn recovery_phase(&self) -> Option<RecoveryCheckpointPhase> {
@@ -1296,7 +1333,7 @@ impl Drop for ActiveChat {
     }
 }
 
-pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
+pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selected: bool) {
     chat.frame_surfaces.clear();
     let inner = frame.area();
     // The pane never takes more than a third of the screen. Its border eats
@@ -1372,7 +1409,7 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
             buffer[(x, y)].set_bg(Color::DarkGray);
         }
     }
-    render_transcript(frame, transcript_area, chat);
+    render_transcript(frame, transcript_area, chat, transcript_selected);
     let queued = chat.queued_prompts.len();
     let prompt_title = prompt_title(chat, queued);
     let prompt_block = Block::default()
@@ -1479,11 +1516,11 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
             .push(SurfaceFrame::fixed(SurfaceId::AutocompletePopup, popup));
     }
     if let Some(dialog) = chat.elicitation.as_ref() {
-        // The dialog owns the frame's interaction while it is up, and its own
-        // surfaces are not registered yet, so nothing behind it stays
-        // selectable.
+        // The dialog owns the frame's interaction while it is up, so the chat
+        // behind it stops being selectable and the dialog registers its own
+        // surfaces in its place.
         chat.frame_surfaces.clear();
-        render_elicitation(frame, dialog);
+        render_elicitation(frame, dialog, &mut chat.frame_surfaces);
     }
 }
 
@@ -1779,7 +1816,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw elicitation");
         let buffer = terminal.backend().buffer();
         let lines = (buffer.area.y..buffer.area.bottom())
@@ -1860,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_elicitation_leaves_nothing_behind_it_selectable() {
+    fn an_open_elicitation_replaces_the_chats_surfaces_with_its_own() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.elicitation = Some(super::super::elicitation::ElicitationDialog::new(
             ElicitationRequest {
@@ -1874,9 +1911,21 @@ mod tests {
 
         drawn_transcript(&mut chat, 80, 24);
 
-        // The dialog owns the frame while it is up; its own surfaces are not
-        // registered yet, so no drag reaches the chat underneath it.
-        assert!(chat.frame_surfaces().is_empty());
+        // The dialog owns the frame while it is up, so no drag reaches the
+        // chat underneath it and only the dialog's own panes are selectable.
+        let surfaces = chat.frame_surfaces();
+        let message = surfaces
+            .surface(SurfaceId::ElicitationMessage)
+            .expect("message pane registered");
+        assert!(surfaces.surface(SurfaceId::ModalBody).is_some());
+        assert!(surfaces.surface(SurfaceId::Transcript).is_none());
+        assert!(surfaces.surface(SurfaceId::PromptInput).is_none());
+        assert_eq!(
+            surfaces
+                .surface_at(message.rect.x, message.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::ElicitationMessage)
+        );
     }
 
     #[test]
@@ -2020,7 +2069,7 @@ mod tests {
         // would.
         shared.set("Background import finished");
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         let buffer = terminal.backend().buffer();
         let footer_row = buffer.area.bottom() - 1;
@@ -2032,7 +2081,7 @@ mod tests {
 
         shared.clear();
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         let buffer = terminal.backend().buffer();
         let footer_text = (buffer.area.x..buffer.area.right())
@@ -2075,7 +2124,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         let buffer = terminal.backend().buffer();
         let rendered = buffer
@@ -2517,7 +2566,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         // The band only covers the pane's inner hitbox: the border columns to
         // either side keep drawing border characters, not the band.
@@ -2541,7 +2590,7 @@ mod tests {
 
         chat.handle_key(key(KeyCode::Enter));
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         assert!(!banded(&terminal, 2), "an unfocused pane draws no band");
         let cursor = terminal
@@ -2560,7 +2609,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
 
         let buffer = terminal.backend().buffer();
@@ -2580,7 +2629,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         // Both panes sit at the left edge, so their top border's row is
         // identified by which corner glyph it draws, not a hardcoded y. The
@@ -2608,7 +2657,7 @@ mod tests {
         chat.handle_key(key(KeyCode::Tab));
         assert_eq!(chat.focus, ChatFocus::Prompt);
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
 
         assert_eq!(
@@ -2726,7 +2775,7 @@ mod tests {
         };
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         // Row 0 is the pane's own top border; the header row sits inside it.
         assert_eq!(bordered_row(&terminal, 1), "› [idle]");
@@ -2739,7 +2788,7 @@ mod tests {
             ChatIoUpdate::OtherSessions(vec![other_session(1, "docs", None, "wrote the guide")]),
         );
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         assert_eq!(bordered_row(&terminal, 1), "› [idle]");
         assert_eq!(bordered_row(&terminal, 2), "  [idle] wrote the guide");

@@ -74,6 +74,8 @@ use crate::{TerminalGuard, short_id, startup_greeting};
 const DASHBOARD_CLOCK_TICK: Duration = Duration::from_secs(1);
 /// Redraw cadence while a dialog animates on its own.
 const IMPORT_PROGRESS_TICK: Duration = Duration::from_millis(125);
+/// Scroll cadence while a drag is held past a scrollable surface's edge.
+const SELECTION_AUTOSCROLL_TICK: Duration = Duration::from_millis(80);
 pub(crate) const QUOTA_REFRESH_NOTICE: &str = "Refreshing profile quotas…";
 pub(crate) const QUOTA_REFRESHED_NOTICE: &str = "Profile quotas refreshed.";
 
@@ -404,6 +406,10 @@ pub(crate) async fn run_dashboard_for_workspace(
         IMPORT_PROGRESS_TICK,
     );
     import_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Only armed while a held pointer sits at a scrollable surface's edge, so
+    // an idle dashboard never ticks on it.
+    let mut autoscroll_tick = tokio::time::interval(SELECTION_AUTOSCROLL_TICK);
+    autoscroll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         if !context.shutdown_requested {
@@ -549,6 +555,12 @@ pub(crate) async fn run_dashboard_for_workspace(
                 if context.dashboard.needs_fast_tick() && context.view == View::Dashboard =>
             {
                 context.dirty = true;
+            }
+            // A drag held past a scrollable surface's edge keeps scrolling it
+            // and keeps extending the selection, the way a held pointer does
+            // in a terminal's own selection.
+            _ = autoscroll_tick.tick(), if context.autoscroll_request().is_some() => {
+                context.apply_autoscroll()?;
             }
         }
         context.drain_feeds();
@@ -985,13 +997,14 @@ impl DashboardContext {
             selection_text,
             ..
         } = self;
+        let transcript_selected = selection.active_surface() == Some(SurfaceId::Transcript);
         // The highlight and the extraction both run inside the draw closure,
         // once the view has drawn: the surfaces are registered by that render
         // and the cells the selection covers only exist in this frame.
         match (*view, active_chat.as_mut()) {
             (View::Chat, Some(chat)) => {
                 terminal.terminal.draw(|frame| {
-                    chat.draw(frame);
+                    chat.draw(frame, transcript_selected);
                     *selection_text = draw_selection(frame, selection, chat.frame_surfaces());
                 })?;
             }
@@ -1002,31 +1015,104 @@ impl DashboardContext {
                 })?;
             }
         }
+        // The transcript reports a row space it can no longer measure the
+        // selection in — a width change, a rebuilt cache, a jump across the
+        // deep past. Dropping the selection is the honest answer; walking
+        // history to rescue it is the full-transcript probe this design exists
+        // to avoid.
+        let invalidated = self
+            .active_chat
+            .as_mut()
+            .is_some_and(hel::hel_chat::ActiveChat::transcript_selection_invalidated);
+        if invalidated && self.selection.active_surface() == Some(SurfaceId::Transcript) {
+            self.selection.clear();
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// The surfaces the view on screen registered on its last frame.
+    fn frame_surfaces(&self) -> &FrameSurfaces {
+        match (self.view, self.active_chat.as_ref()) {
+            (View::Chat, Some(chat)) => chat.frame_surfaces(),
+            _ => self.dashboard.frame_surfaces(),
+        }
+    }
+
+    /// The surface a held drag is asking to scroll, if any.
+    fn autoscroll_request(&self) -> Option<(SurfaceId, i8)> {
+        self.selection.autoscroll_request(self.frame_surfaces())
+    }
+
+    /// Scrolls the surface a drag is holding against its edge, then re-resolves
+    /// the still pointer against the frame that scroll produced.
+    ///
+    /// The pointer emits no events while it is held still, so the rows that
+    /// moved under it only join the selection once the registry is rebuilt,
+    /// which needs the redraw in between.
+    fn apply_autoscroll(&mut self) -> Result<()> {
+        let Some((surface, direction)) = self.autoscroll_request() else {
+            return Ok(());
+        };
+        let Some(chat) = self.active_chat.as_mut() else {
+            return Ok(());
+        };
+        chat.autoscroll_selection(surface, direction);
+        self.dirty = true;
+        self.draw()?;
+        let Self {
+            selection,
+            active_chat,
+            dashboard,
+            view,
+            ..
+        } = self;
+        let surfaces = match (*view, active_chat.as_ref()) {
+            (View::Chat, Some(chat)) => chat.frame_surfaces(),
+            _ => dashboard.frame_surfaces(),
+        };
+        selection.retrack(surfaces);
         Ok(())
     }
 
     /// Routes one terminal event through the selection engine, hit-testing
     /// against the surfaces the view on screen registered.
     fn route_selection(&mut self, event: Event) -> SelectionRouting {
-        let surfaces = match (self.view, self.active_chat.as_ref()) {
+        let Self {
+            selection,
+            active_chat,
+            dashboard,
+            view,
+            ..
+        } = self;
+        let surfaces = match (*view, active_chat.as_ref()) {
             (View::Chat, Some(chat)) => chat.frame_surfaces(),
-            _ => self.dashboard.frame_surfaces(),
+            _ => dashboard.frame_surfaces(),
         };
-        route_selection_event(&mut self.selection, surfaces, event)
+        route_selection_event(selection, surfaces, event)
     }
 
     /// Copies the finished selection to the system and terminal clipboards.
     ///
     /// The frame on screen predates the release that finished the drag, so
-    /// this redraws before reading: the stash is filled during the draw.
+    /// this redraws before reading. Surfaces that scroll their own rows own
+    /// the text a selection covers, because most of it is not on the frame the
+    /// stash is read from; everything else comes out of that stash.
     fn copy_selection(&mut self, surface: SurfaceId, range: SelectionRange) -> Result<()> {
         self.dirty = true;
         self.draw()?;
-        let Some(text) = self
-            .selection_text
-            .take()
-            .filter(|text| !text.trim().is_empty())
-        else {
+        let extracted = match surface {
+            SurfaceId::Transcript => self
+                .active_chat
+                .as_mut()
+                .and_then(|chat| chat.transcript_selection_text(&range)),
+            SurfaceId::ElicitationMessage => self
+                .active_chat
+                .as_ref()
+                .and_then(|chat| chat.elicitation_selection_text(&range)),
+            _ => self.selection_text.take(),
+        };
+        let Some(text) = extracted.filter(|text| !text.trim().is_empty()) else {
             tracing::debug!(?surface, ?range, "selection covered no text");
             return Ok(());
         };
@@ -1742,8 +1828,9 @@ fn dispatch_to_view(
 /// the text it covers.
 ///
 /// Both halves read the same frame, so the copied text is exactly what the
-/// highlight marks. Surfaces that scroll their own content are not registered
-/// yet; when they are, their text comes from their row cache instead.
+/// highlight marks. Surfaces that scroll their own content extract from their
+/// row cache instead: only the visible band of such a selection is on this
+/// frame, and the highlight is all that band is good for.
 fn draw_selection(
     frame: &mut ratatui::Frame,
     selection: &SelectionState,
@@ -1753,6 +1840,9 @@ fn draw_selection(
     let range = selection.range()?;
     let surface = *surfaces.surface(id)?;
     hel::hel_selection::highlight(frame.buffer_mut(), &surface, &range);
+    if matches!(id, SurfaceId::Transcript | SurfaceId::ElicitationMessage) {
+        return None;
+    }
     Some(hel::hel_selection::extract_rows(
         frame.buffer_mut(),
         &surface,
@@ -2196,6 +2286,46 @@ mod tests {
             route_selection_event(&mut selection, &surfaces, drag.clone()),
             SelectionRouting::Forward(drag)
         );
+    }
+
+    /// A surface that scrolls its own rows still gets highlighted, but its
+    /// text is not read back from the frame: most of the selection is off it,
+    /// and the surface's own row cache is what holds those rows.
+    #[test]
+    fn a_scrollable_surface_is_highlighted_without_stashing_frame_text() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).expect("terminal");
+        let mut surfaces = FrameSurfaces::new();
+        surfaces.push(SurfaceFrame::scrollable(
+            SurfaceId::Transcript,
+            Rect::new(0, 1, 20, 3),
+            400,
+            9_000,
+        ));
+        let mut selection = SelectionState::new();
+        route_selection_event(
+            &mut selection,
+            &surfaces,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 1),
+        );
+        route_selection_event(
+            &mut selection,
+            &surfaces,
+            mouse(MouseEventKind::Up(MouseButton::Left), 19, 3),
+        );
+
+        let mut text = Some("stale".to_owned());
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("visible transcript row"),
+                    Rect::new(0, 1, 20, 3),
+                );
+                text = draw_selection(frame, &selection, &surfaces);
+            })
+            .expect("draw");
+
+        assert_eq!(text, None, "the extraction is the transcript's own job");
+        assert_eq!(reversed_cells(&terminal).len(), 60, "all three rows lit up");
     }
 
     #[test]

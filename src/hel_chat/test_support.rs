@@ -95,9 +95,20 @@ pub(super) fn line_text(lines: Vec<Line<'static>>) -> Vec<String> {
 
 /// Draw the chat and return the transcript rows currently on screen.
 pub(super) fn drawn_transcript(chat: &mut ChatState, width: u16, height: u16) -> Vec<String> {
+    drawn_transcript_selecting(chat, width, height, false)
+}
+
+/// Like `drawn_transcript`, but says whether the selection engine still owns a
+/// transcript selection, which is what freezes the transcript's row space.
+pub(super) fn drawn_transcript_selecting(
+    chat: &mut ChatState,
+    width: u16,
+    height: u16,
+    transcript_selected: bool,
+) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     terminal
-        .draw(|frame| render(frame, chat))
+        .draw(|frame| render(frame, chat, transcript_selected))
         .expect("draw chat");
     let buffer = terminal.backend().buffer();
     (buffer.area.y..buffer.area.bottom())
