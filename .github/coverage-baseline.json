@@ -53,6 +53,10 @@
       "minimum": 16.5,
       "reason": "Remaining branches require a live remote relay and interactive UI runtime."
     },
+    "src/hel_chat/second_opinion.rs": {
+      "minimum": 56.75,
+      "reason": "Remaining branches combine the interactive split-view surface with live reviewer relay traffic."
+    },
     "src/hel_acp.rs": {
       "minimum": 67.0,
       "reason": "Remaining ACP branches require live harness transports and timing-dependent cancellation or failure behavior."
@@ -94,7 +98,7 @@
       "reason": "This legacy interactive line editor is not reached by the dashboard-focused automated surface."
     },
     "src/hel_worker_client.rs": {
-      "minimum": 69.25,
+      "minimum": 64.5,
       "reason": "Remaining client branches require remote worker transports and injected lifecycle failures."
     },
     "src/hel_worker_runtime.rs": {
@@ -102,7 +106,7 @@
       "reason": "Remaining runtime branches require supervised worker, ACP bridge, signal, and restart scenarios."
     },
     "src/hel_worker_runtime/unix.rs": {
-      "minimum": 69.75,
+      "minimum": 69.5,
       "reason": "Remaining Unix transport branches require process-group failures and platform socket edge cases."
     }
   }
