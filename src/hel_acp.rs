@@ -617,7 +617,15 @@ fn is_plan_permission(request: &RequestPermissionRequest) -> bool {
     let Ok(value) = serde_json::to_value(request) else {
         return false;
     };
-    nested_string_matches(&value, &["kind"], &|kind| kind == "plan_review")
+    // Claude Code's ExitPlanMode approval arrives as a `switch_mode` tool call
+    // whose rawInput carries the plan text and a `planFilePath`; its title is
+    // "Ready to code?" and its options are generic permission-mode ids
+    // (`default`, `acceptEdits`, `plan`, ...). None of those match a title or
+    // option-id heuristic, so key on the tool kind and the plan payload.
+    nested_string_matches(&value, &["kind"], &|kind| {
+        kind == "plan_review" || kind == "switch_mode"
+    })
+        || nested_string(&value, &["planFilePath", "plan_file_path"]).is_some()
         || nested_string_matches(&value, &["title", "name"], &|name| {
             let normalized = name.to_ascii_lowercase().replace([' ', '_'], "");
             normalized.contains("implementthisplan") || normalized.contains("exitplanmode")
@@ -724,9 +732,6 @@ fn permission_plan_response(
     response: ElicitationResponse,
 ) -> RequestPermissionResponse {
     let (action, _) = plan_review_answer(response);
-    if action == "keep_planning" {
-        return RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
-    }
     let needles: &[&str] = match action.as_str() {
         "implement" => &["implement_plan", "plan_approve", "default", "approve"],
         "revise" => &["plan_revise", "revise"],
@@ -744,14 +749,36 @@ fn permission_plan_response(
                 .any(|needle| id.contains(needle) || name.contains(needle))
         })
         .or_else(|| {
-            (action == "implement")
-                .then(|| {
-                    request.options.iter().find(|option| {
-                        option.kind == PermissionOptionKind::AllowOnce
-                            || option.kind == PermissionOptionKind::AllowAlways
+            // No harness-specific option id matched. Claude's "Ready to code?"
+            // exposes only generic kinds, so fall back by intent: implement
+            // takes an allow option; every decline (revise, keep_planning,
+            // exit) takes a reject option to stay in plan mode rather than
+            // cancelling the turn.
+            if action == "implement" {
+                // Prefer the least-privileged approval so an unmatched harness
+                // never silently escalates to a bypass-permissions option.
+                request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+                    .or_else(|| {
+                        request
+                            .options
+                            .iter()
+                            .find(|option| option.kind == PermissionOptionKind::AllowAlways)
                     })
-                })
-                .flatten()
+            } else {
+                request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == PermissionOptionKind::RejectOnce)
+                    .or_else(|| {
+                        request
+                            .options
+                            .iter()
+                            .find(|option| option.kind == PermissionOptionKind::RejectAlways)
+                    })
+            }
         });
     selected.map_or_else(
         || RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
@@ -1054,6 +1081,24 @@ where
                         }
                     });
                     return Ok(());
+                }
+                // A permission request that is_plan_permission() did not classify
+                // reaches the deny path below. Log its raw shape so an agent whose
+                // request form we do not yet recognize is diagnosable from
+                // worker.log instead of only surfacing as a silent denial.
+                match serde_json::to_value(&request) {
+                    Ok(raw) => tracing::debug!(
+                        target: "hel_acp::plan_diag",
+                        operation = "unclassified_permission_request",
+                        request = %raw,
+                        "permission request not classified as a plan review; raw payload follows"
+                    ),
+                    Err(error) => tracing::debug!(
+                        target: "hel_acp::plan_diag",
+                        operation = "unclassified_permission_request",
+                        %error,
+                        "permission request not classified as a plan review and could not be serialized"
+                    ),
                 }
                 if permission_policy.is_unconstrained() {
                     permission_events
