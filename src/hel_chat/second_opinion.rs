@@ -248,6 +248,13 @@ impl ReviewerPane {
             .filter(|text| !text.trim().is_empty())
     }
 
+    /// Forms the reviewer's harness is waiting on.
+    pub(super) fn pending_elicitations(&self) -> &[ElicitationRequest] {
+        self.session
+            .as_ref()
+            .map_or(&[], |session| session.pending_elicitations.as_slice())
+    }
+
     /// Whether the reviewer has produced anything yet.
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -1093,6 +1100,51 @@ mod tests {
         });
         assert_eq!(outcome, ChatAction::None);
         assert!(chat.second_opinion_split(), "the split stays up");
+    }
+
+    /// A reviewer's form must be answered, or the review stalls waiting on a
+    /// harness nobody is talking to. It is shown in the ordinary dialog and
+    /// its answer is routed back to the reviewer, never to the planner.
+    #[test]
+    fn a_reviewer_form_is_answered_back_to_the_reviewer() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let form = crate::hel_elicitation::ElicitationRequest {
+            id: "reviewer-form-1".into(),
+            message: "Allow reading /etc?".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+        };
+        assert!(chat.show_reviewer_elicitation(form));
+        assert!(chat.reviewer_elicitation_open());
+
+        // The primary's own projection must not take a reviewer's form down.
+        chat.sync_elicitation(&[]);
+        assert!(chat.reviewer_elicitation_open());
+
+        let action = press(&mut chat, KeyCode::Esc);
+        let ChatAction::RespondReviewerElicitation { elicitation_id, .. } = action else {
+            panic!("a reviewer's answer goes to the reviewer: {action:?}");
+        };
+        assert_eq!(elicitation_id, "reviewer-form-1");
+        assert!(!chat.reviewer_elicitation_open());
+    }
+
+    #[test]
+    fn the_primary_form_keeps_the_screen_over_a_reviewer_one() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.restore_elicitation(plan_review());
+        let reviewer_form = crate::hel_elicitation::ElicitationRequest {
+            id: "reviewer-form-1".into(),
+            message: "Allow reading /etc?".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+        };
+        // An answer the planning harness is blocked on matters more than one
+        // its reviewer is.
+        assert!(!chat.show_reviewer_elicitation(reviewer_form));
+        assert!(!chat.reviewer_elicitation_open());
     }
 
     #[test]

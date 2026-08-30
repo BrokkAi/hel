@@ -175,6 +175,42 @@ impl ReviewerSidecar {
                 Ok(response)
             }
             ReviewerRequest::Status => self.forward(RelayRequest::Status),
+            ReviewerRequest::RespondElicitation {
+                elicitation_id,
+                response,
+            } => self.respond_elicitation(elicitation_id, response).await,
+        }
+    }
+
+    /// Answers a form the reviewer's harness is waiting on.
+    ///
+    /// The answer goes straight to the reviewer's ACP runtime, never through
+    /// its command queue: form content is the user's, and the primary's
+    /// answers are kept out of the durable ledger for the same reason.
+    async fn respond_elicitation(
+        &mut self,
+        elicitation_id: String,
+        response: crate::hel_elicitation::ElicitationResponse,
+    ) -> Result<RelayResponseBody> {
+        let Some(running) = self.running.as_ref() else {
+            bail!("no reviewer is running to answer that form");
+        };
+        let (resolved, resolution) = tokio::sync::oneshot::channel();
+        running
+            .commands
+            .send(CommandRequest::ResolveElicitation {
+                elicitation_id: elicitation_id.clone(),
+                response,
+                resolved,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("the reviewer runtime stopped before it could answer"))?;
+        match resolution.await {
+            Ok(Ok(())) => Ok(RelayResponseBody::Ok {
+                payload: RelayResponsePayload::ElicitationResolved { elicitation_id },
+            }),
+            Ok(Err(message)) => bail!("{message}"),
+            Err(_) => bail!("the reviewer runtime stopped before it answered"),
         }
     }
 

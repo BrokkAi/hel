@@ -161,6 +161,15 @@ pub enum ReviewerRequest {
         command: RelayCommand,
     },
     Status,
+    /// Answer a form the reviewer's harness is waiting on.
+    ///
+    /// A reviewer that asks for permission and is never answered stalls the
+    /// whole review, so its forms travel the same connection-only path the
+    /// primary's do.
+    RespondElicitation {
+        elicitation_id: String,
+        response: ElicitationResponse,
+    },
     /// Cancel any turn in flight and stop the reviewer's process group,
     /// keeping its staged profile, native session and journal for next time.
     Pause,
@@ -174,6 +183,7 @@ impl ReviewerRequest {
             Self::Acknowledge { .. } => "reviewer_acknowledge",
             Self::Submit { .. } => "reviewer_submit",
             Self::Status => "reviewer_status",
+            Self::RespondElicitation { .. } => "reviewer_respond_elicitation",
             Self::Pause => "reviewer_pause",
         }
     }
