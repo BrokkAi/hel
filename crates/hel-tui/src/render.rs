@@ -21,8 +21,9 @@ use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
 
 use crate::dialogs::{
-    render_confirmation, render_container_editor, render_import_bundle_confirmation,
-    render_import_progress, render_rename_editor, render_repository_origin,
+    render_config_id_editor, render_confirmation, render_container_editor,
+    render_import_bundle_confirmation, render_import_progress, render_rename_editor,
+    render_repository_origin, render_session_edit, render_target_actions, render_web_dialog,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::{render_resume_dialog, resume_sessions_pane};
@@ -97,6 +98,12 @@ fn render_modal(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
         Mode::RepositoryOrigin(dialog) => {
             render_repository_origin(frame, area, dialog, &mut surfaces)
         }
+        Mode::SessionEdit(dialog) => render_session_edit(frame, area, dialog, &mut surfaces),
+        Mode::ConfigId(editor) => render_config_id_editor(frame, area, editor, &mut surfaces),
+        Mode::TargetActions(dialog) => {
+            render_target_actions(frame, area, dashboard, dialog, &mut surfaces)
+        }
+        Mode::Web(dialog) => render_web_dialog(frame, area, dialog, &mut surfaces),
         Mode::Rename(editor) => render_rename_editor(frame, area, editor, &mut surfaces),
         Mode::EditContainer(editor) => render_container_editor(frame, area, editor, &mut surfaces),
         Mode::Importing(progress) => render_import_progress(frame, area, progress, &mut surfaces),
@@ -1064,28 +1071,32 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .unwrap_or_default()
         .as_secs();
     let rows = dashboard.capacity_details.values().map(|detail| {
-        let capacity = match (&detail.target.kind, &detail.usage) {
-            (DeploymentCapacityKind::Host, Some(usage)) => {
-                let memory_percent = if usage.memory_total_bytes == 0 {
-                    0
-                } else {
-                    (u128::from(usage.memory_used_bytes) * 100
-                        / u128::from(usage.memory_total_bytes))
-                    .min(100)
-                };
-                format!(
-                    "{}% CPU · {memory_percent}% RAM",
-                    usage.cpu_percent.unwrap_or(0)
-                )
+        let capacity = if detail.refreshing {
+            "refreshing…".into()
+        } else {
+            match (&detail.target.kind, &detail.usage) {
+                (DeploymentCapacityKind::Host, Some(usage)) => {
+                    let memory_percent = if usage.memory_total_bytes == 0 {
+                        0
+                    } else {
+                        (u128::from(usage.memory_used_bytes) * 100
+                            / u128::from(usage.memory_total_bytes))
+                        .min(100)
+                    };
+                    format!(
+                        "{}% CPU · {memory_percent}% RAM",
+                        usage.cpu_percent.unwrap_or(0)
+                    )
+                }
+                (DeploymentCapacityKind::AwsFleet, Some(usage)) => format!(
+                    "{} cores · {} RAM · {} disk",
+                    usage.logical_cores,
+                    format_resource_bytes(usage.memory_total_bytes),
+                    format_resource_bytes(usage.disk_total_bytes.unwrap_or(0))
+                ),
+                (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => "on demand".into(),
+                _ => "unavailable".into(),
             }
-            (DeploymentCapacityKind::AwsFleet, Some(usage)) => format!(
-                "{} cores · {} RAM · {} disk",
-                usage.logical_cores,
-                format_resource_bytes(usage.memory_total_bytes),
-                format_resource_bytes(usage.disk_total_bytes.unwrap_or(0))
-            ),
-            (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => "on demand".into(),
-            _ => "unavailable".into(),
         };
         let mut in_use = vec![Span::raw(capacity)];
         if let Some(staleness) = capacity_staleness(detail, now_epoch_seconds) {
@@ -1473,14 +1484,10 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · [S] Resume · [W]orkspaces · [R]ename · [E]dit container · sto[P] · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [S] Resume · [W]orkspaces · [E]dit · We[b] · mark [A]ll read · [Q]uit · Tab pane"
         }
-        Focus::Capacity => {
-            "[N]ew · [S] Resume · [W]orkspaces · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
-        }
-        Focus::Quotas => {
-            "[N]ew · [S] Resume · [W]orkspaces · [R]efresh · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
-        }
+        Focus::Capacity => "[W]orkspaces · [E]dit targets · [R]efresh · We[b] · [Q]uit · Tab pane",
+        Focus::Quotas => "[W]orkspaces · [E]dit profile · [R]efresh · We[b] · [Q]uit · Tab pane",
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -1587,7 +1594,11 @@ mod tests {
         let mut dashboard = dashboard_with_session(running_session());
         dashboard.set_greeting("UNDERLYING DASHBOARD SENTINEL".into());
         assert_eq!(
-            dashboard.handle_key(crate::test_support::ctrl_key('r')),
+            dashboard.handle_key(crate::test_support::ctrl_key('e')),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(crate::test_support::key(KeyCode::Enter)),
             DashboardAction::None
         );
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
@@ -1706,10 +1717,7 @@ mod tests {
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("You: unanswered follow-up"));
-        assert!(
-            rendered.contains("│ Checking the workspace"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("│ Checking the workspace"), "{rendered}");
         assert!(!rendered.contains("Agent:"));
         assert!(!rendered.contains("answer 0"));
         let (user_row, user_line) = lines

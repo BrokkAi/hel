@@ -14,7 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result as AnyResult};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HeaderValue, SET_COOKIE};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_TYPE, COOKIE, HeaderValue, LOCATION, REFERRER_POLICY, SET_COOKIE,
+};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
@@ -100,6 +102,7 @@ pub struct ServerOptions {
     pub secure_cookie: bool,
     tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     viewer_code: String,
+    login_token: String,
     cookie_key: Vec<u8>,
 }
 
@@ -122,12 +125,17 @@ impl ServerOptions {
             secure_cookie: true,
             tls_config: None,
             viewer_code: generate_viewer_code()?,
+            login_token: generate_login_token()?,
             cookie_key: generate_cookie_key()?.to_vec(),
         })
     }
 
     pub fn viewer_code(&self) -> &str {
         &self.viewer_code
+    }
+
+    pub fn login_token(&self) -> &str {
+        &self.login_token
     }
 
     /// Serve HTTPS directly using the supplied Rustls configuration. Hel's
@@ -152,6 +160,7 @@ impl ServerOptions {
     #[cfg(test)]
     fn with_test_credentials(mut self, code: &str, key: &[u8]) -> Self {
         self.viewer_code = code.to_string();
+        self.login_token = "test-login-token".into();
         self.cookie_key = key.to_vec();
         self.secure_cookie = false;
         self
@@ -524,6 +533,7 @@ struct ServerState {
     action_tx: mpsc::Sender<ControllerRequest>,
     receipt_tx: mpsc::Sender<ReadReceiptRequest>,
     viewer_code: Arc<str>,
+    login_token: Arc<str>,
     cookie_key: Arc<[u8]>,
     session_ttl: Duration,
     secure_cookie: bool,
@@ -588,6 +598,7 @@ fn router(options: ServerOptions) -> Router {
         action_tx: options.action_tx,
         receipt_tx: options.receipt_tx,
         viewer_code: options.viewer_code.into(),
+        login_token: options.login_token.into(),
         cookie_key: options.cookie_key.into(),
         session_ttl: options.session_ttl,
         secure_cookie: options.secure_cookie,
@@ -613,6 +624,7 @@ fn router(options: ServerOptions) -> Router {
         .route("/service-worker.js", get(service_worker))
         .route("/icon.svg", get(icon))
         .route("/auth/session", post(create_session).delete(clear_session))
+        .route("/auth/login", get(create_session_from_query))
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -641,6 +653,32 @@ struct LoginRequest {
     code: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginQuery {
+    token: String,
+}
+
+async fn create_session_from_query(
+    State(state): State<ServerState>,
+    Query(query): Query<LoginQuery>,
+) -> Result<Response<Body>, ApiError> {
+    if !constant_time_eq(state.login_token.as_bytes(), query.token.trim().as_bytes()) {
+        return Err(ApiError::unauthorized());
+    }
+    let mut response = issue_session_cookie(&state, StatusCode::SEE_OTHER)?;
+    response
+        .headers_mut()
+        .insert(LOCATION, HeaderValue::from_static("/"));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    Ok(response)
+}
+
 async fn create_session(
     State(state): State<ServerState>,
     Json(request): Json<LoginRequest>,
@@ -656,6 +694,13 @@ async fn create_session(
         return Err(ApiError::unauthorized());
     }
     reset_code_failures(&state);
+    issue_session_cookie(&state, StatusCode::NO_CONTENT)
+}
+
+fn issue_session_cookie(
+    state: &ServerState,
+    status: StatusCode,
+) -> Result<Response<Body>, ApiError> {
     let ephemeral = state.session_ttl.is_zero();
     let validity = if ephemeral {
         EPHEMERAL_SESSION_TTL
@@ -671,7 +716,7 @@ async fn create_session(
         (!ephemeral).then_some(validity.as_secs()),
         state.secure_cookie,
     )?;
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    let mut response = status.into_response();
     response.headers_mut().insert(SET_COOKIE, cookie);
     Ok(response)
 }
@@ -1058,6 +1103,13 @@ fn generate_viewer_code() -> AnyResult<String> {
     }
 }
 
+fn generate_login_token() -> AnyResult<String> {
+    let mut token = [0_u8; 32];
+    getrandom::fill(&mut token)
+        .map_err(|error| anyhow::anyhow!("generate Hel viewer login token: {error}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token))
+}
+
 fn generate_cookie_key() -> AnyResult<[u8; COOKIE_KEY_BYTES]> {
     let mut key = [0_u8; COOKIE_KEY_BYTES];
     getrandom::fill(&mut key)
@@ -1437,6 +1489,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn qr_login_exchanges_the_secret_for_a_cookie_and_redirects_cleanly() {
+        let (app, _, _) = app();
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::get("/auth/login?token=wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .oneshot(
+                Request::get("/auth/login?token=test-login-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+        assert_eq!(accepted.headers().get(LOCATION).unwrap(), "/");
+        assert_eq!(accepted.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+        assert!(accepted.headers().contains_key(SET_COOKIE));
     }
 
     #[test]

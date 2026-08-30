@@ -21,8 +21,9 @@ use hel::hel_state::{
 use hel::hel_targets::AdditionalMount;
 
 use crate::dialogs::{
-    ConfirmDialog, Confirmation, ContainerEditor, FORCE_STOP_CONFIRMATION,
+    ConfigIdEditor, ConfirmDialog, Confirmation, ContainerEditor, FORCE_STOP_CONFIRMATION,
     ImportBundleConfirmation, ImportProgress, RenameEditor, RenameFocus, RepositoryOriginDialog,
+    SessionEditDialog, TargetActionsDialog, WebDialog,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::ResumeDialog;
@@ -129,6 +130,20 @@ pub enum DashboardAction {
         title: String,
     },
     RefreshQuotas,
+    RefreshCapacity,
+    RenameProfile {
+        old_id: String,
+        new_id: String,
+    },
+    RenameTarget {
+        old_id: String,
+        new_id: String,
+    },
+    TestTarget {
+        target_id: String,
+    },
+    CancelTargetTest,
+    LoadWebAccess,
     /// Read the system clipboard on a worker before applying its contents.
     /// Clipboard providers may perform IPC and must never run on the TUI loop.
     PasteFromClipboard,
@@ -172,6 +187,17 @@ pub enum DashboardAction {
     QuitDetach,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebViewerAccess {
+    Ready {
+        viewer_url: String,
+        viewer_code: String,
+        qr_login_url: Option<String>,
+        fallback_reason: Option<String>,
+    },
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOperationKind {
     Launching,
@@ -210,6 +236,10 @@ pub(crate) enum Mode {
     /// The unified picker for every session that is not live.
     ResumeDialog(ResumeDialog),
     RepositoryOrigin(RepositoryOriginDialog),
+    SessionEdit(SessionEditDialog),
+    ConfigId(ConfigIdEditor),
+    TargetActions(TargetActionsDialog),
+    Web(WebDialog),
     Rename(RenameEditor),
     EditContainer(ContainerEditor),
     Importing(ImportProgress),
@@ -397,6 +427,16 @@ impl DashboardState {
             Mode::Resume(wizard) => self.handle_resume_key(key, wizard),
             Mode::ResumeDialog(_) => unreachable!("the resume dialog is handled in place"),
             Mode::RepositoryOrigin(dialog) => self.handle_repository_origin_key(key, dialog),
+            Mode::SessionEdit(dialog) => self.handle_session_edit_key(key, dialog),
+            Mode::ConfigId(editor) => self.handle_config_id_key(key, editor),
+            Mode::TargetActions(dialog) => self.handle_target_actions_key(key, dialog),
+            Mode::Web(_) => match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                _ => DashboardAction::None,
+            },
             Mode::Rename(editor) => self.handle_rename_key(key, editor),
             Mode::EditContainer(editor) => self.handle_container_edit_key(key, editor),
             // The only control is the Cancel button, so Enter presses it too.
@@ -589,6 +629,10 @@ impl DashboardState {
                 self.cycle_focus(true);
                 DashboardAction::None
             }
+            (KeyCode::Char('b'), true) => {
+                self.mode = Mode::Web(WebDialog::loading());
+                DashboardAction::LoadWebAccess
+            }
             (KeyCode::Up | KeyCode::Char('k'), false) => {
                 self.move_selection(-1);
                 DashboardAction::None
@@ -606,7 +650,7 @@ impl DashboardState {
                 self.set_selection(len.saturating_sub(1));
                 DashboardAction::None
             }
-            (KeyCode::Char('a'), true) => self.mark_all_read(),
+            (KeyCode::Char('a'), true) if self.focus == Focus::Active => self.mark_all_read(),
             (KeyCode::Char(digit @ '1'..='9'), false) if self.focus == Focus::Active => {
                 self.expand_project_number(digit.to_digit(10).unwrap_or(0) as usize);
                 DashboardAction::None
@@ -615,8 +659,8 @@ impl DashboardState {
                 self.expand_selected_project();
                 DashboardAction::None
             }
-            (KeyCode::Char('n'), true) => self.begin_new(),
-            (KeyCode::Char('x'), true) => {
+            (KeyCode::Char('n'), true) if self.focus == Focus::Active => self.begin_new(),
+            (KeyCode::Char('x'), true) if self.focus == Focus::Active => {
                 let session_id = self.selected_session().and_then(|session| {
                     self.session_operations
                         .contains_key(&session.id)
@@ -626,40 +670,34 @@ impl DashboardState {
                     DashboardAction::CancelOperation { session_id }
                 })
             }
-            (KeyCode::Char('s'), true) => DashboardAction::OpenResumeDialog,
-            (KeyCode::Char('r'), true) => {
-                if self.focus == Focus::Quotas {
-                    DashboardAction::RefreshQuotas
-                } else if self.focus == Focus::Active {
-                    if !self.reject_selected_operation() {
-                        self.begin_rename();
-                    }
-                    DashboardAction::None
-                } else {
-                    DashboardAction::None
-                }
+            (KeyCode::Char('s'), true) if self.focus == Focus::Active => {
+                DashboardAction::OpenResumeDialog
             }
-            (KeyCode::Char('u'), true) => DashboardAction::RefreshQuotas,
+            (KeyCode::Char('r'), true) if self.focus == Focus::Capacity => {
+                DashboardAction::RefreshCapacity
+            }
+            (KeyCode::Char('r'), true) if self.focus == Focus::Quotas => {
+                DashboardAction::RefreshQuotas
+            }
             // Setup and the container editor never both apply: setup only
             // opens while the config is empty, and an empty config has no
             // sessions to select.
             (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
             (KeyCode::Char('e'), true) if self.focus == Focus::Active => {
-                self.begin_container_edit();
+                self.begin_session_edit();
                 DashboardAction::None
             }
-            (KeyCode::Char('p'), true) if self.focus == Focus::Active => {
-                if self.reject_selected_operation() {
-                    return DashboardAction::None;
-                }
-                if let Some(session) = self.selected_session() {
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
-                        session_id: session.id.clone(),
-                    }));
-                }
+            (KeyCode::Char('e'), true) if self.focus == Focus::Capacity => {
+                self.begin_target_actions();
                 DashboardAction::None
             }
-            (KeyCode::Enter, _) | (KeyCode::Char('o'), true) => self.open_or_resume(),
+            (KeyCode::Char('e'), true) if self.focus == Focus::Quotas => {
+                self.begin_profile_rename();
+                DashboardAction::None
+            }
+            (KeyCode::Enter, _) | (KeyCode::Char('o'), true) if self.focus == Focus::Active => {
+                self.open_or_resume()
+            }
             _ => DashboardAction::None,
         }
     }
@@ -1087,10 +1125,7 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(dashboard.handle_key(ctrl_key('k')), DashboardAction::None);
-        assert_eq!(
-            dashboard.handle_key(ctrl_key('u')),
-            DashboardAction::RefreshQuotas
-        );
+        assert_eq!(dashboard.handle_key(ctrl_key('u')), DashboardAction::None);
         assert_eq!(
             dashboard.handle_key(ctrl_key('s')),
             DashboardAction::OpenResumeDialog
@@ -1115,6 +1150,41 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(dashboard.focus, Focus::Capacity);
+    }
+
+    #[test]
+    fn dashboard_action_hotkeys_follow_the_focused_pane() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        assert_eq!(dashboard.handle_key(ctrl_key('r')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('b')),
+            DashboardAction::LoadWebAccess
+        );
+        dashboard.cancel_modal();
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Capacity);
+        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('r')),
+            DashboardAction::RefreshCapacity
+        );
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('w')),
+            DashboardAction::OpenWorkspacePicker
+        );
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Quotas);
+        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('r')),
+            DashboardAction::RefreshQuotas
+        );
+        assert_eq!(dashboard.handle_key(ctrl_key('u')), DashboardAction::None);
     }
 
     /// The notice bar is the only report a background failure gets, so a key
@@ -1178,7 +1248,11 @@ mod tests {
         running.state = SessionState::Running;
         running.checkpoint = None;
         let mut rename = dashboard_with_session(running);
-        assert_eq!(rename.handle_key(ctrl_key('r')), DashboardAction::None);
+        assert_eq!(rename.handle_key(ctrl_key('e')), DashboardAction::None);
+        assert_eq!(
+            rename.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
 
         let mut importing = dashboard_with_session(stopped_session());
         importing.show_import_progress("Chosen session".into());
@@ -1372,7 +1446,8 @@ mod tests {
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
-        dashboard.handle_key(ctrl_key('r'));
+        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Enter));
         let Mode::Rename(editor) = &mut dashboard.mode else {
             panic!("expected rename editor")
         };

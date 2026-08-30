@@ -41,7 +41,7 @@ use crate::pollers::{
     spawn_interrupted_close_recovery,
 };
 
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -128,6 +128,7 @@ impl RuntimeSessionView {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeSnapshot {
     pub revision: u64,
+    pub config: HelConfig,
     pub sessions: Vec<RuntimeSessionView>,
     pub lifecycles: Vec<RuntimeLifecycleView>,
 }
@@ -228,6 +229,14 @@ enum DaemonAction {
         workspace_id: String,
         after_revision: u64,
     },
+    RenameProfile {
+        old_id: String,
+        new_id: String,
+    },
+    RenameTarget {
+        old_id: String,
+        new_id: String,
+    },
     SubmitSessionCommand {
         session_id: String,
         command_id: String,
@@ -303,7 +312,73 @@ pub(crate) struct DaemonStatus {
     pub started_at: String,
     pub build_version: String,
     pub attached_clients: usize,
-    pub phone_status: String,
+    pub phone_status: WebViewerStatus,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub(crate) enum WebViewerStatus {
+    Disabled,
+    Starting,
+    Ready {
+        viewer_url: String,
+        viewer_code: String,
+        qr_login_url: Option<String>,
+        fallback_reason: Option<String>,
+    },
+    Stopped,
+    Error {
+        message: String,
+    },
+}
+
+impl std::fmt::Debug for WebViewerStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready {
+                viewer_url,
+                viewer_code,
+                fallback_reason,
+                ..
+            } => formatter
+                .debug_struct("Ready")
+                .field("viewer_url", viewer_url)
+                .field("viewer_code", viewer_code)
+                .field("qr_login_url", &"[redacted]")
+                .field("fallback_reason", fallback_reason)
+                .finish(),
+            Self::Disabled => formatter.write_str("Disabled"),
+            Self::Starting => formatter.write_str("Starting"),
+            Self::Stopped => formatter.write_str("Stopped"),
+            Self::Error { message } => formatter.debug_tuple("Error").field(message).finish(),
+        }
+    }
+}
+
+impl std::fmt::Display for WebViewerStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => formatter.write_str("disabled"),
+            Self::Starting => formatter.write_str("starting"),
+            Self::Stopped => formatter.write_str("stopped unexpectedly"),
+            Self::Error { message } => write!(formatter, "error: {message}"),
+            Self::Ready {
+                viewer_url,
+                viewer_code,
+                fallback_reason,
+                ..
+            } => {
+                write!(formatter, "{viewer_url}; viewer code {viewer_code}")?;
+                if let Some(reason) = fallback_reason {
+                    write!(
+                        formatter,
+                        "; local only because Tailscale HTTPS is unavailable: {reason}"
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -314,7 +389,7 @@ struct Attachment {
 
 pub(crate) struct RuntimeState {
     attachments: Mutex<BTreeMap<String, Attachment>>,
-    phone_status: Mutex<String>,
+    phone_status: Mutex<WebViewerStatus>,
     ever_attached: AtomicBool,
     sessions: Mutex<BTreeMap<String, RuntimeSessionView>>,
     revision: std::sync::atomic::AtomicU64,
@@ -322,6 +397,7 @@ pub(crate) struct RuntimeState {
     session_manager: SessionManagerControl,
     lifecycle: Mutex<BTreeMap<String, ActiveLifecycle>>,
     controller: Mutex<Controller>,
+    config_mutation: tokio::sync::Mutex<()>,
     recovery_observer: RecoveryObserver,
 }
 
@@ -372,7 +448,7 @@ impl RuntimeState {
         let (revision_tx, _) = tokio::sync::watch::channel(0);
         Self {
             attachments: Mutex::new(BTreeMap::new()),
-            phone_status: Mutex::new(String::new()),
+            phone_status: Mutex::new(WebViewerStatus::Starting),
             ever_attached: AtomicBool::new(false),
             sessions: Mutex::new(BTreeMap::new()),
             revision: std::sync::atomic::AtomicU64::new(0),
@@ -380,6 +456,7 @@ impl RuntimeState {
             session_manager,
             lifecycle: Mutex::new(BTreeMap::new()),
             controller: Mutex::new(controller),
+            config_mutation: tokio::sync::Mutex::new(()),
             recovery_observer,
         }
     }
@@ -395,14 +472,14 @@ impl RuntimeState {
             .retain(|_, attachment| process_is_alive(attachment.pid));
     }
 
-    fn set_phone_status(&self, status: impl Into<String>) {
+    fn set_phone_status(&self, status: WebViewerStatus) {
         *self
             .phone_status
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = status.into();
+            .unwrap_or_else(PoisonError::into_inner) = status;
     }
 
-    fn phone_status(&self) -> String {
+    fn phone_status(&self) -> WebViewerStatus {
         self.phone_status
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -485,6 +562,12 @@ impl RuntimeState {
             .collect();
         Ok(RuntimeSnapshot {
             revision,
+            config: self
+                .controller
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .config
+                .clone(),
             sessions,
             lifecycles,
         })
@@ -1178,6 +1261,26 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) async fn rename_profile(&mut self, old_id: String, new_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::RenameProfile { old_id, new_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected rename-profile reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn rename_target(&mut self, old_id: String, new_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::RenameTarget { old_id, new_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected rename-target reply {reply:?}"),
+        }
+    }
+
     pub(crate) async fn create_workspace(&mut self, name: String) -> Result<WorkspaceRecord> {
         match self.request(DaemonAction::CreateWorkspace { name }).await? {
             DaemonReply::Workspace(workspace) => Ok(workspace),
@@ -1529,6 +1632,7 @@ pub(crate) fn maintain_attachment(
 
 pub(crate) async fn run_daemon_process() -> Result<()> {
     let _guard = ControllerStoreGuard::acquire()?;
+    Controller::recover_config_id_rename()?;
     HelConfig::migrate_legacy_localhost_target()?;
     let config = HelConfig::load()?;
     hel::hel_database::recover_interrupted_checkpointing_sessions(
@@ -1609,7 +1713,7 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
             },
         );
     } else {
-        state.set_phone_status("disabled");
+        state.set_phone_status(WebViewerStatus::Disabled);
     }
     loop {
         tokio::select! {
@@ -1698,6 +1802,9 @@ fn spawn_manager_target_refresher(
             tokio::select! {
                 _ = cancellation.cancelled() => return,
                 _ = interval.tick() => {
+                    // Keep a controller loaded from the old config from being
+                    // installed after a concurrent id rename has committed.
+                    let _config_mutation = state.config_mutation.lock().await;
                     match tokio::task::spawn_blocking(|| {
                         Controller::load().map(|controller| {
                             let targets = dashboard_worker_targets(&controller);
@@ -1705,8 +1812,20 @@ fn spawn_manager_target_refresher(
                         })
                     }).await {
                         Ok(Ok((controller, refreshed))) => {
-                            *state.controller.lock().unwrap_or_else(PoisonError::into_inner) = controller;
+                            let changed = {
+                                let mut current = state
+                                    .controller
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner);
+                                let changed = current.config != controller.config;
+                                *current = controller;
+                                changed
+                            };
                             targets.send_replace(refreshed);
+                            if changed {
+                                let revision = state.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                                state.revision_tx.send_replace(revision);
+                            }
                         }
                         Ok(Err(error)) => {
                             tracing::warn!(error = format!("{error:#}"), "could not refresh daemon session targets");
@@ -1748,7 +1867,7 @@ fn spawn_phone_server(
     state: Arc<RuntimeState>,
     worker: SessionManagerChannels,
 ) {
-    state.set_phone_status("starting");
+    state.set_phone_status(WebViewerStatus::Starting);
     tokio::spawn(async move {
         let reporter = {
             let state = state.clone();
@@ -1764,10 +1883,12 @@ fn spawn_phone_server(
         .await
         {
             Ok(()) if cancellation.is_cancelled() => {}
-            Ok(()) => state.set_phone_status("stopped unexpectedly"),
+            Ok(()) => state.set_phone_status(WebViewerStatus::Stopped),
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "phone server stopped");
-                state.set_phone_status(format!("error: {error:#}"));
+                state.set_phone_status(WebViewerStatus::Error {
+                    message: format!("{error:#}"),
+                });
             }
         }
     });
@@ -1999,6 +2120,30 @@ async fn handle_action(
                 .runtime_snapshot(&workspace_id, after_revision)
                 .await?,
         )),
+        DaemonAction::RenameProfile { old_id, new_id } => {
+            let _config_mutation = state.config_mutation.lock().await;
+            ensure_no_active_lifecycle(state)?;
+            let controller = blocking(move || {
+                let mut controller = Controller::load()?;
+                controller.rename_profile_id(&old_id, &new_id)?;
+                Ok(controller)
+            })
+            .await?;
+            install_renamed_controller(state, controller);
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::RenameTarget { old_id, new_id } => {
+            let _config_mutation = state.config_mutation.lock().await;
+            ensure_no_active_lifecycle(state)?;
+            let controller = blocking(move || {
+                let mut controller = Controller::load()?;
+                controller.rename_target_id(&old_id, &new_id)?;
+                Ok(controller)
+            })
+            .await?;
+            install_renamed_controller(state, controller);
+            Ok(DaemonReply::Done)
+        }
         DaemonAction::SubmitSessionCommand {
             session_id,
             command_id,
@@ -2066,6 +2211,28 @@ async fn handle_action(
             Ok(DaemonReply::Done)
         }
     }
+}
+
+fn ensure_no_active_lifecycle(state: &RuntimeState) -> Result<()> {
+    ensure!(
+        !state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|active| active.result.borrow().is_none()),
+        "cannot rename configuration while a session lifecycle operation is active"
+    );
+    Ok(())
+}
+
+fn install_renamed_controller(state: &RuntimeState, controller: Controller) {
+    *state
+        .controller
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = controller;
+    let revision = state.revision.fetch_add(1, Ordering::AcqRel) + 1;
+    state.revision_tx.send_replace(revision);
 }
 
 fn workspace_snapshot(workspace_id: &str) -> Result<WorkspaceSnapshot> {

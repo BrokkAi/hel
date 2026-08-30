@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::hel_config::{AwsAddressSource, HelConfig, ProjectBundle, TargetTemplate, data_dir};
 use crate::hel_state::{SessionRecord, SessionResourceAllocation, TargetLocator, allocation_cpus};
@@ -236,6 +236,15 @@ impl Controller {
         targets.sort_by(|left, right| left.id.cmp(&right.id));
         targets
     }
+
+    pub fn test_target(&self, target_id: &str, executor: &impl CommandExecutor) -> Result<()> {
+        let template = self
+            .config
+            .targets
+            .get(target_id)
+            .with_context(|| format!("unknown target template {target_id:?}"))?;
+        preflight_target(template, executor)
+    }
 }
 
 pub(super) fn preflight_target(
@@ -283,7 +292,69 @@ pub(super) fn preflight_target(
             }
             Ok(())
         }
-        _ => Ok(()),
+        TargetTemplate::SshBare { ssh, .. } => {
+            let ssh = backend_ssh(ssh);
+            let command = hel_targets::ssh_connectivity_probe(&ssh);
+            let output = executor.execute(&command)?;
+            ensure!(
+                output.status == 0,
+                "SSH connectivity test failed for {} with status {}: {}",
+                ssh.destination,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Ok(())
+        }
+        TargetTemplate::AwsEc2 {
+            aws_profile,
+            region,
+            launch_template,
+            launch_template_version,
+            ..
+        } => {
+            let mut identity_args = vec!["sts".into(), "get-caller-identity".into()];
+            if let Some(profile) = aws_profile {
+                identity_args.extend(["--profile".into(), profile.clone()]);
+            }
+            let identity = CommandSpec::new("aws", identity_args)
+                .purpose("verify AWS credentials")
+                .stage(ProvisionStage::Provisioning);
+            let output = executor.execute(&identity)?;
+            ensure!(
+                output.status == 0,
+                "AWS credential test failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+
+            let mut launch_args = vec![
+                "ec2".into(),
+                "describe-launch-template-versions".into(),
+                "--region".into(),
+                region.clone(),
+                "--launch-template-name".into(),
+                launch_template.clone(),
+                "--versions".into(),
+                launch_template_version
+                    .clone()
+                    .unwrap_or_else(|| "$Default".into()),
+            ];
+            if let Some(profile) = aws_profile {
+                launch_args.extend(["--profile".into(), profile.clone()]);
+            }
+            let launch = CommandSpec::new("aws", launch_args)
+                .purpose("verify AWS launch template")
+                .stage(ProvisionStage::Provisioning);
+            let output = executor.execute(&launch)?;
+            ensure!(
+                output.status == 0,
+                "AWS launch-template test failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Ok(())
+        }
+        TargetTemplate::LocalBare => Ok(()),
     }
 }
 

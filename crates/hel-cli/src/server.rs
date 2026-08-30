@@ -22,7 +22,7 @@ use hel::hel_targets::{CancellableProcessExecutor, CommandExecutor};
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 
-use crate::daemon::{ResumeSessionRequest, RuntimeState};
+use crate::daemon::{ResumeSessionRequest, RuntimeState, WebViewerStatus};
 use crate::pollers::{
     CredentialSyncNotices, CredentialSyncSignalTracker, LifecycleUpdate, QUOTA_STALE_AFTER,
     QuotaRefreshBatch, QuotaUpdate, apply_worker_record_update, credential_sync_targets,
@@ -433,7 +433,7 @@ impl PhoneActionControl {
 pub(crate) async fn run_server(
     args: ServerArgs,
     termination: tokio_util::sync::CancellationToken,
-    report_status: impl FnOnce(String),
+    report_status: impl FnOnce(WebViewerStatus),
     worker: SessionManagerChannels,
     daemon_runtime: Arc<RuntimeState>,
 ) -> Result<()> {
@@ -515,15 +515,23 @@ pub(crate) async fn run_server(
     } else {
         anyhow::bail!("non-loopback web viewer requires TLS");
     }
-    let fallback = resolved
-        .fallback_reason
-        .map(|reason| format!("; local only because Tailscale HTTPS is unavailable: {reason}"))
-        .unwrap_or_default();
-    report_status(format!(
-        "{}; viewer code {}{fallback}",
-        resolved.viewer_url,
-        options.viewer_code()
-    ));
+    let fallback_reason = resolved.fallback_reason;
+    let qr_login_url = if fallback_reason.is_none() && resolved.viewer_url.starts_with("https://") {
+        let encoded = url::form_urlencoded::byte_serialize(options.login_token().as_bytes())
+            .collect::<String>();
+        Some(format!(
+            "{}/auth/login?token={encoded}",
+            resolved.viewer_url.trim_end_matches('/')
+        ))
+    } else {
+        None
+    };
+    report_status(WebViewerStatus::Ready {
+        viewer_url: resolved.viewer_url,
+        viewer_code: options.viewer_code().to_owned(),
+        qr_login_url,
+        fallback_reason,
+    });
 
     let serve = hel::hel_server::run_server(options);
     let control = async {

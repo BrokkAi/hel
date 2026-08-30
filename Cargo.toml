@@ -61,6 +61,7 @@ hmac = "0.12"
 iana-time-zone = "0.1"
 libc = "0.2"
 pulldown-cmark = { version = "0.10", default-features = false }
+qrcode = { version = "0.14", default-features = false }
 signal-hook = "0.3"
 sysinfo = "0.32"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }

@@ -446,6 +446,7 @@ pub(crate) struct CapacityDetail {
     /// Why the most recent probe failed, if it did. The last good reading stays
     /// on screen beside it rather than vanishing on one failed probe.
     pub(crate) probe_error: Option<String>,
+    pub(crate) refreshing: bool,
 }
 
 impl DashboardState {
@@ -654,6 +655,7 @@ impl DashboardState {
                         on_demand: false,
                         sampled_at_epoch_seconds: None,
                         probe_error: None,
+                        refreshing: false,
                     },
                     |mut detail| {
                         detail.target = target;
@@ -680,6 +682,7 @@ impl DashboardState {
         let Some(detail) = self.capacity_details.get_mut(target_id) else {
             return;
         };
+        detail.refreshing = false;
         match result {
             Ok(usage) => {
                 detail.on_demand = usage.is_none();
@@ -724,6 +727,12 @@ impl DashboardState {
                 }
                 _ => {}
             }
+        }
+    }
+
+    pub fn begin_capacity_refresh(&mut self) {
+        for detail in self.capacity_details.values_mut() {
+            detail.refreshing = true;
         }
     }
 

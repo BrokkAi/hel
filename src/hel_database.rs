@@ -640,6 +640,34 @@ pub fn set_session_title_override(session_id: &str, title: &str, updated_at: &st
     set_session_title_override_to(&database_path(), session_id, title, updated_at)
 }
 
+/// Rewrite a configured profile id in every persisted session in one SQLite
+/// transaction. Configuration is stored separately, so the controller owns
+/// coordinating this update with the matching config-map rename.
+pub fn rename_profile_references(old_id: &str, new_id: &str) -> Result<usize> {
+    rename_session_reference("last_profile", old_id, new_id)
+}
+
+/// Rewrite a configured target id in every persisted session in one SQLite
+/// transaction.
+pub fn rename_target_references(old_id: &str, new_id: &str) -> Result<usize> {
+    rename_session_reference("target_template_id", old_id, new_id)
+}
+
+fn rename_session_reference(column: &str, old_id: &str, new_id: &str) -> Result<usize> {
+    ensure!(
+        matches!(column, "last_profile" | "target_template_id"),
+        "unsupported session reference column"
+    );
+    let mut connection = open(&database_path())?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        &format!("UPDATE sessions SET {column} = ?2 WHERE {column} = ?1"),
+        params![old_id, new_id],
+    )?;
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// Change only whether the resume dialog hides this session. Archiving is a
 /// display choice, so it has its own writer and never rewrites lifecycle,
 /// checkpoint, or title columns another task owns.
