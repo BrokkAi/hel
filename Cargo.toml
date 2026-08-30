@@ -23,6 +23,10 @@ include = [
 [lib]
 name = "hel"
 
+[features]
+default = []
+test-hooks = []
+
 [workspace]
 members = [".", "crates/hel-tui", "crates/hel-cli", "voice-worker"]
 default-members = [".", "crates/hel-tui", "crates/hel-cli"]

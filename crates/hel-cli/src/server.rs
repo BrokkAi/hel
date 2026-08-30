@@ -464,7 +464,7 @@ pub(crate) async fn run_server(
         &mut quota_batch,
         &quota_profiles_tx,
     );
-    let mut revision = 1;
+    let mut revision = daemon_runtime.allocate_revision();
     let mut conversations = std::collections::BTreeMap::new();
     let mut queued_prompts = projected_queued_prompts(&controller)?;
     let mut active_user_shells = std::collections::BTreeMap::new();
@@ -593,7 +593,7 @@ pub(crate) async fn run_server(
                         break;
                     }
                     phone_workspaces = workspace_updates.borrow_and_update().clone();
-                    revision += 1;
+                    revision = daemon_runtime.allocate_revision();
                     publish_snapshot!(revision);
                 }
                 update = quota_updates_rx.recv(), if quota_updates_open => {
@@ -604,7 +604,7 @@ pub(crate) async fn run_server(
                                     .sync_profile_now(&outcome.report.profile_id, None);
                             }
                             quotas.insert(outcome.report.profile_id.clone(), outcome.report);
-                            revision += 1;
+                            revision = daemon_runtime.allocate_revision();
                             publish_snapshot!(revision);
                         }
                         Some(QuotaUpdate::Refreshing { .. } | QuotaUpdate::Finished { .. }) => {}
@@ -655,7 +655,7 @@ pub(crate) async fn run_server(
                             update.session_id.clone(),
                             queued_prompt_projection(&snapshot.materialized),
                         );
-                        revision += 1;
+                        revision = daemon_runtime.allocate_revision();
                         conversation_tx.send_replace(conversations.clone());
                         publish_snapshot!(revision);
                     }
@@ -828,7 +828,7 @@ pub(crate) async fn run_server(
                         )
                     };
                     if publication.is_ok() {
-                        revision += 1;
+                        revision = daemon_runtime.allocate_revision();
                         if let Err(error) = snapshot_tx.send(viewer_snapshot(
                             &controller,
                             &phone_workspaces,
@@ -933,7 +933,7 @@ pub(crate) async fn run_server(
                             conversations.retain(|id, _| {
                                 controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
                             });
-                            revision += 1;
+                            revision = daemon_runtime.allocate_revision();
                             conversation_tx.send_replace(conversations.clone());
                             publish_snapshot!(revision);
                         }

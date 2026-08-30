@@ -414,6 +414,15 @@ impl Controller {
         {
             Ok(latched) => {
                 let artifact = latched.artifact.clone();
+                if let Err(error) = crate::hel_test_hooks::reach_test_hook(
+                    "checkpoint_archive_before_database_publication",
+                ) {
+                    latched.abandon(session_id).await;
+                    return Err(remove_uninstalled_checkpoint(
+                        &artifact.metadata.archive_path,
+                        error,
+                    ));
+                }
                 {
                     let record = self.state.sessions.get_mut(session_id).unwrap();
                     record.state = SessionState::Running;
@@ -509,6 +518,15 @@ impl Controller {
             return Err(remove_uninstalled_checkpoint(
                 &artifact.metadata.archive_path,
                 error.context("final recovery checkpoint verification"),
+            ));
+        }
+        if let Err(error) =
+            crate::hel_test_hooks::reach_test_hook("checkpoint_archive_before_database_publication")
+        {
+            latched.abandon(session_id).await;
+            return Err(remove_uninstalled_checkpoint(
+                &artifact.metadata.archive_path,
+                error,
             ));
         }
         let persist_started = Instant::now();

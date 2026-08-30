@@ -14,6 +14,10 @@ workspace = true
 name = "hel"
 path = "src/main.rs"
 
+[features]
+default = []
+test-hooks = ["hel/test-hooks"]
+
 [dependencies]
 hel = { path = "../..", package = "hel-core", version = "0.2.0" }
 hel-tui = { path = "../hel-tui", version = "0.2.0" }

@@ -11,8 +11,9 @@ if [[ $# -ne 1 ]]; then
     exit 2
 fi
 
-hel_binary=$1
-[[ -x $hel_binary ]] || { echo "hel binary is not executable: $hel_binary" >&2; exit 2; }
+hel_input=$1
+[[ -x $hel_input ]] || { echo "hel binary is not executable: $hel_input" >&2; exit 2; }
+hel_binary=$(cd -- "$(dirname -- "$hel_input")" && pwd)/$(basename -- "$hel_input")
 command -v python3 >/dev/null
 command -v timeout >/dev/null
 

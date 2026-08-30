@@ -448,14 +448,19 @@ impl RuntimeState {
         recovery_observer: RecoveryObserver,
         workspaces: Vec<WorkspaceRecord>,
     ) -> Self {
-        let (revision_tx, _) = tokio::sync::watch::channel(0);
+        // Revisions are opaque cursors, so give every daemon incarnation a
+        // fresh high-water mark. Clients that survive a daemon restart must
+        // never wait on, or render, a cursor from the previous process as if
+        // it belonged to the new feed.
+        let initial_revision = u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap_or(1);
+        let (revision_tx, _) = tokio::sync::watch::channel(initial_revision);
         let (workspaces_tx, _) = tokio::sync::watch::channel(workspaces);
         Self {
             attachments: Mutex::new(BTreeMap::new()),
             phone_status: Mutex::new(WebViewerStatus::Starting),
             ever_attached: AtomicBool::new(false),
             sessions: Mutex::new(BTreeMap::new()),
-            revision: std::sync::atomic::AtomicU64::new(0),
+            revision: std::sync::atomic::AtomicU64::new(initial_revision),
             revision_tx,
             workspaces_tx,
             session_manager,
@@ -464,6 +469,16 @@ impl RuntimeState {
             config_mutation: tokio::sync::Mutex::new(()),
             recovery_observer,
         }
+    }
+
+    pub(crate) fn allocate_revision(&self) -> u64 {
+        self.revision.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn publish_revision(&self) -> u64 {
+        let revision = self.allocate_revision();
+        self.revision_tx.send_replace(revision);
+        revision
     }
 
     fn attachments(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Attachment>> {
@@ -511,13 +526,12 @@ impl RuntimeState {
             .controller
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = controller;
-        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-        self.revision_tx.send_replace(revision);
+        let revision = self.publish_revision();
         tracing::debug!(revision, session_count, "daemon controller state reloaded");
         Ok(())
     }
 
-    fn publish_session(&self, session_id: String, view: ManagedSessionView) {
+    async fn publish_session(&self, session_id: String, view: ManagedSessionView) -> Result<()> {
         let connected = view.connected;
         let has_snapshot = view.snapshot.is_some();
         tracing::debug!(
@@ -549,8 +563,9 @@ impl RuntimeState {
                 session_id.clone(),
                 RuntimeSessionView::from_managed(session_id, view),
             );
-        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-        self.revision_tx.send_replace(revision);
+        reach_test_hook("relay_projection_before_revision_publication").await?;
+        self.publish_revision();
+        Ok(())
     }
 
     async fn runtime_snapshot(
@@ -658,18 +673,22 @@ impl RuntimeState {
                         result: result_rx.clone(),
                     },
                 );
-                let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-                self.revision_tx.send_replace(revision);
+                self.publish_revision();
                 let state = Arc::clone(self);
                 let operation_session_id = session_id.clone();
                 let operation = work.take().expect("new lifecycle operation has work");
                 tokio::spawn(async move {
-                    let result = operation(state.clone(), operation_session_id.clone(), cancelled)
-                        .await
-                        .map_err(|error| format!("{error:#}"));
+                    let mut result =
+                        operation(state.clone(), operation_session_id.clone(), cancelled)
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                    if let Err(error) =
+                        reach_test_hook("lifecycle_reservation_before_result_publication").await
+                    {
+                        result = Err(format!("test lifecycle publication hook failed: {error:#}"));
+                    }
                     result_tx.send_replace(Some(result));
-                    let revision = state.revision.fetch_add(1, Ordering::AcqRel) + 1;
-                    state.revision_tx.send_replace(revision);
+                    state.publish_revision();
                 });
                 result_rx
             }
@@ -1043,8 +1062,7 @@ impl RuntimeState {
             .get_mut(session_id)
         {
             active.resume_destination = Some((profile_id, target_id));
-            let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-            self.revision_tx.send_replace(revision);
+            self.publish_revision();
         }
     }
 
@@ -1078,8 +1096,7 @@ impl RuntimeState {
             }
         };
         if changed {
-            let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-            self.revision_tx.send_replace(revision);
+            self.publish_revision();
         }
     }
 
@@ -1091,8 +1108,7 @@ impl RuntimeState {
             .get_mut(session_id)
         {
             active.notice = Some(notice.to_owned());
-            let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-            self.revision_tx.send_replace(revision);
+            self.publish_revision();
         }
     }
 }
@@ -1715,6 +1731,7 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
         build_version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     write_metadata(&metadata_path(), &metadata)?;
+    reach_test_hook("daemon_metadata_before_listening").await?;
 
     let workspaces = tokio::task::spawn_blocking(hel::hel_database::list_workspaces)
         .await
@@ -1825,7 +1842,7 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
                     tracing::warn!(%error, "phone session view bridge stopped");
                     phone_publisher = None;
                 }
-                state.publish_session(update.session_id, update.view);
+                state.publish_session(update.session_id, update.view).await?;
             }
         }
     }
@@ -1880,8 +1897,7 @@ fn spawn_manager_target_refresher(
                             };
                             targets.send_replace(refreshed);
                             if changed {
-                                let revision = state.revision.fetch_add(1, Ordering::AcqRel) + 1;
-                                state.revision_tx.send_replace(revision);
+                                state.publish_revision();
                             }
                         }
                         Ok(Err(error)) => {
@@ -2066,6 +2082,18 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .context("daemon background database task panicked")?
+}
+
+async fn reach_test_hook(name: &'static str) -> Result<()> {
+    #[cfg(feature = "test-hooks")]
+    {
+        tokio::task::spawn_blocking(move || hel::hel_test_hooks::reach_test_hook(name))
+            .await
+            .context("test hook task panicked")??;
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = name;
+    Ok(())
 }
 
 async fn handle_action(
@@ -2291,8 +2319,7 @@ fn install_renamed_controller(state: &RuntimeState, controller: Controller) {
         .controller
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = controller;
-    let revision = state.revision.fetch_add(1, Ordering::AcqRel) + 1;
-    state.revision_tx.send_replace(revision);
+    state.publish_revision();
 }
 
 fn workspace_snapshot(workspace_id: &str) -> Result<WorkspaceSnapshot> {

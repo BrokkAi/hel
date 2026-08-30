@@ -244,8 +244,10 @@ class Lab:
         self.data = self.runtime_root / "data"
         self.profile = self.runtime_root / "profile"
         self.project = self.runtime_root / "project"
-        for directory in [self.config, self.data, self.profile, self.project]:
+        self.hooks = self.runtime_root / "hooks"
+        for directory in [self.config, self.data, self.profile, self.project, self.hooks]:
             directory.mkdir()
+        self.hook_name: str | None = None
         self.trace_path = self.root / "trace.json"
         self.trace: dict[str, object] = {
             "format_version": 1,
@@ -319,6 +321,9 @@ class Lab:
             }
         )
         env.pop("HEL_DAEMON_EXIT_WHEN_IDLE", None)
+        if self.hook_name is not None:
+            env["HEL_TEST_HOOK"] = self.hook_name
+            env["HEL_TEST_HOOK_DIR"] = str(self.hooks)
         return env
 
     @staticmethod
@@ -336,6 +341,9 @@ class Lab:
         self.git_output(["commit", "-m", "initial fixture"], self.project)
 
         bridge = self.runtime_root / "fake_acp.py"
+        fixture_bin = self.runtime_root / "bin"
+        fixture_bin.mkdir()
+        (fixture_bin / "python3").symlink_to(sys.executable)
         bridge.write_text(
             """#!/usr/bin/env python3
 import json
@@ -419,7 +427,7 @@ tailscale_detect = false
 kind = "codex"
 home = {json.dumps(str(self.profile))}
 executable = {json.dumps(str(bridge))}
-environment = {{ HEL_FAKE_ACP_LOG = {json.dumps(str(self.runtime_root / "fake-acp.log"))} }}
+environment = {{ HEL_FAKE_ACP_LOG = {json.dumps(str(self.runtime_root / "fake-acp.log"))}, PATH = {json.dumps(str(fixture_bin))} }}
 
 [bundles.fixture]
 primary_repo = "fixture"

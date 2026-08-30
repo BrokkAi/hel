@@ -40,6 +40,7 @@ pub mod hel_subprocess;
 pub mod hel_tailscale;
 pub mod hel_targets;
 pub mod hel_terminal;
+pub mod hel_test_hooks;
 pub mod hel_text_input;
 pub mod hel_transcript;
 pub mod hel_user_shell;

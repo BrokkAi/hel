@@ -16,7 +16,7 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 - [x] (2026-08-30 15:18Z) Recorded the product-scope decisions: runtime paths are the priority, mutation testing is deferred, and Luna testing remains a local runbook.
 - [x] (2026-08-30 15:29Z) Milestone 1: repaired full-package coverage reporting, established a crate-qualified baseline, and fixed the asynchronous log-writer lifetime exposed by the PTY teardown assertion.
 - [x] (2026-08-30 16:04Z) Milestone 2: added the isolated replayable runtime lab, made daemon state live across web/TUI clients, centralized recovery ownership, and passed the three-client lifecycle scenario twice at seed 1 plus seed 2.
-- [ ] Milestone 3: expand property and process-chaos coverage around durable state and exact crash boundaries.
+- [x] (2026-08-30 16:50Z) Milestone 3: added generated multi-segment journal faults, compiled-out named crash hooks, a table-driven six-boundary process matrix, and fixed the relay projection/revision races it reproduced.
 - [ ] Milestone 4: add browser coverage and the local Luna tmux runbook.
 - [ ] Milestone 5: establish pull-request, nightly, and beta acceptance gates and complete an end-to-end demonstration.
 
@@ -55,6 +55,15 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 - Observation: the web viewer could advertise a newly provisioned session before its remote session handle had appeared.
   Evidence: a prompt posted immediately after the snapshot first reached `running` failed with `session ... is not managed`. Phone relay actions now wait for the managed session with the same bounded five-second window used by controller lifecycle code.
 
+- Observation: daemon and web revision counters restarted from small integers, so a client surviving daemon death could observe a lower revision or wait thirty seconds for an old cursor the new process could not reach.
+  Evidence: killing at `relay_projection_before_revision_publication` moved the web feed from revision 5 to 3. Both feeds now allocate opaque cursors from one process-generation counter seeded with the daemon start timestamp; the same crash scenario remained monotonic after restart.
+
+- Observation: two valid controller projectors can briefly overlap while a newly provisioned worker becomes visible to the daemon actor.
+  Evidence: the checkpoint hook matrix reproduced `session actor received relay event 1 after its projection had already applied it`. A page that loses this race now rolls back, reloads the newer durable projection, and reattaches with its exact ordinal and digest; digest mismatch, gaps, and immutable projection changes remain integrity errors.
+
+- Observation: fresh fake Codex homes and relative binary paths made existing chaos fixtures depend on ambient machine behavior.
+  Evidence: one matrix run spawned real plugin-marketplace clone children, and `session_restart_chaos.sh ./target/.../hel` later failed after changing its child working directory. The deterministic profile now has a private PATH containing only its Python bridge, and the topology runner canonicalizes the Hel binary before launching children.
+
 ## Decision Log
 
 - Decision: defer all `cargo-mutants` installation, configuration, and execution from this ExecPlan.
@@ -89,11 +98,17 @@ The visible proof is not a coverage percentage. It is a test run in which two te
   Rationale: remote dashboards and the phone server consume daemon-owned views and submit commands through it; independent recovery coordinators cannot share the daemon actor's leased relay connection safely and provide no additional durability authority.
   Date/Author: 2026-08-30, Codex.
 
+- Decision: keep ordinary worker-topology chaos and named durability hooks as two specialized runners under one process-chaos layer.
+  Rationale: `session_restart_chaos.sh` validates a single live worker topology across proxy, helper, bridge, supervisor, and worker deaths. `run-test-hook-chaos.sh` is table-driven across fresh full-stack roots because every durability boundary needs independent daemon, database, PTY, and web state. Combining their setup would weaken isolation and make failures harder to replay.
+  Date/Author: 2026-08-30, Codex.
+
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. Coverage now measures `hel-core`, `hel-cli`, and `hel-tui` without collapsing same-named source paths, and the baseline records the real 78.12% aggregate with reviewed runtime exceptions. The full instrumented suite passed: 65 `hel-cli` unit tests, its logging and two PTY integration tests, 1,355 `hel-core` tests with four ignored, and 197 `hel-tui` tests with one ignored. The log worker now uses a bounded flush barrier while remaining valid for the lifetime of the global tracing subscriber, so detached runtime diagnostics cannot corrupt the restored terminal.
+Milestones 1 through 3 are complete. Coverage now measures `hel-core`, `hel-cli`, and `hel-tui` without collapsing same-named source paths, and the baseline records the real 78.12% aggregate with reviewed runtime exceptions. The full instrumented suite passed: 65 `hel-cli` unit tests, its logging and two PTY integration tests, 1,355 `hel-core` tests with four ignored, and 197 `hel-tui` tests with one ignored. The log worker now uses a bounded flush barrier while remaining valid for the lifetime of the global tracing subscriber, so detached runtime diagnostics cannot corrupt the restored terminal.
 
-The system lab now creates short isolated runtime roots, a disposable Git workspace, a stateful fake ACP bridge with checkpointable Codex artifacts, a local-bare worker, one persistent daemon, two 140x32 PTYs, and an authenticated loopback web client. It asserts exact-once prompt/reply projection, screen convergence, monotonic client convergence revisions, stopped lifecycle state, sub-two-second UI quit, daemon shutdown, SQLite integrity and foreign keys, and zero processes retaining the isolated environment. Failures retain runtime state and print one replay command. Two consecutive seed-1 runs produced the same logical seven-action trace; seed 2 also passed. The lab itself exposed and drove fixes for stale web workspaces, missing cross-client session records, duplicated recovery ownership, and the new-session/managed-actor race. The remaining beta gaps are expanded generated/crash chaos, richer PTY/browser and Luna campaigns, and tiered automation.
+The system lab now creates short isolated runtime roots, a disposable Git workspace, a stateful fake ACP bridge with checkpointable Codex artifacts, a local-bare worker, one persistent daemon, two 140x32 PTYs, and an authenticated loopback web client. It asserts exact-once prompt/reply projection, screen convergence, monotonic client convergence revisions, stopped lifecycle state, sub-two-second UI quit, daemon shutdown, SQLite integrity and foreign keys, and zero processes retaining the isolated environment. Failures retain runtime state and print one replay command. Two consecutive seed-1 runs produced the same logical seven-action trace; seed 2 also passed. The lab itself exposed and drove fixes for stale web workspaces, missing cross-client session records, duplicated recovery ownership, and the new-session/managed-actor race. The remaining beta gaps are richer PTY/browser and Luna campaigns plus tiered automation.
+
+The crash layer now adds a 128-case generated multi-segment journal property (more than one thousand append/fault/recovery transitions in the validated run), with `PROPTEST_CASES` available for larger nightly campaigns. Six feature-gated durability hooks cover daemon metadata, journal publication, config migration, lifecycle result publication, relay revision publication, and checkpoint database publication. A consecutive seed-301 matrix passed all six with clean SQLite and no leaked process; the pre-existing topology chaos also passed five durable worker/bridge generations. Deliberately inverting the multi-segment invariant failed immediately and printed seed `424242` plus a minimized input, after which the real assertion was restored and passed. Remaining work is richer PTY/browser and Luna coverage plus tiered automation.
 
 ## Context and Orientation
 

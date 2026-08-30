@@ -796,6 +796,7 @@ impl DurableRelay {
         if created_active_segment {
             sync_directory(&journal)?;
         }
+        crate::hel_test_hooks::reach_test_hook("journal_append_before_snapshot_publication")?;
 
         match staged {
             Some(next_snapshot) => self.snapshot = next_snapshot,
@@ -1837,7 +1838,8 @@ mod tests {
         }
         // A torn, in-flight fourth record: content began but the closing bytes
         // and newline are not on disk yet.
-        file.write_all(br#"{"ordinal":4,"previous_digest":"#).unwrap();
+        file.write_all(br#"{"ordinal":4,"previous_digest":"#)
+            .unwrap();
         file.sync_all().unwrap();
         let len_before = path.metadata().unwrap().len();
 
@@ -1890,7 +1892,8 @@ mod tests {
         write_event(&mut file, 1, &mut previous_digest);
         // A corrupt interior record: terminated (has its newline) but not valid
         // JSON, so its bytes are unrecoverable.
-        file.write_all(br#"{"ordinal":2,"observation": BROKEN"#).unwrap();
+        file.write_all(br#"{"ordinal":2,"observation": BROKEN"#)
+            .unwrap();
         file.write_all(b"\n").unwrap();
         write_event(&mut file, 3, &mut previous_digest);
         file.sync_all().unwrap();
@@ -1932,7 +1935,8 @@ mod tests {
             let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
             for ordinal in 1..=COUNT {
                 if ordinal == corrupt_index {
-                    file.write_all(br#"{"ordinal":0,"observation": BROKEN"#).unwrap();
+                    file.write_all(br#"{"ordinal":0,"observation": BROKEN"#)
+                        .unwrap();
                     file.write_all(b"\n").unwrap();
                     continue;
                 }
@@ -1972,7 +1976,11 @@ mod tests {
                 seen, expected,
                 "every intact record must survive corruption at index {corrupt_index}"
             );
-            assert_eq!(gaps.len(), 1, "one gap for corruption at index {corrupt_index}");
+            assert_eq!(
+                gaps.len(),
+                1,
+                "one gap for corruption at index {corrupt_index}"
+            );
         }
     }
 
