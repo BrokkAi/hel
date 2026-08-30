@@ -183,6 +183,80 @@ fn finds_modes_in_flat_and_grouped_options() {
 }
 
 #[test]
+fn advertised_choices_flatten_groups_and_follow_the_option_category() {
+    let model = SessionConfigOption::select(
+        "gpt_model",
+        "Model",
+        "fast",
+        SessionConfigSelectOptions::Grouped(vec![
+            SessionConfigSelectGroup::new(
+                "hosted",
+                "Hosted",
+                vec![SessionConfigSelectOption::new("fast", "Fast")],
+            ),
+            SessionConfigSelectGroup::new(
+                "local",
+                "Local",
+                vec![SessionConfigSelectOption::new("deep", "Deep").description("Slower, better")],
+            ),
+        ]),
+    )
+    .category(SessionConfigOptionCategory::Model);
+    let effort = SessionConfigOption::select(
+        "reasoning_effort",
+        "Effort",
+        "low",
+        SessionConfigSelectOptions::Ungrouped(vec![
+            SessionConfigSelectOption::new("low", "Low"),
+            SessionConfigSelectOption::new("high", "High"),
+        ]),
+    );
+    let options = vec![model, effort];
+
+    // The option id is not "model", so only the category can find it.
+    assert_eq!(
+        session_config_choices(&options, "model"),
+        vec![
+            SessionConfigChoice {
+                value: "fast".into(),
+                name: "Fast".into(),
+                description: None,
+            },
+            SessionConfigChoice {
+                value: "deep".into(),
+                name: "Deep".into(),
+                description: Some("Slower, better".into()),
+            },
+        ]
+    );
+    assert_eq!(
+        session_config_choices(&options, "effort")
+            .into_iter()
+            .map(|choice| choice.value)
+            .collect::<Vec<_>>(),
+        vec!["low", "high"]
+    );
+}
+
+#[test]
+fn an_option_the_harness_does_not_advertise_offers_no_choices() {
+    assert!(session_config_choices(&[], "model").is_empty());
+    assert!(session_config_choices(&[], "effort").is_empty());
+
+    // A harness that advertises only a mode selector configures neither.
+    let mode = SessionConfigOption::select(
+        "interaction_mode",
+        "Mode",
+        "plan",
+        SessionConfigSelectOptions::Ungrouped(vec![SessionConfigSelectOption::new("plan", "Plan")]),
+    )
+    .category(SessionConfigOptionCategory::Mode);
+    assert!(session_config_choices(std::slice::from_ref(&mode), "model").is_empty());
+    assert!(session_config_choices(std::slice::from_ref(&mode), "effort").is_empty());
+    assert_eq!(session_config_choices(&[mode], "mode").len(), 1);
+}
+
+#[test]
 fn production_compactors_are_fixed_independently_of_target_profiles() {
     assert_eq!(
         production_compaction_config(HarnessKind::Codex),

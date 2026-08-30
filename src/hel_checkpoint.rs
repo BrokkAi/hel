@@ -4143,6 +4143,70 @@ mod tests {
         );
     }
 
+    /// A second opinion keeps its whole world — profile, native session and
+    /// relay — inside the primary worker root. A v1 checkpoint is single
+    /// session, so none of it may end up in the archive.
+    #[test]
+    fn a_checkpoint_excludes_everything_the_reviewer_owns() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        let reviewer = spec.relay_root.join("reviewer");
+        let reviewer_home = reviewer.join("profile");
+        // A reviewer that ran: a staged profile with its own native rollout,
+        // its own relay journal, and its own supervisor spec.
+        let reviewer_native = reviewer_home.join("sessions/2026/08/09");
+        fs::create_dir_all(&reviewer_native).unwrap();
+        fs::write(
+            reviewer_native.join("rollout-reviewer-native.jsonl"),
+            b"reviewer native session",
+        )
+        .unwrap();
+        fs::create_dir_all(reviewer.join("relay-journal")).unwrap();
+        fs::write(
+            reviewer.join("relay-journal/active.jsonl"),
+            b"reviewer relay events",
+        )
+        .unwrap();
+        fs::write(reviewer.join("relay-state.json"), b"reviewer relay state").unwrap();
+        fs::write(reviewer.join("acp-supervisor.json"), b"reviewer bridge").unwrap();
+
+        export_checkpoint(&spec).unwrap();
+
+        let archive = read_archive_verified(&spec.output_path).unwrap();
+        let native = archive
+            .manifest
+            .payloads
+            .iter()
+            .filter_map(|payload| match &payload.role {
+                PayloadRole::NativeArtifact { relative_path } => {
+                    Some(relative_path.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            native.iter().all(|path| !path.contains("reviewer")),
+            "a reviewer's files must stay out of the checkpoint: {native:?}"
+        );
+        let bytes = fs::read(&spec.output_path).unwrap();
+        for secret in [
+            b"reviewer native session".as_slice(),
+            b"reviewer relay events".as_slice(),
+            b"reviewer relay state".as_slice(),
+        ] {
+            assert!(
+                !bytes.windows(secret.len()).any(|window| window == secret),
+                "the archive must not carry the reviewer's content"
+            );
+        }
+        // The primary's own native session is still captured, so this proves
+        // exclusion rather than an export that captured nothing.
+        assert!(
+            !native.is_empty(),
+            "the primary's native session must still be exported"
+        );
+    }
+
     #[test]
     fn transfer_rejects_a_same_ordinal_frontier_digest_mismatch() {
         let temp = tempfile::tempdir().unwrap();

@@ -30,10 +30,10 @@ use agent_client_protocol::schema::v1::{
     PermissionOptionKind, PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigValueId, SessionId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalExitStatus,
-    TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallUpdateFields,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TerminalExitStatus, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
+    TextContent, ToolCallUpdateFields, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -56,6 +56,75 @@ use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, ProjectMemoryMcpDeliv
 
 pub(crate) fn plan_review_carries_native_feedback(id: &str) -> bool {
     grok::is_plan_review_id(id)
+}
+
+/// Identity prefix every normalized plan decision shares, whatever harness
+/// dialect produced it.
+pub const PLAN_REVIEW_ID_PREFIX: &str = "plan-review-";
+
+/// Header [`normalized_plan_review`] puts in front of the harness's proposal
+/// text. Reading the proposal back out is the inverse, so both live here.
+const PLAN_REVIEW_MESSAGE_PREFIX: &str = "Review the agent's plan:\n\n";
+
+/// Whether this elicitation id belongs to one of Hel's normalized plan
+/// decisions.
+#[must_use]
+pub fn is_plan_review_id(id: &str) -> bool {
+    id.starts_with(PLAN_REVIEW_ID_PREFIX)
+}
+
+/// The exact proposal text a normalized plan decision carries.
+///
+/// Returns `None` for any other elicitation, and for a plan decision whose
+/// message was not built by [`normalized_plan_review`].
+#[must_use]
+pub fn plan_review_proposal(request: &ElicitationRequest) -> Option<&str> {
+    if !is_plan_review_id(&request.id) {
+        return None;
+    }
+    request.message.strip_prefix(PLAN_REVIEW_MESSAGE_PREFIX)
+}
+
+/// The plan decision Hel answers itself instead of forwarding to the harness.
+/// Every other decision maps to a native option through the dialect bridge.
+pub const PLAN_REVIEW_SECOND_OPINION: &str = "second_opinion";
+
+/// The proposal to review when this answer asked for a second opinion.
+///
+/// A second opinion is local: the harness's decision stays pending while Hel
+/// sets the reviewer up, so this answer must never reach ACP. Callers use the
+/// returned proposal as the captured text they hand to the reviewer.
+#[must_use]
+pub fn plan_review_second_opinion<'a>(
+    request: &'a ElicitationRequest,
+    response: &ElicitationResponse,
+) -> Option<&'a str> {
+    let proposal = plan_review_proposal(request)?;
+    let ElicitationResponse::Accept { content } = response else {
+        return None;
+    };
+    match content.get(PLAN_REVIEW_ACTION) {
+        Some(ElicitationValue::String(action)) if action == PLAN_REVIEW_SECOND_OPINION => {
+            Some(proposal)
+        }
+        _ => None,
+    }
+}
+
+/// The answer Hel gives the harness once a second opinion has been set up.
+///
+/// Gathering context needs an idle planning session, so the pending decision
+/// has to be resolved first. Declining keeps plan mode active, which is why
+/// the captured proposal is the only copy of the plan that survives and why
+/// cancelling a review owes the user a Hel-owned decision in its place.
+#[must_use]
+pub fn plan_review_keep_planning() -> ElicitationResponse {
+    ElicitationResponse::Accept {
+        content: std::collections::BTreeMap::from([(
+            PLAN_REVIEW_ACTION.to_owned(),
+            ElicitationValue::String("keep_planning".to_owned()),
+        )]),
+    }
 }
 
 /// Private ACP metadata is provider-local and has no Hel projection. In
@@ -638,13 +707,13 @@ fn is_plan_permission(request: &RequestPermissionRequest) -> bool {
         })
 }
 
-fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationRequest {
+pub(crate) fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationRequest {
     let plan = nested_string(value, &["plan", "plan_content", "planContent"])
         .unwrap_or("The agent did not provide plan text in its review request.");
     ElicitationRequest {
         id,
         title: Some("Plan review".into()),
-        message: format!("Review the agent's plan:\n\n{plan}"),
+        message: format!("{PLAN_REVIEW_MESSAGE_PREFIX}{plan}"),
         description: Some("Choose what Hel should tell the planning harness.".into()),
         fields: vec![
             ElicitationField {
@@ -669,6 +738,14 @@ fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationR
                             value: "revise".into(),
                             title: "Revise".into(),
                             description: Some("Keep planning and incorporate feedback".into()),
+                            preview: None,
+                        },
+                        ElicitationOption {
+                            value: PLAN_REVIEW_SECOND_OPINION.into(),
+                            title: "Get a second opinion".into(),
+                            description: Some(
+                                "Ask another agent to review this plan before you decide".into(),
+                            ),
                             preview: None,
                         },
                         ElicitationOption {
@@ -735,6 +812,9 @@ fn permission_plan_response(
         "implement" => &["implement_plan", "plan_approve", "default", "approve"],
         "revise" => &["plan_revise", "revise"],
         "exit" => &["reject_and_exit", "exit"],
+        // A second opinion is answered locally and never reaches here. If one
+        // ever did, it must not approve the plan, so it declines like every
+        // other non-approval and leaves the session in plan mode.
         _ => &[],
     };
     let selected = request
@@ -2376,6 +2456,48 @@ async fn set_session_config(
         .with_context(|| format!("set session {key} to {value}"))?;
     *options = response.config_options;
     Ok(())
+}
+
+/// One selectable value of a session configuration option, flattened out of
+/// the harness's ACP select shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionConfigChoice {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Every value the harness currently advertises for `key`, in advertised
+/// order and with option groups flattened.
+///
+/// Empty when the harness advertises no such option or exposes it as
+/// something other than a select, which callers read as "not configurable".
+#[must_use]
+pub fn session_config_choices(
+    options: &[SessionConfigOption],
+    key: &str,
+) -> Vec<SessionConfigChoice> {
+    let Some(option) = find_session_config_option(options, key) else {
+        return Vec::new();
+    };
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    let choices = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect::<Vec<_>>(),
+        SessionConfigSelectOptions::Grouped(groups) => {
+            groups.iter().flat_map(|group| &group.options).collect()
+        }
+        _ => Vec::new(),
+    };
+    choices
+        .into_iter()
+        .map(|choice| SessionConfigChoice {
+            value: choice.value.to_string(),
+            name: choice.name.clone(),
+            description: choice.description.clone(),
+        })
+        .collect()
 }
 
 pub(crate) fn find_session_config_option<'a>(

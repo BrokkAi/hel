@@ -22,8 +22,8 @@ pub use journal::{RestoredRelaySeed, restored_relay_seed_path};
 pub use protocol::{
     RelayErrorCode, RelayErrorDetail, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
     RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload, RelayVersionRange,
-    incompatible_request_protocol_response, invalid_relay_request_response, read_relay_frame,
-    serve_relay_json_lines, unsupported_relay_method_response, write_relay_frame,
+    ReviewerRequest, incompatible_request_protocol_response, invalid_relay_request_response,
+    read_relay_frame, serve_relay_json_lines, unsupported_relay_method_response, write_relay_frame,
 };
 #[cfg(unix)]
 pub(crate) use snapshot::truncate_start_with_marker;
@@ -94,7 +94,7 @@ const RELAY_SNAPSHOT_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 /// Current durable ACP relay protocol. Peers that only speak an older
 /// version in [`RELAY_MIN_PROTOCOL_VERSION`]..=this range still connect.
 /// Protocol 0 is the retired pre-relay worker protocol and is rejected.
-pub const RELAY_PROTOCOL_VERSION: u32 = 5;
+pub const RELAY_PROTOCOL_VERSION: u32 = 6;
 pub const RELAY_MIN_PROTOCOL_VERSION: u32 = 1;
 /// Digest for the empty relay event prefix (ordinal zero).
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
@@ -721,6 +721,17 @@ impl DurableRelay {
                 return Ok(relay_error(
                     RelayErrorCode::InvalidState,
                     "elicitation responses must be handled by the live relay transport",
+                    false,
+                    None,
+                ));
+            }
+            RelayRequest::Reviewer { .. } => {
+                // The reviewer has its own relay and its own harness process.
+                // Only the live worker transport owns both, so this relay
+                // never answers for it.
+                return Ok(relay_error(
+                    RelayErrorCode::InvalidState,
+                    "reviewer requests must be handled by the live relay transport",
                     false,
                     None,
                 ));

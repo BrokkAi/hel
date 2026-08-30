@@ -61,7 +61,7 @@ impl AcpSupervisorSpec {
     }
 
     #[cfg(unix)]
-    fn write(&self, path: &Path) -> Result<()> {
+    pub(crate) fn write_spec(&self, path: &Path) -> Result<()> {
         let body = serde_json::to_vec_pretty(self)?;
         crate::hel_config::atomic_write(path, &body)
     }
@@ -146,6 +146,51 @@ impl ProjectMemoryMcpDelivery {
     }
 }
 
+/// How to launch the second-opinion reviewer beside a primary session.
+///
+/// The reviewer shares the primary's target and working directory and nothing
+/// else: its harness home is a fresh copy of the chosen profile, staged under
+/// the primary worker root, and the worker sets that home itself so a
+/// controller can never point a reviewer at the primary's credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerLaunchConfig {
+    /// Configured profile this reviewer was staged from, for display and for
+    /// deciding whether a saved reviewer still matches the user's choice.
+    pub profile_id: String,
+    pub harness: HarnessKind,
+    pub bridge_command: PathBuf,
+    pub bridge_args: Vec<String>,
+    /// Harness environment without its home variable: the worker fills that in
+    /// from the staged reviewer directory it owns.
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub execution_policy: ExecutionPolicy,
+    /// Model to apply once the session opens, or `None` when the harness
+    /// advertises no model selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Bumped whenever native continuity is lost, so a reviewer that outlived
+    /// its harness starts a visibly new conversation instead of pretending to
+    /// resume one.
+    #[serde(default)]
+    pub generation: u64,
+}
+
+impl ReviewerLaunchConfig {
+    /// Whether a running reviewer launched from `self` can serve `other`
+    /// without being restarted. Model and effort are applied on the live
+    /// session, so they never force a restart; identity does.
+    #[must_use]
+    pub fn reusable_for(&self, other: &Self) -> bool {
+        self.profile_id == other.profile_id
+            && self.harness == other.harness
+            && self.generation == other.generation
+    }
+}
+
 impl WorkerLaunchConfig {
     #[cfg(unix)]
     fn enforce_execution_policy(&mut self) {
@@ -174,6 +219,8 @@ impl WorkerLaunchConfig {
     }
 }
 
+#[cfg(unix)]
+pub(crate) mod reviewer;
 #[cfg(unix)]
 mod unix;
 
@@ -270,3 +317,5 @@ pub async fn run_acp_supervisor(_spec: AcpSupervisorSpec) -> anyhow::Result<()> 
 
 #[cfg(all(test, unix))]
 mod relay_tests;
+#[cfg(all(test, unix))]
+mod reviewer_tests;

@@ -190,7 +190,7 @@ impl ElicitationDialog {
     }
 
     fn is_plan_review(&self) -> bool {
-        self.request.id.starts_with("plan-review-")
+        crate::hel_acp::is_plan_review_id(&self.request.id)
     }
 
     /// The message pane's content area, recorded by the last frame.

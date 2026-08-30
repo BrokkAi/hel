@@ -1103,6 +1103,12 @@ impl DashboardContext {
                 .active_chat
                 .as_ref()
                 .and_then(|chat| chat.elicitation_selection_text(&range)),
+            // The reviewer pane scrolls its own rows, so the text a selection
+            // covers comes out of that pane rather than off this frame.
+            SurfaceId::ReviewerTranscript => self
+                .active_chat
+                .as_ref()
+                .and_then(|chat| chat.reviewer_selection_text(&range)),
             _ => self.selection_text.take(),
         };
         let Some(text) = extracted.filter(|text| !text.trim().is_empty()) else {
@@ -2013,7 +2019,10 @@ fn draw_selection(
     let range = selection.range()?;
     let surface = *surfaces.surface(id)?;
     hel::hel_selection::highlight(frame.buffer_mut(), &surface, &range);
-    if matches!(id, SurfaceId::Transcript | SurfaceId::ElicitationMessage) {
+    if matches!(
+        id,
+        SurfaceId::Transcript | SurfaceId::ElicitationMessage | SurfaceId::ReviewerTranscript
+    ) {
         return None;
     }
     Some(hel::hel_selection::extract_rows(

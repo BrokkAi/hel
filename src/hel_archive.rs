@@ -218,6 +218,11 @@ pub enum CanonicalTranscriptBody {
         /// Complete current ACP `Plan` value.
         plan: serde_json::Value,
     },
+    /// A plan the harness asked the user to approve, kept verbatim.
+    PlanProposal {
+        proposal_id: String,
+        plan: String,
+    },
     System {
         text: String,
     },
@@ -1850,6 +1855,13 @@ fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()>
                             item.stable_id
                         )
                     })?;
+            }
+            CanonicalTranscriptBody::PlanProposal { proposal_id, .. } => {
+                ensure!(
+                    !proposal_id.trim().is_empty(),
+                    "canonical transcript item '{}' has an empty plan proposal id",
+                    item.stable_id
+                );
             }
             CanonicalTranscriptBody::System { .. } => {}
         }
