@@ -2,6 +2,8 @@
 
 This is a local exploratory test campaign for Hel's Linux/WSL runtime. It is not a CI job and it must never use personal Hel state, paid harnesses, remote targets, or real credentials. A finding is useful only when its exact actions and evidence are saved so the behavior can become a deterministic regression.
 
+This runbook defines the missions and evidence for a single campaign operator. To distribute those missions across four concurrent Luna workers with explicit lab ownership and a semantic browser lane, follow `.agents/docs/parallel-luna-testing.md` as the outer orchestration guide and use this document for the mission details.
+
 ## Prepare an isolated campaign
 
 Build the current commit and install the pinned browser once:
