@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 
 use crate::clock::epoch_seconds;
 pub use crate::hel_acp::PlanControl;
+use crate::hel_acp::SessionConfigChoice;
 use crate::hel_acp::surface::{AcpSessionSurface, PlanControlError};
 use crate::hel_acp::{RuntimeEvent, plan_review_carries_native_feedback};
 use crate::hel_config::HarnessKind;
@@ -55,8 +56,8 @@ use crate::hel_worker::{
 };
 
 use autocomplete::{
-    Autocomplete, CommandChoice, ConfigValueChoice, LocalCommand, builtin_command_choices,
-    parse_local_command, prompt_invokes_command,
+    Autocomplete, CommandChoice, LocalCommand, builtin_command_choices, parse_local_command,
+    prompt_invokes_command,
 };
 use elicitation::ElicitationDialog;
 use history::{HistorySearch, HistorySearchRequest};
@@ -297,8 +298,8 @@ pub struct ChatState {
     acp_surface: AcpSessionSurface,
     plan_command_pending: bool,
     command_choices: Vec<CommandChoice>,
-    model_values: Vec<ConfigValueChoice>,
-    effort_values: Vec<ConfigValueChoice>,
+    model_values: Vec<SessionConfigChoice>,
+    effort_values: Vec<SessionConfigChoice>,
     autocomplete: Option<Autocomplete>,
     anchor: TranscriptAnchor,
     /// On entry, reveal the response advertised by the dashboard when later

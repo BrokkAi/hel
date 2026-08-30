@@ -1,15 +1,13 @@
 //! Slash commands: what they parse to, what the popup offers, and how a
 //! chosen completion lands back in the composer.
 
-use agent_client_protocol::schema::v1::{
-    AvailableCommandInput, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
-};
+use agent_client_protocol::schema::v1::{AvailableCommandInput, SessionConfigOption};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem};
 
-use crate::hel_acp::find_session_config_option;
+use crate::hel_acp::{SessionConfigChoice, session_config_choices};
 use crate::hel_transcript::{ChatEntry, ChatRole};
 
 use super::ChatState;
@@ -37,13 +35,6 @@ pub(super) struct CommandChoice {
     description: String,
     input_hint: Option<String>,
     source: CommandSource,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ConfigValueChoice {
-    value: String,
-    name: String,
-    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,8 +186,8 @@ impl ChatState {
 
     pub(super) fn set_config_options(&mut self, options: &[SessionConfigOption]) {
         self.acp_surface.set_config_options(options);
-        self.model_values = config_values(options, "model");
-        self.effort_values = config_values(options, "effort");
+        self.model_values = session_config_choices(options, "model");
+        self.effort_values = session_config_choices(options, "effort");
         self.rebuild_command_choices();
     }
 
@@ -318,38 +309,6 @@ fn parse_slash_command(prompt: &str) -> Option<(&str, &str)> {
     )
 }
 
-fn find_config_option<'a>(
-    options: &'a [SessionConfigOption],
-    key: &str,
-) -> Option<&'a SessionConfigOption> {
-    find_session_config_option(options, key)
-}
-
-fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueChoice> {
-    let option = find_config_option(options, key);
-    let Some(option) = option else {
-        return Vec::new();
-    };
-    let SessionConfigKind::Select(select) = &option.kind else {
-        return Vec::new();
-    };
-    let choices = match &select.options {
-        SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect::<Vec<_>>(),
-        SessionConfigSelectOptions::Grouped(groups) => {
-            groups.iter().flat_map(|group| &group.options).collect()
-        }
-        _ => Vec::new(),
-    };
-    choices
-        .into_iter()
-        .map(|choice| ConfigValueChoice {
-            value: choice.value.to_string(),
-            name: choice.name.clone(),
-            description: choice.description.clone(),
-        })
-        .collect()
-}
-
 /// Draws the popup over the prompt and reports the rows it covers, so the
 /// caller can register them as a selectable surface.
 pub(super) fn render_autocomplete(
@@ -432,7 +391,7 @@ fn autocomplete_row(chat: &ChatState, kind: AutocompleteKind, index: usize) -> O
     }
 }
 
-fn config_value_row(choice: &ConfigValueChoice) -> Option<String> {
+fn config_value_row(choice: &SessionConfigChoice) -> Option<String> {
     let description = choice
         .description
         .as_deref()

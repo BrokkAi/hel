@@ -30,10 +30,10 @@ use agent_client_protocol::schema::v1::{
     PermissionOptionKind, PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigValueId, SessionId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalExitStatus,
-    TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallUpdateFields,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TerminalExitStatus, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
+    TextContent, ToolCallUpdateFields, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -2403,6 +2403,48 @@ async fn set_session_config(
         .with_context(|| format!("set session {key} to {value}"))?;
     *options = response.config_options;
     Ok(())
+}
+
+/// One selectable value of a session configuration option, flattened out of
+/// the harness's ACP select shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionConfigChoice {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Every value the harness currently advertises for `key`, in advertised
+/// order and with option groups flattened.
+///
+/// Empty when the harness advertises no such option or exposes it as
+/// something other than a select, which callers read as "not configurable".
+#[must_use]
+pub fn session_config_choices(
+    options: &[SessionConfigOption],
+    key: &str,
+) -> Vec<SessionConfigChoice> {
+    let Some(option) = find_session_config_option(options, key) else {
+        return Vec::new();
+    };
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    let choices = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect::<Vec<_>>(),
+        SessionConfigSelectOptions::Grouped(groups) => {
+            groups.iter().flat_map(|group| &group.options).collect()
+        }
+        _ => Vec::new(),
+    };
+    choices
+        .into_iter()
+        .map(|choice| SessionConfigChoice {
+            value: choice.value.to_string(),
+            name: choice.name.clone(),
+            description: choice.description.clone(),
+        })
+        .collect()
 }
 
 pub(crate) fn find_session_config_option<'a>(
