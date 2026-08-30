@@ -26,7 +26,11 @@ use crate::hel_targets::{
     TargetRecoveryPlan, ensure_recovery_target_running,
 };
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
-use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected, RelayTransportDead};
+use crate::hel_worker_client::{
+    RelayAttachment, RelayClient, RelayEventPage, RelayRejected, RelayTransportDead,
+    StartedReviewer,
+};
+use crate::hel_worker_runtime::ReviewerLaunchConfig;
 
 const SESSION_SYNC_INTERVAL: Duration = Duration::from_millis(150);
 /// Release SQLite's single writer between bounded pieces of a large relay
@@ -303,6 +307,57 @@ impl RemoteSessionRequests {
     }
 }
 
+/// What a caller asks of a session's second-opinion reviewer.
+///
+/// The reviewer is a sidecar of the session's worker, so every action travels
+/// the session's own relay connection rather than opening a second one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerAction {
+    Start {
+        config: Box<ReviewerLaunchConfig>,
+    },
+    Submit {
+        command_id: String,
+        command: RelayCommand,
+    },
+    Attach {
+        after_ordinal: u64,
+        after_digest: String,
+    },
+    Acknowledge {
+        through_ordinal: u64,
+        through_digest: String,
+    },
+    Status,
+    Pause,
+}
+
+impl ReviewerAction {
+    pub const fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "reviewer_start",
+            Self::Submit { .. } => "reviewer_submit",
+            Self::Attach { .. } => "reviewer_attach",
+            Self::Acknowledge { .. } => "reviewer_acknowledge",
+            Self::Status => "reviewer_status",
+            Self::Pause => "reviewer_pause",
+        }
+    }
+}
+
+/// What a [`ReviewerAction`] produced.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerOutcome {
+    Started(Box<StartedReviewer>),
+    Accepted { ordinal: u64 },
+    Attached(Box<RelayAttachment>),
+    Acknowledged(RelayCursor),
+    Status(Box<RelayOperationalState>),
+    Paused,
+}
+
 pub enum RemoteSessionRequest {
     Submit {
         session_id: String,
@@ -319,6 +374,11 @@ pub enum RemoteSessionRequest {
         elicitation_id: String,
         response: ElicitationResponse,
         reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    Reviewer {
+        session_id: String,
+        action: ReviewerAction,
+        reply: oneshot::Sender<std::result::Result<ReviewerOutcome, String>>,
     },
 }
 
@@ -591,6 +651,23 @@ impl ManagedSessionHandle {
             .map_err(anyhow::Error::msg)
     }
 
+    /// Drive the session's second-opinion reviewer.
+    ///
+    /// The reviewer shares this session's relay connection, so its actions
+    /// queue behind the session's own and are refused while a lifecycle
+    /// operation holds the connection.
+    pub async fn reviewer(&self, action: ReviewerAction) -> Result<ReviewerOutcome> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(ActorCommand::Reviewer { action, reply })
+            .await
+            .context("session manager stopped")?;
+        result
+            .await
+            .context("session manager stopped")?
+            .map_err(anyhow::Error::msg)
+    }
+
     pub(crate) async fn enqueue_sync(&self) -> Result<PendingRelaySync> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -699,6 +776,10 @@ enum ActorCommand {
         response: ElicitationResponse,
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
+    Reviewer {
+        action: ReviewerAction,
+        reply: oneshot::Sender<std::result::Result<ReviewerOutcome, String>>,
+    },
     /// The connection is handed over whole, and so is the failure: a caller
     /// that must decide whether to restart the worker needs the typed cause,
     /// which formatting the error to a string would destroy.
@@ -713,6 +794,7 @@ impl ActorCommand {
             Self::Submit { .. } => "submit",
             Self::Sync { .. } => "sync",
             Self::RespondElicitation { .. } => "respond_elicitation",
+            Self::Reviewer { action, .. } => action.operation_name(),
             Self::Lease { .. } => "lease",
         }
     }
@@ -743,6 +825,15 @@ impl ActorCommand {
                         %session_id,
                         operation = "respond_elicitation",
                         "elicitation rejection receiver was already closed"
+                    );
+                }
+            }
+            Self::Reviewer { reply, .. } => {
+                if reply.send(Err(message.to_owned())).is_err() {
+                    tracing::debug!(
+                        %session_id,
+                        operation = "reviewer",
+                        "reviewer rejection receiver was already closed"
                     );
                 }
             }
@@ -976,6 +1067,11 @@ async fn run_remote_session_actor(
                 response,
                 reply,
             },
+            ActorCommand::Reviewer { action, reply } => RemoteSessionRequest::Reviewer {
+                session_id: session_id.clone(),
+                action,
+                reply,
+            },
             ActorCommand::Lease { reply } => {
                 let _ = reply.send(Err(anyhow::anyhow!(
                     "relay connection leases are available only inside the controller daemon"
@@ -990,6 +1086,9 @@ async fn run_remote_session_actor(
                 }
                 RemoteSessionRequest::Sync { reply, .. }
                 | RemoteSessionRequest::RespondElicitation { reply, .. } => {
+                    let _ = reply.send(Err("controller daemon request bridge stopped".into()));
+                }
+                RemoteSessionRequest::Reviewer { reply, .. } => {
                     let _ = reply.send(Err("controller daemon request bridge stopped".into()));
                 }
             }
@@ -1559,6 +1658,60 @@ async fn run_session_actor(
                         );
                     }
                     }
+                    ActorCommand::Reviewer { action, reply } => {
+                        if lifecycle.is_leased() {
+                            // A lifecycle operation owns the connection, and a
+                            // reviewer action is not worth deferring: the user
+                            // is waiting on its answer now.
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                operation = action.operation_name(),
+                                "rejecting a reviewer action while the session is leased"
+                            );
+                            if reply
+                                .send(Err("session is reserved for a lifecycle operation".into()))
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    session_id = %target.session_id,
+                                    operation = "reviewer",
+                                    "reviewer rejection receiver was already closed"
+                                );
+                            }
+                            continue;
+                        }
+                        let operation = action.operation_name();
+                        let result = async {
+                            sync_actor_connection(&target, &mut connection).await?;
+                            let connection =
+                                connection.as_mut().context("relay is disconnected")?;
+                            drive_reviewer(connection, action).await
+                        }
+                        .await;
+                        match &result {
+                            Ok(_) => {}
+                            Err(error) if !is_final_rejection(error) => connection = None,
+                            Err(_) => {}
+                        }
+                        if let Err(error) = &result {
+                            tracing::warn!(
+                                session_id = %target.session_id,
+                                %operation,
+                                error = %error,
+                                "reviewer action failed"
+                            );
+                        }
+                        if reply
+                            .send(result.map_err(|error| format!("{error:#}")))
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                %operation,
+                                "reviewer result receiver was already closed"
+                            );
+                        }
+                    }
                     ActorCommand::RespondElicitation {
                         elicitation_id,
                         response,
@@ -1874,6 +2027,49 @@ async fn submit_actor_command(
     }
     let detail = first_error.unwrap_or_else(|| "relay submission failed".into());
     bail!("relay command {command_id} failed after an idempotent reconnect: {detail}")
+}
+
+/// Perform one reviewer action on a synchronized relay connection.
+///
+/// The reviewer's own relay answers most of these, so the outcomes mirror the
+/// primary's: an attach page, an acknowledgement cursor, an accepted command.
+async fn drive_reviewer(
+    connection: &mut StandaloneSession,
+    action: ReviewerAction,
+) -> Result<ReviewerOutcome> {
+    let client = &mut connection.client;
+    Ok(match action {
+        ReviewerAction::Start { config } => {
+            ReviewerOutcome::Started(Box::new(client.start_reviewer(*config).await?))
+        }
+        ReviewerAction::Submit {
+            command_id,
+            command,
+        } => ReviewerOutcome::Accepted {
+            ordinal: client.submit_to_reviewer(command_id, command).await?,
+        },
+        ReviewerAction::Attach {
+            after_ordinal,
+            after_digest,
+        } => ReviewerOutcome::Attached(Box::new(
+            client.attach_reviewer(after_ordinal, after_digest).await?,
+        )),
+        ReviewerAction::Acknowledge {
+            through_ordinal,
+            through_digest,
+        } => ReviewerOutcome::Acknowledged(
+            client
+                .acknowledge_reviewer(through_ordinal, through_digest)
+                .await?,
+        ),
+        ReviewerAction::Status => {
+            ReviewerOutcome::Status(Box::new(client.reviewer_status().await?))
+        }
+        ReviewerAction::Pause => {
+            client.pause_reviewer().await?;
+            ReviewerOutcome::Paused
+        }
+    })
 }
 
 async fn sync_actor_connection(
@@ -2499,6 +2695,95 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+
+    /// A reviewer action reaches a remote controller daemon as JSON, so both
+    /// halves of the exchange have to survive that round trip intact.
+    #[test]
+    fn reviewer_actions_and_outcomes_survive_the_daemon_wire() {
+        let config = ReviewerLaunchConfig {
+            profile_id: "claude".into(),
+            harness: crate::hel_config::HarnessKind::Claude,
+            bridge_command: "npx".into(),
+            bridge_args: vec!["claude-code-acp".into()],
+            environment: BTreeMap::from([("EXTRA".into(), "1".into())]),
+            execution_policy: crate::hel_config::ExecutionPolicy::Unconstrained,
+            model: Some("sonnet".into()),
+            effort: Some("high".into()),
+            generation: 2,
+        };
+        let actions = [
+            ReviewerAction::Start {
+                config: Box::new(config),
+            },
+            ReviewerAction::Submit {
+                command_id: "review-1".into(),
+                command: RelayCommand::Cancel,
+            },
+            ReviewerAction::Attach {
+                after_ordinal: 4,
+                after_digest: "digest".into(),
+            },
+            ReviewerAction::Acknowledge {
+                through_ordinal: 4,
+                through_digest: "digest".into(),
+            },
+            ReviewerAction::Status,
+            ReviewerAction::Pause,
+        ];
+        for action in actions {
+            let encoded = serde_json::to_string(&action).unwrap();
+            let decoded: ReviewerAction = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, action);
+        }
+
+        let outcome = ReviewerOutcome::Accepted { ordinal: 9 };
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        let decoded: ReviewerOutcome = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(decoded, ReviewerOutcome::Accepted { ordinal: 9 }));
+
+        let paused = serde_json::to_string(&ReviewerOutcome::Paused).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ReviewerOutcome>(&paused).unwrap(),
+            ReviewerOutcome::Paused
+        ));
+    }
+
+    /// Every reviewer action names itself for the actor's logs and for the
+    /// rejection path, so a stalled review can be traced to the step it stalled
+    /// on.
+    #[test]
+    fn every_reviewer_action_names_its_operation() {
+        let names = [
+            ReviewerAction::Submit {
+                command_id: String::new(),
+                command: RelayCommand::Cancel,
+            }
+            .operation_name(),
+            ReviewerAction::Attach {
+                after_ordinal: 0,
+                after_digest: String::new(),
+            }
+            .operation_name(),
+            ReviewerAction::Acknowledge {
+                through_ordinal: 0,
+                through_digest: String::new(),
+            }
+            .operation_name(),
+            ReviewerAction::Status.operation_name(),
+            ReviewerAction::Pause.operation_name(),
+        ];
+        assert_eq!(
+            names,
+            [
+                "reviewer_submit",
+                "reviewer_attach",
+                "reviewer_acknowledge",
+                "reviewer_status",
+                "reviewer_pause",
+            ]
+        );
+        assert!(names.iter().all(|name| name.starts_with("reviewer_")));
+    }
 
     #[test]
     fn reconnect_delay_backs_off_and_stops_at_the_ceiling() {

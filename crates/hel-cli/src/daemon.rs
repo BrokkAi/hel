@@ -250,6 +250,13 @@ enum DaemonAction {
         elicitation_id: String,
         response: ElicitationResponse,
     },
+    /// Drive a session's second-opinion reviewer. The reviewer is a sidecar of
+    /// the session's worker, so it travels the session's own relay rather than
+    /// becoming a session of its own here.
+    ReviewerAction {
+        session_id: String,
+        action: hel::hel_session_manager::ReviewerAction,
+    },
     CloseSession {
         session_id: String,
     },
@@ -302,6 +309,7 @@ enum DaemonReply {
     MaterializedSession(MaterializedSession),
     RegisteredSession(Box<RegisteredSession>),
     Ordinal(u64),
+    Reviewer(Box<hel::hel_session_manager::ReviewerOutcome>),
     Done,
 }
 
@@ -1384,6 +1392,20 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) async fn reviewer_action(
+        &mut self,
+        session_id: String,
+        action: hel::hel_session_manager::ReviewerAction,
+    ) -> Result<hel::hel_session_manager::ReviewerOutcome> {
+        match self
+            .request(DaemonAction::ReviewerAction { session_id, action })
+            .await?
+        {
+            DaemonReply::Reviewer(outcome) => Ok(*outcome),
+            reply => bail!("unexpected reviewer reply {reply:?}"),
+        }
+    }
+
     pub(crate) async fn sync_session(&mut self, session_id: String) -> Result<()> {
         match self
             .request(DaemonAction::SyncSession { session_id })
@@ -1953,6 +1975,16 @@ async fn forward_in_process_session_request(
             .map_err(|error| format!("{error:#}"));
             let _ = reply.send(result);
         }
+        RemoteSessionRequest::Reviewer {
+            session_id,
+            action,
+            reply,
+        } => {
+            let result = async { manager.session(session_id).await?.reviewer(action).await }
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -2153,6 +2185,12 @@ async fn handle_action(
             Ok(DaemonReply::Ordinal(
                 session.submit(command_id, command).await?,
             ))
+        }
+        DaemonAction::ReviewerAction { session_id, action } => {
+            let session = state.session_manager.session(session_id).await?;
+            Ok(DaemonReply::Reviewer(Box::new(
+                session.reviewer(action).await?,
+            )))
         }
         DaemonAction::SyncSession { session_id } => {
             state

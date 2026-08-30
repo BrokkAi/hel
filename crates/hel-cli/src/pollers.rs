@@ -1350,6 +1350,21 @@ async fn forward_remote_session_request(request: RemoteSessionRequest) {
             .map_err(|error| format!("{error:#}"));
             let _ = reply.send(result);
         }
+        RemoteSessionRequest::Reviewer {
+            session_id,
+            action,
+            reply,
+        } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .reviewer_action(session_id, action)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
     }
 }
 

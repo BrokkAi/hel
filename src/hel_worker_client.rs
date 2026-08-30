@@ -75,7 +75,7 @@ async fn drain_proxy_stderr(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RelayAttachment {
     pub state: RelayOperationalState,
     pub events: Vec<RelayEvent>,
@@ -84,7 +84,7 @@ pub struct RelayAttachment {
 }
 
 /// What the reviewer sidecar reports once it is running.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StartedReviewer {
     /// The reviewer's own native session, distinct from the primary's.
     pub native_session_id: Option<String>,
