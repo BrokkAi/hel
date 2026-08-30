@@ -661,6 +661,7 @@ pub struct ActiveChat {
     remote_open: bool,
     session_open: bool,
     session_reconnect_in_flight: bool,
+    session_feed_expected: bool,
     /// Preserve the stronger reconnect result when the initial sync, which
     /// independently reacquires the same actor, finishes just afterwards.
     reconnect_notice_pending_sync: bool,
@@ -800,6 +801,7 @@ impl ActiveChat {
             remote_open: true,
             session_open: true,
             session_reconnect_in_flight: false,
+            session_feed_expected: false,
             reconnect_notice_pending_sync: false,
         }
     }
@@ -815,6 +817,17 @@ impl ActiveChat {
     /// useful while that asynchronous handoff is in flight.
     pub fn session_feed_open(&self) -> bool {
         self.session_open
+    }
+
+    /// Keeps a visible chat attached when another control surface makes its
+    /// session runnable again. A stopped actor gets one bounded handoff attempt
+    /// on its own; a durable active record means replacement should keep being
+    /// retried until the actor appears or another record retires the session.
+    pub fn set_session_feed_expected(&mut self, expected: bool) {
+        self.session_feed_expected = expected;
+        if expected && !self.session_open {
+            self.begin_session_reconnect();
+        }
     }
 
     /// The composer's current text. The dashboard saves this on detach so
@@ -1020,9 +1033,13 @@ impl ActiveChat {
                     self.begin_session_reconnect();
                 }
             }
-            Err(error) => self
-                .state
-                .set_notice(format!("Could not reconnect to session relay: {error}")),
+            Err(error) => {
+                self.state
+                    .set_notice(format!("Could not reconnect to session relay: {error}"));
+                if self.session_feed_expected {
+                    self.begin_session_reconnect();
+                }
+            }
         }
     }
 
@@ -2021,6 +2038,41 @@ mod tests {
         .expect("the replacement actor became the live chat feed");
 
         assert_eq!(chat.draft(), "half-written prompt");
+        assert_eq!(
+            chat.state.notice().as_deref(),
+            Some("Reconnected to session relay")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_runtime_record_rearms_a_chat_after_its_handoff_timed_out() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-resumed", 74);
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            None,
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            "still drafting".into(),
+            Notices::default(),
+        );
+        chat.session_open = false;
+        chat.finish_session_reconnect(Err("session session-resumed is not managed".into()));
+
+        chat.set_session_feed_expected(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                ActiveChat::pump(Some(&mut chat)).await;
+                if chat.session_feed_open() && !chat.session.is_stopped() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the active runtime record restarted the session handoff");
+
+        assert_eq!(chat.draft(), "still drafting");
         assert_eq!(
             chat.state.notice().as_deref(),
             Some("Reconnected to session relay")

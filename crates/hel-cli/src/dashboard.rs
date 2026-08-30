@@ -59,9 +59,9 @@ use crate::pollers::{
     QuotaRefreshBatch, QuotaUpdate, ResourcePollTarget, ResourcePollUpdate, WorkerDiagnosisTracker,
     WorkerPollTarget, apply_worker_poll_update, complete_manual_quota_refresh,
     dashboard_worker_targets, projected_queued_prompts, quota_refresh_profiles,
-    refresh_dashboard_poll_targets, schedule_due_credential_syncs, spawn_dashboard_capacity_poller,
-    spawn_dashboard_resource_poller, spawn_quota_refresher, spawn_remote_dashboard_worker_poller,
-    spawn_worker_diagnosis,
+    refresh_dashboard_poll_targets, schedule_due_credential_syncs, session_target_is_pollable,
+    spawn_dashboard_capacity_poller, spawn_dashboard_resource_poller, spawn_quota_refresher,
+    spawn_remote_dashboard_worker_poller, spawn_worker_diagnosis,
 };
 use crate::{TerminalGuard, short_id, startup_greeting};
 
@@ -1540,10 +1540,16 @@ impl DashboardContext {
         let Some(records) = latest else {
             return;
         };
-        let sessions = records
+        let sessions: BTreeMap<String, SessionRecord> = records
             .into_iter()
             .map(|session| (session.id.clone(), session))
             .collect();
+        if let Some(chat) = self.active_chat.as_mut() {
+            let feed_expected = sessions
+                .get(chat.session_id())
+                .is_some_and(session_target_is_pollable);
+            chat.set_session_feed_expected(feed_expected);
+        }
         if self.controller.state.sessions == sessions {
             return;
         }

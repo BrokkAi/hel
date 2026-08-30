@@ -793,7 +793,7 @@ fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget
 /// by a live target. A recoverable error stays visible so the user can resume
 /// its checkpoint, but its failed target must not keep reconnecting or being
 /// sampled.
-fn session_target_is_pollable(session: &hel::hel_state::SessionRecord) -> bool {
+pub(crate) fn session_target_is_pollable(session: &hel::hel_state::SessionRecord) -> bool {
     session.state.is_active() && session.state != SessionState::Error && session.target.is_some()
 }
 

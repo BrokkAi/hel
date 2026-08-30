@@ -1269,7 +1269,7 @@ self.addEventListener('fetch', event => { if (event.request.method === 'GET' && 
 const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="100" fill="#08090d"/><path d="M132 88v336M380 88v336M132 256h248" stroke="#b9ff5a" stroke-width="54" stroke-linecap="round"/></svg>"##;
 
 const VIEWER_HTML: &str = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="icon" href="/icon.svg"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
 <style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
@@ -1559,6 +1559,11 @@ mod tests {
         assert!(!json.contains("secret.registry"));
         assert!(!json.contains("native-secret-id"));
         assert!(json.contains("\"has_error\":true"));
+    }
+
+    #[test]
+    fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
+        assert!(VIEWER_HTML.contains(r#"<link rel="icon" href="/icon.svg">"#));
     }
 
     #[tokio::test]
