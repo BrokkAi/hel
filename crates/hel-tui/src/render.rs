@@ -2023,7 +2023,10 @@ mod tests {
             unread_agent_messages: 1,
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&unread_idle), false), Color::LightBlue);
+        assert_eq!(
+            session_band_color(Some(&unread_idle), false),
+            Color::LightBlue
+        );
 
         let collapsed =
             collapsed_session_line("› ", "podman", Some(&unread_idle), false, 1, 80, None);

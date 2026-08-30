@@ -407,6 +407,7 @@ pub(crate) struct RuntimeState {
     session_manager: SessionManagerControl,
     lifecycle: Mutex<BTreeMap<String, ActiveLifecycle>>,
     controller: Mutex<Controller>,
+    controller_loader: fn() -> Result<Controller>,
     config_mutation: tokio::sync::Mutex<()>,
     recovery_observer: RecoveryObserver,
 }
@@ -456,6 +457,22 @@ impl RuntimeState {
         recovery_observer: RecoveryObserver,
         workspaces: Vec<WorkspaceRecord>,
     ) -> Self {
+        Self::new_with_controller_loader(
+            session_manager,
+            controller,
+            recovery_observer,
+            workspaces,
+            Controller::load,
+        )
+    }
+
+    fn new_with_controller_loader(
+        session_manager: SessionManagerControl,
+        controller: Controller,
+        recovery_observer: RecoveryObserver,
+        workspaces: Vec<WorkspaceRecord>,
+        controller_loader: fn() -> Result<Controller>,
+    ) -> Self {
         // Revisions are opaque cursors, so give every daemon incarnation a
         // fresh high-water mark. Clients that survive a daemon restart must
         // never wait on, or render, a cursor from the previous process as if
@@ -474,6 +491,7 @@ impl RuntimeState {
             session_manager,
             lifecycle: Mutex::new(BTreeMap::new()),
             controller: Mutex::new(controller),
+            controller_loader,
             config_mutation: tokio::sync::Mutex::new(()),
             recovery_observer,
         }
@@ -539,7 +557,8 @@ impl RuntimeState {
         // Serialize installs so an earlier phone publication cannot overwrite
         // a later completed lifecycle with the controller snapshot it loaded.
         let _mutation = self.config_mutation.lock().await;
-        let controller = tokio::task::spawn_blocking(Controller::load)
+        let controller_loader = self.controller_loader;
+        let controller = tokio::task::spawn_blocking(controller_loader)
             .await
             .context("daemon controller reload task panicked")??;
         let session_count = controller.state.sessions.len();
@@ -2458,7 +2477,7 @@ mod tests {
     fn test_runtime_state() -> Arc<RuntimeState> {
         let remote = spawn_remote_session_manager().unwrap();
         let recovery = hel::hel_recovery::RecoveryCoordinator::spawn(remote.control.clone());
-        Arc::new(RuntimeState::new(
+        Arc::new(RuntimeState::new_with_controller_loader(
             remote.control,
             Controller {
                 config: HelConfig::default(),
@@ -2466,6 +2485,12 @@ mod tests {
             },
             recovery.observer(),
             Vec::new(),
+            || {
+                Ok(Controller {
+                    config: HelConfig::default(),
+                    state: hel::hel_state::HelState::default(),
+                })
+            },
         ))
     }
 
