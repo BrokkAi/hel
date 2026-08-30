@@ -1976,7 +1976,7 @@ impl DashboardState {
 mod tests {
     use std::time::Instant;
 
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -2251,13 +2251,21 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
 
-        assert_eq!(dashboard.handle_key(ctrl_key('w')), DashboardAction::None);
+        let control_key =
+            |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+        assert_eq!(
+            dashboard.handle_key(control_key('w')),
+            DashboardAction::None
+        );
         let Mode::Rename(editor) = &dashboard.mode else {
             panic!("expected rename editor");
         };
         assert!(editor.title.ends_with("alpha "));
 
-        assert_eq!(dashboard.handle_key(ctrl_key('c')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(control_key('c')),
+            DashboardAction::None
+        );
         assert!(matches!(dashboard.mode, Mode::Dashboard));
     }
 
