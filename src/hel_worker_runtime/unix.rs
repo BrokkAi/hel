@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
+use super::reviewer::{ReviewerPlacement, ReviewerSidecar};
 use super::{AcpSupervisorSpec, CredentialEndpoint, DISCOVER_LOGIN_PATH_ENV, WorkerLaunchConfig};
 
 pub(super) const PROXY_INITIAL_INPUT_TIMEOUT: std::time::Duration =
@@ -23,7 +24,7 @@ use crate::hel_worker::{
 };
 use crate::hel_worker_protocol::{DecodedRelayRequest, decode_relay_request};
 
-pub(super) const ACP_EVENT_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const ACP_EVENT_CHANNEL_CAPACITY: usize = 256;
 const LOGIN_PATH_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const LOGIN_PATH_MARKER: &str = "__HEL_LOGIN_PATH__=";
 
@@ -187,135 +188,161 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
         environment: config.environment,
         cwd: config.cwd.clone(),
     }
-    .write(&supervisor_path)?;
-    let acp_spec = LaunchSpec {
-        command: std::env::current_exe().context("locate Hel worker executable")?,
-        args: vec![
-            "worker".into(),
-            "acp-supervisor".into(),
-            "--spec".into(),
-            supervisor_path.to_string_lossy().into_owned(),
-        ],
-        environment: Default::default(),
-        cwd: config.cwd,
-        additional_directories: config.additional_directories,
-        project_memory: config.project_memory,
-        resume_session,
-        harness: config.harness,
-        execution_policy: config.execution_policy,
-        acp_activity: relay
-            .lock()
-            .expect("relay lock poisoned")
-            .acp_activity_clock(),
-    };
-    let mut acp_task = tokio::spawn(hel_acp::run(acp_spec, acp_commands_rx, acp_events_tx));
+    .write_spec(&supervisor_path)?;
+    let worker_executable = std::env::current_exe().context("locate Hel worker executable")?;
+    // The reviewer shares this session's target and working directory and
+    // nothing else. It stays idle until a controller asks for a second
+    // opinion, so constructing it costs nothing.
+    let reviewer = Arc::new(tokio::sync::Mutex::new(ReviewerSidecar::new(
+        ReviewerPlacement {
+            worker_root: root.clone(),
+            session_id: config.session_id.clone(),
+            cwd: config.cwd.clone(),
+            additional_directories: config.additional_directories.clone(),
+            worker_executable: worker_executable.clone(),
+        },
+    )));
+    // Everything that can start a reviewer runs inside this block, so every
+    // way out of it — including an error — passes through the pause below.
+    // Stopping the reviewer's process group before this worker exits is what
+    // keeps a harness from outliving the session it was reviewing for.
+    let outcome = async {
+        let acp_spec = LaunchSpec {
+            command: worker_executable,
+            args: vec![
+                "worker".into(),
+                "acp-supervisor".into(),
+                "--spec".into(),
+                supervisor_path.to_string_lossy().into_owned(),
+            ],
+            environment: Default::default(),
+            cwd: config.cwd,
+            additional_directories: config.additional_directories,
+            project_memory: config.project_memory,
+            resume_session,
+            harness: config.harness,
+            execution_policy: config.execution_policy,
+            acp_activity: relay
+                .lock()
+                .expect("relay lock poisoned")
+                .acp_activity_clock(),
+        };
+        let mut acp_task = tokio::spawn(hel_acp::run(acp_spec, acp_commands_rx, acp_events_tx));
 
-    let event_relay = relay.clone();
-    let mut event_task = tokio::spawn(run_relay_coordinator_with_shells(
-        event_relay,
-        acp_events_rx,
-        dispatch_wake_rx,
-        acp_commands_tx.clone(),
-        user_shells,
-    ));
+        let event_relay = relay.clone();
+        let mut event_task = tokio::spawn(run_relay_coordinator_with_shells(
+            event_relay,
+            acp_events_rx,
+            dispatch_wake_rx,
+            acp_commands_tx.clone(),
+            user_shells,
+        ));
 
-    let acp_join = loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accept worker proxy")?;
-                let client_relay = relay.clone();
-                let client_dispatch_wake = dispatch_wake_tx.clone();
-                let client_credentials = credentials.clone();
-                let client_fatal = fatal_tx.clone();
-                let client_commands = acp_commands_tx.clone();
-                let client_project_memory = project_memory.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = serve_client_with_memory(
-                        stream,
-                        client_relay,
-                        client_dispatch_wake,
-                        client_credentials,
-                        client_project_memory,
-                        Some(client_commands),
-                        client_fatal,
-                    ).await {
-                        tracing::warn!(%error, "relay proxy client disconnected");
-                    }
-                });
-            }
-            fatal = fatal_rx.recv() => {
-                let error = fatal
-                    .unwrap_or_else(|| anyhow::anyhow!("relay failure report was lost"));
-                event_task.abort();
-                drop(acp_commands_tx);
-                return abort_peer_and_return(
-                    &mut acp_task,
-                    error,
-                    "relay durable state became unwritable",
-                ).await;
-            }
-            result = &mut event_task => {
-                match result {
-                    Ok(Ok(())) => break acp_task.await,
-                    Ok(Err(error)) => {
-                        drop(acp_commands_tx);
-                        return abort_peer_and_return(
-                            &mut acp_task,
-                            error,
-                            "relay coordinator failed",
-                        ).await;
-                    }
-                    Err(error) => {
-                        drop(acp_commands_tx);
-                        return abort_peer_and_return(
-                            &mut acp_task,
-                            anyhow::anyhow!(error),
-                            "relay coordinator task stopped",
-                        ).await;
+        let acp_join = loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.context("accept worker proxy")?;
+                    let client_relay = relay.clone();
+                    let client_dispatch_wake = dispatch_wake_tx.clone();
+                    let client_credentials = credentials.clone();
+                    let client_fatal = fatal_tx.clone();
+                    let client_commands = acp_commands_tx.clone();
+                    let client_project_memory = project_memory.clone();
+                    let client_reviewer = reviewer.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = serve_client_with_memory(
+                            stream,
+                            client_relay,
+                            client_dispatch_wake,
+                            client_credentials,
+                            ConnectionRuntime {
+                                project_memory: client_project_memory,
+                                commands: Some(client_commands),
+                                reviewer: Some(client_reviewer),
+                            },
+                            client_fatal,
+                        ).await {
+                            tracing::warn!(%error, "relay proxy client disconnected");
+                        }
+                    });
+                }
+                fatal = fatal_rx.recv() => {
+                    let error = fatal
+                        .unwrap_or_else(|| anyhow::anyhow!("relay failure report was lost"));
+                    event_task.abort();
+                    drop(acp_commands_tx);
+                    return abort_peer_and_return(
+                        &mut acp_task,
+                        error,
+                        "relay durable state became unwritable",
+                    ).await;
+                }
+                result = &mut event_task => {
+                    match result {
+                        Ok(Ok(())) => break acp_task.await,
+                        Ok(Err(error)) => {
+                            drop(acp_commands_tx);
+                            return abort_peer_and_return(
+                                &mut acp_task,
+                                error,
+                                "relay coordinator failed",
+                            ).await;
+                        }
+                        Err(error) => {
+                            drop(acp_commands_tx);
+                            return abort_peer_and_return(
+                                &mut acp_task,
+                                anyhow::anyhow!(error),
+                                "relay coordinator task stopped",
+                            ).await;
+                        }
                     }
                 }
+                result = &mut acp_task => {
+                    event_task.await.context("relay event task stopped")??;
+                    break result;
+                }
             }
-            result = &mut acp_task => {
-                event_task.await.context("relay event task stopped")??;
-                break result;
+        };
+        let acp_result = match acp_join {
+            Ok(result) => result,
+            Err(error) => {
+                let error = anyhow::anyhow!("ACP runtime task stopped: {error}");
+                relay
+                    .lock()
+                    .expect("relay state lock poisoned")
+                    .record_observation(RelayObservation::Warning {
+                        message: format!("{error:#}"),
+                    })?;
+                Err(error)
             }
+        };
+        let closed = relay
+            .lock()
+            .expect("relay state lock poisoned")
+            .operational_state()
+            .execution
+            == crate::hel_worker::RelayExecutionState::Closed;
+        if !closed {
+            return acp_result;
         }
-    };
-    let acp_result = match acp_join {
-        Ok(result) => result,
-        Err(error) => {
-            let error = anyhow::anyhow!("ACP runtime task stopped: {error}");
-            relay
-                .lock()
-                .expect("relay state lock poisoned")
-                .record_observation(RelayObservation::Warning {
-                    message: format!("{error:#}"),
-                })?;
-            Err(error)
+        if let Err(error) = &acp_result {
+            tracing::warn!(%error, "ACP runtime failed after the relay closed");
         }
-    };
-    let closed = relay
-        .lock()
-        .expect("relay state lock poisoned")
-        .operational_state()
-        .execution
-        == crate::hel_worker::RelayExecutionState::Closed;
-    if !closed {
-        return acp_result;
+        serve_terminal_relay(
+            listener,
+            relay,
+            dispatch_wake_tx,
+            credentials,
+            project_memory,
+            fatal_tx,
+            fatal_rx,
+        )
+        .await
     }
-    if let Err(error) = &acp_result {
-        tracing::warn!(%error, "ACP runtime failed after the relay closed");
-    }
-    serve_terminal_relay(
-        listener,
-        relay,
-        dispatch_wake_tx,
-        credentials,
-        project_memory,
-        fatal_tx,
-        fatal_rx,
-    )
-    .await
+    .await;
+    reviewer.lock().await.pause().await;
+    outcome
 }
 
 async fn discover_login_path(session_id: &str) -> Option<String> {
@@ -428,8 +455,10 @@ pub(super) async fn serve_terminal_relay(
                 client_relay,
                 client_dispatch_wake,
                 client_credentials,
-                client_project_memory,
-                None,
+                ConnectionRuntime {
+                    project_memory: client_project_memory,
+                    ..ConnectionRuntime::default()
+                },
                 client_fatal,
             )
             .await
@@ -518,13 +547,18 @@ async fn run_relay_coordinator_with_shells(
     }
 }
 
-#[cfg(test)]
-pub(super) async fn run_relay_coordinator(
+/// A relay coordinator for a session that runs no user shells.
+///
+/// The reviewer sidecar is one: `!` commands belong to the person driving the
+/// primary session, and are never routed to the agent reviewing its plan.
+pub(crate) async fn run_relay_coordinator(
     relay: Arc<Mutex<DurableRelay>>,
     events: mpsc::Receiver<RuntimeEvent>,
     dispatch_wakes: mpsc::Receiver<()>,
     commands: mpsc::Sender<CommandRequest>,
 ) -> Result<()> {
+    // The registry is inert without a live event sink, so its working
+    // directory only has to exist.
     let (shell_events, _shell_events_rx) = mpsc::channel(1);
     let user_shells = crate::hel_user_shell::UserShellRegistry::new(
         std::env::current_dir()?,
@@ -1134,8 +1168,19 @@ pub(super) async fn handle_request(
     ))
 }
 
-/// `commands` is the ACP coordinator's command channel, or `None` once the
-/// session is sealed and no ACP runtime is left to serve scratch prompts.
+/// The live services one relay connection can reach beyond the durable relay:
+/// everything answered on the connection instead of being journaled.
+#[derive(Clone, Default)]
+pub(super) struct ConnectionRuntime {
+    pub(super) project_memory: ProjectMemoryEndpoint,
+    /// The ACP coordinator's command channel, or `None` once the session is
+    /// sealed and no ACP runtime is left to serve scratch prompts.
+    pub(super) commands: Option<mpsc::Sender<CommandRequest>>,
+    /// The second-opinion reviewer, when this worker has an ACP runtime to run
+    /// one beside. A sealed session has none.
+    pub(super) reviewer: Option<Arc<tokio::sync::Mutex<ReviewerSidecar>>>,
+}
+
 #[cfg(test)]
 pub(super) async fn serve_client(
     stream: UnixStream,
@@ -1150,8 +1195,10 @@ pub(super) async fn serve_client(
         relay,
         dispatch_wake,
         credentials,
-        ProjectMemoryEndpoint::default(),
-        commands,
+        ConnectionRuntime {
+            commands,
+            ..ConnectionRuntime::default()
+        },
         fatal,
     )
     .await
@@ -1162,10 +1209,14 @@ pub(super) async fn serve_client_with_memory(
     relay: Arc<Mutex<DurableRelay>>,
     dispatch_wake: mpsc::Sender<()>,
     credentials: std::result::Result<CredentialEndpoint, String>,
-    project_memory: ProjectMemoryEndpoint,
-    commands: Option<mpsc::Sender<CommandRequest>>,
+    runtime: ConnectionRuntime,
     fatal: mpsc::Sender<anyhow::Error>,
 ) -> Result<()> {
+    let ConnectionRuntime {
+        project_memory,
+        commands,
+        reviewer,
+    } = runtime;
     let relay_root = relay
         .lock()
         .expect("relay state lock poisoned")
@@ -1246,6 +1297,15 @@ pub(super) async fn serve_client_with_memory(
                 // sequential RPC.
                 let response = compaction_response(envelope, commands.as_ref()).await;
                 write_logged_response(&mut writer, &response, &session_id, "compact").await?;
+                continue;
+            }
+            if let RelayRequest::Reviewer { .. } = &envelope.request {
+                // The reviewer is a sidecar with its own relay and its own
+                // harness process. Both live on this connection's worker, so
+                // the primary's relay never sees these.
+                let operation = envelope.request.method_name();
+                let response = reviewer_response(envelope, reviewer.as_ref()).await;
+                write_logged_response(&mut writer, &response, &session_id, operation).await?;
                 continue;
             }
             if let RelayRequest::RespondElicitation { .. } = &envelope.request {
@@ -1391,6 +1451,34 @@ async fn compaction_response(
         protocol_version: envelope.protocol_version,
         body,
     }
+}
+
+async fn reviewer_response(
+    envelope: RelayRequestEnvelope,
+    reviewer: Option<&Arc<tokio::sync::Mutex<ReviewerSidecar>>>,
+) -> RelayResponseEnvelope {
+    if !envelope.request.supported_at(envelope.protocol_version) {
+        return incompatible_request_protocol_response(
+            envelope.request_id,
+            envelope.protocol_version,
+        );
+    }
+    let Some(reviewer) = reviewer else {
+        return RelayResponseEnvelope {
+            request_id: envelope.request_id,
+            protocol_version: envelope.protocol_version,
+            body: compaction_error(
+                RelayErrorCode::InvalidState,
+                "session is closed; no reviewer can run beside it",
+            ),
+        };
+    };
+    let RelayRequest::Reviewer { request } = envelope.request.clone() else {
+        unreachable!("reviewer_response only serves reviewer requests");
+    };
+    // Reviewer operations are sequential by construction: starting,
+    // configuring and pausing one harness cannot interleave.
+    reviewer.lock().await.handle(envelope, request).await
 }
 
 fn compaction_error(code: RelayErrorCode, message: &str) -> RelayResponseBody {
