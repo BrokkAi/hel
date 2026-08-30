@@ -109,6 +109,7 @@ pub enum DashboardAction {
     },
     CancelOperation {
         session_id: String,
+        kind: SessionOperationKind,
     },
     ResolveAwsResourceOptions {
         target_template_ids: Vec<String>,
@@ -661,13 +662,13 @@ impl DashboardState {
             }
             (KeyCode::Char('n'), true) if self.focus == Focus::Active => self.begin_new(),
             (KeyCode::Char('x'), true) if self.focus == Focus::Active => {
-                let session_id = self.selected_session().and_then(|session| {
+                let operation = self.selected_session().and_then(|session| {
                     self.session_operations
-                        .contains_key(&session.id)
-                        .then(|| session.id.clone())
+                        .get(&session.id)
+                        .map(|operation| (session.id.clone(), operation.kind))
                 });
-                session_id.map_or(DashboardAction::None, |session_id| {
-                    DashboardAction::CancelOperation { session_id }
+                operation.map_or(DashboardAction::None, |(session_id, kind)| {
+                    DashboardAction::CancelOperation { session_id, kind }
                 })
             }
             (KeyCode::Char('s'), true) if self.focus == Focus::Active => {
@@ -1185,6 +1186,27 @@ mod tests {
             DashboardAction::RefreshQuotas
         );
         assert_eq!(dashboard.handle_key(ctrl_key('u')), DashboardAction::None);
+    }
+
+    #[test]
+    fn remote_operation_cancel_action_carries_the_operation_kind() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let session_id = session.id.clone();
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.begin_session_operation(
+            session_id.clone(),
+            SessionOperationKind::Launching,
+            None,
+        );
+
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('x')),
+            DashboardAction::CancelOperation {
+                session_id,
+                kind: SessionOperationKind::Launching,
+            }
+        );
     }
 
     /// The notice bar is the only report a background failure gets, so a key

@@ -94,6 +94,10 @@ pub(crate) enum DashboardIoUpdate {
         result: Box<std::result::Result<ImportedDashboardSessionApply, String>>,
     },
     LifecycleReloaded(Box<LifecycleReloaded>),
+    LifecycleCancellation {
+        session_id: String,
+        result: std::result::Result<(), String>,
+    },
     CheckpointArchiveSizes {
         generation: u64,
         sizes: BTreeMap<String, Option<u64>>,
@@ -1244,6 +1248,14 @@ impl DashboardContext {
             },
             DashboardIoUpdate::LifecycleReloaded(reloaded) => {
                 self.apply_lifecycle_reloaded(*reloaded)
+            }
+            DashboardIoUpdate::LifecycleCancellation { session_id, result } => {
+                if let Err(error) = result {
+                    self.dashboard.set_failure_notice(format!(
+                        "Could not cancel operation for {}: {error}",
+                        short_id(&session_id)
+                    ));
+                }
             }
             DashboardIoUpdate::CheckpointArchiveSizes { generation, sizes } => {
                 if generation == self.checkpoint_archive_generation {

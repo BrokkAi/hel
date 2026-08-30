@@ -33,7 +33,7 @@ use hel::hel_session_manager::{
     SessionManagerControl, SessionManagerShutdown, SessionManagerUpdates, ViewError,
 };
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_state::{MaterializedSession, SessionRecord, SessionResourceAllocation};
+use hel::hel_state::{MaterializedSession, SessionRecord, SessionResourceAllocation, SessionState};
 use hel::hel_targets::DeploymentCapacityTarget;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::{
@@ -1544,6 +1544,25 @@ impl DashboardContext {
             .into_iter()
             .map(|session| (session.id.clone(), session))
             .collect();
+        let settled_remote_operations = self
+            .remote_lifecycle_sessions
+            .iter()
+            .filter(|session_id| {
+                self.dashboard
+                    .session_operation_kind(session_id)
+                    .is_some_and(|kind| {
+                        remote_lifecycle_settled(
+                            kind,
+                            sessions.get(*session_id).map(|session| session.state),
+                        )
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in settled_remote_operations {
+            self.dashboard.finish_session_operation(&session_id);
+            self.remote_lifecycle_sessions.remove(&session_id);
+        }
         if let Some(chat) = self.active_chat.as_mut() {
             let feed_expected = sessions
                 .get(chat.session_id())
@@ -1834,6 +1853,41 @@ impl DashboardContext {
             &self.dashboard_io_tx,
             self.critical_operations.clone(),
         )
+    }
+}
+
+/// A durable terminal lifecycle state is authoritative over a remote UI
+/// overlay. The daemon lifecycle feed normally removes the overlay first, but
+/// records and lifecycles travel on separate watch channels; retaining a
+/// completed overlay would otherwise force a fresh Running record back to a
+/// displayed Provisioning state indefinitely.
+fn remote_lifecycle_settled(kind: SessionOperationKind, state: Option<SessionState>) -> bool {
+    match kind {
+        SessionOperationKind::Launching
+        | SessionOperationKind::Resuming
+        | SessionOperationKind::Connecting
+        | SessionOperationKind::Importing => state.is_some_and(|state| {
+            matches!(
+                state,
+                SessionState::Running
+                    | SessionState::Disconnected
+                    | SessionState::Lost
+                    | SessionState::Error
+                    | SessionState::DestroyedWithDataLoss
+            )
+        }),
+        SessionOperationKind::Stopping => state.is_some_and(|state| {
+            matches!(
+                state,
+                SessionState::Stopped
+                    | SessionState::Lost
+                    | SessionState::Error
+                    | SessionState::DestroyedWithDataLoss
+            )
+        }),
+        SessionOperationKind::Destroying => {
+            state.is_none_or(|state| matches!(state, SessionState::DestroyedWithDataLoss))
+        }
     }
 }
 
@@ -2156,6 +2210,26 @@ mod tests {
             );
         }
         DashboardState::new(config, state, std::collections::BTreeMap::new())
+    }
+
+    #[test]
+    fn durable_terminal_state_settles_remote_lifecycle_overlay() {
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Launching,
+            Some(SessionState::Running)
+        ));
+        assert!(!remote_lifecycle_settled(
+            SessionOperationKind::Stopping,
+            Some(SessionState::Running)
+        ));
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Stopping,
+            Some(SessionState::Stopped)
+        ));
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Destroying,
+            None
+        ));
     }
 
     /// Draws the dashboard exactly as the loop does, so the highlight and the

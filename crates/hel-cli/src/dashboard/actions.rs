@@ -491,28 +491,36 @@ pub(crate) async fn apply_dashboard_action(
                 },
             );
         }
-        DashboardAction::CancelOperation { session_id } => {
+        DashboardAction::CancelOperation { session_id, kind } => {
             if let Some(operation) = context.lifecycle_operations.get(&session_id) {
                 operation.cancelled.store(true, Ordering::Release);
-                let daemon_session_id = session_id.clone();
-                tokio::spawn(async move {
-                    let result = async {
-                        daemon::connect_or_start()
-                            .await?
-                            .cancel_lifecycle(daemon_session_id)
-                            .await
-                    }
-                    .await;
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "could not cancel daemon lifecycle operation");
-                    }
-                });
-                context.dashboard.set_notice(format!(
-                    "Cancelling {} for {}…",
-                    operation.kind.label().to_ascii_lowercase(),
-                    short_id(&session_id)
-                ));
             }
+            let daemon_session_id = session_id.clone();
+            let updates = context.dashboard_io_tx.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    daemon::connect_or_start()
+                        .await?
+                        .cancel_lifecycle(daemon_session_id.clone())
+                        .await
+                }
+                .await
+                .map_err(|error: anyhow::Error| format!("{error:#}"));
+                if updates
+                    .send(DashboardIoUpdate::LifecycleCancellation {
+                        session_id: daemon_session_id,
+                        result,
+                    })
+                    .is_err()
+                {
+                    tracing::debug!("dashboard closed before lifecycle cancellation completed");
+                }
+            });
+            context.dashboard.set_notice(format!(
+                "Cancelling {} for {}…",
+                kind.label().to_ascii_lowercase(),
+                short_id(&session_id)
+            ));
         }
     }
     Ok(())
