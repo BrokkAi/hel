@@ -15,7 +15,7 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 - [x] (2026-08-30 15:18Z) Inspected the existing unit, PTY, coverage, property, and process-chaos tests and measured the current coverage shape.
 - [x] (2026-08-30 15:18Z) Recorded the product-scope decisions: runtime paths are the priority, mutation testing is deferred, and Luna testing remains a local runbook.
 - [x] (2026-08-30 15:29Z) Milestone 1: repaired full-package coverage reporting, established a crate-qualified baseline, and fixed the asynchronous log-writer lifetime exposed by the PTY teardown assertion.
-- [ ] Milestone 2: add the isolated, replayable runtime scenario harness and deterministic multi-client tests.
+- [x] (2026-08-30 16:04Z) Milestone 2: added the isolated replayable runtime lab, made daemon state live across web/TUI clients, centralized recovery ownership, and passed the three-client lifecycle scenario twice at seed 1 plus seed 2.
 - [ ] Milestone 3: expand property and process-chaos coverage around durable state and exact crash boundaries.
 - [ ] Milestone 4: add browser coverage and the local Luna tmux runbook.
 - [ ] Milestone 5: establish pull-request, nightly, and beta acceptance gates and complete an end-to-end demonstration.
@@ -42,6 +42,18 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 
 - Observation: Hel already has substantial deterministic coverage and one property-based journal-chaos suite.
   Evidence: the repository contains roughly 1,600 Rust tests, `src/hel_worker/journal_chaos.rs` runs 160 generated cases, and `tests/e2e/session_restart_chaos.sh` kills five real worker-side process generations in an explicitly isolated container.
+
+- Observation: the phone server captured the workspace list at daemon startup, so a workspace created by the first setup TUI never appeared in the already-running web viewer.
+  Evidence: the first lab replay authenticated successfully but `/api/snapshot` returned no workspaces. RuntimeState now publishes workspace records over a watch feed, and a focused unit test proves an existing phone subscriber receives later creation.
+
+- Observation: publishing live worker views was insufficient to make a daemon-created session visible in existing dashboards.
+  Evidence: daemon diagnostics showed a connected view and a one-session controller while both PTYs still omitted the title. Runtime snapshots did not carry `SessionRecord`s, so each dashboard discarded the view for an unknown local record. The runtime feed now installs workspace-filtered records before applying worker updates.
+
+- Observation: recovery coordinators in every TUI and in the phone server competed with the daemon's recovery coordinator for the same checkpoint barrier.
+  Evidence: the first converged transcript acquired multiple `checkpoint-*` barriers which were cancelled as client-owned proxy connections disappeared; a subsequent web close remained running with checkpoint errors. Recovery and interrupted-close ownership now live only in the daemon, which already serializes them with lifecycle operations.
+
+- Observation: the web viewer could advertise a newly provisioned session before its remote session handle had appeared.
+  Evidence: a prompt posted immediately after the snapshot first reached `running` failed with `session ... is not managed`. Phone relay actions now wait for the managed session with the same bounded five-second window used by controller lifecycle code.
 
 ## Decision Log
 
@@ -73,9 +85,15 @@ The visible proof is not a coverage percentage. It is a test run in which two te
   Rationale: intermittent failure is the behavior under test. Every generated run must record enough state to replay its first failing seed; a subsequent successful attempt does not erase the failure.
   Date/Author: 2026-08-30, Codex.
 
+- Decision: the persistent daemon is the sole owner of automatic recovery and interrupted lifecycle recovery.
+  Rationale: remote dashboards and the phone server consume daemon-owned views and submit commands through it; independent recovery coordinators cannot share the daemon actor's leased relay connection safely and provide no additional durability authority.
+  Date/Author: 2026-08-30, Codex.
+
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. Coverage now measures `hel-core`, `hel-cli`, and `hel-tui` without collapsing same-named source paths, and the baseline records the real 78.12% aggregate with reviewed runtime exceptions. The full instrumented suite passed: 65 `hel-cli` unit tests, its logging and two PTY integration tests, 1,355 `hel-core` tests with four ignored, and 197 `hel-tui` tests with one ignored. The log worker now uses a bounded flush barrier while remaining valid for the lifetime of the global tracing subscriber, so detached runtime diagnostics cannot corrupt the restored terminal. The remaining beta gaps are the multi-client system lab, expanded generated/crash chaos, browser and Luna campaigns, and tiered automation.
+Milestones 1 and 2 are complete. Coverage now measures `hel-core`, `hel-cli`, and `hel-tui` without collapsing same-named source paths, and the baseline records the real 78.12% aggregate with reviewed runtime exceptions. The full instrumented suite passed: 65 `hel-cli` unit tests, its logging and two PTY integration tests, 1,355 `hel-core` tests with four ignored, and 197 `hel-tui` tests with one ignored. The log worker now uses a bounded flush barrier while remaining valid for the lifetime of the global tracing subscriber, so detached runtime diagnostics cannot corrupt the restored terminal.
+
+The system lab now creates short isolated runtime roots, a disposable Git workspace, a stateful fake ACP bridge with checkpointable Codex artifacts, a local-bare worker, one persistent daemon, two 140x32 PTYs, and an authenticated loopback web client. It asserts exact-once prompt/reply projection, screen convergence, monotonic client convergence revisions, stopped lifecycle state, sub-two-second UI quit, daemon shutdown, SQLite integrity and foreign keys, and zero processes retaining the isolated environment. Failures retain runtime state and print one replay command. Two consecutive seed-1 runs produced the same logical seven-action trace; seed 2 also passed. The lab itself exposed and drove fixes for stale web workspaces, missing cross-client session records, duplicated recovery ownership, and the new-session/managed-actor race. The remaining beta gaps are expanded generated/crash chaos, richer PTY/browser and Luna campaigns, and tiered automation.
 
 ## Context and Orientation
 

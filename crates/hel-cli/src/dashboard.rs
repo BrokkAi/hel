@@ -26,7 +26,6 @@ use crossterm::event::{
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
 use hel::hel_credentials::CredentialSyncHandle;
-use hel::hel_recovery::RecoveryCoordinator;
 use hel::hel_selection::{
     FrameSurfaces, SelectionAction, SelectionRange, SelectionState, SurfaceId,
 };
@@ -34,7 +33,7 @@ use hel::hel_session_manager::{
     SessionManagerControl, SessionManagerShutdown, SessionManagerUpdates, ViewError,
 };
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_state::{MaterializedSession, RecoveryObserver, SessionResourceAllocation};
+use hel::hel_state::{MaterializedSession, SessionRecord, SessionResourceAllocation};
 use hel::hel_targets::DeploymentCapacityTarget;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::{
@@ -48,7 +47,7 @@ use tokio_stream::StreamExt as _;
 use crate::dashboard::io::{
     ActiveLifecycleOperation, DashboardIoUpdate, LifecycleReload, checkpoint_archive_targets,
     spawn_checkpoint_archive_size_refresh, spawn_clipboard_write, spawn_io, spawn_lifecycle_reload,
-    spawn_materialized_session_projection, spawn_project_source_resolution, spawn_recovery_reload,
+    spawn_materialized_session_projection, spawn_project_source_resolution,
     spawn_stored_session_summary,
 };
 use crate::import::{
@@ -59,10 +58,10 @@ use crate::pollers::{
     CapacityPollUpdate, CredentialSyncNotices, CredentialSyncSignalTracker, Feed, LifecycleUpdate,
     QuotaRefreshBatch, QuotaUpdate, ResourcePollTarget, ResourcePollUpdate, WorkerDiagnosisTracker,
     WorkerPollTarget, apply_worker_poll_update, complete_manual_quota_refresh,
-    dashboard_worker_targets, merge_recovery_result_loaded, projected_queued_prompts,
-    quota_refresh_profiles, refresh_dashboard_poll_targets, schedule_due_credential_syncs,
-    spawn_dashboard_capacity_poller, spawn_dashboard_resource_poller, spawn_quota_refresher,
-    spawn_remote_dashboard_worker_poller, spawn_worker_diagnosis,
+    dashboard_worker_targets, projected_queued_prompts, quota_refresh_profiles,
+    refresh_dashboard_poll_targets, schedule_due_credential_syncs, spawn_dashboard_capacity_poller,
+    spawn_dashboard_resource_poller, spawn_quota_refresher, spawn_remote_dashboard_worker_poller,
+    spawn_worker_diagnosis,
 };
 use crate::{TerminalGuard, short_id, startup_greeting};
 
@@ -265,14 +264,12 @@ pub(crate) struct DashboardContext {
     worker: Feed<SessionManagerUpdates>,
     runtime_lifecycles: Feed<watch::Receiver<Vec<crate::daemon::RuntimeLifecycleView>>>,
     runtime_config: Feed<watch::Receiver<HelConfig>>,
+    runtime_records: Feed<watch::Receiver<Vec<SessionRecord>>>,
     config_reload_in_flight: bool,
     remote_lifecycle_sessions: BTreeSet<String>,
     pub(crate) worker_commands_tx: SessionManagerControl,
     worker_shutdown: Option<SessionManagerShutdown>,
     worker_diagnoses: WorkerDiagnosisTracker,
-
-    recovery: Feed<RecoveryCoordinator>,
-    pub(crate) recovery_observer: RecoveryObserver,
 
     pub(crate) lifecycle_updates_tx: UnboundedSender<LifecycleUpdate>,
     lifecycle: Feed<UnboundedReceiver<LifecycleUpdate>>,
@@ -504,8 +501,8 @@ pub(crate) async fn run_dashboard_for_workspace(
                 let woke = context.runtime_config.accept(update);
                 context.dirty |= woke;
             }
-            result = context.recovery.wait(), if context.recovery.is_open() => {
-                let woke = context.recovery.accept(result);
+            update = context.runtime_records.wait(), if context.runtime_records.is_open() => {
+                let woke = context.runtime_records.accept(update);
                 context.dirty |= woke;
             }
             result = context.credential_sync.wait(), if context.credential_sync.is_open() => {
@@ -769,9 +766,8 @@ impl DashboardContext {
         let worker_shutdown = remote_worker.shutdown;
         let runtime_lifecycles_rx = remote_worker.lifecycles;
         let runtime_config_rx = remote_worker.config;
+        let runtime_records_rx = remote_worker.records;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
-        let recovery = RecoveryCoordinator::spawn(worker_commands_tx.clone());
-        let recovery_observer = recovery.observer();
         let (lifecycle_updates_tx, lifecycle_updates_rx) =
             tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
         let (critical_operations, critical_operations_changed) = CriticalOperationTracker::new();
@@ -829,13 +825,12 @@ impl DashboardContext {
             worker: Feed::new(worker_updates_rx),
             runtime_lifecycles: Feed::new(runtime_lifecycles_rx),
             runtime_config: Feed::new(runtime_config_rx),
+            runtime_records: Feed::new(runtime_records_rx),
             config_reload_in_flight: false,
             remote_lifecycle_sessions: BTreeSet::new(),
             worker_commands_tx,
             worker_shutdown: Some(worker_shutdown),
             worker_diagnoses: WorkerDiagnosisTracker::default(),
-            recovery: Feed::new(recovery),
-            recovery_observer,
             lifecycle_updates_tx,
             lifecycle: Feed::new(lifecycle_updates_rx),
             lifecycle_operations,
@@ -1268,11 +1263,6 @@ impl DashboardContext {
                 });
             }
         }
-        let recovery_context = hel::hel_state::RecoveryContext {
-            observer: self.recovery_observer.clone(),
-            session: session_record.clone(),
-            config: self.controller.config.clone(),
-        };
         let sessions = self.worker_commands_tx.clone();
         let notices = self.notices.clone();
         let updates = self.dashboard_io_tx.clone();
@@ -1288,13 +1278,7 @@ impl DashboardContext {
                 .await
                 .map(|managed| {
                     hel::hel_chat::ActiveChat::open(
-                        managed,
-                        &bundle_id,
-                        Some(recovery_context),
-                        sessions,
-                        header,
-                        draft,
-                        notices,
+                        managed, &bundle_id, None, sessions, header, draft, notices,
                     )
                 })
                 .map_err(|error| format!("{error:#}"));
@@ -1341,6 +1325,7 @@ impl DashboardContext {
     /// feed, in the order the UI depends on.
     fn drain_feeds(&mut self) {
         self.drain_quota_updates();
+        self.drain_runtime_records();
         self.drain_worker_updates();
         self.drain_runtime_lifecycles();
         self.drain_runtime_config();
@@ -1349,7 +1334,6 @@ impl DashboardContext {
             &self.credential_sync_handle,
             Instant::now(),
         );
-        self.drain_recovery_results();
         self.drain_credential_results();
         self.drain_resource_updates();
         self.drain_capacity_updates();
@@ -1548,10 +1532,25 @@ impl DashboardContext {
         );
     }
 
-    fn drain_recovery_results(&mut self) {
-        while let Some(result) = self.recovery.next_ready() {
-            spawn_recovery_reload(result, self.dashboard_io_tx.clone());
+    fn drain_runtime_records(&mut self) {
+        let mut latest = None;
+        while let Some(records) = self.runtime_records.next_ready() {
+            latest = Some(records);
         }
+        let Some(records) = latest else {
+            return;
+        };
+        let sessions = records
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect();
+        if self.controller.state.sessions == sessions {
+            return;
+        }
+        self.controller.state.sessions = sessions;
+        self.dashboard.set_state(self.controller.state.clone());
+        self.controller_changed = true;
+        self.refresh_poll_targets();
     }
 
     fn drain_credential_results(&mut self) {
@@ -2041,36 +2040,6 @@ fn workspace_picker_event(event: &Event) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         && key.modifiers.contains(accelerator)
         && key.code == KeyCode::Char('w')
-}
-
-pub(super) fn apply_recovery_result_loaded(
-    context: &mut DashboardContext,
-    mut loaded: Controller,
-    result: hel::hel_recovery::RecoveryResult,
-) {
-    let session_id = result.session_id.clone();
-    let failure = if result.cancelled {
-        // A copy the user preempted is not a failure worth reporting.
-        None
-    } else {
-        result.outcome.as_ref().err().cloned()
-    };
-    let merged = merge_recovery_result_loaded(&mut loaded, result);
-    context.controller = loaded;
-    context
-        .dashboard
-        .set_config(context.controller.config.clone());
-    context
-        .dashboard
-        .set_state(context.controller.state.clone());
-    context.refresh_poll_targets();
-    context.controller_changed = true;
-    if merged && let Some(detail) = failure {
-        context.dashboard.set_notice(format!(
-            "Recovery copy for {} failed: {detail}",
-            short_id(&session_id)
-        ));
-    }
 }
 
 pub(crate) fn resume_progress_notice(

@@ -28,8 +28,8 @@ use hel::hel_session_manager::{
     spawn_remote_session_manager,
 };
 use hel::hel_state::{
-    HelState, ManagedSessionSnapshot, MaterializedSession, SessionResourceAllocation, SessionState,
-    normalize_session_title,
+    HelState, ManagedSessionSnapshot, MaterializedSession, SessionRecord,
+    SessionResourceAllocation, SessionState, normalize_session_title,
 };
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
@@ -1168,6 +1168,7 @@ pub(crate) struct RemoteDashboardWorkerPoller {
     pub(crate) shutdown: SessionManagerShutdown,
     pub(crate) lifecycles: tokio::sync::watch::Receiver<Vec<daemon::RuntimeLifecycleView>>,
     pub(crate) config: tokio::sync::watch::Receiver<hel::hel_config::HelConfig>,
+    pub(crate) records: tokio::sync::watch::Receiver<Vec<SessionRecord>>,
 }
 
 pub(crate) fn spawn_remote_dashboard_worker_poller(
@@ -1184,6 +1185,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
     } = channels;
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::watch::channel(Vec::new());
     let (config_tx, config_rx) = tokio::sync::watch::channel(hel::hel_config::HelConfig::default());
+    let (records_tx, records_rx) = tokio::sync::watch::channel(Vec::new());
     tokio::spawn(async move {
         let mut revision = 0_u64;
         let mut requests_open = true;
@@ -1205,6 +1207,14 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                     false
                                 } else {
                                     *config = snapshot.config.clone();
+                                    true
+                                }
+                            });
+                            records_tx.send_if_modified(|records| {
+                                if *records == snapshot.records {
+                                    false
+                                } else {
+                                    records.clone_from(&snapshot.records);
                                     true
                                 }
                             });
@@ -1294,6 +1304,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         shutdown,
         lifecycles: lifecycle_rx,
         config: config_rx,
+        records: records_rx,
     })
 }
 
@@ -1578,63 +1589,6 @@ fn queued_prompt_entries(
             created_at_ms: prompt.queued_at_ms,
         })
         .collect()
-}
-
-pub(crate) fn merge_recovery_result(
-    controller: &mut Controller,
-    result: hel::hel_recovery::RecoveryResult,
-) -> bool {
-    if let Err(error) = controller.reload() {
-        tracing::warn!(%error, "could not reload a completed recovery checkpoint");
-        return false;
-    }
-    merge_recovery_result_loaded(controller, result)
-}
-
-/// Applies a recovery result after its controller reload already ran on a
-/// blocking task. The dashboard uses this variant so the event loop only
-/// folds in memory state.
-pub(crate) fn merge_recovery_result_loaded(
-    controller: &mut Controller,
-    result: hel::hel_recovery::RecoveryResult,
-) -> bool {
-    let hel::hel_recovery::RecoveryResult {
-        session_id,
-        expected_target,
-        outcome,
-        cancelled,
-    } = result;
-    let Some(session) = controller.state.sessions.get_mut(&session_id) else {
-        tracing::warn!(%session_id, "recovery result refers to a session no longer in controller state");
-        return false;
-    };
-    if session.target.as_ref() != Some(&expected_target) || !session.state.is_active() {
-        tracing::debug!(%session_id, "discarding recovery result for a session whose target or state changed");
-        return false;
-    }
-    match outcome {
-        Ok(artifact) => {
-            if session.checkpoint.as_ref() != Some(&artifact.metadata) {
-                tracing::warn!(
-                    %session_id,
-                    "recovery checkpoint result no longer matches the durable session record; retaining both archives"
-                );
-                return false;
-            }
-        }
-        Err(_) if cancelled => {
-            // A preempted copy was never judged, so it must not leave a
-            // checkpoint error on the session.
-            return false;
-        }
-        Err(detail) => {
-            // record_recovery_failure normally made this durable before the
-            // result was published. Preserve the diagnostic in this view if
-            // that write itself failed; later reloads remain authoritative.
-            session.last_checkpoint_error = Some(detail);
-        }
-    }
-    true
 }
 
 pub(crate) enum LifecycleSuccess {

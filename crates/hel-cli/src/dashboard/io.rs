@@ -18,8 +18,7 @@ use hel::hel_controller::ResumeRepositorySourcePreflight;
 use hel::hel_import::{configured_bundle_for_local, configured_bundle_for_origin};
 use hel::hel_setup::github_repository_from_origin;
 use hel::hel_state::{
-    HelState, MaterializedSession, ProjectSourceIdentity, RecoveryObserver, SessionRecord,
-    SessionState,
+    HelState, MaterializedSession, ProjectSourceIdentity, SessionRecord, SessionState,
 };
 use hel::hel_targets::CancellableProcessExecutor;
 use hel_tui::{
@@ -34,7 +33,6 @@ use crate::dashboard::{CriticalOperationTracker, DashboardContext};
 use crate::import::{DashboardImportSuccess, PendingDashboardImport, persist_imported_session};
 use crate::pollers::{
     LifecycleSuccess, LifecycleUpdate, WorkerRecordPersistence, WorkerRecordPersistenceOutcome,
-    reserve_recovery_or_cancel,
 };
 use crate::short_id;
 
@@ -96,10 +94,6 @@ pub(crate) enum DashboardIoUpdate {
         result: Box<std::result::Result<ImportedDashboardSessionApply, String>>,
     },
     LifecycleReloaded(Box<LifecycleReloaded>),
-    RecoveryReloaded {
-        recovery: Box<hel::hel_recovery::RecoveryResult>,
-        result: std::result::Result<Controller, String>,
-    },
     CheckpointArchiveSizes {
         generation: u64,
         sizes: BTreeMap<String, Option<u64>>,
@@ -231,24 +225,6 @@ pub(crate) struct LifecycleReload {
 pub(crate) struct LifecycleReloaded {
     reload: LifecycleReload,
     result: std::result::Result<Controller, String>,
-}
-
-/// Reloads durable state for a completed recovery copy off the dashboard
-/// loop. Recovery itself is already supervised; the follow-up reload must be
-/// supervised too because it reads the database and state files.
-pub(crate) fn spawn_recovery_reload(
-    recovery: hel::hel_recovery::RecoveryResult,
-    updates: UnboundedSender<DashboardIoUpdate>,
-) -> JoinHandle<()> {
-    spawn_io(
-        "reload recovery state",
-        updates,
-        Controller::load,
-        move |result| DashboardIoUpdate::RecoveryReloaded {
-            recovery: Box::new(recovery),
-            result,
-        },
-    )
 }
 
 /// Runs one blocking job off the loop and reports its outcome on the
@@ -432,17 +408,14 @@ pub(crate) struct LifecycleOperationRequest {
     pub(crate) session_id: String,
     pub(crate) kind: SessionOperationKind,
     pub(crate) cancelled: Arc<AtomicBool>,
-    /// Set when the operation must preempt a recovery copy already running for
-    /// the session.
-    pub(crate) recovery: Option<RecoveryObserver>,
     pub(crate) updates: UnboundedSender<LifecycleUpdate>,
 }
 
 /// Runs one session lifecycle operation on a blocking task.
 ///
-/// Every one of them takes the same three steps around its own work: hold the
-/// session against recovery copies, reload the controller so it acts on
-/// durable state, and answer on the lifecycle channel whatever happens.
+/// Every one of them reloads the controller so it acts on durable state, then
+/// answers on the lifecycle channel whatever happens. The daemon owns
+/// lifecycle/recovery serialization.
 pub(crate) fn spawn_lifecycle_operation(
     request: LifecycleOperationRequest,
     tracker: CriticalOperationTracker,
@@ -452,10 +425,8 @@ pub(crate) fn spawn_lifecycle_operation(
         session_id,
         kind,
         cancelled,
-        recovery,
         updates,
     } = request;
-    let operation_session_id = session_id.clone();
     let guard = tracker.begin_cancellable(
         format!(
             "{} session {}",
@@ -466,11 +437,6 @@ pub(crate) fn spawn_lifecycle_operation(
     );
     tokio::task::spawn_blocking(move || {
         let result = (|| -> Result<LifecycleSuccess> {
-            let _recovery_reservation = recovery
-                .map(|observer| {
-                    reserve_recovery_or_cancel(&observer, &operation_session_id, &cancelled)
-                })
-                .transpose()?;
             let mut controller = Controller::load()?;
             work(&mut controller, cancelled)
         })()
@@ -1279,17 +1245,6 @@ impl DashboardContext {
             DashboardIoUpdate::LifecycleReloaded(reloaded) => {
                 self.apply_lifecycle_reloaded(*reloaded)
             }
-            DashboardIoUpdate::RecoveryReloaded { recovery, result } => match result {
-                Ok(controller) => {
-                    super::apply_recovery_result_loaded(self, controller, *recovery);
-                }
-                Err(error) => {
-                    tracing::warn!("could not reload a completed recovery checkpoint: {error}");
-                    self.dashboard.set_notice(format!(
-                        "Could not refresh recovered session state: {error}"
-                    ));
-                }
-            },
             DashboardIoUpdate::CheckpointArchiveSizes { generation, sizes } => {
                 if generation == self.checkpoint_archive_generation {
                     self.dashboard.apply_checkpoint_archive_sizes(sizes);

@@ -129,6 +129,7 @@ impl RuntimeSessionView {
 pub(crate) struct RuntimeSnapshot {
     pub revision: u64,
     pub config: HelConfig,
+    pub records: Vec<SessionRecord>,
     pub sessions: Vec<RuntimeSessionView>,
     pub lifecycles: Vec<RuntimeLifecycleView>,
 }
@@ -394,6 +395,7 @@ pub(crate) struct RuntimeState {
     sessions: Mutex<BTreeMap<String, RuntimeSessionView>>,
     revision: std::sync::atomic::AtomicU64,
     revision_tx: tokio::sync::watch::Sender<u64>,
+    workspaces_tx: tokio::sync::watch::Sender<Vec<WorkspaceRecord>>,
     session_manager: SessionManagerControl,
     lifecycle: Mutex<BTreeMap<String, ActiveLifecycle>>,
     controller: Mutex<Controller>,
@@ -444,8 +446,10 @@ impl RuntimeState {
         session_manager: SessionManagerControl,
         controller: Controller,
         recovery_observer: RecoveryObserver,
+        workspaces: Vec<WorkspaceRecord>,
     ) -> Self {
         let (revision_tx, _) = tokio::sync::watch::channel(0);
+        let (workspaces_tx, _) = tokio::sync::watch::channel(workspaces);
         Self {
             attachments: Mutex::new(BTreeMap::new()),
             phone_status: Mutex::new(WebViewerStatus::Starting),
@@ -453,6 +457,7 @@ impl RuntimeState {
             sessions: Mutex::new(BTreeMap::new()),
             revision: std::sync::atomic::AtomicU64::new(0),
             revision_tx,
+            workspaces_tx,
             session_manager,
             lifecycle: Mutex::new(BTreeMap::new()),
             controller: Mutex::new(controller),
@@ -486,7 +491,41 @@ impl RuntimeState {
             .clone()
     }
 
+    fn workspaces(&self) -> tokio::sync::watch::Receiver<Vec<WorkspaceRecord>> {
+        self.workspaces_tx.subscribe()
+    }
+
+    fn publish_workspaces(&self, workspaces: Vec<WorkspaceRecord>) {
+        self.workspaces_tx.send_replace(workspaces);
+    }
+
+    pub(crate) async fn reload_controller(&self) -> Result<()> {
+        // Serialize installs so an earlier phone publication cannot overwrite
+        // a later completed lifecycle with the controller snapshot it loaded.
+        let _mutation = self.config_mutation.lock().await;
+        let controller = tokio::task::spawn_blocking(Controller::load)
+            .await
+            .context("daemon controller reload task panicked")??;
+        let session_count = controller.state.sessions.len();
+        *self
+            .controller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = controller;
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        self.revision_tx.send_replace(revision);
+        tracing::debug!(revision, session_count, "daemon controller state reloaded");
+        Ok(())
+    }
+
     fn publish_session(&self, session_id: String, view: ManagedSessionView) {
+        let connected = view.connected;
+        let has_snapshot = view.snapshot.is_some();
+        tracing::debug!(
+            %session_id,
+            connected,
+            has_snapshot,
+            "daemon received a session view"
+        );
         if let Some(snapshot) = view.snapshot.as_ref() {
             let controller = self
                 .controller
@@ -560,14 +599,15 @@ impl RuntimeState {
                 notice: active.notice.clone(),
             })
             .collect();
+        let controller = self
+            .controller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let records = runtime_records_for_sessions(&controller, &session_ids);
         Ok(RuntimeSnapshot {
             revision,
-            config: self
-                .controller
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .config
-                .clone(),
+            config: controller.config.clone(),
+            records,
             sessions,
             lifecycles,
         })
@@ -1055,6 +1095,19 @@ impl RuntimeState {
             self.revision_tx.send_replace(revision);
         }
     }
+}
+
+fn runtime_records_for_sessions(
+    controller: &Controller,
+    session_ids: &BTreeSet<String>,
+) -> Vec<SessionRecord> {
+    controller
+        .state
+        .sessions
+        .iter()
+        .filter(|(session_id, _)| session_ids.contains(*session_id))
+        .map(|(_, session)| session.clone())
+        .collect()
 }
 
 struct DaemonStageReportingExecutor<E> {
@@ -1663,6 +1716,9 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
     };
     write_metadata(&metadata_path(), &metadata)?;
 
+    let workspaces = tokio::task::spawn_blocking(hel::hel_database::list_workspaces)
+        .await
+        .context("daemon workspace load task panicked")??;
     let state = Arc::new(RuntimeState::new(
         manager_control.clone(),
         Controller {
@@ -1670,6 +1726,7 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
             state: controller.state.clone(),
         },
         recovery_observer.clone(),
+        workspaces,
     ));
     let cancellation = hel::termination::Coordinator::install().token();
     let target_refresh = spawn_manager_target_refresher(
@@ -1842,23 +1899,20 @@ fn spawn_manager_target_refresher(
 }
 
 async fn refresh_runtime_controller(state: &RuntimeState) {
-    match tokio::task::spawn_blocking(Controller::load).await {
-        Ok(Ok(controller)) => {
-            *state
-                .controller
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = controller;
-            let revision = state.revision.fetch_add(1, Ordering::AcqRel) + 1;
-            state.revision_tx.send_replace(revision);
-        }
-        Ok(Err(error)) => {
-            tracing::warn!(
-                error = format!("{error:#}"),
-                "could not refresh daemon controller state"
-            );
-        }
-        Err(error) => tracing::error!(%error, "daemon controller refresh task failed"),
+    if let Err(error) = state.reload_controller().await {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "could not refresh daemon controller state"
+        );
     }
+}
+
+async fn refresh_runtime_workspaces(state: &RuntimeState) -> Result<()> {
+    let workspaces = tokio::task::spawn_blocking(hel::hel_database::list_workspaces)
+        .await
+        .context("daemon workspace refresh task panicked")??;
+    state.publish_workspaces(workspaces);
+    Ok(())
 }
 
 fn spawn_phone_server(
@@ -1868,6 +1922,7 @@ fn spawn_phone_server(
     worker: SessionManagerChannels,
 ) {
     state.set_phone_status(WebViewerStatus::Starting);
+    let workspaces = state.workspaces();
     tokio::spawn(async move {
         let reporter = {
             let state = state.clone();
@@ -1879,6 +1934,7 @@ fn spawn_phone_server(
             reporter,
             worker,
             state.clone(),
+            workspaces,
         )
         .await
         {
@@ -2053,11 +2109,14 @@ async fn handle_action(
                     .collect(),
             ))
         }
-        DaemonAction::CreateWorkspace { name } => Ok(DaemonReply::Workspace(
-            blocking(move || hel::hel_database::create_workspace(&name)).await?,
-        )),
+        DaemonAction::CreateWorkspace { name } => {
+            let workspace = blocking(move || hel::hel_database::create_workspace(&name)).await?;
+            refresh_runtime_workspaces(state).await?;
+            Ok(DaemonReply::Workspace(workspace))
+        }
         DaemonAction::RenameWorkspace { workspace_id, name } => {
             blocking(move || hel::hel_database::rename_workspace(&workspace_id, &name)).await?;
+            refresh_runtime_workspaces(state).await?;
             Ok(DaemonReply::Done)
         }
         DaemonAction::DeleteWorkspace { workspace_id } => {
@@ -2069,6 +2128,7 @@ async fn handle_action(
                 "workspace still has attached clients"
             );
             blocking(move || hel::hel_database::delete_empty_workspace(&workspace_id)).await?;
+            refresh_runtime_workspaces(state).await?;
             Ok(DaemonReply::Done)
         }
         DaemonAction::Attach {
@@ -2305,7 +2365,29 @@ mod tests {
                 state: hel::hel_state::HelState::default(),
             },
             recovery.observer(),
+            Vec::new(),
         ))
+    }
+
+    #[tokio::test]
+    async fn workspace_publication_reaches_existing_phone_subscriber() {
+        let state = test_runtime_state();
+        let mut workspaces = state.workspaces();
+        let expected = WorkspaceRecord {
+            id: "workspace-1".into(),
+            name: "Reliability".into(),
+            created_at: "2026-08-30T00:00:00Z".into(),
+            last_opened_at: "2026-08-30T00:00:00Z".into(),
+            session_count: 0,
+        };
+
+        state.publish_workspaces(vec![expected.clone()]);
+        tokio::time::timeout(Duration::from_secs(1), workspaces.changed())
+            .await
+            .expect("workspace publication timed out")
+            .expect("workspace publisher stopped");
+
+        assert_eq!(workspaces.borrow_and_update().as_slice(), &[expected]);
     }
 
     #[tokio::test]

@@ -21,13 +21,13 @@ use hel::hel_tailscale::TailscaleTls;
 use hel::hel_targets::{CancellableProcessExecutor, CommandExecutor};
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_client::CredentialSyncCoordinator;
+use hel::hel_workspace::WorkspaceRecord;
 
 use crate::daemon::{ResumeSessionRequest, RuntimeState, WebViewerStatus};
 use crate::pollers::{
-    CredentialSyncNotices, CredentialSyncSignalTracker, LifecycleUpdate, QUOTA_STALE_AFTER,
-    QuotaRefreshBatch, QuotaUpdate, apply_worker_record_update, credential_sync_targets,
-    dashboard_worker_targets, merge_recovery_result, projected_queued_prompts,
-    queued_prompt_projection, quota_refresh_profiles, reserve_recovery_or_cancel,
+    CredentialSyncNotices, CredentialSyncSignalTracker, QUOTA_STALE_AFTER, QuotaRefreshBatch,
+    QuotaUpdate, apply_worker_record_update, credential_sync_targets, dashboard_worker_targets,
+    projected_queued_prompts, queued_prompt_projection, quota_refresh_profiles,
     schedule_due_credential_syncs, spawn_quota_refresher,
 };
 
@@ -313,6 +313,18 @@ fn request_controller_reload(
     }
 }
 
+fn request_daemon_controller_reload(daemon_runtime: Arc<RuntimeState>, reason: &'static str) {
+    tokio::spawn(async move {
+        if let Err(error) = daemon_runtime.reload_controller().await {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                reason,
+                "phone operation could not refresh dashboard controller state"
+            );
+        }
+    });
+}
+
 /// What one phone read receipt actually needs.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(test)]
@@ -436,13 +448,12 @@ pub(crate) async fn run_server(
     report_status: impl FnOnce(WebViewerStatus),
     worker: SessionManagerChannels,
     daemon_runtime: Arc<RuntimeState>,
+    mut workspace_updates: tokio::sync::watch::Receiver<Vec<WorkspaceRecord>>,
 ) -> Result<()> {
     let resolved = resolve_server_args(args, termination.clone()).await?;
     let bind = resolved.bind;
     let mut controller = Controller::load()?;
-    let phone_workspaces = tokio::task::spawn_blocking(hel::hel_database::list_workspaces)
-        .await
-        .context("phone workspace load task panicked")??;
+    let mut phone_workspaces = workspace_updates.borrow_and_update().clone();
     let mut quotas = std::collections::BTreeMap::new();
     let (quota_profiles_tx, mut quota_updates_rx) = spawn_quota_refresher();
     let mut quota_batch = QuotaRefreshBatch::default();
@@ -476,11 +487,6 @@ pub(crate) async fn run_server(
         shutdown: worker_shutdown,
     } = worker;
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
-    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn(worker_commands_tx.clone());
-    let recovery_observer = recovery.observer();
-    let (_interrupted_close_tx, mut interrupted_close_rx) =
-        tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
-    let mut interrupted_close_cancellations = std::collections::BTreeMap::new();
     let mut credential_sync = CredentialSyncCoordinator::spawn();
     let credential_sync_handle = credential_sync.handle();
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
@@ -535,7 +541,7 @@ pub(crate) async fn run_server(
 
     let serve = hel::hel_server::run_server(options);
     let control = async {
-        let mut recovery_tick = tokio::time::interval(Duration::from_millis(250));
+        let mut credential_tick = tokio::time::interval(Duration::from_millis(250));
         let (action_done_tx, mut action_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
             u64,
             Option<String>,
@@ -578,6 +584,18 @@ pub(crate) async fn run_server(
         loop {
             tokio::select! {
                 _ = termination.cancelled() => break,
+                changed = workspace_updates.changed() => {
+                    if changed.is_err() {
+                        failure = feed_stopped(
+                            termination.is_cancelled(),
+                            "the daemon stopped publishing workspaces to the phone server",
+                        );
+                        break;
+                    }
+                    phone_workspaces = workspace_updates.borrow_and_update().clone();
+                    revision += 1;
+                    publish_snapshot!(revision);
+                }
                 update = quota_updates_rx.recv(), if quota_updates_open => {
                     match update {
                         Some(QuotaUpdate::Report(outcome)) => {
@@ -642,39 +660,18 @@ pub(crate) async fn run_server(
                         publish_snapshot!(revision);
                     }
                 }
-                _ = recovery_tick.tick() => {
+                _ = credential_tick.tick() => {
                     schedule_due_credential_syncs(
                         &mut credential_sync_signals,
                         &credential_sync_handle,
                         Instant::now(),
                     );
-                    let mut changed = false;
-                    while let Some(result) = recovery.try_result() {
-                        changed |= merge_recovery_result(&mut controller, result);
-                    }
                     while let Some(result) = credential_sync.try_result() {
                         crate::pollers::log_credential_sync_actions(&result);
                         if let Some(notice) = credential_sync_notices.notice(&result) {
                             eprintln!("Hel: {notice}");
                         }
                     }
-                    if changed {
-                        revision += 1;
-                        publish_snapshot!(revision);
-                    }
-                }
-                completed = interrupted_close_rx.recv() => {
-                    let Some(completed) = completed else { continue; };
-                    active_actions.remove(&completed.session_id);
-                    interrupted_close_cancellations.remove(&completed.session_id);
-                    if let Err(error) = &completed.result {
-                        tracing::warn!(session_id = %completed.session_id, "could not resume interrupted close: {error}");
-                    }
-                    request_controller_reload(
-                        &mut controller_reload_in_flight,
-                        &mut controller_reload_requested,
-                        &controller_reload_tx,
-                    );
                 }
                 receipt = receipt_rx.recv() => {
                     let Some(ReadReceiptRequest { client_id, session_id, through, reply }) = receipt else {
@@ -745,7 +742,6 @@ pub(crate) async fn run_server(
                             session_id,
                             &action_sessions,
                             &action_cancellations,
-                            &interrupted_close_cancellations,
                         ) {
                             daemon_runtime.cancel_lifecycle_if_active(session_id);
                             ActionOutcome::Accepted
@@ -772,7 +768,6 @@ pub(crate) async fn run_server(
                     };
                     let ControllerRequest { action, reply } = request;
                     let done = action_done_tx.clone();
-                    let observer = recovery_observer.clone();
                     let session_control = worker_commands_tx.clone();
                     let daemon_runtime = daemon_runtime.clone();
                     let started = action_started_tx.clone();
@@ -788,23 +783,6 @@ pub(crate) async fn run_server(
                     tokio::spawn(async move {
                         let joined = tokio::task::spawn_blocking(move || {
                             let result = (|| -> Result<()> {
-                                let _recovery_reservation = match &action {
-                                    ControllerAction::Prompt { session_id, .. }
-                                    | ControllerAction::RunShell { session_id, .. }
-                                    | ControllerAction::CancelShell { session_id, .. }
-                                    | ControllerAction::Close { session_id }
-                                    | ControllerAction::Resume { session_id, .. }
-                                    | ControllerAction::RemoveQueuedPrompt { session_id, .. } => {
-                                        Some(reserve_recovery_or_cancel(
-                                            &observer,
-                                            session_id,
-                                            &control.cancelled,
-                                        )?)
-                                    }
-                                    ControllerAction::New { .. }
-                                    | ControllerAction::Open { .. }
-                                    | ControllerAction::Cancel { .. } => None,
-                                };
                                 if control.cancelled.load(Ordering::Acquire) {
                                     bail!("phone action cancelled");
                                 }
@@ -862,6 +840,10 @@ pub(crate) async fn run_server(
                         )) {
                             tracing::debug!(revision, %error, "phone snapshot delivery failed; no viewer is subscribed");
                         }
+                        request_daemon_controller_reload(
+                            daemon_runtime.clone(),
+                            "new session publication",
+                        );
                     };
                     if publication.is_err()
                         && let Some(control) = action_cancellations.get(&started.action_id)
@@ -912,6 +894,10 @@ pub(crate) async fn run_server(
                         &mut controller_reload_in_flight,
                         &mut controller_reload_requested,
                         &controller_reload_tx,
+                    );
+                    request_daemon_controller_reload(
+                        daemon_runtime.clone(),
+                        "phone action completion",
                     );
                 }
                 reloaded = controller_reload_rx.recv() => {
@@ -964,9 +950,6 @@ pub(crate) async fn run_server(
             }
         }
         // Every exit stops in-flight work, whether it was asked for or forced.
-        for cancelled in interrupted_close_cancellations.values() {
-            cancelled.store(true, Ordering::Release);
-        }
         for control in action_cancellations.values() {
             control.request_cancel();
         }
@@ -1049,7 +1032,6 @@ fn request_phone_action_cancellation(
     session_id: &str,
     action_sessions: &std::collections::BTreeMap<u64, String>,
     action_cancellations: &std::collections::BTreeMap<u64, PhoneActionControl>,
-    interrupted_cancellations: &std::collections::BTreeMap<String, Arc<AtomicBool>>,
 ) -> bool {
     let control = action_sessions
         .iter()
@@ -1061,13 +1043,7 @@ fn request_phone_action_cancellation(
     if let Some(control) = control {
         return control.request_cancel();
     }
-    interrupted_cancellations
-        .get(session_id)
-        .is_some_and(|cancelled| {
-            cancelled
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        })
+    false
 }
 
 fn track_started_phone_session(
@@ -1180,7 +1156,7 @@ async fn apply_phone_action(
         ControllerAction::Prompt { session_id, text } => {
             services
                 .sessions
-                .session(&session_id)
+                .wait_for_session(&session_id, Duration::from_secs(5))
                 .await?
                 .submit(
                     new_command_id("phone-prompt")?,
@@ -1199,7 +1175,7 @@ async fn apply_phone_action(
         } => {
             services
                 .sessions
-                .session(&session_id)
+                .wait_for_session(&session_id, Duration::from_secs(5))
                 .await?
                 .submit(
                     new_command_id("phone-shell")?,
@@ -1214,7 +1190,7 @@ async fn apply_phone_action(
         } => {
             services
                 .sessions
-                .session(&session_id)
+                .wait_for_session(&session_id, Duration::from_secs(5))
                 .await?
                 .submit(
                     new_command_id("phone-cancel-shell")?,
@@ -1791,7 +1767,6 @@ mod tests {
             "session-2",
             &action_sessions,
             &cancellations,
-            &std::collections::BTreeMap::new(),
         ));
         assert!(!first.cancelled.load(Ordering::Acquire));
         assert!(second.cancelled.load(Ordering::Acquire));
@@ -1799,7 +1774,6 @@ mod tests {
             "missing",
             &action_sessions,
             &cancellations,
-            &std::collections::BTreeMap::new(),
         ));
     }
 
