@@ -29,9 +29,9 @@ pub use protocol::{
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
     ActiveAgentTerminal, ActiveRelayPrompt, ActiveUserShell, ClaimedRelayCommand,
-    QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_FORMAT_V2, RelayCommand, RelayCommandKind,
-    RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState, RelayObservation,
-    RelayOperationalState, UserShellResult, UserShellStatus, relay_event_digest,
+    QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_FORMAT_V2, RelayCommand,
+    RelayCommandKind, RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState,
+    RelayObservation, RelayOperationalState, UserShellResult, UserShellStatus, relay_event_digest,
     validate_relay_event, validate_relay_event_self,
 };
 pub use types::{
@@ -1779,37 +1779,34 @@ impl RelayReplayPlan {
                 Some(self.desynchronized_detail(after_ordinal, after_digest)),
             )));
         }
-        let page = match self.read_events_after(
-            after_ordinal,
-            after_digest,
-            RELAY_REPLAY_BYTE_BUDGET,
-        ) {
-            Ok(page) => page,
-            Err(error) => {
-                // An unreadable old span cannot be served, but newer history
-                // still can. Answer with a desynchronization cursor past the
-                // corruption so the controller resynchronizes from there
-                // instead of retrying the same unparseable bytes forever.
-                if let Some(gap) = error.downcast_ref::<UnreadableRelaySpan>() {
-                    let (earliest_available, earliest_digest) =
-                        self.recovery_cursor_after(gap.recover_after);
-                    return Ok(Err(relay_protocol_error(
-                        RelayErrorCode::Desynchronized,
-                        error.to_string(),
-                        false,
-                        Some(RelayErrorDetail::Desynchronized {
-                            requested_after: after_ordinal,
-                            requested_digest: after_digest.to_owned(),
-                            earliest_available,
-                            earliest_digest,
-                            latest: self.latest_ordinal,
-                            latest_digest: self.latest_digest.clone(),
-                        }),
-                    )));
+        let page =
+            match self.read_events_after(after_ordinal, after_digest, RELAY_REPLAY_BYTE_BUDGET) {
+                Ok(page) => page,
+                Err(error) => {
+                    // An unreadable old span cannot be served, but newer history
+                    // still can. Answer with a desynchronization cursor past the
+                    // corruption so the controller resynchronizes from there
+                    // instead of retrying the same unparseable bytes forever.
+                    if let Some(gap) = error.downcast_ref::<UnreadableRelaySpan>() {
+                        let (earliest_available, earliest_digest) =
+                            self.recovery_cursor_after(gap.recover_after);
+                        return Ok(Err(relay_protocol_error(
+                            RelayErrorCode::Desynchronized,
+                            error.to_string(),
+                            false,
+                            Some(RelayErrorDetail::Desynchronized {
+                                requested_after: after_ordinal,
+                                requested_digest: after_digest.to_owned(),
+                                earliest_available,
+                                earliest_digest,
+                                latest: self.latest_ordinal,
+                                latest_digest: self.latest_digest.clone(),
+                            }),
+                        )));
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         ensure_serialized_budget(&state, RELAY_STATE_BYTE_BUDGET, "relay operational state")?;
         Ok(Ok(RelayResponsePayload::Attached {
             state,
@@ -1966,51 +1963,57 @@ impl RelayReplayPlan {
             if page_full || span.file_last_ordinal <= through_ordinal {
                 continue;
             }
-            let read = visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, encoded_len| {
-                if event.ordinal <= span.after_ordinal || event.ordinal <= through_ordinal {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                if event.ordinal > self.latest_ordinal {
-                    // The active segment kept growing after this plan was
-                    // captured. Those events are real, but the reply's
-                    // operational state describes the frontier the plan saw,
-                    // so the page stops there and the caller asks again.
-                    return Ok(ControlFlow::Break(()));
-                }
-                let expected = through_ordinal
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
-                if event.ordinal != expected {
-                    bail!(
-                        "relay journal page has a gap after event {through_ordinal}: found {}",
-                        event.ordinal
-                    );
-                }
-                // The page is assembled off the relay lock, so it carries its
-                // own proof that it is one unbroken run the cursor named rather
-                // than fragments of a journal that moved. For v1 the in-record
-                // chain link proves this; a v2 page relies instead on both
-                // endpoints being digest anchors (the cursor and the frontier)
-                // plus each interior record self-validating and the ordinals
-                // being contiguous.
-                if event.format == RELAY_EVENT_FORMAT_V1 && event.previous_digest != through_digest {
-                    bail!(
-                        "relay journal event {} does not chain from event {through_ordinal}",
-                        event.ordinal
-                    );
-                }
-                validate_relay_event(through_ordinal, &through_digest, &event)
-                    .context("validate relay journal page event")?;
-                if !events.is_empty() && used.saturating_add(encoded_len) > byte_budget {
-                    page_full = true;
-                    return Ok(ControlFlow::Break(()));
-                }
-                used = used.saturating_add(encoded_len);
-                through_ordinal = event.ordinal;
-                through_digest.clone_from(&event.digest);
-                events.push(event);
-                Ok(ControlFlow::Continue(()))
-            });
+            let read = visit_relay_journal_file(
+                &span.path,
+                JournalReadMode::Strict,
+                |event, encoded_len| {
+                    if event.ordinal <= span.after_ordinal || event.ordinal <= through_ordinal {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    if event.ordinal > self.latest_ordinal {
+                        // The active segment kept growing after this plan was
+                        // captured. Those events are real, but the reply's
+                        // operational state describes the frontier the plan saw,
+                        // so the page stops there and the caller asks again.
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    let expected = through_ordinal
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
+                    if event.ordinal != expected {
+                        bail!(
+                            "relay journal page has a gap after event {through_ordinal}: found {}",
+                            event.ordinal
+                        );
+                    }
+                    // The page is assembled off the relay lock, so it carries its
+                    // own proof that it is one unbroken run the cursor named rather
+                    // than fragments of a journal that moved. For v1 the in-record
+                    // chain link proves this; a v2 page relies instead on both
+                    // endpoints being digest anchors (the cursor and the frontier)
+                    // plus each interior record self-validating and the ordinals
+                    // being contiguous.
+                    if event.format == RELAY_EVENT_FORMAT_V1
+                        && event.previous_digest != through_digest
+                    {
+                        bail!(
+                            "relay journal event {} does not chain from event {through_ordinal}",
+                            event.ordinal
+                        );
+                    }
+                    validate_relay_event(through_ordinal, &through_digest, &event)
+                        .context("validate relay journal page event")?;
+                    if !events.is_empty() && used.saturating_add(encoded_len) > byte_budget {
+                        page_full = true;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    used = used.saturating_add(encoded_len);
+                    through_ordinal = event.ordinal;
+                    through_digest.clone_from(&event.digest);
+                    events.push(event);
+                    Ok(ControlFlow::Continue(()))
+                },
+            );
             if let Err(error) = read {
                 // This span will not parse. If newer, readable history exists
                 // past it, mark the error so `attach` can send the controller a

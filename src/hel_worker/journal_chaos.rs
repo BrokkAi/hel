@@ -50,7 +50,9 @@ fn build_active_journal(sizes: &[usize]) -> (TempDir, Vec<Record>) {
 }
 
 fn active_path(temp: &TempDir) -> std::path::PathBuf {
-    temp.path().join(RELAY_JOURNAL_DIR).join(RELAY_ACTIVE_SEGMENT)
+    temp.path()
+        .join(RELAY_JOURNAL_DIR)
+        .join(RELAY_ACTIVE_SEGMENT)
 }
 
 /// Byte ranges `(start, len_including_newline)` of each newline-terminated line.
