@@ -2003,14 +2003,16 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
     if let Some(SecondOpinion::Review(review)) = chat.second_opinion() {
         // The split has no composer: the revised plan is the planner's to
         // write, so the only input here is which of the three actions to take.
-        render_split_actions(
+        let buttons = render_split_actions(
             frame,
             prompt_area,
             &review.workflow,
             review.action,
             &review.status,
         );
+        chat.split_action_areas = buttons;
     } else {
+        chat.split_action_areas.clear();
         let queued = chat.queued_prompts.len();
         let prompt_title = prompt_title(chat, queued);
         let prompt_block = Block::default()

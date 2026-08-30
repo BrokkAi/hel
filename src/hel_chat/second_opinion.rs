@@ -491,6 +491,23 @@ impl super::ChatState {
         format!("second-opinion-{purpose}-{}", self.second_opinion_sequence)
     }
 
+    /// Activates the split action under the pointer, if any.
+    pub(super) fn click_split_action(&mut self, column: u16, row: u16) -> super::ChatAction {
+        let Some(action) = self
+            .split_action_areas
+            .iter()
+            .find(|(_, area)| area.contains(ratatui::layout::Position::new(column, row)))
+            .map(|(action, _)| *action)
+        else {
+            return super::ChatAction::None;
+        };
+        let Some(SecondOpinion::Review(review)) = self.second_opinion.as_mut() else {
+            return super::ChatAction::None;
+        };
+        review.action = action;
+        self.activate_split_action()
+    }
+
     /// Scrolls whichever pane the pointer is over.
     pub(super) fn scroll_second_opinion(&mut self, rows: isize) -> bool {
         let height = self.last_viewport_height.max(1);
@@ -646,15 +663,18 @@ pub(super) fn render_reviewer(
     (inner, top, total)
 }
 
-/// Draws the split's action bar.
+/// Draws the split's action bar and reports where each button landed, so a
+/// click can pick the same action the keyboard would.
 pub(super) fn render_split_actions(
     frame: &mut ratatui::Frame,
     area: Rect,
     workflow: &ReviewWorkflow,
     action: SplitAction,
     status: &str,
-) {
+) -> Vec<(SplitAction, Rect)> {
     let mut spans = Vec::new();
+    let mut buttons = Vec::new();
+    let mut column = area.x;
     for candidate in SplitAction::ORDER {
         let available = match candidate {
             SplitAction::Transfer => workflow.can_transfer(),
@@ -667,7 +687,16 @@ pub(super) fn render_split_actions(
         if candidate == action {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        spans.push(Span::styled(format!(" {} ", candidate.label()), style));
+        let label = format!(" {} ", candidate.label());
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        if column < area.right() {
+            buttons.push((
+                candidate,
+                Rect::new(column, area.y, width.min(area.right() - column), 1),
+            ));
+        }
+        column = column.saturating_add(width).saturating_add(2);
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw("  "));
     }
     let waiting = match workflow.stage() {
@@ -681,6 +710,7 @@ pub(super) fn render_split_actions(
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    buttons
 }
 
 /// Kept beside the pane so the projection helper and the pane agree on which
@@ -957,6 +987,112 @@ mod tests {
             text.contains("reviewer line 0"),
             "the pane resolves its own rows: {text:?}"
         );
+    }
+
+    /// A live split, drawn once so its panes and buttons have real rects.
+    fn drawn_split() -> (ChatState, ratatui::layout::Rect) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        // Enough primary history to have somewhere to scroll to, so a wheel
+        // that reaches the primary is visible in its anchor.
+        chat.entries.extend((1..=60).map(|index| {
+            ChatEntry::plain(index, ChatRole::Agent, format!("primary line {index}"))
+        }));
+        let captured = captured();
+        let (mut workflow, _) =
+            ReviewWorkflow::start(captured.id(), captured.proposal.clone(), "context-1");
+        workflow.primary_context_completed("context-1", "context", "review-1");
+        workflow.reviewer_turn_completed("review-1", "the plan misses error handling");
+        chat.open_second_opinion(
+            captured,
+            ReviewerSetup::new("workspace-1", profiles(), ReviewerDefaults::default()),
+        );
+        chat.second_opinion_mut()
+            .expect("the view is open")
+            .begin_review(workflow, "ready", 0);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::hel_chat::active::render(frame, &mut chat, false))
+            .unwrap();
+        let reviewer = chat.reviewer_area.expect("the split draws a reviewer pane");
+        (chat, reviewer)
+    }
+
+    #[test]
+    fn the_wheel_scrolls_whichever_pane_it_is_over() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, reviewer) = drawn_split();
+        let primary_before = chat.anchor;
+
+        let wheel = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Over the reviewer: only the reviewer moves.
+        chat.handle_mouse(wheel(
+            MouseEventKind::ScrollUp,
+            reviewer.x + 1,
+            reviewer.y + 1,
+        ));
+        assert_eq!(chat.anchor, primary_before);
+
+        // Outside it: the primary transcript takes the wheel instead.
+        chat.handle_mouse(wheel(MouseEventKind::ScrollUp, 1, reviewer.y + 1));
+        assert_ne!(
+            chat.anchor, primary_before,
+            "a wheel outside the reviewer pane scrolls the primary"
+        );
+
+        let _ = MouseButton::Left;
+    }
+
+    #[test]
+    fn clicking_a_split_button_takes_the_same_action_as_the_keyboard() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _) = drawn_split();
+        let (action, area) = chat
+            .split_action_areas
+            .iter()
+            .find(|(action, _)| *action == SplitAction::Implement)
+            .copied()
+            .expect("the split draws its action buttons");
+        assert_eq!(action, SplitAction::Implement);
+
+        let outcome = chat.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let ChatAction::SecondOpinion(SecondOpinionIntent::Workflow(requests)) = outcome else {
+            panic!("clicking a button acts on it: {outcome:?}");
+        };
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            WorkflowRequest::PromptPrimary { prompt, .. } if prompt.contains("1. Read")
+        )));
+    }
+
+    #[test]
+    fn clicking_beside_the_buttons_does_nothing() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, reviewer) = drawn_split();
+        let outcome = chat.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: reviewer.x + 1,
+            row: reviewer.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(outcome, ChatAction::None);
+        assert!(chat.second_opinion_split(), "the split stays up");
     }
 
     #[test]

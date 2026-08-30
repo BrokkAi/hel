@@ -312,6 +312,9 @@ pub struct ChatState {
     /// Where the reviewer pane sat on the last frame, so hover can decide
     /// which transcript the wheel drives.
     reviewer_area: Option<Rect>,
+    /// Where the split's action buttons sat on the last frame, so a click
+    /// picks the same action the keyboard would.
+    split_action_areas: Vec<(second_opinion::SplitAction, Rect)>,
     /// Distinguishes the command ids the review's own steps submit.
     second_opinion_sequence: u64,
     recovery_phase: Option<RecoveryCheckpointPhase>,
@@ -395,6 +398,7 @@ impl ChatState {
             elicitation: None,
             second_opinion: None,
             reviewer_area: None,
+            split_action_areas: Vec::new(),
             second_opinion_sequence: 0,
             recovery_phase: None,
             goal_prompt_active: snapshot
@@ -1643,6 +1647,9 @@ impl ChatState {
                 }
                 (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
                 (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+                (MouseEventKind::Down(MouseButton::Left), _) => {
+                    return self.click_split_action(mouse.column, mouse.row);
+                }
                 _ => {}
             }
             return ChatAction::None;
