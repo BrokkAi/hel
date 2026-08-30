@@ -3,8 +3,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::{self, Sender, SyncSender};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
 const RETAINED_LOGS: usize = 10;
-const LOG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct ControllerLog {
     _writer_guard: ReliableWorkerGuard,
@@ -31,13 +31,11 @@ struct ReliableWriter {
 
 enum LogMessage {
     Line(Vec<u8>),
-    Shutdown,
+    Flush(SyncSender<std::io::Result<()>>),
 }
 
 struct ReliableWorkerGuard {
     sender: Option<Sender<LogMessage>>,
-    worker: Option<JoinHandle<()>>,
-    completed: Receiver<()>,
 }
 
 impl Write for ReliableWriter {
@@ -52,7 +50,21 @@ impl Write for ReliableWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        let (flushed_tx, flushed_rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(LogMessage::Flush(flushed_tx))
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "log worker stopped")
+            })?;
+        flushed_rx
+            .recv_timeout(LOG_FLUSH_TIMEOUT)
+            .map_err(|error| {
+                let kind = match error {
+                    mpsc::RecvTimeoutError::Timeout => std::io::ErrorKind::TimedOut,
+                    mpsc::RecvTimeoutError::Disconnected => std::io::ErrorKind::BrokenPipe,
+                };
+                std::io::Error::new(kind, format!("log worker did not flush: {error}"))
+            })?
     }
 }
 
@@ -66,47 +78,30 @@ impl<'a> MakeWriter<'a> for ReliableWriter {
 
 impl Drop for ReliableWorkerGuard {
     fn drop(&mut self) {
-        if let Some(sender) = self.sender.take()
-            && sender.send(LogMessage::Shutdown).is_err()
-        {
-            eprintln!("Hel log writer shutdown signal could not be delivered");
-            if let Some(worker) = self.worker.take()
-                && let Err(error) = worker.join()
-            {
-                eprintln!("Hel log writer panicked: {error:?}");
-            }
+        let Some(sender) = self.sender.take() else {
             return;
+        };
+        let mut writer = ReliableWriter { sender };
+        if let Err(error) = writer.flush() {
+            eprintln!("Hel log writer failed to drain before exit: {error}");
         }
-        // A failed filesystem must not make quitting the dashboard hang. Give
-        // the writer a bounded chance to drain and flush, then detach it; the
-        // operating system will close the file when the process exits.
-        match self.completed.recv_timeout(LOG_SHUTDOWN_TIMEOUT) {
-            Ok(()) => {
-                if let Some(worker) = self.worker.take()
-                    && let Err(error) = worker.join()
-                {
-                    eprintln!("Hel log writer panicked: {error:?}");
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                eprintln!("Hel log writer did not drain before shutdown timeout");
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("Hel log writer completion channel closed unexpectedly");
-            }
-        }
+        // The global tracing subscriber owns another sender for the rest of
+        // the process. Keep its worker valid after this flush so detached
+        // runtime work cannot turn a late diagnostic into terminal output.
+        // The operating system stops the detached writer at process exit.
     }
 }
 
 fn reliable_non_blocking(file: File) -> Result<(ReliableWriter, ReliableWorkerGuard)> {
     let (sender, receiver) = mpsc::channel();
-    let (completed_tx, completed) = mpsc::sync_channel(1);
-    let worker = thread::Builder::new()
+    thread::Builder::new()
         .name("hel-log-writer".into())
         .spawn(move || {
-            write_log_messages(file, receiver);
-            if completed_tx.send(()).is_err() {
-                eprintln!("Hel log writer completion could not be reported");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write_log_messages(file, receiver);
+            }));
+            if let Err(error) = result {
+                eprintln!("Hel log writer panicked: {error:?}");
             }
         })
         .context("spawn Hel log writer")?;
@@ -115,8 +110,6 @@ fn reliable_non_blocking(file: File) -> Result<(ReliableWriter, ReliableWorkerGu
     };
     let guard = ReliableWorkerGuard {
         sender: Some(sender),
-        worker: Some(worker),
-        completed,
     };
     Ok((writer, guard))
 }
@@ -130,7 +123,16 @@ fn write_log_messages(mut file: File, receiver: mpsc::Receiver<LogMessage>) {
                     break;
                 }
             }
-            LogMessage::Shutdown => break,
+            LogMessage::Flush(flushed) => {
+                let result = file.flush();
+                let failed = result.is_err();
+                if flushed.send(result).is_err() {
+                    eprintln!("Hel log writer flush completion could not be reported");
+                }
+                if failed {
+                    break;
+                }
+            }
         }
     }
     if let Err(error) = file.flush() {
@@ -262,6 +264,22 @@ mod tests {
         let contents = fs::read_to_string(path).unwrap();
         assert_eq!(contents.lines().count(), 10_000);
         assert!(contents.ends_with("error 9999\n"));
+    }
+
+    #[test]
+    fn reliable_writer_remains_valid_after_guard_flushes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("late.log");
+        let file = File::create(&path).unwrap();
+        let (mut writer, guard) = reliable_non_blocking(file).unwrap();
+        writer.write_all(b"before guard drop\n").unwrap();
+
+        drop(guard);
+        writer.write_all(b"after guard drop\n").unwrap();
+        writer.flush().unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert_eq!(contents, "before guard drop\nafter guard drop\n");
     }
 
     #[test]

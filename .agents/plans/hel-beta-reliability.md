@@ -14,7 +14,7 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 
 - [x] (2026-08-30 15:18Z) Inspected the existing unit, PTY, coverage, property, and process-chaos tests and measured the current coverage shape.
 - [x] (2026-08-30 15:18Z) Recorded the product-scope decisions: runtime paths are the priority, mutation testing is deferred, and Luna testing remains a local runbook.
-- [ ] Milestone 1: repair coverage reporting and the instrumented PTY teardown failure.
+- [x] (2026-08-30 15:29Z) Milestone 1: repaired full-package coverage reporting, established a crate-qualified baseline, and fixed the asynchronous log-writer lifetime exposed by the PTY teardown assertion.
 - [ ] Milestone 2: add the isolated, replayable runtime scenario harness and deterministic multi-client tests.
 - [ ] Milestone 3: expand property and process-chaos coverage around durable state and exact crash boundaries.
 - [ ] Milestone 4: add browser coverage and the local Luna tmux runbook.
@@ -30,6 +30,15 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 
 - Observation: coverage instrumentation exposed an actual terminal shutdown defect before producing a report.
   Evidence: `dashboard_detach_restores_terminal_then_exits_promptly_with_final_message` failed because `[tracing-subscriber] Unable to write an event ... log worker stopped` appeared after the documented final detach message.
+
+- Observation: the PTY symptom is timing-sensitive, but its underlying writer-lifetime violation is deterministic.
+  Evidence: a focused instrumented rerun passed before the fix. A new logging regression instead holds the subscriber's writer clone, drops the controller guard, and proves a subsequent record and flush still succeed. The prior implementation returned `BrokenPipe("log worker stopped")` in that exact sequence.
+
+- Observation: adding `hel-cli` and `hel-tui` to the report lowers the honest aggregate baseline rather than indicating a new code regression.
+  Evidence: the validated report now contains crate-qualified paths for all three packages and measures 78.12% aggregate line coverage. The previous 83.75% baseline described only `hel-core` even though the workflow had run all workspace tests.
+
+- Observation: the repository-wide rustfmt check has pre-existing differences outside this milestone.
+  Evidence: `cargo fmt --all -- --check` reports committed formatting changes in `src/hel_acp/tests.rs`, `src/hel_acp.rs`, `src/hel_worker/journal.rs`, `src/hel_worker/journal_chaos.rs`, `src/hel_worker/snapshot.rs`, and `src/hel_worker.rs`. The changed `hel-cli` package was formatted independently and those unrelated files were left untouched.
 
 - Observation: Hel already has substantial deterministic coverage and one property-based journal-chaos suite.
   Evidence: the repository contains roughly 1,600 Rust tests, `src/hel_worker/journal_chaos.rs` runs 160 generated cases, and `tests/e2e/session_restart_chaos.sh` kills five real worker-side process generations in an explicitly isolated container.
@@ -66,7 +75,7 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 
 ## Outcomes & Retrospective
 
-No implementation milestone is complete yet. This section must be updated after every milestone with the behavior delivered, the failures discovered, the remaining gaps, and any change to the beta bar.
+Milestone 1 is complete. Coverage now measures `hel-core`, `hel-cli`, and `hel-tui` without collapsing same-named source paths, and the baseline records the real 78.12% aggregate with reviewed runtime exceptions. The full instrumented suite passed: 65 `hel-cli` unit tests, its logging and two PTY integration tests, 1,355 `hel-core` tests with four ignored, and 197 `hel-tui` tests with one ignored. The log worker now uses a bounded flush barrier while remaining valid for the lifetime of the global tracing subscriber, so detached runtime diagnostics cannot corrupt the restored terminal. The remaining beta gaps are the multi-client system lab, expanded generated/crash chaos, browser and Luna campaigns, and tiered automation.
 
 ## Context and Orientation
 
@@ -80,7 +89,7 @@ The user's `AGENTS.md` change that introduced ExecPlans is already present as an
 
 ## Plan of Work
 
-Milestone 1 makes the measurement layer trustworthy. First reproduce the instrumented PTY failure with `cargo llvm-cov` and fix the logging lifetime rather than weakening the assertion: the detach message must remain the final terminal output, and the tracing subscriber must not attempt to use a stopped asynchronous writer. Add or strengthen the focused PTY regression. Then change `.github/workflows/coverage.yml` so the JSON and LCOV report commands pass `-p hel-core -p hel-tui -p hel-cli`. Update `scripts/check-coverage.mjs` so paths retain `crates/hel-cli/` and `crates/hel-tui/` instead of collapsing every last `/src/` suffix into the root package. Replace `.github/coverage-baseline.json` with a full-package baseline after the new runtime tests exist; until then, keep coverage diagnostic rather than publishing a misleading gate. The policy remains no aggregate regression beyond the existing 0.25 percentage-point tolerance and a reviewed per-module exception for system boundaries that cannot run headlessly. Do not spend this milestone raising coverage for one-shot command parsing or ignored import wrappers.
+Milestone 1 makes the measurement layer trustworthy. First reproduce the instrumented PTY failure with `cargo llvm-cov` and fix the logging lifetime rather than weakening the assertion: the detach message must remain the final terminal output, and the tracing subscriber must not attempt to use a stopped asynchronous writer. Add or strengthen the focused PTY regression. Then change `.github/workflows/coverage.yml` so the JSON and LCOV report commands pass `-p hel-core -p hel-tui -p hel-cli`. Update `scripts/check-coverage.mjs` so paths retain `crates/hel-cli/` and `crates/hel-tui/` instead of collapsing every last `/src/` suffix into the root package. Replace `.github/coverage-baseline.json` with a full-package baseline, then raise its runtime minima as later milestones add behavior coverage. The policy remains no aggregate regression beyond the existing 0.25 percentage-point tolerance and a reviewed per-module exception for system boundaries that cannot run headlessly. Do not spend this milestone raising coverage for one-shot command parsing or ignored import wrappers.
 
 Milestone 2 creates a deterministic system laboratory. Add reusable fixtures under `tests/e2e/` rather than creating a crate. The laboratory must create isolated config, data, cache, workspace, profile, and worker roots; allocate loopback ports; initialize a small Git repository; start a deterministic fake ACP bridge; and supervise every child in its own process group. It must expose bounded `start`, `wait_for`, `signal`, and `cleanup` operations and save a JSON trace containing the build commit, scenario name, seed, action sequence, process identifiers, observed daemon revisions, and artifact paths. The first scenarios launch a session on a local-bare target, attach two dashboard clients, connect the web viewer, submit and queue work, detach and reattach, and issue overlapping lifecycle requests. Assertions must prove exactly-once transcript content, monotonic revisions, converged clients, bounded quit and stop, SQLite `PRAGMA integrity_check`, valid relay frontiers, and no live child processes after cleanup. Drive terminal clients through a real pseudo-terminal or tmux screen, never by invoking TUI reducer methods directly.
 

@@ -49,8 +49,8 @@ jobs:
     - name: Collect Hel coverage
       run: |
         cargo llvm-cov --workspace --exclude hel-voice-worker --no-report --locked
-        cargo llvm-cov report --lcov --output-path coverage.lcov
-        cargo llvm-cov report --json --output-path coverage.json
+        cargo llvm-cov report -p hel-core -p hel-tui -p hel-cli --lcov --output-path coverage.lcov
+        cargo llvm-cov report -p hel-core -p hel-tui -p hel-cli --json --output-path coverage.json
 
     - name: Check coverage baseline
       run: node scripts/check-coverage.mjs coverage.json .github/coverage-baseline.json coverage-summary.md
