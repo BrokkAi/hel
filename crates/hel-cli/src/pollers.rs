@@ -494,6 +494,15 @@ pub(crate) fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPol
         .collect()
 }
 
+pub(crate) fn dashboard_worker_targets_excluding(
+    controller: &Controller,
+    excluded_sessions: &std::collections::BTreeSet<String>,
+) -> Vec<WorkerPollTarget> {
+    let mut targets = dashboard_worker_targets(controller);
+    targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    targets
+}
+
 /// Sessions whose worker can answer credential requests right now. Sessions
 /// still provisioning or already disconnected would only produce connection
 /// errors, so they stay out.
@@ -804,8 +813,7 @@ pub(crate) fn refresh_dashboard_poll_targets(
     credential_sync: &CredentialSyncHandle,
     excluded_sessions: &std::collections::BTreeSet<String>,
 ) {
-    let mut worker_targets = dashboard_worker_targets(controller);
-    worker_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    let worker_targets = dashboard_worker_targets_excluding(controller, excluded_sessions);
     worker_targets_tx.send_replace(worker_targets);
     let mut resource_targets = dashboard_resource_targets(controller);
     resource_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
@@ -1830,6 +1838,21 @@ mod tests {
         let recoverable_error = podman_controller(SessionState::Error);
         assert!(dashboard_worker_targets(&recoverable_error).is_empty());
         assert!(dashboard_resource_targets(&recoverable_error).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_owned_session_stays_out_of_worker_targets() {
+        let controller = podman_controller(SessionState::Provisioning);
+        assert_eq!(dashboard_worker_targets(&controller).len(), 1);
+
+        let excluded = controller
+            .state
+            .sessions
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(dashboard_worker_targets_excluding(&controller, &excluded).is_empty());
     }
 
     #[test]

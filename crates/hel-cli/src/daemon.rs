@@ -37,8 +37,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::pollers::{
-    dashboard_worker_targets, interrupted_close_session_ids, reserve_recovery_or_cancel,
-    spawn_interrupted_close_recovery,
+    dashboard_worker_targets, dashboard_worker_targets_excluding, interrupted_close_session_ids,
+    reserve_recovery_or_cancel, spawn_interrupted_close_recovery,
 };
 
 const PROTOCOL_VERSION: u32 = 3;
@@ -508,6 +508,15 @@ impl RuntimeState {
 
     fn workspaces(&self) -> tokio::sync::watch::Receiver<Vec<WorkspaceRecord>> {
         self.workspaces_tx.subscribe()
+    }
+
+    fn lifecycle_session_ids(&self) -> BTreeSet<String> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn revisions(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -1897,13 +1906,17 @@ fn spawn_manager_target_refresher(
                     // Keep a controller loaded from the old config from being
                     // installed after a concurrent id rename has committed.
                     let _config_mutation = state.config_mutation.lock().await;
-                    match tokio::task::spawn_blocking(|| {
-                        Controller::load().map(|controller| {
-                            let targets = dashboard_worker_targets(&controller);
-                            (controller, targets)
-                        })
-                    }).await {
-                        Ok(Ok((controller, refreshed))) => {
+                    match tokio::task::spawn_blocking(Controller::load).await {
+                        Ok(Ok(controller)) => {
+                            // A lifecycle operation owns worker startup,
+                            // teardown, or relocation. Polling the same target
+                            // concurrently can mistake an incomplete worker
+                            // install for a dead relay and start recovery.
+                            let lifecycle_sessions = state.lifecycle_session_ids();
+                            let refreshed = dashboard_worker_targets_excluding(
+                                &controller,
+                                &lifecycle_sessions,
+                            );
                             let changed = {
                                 let mut current = state
                                     .controller
