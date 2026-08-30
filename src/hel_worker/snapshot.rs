@@ -957,6 +957,16 @@ pub fn validate_relay_event(
             event.ordinal
         );
     }
+    validate_relay_event_self(event)
+}
+
+/// Verify a record purely against itself: its `digest` field is well-formed and
+/// recomputes to the same value. This is the corruption check for a single
+/// record, independent of any neighbour — the unit of trust that lets a corrupt
+/// record be isolated instead of poisoning the events around it. It does not
+/// check ordinal continuity or (for v1) the chain link; those are the caller's
+/// job where a trusted cursor is available.
+pub fn validate_relay_event_self(event: &RelayEvent) -> Result<()> {
     validate_relay_digest(&event.digest, "event digest")?;
     let expected_digest = relay_event_digest(event)?;
     if event.digest != expected_digest {

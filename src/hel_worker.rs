@@ -32,7 +32,7 @@ pub use snapshot::{
     QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_FORMAT_V2, RelayCommand, RelayCommandKind,
     RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState, RelayObservation,
     RelayOperationalState, UserShellResult, UserShellStatus, relay_event_digest,
-    validate_relay_event,
+    validate_relay_event, validate_relay_event_self,
 };
 pub use types::{
     ActivePrompt, Attachment, QueuedPrompt, SequencedEvent, WorkerEvent, WorkerPhase,
@@ -1849,6 +1849,11 @@ impl RelayReplayPlan {
         if let Some((_, digest)) = self.hot_digests.iter().find(|(hot, _)| *hot == ordinal) {
             return Ok(Some(digest.clone()));
         }
+        // A v1 span caches the digest at its boundary in the first event's
+        // `previous_digest`, so the digest before the span can be read without
+        // touching the segment. v2 records carry no such back-reference
+        // (`file_first_previous_digest` is None), so fall through to read the
+        // event at `ordinal` directly.
         if let Some(span) = self.spans.iter().find(|span| {
             span.file_first_ordinal.checked_sub(1) == Some(ordinal) && ordinal >= span.after_ordinal
         }) {
@@ -1857,16 +1862,17 @@ impl RelayReplayPlan {
             }
             let mut digest = None;
             visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
-                let previous_ordinal = event
-                    .ordinal
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow!("relay event ordinal zero is invalid"))?;
-                validate_relay_event(previous_ordinal, &event.previous_digest, &event)
+                validate_relay_event_self(&event)
                     .with_context(|| format!("validate relay journal {}", span.path.display()))?;
-                digest = Some(event.previous_digest);
+                if event.format == RELAY_EVENT_FORMAT_V1 && !event.previous_digest.is_empty() {
+                    digest = Some(event.previous_digest);
+                }
                 Ok(ControlFlow::Break(()))
             })?;
-            return Ok(digest);
+            if digest.is_some() {
+                return Ok(digest);
+            }
+            // v2 first event: no cached boundary digest; read the target itself.
         }
         let Some(span) = self
             .spans
@@ -1878,16 +1884,21 @@ impl RelayReplayPlan {
         let mut digest = None;
         let mut previous: Option<RelayEvent> = None;
         visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
-            if let Some(previous) = &previous {
-                validate_relay_event(previous.ordinal, &previous.digest, &event)
-                    .with_context(|| format!("validate relay journal {}", span.path.display()))?;
-            } else {
-                let previous_ordinal = event
-                    .ordinal
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow!("relay event ordinal zero is invalid"))?;
-                validate_relay_event(previous_ordinal, &event.previous_digest, &event)
-                    .with_context(|| format!("validate relay journal {}", span.path.display()))?;
+            // Each record is validated by its own digest (the corruption check).
+            // Between consecutive records the v1 chain link is also enforced;
+            // v2 records have no link and are trusted on their own digest.
+            validate_relay_event_self(&event)
+                .with_context(|| format!("validate relay journal {}", span.path.display()))?;
+            if let Some(previous) = &previous
+                && event.format == RELAY_EVENT_FORMAT_V1
+                && event.previous_digest != previous.digest
+            {
+                bail!(
+                    "relay journal {} event {} does not chain from event {}",
+                    span.path.display(),
+                    event.ordinal,
+                    previous.ordinal
+                );
             }
             if event.ordinal == ordinal {
                 digest = Some(event.digest.clone());
@@ -1939,9 +1950,13 @@ impl RelayReplayPlan {
                     );
                 }
                 // The page is assembled off the relay lock, so it carries its
-                // own proof that it is one unbroken run of the chain the cursor
-                // named rather than fragments of a journal that moved.
-                if event.previous_digest != through_digest {
+                // own proof that it is one unbroken run the cursor named rather
+                // than fragments of a journal that moved. For v1 the in-record
+                // chain link proves this; a v2 page relies instead on both
+                // endpoints being digest anchors (the cursor and the frontier)
+                // plus each interior record self-validating and the ordinals
+                // being contiguous.
+                if event.format == RELAY_EVENT_FORMAT_V1 && event.previous_digest != through_digest {
                     bail!(
                         "relay journal event {} does not chain from event {through_ordinal}",
                         event.ordinal

@@ -1480,7 +1480,15 @@ impl ProjectionPage<'_> {
         if event_ordinal == 0 {
             bail!("relay event ordinal must be positive");
         }
-        validate_relay_event_digest(previous_event_digest, "previous relay event digest")?;
+        // A v2 event carries no chain link (empty previous digest). Its
+        // continuity to the projection frontier is proven by ordinal
+        // contiguity plus the attach cursor the controller validated against
+        // the worker, not by an in-record back-reference; divergence is caught
+        // there, before any event is applied.
+        let chained = !previous_event_digest.is_empty();
+        if chained {
+            validate_relay_event_digest(previous_event_digest, "previous relay event digest")?;
+        }
         validate_relay_event_frontier(event_ordinal, event_digest, "relay event frontier")?;
         let session_id = self.session_id;
         let applied = self.applied_ordinal;
@@ -1504,7 +1512,7 @@ impl ProjectionPage<'_> {
                 "relay event gap for session {session_id}: expected ordinal {expected}, received {event_ordinal}"
             );
         }
-        if previous_event_digest != self.applied_digest {
+        if chained && previous_event_digest != self.applied_digest {
             bail!(
                 "relay event chain diverged for session {session_id} before ordinal {event_ordinal}: projection has {}, event follows {previous_event_digest}",
                 self.applied_digest

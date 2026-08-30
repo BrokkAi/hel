@@ -22,7 +22,7 @@ use super::snapshot::{
     RELAY_EVENT_FORMAT_V1, RelayCommand, RelayCommandOutcome, RelayDispatchState, RelayEvent,
     RelayObservation, RelaySnapshot, apply_relay_event, clamp_observation, ensure_byte_budget,
     ensure_serialized_budget, observation_changes_state, relay_event_digest, validate_relay_digest,
-    validate_relay_event,
+    validate_relay_event, validate_relay_event_self,
 };
 use super::{
     DurableRelay, RELAY_ACTIVE_SEGMENT, RELAY_EVENT_BYTE_BUDGET, RELAY_EVENT_ENVELOPE_RESERVE,
@@ -217,19 +217,18 @@ pub(crate) fn open_relay_journal(
             let mut segment_events = Vec::new();
             let mut previous: Option<RelayEvent> = None;
             visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
+                // Validate each record by its own digest; between consecutive
+                // records the v1 chain link is also enforced. The first record
+                // read cold has no trusted predecessor, so it is validated on
+                // its own digest alone (a v2 record carries no back-reference).
                 if let Some(previous) = &previous {
                     validate_relay_event(previous.ordinal, &previous.digest, &event).with_context(
                         || format!("validate relay journal {}", span.path.display()),
                     )?;
                 } else {
-                    let previous_ordinal = event
-                        .ordinal
-                        .checked_sub(1)
-                        .ok_or_else(|| anyhow!("relay event ordinal zero is invalid"))?;
-                    validate_relay_event(previous_ordinal, &event.previous_digest, &event)
-                        .with_context(|| {
-                            format!("validate relay journal {}", span.path.display())
-                        })?;
+                    validate_relay_event_self(&event).with_context(|| {
+                        format!("validate relay journal {}", span.path.display())
+                    })?;
                 }
                 if event.ordinal > span.after_ordinal && event.ordinal <= snapshot.latest_ordinal {
                     segment_events.push(event.clone());
@@ -342,11 +341,7 @@ fn inspect_relay_journal_file(
             validate_relay_event(previous.ordinal, &previous.digest, &event)
                 .with_context(|| format!("validate relay journal {}", path.display()))?;
         } else {
-            let previous_ordinal = event
-                .ordinal
-                .checked_sub(1)
-                .ok_or_else(|| anyhow!("relay event ordinal zero is invalid"))?;
-            validate_relay_event(previous_ordinal, &event.previous_digest, &event)
+            validate_relay_event_self(&event)
                 .with_context(|| format!("validate relay journal {}", path.display()))?;
             first = Some(event.clone());
         }
@@ -356,7 +351,11 @@ fn inspect_relay_journal_file(
     Ok(first.zip(previous).map(|(first, last)| RelayJournalSpan {
         path: path.to_owned(),
         file_first_ordinal: first.ordinal,
-        file_first_previous_digest: Some(first.previous_digest),
+        // A v1 first event caches the digest before the span in its
+        // `previous_digest`; a v2 first event carries none, so the boundary
+        // digest must be read from the event itself when needed.
+        file_first_previous_digest: (!first.previous_digest.is_empty())
+            .then_some(first.previous_digest),
         file_last_ordinal: last.ordinal,
         file_last_digest: Some(last.digest),
         after_ordinal: 0,
@@ -831,7 +830,10 @@ impl DurableRelay {
         self.journal_spans.push(RelayJournalSpan {
             path: active.to_owned(),
             file_first_ordinal: event.ordinal,
-            file_first_previous_digest: Some(event.previous_digest.clone()),
+            // v2 events carry no `previous_digest`; the boundary digest is read
+            // from the event itself when needed.
+            file_first_previous_digest: (!event.previous_digest.is_empty())
+                .then(|| event.previous_digest.clone()),
             file_last_ordinal: event.ordinal,
             file_last_digest: Some(event.digest.clone()),
             after_ordinal: event.ordinal - 1,
