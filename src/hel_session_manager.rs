@@ -2019,6 +2019,7 @@ impl StandaloneSession {
         let original_digest = self.materialized.applied_event_digest.clone();
         let original_operational = self.operational.clone();
         let mut repaired = false;
+        let mut repaired_frontiers = std::collections::HashSet::new();
         loop {
             let after_ordinal = self.materialized.applied_event_ordinal;
             match self.catch_up_fixed_frontier().await {
@@ -2033,6 +2034,21 @@ impl StandaloneSession {
                             )
                         })?;
                     repaired = true;
+                    // Repair rebuilds from the same durable checkpoint every
+                    // time. If catching up from that frontier still desyncs — as
+                    // it does when relay history is unreadable past the
+                    // checkpoint — repairing again lands on the same frontier and
+                    // would loop forever. Fail loudly on the second visit instead
+                    // of hanging; recovery got everything the checkpoint covers.
+                    let frontier = self.materialized.applied_event_ordinal;
+                    if !repaired_frontiers.insert(frontier) {
+                        bail!(
+                            "controller projection for {} cannot catch up: relay history is \
+                             unreadable and rebuilding from checkpoint frontier {frontier} does \
+                             not get past it",
+                            self.materialized.session_id
+                        );
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),

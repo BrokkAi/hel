@@ -2249,7 +2249,27 @@ mod tests {
         let RelayResponseBody::Error { error } = response.body else {
             panic!("corrupt history was served: {response:?}");
         };
-        assert_eq!(error.code, RelayErrorCode::Internal);
+        // Corrupt history is never served as valid data. Because readable
+        // history exists past the corrupt segment, the relay answers with a
+        // recovery cursor so the controller resynchronizes forward instead of
+        // retrying the unreadable bytes forever.
+        assert_eq!(error.code, RelayErrorCode::Desynchronized);
+        let Some(RelayErrorDetail::Desynchronized {
+            earliest_available,
+            latest,
+            ..
+        }) = error.detail
+        else {
+            panic!("expected a desync recovery cursor: {error:?}");
+        };
+        assert!(
+            earliest_available > 0,
+            "recovery cursor must skip the corrupt segment, got {earliest_available}"
+        );
+        assert!(
+            earliest_available < latest,
+            "newer readable history must remain available: {earliest_available} < {latest}"
+        );
     }
 
     #[test]

@@ -1715,6 +1715,27 @@ pub struct RelayReplayPlan {
     generation: u64,
 }
 
+/// A journal span could not be parsed during a replay. When newer readable
+/// history exists past it, `read_events_after` attaches this to the error so
+/// `attach` can answer with a `Desynchronized` recovery cursor rather than a
+/// retryable failure that the controller would loop on forever.
+#[derive(Debug)]
+struct UnreadableRelaySpan {
+    recover_after: u64,
+}
+
+impl std::fmt::Display for UnreadableRelaySpan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "relay history is unreadable; readable events resume after event {}",
+            self.recover_after
+        )
+    }
+}
+
+impl std::error::Error for UnreadableRelaySpan {}
+
 impl RelayReplayPlan {
     fn attach(
         &self,
@@ -1730,7 +1751,39 @@ impl RelayReplayPlan {
                 Some(self.desynchronized_detail(after_ordinal, after_digest)),
             )));
         }
-        let page = self.read_events_after(after_ordinal, after_digest, RELAY_REPLAY_BYTE_BUDGET)?;
+        let page = match self.read_events_after(
+            after_ordinal,
+            after_digest,
+            RELAY_REPLAY_BYTE_BUDGET,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                // An unreadable old span cannot be served, but newer history
+                // still can. Answer with a desynchronization cursor past the
+                // corruption so the controller resynchronizes from there
+                // instead of retrying the same unparseable bytes forever.
+                if let Some(gap) = error.downcast_ref::<UnreadableRelaySpan>() {
+                    let recover_after = gap.recover_after;
+                    let recover_digest = self.digest_at(recover_after)?.ok_or_else(|| {
+                        anyhow!("relay digest missing at recovery boundary {recover_after}")
+                    })?;
+                    return Ok(Err(relay_protocol_error(
+                        RelayErrorCode::Desynchronized,
+                        error.to_string(),
+                        false,
+                        Some(RelayErrorDetail::Desynchronized {
+                            requested_after: after_ordinal,
+                            requested_digest: after_digest.to_owned(),
+                            earliest_available: recover_after,
+                            earliest_digest: recover_digest,
+                            latest: self.latest_ordinal,
+                            latest_digest: self.latest_digest.clone(),
+                        }),
+                    )));
+                }
+                return Err(error);
+            }
+        };
         ensure_serialized_budget(&state, RELAY_STATE_BYTE_BUDGET, "relay operational state")?;
         Ok(Ok(RelayResponsePayload::Attached {
             state,
@@ -1848,7 +1901,7 @@ impl RelayReplayPlan {
             if page_full || span.file_last_ordinal <= through_ordinal {
                 continue;
             }
-            visit_relay_journal_file(&span.path, false, |event, encoded_len| {
+            let read = visit_relay_journal_file(&span.path, false, |event, encoded_len| {
                 if event.ordinal <= span.after_ordinal || event.ordinal <= through_ordinal {
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -1888,7 +1941,19 @@ impl RelayReplayPlan {
                 through_digest.clone_from(&event.digest);
                 events.push(event);
                 Ok(ControlFlow::Continue(()))
-            })?;
+            });
+            if let Err(error) = read {
+                // This span will not parse. If newer, readable history exists
+                // past it, mark the error so `attach` can send the controller a
+                // recovery cursor after this span instead of a retryable failure
+                // it would loop on. The corrupt bytes are never served as valid.
+                if span.file_last_ordinal < self.latest_ordinal {
+                    return Err(error.context(UnreadableRelaySpan {
+                        recover_after: span.file_last_ordinal,
+                    }));
+                }
+                return Err(error);
+            }
             // A canonical span contributes every ordinal through its last one.
             // Stopping short means the file no longer holds what this plan
             // captured: it was sealed, rewritten, or pruned under the reader.
