@@ -1111,6 +1111,7 @@ impl ActiveChat {
             }
             ChatAction::RemoveQueuedPrompt { id, text, kind } => {
                 let Some(command_id) = self.command_id("remove-prompt") else {
+                    self.state.fail_queued_prompt_removal(id, text, kind);
                     return ChatEventOutcome::Handled;
                 };
                 self.state.set_notice("Removing queued prompt…");

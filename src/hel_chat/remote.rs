@@ -8,7 +8,7 @@ use crate::hel_session_manager::{ManagedSessionHandle, SessionManagerControl};
 use crate::hel_state::{QueuedCommandKind, config_command_text};
 use crate::hel_worker::RelayCommand;
 
-use super::{ChatState, PlanControl, PlanReviewFollowup, QueuedPrompt, queued_prompt_preview};
+use super::{ChatState, PlanControl, PlanReviewFollowup, queued_prompt_preview};
 
 const CHAT_REMOTE_QUEUE_CAPACITY: usize = 32;
 const SESSION_ACTOR_REPLACEMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -818,10 +818,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             kind,
             result: Err(error),
         } => {
-            if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
-                chat.queued_prompts
-                    .push_back(QueuedPrompt { id, text, kind });
-            }
+            chat.fail_queued_prompt_removal(id, text, kind);
             chat.set_notice(format!("Queued prompt was not removed: {error}"));
         }
         ChatRemoteResult::SetConfig { result: Ok(()), .. } => {
@@ -901,10 +898,7 @@ pub(super) fn queue_chat_remote_operation(
                 restore_unsent_input(chat, &format!("!{command}"));
             }
             ChatRemoteOperation::RemoveQueuedPrompt { id, text, kind, .. } => {
-                if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
-                    chat.queued_prompts
-                        .push_back(QueuedPrompt { id, text, kind });
-                }
+                chat.fail_queued_prompt_removal(id, text, kind);
             }
             ChatRemoteOperation::SetConfig { key, value, .. } => {
                 restore_unsent_input(chat, &config_command_text(&key, &value));

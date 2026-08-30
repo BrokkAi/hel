@@ -288,6 +288,10 @@ pub struct ChatState {
     next_history_search_generation: u64,
     pending_history_search: Option<HistorySearchRequest>,
     queued_prompts: VecDeque<QueuedPrompt>,
+    /// Queue entries optimistically moved back into the composer. A relay
+    /// snapshot can still contain one until its removal command is projected,
+    /// so keep its identity hidden across those stale snapshots.
+    pending_queue_removals: BTreeSet<String>,
     active_user_shells: Vec<String>,
     active_agent_terminals: Vec<ActiveAgentTerminal>,
     claimed_agent_terminals: BTreeMap<String, i64>,
@@ -367,6 +371,7 @@ impl ChatState {
             next_history_search_generation: 0,
             pending_history_search: None,
             queued_prompts: VecDeque::new(),
+            pending_queue_removals: BTreeSet::new(),
             active_user_shells: Vec::new(),
             active_agent_terminals: Vec::new(),
             claimed_agent_terminals: BTreeMap::new(),
@@ -535,9 +540,17 @@ impl ChatState {
         // transcript projection. Keep the small queue authoritative even when
         // the transcript frontier has not moved and its expensive rebuild is
         // correctly skipped.
+        let projected_queue_ids = session
+            .queued_prompts
+            .iter()
+            .map(|prompt| prompt.command_id.as_str())
+            .collect::<BTreeSet<_>>();
+        self.pending_queue_removals
+            .retain(|id| projected_queue_ids.contains(id.as_str()));
         self.queued_prompts = session
             .queued_prompts
             .iter()
+            .filter(|prompt| !self.pending_queue_removals.contains(&prompt.command_id))
             .map(|prompt| QueuedPrompt {
                 id: prompt.command_id.clone(),
                 text: materialized_content_text(&prompt.content),
@@ -1082,6 +1095,7 @@ impl ChatState {
         let Some(queued) = self.queued_prompts.pop_back() else {
             return ChatAction::None;
         };
+        self.pending_queue_removals.insert(queued.id.clone());
         self.set_input(queued.text.clone());
         self.set_notice(if queued.kind.is_prompt() {
             "Editing the most recently queued prompt"
@@ -1092,6 +1106,14 @@ impl ChatState {
             id: queued.id,
             text: queued.text,
             kind: queued.kind,
+        }
+    }
+
+    fn fail_queued_prompt_removal(&mut self, id: String, text: String, kind: QueuedCommandKind) {
+        self.pending_queue_removals.remove(&id);
+        if !self.queued_prompts.iter().any(|prompt| prompt.id == id) {
+            self.queued_prompts
+                .push_back(QueuedPrompt { id, text, kind });
         }
     }
 
@@ -1647,17 +1669,21 @@ impl ChatState {
                 self.apply_adapter(event.seq, event.recorded_at_ms, payload)
             }
             WorkerEvent::QueuedPromptAdded { prompt } => {
-                self.queued_prompts.push_back(QueuedPrompt {
-                    id: prompt.id.clone(),
-                    text: prompt.text.clone(),
-                    kind: QueuedCommandKind::Prompt,
-                });
+                if !self.pending_queue_removals.contains(&prompt.id) {
+                    self.queued_prompts.push_back(QueuedPrompt {
+                        id: prompt.id.clone(),
+                        text: prompt.text.clone(),
+                        kind: QueuedCommandKind::Prompt,
+                    });
+                }
             }
             WorkerEvent::QueuedPromptRemoved { queue_id } => {
                 self.queued_prompts.retain(|prompt| prompt.id != *queue_id);
+                self.pending_queue_removals.remove(queue_id);
             }
             WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
                 self.queued_prompts.retain(|queued| queued.id != prompt.id);
+                self.pending_queue_removals.remove(&prompt.id);
                 self.phase = WorkerPhase::Running;
                 self.start_turn_clock(event.recorded_at_ms);
                 self.entries.push(
@@ -1665,7 +1691,10 @@ impl ChatState {
                         .with_recorded_at(event.recorded_at_ms),
                 );
             }
-            WorkerEvent::QueuedPromptsCleared => self.queued_prompts.clear(),
+            WorkerEvent::QueuedPromptsCleared => {
+                self.queued_prompts.clear();
+                self.pending_queue_removals.clear();
+            }
             WorkerEvent::ConfigChanged { .. } => {}
         }
     }
@@ -2656,6 +2685,71 @@ mod tests {
                 value: "sonnet".into(),
             }
         );
+    }
+
+    #[test]
+    fn stale_projection_does_not_restore_a_queue_entry_being_edited() {
+        let mut session = MaterializedSession::empty("session-queue-edit");
+        session.applied_event_ordinal = 5;
+        session.queued_prompts.push(MaterializedQueuedPrompt {
+            command_id: "queued-prompt".into(),
+            kind: QueuedCommandKind::Prompt,
+            content: vec![serde_json::json!({"type": "text", "text": "revise me"})],
+            queued_at_ms: 10,
+        });
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Up)),
+            ChatAction::RemoveQueuedPrompt {
+                id: "queued-prompt".into(),
+                text: "revise me".into(),
+                kind: QueuedCommandKind::Prompt,
+            }
+        );
+        remote::apply_chat_remote_result(
+            &mut chat,
+            remote::ChatRemoteResult::RemoveQueuedPrompt {
+                id: "queued-prompt".into(),
+                text: "revise me".into(),
+                kind: QueuedCommandKind::Prompt,
+                result: Ok(()),
+            },
+        );
+
+        // The relay accepted the removal, but its previously published view
+        // can still arrive before the projection containing that command.
+        chat.apply_materialized(&session, &[], &[]);
+        assert_eq!(chat.input, "revise me");
+        assert!(chat.queued_prompts.is_empty());
+        assert!(chat.pending_queue_removals.contains("queued-prompt"));
+
+        session.applied_event_ordinal = 6;
+        session.queued_prompts.clear();
+        chat.apply_materialized(&session, &[], &[]);
+        assert!(chat.pending_queue_removals.is_empty());
+    }
+
+    #[test]
+    fn failed_queue_removal_restores_the_peeled_entry() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.queued_prompts
+            .push_back(queued("queued-prompt", "revise me"));
+        chat.handle_key(ctrl('p'));
+
+        remote::apply_chat_remote_result(
+            &mut chat,
+            remote::ChatRemoteResult::RemoveQueuedPrompt {
+                id: "queued-prompt".into(),
+                text: "revise me".into(),
+                kind: QueuedCommandKind::Prompt,
+                result: Err("relay rejected removal".into()),
+            },
+        );
+
+        assert!(chat.pending_queue_removals.is_empty());
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].id, "queued-prompt");
     }
 
     #[test]
