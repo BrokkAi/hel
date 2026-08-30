@@ -9,6 +9,8 @@
 //! a reviewer answer arriving would move the reader's place in the primary
 //! transcript, and a drag started in one pane would run into the other.
 
+use std::sync::Arc;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -153,6 +155,17 @@ impl SecondOpinion {
         }
     }
 
+    /// Rebuilds the reviewer's pane from a stored transcript.
+    pub(super) fn restore_reviewer(
+        &mut self,
+        session_id: &str,
+        transcript: Vec<Arc<crate::hel_state::TranscriptItem>>,
+    ) {
+        if let Self::Review(review) = self {
+            review.reviewer.restore(session_id, transcript);
+        }
+    }
+
     /// Replaces the waterfall with the split once a reviewer is running.
     pub(super) fn begin_review(
         &mut self,
@@ -246,6 +259,38 @@ impl ReviewerPane {
                 super::transcript::materialized_chunks_text(chunks)
             })
             .filter(|text| !text.trim().is_empty())
+    }
+
+    /// What the pane has read of the reviewer's conversation, for the copy
+    /// the controller keeps against the target going away.
+    pub(super) fn transcript(&self) -> Vec<Arc<crate::hel_state::TranscriptItem>> {
+        self.session
+            .as_ref()
+            .map(|session| session.transcript.clone())
+            .unwrap_or_default()
+    }
+
+    /// Rebuilds a pane from a stored transcript, for a review restored after
+    /// the reviewer's own journal became unreachable.
+    pub(super) fn restore(
+        &mut self,
+        session_id: &str,
+        transcript: Vec<Arc<crate::hel_state::TranscriptItem>>,
+    ) {
+        if transcript.is_empty() {
+            return;
+        }
+        let mut session = MaterializedSession::empty(session_id);
+        session.applied_event_ordinal = transcript
+            .iter()
+            .map(|item| item.position)
+            .max()
+            .unwrap_or(0);
+        session.transcript = transcript;
+        self.entries = materialized_chat_entries_reusing(&session, 0, Vec::new());
+        self.session = Some(session);
+        self.width = 0;
+        self.follow = true;
     }
 
     /// Forms the reviewer's harness is waiting on.
@@ -1181,6 +1226,40 @@ mod tests {
             PRIMARY_CONTEXT_REQUEST,
         ));
         assert_eq!(chat.entries[0].role, ChatRole::System);
+    }
+
+    /// A review whose target is gone still has to be readable: the reviewer's
+    /// own journal died with it, so the pane is rebuilt from the copy the
+    /// controller kept.
+    #[test]
+    fn a_reviewer_pane_rebuilds_from_a_stored_transcript() {
+        let item = std::sync::Arc::new(crate::hel_state::TranscriptItem {
+            stable_id: "agent:1".into(),
+            position: 1,
+            latest_content_event_ordinal: Some(1),
+            created_at_ms: 0,
+            last_changed_at_ms: 0,
+            body: crate::hel_state::TranscriptBody::Agent {
+                chunks: vec![serde_json::json!({
+                    "content": {"type": "text", "text": "the plan misses error handling"}
+                })],
+                streaming: false,
+            },
+        });
+
+        let mut pane = ReviewerPane::default();
+        assert!(pane.is_empty());
+        pane.restore("session-1-reviewer", vec![item]);
+
+        assert!(!pane.is_empty());
+        assert_eq!(
+            pane.latest_answer().as_deref(),
+            Some("the plan misses error handling"),
+            "a restored review can still be read, and transferred from"
+        );
+        // Restoring nothing leaves the pane alone rather than clearing it.
+        pane.restore("session-1-reviewer", Vec::new());
+        assert!(!pane.is_empty());
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::hel_workspace::{
     normalize_workspace_name,
 };
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -1915,7 +1915,7 @@ fn remember_reviewer_selection_in(
 }
 
 /// A second-opinion review that was still open when the UI last stopped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredReview {
     pub workflow: crate::hel_second_opinion::ReviewWorkflow,
     /// Reviewer lifetime this review belongs to. It is bumped when native
@@ -1926,6 +1926,10 @@ pub struct StoredReview {
     pub context_baseline: u64,
     /// Whether the reviewer's native session is known to be gone.
     pub native_lost: bool,
+    /// What the controller has read of the reviewer's conversation. The
+    /// reviewer's own journal is the source, but it dies with the target, so
+    /// this copy is what keeps a finished review readable afterwards.
+    pub reviewer_transcript: Vec<std::sync::Arc<crate::hel_state::TranscriptItem>>,
 }
 
 /// The open review for `session_id`, if the session has one.
@@ -1937,7 +1941,7 @@ fn active_review_in(path: &Path, session_id: &str) -> Result<Option<StoredReview
     let connection = open(path)?;
     let row = connection
         .query_row(
-            "SELECT workflow, generation, context_baseline, native_lost
+            "SELECT workflow, generation, context_baseline, native_lost, reviewer_transcript
              FROM second_opinion_reviews WHERE session_id = ?1",
             [session_id],
             |row| {
@@ -1946,11 +1950,12 @@ fn active_review_in(path: &Path, session_id: &str) -> Result<Option<StoredReview
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((workflow, generation, baseline, native_lost)) = row else {
+    let Some((workflow, generation, baseline, native_lost, transcript)) = row else {
         return Ok(None);
     };
     Ok(Some(StoredReview {
@@ -1958,6 +1963,8 @@ fn active_review_in(path: &Path, session_id: &str) -> Result<Option<StoredReview
         generation: u64::try_from(generation).unwrap_or_default(),
         context_baseline: u64::try_from(baseline).unwrap_or_default(),
         native_lost: native_lost != 0,
+        reviewer_transcript: serde_json::from_str(&transcript)
+            .context("parse the stored reviewer transcript")?,
     }))
 }
 
@@ -1970,19 +1977,22 @@ fn save_active_review_in(path: &Path, session_id: &str, review: &StoredReview) -
     let connection = open(path)?;
     connection.execute(
         "INSERT INTO second_opinion_reviews(
-             session_id, workflow, generation, context_baseline, native_lost
-         ) VALUES (?1, ?2, ?3, ?4, ?5)
+             session_id, workflow, generation, context_baseline, native_lost,
+             reviewer_transcript
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(session_id) DO UPDATE SET
              workflow = excluded.workflow,
              generation = excluded.generation,
              context_baseline = excluded.context_baseline,
-             native_lost = excluded.native_lost",
+             native_lost = excluded.native_lost,
+             reviewer_transcript = excluded.reviewer_transcript",
         params![
             session_id,
             serde_json::to_string(&review.workflow)?,
             i64::try_from(review.generation).unwrap_or(i64::MAX),
             i64::try_from(review.context_baseline).unwrap_or(i64::MAX),
             i64::from(review.native_lost),
+            serde_json::to_string(&review.reviewer_transcript)?,
         ],
     )?;
     Ok(())

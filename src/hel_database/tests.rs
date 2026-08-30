@@ -619,11 +619,25 @@ fn an_open_review_survives_a_restart_and_a_finished_one_does_not() {
     assert_eq!(active_review_in(&database, "session-1").unwrap(), None);
 
     let (mut workflow, _) = ReviewWorkflow::start("plan-review-1", "1. Read\n2. Change", "ctx-1");
+    let reviewer_transcript = vec![std::sync::Arc::new(TranscriptItem {
+        stable_id: "agent:1".into(),
+        position: 1,
+        latest_content_event_ordinal: Some(1),
+        created_at_ms: 0,
+        last_changed_at_ms: 0,
+        body: TranscriptBody::Agent {
+            chunks: vec![serde_json::json!({
+                "content": {"type": "text", "text": "the plan misses error handling"}
+            })],
+            streaming: false,
+        },
+    })];
     let stored = StoredReview {
         workflow: workflow.clone(),
         generation: 0,
         context_baseline: 7,
         native_lost: false,
+        reviewer_transcript: reviewer_transcript.clone(),
     };
     save_active_review_in(&database, "session-1", &stored).unwrap();
 
@@ -631,6 +645,9 @@ fn an_open_review_survives_a_restart_and_a_finished_one_does_not() {
     assert_eq!(restored, stored);
     assert_eq!(restored.workflow.proposal(), "1. Read\n2. Change");
     assert!(!restored.workflow.finished());
+    // The reviewer's conversation is kept here too: its own journal dies with
+    // the target, and a finished review still has to be readable.
+    assert_eq!(restored.reviewer_transcript, reviewer_transcript);
 
     // Advancing the review updates the same row rather than adding another.
     workflow.primary_context_completed("ctx-1", "the user asked for X", "review-1");
@@ -665,6 +682,7 @@ fn losing_the_target_ends_the_reviewer_conversation_and_bumps_its_generation() {
             generation: 3,
             context_baseline: 0,
             native_lost: false,
+            reviewer_transcript: Vec::new(),
         },
     )
     .unwrap();

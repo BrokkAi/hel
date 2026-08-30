@@ -855,8 +855,16 @@ impl ActiveChat {
             } else {
                 "reloading the review…"
             };
+            let reviewer_transcript = stored.reviewer_transcript;
             if let Some(view) = state.second_opinion_mut() {
                 view.begin_review(stored.workflow, status, stored.context_baseline);
+                // The reviewer's own journal is the source while the target
+                // lives; this copy is what keeps the conversation readable
+                // once it does not.
+                view.restore_reviewer(
+                    &reviewer_session_id(session.session_id()),
+                    reviewer_transcript,
+                );
             }
         }
         let chat = Self {
@@ -1526,6 +1534,7 @@ impl ActiveChat {
             generation: self.reviewer_generation,
             context_baseline: review.context_baseline,
             native_lost: false,
+            reviewer_transcript: review.reviewer.transcript(),
         };
         if let Err(error) =
             crate::hel_database::save_active_review(self.session.session_id(), &stored)
