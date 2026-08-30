@@ -1873,6 +1873,124 @@ mod tests {
     }
 
     #[test]
+    fn recovery_isolates_a_corrupt_record_at_every_position() {
+        // "Recover everything that isn't actively corrupted": whichever single
+        // record is corrupt, all the others come back and exactly one gap is
+        // reported.
+        const COUNT: u64 = 6;
+        for corrupt_index in 1..=COUNT {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(RELAY_ACTIVE_SEGMENT);
+            let mut file = File::create(&path).unwrap();
+            let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
+            for ordinal in 1..=COUNT {
+                if ordinal == corrupt_index {
+                    file.write_all(br#"{"ordinal":0,"observation": BROKEN"#).unwrap();
+                    file.write_all(b"\n").unwrap();
+                    continue;
+                }
+                let event = RelayEvent {
+                    format: RELAY_EVENT_FORMAT_V2,
+                    ordinal,
+                    previous_digest: String::new(),
+                    digest: String::new(),
+                    recorded_at_ms: ordinal as i64,
+                    command_id: None,
+                    observation: RelayObservation::Warning {
+                        message: format!("event {ordinal}"),
+                    },
+                };
+                let event = RelayEvent {
+                    digest: relay_event_digest(&event).unwrap(),
+                    ..event
+                };
+                // v2 records self-hash; keep a running frontier only to mimic
+                // the writer, though v2 does not fold it in.
+                previous_digest = event.digest.clone();
+                serde_json::to_writer(&mut file, &event).unwrap();
+                file.write_all(b"\n").unwrap();
+            }
+            file.sync_all().unwrap();
+            let _ = &previous_digest;
+
+            let mut seen = Vec::new();
+            let gaps = visit_relay_journal_file(&path, JournalReadMode::Recover, |event, _| {
+                validate_relay_event_self(&event).unwrap();
+                seen.push(event.ordinal);
+                Ok(ControlFlow::Continue(()))
+            })
+            .expect("recovery must not fail on a corrupt record");
+            let expected: Vec<u64> = (1..=COUNT).filter(|o| *o != corrupt_index).collect();
+            assert_eq!(
+                seen, expected,
+                "every intact record must survive corruption at index {corrupt_index}"
+            );
+            assert_eq!(gaps.len(), 1, "one gap for corruption at index {corrupt_index}");
+        }
+    }
+
+    #[test]
+    fn a_journal_mixing_v1_and_v2_records_reads_and_validates_across_the_boundary() {
+        // During the lazy migration a journal holds legacy v1 records followed
+        // by new v2 records. Both formats read, each self-validates, and the
+        // v1→v2 boundary validates without a chain link.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(RELAY_ACTIVE_SEGMENT);
+        let mut file = File::create(&path).unwrap();
+
+        let v1 = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V1,
+            ordinal: 1,
+            previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+            digest: String::new(),
+            recorded_at_ms: 1,
+            command_id: None,
+            observation: RelayObservation::Warning {
+                message: "legacy".into(),
+            },
+        };
+        let v1 = RelayEvent {
+            digest: relay_event_digest(&v1).unwrap(),
+            ..v1
+        };
+        serde_json::to_writer(&mut file, &v1).unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let v2 = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V2,
+            ordinal: 2,
+            previous_digest: String::new(),
+            digest: String::new(),
+            recorded_at_ms: 2,
+            command_id: None,
+            observation: RelayObservation::Warning {
+                message: "new".into(),
+            },
+        };
+        let v2 = RelayEvent {
+            digest: relay_event_digest(&v2).unwrap(),
+            ..v2
+        };
+        serde_json::to_writer(&mut file, &v2).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+
+        let mut events = Vec::new();
+        visit_relay_journal_file(&path, JournalReadMode::Strict, |event, _| {
+            events.push(event);
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].format, RELAY_EVENT_FORMAT_V1);
+        assert_eq!(events[1].format, RELAY_EVENT_FORMAT_V2);
+        // The v2 record continues from the v1 record across the format
+        // boundary: ordinal contiguity holds and the v2 record self-validates,
+        // with no chain link required.
+        validate_relay_event(v1.ordinal, &v1.digest, &events[1]).unwrap();
+    }
+
+    #[test]
     fn first_active_journal_file_is_reopenable_after_its_first_append() {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
