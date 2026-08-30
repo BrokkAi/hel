@@ -443,9 +443,17 @@ fn visit_relay_journal_reader(
         if consumed == 0 {
             return Ok(RelayJournalScan { truncate_to: None });
         }
-        if !terminated && repair_partial_tail {
+        if !terminated {
+            // A line with no trailing newline is a partial or in-flight append,
+            // never a committed event: `append_relay_event` writes each record
+            // and its newline in a single call. Stop at the last complete
+            // record instead of parsing the torn bytes (which fails with an
+            // "EOF while parsing" error). Repair mode truncates the torn tail;
+            // a read-only replay — an attach serving the hot segment while the
+            // worker is still appending to it — leaves the file untouched for
+            // the writer to finish.
             return Ok(RelayJournalScan {
-                truncate_to: Some(complete_bytes),
+                truncate_to: repair_partial_tail.then_some(complete_bytes),
             });
         }
         complete_bytes = complete_bytes
@@ -1660,6 +1668,61 @@ mod tests {
         let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
         assert_eq!(relay.latest_ordinal(), 2);
         assert_eq!(retained_events(&relay).len(), 2);
+    }
+
+    #[test]
+    fn a_read_only_replay_tolerates_a_torn_active_tail_and_serves_the_newest_record() {
+        // An attach serving the hot segment can read it while the worker is
+        // mid-append, catching a final record with no trailing newline. That
+        // partial write must not fail the replay: every complete record —
+        // including the most recent — has to be delivered, and the live file
+        // must be left untouched for the writer to finish.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(RELAY_ACTIVE_SEGMENT);
+        let mut file = File::create(&path).unwrap();
+        let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
+        for ordinal in 1..=3 {
+            let event = RelayEvent {
+                ordinal,
+                previous_digest: previous_digest.clone(),
+                digest: String::new(),
+                recorded_at_ms: epoch_millis(),
+                command_id: None,
+                observation: RelayObservation::Warning {
+                    message: format!("event {ordinal}"),
+                },
+            };
+            let event = RelayEvent {
+                digest: relay_event_digest(&event).unwrap(),
+                ..event
+            };
+            previous_digest = event.digest.clone();
+            serde_json::to_writer(&mut file, &event).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        // A torn, in-flight fourth record: content began but the closing bytes
+        // and newline are not on disk yet.
+        file.write_all(br#"{"ordinal":4,"previous_digest":"#).unwrap();
+        file.sync_all().unwrap();
+        let len_before = path.metadata().unwrap().len();
+
+        let mut seen = Vec::new();
+        visit_relay_journal_file(&path, false, |event, _| {
+            seen.push(event.ordinal);
+            Ok(ControlFlow::Continue(()))
+        })
+        .expect("a read-only replay must tolerate a torn tail");
+
+        assert_eq!(
+            seen,
+            vec![1, 2, 3],
+            "every complete record, including the most recent, must be served"
+        );
+        assert_eq!(
+            path.metadata().unwrap().len(),
+            len_before,
+            "a read-only replay must not truncate the live segment"
+        );
     }
 
     #[test]
