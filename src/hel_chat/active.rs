@@ -885,6 +885,14 @@ impl ActiveChat {
         self.session.session_id()
     }
 
+    /// Whether a second opinion is open on this session.
+    ///
+    /// Stopping the session tears its target down, which takes the reviewer's
+    /// conversation with it, so the stop confirmation asks about this.
+    pub fn has_open_review(&self) -> bool {
+        self.state.second_opinion_active()
+    }
+
     /// Whether this view is still attached to a live session actor.
     ///
     /// Pause, destroy, and a replaced target retire the actor and close this

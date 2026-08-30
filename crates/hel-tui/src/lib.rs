@@ -302,6 +302,10 @@ pub struct DashboardState {
     /// Sessions whose relay worker the controller currently cannot reach. Their
     /// summary band renders red so an unreachable target is obvious at a glance.
     pub(crate) unreachable_sessions: BTreeSet<String>,
+    /// Sessions with a second opinion in progress. Stopping one destroys its
+    /// target, and the reviewer's conversation goes with it, so the stop
+    /// confirmation says so first.
+    pub(crate) sessions_with_review: BTreeSet<String>,
     pub(crate) project_sources: BTreeMap<String, ProjectSourceIdentity>,
     pub(crate) checkpoint_archive_sizes: BTreeMap<String, Option<u64>>,
     pub(crate) session_operations: BTreeMap<String, SessionOperationDisplay>,
@@ -345,6 +349,7 @@ impl DashboardState {
             quota_refreshing: BTreeSet::new(),
             session_details: BTreeMap::new(),
             unreachable_sessions: BTreeSet::new(),
+            sessions_with_review: BTreeSet::new(),
             project_sources: BTreeMap::new(),
             checkpoint_archive_sizes: BTreeMap::new(),
             session_operations: BTreeMap::new(),

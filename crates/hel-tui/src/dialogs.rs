@@ -202,6 +202,9 @@ pub(crate) enum Confirmation {
     },
     Close {
         session_id: String,
+        /// Whether a second opinion is open on this session. Stopping tears
+        /// the target down, and the reviewer's conversation goes with it.
+        reviewer_conversation: bool,
     },
     CloseFailed {
         session_id: String,
@@ -1067,21 +1070,12 @@ pub(crate) fn render_repository_origin(
     frame.render_widget(paragraph, popup);
 }
 
-pub(crate) fn render_confirmation(
-    frame: &mut Frame,
-    area: Rect,
-    dialog: &ConfirmDialog,
-    surfaces: &mut FrameSurfaces,
-) {
-    let confirmation = &dialog.confirmation;
-    // Minimum height per dialog; `popup_height` grows it to fit wrapped content.
-    let nominal = match confirmation {
-        Confirmation::DirtyLocal { .. } => 11,
-        Confirmation::CloseFailed { .. } => 12,
-        Confirmation::Close { .. } | Confirmation::DestroyStopped { .. } => 10,
-        Confirmation::ForceStop { .. } => 10,
-    };
-    let (title, mut lines) = match confirmation {
+/// Title and body of one confirmation, without its buttons.
+///
+/// Split out so the wording a dialog shows can be asserted without
+/// rendering a frame and reading cells back.
+fn confirmation_body(confirmation: &Confirmation) -> (&'static str, Vec<Line<'static>>) {
+    match confirmation {
         Confirmation::DirtyLocal { repositories, .. } => {
             let mut lines = vec![
                 Line::raw("The initial worker will include these uncommitted changes:"),
@@ -1096,14 +1090,30 @@ pub(crate) fn render_confirmation(
             ]);
             (" Local repository has uncommitted changes ", lines)
         }
-        Confirmation::Close { session_id } => (
-            " Stop session? ",
-            vec![
+        Confirmation::Close {
+            session_id,
+            reviewer_conversation,
+        } => {
+            let mut lines = vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify a recovery copy before destroying the target."),
-            ],
-        ),
+            ];
+            if *reviewer_conversation {
+                // The reviewer's native session lives on the target, and a v1
+                // checkpoint is single session, so resuming cannot bring it
+                // back. Saying so before the stop is the only warning there is.
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "The second opinion in progress cannot be continued after resume.",
+                    Style::default().fg(Color::Yellow),
+                ));
+                lines.push(Line::raw(
+                    "Its review is kept for reference; a later one starts a new conversation.",
+                ));
+            }
+            (" Stop session? ", lines)
+        }
         Confirmation::DestroyStopped { session_id, .. } => (
             " Permanently destroy stopped session? ",
             vec![
@@ -1138,7 +1148,28 @@ pub(crate) fn render_confirmation(
                 ),
             ],
         ),
+    }
+}
+
+pub(crate) fn render_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &ConfirmDialog,
+    surfaces: &mut FrameSurfaces,
+) {
+    let confirmation = &dialog.confirmation;
+    // Minimum height per dialog; `popup_height` grows it to fit wrapped content.
+    let nominal = match confirmation {
+        Confirmation::DirtyLocal { .. } => 11,
+        Confirmation::CloseFailed { .. } => 12,
+        Confirmation::Close {
+            reviewer_conversation: true,
+            ..
+        } => 13,
+        Confirmation::Close { .. } | Confirmation::DestroyStopped { .. } => 10,
+        Confirmation::ForceStop { .. } => 10,
     };
+    let (title, mut lines) = confirmation_body(confirmation);
     let buttons = confirmation_buttons(confirmation);
     if !buttons.is_empty() {
         lines.push(Line::raw(""));
@@ -1417,8 +1448,10 @@ impl DashboardState {
                 return DashboardAction::None;
             }
             ButtonKey::Activate(index) if index == dialog.stop_index() => {
+                let reviewer_conversation = self.sessions_with_review.contains(&dialog.session_id);
                 self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
                     session_id: dialog.session_id,
+                    reviewer_conversation,
                 }));
                 return DashboardAction::None;
             }
@@ -1891,7 +1924,7 @@ impl DashboardState {
                 self.cancel_modal();
                 action
             }
-            (Confirmation::Close { session_id }, 1) => {
+            (Confirmation::Close { session_id, .. }, 1) => {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
             }
@@ -2878,10 +2911,62 @@ mod tests {
     }
 
     #[test]
+    fn stopping_a_session_warns_about_a_review_it_would_end() {
+        let quiet = confirmation_lines(&Confirmation::Close {
+            session_id: "session-1".into(),
+            reviewer_conversation: false,
+        });
+        assert!(
+            !quiet.iter().any(|line| line.contains("second opinion")),
+            "a session with no review says nothing about one: {quiet:?}"
+        );
+
+        let warned = confirmation_lines(&Confirmation::Close {
+            session_id: "session-1".into(),
+            reviewer_conversation: true,
+        });
+        assert!(
+            warned
+                .iter()
+                .any(|line| line.contains("cannot be continued after resume")),
+            "stopping must warn that the review ends with the target: {warned:?}"
+        );
+        // The choice is still the ordinary one: stop anyway, or cancel.
+        assert_eq!(
+            confirmation_buttons(&Confirmation::Close {
+                session_id: "session-1".into(),
+                reviewer_conversation: true,
+            }),
+            &["Cancel", "Stop"]
+        );
+    }
+
+    /// The rendered body of one confirmation, as plain strings.
+    fn confirmation_lines(confirmation: &Confirmation) -> Vec<String> {
+        confirmation_body(confirmation)
+            .1
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
     fn button_confirmations_keep_their_button_row_visible() {
         let confirmations = [
             Confirmation::Close {
                 session_id: "session-1".into(),
+                reviewer_conversation: false,
+            },
+            // The warning adds rows, so the taller variant has to keep its
+            // buttons on screen too.
+            Confirmation::Close {
+                session_id: "session-1".into(),
+                reviewer_conversation: true,
             },
             Confirmation::DestroyStopped {
                 session_id: "session-1".into(),
