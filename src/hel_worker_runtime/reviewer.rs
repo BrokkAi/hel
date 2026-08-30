@@ -20,19 +20,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::unix::{ACP_EVENT_CHANNEL_CAPACITY, run_relay_coordinator};
-use super::{AcpSupervisorSpec, ReviewerLaunchConfig};
+use super::{AcpSupervisorSpec, REVIEWER_DIR, REVIEWER_PROFILE_DIR, ReviewerLaunchConfig};
 use crate::hel_acp::{self, CommandRequest, LaunchSpec};
 use crate::hel_worker::{
     DurableRelay, RelayCommand, RelayCursor, RelayEvent, RelayObservation, RelayOperationalState,
     RelayRequest, RelayRequestEnvelope, RelayResponseBody, RelayResponseEnvelope,
     RelayResponsePayload,
 };
-
-/// Directory inside the primary worker root that holds everything the reviewer
-/// owns: its staged profile, its relay journal and its relay state.
-pub const REVIEWER_DIR: &str = "reviewer";
-/// Where the controller stages the chosen profile, inside [`REVIEWER_DIR`].
-pub const REVIEWER_PROFILE_DIR: &str = "profile";
 
 /// How long a reviewer may take to open its native session and advertise its
 /// configuration. A harness that has to authenticate or warm a large profile

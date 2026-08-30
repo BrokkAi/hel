@@ -407,6 +407,7 @@ fn status_parts(status: std::process::ExitStatus) -> (Option<i32>, Option<String
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn user_shell_restores_github_wrapper_after_login_profile() {
         use std::os::unix::fs::PermissionsExt;
