@@ -1227,12 +1227,15 @@ fn api_quota_bar() -> Line<'static> {
     ])
 }
 
-fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
-    let weekly_exhausted = quota
+fn weekly_quota_exhausted(quota: &ProfileQuota) -> bool {
+    quota
         .weekly_window()
         .and_then(quota_remaining_percent)
-        .is_some_and(|remaining| remaining < 1);
-    let five_hour = if weekly_exhausted {
+        .is_some_and(|remaining| remaining < 1)
+}
+
+fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
+    let five_hour = if weekly_quota_exhausted(quota) {
         None
     } else {
         quota.five_hour_window()
@@ -1294,7 +1297,12 @@ fn quota_reset_cells(quota: &ProfileQuota, now: u64) -> (String, String) {
         }
         weekly.push_str(extra);
     }
-    (weekly, quota_reset_cell(quota.five_hour_window(), now))
+    let five_hour = if weekly_quota_exhausted(quota) {
+        String::new()
+    } else {
+        quota_reset_cell(quota.five_hour_window(), now)
+    };
+    (weekly, five_hour)
 }
 
 struct QuotaTableRow {
@@ -3143,7 +3151,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_render_hides_five_hour_bar_when_weekly_quota_is_exhausted() {
+    fn quota_render_hides_five_hour_bar_and_reset_when_weekly_quota_is_exhausted() {
         let quota = ProfileQuota {
             profile_id: "codex-1".into(),
             harness: HarnessKind::Codex,
@@ -3188,6 +3196,7 @@ mod tests {
 
         assert!(rendered.contains("0%"));
         assert!(!rendered.contains("70%"));
+        assert!(!rendered.contains("4h"));
     }
 
     #[test]
