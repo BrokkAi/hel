@@ -1,13 +1,14 @@
 //! Transcript compatibility for agents that use client terminals without
 //! publishing the ACP tool call that owns them.
 
-use agent_client_protocol::schema::v1::{
-    Terminal, ToolCall, ToolCallContent, ToolCallStatus, ToolKind,
-};
+use agent_client_protocol::schema::v1::ToolCall;
+#[cfg(any(unix, test))]
+use agent_client_protocol::schema::v1::{Terminal, ToolCallContent, ToolCallStatus, ToolKind};
 
 const FALLBACK_TERMINAL_META_KEY: &str = "hel.dev/fallback-terminal";
 const FALLBACK_TERMINAL_TOOL_ID_PREFIX: &str = "hel-terminal:";
 
+#[cfg(any(unix, test))]
 pub(crate) fn fallback_terminal_tool_call(terminal_id: &str, command: String) -> ToolCall {
     ToolCall::new(fallback_terminal_tool_call_id(terminal_id), command)
         .kind(ToolKind::Execute)
