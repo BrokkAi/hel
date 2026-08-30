@@ -63,6 +63,17 @@ pub enum TranscriptBody {
         /// plan- and entry-level metadata.
         plan: serde_json::Value,
     },
+    /// A plan the harness asked the user to approve, captured where the
+    /// decision happened so it renders inline and survives restart and export.
+    ///
+    /// It is a record of the proposal, not conversation input: Hel never
+    /// replays it to a model as a user or agent message.
+    PlanProposal {
+        /// Identity of the plan review that carried this proposal.
+        proposal_id: String,
+        /// Exact proposal text the harness sent.
+        plan: String,
+    },
     System {
         text: String,
     },
@@ -217,6 +228,8 @@ pub enum ChatRole {
     Tool,
     /// Current agent plan.
     Plan,
+    /// A plan proposal awaiting, or already given, a decision.
+    PlanProposal,
     System,
 }
 

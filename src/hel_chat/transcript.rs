@@ -378,6 +378,7 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
                 | (ChatRole::Thought, TranscriptBody::Thought { .. })
                 | (ChatRole::Tool, TranscriptBody::Tool { .. })
                 | (ChatRole::Plan, TranscriptBody::Plan { .. })
+                | (ChatRole::PlanProposal, TranscriptBody::PlanProposal { .. })
                 | (
                     ChatRole::System,
                     TranscriptBody::System { .. } | TranscriptBody::TerminalOutput { .. }
@@ -412,7 +413,9 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
 fn item_update_ordinal(item: &TranscriptItem, frontier: u64) -> u64 {
     let latest = match &item.body {
         // Created once and never revisited, so the creating event is exact.
-        TranscriptBody::User { .. } | TranscriptBody::System { .. } => item.position,
+        TranscriptBody::User { .. }
+        | TranscriptBody::System { .. }
+        | TranscriptBody::PlanProposal { .. } => item.position,
         // Every appended chunk records the ordinal that appended it. Closing
         // the stream is the only other edit and nothing rendered reads it.
         TranscriptBody::Agent { .. } => item.latest_content_event_ordinal.unwrap_or(frontier),
@@ -527,6 +530,9 @@ fn materialized_chat_entry_with_diffstats(
                 })
                 .collect(),
         ),
+        TranscriptBody::PlanProposal { plan, .. } => {
+            ChatEntry::plain(item.position, ChatRole::PlanProposal, plan)
+        }
         TranscriptBody::System { text } => ChatEntry::plain(item.position, ChatRole::System, text),
     };
     entry.seq = item_update_ordinal(item, frontier);
@@ -593,6 +599,7 @@ fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
             ),
         ),
         ChatRole::Plan => ("plan", "Plan".to_owned()),
+        ChatRole::PlanProposal => ("plan-proposal", "Proposed plan".to_owned()),
         ChatRole::System => ("system", "Hel".to_owned()),
     };
     let source = if entry.role == ChatRole::Plan {
@@ -2173,6 +2180,16 @@ fn entry_visual(entry: &ChatEntry) -> EntryVisual {
             EntryVisual {
                 glyph: "◇",
                 label: "Plan".into(),
+                header_style: style,
+                body_style: Style::default(),
+                rail_style: style,
+            }
+        }
+        ChatRole::PlanProposal => {
+            let style = Style::default().fg(Color::LightMagenta);
+            EntryVisual {
+                glyph: "◈",
+                label: "Proposed plan".into(),
                 header_style: style,
                 body_style: Style::default(),
                 rail_style: style,

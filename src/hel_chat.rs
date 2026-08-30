@@ -696,7 +696,7 @@ impl ChatState {
         request: &ElicitationRequest,
         response: &ElicitationResponse,
     ) -> Option<PlanReviewFollowup> {
-        if !request.id.starts_with("plan-review-") {
+        if !crate::hel_acp::is_plan_review_id(&request.id) {
             return None;
         }
         let ElicitationResponse::Accept { content } = response else {
@@ -824,6 +824,7 @@ impl ChatState {
                         |id| format!("tool:{id}"),
                     ),
                     ChatRole::Plan => format!("plan:{}", entry.start_seq),
+                    ChatRole::PlanProposal => format!("plan-proposal:{}", entry.start_seq),
                     ChatRole::System => format!("system:{}", entry.start_seq),
                 };
                 let stable_id = if stable_ids.insert(base_id.clone()) {
@@ -914,6 +915,10 @@ impl ChatState {
                                 .collect(),
                         ))
                         .expect("ACP plan serialization cannot fail"),
+                    },
+                    ChatRole::PlanProposal => TranscriptBody::PlanProposal {
+                        proposal_id: format!("legacy:{}", entry.start_seq),
+                        plan: entry.text.clone(),
                     },
                     ChatRole::System => TranscriptBody::System {
                         text: entry.text.clone(),

@@ -397,6 +397,27 @@ fn project_observation(
             pending.retain(|existing| existing.id != request.id);
             pending.push(request.clone());
             mutation.pending_elicitations = Some(pending);
+            // A plan decision also becomes a durable transcript item at the
+            // point the harness proposed it, so the proposal renders inline
+            // after the conversation that produced it and outlives both the
+            // decision dialog and the session's process.
+            if let Some(plan) = crate::hel_acp::plan_review_proposal(request) {
+                close_streams(index, mutation, event.recorded_at_ms);
+                upsert(
+                    mutation,
+                    TranscriptItem {
+                        stable_id: plan_proposal_item_id(event.ordinal),
+                        position: event.ordinal,
+                        latest_content_event_ordinal: None,
+                        created_at_ms: event.recorded_at_ms,
+                        last_changed_at_ms: event.recorded_at_ms,
+                        body: TranscriptBody::PlanProposal {
+                            proposal_id: request.id.clone(),
+                            plan: plan.to_owned(),
+                        },
+                    },
+                );
+            }
         }
         RelayObservation::ElicitationResolved { elicitation_id, .. } => {
             let mut pending = current.pending_elicitations.clone();
@@ -758,6 +779,13 @@ fn project_observation(
 
 fn user_shell_item_id(command_id: &str) -> String {
     format!("shell:{command_id}")
+}
+
+/// Stable id of the captured plan proposal created by the relay event at
+/// `ordinal`. The ordinal keys it because the harness-side review id restarts
+/// with every harness process, while the ordinal is durable and replay-stable.
+pub fn plan_proposal_item_id(ordinal: u64) -> String {
+    format!("plan-proposal:{ordinal}")
 }
 
 fn user_shell_text(
@@ -1542,6 +1570,12 @@ pub fn canonical_session_from_materialized(
                 TranscriptBody::Plan { plan } => {
                     CanonicalTranscriptBody::Plan { plan: plan.clone() }
                 }
+                TranscriptBody::PlanProposal { proposal_id, plan } => {
+                    CanonicalTranscriptBody::PlanProposal {
+                        proposal_id: proposal_id.clone(),
+                        plan: plan.clone(),
+                    }
+                }
                 TranscriptBody::System { text } => {
                     CanonicalTranscriptBody::System { text: text.clone() }
                 }
@@ -1633,6 +1667,12 @@ pub fn materialized_session_from_canonical(
                 }
                 CanonicalTranscriptBody::Plan { plan } => {
                     TranscriptBody::Plan { plan: plan.clone() }
+                }
+                CanonicalTranscriptBody::PlanProposal { proposal_id, plan } => {
+                    TranscriptBody::PlanProposal {
+                        proposal_id: proposal_id.clone(),
+                        plan: plan.clone(),
+                    }
                 }
                 CanonicalTranscriptBody::System { text } => {
                     TranscriptBody::System { text: text.clone() }
@@ -1902,6 +1942,74 @@ mod tests {
             },
         );
         assert!(session.pending_elicitations.is_empty());
+        assert!(session.transcript.is_empty());
+    }
+
+    #[test]
+    fn a_plan_decision_also_becomes_a_durable_proposal_item() {
+        let mut session = MaterializedSession::empty("session-1");
+        let plan = "1. Read the code\n2. Change it";
+        let request = crate::hel_acp::normalized_plan_review(
+            "plan-review-3".into(),
+            &serde_json::json!({ "plan": plan }),
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::ElicitationRequested {
+                request: request.clone(),
+            },
+        );
+
+        assert_eq!(session.pending_elicitations, vec![request]);
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert_eq!(item.stable_id, plan_proposal_item_id(1));
+        assert_eq!(item.position, 1);
+        assert_eq!(
+            item.body,
+            TranscriptBody::PlanProposal {
+                proposal_id: "plan-review-3".into(),
+                plan: plan.into(),
+            }
+        );
+
+        // Answering the decision retires the dialog, not the record of it.
+        apply_observation(
+            &mut session,
+            RelayObservation::ElicitationResolved {
+                elicitation_id: "plan-review-3".into(),
+                action: "accept".into(),
+            },
+        );
+        assert!(session.pending_elicitations.is_empty());
+        assert_eq!(session.transcript.len(), 1);
+    }
+
+    #[test]
+    fn a_captured_proposal_keeps_its_place_after_the_conversation_that_produced_it() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, untagged_agent_chunk("here is my plan"));
+        apply_observation(
+            &mut session,
+            RelayObservation::ElicitationRequested {
+                request: crate::hel_acp::normalized_plan_review(
+                    "plan-review-1".into(),
+                    &serde_json::json!({ "plan": "do the work" }),
+                ),
+            },
+        );
+        apply_observation(&mut session, untagged_agent_chunk("starting now"));
+
+        let bodies = session
+            .transcript
+            .iter()
+            .map(|item| match &item.body {
+                TranscriptBody::Agent { .. } => "agent",
+                TranscriptBody::PlanProposal { .. } => "proposal",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, vec!["agent", "proposal", "agent"]);
     }
 
     /// An agent message chunk with no `message_id`, as Grok Build's goal mode streams them.
@@ -3195,6 +3303,17 @@ mod tests {
                     }],
                     "_meta": {"planProvider": "test"}
                 }),
+            },
+        }));
+        session.transcript.push(Arc::new(TranscriptItem {
+            stable_id: plan_proposal_item_id(4),
+            position: 4,
+            latest_content_event_ordinal: None,
+            created_at_ms: 40,
+            last_changed_at_ms: 40,
+            body: TranscriptBody::PlanProposal {
+                proposal_id: "plan-review-1".into(),
+                plan: "1. Read the code\n2. Change it".into(),
             },
         }));
         session.queued_prompts.push(MaterializedQueuedPrompt {

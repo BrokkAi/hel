@@ -58,6 +58,33 @@ pub(crate) fn plan_review_carries_native_feedback(id: &str) -> bool {
     grok::is_plan_review_id(id)
 }
 
+/// Identity prefix every normalized plan decision shares, whatever harness
+/// dialect produced it.
+pub const PLAN_REVIEW_ID_PREFIX: &str = "plan-review-";
+
+/// Header [`normalized_plan_review`] puts in front of the harness's proposal
+/// text. Reading the proposal back out is the inverse, so both live here.
+const PLAN_REVIEW_MESSAGE_PREFIX: &str = "Review the agent's plan:\n\n";
+
+/// Whether this elicitation id belongs to one of Hel's normalized plan
+/// decisions.
+#[must_use]
+pub fn is_plan_review_id(id: &str) -> bool {
+    id.starts_with(PLAN_REVIEW_ID_PREFIX)
+}
+
+/// The exact proposal text a normalized plan decision carries.
+///
+/// Returns `None` for any other elicitation, and for a plan decision whose
+/// message was not built by [`normalized_plan_review`].
+#[must_use]
+pub fn plan_review_proposal(request: &ElicitationRequest) -> Option<&str> {
+    if !is_plan_review_id(&request.id) {
+        return None;
+    }
+    request.message.strip_prefix(PLAN_REVIEW_MESSAGE_PREFIX)
+}
+
 /// Private ACP metadata is provider-local and has no Hel projection. In
 /// particular, Codex can replay terminal-output metadata for old tool calls on
 /// every `session/load`; journaling those invisible deltas grows the relay and
@@ -624,8 +651,7 @@ fn is_plan_permission(request: &RequestPermissionRequest) -> bool {
     // option-id heuristic, so key on the tool kind and the plan payload.
     nested_string_matches(&value, &["kind"], &|kind| {
         kind == "plan_review" || kind == "switch_mode"
-    })
-        || nested_string(&value, &["planFilePath", "plan_file_path"]).is_some()
+    }) || nested_string(&value, &["planFilePath", "plan_file_path"]).is_some()
         || nested_string_matches(&value, &["title", "name"], &|name| {
             let normalized = name.to_ascii_lowercase().replace([' ', '_'], "");
             normalized.contains("implementthisplan") || normalized.contains("exitplanmode")
@@ -639,13 +665,13 @@ fn is_plan_permission(request: &RequestPermissionRequest) -> bool {
         })
 }
 
-fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationRequest {
+pub(crate) fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationRequest {
     let plan = nested_string(value, &["plan", "plan_content", "planContent"])
         .unwrap_or("The agent did not provide plan text in its review request.");
     ElicitationRequest {
         id,
         title: Some("Plan review".into()),
-        message: format!("Review the agent's plan:\n\n{plan}"),
+        message: format!("{PLAN_REVIEW_MESSAGE_PREFIX}{plan}"),
         description: Some("Choose what Hel should tell the planning harness.".into()),
         fields: vec![
             ElicitationField {

@@ -409,7 +409,10 @@ fn turns_from_snapshot(snapshot: &CanonicalSessionSnapshot) -> Result<Vec<Turn>>
             CanonicalTranscriptBody::Plan { plan } => {
                 push_turn_event(&mut turns, TurnEvent::Plan(plan.clone()))?;
             }
+            // A captured plan proposal is a record of a decision point, not
+            // conversation input, so compaction never replays it to a model.
             CanonicalTranscriptBody::Thought { .. }
+            | CanonicalTranscriptBody::PlanProposal { .. }
             | CanonicalTranscriptBody::System { .. }
             | CanonicalTranscriptBody::TerminalOutput { .. } => {}
         }
