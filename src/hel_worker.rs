@@ -54,7 +54,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedCommandKind;
 use journal::{
-    RelayJournalSpan, open_relay_journal, read_restored_relay_seed, visit_relay_journal_file,
+    JournalReadMode, RelayJournalSpan, open_relay_journal, read_restored_relay_seed,
+    visit_relay_journal_file,
 };
 use protocol::{incompatible_request_protocol, relay_error, relay_protocol_error};
 use snapshot::{
@@ -1855,7 +1856,7 @@ impl RelayReplayPlan {
                 return Ok(Some(digest.clone()));
             }
             let mut digest = None;
-            visit_relay_journal_file(&span.path, false, |event, _| {
+            visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
                 let previous_ordinal = event
                     .ordinal
                     .checked_sub(1)
@@ -1876,7 +1877,7 @@ impl RelayReplayPlan {
         };
         let mut digest = None;
         let mut previous: Option<RelayEvent> = None;
-        visit_relay_journal_file(&span.path, false, |event, _| {
+        visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
             if let Some(previous) = &previous {
                 validate_relay_event(previous.ordinal, &previous.digest, &event)
                     .with_context(|| format!("validate relay journal {}", span.path.display()))?;
@@ -1917,7 +1918,7 @@ impl RelayReplayPlan {
             if page_full || span.file_last_ordinal <= through_ordinal {
                 continue;
             }
-            let read = visit_relay_journal_file(&span.path, false, |event, encoded_len| {
+            let read = visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, encoded_len| {
                 if event.ordinal <= span.after_ordinal || event.ordinal <= through_ordinal {
                     return Ok(ControlFlow::Continue(()));
                 }

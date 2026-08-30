@@ -170,7 +170,7 @@ pub(crate) fn open_relay_journal(
         }
         let boundary = recovered_ordinal;
         let mut boundary_verified = span.file_first_ordinal == boundary.saturating_add(1);
-        visit_relay_journal_file(&span.path, false, |event, _| {
+        visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
             if event.ordinal < boundary {
                 return Ok(ControlFlow::Continue(()));
             }
@@ -216,7 +216,7 @@ pub(crate) fn open_relay_journal(
         for span in spans.iter().rev() {
             let mut segment_events = Vec::new();
             let mut previous: Option<RelayEvent> = None;
-            visit_relay_journal_file(&span.path, false, |event, _| {
+            visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
                 if let Some(previous) = &previous {
                     validate_relay_event(previous.ordinal, &previous.digest, &event).with_context(
                         || format!("validate relay journal {}", span.path.display()),
@@ -299,7 +299,7 @@ fn seal_active_relay_segment(journal: &Path, metadata: &mut RelayJournalSpan) ->
         .write(true)
         .open(&temporary)?;
     let mut encoder = GzEncoder::new(file, Compression::default());
-    visit_relay_journal_file(&active, false, |event, _| {
+    visit_relay_journal_file(&active, JournalReadMode::Strict, |event, _| {
         serde_json::to_writer(&mut encoder, &event)?;
         encoder.write_all(b"\n")?;
         Ok(ControlFlow::Continue(()))
@@ -331,7 +331,12 @@ fn inspect_relay_journal_file(
 ) -> Result<Option<RelayJournalSpan>> {
     let mut first: Option<RelayEvent> = None;
     let mut previous: Option<RelayEvent> = None;
-    visit_relay_journal_file(path, repair_partial_tail, |event, encoded_len| {
+    let mode = if repair_partial_tail {
+        JournalReadMode::RepairTail
+    } else {
+        JournalReadMode::Strict
+    };
+    visit_relay_journal_file(path, mode, |event, encoded_len| {
         ensure_byte_budget(encoded_len, RELAY_EVENT_BYTE_BUDGET, "relay event")?;
         if let Some(previous) = &previous {
             validate_relay_event(previous.ordinal, &previous.digest, &event)
@@ -392,24 +397,29 @@ fn sealed_relay_journal_metadata(path: &Path) -> Result<RelayJournalSpan> {
 
 pub(crate) fn visit_relay_journal_file(
     path: &Path,
-    repair_partial_tail: bool,
+    mode: JournalReadMode,
     mut visitor: impl FnMut(RelayEvent, usize) -> Result<ControlFlow<()>>,
-) -> Result<()> {
+) -> Result<Vec<RelayJournalGap>> {
     if !path.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let compressed = path.extension().is_some_and(|extension| extension == "gz");
     if compressed {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let decoder = GzDecoder::new(file);
         let mut reader = std::io::BufReader::new(decoder);
-        visit_relay_journal_reader(path, &mut reader, false, &mut visitor)?;
-        return Ok(());
+        let scan = visit_relay_journal_reader(
+            path,
+            &mut reader,
+            mode.without_tail_repair(),
+            &mut visitor,
+        )?;
+        return Ok(scan.gaps);
     }
 
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
-    let scan = visit_relay_journal_reader(path, &mut reader, repair_partial_tail, &mut visitor)?;
+    let scan = visit_relay_journal_reader(path, &mut reader, mode, &mut visitor)?;
     drop(reader);
     if let Some(valid_len) = scan.truncate_to {
         let file = OpenOptions::new()
@@ -422,26 +432,66 @@ pub(crate) fn visit_relay_journal_file(
             sync_directory(parent)?;
         }
     }
-    Ok(())
+    Ok(scan.gaps)
+}
+
+/// How a journal file is read when a record does not parse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum JournalReadMode {
+    /// Read-only and strict: an unparseable terminated record aborts the scan.
+    /// A torn tail (no trailing newline) stops cleanly without touching the file.
+    Strict,
+    /// Startup repair of the live active segment: like `Strict`, but a torn tail
+    /// is truncated to the last complete record.
+    RepairTail,
+    /// Recovery: an unparseable terminated record is skipped and recorded as a
+    /// byte gap; the scan recovers every intact record either side of it. A torn
+    /// tail stops cleanly (never truncates — recovery is read-only).
+    Recover,
+}
+
+impl JournalReadMode {
+    /// Tail repair is meaningless for a compressed sealed segment (its bytes are
+    /// gzip-framed and immutable), so drop it there while keeping recovery.
+    fn without_tail_repair(self) -> Self {
+        match self {
+            JournalReadMode::RepairTail => JournalReadMode::Strict,
+            other => other,
+        }
+    }
+}
+
+/// A run of unrecoverable bytes skipped during `Recover` — one or more corrupt
+/// records. The surrounding good records are recovered; the caller correlates
+/// the byte range with ordinals from the events it did receive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RelayJournalGap {
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: usize,
 }
 
 struct RelayJournalScan {
     truncate_to: Option<u64>,
+    gaps: Vec<RelayJournalGap>,
 }
 
 fn visit_relay_journal_reader(
     path: &Path,
     reader: &mut impl BufRead,
-    repair_partial_tail: bool,
+    mode: JournalReadMode,
     visitor: &mut impl FnMut(RelayEvent, usize) -> Result<ControlFlow<()>>,
 ) -> Result<RelayJournalScan> {
     let mut line = Vec::new();
     let mut complete_bytes = 0_u64;
+    let mut gaps = Vec::new();
     loop {
         let (consumed, terminated) = read_bounded_line(reader, &mut line, RELAY_EVENT_BYTE_BUDGET)
             .with_context(|| format!("read relay journal {}", path.display()))?;
         if consumed == 0 {
-            return Ok(RelayJournalScan { truncate_to: None });
+            return Ok(RelayJournalScan {
+                truncate_to: None,
+                gaps,
+            });
         }
         if !terminated {
             // A line with no trailing newline is a partial or in-flight append,
@@ -449,26 +499,55 @@ fn visit_relay_journal_reader(
             // and its newline in a single call. Stop at the last complete
             // record instead of parsing the torn bytes (which fails with an
             // "EOF while parsing" error). Repair mode truncates the torn tail;
-            // a read-only replay — an attach serving the hot segment while the
-            // worker is still appending to it — leaves the file untouched for
-            // the writer to finish.
+            // every other mode leaves the file untouched for the writer to
+            // finish.
             return Ok(RelayJournalScan {
-                truncate_to: repair_partial_tail.then_some(complete_bytes),
+                truncate_to: (mode == JournalReadMode::RepairTail).then_some(complete_bytes),
+                gaps,
             });
         }
+        let record_offset = complete_bytes;
         complete_bytes = complete_bytes
             .checked_add(u64::try_from(consumed).context("relay journal length overflow")?)
             .ok_or_else(|| anyhow!("relay journal length overflow"))?;
         if line.is_empty() {
             continue;
         }
-        let event = serde_json::from_slice(&line)
-            .with_context(|| format!("parse relay journal {}", path.display()))?;
+        let event = match serde_json::from_slice(&line) {
+            Ok(event) => event,
+            Err(error) => {
+                // A terminated record that will not parse is unrecoverable. In
+                // recovery, skip it so its corruption cannot poison the intact
+                // records around it; otherwise fail as before.
+                if mode == JournalReadMode::Recover {
+                    tracing::warn!(
+                        journal = %path.display(),
+                        byte_offset = record_offset,
+                        bytes = line.len(),
+                        %error,
+                        "skipping unparseable relay journal record during recovery",
+                    );
+                    gaps.push(RelayJournalGap {
+                        byte_offset: record_offset,
+                        byte_len: line.len(),
+                    });
+                    continue;
+                }
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("parse relay journal {}", path.display()));
+            }
+        };
         if visitor(event, line.len())?.is_break() {
-            return Ok(RelayJournalScan { truncate_to: None });
+            return Ok(RelayJournalScan {
+                truncate_to: None,
+                gaps,
+            });
         }
         if !terminated {
-            return Ok(RelayJournalScan { truncate_to: None });
+            return Ok(RelayJournalScan {
+                truncate_to: None,
+                gaps,
+            });
         }
     }
 }
@@ -788,7 +867,7 @@ impl DurableRelay {
         let mut last: Option<RelayEvent> = None;
         let mut written_through = retain_after;
         for span in &self.journal_spans {
-            visit_relay_journal_file(&span.path, false, |event, _| {
+            visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
                 if event.ordinal <= span.after_ordinal || event.ordinal <= written_through {
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -1710,7 +1789,7 @@ mod tests {
         let len_before = path.metadata().unwrap().len();
 
         let mut seen = Vec::new();
-        visit_relay_journal_file(&path, false, |event, _| {
+        visit_relay_journal_file(&path, JournalReadMode::Strict, |event, _| {
             seen.push(event.ordinal);
             Ok(ControlFlow::Continue(()))
         })
@@ -1726,6 +1805,65 @@ mod tests {
             len_before,
             "a read-only replay must not truncate the live segment"
         );
+    }
+
+    #[test]
+    fn recover_mode_skips_a_corrupt_record_and_recovers_its_neighbours() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(RELAY_ACTIVE_SEGMENT);
+        fn write_event(file: &mut File, ordinal: u64, previous_digest: &mut String) {
+            let event = RelayEvent {
+                format: RELAY_EVENT_FORMAT_V1,
+                ordinal,
+                previous_digest: previous_digest.clone(),
+                digest: String::new(),
+                recorded_at_ms: ordinal as i64,
+                command_id: None,
+                observation: RelayObservation::Warning {
+                    message: format!("event {ordinal}"),
+                },
+            };
+            let event = RelayEvent {
+                digest: relay_event_digest(&event).unwrap(),
+                ..event
+            };
+            *previous_digest = event.digest.clone();
+            serde_json::to_writer(&mut *file, &event).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+
+        let mut file = File::create(&path).unwrap();
+        let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
+        write_event(&mut file, 1, &mut previous_digest);
+        // A corrupt interior record: terminated (has its newline) but not valid
+        // JSON, so its bytes are unrecoverable.
+        file.write_all(br#"{"ordinal":2,"observation": BROKEN"#).unwrap();
+        file.write_all(b"\n").unwrap();
+        write_event(&mut file, 3, &mut previous_digest);
+        file.sync_all().unwrap();
+
+        // Strict aborts on the corrupt record.
+        let strict = visit_relay_journal_file(&path, JournalReadMode::Strict, |_, _| {
+            Ok(ControlFlow::Continue(()))
+        });
+        assert!(
+            strict.is_err(),
+            "strict reads must not silently pass a corrupt record"
+        );
+
+        // Recover skips it and delivers both intact neighbours, reporting one gap.
+        let mut seen = Vec::new();
+        let gaps = visit_relay_journal_file(&path, JournalReadMode::Recover, |event, _| {
+            seen.push(event.ordinal);
+            Ok(ControlFlow::Continue(()))
+        })
+        .expect("recovery must not fail on a corrupt record");
+        assert_eq!(
+            seen,
+            vec![1, 3],
+            "records either side of the corruption must be recovered"
+        );
+        assert_eq!(gaps.len(), 1, "the one corrupt record is reported as a gap");
     }
 
     #[test]
