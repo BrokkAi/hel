@@ -15,7 +15,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--hel", required=True, type=pathlib.Path)
-    parser.add_argument("--fake-delay-ms", type=int, default=1500)
+    parser.add_argument("--fake-delay-ms", type=int, default=15000)
     args = parser.parse_args()
     if args.fake_delay_ms < 0:
         parser.error("--fake-delay-ms must be non-negative")

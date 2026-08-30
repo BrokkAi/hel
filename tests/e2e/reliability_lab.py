@@ -358,6 +358,7 @@ class Lab:
             """#!/usr/bin/env python3
 import json
 import os
+import select
 import sys
 import time
 
@@ -376,6 +377,19 @@ def delay():
     delay_ms = int(os.environ.get("HEL_FAKE_ACP_DELAY_MS", "0"))
     if delay_ms > 0:
         time.sleep(delay_ms / 1000)
+
+def wait_for_prompt_cancel():
+    delay_ms = int(os.environ.get("HEL_FAKE_ACP_DELAY_MS", "0"))
+    if delay_ms <= 0:
+        return False
+    ready, _, _ = select.select([sys.stdin], [], [], delay_ms / 1000)
+    if not ready:
+        return False
+    cancellation = json.loads(sys.stdin.readline())
+    log(cancellation)
+    if cancellation.get("method") != "session/cancel":
+        raise RuntimeError("expected session/cancel while prompt was delayed")
+    return True
 
 for line in sys.stdin:
     message = json.loads(line)
@@ -412,19 +426,21 @@ for line in sys.stdin:
                 },
             },
         })
-        delay()
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "reliability reply: " + text},
+        if wait_for_prompt_cancel():
+            result = {"stopReason": "cancelled"}
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "reliability reply: " + text},
+                    },
                 },
-            },
-        })
-        result = {"stopReason": "end_turn"}
+            })
+            result = {"stopReason": "end_turn"}
     elif ident is None:
         continue
     else:
