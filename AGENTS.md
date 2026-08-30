@@ -1,3 +1,17 @@
+# ExecPlans
+
+Use an ExecPlan for a complex feature or a significant refactor. Follow `.agents/PLANS.md` from design through implementation.
+
+Use `.agents/` as the only repository namespace for planning and design artifacts that agents own. Do not create `.agent/`.
+
+Store each ExecPlan in `.agents/plans/`.
+
+Keep `.agents/PLANS.md` as the standard for ExecPlans. Do not store individual ExecPlans next to `.agents/PLANS.md`.
+
+Store design notes for LLMs or agents in `.agents/docs/`. These notes can include agent context, publication runbooks, parity notes, and similar internal information. Do not publish these notes as product documentation.
+
+Reserve `docs/` for future documentation for human readers. Do not store ExecPlans, agent runbooks, or LLM-only context in `docs/`.
+
 # Repository Guidelines
 
 # Git / version control

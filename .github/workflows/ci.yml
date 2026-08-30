@@ -126,6 +126,40 @@ jobs:
       if: runner.os == 'Windows'
       run: cargo test --no-run
 
+  reliability-smoke:
+    name: Three-client reliability smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Install Linux musl tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
+
+    - name: Build the isolated-test controller
+      run: cargo build --locked -p hel-cli
+
+    - name: Run deterministic daemon, two-TUI, and web scenario
+      run: tests/e2e/run-reliability.sh --scenario multi-client-happy-path --seed 1 ./target/x86_64-unknown-linux-musl/debug/hel
+
+    - name: Upload reliability evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: pull-request-reliability-smoke
+        path: target/reliability-artifacts/
+        if-no-files-found: warn
+        retention-days: 14
+
   voice-worker:
     name: Voice worker (ubuntu-latest)
     runs-on: ubuntu-latest

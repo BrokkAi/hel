@@ -2764,6 +2764,29 @@ fn workspace_crud_enforces_unique_names_and_only_deletes_empty_workspaces() {
 }
 
 #[test]
+fn setup_workspace_creation_returns_the_concurrent_name_winner() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    list_workspaces_from(&database).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let create = |name: &'static str| {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            create_or_get_workspace_at(&database, name).unwrap()
+        })
+    };
+    let first = create("  Bifrost  ");
+    let second = create("bIFROST");
+    let winner = first.join().unwrap();
+    let follower = second.join().unwrap();
+
+    assert_eq!(follower, winner);
+    assert_eq!(list_workspaces_from(&database).unwrap(), vec![winner]);
+}
+
+#[test]
 fn read_frontiers_are_independent_per_client_with_the_session_cursor_as_baseline() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("hel.sqlite3");

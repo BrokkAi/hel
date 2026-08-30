@@ -123,6 +123,52 @@ pub fn create_workspace(name: &str) -> Result<WorkspaceRecord> {
     create_workspace_at(&database_path(), name)
 }
 
+/// Create the named workspace, or return the concurrently-created winner.
+///
+/// Interactive setup uses this operation after presenting a snapshot of the
+/// workspace list. Several selectors can therefore submit the same normalized
+/// name legitimately. Explicit database creation remains strict through
+/// [`create_workspace`].
+pub fn create_or_get_workspace(name: &str) -> Result<WorkspaceRecord> {
+    create_or_get_workspace_at(&database_path(), name)
+}
+
+pub fn create_or_get_workspace_at(path: &Path, name: &str) -> Result<WorkspaceRecord> {
+    let (name, name_key) = normalize_workspace_name(name)?;
+    let id = new_workspace_id()?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut connection = open(path)?;
+    let transaction = connection.transaction()?;
+    transaction
+        .execute(
+            "INSERT INTO workspaces(workspace_id, name, name_key, created_at, last_opened_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(name_key) DO NOTHING",
+            params![id, name, name_key, now],
+        )
+        .with_context(|| format!("create or find workspace {name:?}"))?;
+    let workspace = transaction.query_row(
+        "SELECT w.workspace_id, w.name, w.created_at, w.last_opened_at,
+                count(c.session_id)
+           FROM workspaces w
+           LEFT JOIN session_contexts c USING(workspace_id)
+          WHERE w.name_key = ?1
+          GROUP BY w.workspace_id",
+        params![name_key],
+        |row| {
+            Ok(WorkspaceRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                last_opened_at: row.get(3)?,
+                session_count: row.get(4)?,
+            })
+        },
+    )?;
+    transaction.commit()?;
+    Ok(workspace)
+}
+
 pub fn create_workspace_at(path: &Path, name: &str) -> Result<WorkspaceRecord> {
     let (name, name_key) = normalize_workspace_name(name)?;
     let id = new_workspace_id()?;

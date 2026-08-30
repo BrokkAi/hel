@@ -159,6 +159,12 @@ pub(super) fn mode_config_option(current: &str, values: &[&str]) -> SessionConfi
         .category(SessionConfigOptionCategory::Mode)
 }
 
+pub(super) fn fast_mode_option(current: &str) -> SessionConfigOption {
+    let mut option = select_config_option("fast-mode", current, &["off", "on"]);
+    option.name = "Fast mode".into();
+    option
+}
+
 pub(super) fn select_config_option(
     id: &str,
     current: &str,

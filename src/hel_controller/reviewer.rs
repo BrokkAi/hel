@@ -16,8 +16,7 @@ use anyhow::{Context, Result, bail};
 use super::worker_binary::{bridge_launch, stage_profile};
 use super::{Controller, execute_checked, scp_command_spec, ssh_command_spec};
 use crate::hel_targets::{self, CommandExecutor, CommandSpec, ProcessExecutor};
-use crate::hel_worker_runtime::ReviewerLaunchConfig;
-use crate::hel_worker_runtime::reviewer::{REVIEWER_DIR, REVIEWER_PROFILE_DIR};
+use crate::hel_worker_runtime::{REVIEWER_DIR, REVIEWER_PROFILE_DIR, ReviewerLaunchConfig};
 
 impl Controller {
     /// Copy `profile_id`'s home into the session worker's reviewer directory

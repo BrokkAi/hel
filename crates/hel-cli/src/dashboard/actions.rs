@@ -429,11 +429,8 @@ pub(crate) async fn apply_dashboard_action(
             context
                 .dashboard
                 .set_notice(format!("Stopping {}…", short_id(&session_id)));
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Stopping,
-                true,
-            );
+            let request =
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Stopping);
             let runtime = tokio::runtime::Handle::current();
             spawn_lifecycle_operation(
                 request,
@@ -461,11 +458,8 @@ pub(crate) async fn apply_dashboard_action(
             );
         }
         DashboardAction::ForceStop { session_id } => {
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Stopping,
-                true,
-            );
+            let request =
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Stopping);
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
@@ -481,13 +475,8 @@ pub(crate) async fn apply_dashboard_action(
             );
         }
         DashboardAction::DestroyStopped { session_id } => {
-            // A stopped session has no worker, so nothing is copying it and
-            // no recovery reservation is needed.
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Destroying,
-                false,
-            );
+            let request =
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Destroying);
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
@@ -502,28 +491,36 @@ pub(crate) async fn apply_dashboard_action(
                 },
             );
         }
-        DashboardAction::CancelOperation { session_id } => {
+        DashboardAction::CancelOperation { session_id, kind } => {
             if let Some(operation) = context.lifecycle_operations.get(&session_id) {
                 operation.cancelled.store(true, Ordering::Release);
-                let daemon_session_id = session_id.clone();
-                tokio::spawn(async move {
-                    let result = async {
-                        daemon::connect_or_start()
-                            .await?
-                            .cancel_lifecycle(daemon_session_id)
-                            .await
-                    }
-                    .await;
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "could not cancel daemon lifecycle operation");
-                    }
-                });
-                context.dashboard.set_notice(format!(
-                    "Cancelling {} for {}…",
-                    operation.kind.label().to_ascii_lowercase(),
-                    short_id(&session_id)
-                ));
             }
+            let daemon_session_id = session_id.clone();
+            let updates = context.dashboard_io_tx.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    daemon::connect_or_start()
+                        .await?
+                        .cancel_lifecycle(daemon_session_id.clone())
+                        .await
+                }
+                .await
+                .map_err(|error: anyhow::Error| format!("{error:#}"));
+                if updates
+                    .send(DashboardIoUpdate::LifecycleCancellation {
+                        session_id: daemon_session_id,
+                        result,
+                    })
+                    .is_err()
+                {
+                    tracing::debug!("dashboard closed before lifecycle cancellation completed");
+                }
+            });
+            context.dashboard.set_notice(format!(
+                "Cancelling {} for {}…",
+                kind.label().to_ascii_lowercase(),
+                short_id(&session_id)
+            ));
         }
     }
     Ok(())
@@ -618,11 +615,8 @@ fn start_session_launch_with_repository_preflight(
                 &profile_id,
                 &target_template_id,
             ));
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Resuming,
-                true,
-            );
+            let request =
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Resuming);
             context.dashboard.set_resume_destination(
                 &session_id,
                 profile_id.clone(),
@@ -661,13 +655,11 @@ fn start_session_launch_with_repository_preflight(
 
 impl DashboardContext {
     /// Marks a session busy in the UI and hands back what runs its operation
-    /// off the loop. `reserve_recovery` is for operations that must preempt a
-    /// recovery copy already running for the session.
+    /// off the loop. The daemon owns lifecycle/recovery serialization.
     fn begin_lifecycle_operation(
         &mut self,
         session_id: &str,
         kind: SessionOperationKind,
-        reserve_recovery: bool,
     ) -> LifecycleOperationRequest {
         self.dashboard
             .begin_session_operation(session_id.to_owned(), kind, None);
@@ -683,7 +675,6 @@ impl DashboardContext {
             session_id: session_id.to_owned(),
             kind,
             cancelled,
-            recovery: reserve_recovery.then(|| self.recovery_observer.clone()),
             updates: self.lifecycle_updates_tx.clone(),
         }
     }

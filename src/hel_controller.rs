@@ -518,6 +518,7 @@ impl Controller {
                 .context("remove profile rename journal after config save failed")?;
             return Err(error).context("save renamed profile configuration");
         }
+        crate::hel_test_hooks::reach_test_hook("config_replacement_before_reference_migration")?;
         if let Err(error) = crate::hel_database::rename_profile_references(old_id, new_id) {
             if let Err(restore_error) = previous.save() {
                 return Err(error).context(format!(
@@ -565,6 +566,7 @@ impl Controller {
                 .context("remove target rename journal after config save failed")?;
             return Err(error).context("save renamed target configuration");
         }
+        crate::hel_test_hooks::reach_test_hook("config_replacement_before_reference_migration")?;
         if let Err(error) = crate::hel_database::rename_target_references(old_id, new_id) {
             if let Err(restore_error) = previous.save() {
                 return Err(error).context(format!(

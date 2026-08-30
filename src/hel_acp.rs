@@ -8,9 +8,9 @@ mod dialect;
 pub(crate) mod surface;
 mod terminal_compat;
 pub use surface::PlanControl;
-pub(crate) use terminal_compat::{
-    fallback_terminal_tool_call, fallback_terminal_tool_call_id, is_fallback_terminal_tool_call,
-};
+#[cfg(any(unix, test))]
+pub(crate) use terminal_compat::fallback_terminal_tool_call;
+pub(crate) use terminal_compat::{fallback_terminal_tool_call_id, is_fallback_terminal_tool_call};
 
 use dialect::grok;
 

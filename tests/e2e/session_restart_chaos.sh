@@ -11,12 +11,14 @@ if [[ $# -ne 1 ]]; then
     exit 2
 fi
 
-hel_binary=$1
-[[ -x $hel_binary ]] || { echo "hel binary is not executable: $hel_binary" >&2; exit 2; }
+hel_input=$1
+[[ -x $hel_input ]] || { echo "hel binary is not executable: $hel_input" >&2; exit 2; }
+hel_binary=$(cd -- "$(dirname -- "$hel_input")" && pwd)/$(basename -- "$hel_input")
 command -v python3 >/dev/null
 command -v timeout >/dev/null
 
 chaos_root=$(mktemp -d)
+artifact_dir=${HEL_CHAOS_ARTIFACT_DIR:-}
 worker_root=$chaos_root/worker
 workspace=$chaos_root/workspace
 profile=$chaos_root/profile
@@ -33,6 +35,15 @@ cleanup() {
     if [[ -n ${worker_pid:-} ]] && kill -0 "$worker_pid" 2>/dev/null; then
         kill -TERM "$worker_pid" 2>/dev/null || true
         wait "$worker_pid" 2>/dev/null || true
+    fi
+    if [[ -n $artifact_dir ]]; then
+        mkdir -p "$artifact_dir"
+        while IFS= read -r -d '' evidence; do
+            relative=${evidence#"$chaos_root/"}
+            mkdir -p "$artifact_dir/$(dirname -- "$relative")"
+            cp -a "$evidence" "$artifact_dir/$relative"
+        done < <(find "$chaos_root" -type f -print0)
+        ps -eo pid=,ppid=,pgid=,sid=,stat=,etimes=,args= >"$artifact_dir/process-tree.txt"
     fi
 }
 trap cleanup EXIT

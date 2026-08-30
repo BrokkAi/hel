@@ -28,8 +28,8 @@ use hel::hel_session_manager::{
     spawn_remote_session_manager,
 };
 use hel::hel_state::{
-    HelState, ManagedSessionSnapshot, MaterializedSession, SessionResourceAllocation, SessionState,
-    normalize_session_title,
+    HelState, ManagedSessionSnapshot, MaterializedSession, SessionRecord,
+    SessionResourceAllocation, SessionState, normalize_session_title,
 };
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
@@ -494,6 +494,15 @@ pub(crate) fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPol
         .collect()
 }
 
+pub(crate) fn dashboard_worker_targets_excluding(
+    controller: &Controller,
+    excluded_sessions: &std::collections::BTreeSet<String>,
+) -> Vec<WorkerPollTarget> {
+    let mut targets = dashboard_worker_targets(controller);
+    targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    targets
+}
+
 /// Sessions whose worker can answer credential requests right now. Sessions
 /// still provisioning or already disconnected would only produce connection
 /// errors, so they stay out.
@@ -793,7 +802,7 @@ fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget
 /// by a live target. A recoverable error stays visible so the user can resume
 /// its checkpoint, but its failed target must not keep reconnecting or being
 /// sampled.
-fn session_target_is_pollable(session: &hel::hel_state::SessionRecord) -> bool {
+pub(crate) fn session_target_is_pollable(session: &hel::hel_state::SessionRecord) -> bool {
     session.state.is_active() && session.state != SessionState::Error && session.target.is_some()
 }
 
@@ -804,8 +813,7 @@ pub(crate) fn refresh_dashboard_poll_targets(
     credential_sync: &CredentialSyncHandle,
     excluded_sessions: &std::collections::BTreeSet<String>,
 ) {
-    let mut worker_targets = dashboard_worker_targets(controller);
-    worker_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    let worker_targets = dashboard_worker_targets_excluding(controller, excluded_sessions);
     worker_targets_tx.send_replace(worker_targets);
     let mut resource_targets = dashboard_resource_targets(controller);
     resource_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
@@ -1168,6 +1176,44 @@ pub(crate) struct RemoteDashboardWorkerPoller {
     pub(crate) shutdown: SessionManagerShutdown,
     pub(crate) lifecycles: tokio::sync::watch::Receiver<Vec<daemon::RuntimeLifecycleView>>,
     pub(crate) config: tokio::sync::watch::Receiver<hel::hel_config::HelConfig>,
+    pub(crate) records: tokio::sync::watch::Receiver<Vec<SessionRecord>>,
+}
+
+const PROJECTION_CONVERGENCE_RETRIES: u8 = 20;
+const PROJECTION_CONVERGENCE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionMismatch {
+    published_ordinal: u64,
+    published_digest: String,
+    durable_ordinal: u64,
+    durable_digest: String,
+}
+
+#[derive(Default)]
+struct ProjectionConvergence {
+    attempts: std::collections::BTreeMap<String, (ProjectionMismatch, u8)>,
+}
+
+impl ProjectionConvergence {
+    fn converged(&mut self, session_id: &str) {
+        self.attempts.remove(session_id);
+    }
+
+    /// Give a lifecycle rollback and the daemon's cached relay view a bounded
+    /// window to converge. Repeating the same mismatch eventually reports the
+    /// integrity failure instead of hiding it indefinitely.
+    fn should_retry(&mut self, session_id: &str, mismatch: ProjectionMismatch) -> bool {
+        let entry = self
+            .attempts
+            .entry(session_id.to_owned())
+            .or_insert_with(|| (mismatch.clone(), 0));
+        if entry.0 != mismatch {
+            *entry = (mismatch, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= PROJECTION_CONVERGENCE_RETRIES
+    }
 }
 
 pub(crate) fn spawn_remote_dashboard_worker_poller(
@@ -1184,9 +1230,11 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
     } = channels;
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::watch::channel(Vec::new());
     let (config_tx, config_rx) = tokio::sync::watch::channel(hel::hel_config::HelConfig::default());
+    let (records_tx, records_rx) = tokio::sync::watch::channel(Vec::new());
     tokio::spawn(async move {
         let mut revision = 0_u64;
         let mut requests_open = true;
+        let mut projection_convergence = ProjectionConvergence::default();
         loop {
             tokio::select! {
                 request = requests.recv(), if requests_open => {
@@ -1199,12 +1247,21 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                 snapshot = poll_daemon_runtime(workspace_id.clone(), revision) => {
                     match snapshot {
                         Ok(snapshot) => {
-                            revision = revision.max(snapshot.revision);
+                            let snapshot_revision = snapshot.revision;
+                            let mut retry_projection = false;
                             config_tx.send_if_modified(|config| {
                                 if *config == snapshot.config {
                                     false
                                 } else {
                                     *config = snapshot.config.clone();
+                                    true
+                                }
+                            });
+                            records_tx.send_if_modified(|records| {
+                                if *records == snapshot.records {
+                                    false
+                                } else {
+                                    records.clone_from(&snapshot.records);
                                     true
                                 }
                             });
@@ -1219,8 +1276,11 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                         }).await;
                                         match loaded {
                                             Ok(Ok(Some(materialized)))
-                                                if materialized.applied_event_ordinal >= runtime.projection_ordinal =>
+                                                if materialized.applied_event_ordinal > runtime.projection_ordinal
+                                                    || (materialized.applied_event_ordinal == runtime.projection_ordinal
+                                                        && materialized.applied_event_digest == runtime.projection_digest) =>
                                             {
+                                                projection_convergence.converged(&session_id);
                                                 ManagedSessionView {
                                                     snapshot: Some(ManagedSessionSnapshot {
                                                         materialized,
@@ -1232,15 +1292,37 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                                     error: runtime.error,
                                                 }
                                             }
-                                            Ok(Ok(Some(materialized))) => ManagedSessionView {
-                                                snapshot: None,
-                                                connected: false,
-                                                error: Some(ViewError::ProjectionIntegrity(format!(
-                                                    "daemon published projection {} but SQLite contains only {}",
-                                                    runtime.projection_ordinal,
-                                                    materialized.applied_event_ordinal,
-                                                ))),
-                                            },
+                                            Ok(Ok(Some(materialized))) => {
+                                                let mismatch = ProjectionMismatch {
+                                                    published_ordinal: runtime.projection_ordinal,
+                                                    published_digest: runtime.projection_digest.clone(),
+                                                    durable_ordinal: materialized.applied_event_ordinal,
+                                                    durable_digest: materialized.applied_event_digest.clone(),
+                                                };
+                                                if projection_convergence.should_retry(&session_id, mismatch) {
+                                                    retry_projection = true;
+                                                    continue;
+                                                }
+                                                let detail = if materialized.applied_event_ordinal
+                                                    < runtime.projection_ordinal
+                                                {
+                                                    format!(
+                                                        "daemon published projection {} but SQLite contains only {} after a bounded convergence retry",
+                                                        runtime.projection_ordinal,
+                                                        materialized.applied_event_ordinal,
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "daemon and SQLite projection digests differ at ordinal {} after a bounded convergence retry",
+                                                        runtime.projection_ordinal,
+                                                    )
+                                                };
+                                                ManagedSessionView {
+                                                    snapshot: None,
+                                                    connected: false,
+                                                    error: Some(ViewError::ProjectionIntegrity(detail)),
+                                                }
+                                            }
                                             Ok(Ok(None)) => ManagedSessionView {
                                                 snapshot: None,
                                                 connected: false,
@@ -1274,6 +1356,11 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                     return;
                                 }
                             }
+                            if retry_projection {
+                                tokio::time::sleep(PROJECTION_CONVERGENCE_RETRY_DELAY).await;
+                            } else {
+                                revision = revision.max(snapshot_revision);
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(%error, "could not refresh sessions from controller daemon");
@@ -1294,6 +1381,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         shutdown,
         lifecycles: lifecycle_rx,
         config: config_rx,
+        records: records_rx,
     })
 }
 
@@ -1595,63 +1683,6 @@ fn queued_prompt_entries(
         .collect()
 }
 
-pub(crate) fn merge_recovery_result(
-    controller: &mut Controller,
-    result: hel::hel_recovery::RecoveryResult,
-) -> bool {
-    if let Err(error) = controller.reload() {
-        tracing::warn!(%error, "could not reload a completed recovery checkpoint");
-        return false;
-    }
-    merge_recovery_result_loaded(controller, result)
-}
-
-/// Applies a recovery result after its controller reload already ran on a
-/// blocking task. The dashboard uses this variant so the event loop only
-/// folds in memory state.
-pub(crate) fn merge_recovery_result_loaded(
-    controller: &mut Controller,
-    result: hel::hel_recovery::RecoveryResult,
-) -> bool {
-    let hel::hel_recovery::RecoveryResult {
-        session_id,
-        expected_target,
-        outcome,
-        cancelled,
-    } = result;
-    let Some(session) = controller.state.sessions.get_mut(&session_id) else {
-        tracing::warn!(%session_id, "recovery result refers to a session no longer in controller state");
-        return false;
-    };
-    if session.target.as_ref() != Some(&expected_target) || !session.state.is_active() {
-        tracing::debug!(%session_id, "discarding recovery result for a session whose target or state changed");
-        return false;
-    }
-    match outcome {
-        Ok(artifact) => {
-            if session.checkpoint.as_ref() != Some(&artifact.metadata) {
-                tracing::warn!(
-                    %session_id,
-                    "recovery checkpoint result no longer matches the durable session record; retaining both archives"
-                );
-                return false;
-            }
-        }
-        Err(_) if cancelled => {
-            // A preempted copy was never judged, so it must not leave a
-            // checkpoint error on the session.
-            return false;
-        }
-        Err(detail) => {
-            // record_recovery_failure normally made this durable before the
-            // result was published. Preserve the diagnostic in this view if
-            // that write itself failed; later reloads remain authoritative.
-            session.last_checkpoint_error = Some(detail);
-        }
-    }
-    true
-}
-
 pub(crate) enum LifecycleSuccess {
     Created,
     Resumed {
@@ -1822,6 +1853,65 @@ mod tests {
         let recoverable_error = podman_controller(SessionState::Error);
         assert!(dashboard_worker_targets(&recoverable_error).is_empty());
         assert!(dashboard_resource_targets(&recoverable_error).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_owned_session_stays_out_of_worker_targets() {
+        let controller = podman_controller(SessionState::Provisioning);
+        assert_eq!(dashboard_worker_targets(&controller).len(), 1);
+
+        let excluded = controller
+            .state
+            .sessions
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(dashboard_worker_targets_excluding(&controller, &excluded).is_empty());
+    }
+
+    #[test]
+    fn projection_rollback_race_retries_before_reporting_integrity_failure() {
+        let mismatch = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "published".into(),
+            durable_ordinal: 36,
+            durable_digest: "durable".into(),
+        };
+        let mut convergence = ProjectionConvergence::default();
+
+        for _ in 0..PROJECTION_CONVERGENCE_RETRIES {
+            assert!(convergence.should_retry("session-1", mismatch.clone()));
+        }
+        assert!(
+            !convergence.should_retry("session-1", mismatch),
+            "a persistent mismatch must still become an integrity error"
+        );
+
+        convergence.converged("session-1");
+        assert!(convergence.attempts.is_empty());
+    }
+
+    #[test]
+    fn a_changed_projection_mismatch_gets_its_own_convergence_window() {
+        let mut convergence = ProjectionConvergence::default();
+        let stale_lineage = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "old-lineage".into(),
+            durable_ordinal: 36,
+            durable_digest: "checkpoint".into(),
+        };
+        for _ in 0..=PROJECTION_CONVERGENCE_RETRIES {
+            convergence.should_retry("session-1", stale_lineage.clone());
+        }
+        let equal_frontier_different_lineage = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "old-lineage".into(),
+            durable_ordinal: 39,
+            durable_digest: "new-lineage".into(),
+        };
+
+        assert!(convergence.should_retry("session-1", equal_frontier_different_lineage));
     }
 
     #[test]

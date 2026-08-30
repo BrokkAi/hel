@@ -46,6 +46,23 @@ const WORKER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 const SESSION_MANAGER_SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 
+#[derive(Debug)]
+struct ProjectionAdvancedError {
+    event_ordinal: u64,
+}
+
+impl std::fmt::Display for ProjectionAdvancedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "another projector committed relay event {} first",
+            self.event_ordinal
+        )
+    }
+}
+
+impl std::error::Error for ProjectionAdvancedError {}
+
 /// Delay before the next reconnect attempt after `failures` consecutive
 /// failures. Doubles from `RECONNECT_INTERVAL` up to the ceiling.
 fn reconnect_delay(failures: u32) -> Duration {
@@ -2235,6 +2252,14 @@ impl StandaloneSession {
             let after_ordinal = self.materialized.applied_event_ordinal;
             match self.catch_up_fixed_frontier().await {
                 Ok(()) => break,
+                Err(error) if error.downcast_ref::<ProjectionAdvancedError>().is_some() => {
+                    let durable = load_projection(&self.materialized.session_id).await?;
+                    if durable.applied_event_ordinal <= after_ordinal {
+                        return Err(error);
+                    }
+                    self.materialized = durable;
+                    continue;
+                }
                 Err(error) if relay_desynchronized(&error) => {
                     self.repair_projection()
                         .await
@@ -2453,12 +2478,9 @@ impl StandaloneSession {
                     let mut credential_sync_signal = None;
                     apply_projection_page(&session_id, |committed| {
                         for event in &events {
-                            let mutation = project_relay_event_indexed(
-                                &projection,
-                                &projection_index,
-                                event,
-                            )?
-                            .mutation;
+                            let mutation =
+                                project_relay_event_indexed(&projection, &projection_index, event)?
+                                    .mutation;
                             match committed.apply(
                                 event.ordinal,
                                 &event.previous_digest,
@@ -2475,8 +2497,7 @@ impl StandaloneSession {
                                         event,
                                         mutation,
                                     )?;
-                                    if let Some(reason) =
-                                        relay_event_credential_sync_reason(event)
+                                    if let Some(reason) = relay_event_credential_sync_reason(event)
                                     {
                                         credential_sync_signal = Some(CredentialSyncSignal {
                                             ordinal: event.ordinal,
@@ -2485,10 +2506,9 @@ impl StandaloneSession {
                                     }
                                 }
                                 ProjectionApplyOutcome::AlreadyApplied => {
-                                    return Err(ProjectionIntegrityError(format!(
-                                        "session actor received relay event {} after its projection had already applied it",
-                                        event.ordinal
-                                    ))
+                                    return Err(ProjectionAdvancedError {
+                                        event_ordinal: event.ordinal,
+                                    }
                                     .into());
                                 }
                             }
@@ -4087,6 +4107,9 @@ mod tests {
         ))
         .context("apply projection event");
         assert!(projection_integrity_failure(&integrity));
+
+        let concurrent = anyhow::Error::from(ProjectionAdvancedError { event_ordinal: 7 });
+        assert!(!projection_integrity_failure(&concurrent));
 
         let unreachable = anyhow::anyhow!("connection refused").context("connect relay proxy");
         assert!(!projection_integrity_failure(&unreachable));

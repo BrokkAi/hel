@@ -796,6 +796,7 @@ impl DurableRelay {
         if created_active_segment {
             sync_directory(&journal)?;
         }
+        crate::hel_test_hooks::reach_test_hook("journal_append_before_snapshot_publication")?;
 
         match staged {
             Some(next_snapshot) => self.snapshot = next_snapshot,

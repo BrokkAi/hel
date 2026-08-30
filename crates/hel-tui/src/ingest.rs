@@ -600,6 +600,12 @@ impl DashboardState {
         self.clamp_selections();
     }
 
+    pub fn session_operation_kind(&self, session_id: &str) -> Option<SessionOperationKind> {
+        self.session_operations
+            .get(session_id)
+            .map(|operation| operation.kind)
+    }
+
     fn apply_operation_projection(&mut self) {
         for (session_id, operation) in &self.session_operations {
             if let Some(placeholder) = &operation.placeholder {

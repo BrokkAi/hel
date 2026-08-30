@@ -17,21 +17,47 @@ use proptest::prelude::*;
 use tempfile::TempDir;
 
 use super::{
-    JournalReadMode, RELAY_ACTIVE_SEGMENT, RELAY_JOURNAL_DIR, set_seal_byte_limit_override,
-    visit_relay_journal_file,
+    JournalReadMode, RELAY_ACTIVE_SEGMENT, RELAY_JOURNAL_DIR, sealed_relay_journal_metadata,
+    set_seal_byte_limit_override, visit_relay_journal_file,
 };
-use crate::hel_worker::{DurableRelay, RelayObservation, validate_relay_event_self};
+use crate::hel_worker::test_support::{acknowledge_relay, ready_checkpoint, submit_relay};
+use crate::hel_worker::{
+    DurableRelay, RelayCommand, RelayEvent, RelayObservation, validate_relay_event_self,
+};
 
 const SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
 
 /// An ordinal and its digest — the ground truth for a recovered record.
 type Record = (u64, String);
 
+fn chaos_config(default_cases: u32) -> ProptestConfig {
+    let mut config = ProptestConfig::default();
+    if std::env::var_os("PROPTEST_CASES").is_none() {
+        config.cases = default_cases;
+    }
+    config
+}
+
+struct SealOverride;
+
+impl SealOverride {
+    fn install(limit: u64) -> Self {
+        set_seal_byte_limit_override(Some(limit));
+        Self
+    }
+}
+
+impl Drop for SealOverride {
+    fn drop(&mut self) {
+        set_seal_byte_limit_override(None);
+    }
+}
+
 /// Build a single-segment (active-only) journal of `sizes.len()` v2 records and
 /// return the tempdir plus the truth set in order. Sealing is disabled so every
 /// record lands in `active.jsonl` with a predictable layout.
 fn build_active_journal(sizes: &[usize]) -> (TempDir, Vec<Record>) {
-    set_seal_byte_limit_override(Some(u64::MAX));
+    let _seal = SealOverride::install(u64::MAX);
     let temp = tempfile::tempdir().unwrap();
     let mut truth = Vec::new();
     {
@@ -45,8 +71,51 @@ fn build_active_journal(sizes: &[usize]) -> (TempDir, Vec<Record>) {
             truth.push((ordinal, relay.latest_digest().to_owned()));
         }
     }
-    set_seal_byte_limit_override(None);
     (temp, truth)
+}
+
+fn capture_new_records(relay: &DurableRelay, truth: &mut Vec<Record>) {
+    let (after, digest) = truth
+        .last()
+        .cloned()
+        .unwrap_or((0, crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned()));
+    truth.extend(
+        relay
+            .events_after(after, &digest)
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.ordinal, event.digest)),
+    );
+}
+
+fn append_warning(relay: &mut DurableRelay, truth: &mut Vec<Record>, size: usize) {
+    let ordinal = relay
+        .record_observation(RelayObservation::Warning {
+            message: "m".repeat(size),
+        })
+        .unwrap();
+    truth.push((ordinal, relay.latest_digest().to_owned()));
+}
+
+fn active_events(path: &std::path::Path) -> Vec<(RelayEvent, (usize, usize))> {
+    let bytes = std::fs::read(path).unwrap();
+    line_ranges(&bytes)
+        .into_iter()
+        .filter_map(|range @ (start, len)| {
+            serde_json::from_slice::<RelayEvent>(&bytes[start..start + len - 1])
+                .ok()
+                .map(|event| (event, range))
+        })
+        .collect()
+}
+
+fn journal_files(temp: &TempDir) -> Vec<std::path::PathBuf> {
+    let mut files = std::fs::read_dir(temp.path().join(RELAY_JOURNAL_DIR))
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 fn active_path(temp: &TempDir) -> std::path::PathBuf {
@@ -80,7 +149,7 @@ fn recover(path: &std::path::Path) -> Result<(Vec<Record>, usize), String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 160, ..ProptestConfig::default() })]
+    #![proptest_config(chaos_config(128))]
 
     /// Whatever single fault hits the active segment, the Recover reader returns
     /// exactly the records the fault could not have destroyed, reports the
@@ -214,5 +283,156 @@ proptest! {
             "the corrupt record must not validate as its original: {:?}",
             truth[idx]
         );
+    }
+
+    /// Generated multi-segment histories exercise append, seal, acknowledge,
+    /// checkpoint-prune, reopen, corrupt, truncate, delete, duplicate, and
+    /// recover transitions. A fault may discard only unacknowledged tail data:
+    /// a successful reopen must preserve the exact acknowledged cursor and may
+    /// serve only genuine, strictly ordered records from the reference model.
+    #[test]
+    fn acknowledged_frontier_survives_generated_multisegment_faults(
+        prefix_sizes in prop::collection::vec(8usize..96, 8..24),
+        tail_sizes in prop::collection::vec(8usize..96, 4..16),
+        checkpoint_prune in any::<bool>(),
+        ack_seed in any::<u64>(),
+        fault_kind in 0u8..6,
+    ) {
+        let _seal = SealOverride::install(384);
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let mut truth = Vec::new();
+        for size in prefix_sizes {
+            append_warning(&mut relay, &mut truth, size);
+        }
+
+        let acknowledged = if checkpoint_prune {
+            let ready = ready_checkpoint(&mut relay, "model-checkpoint");
+            capture_new_records(&relay, &mut truth);
+            acknowledge_relay(&mut relay, "model-ack", ready.ordinal);
+            submit_relay(
+                &mut relay,
+                "model-checkpoint-complete",
+                RelayCommand::CompleteCheckpoint {
+                    barrier_command_id: "model-checkpoint".into(),
+                },
+            );
+            capture_new_records(&relay, &mut truth);
+            (ready.ordinal, ready.digest)
+        } else {
+            let index = (ack_seed as usize) % (truth.len() + 1);
+            if index == 0 {
+                (0, crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned())
+            } else {
+                let acknowledged = truth[index - 1].clone();
+                acknowledge_relay(&mut relay, "model-ack", acknowledged.0);
+                acknowledged
+            }
+        };
+
+        for size in tail_sizes {
+            append_warning(&mut relay, &mut truth, size);
+        }
+        prop_assert!(
+            journal_files(&temp)
+                .iter()
+                .filter(|path| path.extension().is_some_and(|extension| extension == "gz"))
+                .count()
+                >= 2,
+            "generated history must cross multiple sealed segments"
+        );
+        drop(relay);
+
+        let active = active_path(&temp);
+        match fault_kind {
+            0 => {
+                // Corrupt the last unacknowledged record without changing the
+                // newline boundary, so recovery either rejects the journal or
+                // drops exactly damaged tail data.
+                let bytes = std::fs::read(&active).unwrap();
+                if let Some((event, (start, len))) = active_events(&active)
+                    .into_iter()
+                    .rev()
+                    .find(|(event, _)| event.ordinal > acknowledged.0)
+                {
+                    let mut faulted = bytes;
+                    let content_end = start + len - 1;
+                    let position = start + (content_end - start).saturating_sub(1) / 2;
+                    faulted[position] ^= 0x40;
+                    std::fs::write(&active, faulted).unwrap();
+                    prop_assert!(event.ordinal > acknowledged.0);
+                }
+            }
+            1 => {
+                // Truncate only the unacknowledged tail record.
+                let bytes = std::fs::read(&active).unwrap();
+                if let Some((_event, (start, len))) = active_events(&active)
+                    .into_iter()
+                    .rev()
+                    .find(|(event, _)| event.ordinal > acknowledged.0)
+                {
+                    std::fs::write(&active, &bytes[..start + (len / 2).max(1)]).unwrap();
+                }
+            }
+            2 => {
+                // Delete an unacknowledged sealed segment. A gap must fail
+                // closed; if another copy covers it, recovery may proceed.
+                if let Some(path) = journal_files(&temp).into_iter().find(|path| {
+                    path.extension().is_some_and(|extension| extension == "gz")
+                        && sealed_relay_journal_metadata(path)
+                            .is_ok_and(|span| span.file_first_ordinal > acknowledged.0)
+                }) {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            3 => {
+                // A duplicated committed line models a stale active copy left
+                // beside a sealed generation.
+                let bytes = std::fs::read(&active).unwrap();
+                if let Some((_, (start, len))) = active_events(&active).last() {
+                    let mut duplicated = bytes.clone();
+                    duplicated.extend_from_slice(&bytes[*start..*start + *len]);
+                    std::fs::write(&active, duplicated).unwrap();
+                }
+            }
+            4 => {
+                // A torn append was never committed and is not a gap.
+                let mut bytes = std::fs::read(&active).unwrap();
+                bytes.extend_from_slice(br#"{"ordinal":999,"partial"#);
+                std::fs::write(&active, bytes).unwrap();
+            }
+            _ => {
+                // A terminated corrupt record is recoverable as one gap and
+                // cannot fabricate a valid event.
+                let mut bytes = std::fs::read(&active).unwrap();
+                bytes.extend_from_slice(br#"{"ordinal":999,"observation":BROKEN}"#);
+                bytes.push(b'\n');
+                std::fs::write(&active, bytes).unwrap();
+            }
+        }
+
+        let reopened = DurableRelay::open(temp.path(), SESSION, "1.0.0");
+        if let Ok(mut reopened) = reopened {
+            prop_assert_eq!(reopened.acknowledged_through(), acknowledged.0);
+            prop_assert_eq!(reopened.acknowledged_digest(), acknowledged.1.as_str());
+            let retained = reopened
+                .events_after(acknowledged.0, &acknowledged.1)
+                .map_err(|error| TestCaseError::fail(format!("serve recovered suffix: {error:#}")))?;
+            let recovered = retained
+                .iter()
+                .map(|event| (event.ordinal, event.digest.clone()))
+                .collect::<Vec<_>>();
+            prop_assert!(
+                recovered.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "recovered records must stay strictly ordered: {recovered:?}"
+            );
+            for record in &recovered {
+                prop_assert!(truth.contains(record), "recovery fabricated {record:?}");
+            }
+            let next = reopened
+                .record_observation(RelayObservation::Warning { message: "after-recovery".into() })
+                .map_err(|error| TestCaseError::fail(format!("append after recovery: {error:#}")))?;
+            prop_assert!(next > acknowledged.0);
+        }
     }
 }

@@ -78,7 +78,11 @@ impl QueuedCommandKind {
 /// The composer form of a configuration change, used both as the queue entry's
 /// display text and as the text peeled back into the composer for editing.
 pub fn config_command_text(key: &str, value: &str) -> String {
-    format!("/{key} {value}")
+    if key == "fast-mode" {
+        "/fast".to_owned()
+    } else {
+        format!("/{key} {value}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1314,6 +1318,13 @@ mod tests {
         CONFIG_VERSION, ContainerTemplate, HarnessProfile, ProjectBundle, ProjectRepository,
         TargetTemplate,
     };
+
+    #[test]
+    fn fast_mode_configuration_uses_its_user_facing_toggle_command() {
+        assert_eq!(config_command_text("fast-mode", "on"), "/fast");
+        assert_eq!(config_command_text("fast-mode", "off"), "/fast");
+        assert_eq!(config_command_text("model", "sol"), "/model sol");
+    }
 
     fn sample_state() -> HelState {
         let session = SessionRecord {

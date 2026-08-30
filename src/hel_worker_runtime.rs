@@ -11,6 +11,10 @@ pub use crate::hel_worker::WORKER_PID_FILE;
 
 pub(crate) const GITHUB_CLI_BIN_ENV: &str = "HEL_GITHUB_CLI_BIN";
 pub(crate) const DISCOVER_LOGIN_PATH_ENV: &str = "HEL_DISCOVER_LOGIN_PATH";
+/// Directory inside the primary worker root that holds everything the reviewer owns.
+pub(crate) const REVIEWER_DIR: &str = "reviewer";
+/// Where the controller stages the chosen profile, inside [`REVIEWER_DIR`].
+pub(crate) const REVIEWER_PROFILE_DIR: &str = "profile";
 
 pub(crate) fn github_cli_login_shell_command(command: &str) -> String {
     format!(

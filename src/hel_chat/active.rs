@@ -694,6 +694,7 @@ pub struct ActiveChat {
     remote_open: bool,
     session_open: bool,
     session_reconnect_in_flight: bool,
+    session_feed_expected: bool,
     /// Preserve the stronger reconnect result when the initial sync, which
     /// independently reacquires the same actor, finishes just afterwards.
     reconnect_notice_pending_sync: bool,
@@ -884,6 +885,7 @@ impl ActiveChat {
             remote_open: true,
             session_open: true,
             session_reconnect_in_flight: false,
+            session_feed_expected: false,
             reconnect_notice_pending_sync: false,
             reviewer_generation,
             resuming_reviewer: None,
@@ -913,6 +915,17 @@ impl ActiveChat {
     /// useful while that asynchronous handoff is in flight.
     pub fn session_feed_open(&self) -> bool {
         self.session_open
+    }
+
+    /// Keeps a visible chat attached when another control surface makes its
+    /// session runnable again. A stopped actor gets one bounded handoff attempt
+    /// on its own; a durable active record means replacement should keep being
+    /// retried until the actor appears or another record retires the session.
+    pub fn set_session_feed_expected(&mut self, expected: bool) {
+        self.session_feed_expected = expected;
+        if expected && !self.session_open {
+            self.begin_session_reconnect();
+        }
     }
 
     /// The composer's current text. The dashboard saves this on detach so
@@ -1180,9 +1193,13 @@ impl ActiveChat {
                     self.begin_session_reconnect();
                 }
             }
-            Err(error) => self
-                .state
-                .set_notice(format!("Could not reconnect to session relay: {error}")),
+            Err(error) => {
+                self.state
+                    .set_notice(format!("Could not reconnect to session relay: {error}"));
+                if self.session_feed_expected {
+                    self.begin_session_reconnect();
+                }
+            }
         }
     }
 
@@ -1254,6 +1271,7 @@ impl ActiveChat {
             }
             ChatAction::RemoveQueuedPrompt { id, text, kind } => {
                 let Some(command_id) = self.command_id("remove-prompt") else {
+                    self.state.fail_queued_prompt_removal(id, text, kind);
                     return ChatEventOutcome::Handled;
                 };
                 self.state.set_notice("Removing queued prompt…");
@@ -2292,6 +2310,9 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
         .flatten()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    if chat.fast_mode_active() {
+        parts.push("Fast".into());
+    }
     if let Some(recovery_phase) = chat.recovery_phase {
         parts.push(
             match recovery_phase {
@@ -2391,8 +2412,8 @@ mod tests {
         assert_eq!(line.style.fg, Some(Color::Yellow));
     }
     use crate::hel_chat::test_support::{
-        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, key, mouse_at_row,
-        mouse_in, queued, snapshot,
+        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, fast_mode_option, key,
+        mouse_at_row, mouse_in, queued, snapshot,
     };
     use crate::hel_elicitation::ElicitationRequest;
     use crate::hel_state::MaterializedExecutionState;
@@ -2789,6 +2810,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_active_runtime_record_rearms_a_chat_after_its_handoff_timed_out() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-resumed", 74);
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            None,
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            "still drafting".into(),
+            Notices::default(),
+        );
+        chat.session_open = false;
+        chat.finish_session_reconnect(Err("session session-resumed is not managed".into()));
+
+        chat.set_session_feed_expected(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                ActiveChat::pump(Some(&mut chat)).await;
+                if chat.session_feed_open() && !chat.session.is_stopped() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the active runtime record restarted the session handoff");
+
+        assert_eq!(chat.draft(), "still drafting");
+        assert_eq!(
+            chat.state.notice().as_deref(),
+            Some("Reconnected to session relay")
+        );
+    }
+
     #[test]
     fn retiring_the_session_feed_keeps_a_closing_phase_in_place() {
         let mut chat = ChatState::new(&snapshot(), &[]);
@@ -2901,6 +2957,19 @@ mod tests {
         // not a re-introduced session title bar).
         assert!(!rendered.contains("HEL /"));
         assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
+    }
+
+    #[test]
+    fn composer_title_shows_fast_only_while_the_confirmed_mode_is_active() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&[fast_mode_option("off")]);
+        assert!(!prompt_title(&chat, 0).contains("Fast"));
+
+        chat.set_config_options(&[fast_mode_option("on")]);
+        assert_eq!(prompt_title(&chat, 0), " Fast · Prompt ");
+
+        chat.set_config_options(&[]);
+        assert!(!prompt_title(&chat, 0).contains("Fast"));
     }
 
     #[test]
