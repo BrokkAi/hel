@@ -5,12 +5,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import os
 import pathlib
 import signal
-import socket
-import struct
 import sys
 import threading
 import time
@@ -95,35 +92,6 @@ def restart_after_daemon_crash(lab: Lab, port: int, ordinal: int) -> object:
     return client
 
 
-def daemon_request(lab: Lab, action: dict[str, object]) -> object:
-    metadata = json.loads((lab.data / "daemon.json").read_text())
-    envelope = {
-        "protocol_version": 3,
-        "request_id": 99,
-        "token": metadata["token"],
-        "action": action,
-    }
-    body = json.dumps(envelope, separators=(",", ":")).encode()
-    host, port_text = str(metadata["address"]).rsplit(":", 1)
-    with socket.create_connection((host, int(port_text)), timeout=5) as stream:
-        stream.sendall(struct.pack(">I", len(body)) + body)
-        header = stream.recv(4)
-        if len(header) != 4:
-            raise ScenarioFailure("daemon closed before its response frame")
-        remaining = struct.unpack(">I", header)[0]
-        chunks = bytearray()
-        while len(chunks) < remaining:
-            chunk = stream.recv(remaining - len(chunks))
-            if not chunk:
-                raise ScenarioFailure("daemon response frame was truncated")
-            chunks.extend(chunk)
-    response = json.loads(chunks)
-    result = response.get("result")
-    if not isinstance(result, dict) or "Ok" not in result:
-        raise ScenarioFailure(f"daemon action failed: {response!r}")
-    return result["Ok"]
-
-
 def one_workspace(lab: Lab) -> dict[str, object]:
     snapshot = lab.snapshot()
     workspaces = snapshot.get("workspaces", [])
@@ -155,8 +123,7 @@ def start_session(lab: Lab, title: str) -> str:
 
 def start_daemon_lifecycle_session(lab: Lab, title: str) -> str:
     workspace = one_workspace(lab)
-    reply = daemon_request(
-        lab,
+    reply = lab.daemon_request(
         {
             "action": "start_create_session",
             "arguments": {
@@ -227,8 +194,7 @@ def run_hook(lab: Lab, hook: str) -> None:
         def rename() -> None:
             try:
                 outcome.append(
-                    daemon_request(
-                        lab,
+                    lab.daemon_request(
                         {
                             "action": "rename_target",
                             "arguments": {"old_id": "localhost", "new_id": "local-renamed"},

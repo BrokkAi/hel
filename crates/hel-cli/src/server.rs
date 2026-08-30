@@ -453,6 +453,8 @@ pub(crate) async fn run_server(
     let resolved = resolve_server_args(args, termination.clone()).await?;
     let bind = resolved.bind;
     let mut controller = Controller::load()?;
+    let mut daemon_revisions = daemon_runtime.revisions();
+    daemon_revisions.borrow_and_update();
     let mut phone_workspaces = workspace_updates.borrow_and_update().clone();
     let mut quotas = std::collections::BTreeMap::new();
     let (quota_profiles_tx, mut quota_updates_rx) = spawn_quota_refresher();
@@ -584,6 +586,21 @@ pub(crate) async fn run_server(
         loop {
             tokio::select! {
                 _ = termination.cancelled() => break,
+                changed = daemon_revisions.changed() => {
+                    if changed.is_err() {
+                        failure = feed_stopped(
+                            termination.is_cancelled(),
+                            "the daemon stopped publishing runtime revisions to the phone server",
+                        );
+                        break;
+                    }
+                    daemon_revisions.borrow_and_update();
+                    request_controller_reload(
+                        &mut controller_reload_in_flight,
+                        &mut controller_reload_requested,
+                        &controller_reload_tx,
+                    );
+                }
                 changed = workspace_updates.changed() => {
                     if changed.is_err() {
                         failure = feed_stopped(

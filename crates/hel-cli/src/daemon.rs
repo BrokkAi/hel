@@ -510,6 +510,10 @@ impl RuntimeState {
         self.workspaces_tx.subscribe()
     }
 
+    pub(crate) fn revisions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision_tx.subscribe()
+    }
+
     fn publish_workspaces(&self, workspaces: Vec<WorkspaceRecord>) {
         self.workspaces_tx.send_replace(workspaces);
     }
@@ -682,6 +686,20 @@ impl RuntimeState {
                         operation(state.clone(), operation_session_id.clone(), cancelled)
                             .await
                             .map_err(|error| format!("{error:#}"));
+                    if let Err(error) = state.reload_controller().await {
+                        let reload_error = format!(
+                            "reload daemon state after lifecycle operation for {operation_session_id}: {error:#}"
+                        );
+                        if result.is_ok() {
+                            result = Err(reload_error);
+                        } else {
+                            tracing::warn!(
+                                session_id = %operation_session_id,
+                                error = reload_error,
+                                "lifecycle failed and its durable state could not be reloaded"
+                            );
+                        }
+                    }
                     if let Err(error) =
                         reach_test_hook("lifecycle_reservation_before_result_publication").await
                     {

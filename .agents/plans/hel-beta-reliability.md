@@ -17,7 +17,7 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 - [x] (2026-08-30 15:29Z) Milestone 1: repaired full-package coverage reporting, established a crate-qualified baseline, and fixed the asynchronous log-writer lifetime exposed by the PTY teardown assertion.
 - [x] (2026-08-30 16:04Z) Milestone 2: added the isolated replayable runtime lab, made daemon state live across web/TUI clients, centralized recovery ownership, and passed the three-client lifecycle scenario twice at seed 1 plus seed 2.
 - [x] (2026-08-30 16:50Z) Milestone 3: added generated multi-segment journal faults, compiled-out named crash hooks, a table-driven six-boundary process matrix, and fixed the relay projection/revision races it reproduced.
-- [ ] Milestone 4: add browser coverage and the local Luna tmux runbook.
+- [x] (2026-08-30 17:20Z) Milestone 4: added pinned real-browser/TUI coverage, PTY resize and stale-browser recovery, and a reproducible local Luna tmux campaign.
 - [ ] Milestone 5: establish pull-request, nightly, and beta acceptance gates and complete an end-to-end demonstration.
 
 ## Surprises & Discoveries
@@ -64,6 +64,15 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 - Observation: fresh fake Codex homes and relative binary paths made existing chaos fixtures depend on ambient machine behavior.
   Evidence: one matrix run spawned real plugin-marketplace clone children, and `session_restart_chaos.sh ./target/.../hel` later failed after changing its child working directory. The deterministic profile now has a private PATH containing only its Python bridge, and the topology runner canonicalizes the Hel binary before launching children.
 
+- Observation: lifecycle state initiated by a TUI could remain stale in the already-running web viewer even after checkpoint and teardown completed durably.
+  Evidence: the browser/TUI scenario stopped a local-bare session in the TUI and SQLite reached `stopped`, while the phone snapshot remained `running` until timeout. Daemon lifecycle completion now reloads its durable controller before publication, and the phone control loop subscribes to daemon runtime revisions and coalesces controller reloads off its event loop.
+
+- Observation: Chromium's offline emulation did not reliably break an already-open EventSource connection, so returning online could leave the page stale indefinitely.
+  Evidence: the first repaired lifecycle replay published the stopped web revision but the browser observed no SSE update for forty seconds. The page now retains its EventSource and explicitly recreates it plus refreshes the snapshot on the browser `online` event.
+
+- Observation: the real web New form correctly requires a project directory for local-bare targets, which the initial browser driver omitted.
+  Evidence: native form validation prevented submission and the locator waited forever for a session that had never been requested. The Playwright scenario now fills the visible required directory and logs only non-secret stage names.
+
 ## Decision Log
 
 - Decision: defer all `cargo-mutants` installation, configuration, and execution from this ExecPlan.
@@ -108,7 +117,9 @@ Milestones 1 through 3 are complete. Coverage now measures `hel-core`, `hel-cli`
 
 The system lab now creates short isolated runtime roots, a disposable Git workspace, a stateful fake ACP bridge with checkpointable Codex artifacts, a local-bare worker, one persistent daemon, two 140x32 PTYs, and an authenticated loopback web client. It asserts exact-once prompt/reply projection, screen convergence, monotonic client convergence revisions, stopped lifecycle state, sub-two-second UI quit, daemon shutdown, SQLite integrity and foreign keys, and zero processes retaining the isolated environment. Failures retain runtime state and print one replay command. Two consecutive seed-1 runs produced the same logical seven-action trace; seed 2 also passed. The lab itself exposed and drove fixes for stale web workspaces, missing cross-client session records, duplicated recovery ownership, and the new-session/managed-actor race. The remaining beta gaps are richer PTY/browser and Luna campaigns plus tiered automation.
 
-The crash layer now adds a 128-case generated multi-segment journal property (more than one thousand append/fault/recovery transitions in the validated run), with `PROPTEST_CASES` available for larger nightly campaigns. Six feature-gated durability hooks cover daemon metadata, journal publication, config migration, lifecycle result publication, relay revision publication, and checkpoint database publication. A consecutive seed-301 matrix passed all six with clean SQLite and no leaked process; the pre-existing topology chaos also passed five durable worker/bridge generations. Deliberately inverting the multi-segment invariant failed immediately and printed seed `424242` plus a minimized input, after which the real assertion was restored and passed. Remaining work is richer PTY/browser and Luna coverage plus tiered automation.
+The crash layer now adds a 128-case generated multi-segment journal property (more than one thousand append/fault/recovery transitions in the validated run), with `PROPTEST_CASES` available for larger nightly campaigns. Six feature-gated durability hooks cover daemon metadata, journal publication, config migration, lifecycle result publication, relay revision publication, and checkpoint database publication. A consecutive seed-301 matrix passed all six with clean SQLite and no leaked process; the pre-existing topology chaos also passed five durable worker/bridge generations. Deliberately inverting the multi-segment invariant failed immediately and printed seed `424242` plus a minimized input, after which the real assertion was restored and passed.
+
+The surface layer pins Playwright 1.62.1 and its Chromium revision under `tests/e2e/web`. Seed 413 passed the real HTTPS viewer with QR-token exchange, code login, mobile rendering, web session creation, conversation open, a browser held offline while the TUI resized and stopped the same session, explicit SSE recovery, browser resume and stop, cookie expiry, logout, bounded terminal quit, clean SQLite, a valid trace archive, and zero leaked processes. The run exposed and drove fixes for stale non-phone lifecycle state and online EventSource recovery. `.agents/docs/luna-reliability-runbook.md` and `prepare-luna-lab.py` provide an isolated fake-harness tmux campaign with eight mission cards and a mandatory evidence schema. Remaining work is tiered CI/nightly automation and recording the operational beta gates.
 
 ## Context and Orientation
 

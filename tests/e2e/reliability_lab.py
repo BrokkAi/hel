@@ -15,6 +15,7 @@ import select
 import shutil
 import signal
 import socket
+import ssl
 import sqlite3
 import struct
 import subprocess
@@ -195,6 +196,15 @@ class PtyClient:
     def send(self, data: bytes) -> None:
         os.write(self.master, data)
 
+    def resize(self, rows: int, columns: int) -> None:
+        import fcntl
+
+        fcntl.ioctl(
+            self.master,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", rows, columns, 0, 0),
+        )
+
     def quit(self) -> float:
         started = time.monotonic()
         self.send(b"\x11")
@@ -332,7 +342,7 @@ class Lab:
             listener.bind(("127.0.0.1", 0))
             return int(listener.getsockname()[1])
 
-    def prepare(self) -> int:
+    def prepare(self, *, phone_tls: bool = False) -> int:
         self.git_output(["init", "--initial-branch=main"], self.project)
         self.git_output(["config", "user.name", "Hel Reliability"], self.project)
         self.git_output(["config", "user.email", "reliability@invalid"], self.project)
@@ -416,12 +426,55 @@ for line in sys.stdin:
         )
         bridge.chmod(0o700)
         port = self.free_port()
+        tls_config = ""
+        if phone_tls:
+            certificate = self.runtime_root / "viewer-cert.pem"
+            private_key = self.runtime_root / "viewer-key.pem"
+            result = subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(private_key),
+                    "-out",
+                    str(certificate),
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=127.0.0.1",
+                    "-addext",
+                    "subjectAltName=IP:127.0.0.1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise ScenarioFailure(f"create browser TLS fixture: {result.stderr.strip()}")
+            private_key.chmod(0o600)
+            tls_context = ssl.create_default_context()
+            tls_context.check_hostname = False
+            tls_context.verify_mode = ssl.CERT_NONE
+            self.http = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(self.cookie_jar),
+                urllib.request.HTTPSHandler(context=tls_context),
+            )
+            tls_config = (
+                f"tls_cert = {json.dumps(str(certificate))}\n"
+                f"tls_key = {json.dumps(str(private_key))}\n"
+            )
         config = f'''version = 1
 
 [phone]
 enabled = true
 bind = "127.0.0.1:{port}"
 tailscale_detect = false
+{tls_config}
 
 [profiles.fake]
 kind = "codex"
@@ -477,16 +530,44 @@ kind = "local-bare"
             result = self.command("daemon", "status", timeout=3, check=False)
             last = result.stdout + result.stderr
             match = re.search(
-                rf"web viewer (http://127\.0\.0\.1:{port}); viewer code ([0-9]{{6}})",
+                rf"web viewer (?:http|https)://127\.0\.0\.1:{port}; viewer code ([0-9]{{6}})",
                 result.stdout,
             )
             if result.returncode == 0 and match:
                 metadata = json.loads((self.data / "daemon.json").read_text())
                 self.daemon_pid = int(metadata["pid"])
                 self.record_process("observed", "daemon", self.daemon_pid)
-                return match.group(2), self.daemon_pid
+                return match.group(1), self.daemon_pid
             time.sleep(0.1)
         raise ScenarioFailure(f"daemon/web viewer did not become ready: {last[-4000:]}")
+
+    def daemon_request(self, action: dict[str, object], request_id: int = 99) -> object:
+        metadata = json.loads((self.data / "daemon.json").read_text())
+        envelope = {
+            "protocol_version": 3,
+            "request_id": request_id,
+            "token": metadata["token"],
+            "action": action,
+        }
+        body = json.dumps(envelope, separators=(",", ":")).encode()
+        host, port_text = str(metadata["address"]).rsplit(":", 1)
+        with socket.create_connection((host, int(port_text)), timeout=5) as stream:
+            stream.sendall(struct.pack(">I", len(body)) + body)
+            header = stream.recv(4)
+            if len(header) != 4:
+                raise ScenarioFailure("daemon closed before its response frame")
+            remaining = struct.unpack(">I", header)[0]
+            chunks = bytearray()
+            while len(chunks) < remaining:
+                chunk = stream.recv(remaining - len(chunks))
+                if not chunk:
+                    raise ScenarioFailure("daemon response frame was truncated")
+                chunks.extend(chunk)
+        response = json.loads(chunks)
+        result = response.get("result")
+        if not isinstance(result, dict) or "Ok" not in result:
+            raise ScenarioFailure(f"daemon action failed: {response!r}")
+        return result["Ok"]
 
     def request(self, method: str, path: str, body: object | None = None) -> tuple[int, object | None]:
         data = None if body is None else json.dumps(body).encode()
