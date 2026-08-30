@@ -27,8 +27,9 @@ use crate::hel_worker::{
     RELAY_PROTOCOL_VERSION, RelayCommand, RelayCursor, RelayErrorCode, RelayEvent,
     RelayOperationalState, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
     RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload, RelayVersionRange,
-    validate_relay_event,
+    ReviewerRequest, validate_relay_event,
 };
+use crate::hel_worker_runtime::ReviewerLaunchConfig;
 
 const RELAY_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const RELAY_SLOW_OPERATION_WARNING: Duration = Duration::from_secs(5);
@@ -80,6 +81,19 @@ pub struct RelayAttachment {
     pub events: Vec<RelayEvent>,
     pub through_ordinal: u64,
     pub through_digest: String,
+}
+
+/// What the reviewer sidecar reports once it is running.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StartedReviewer {
+    /// The reviewer's own native session, distinct from the primary's.
+    pub native_session_id: Option<String>,
+    /// What the reviewer's harness advertises right now, which is what the
+    /// selection waterfall offers the user.
+    pub config_options: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+    /// Whether an already-running reviewer served this request.
+    pub reused: bool,
+    pub state: RelayOperationalState,
 }
 
 /// One bounded page in a catch-up whose upper frontier was fixed before any
@@ -686,6 +700,170 @@ impl RelayClient {
             RelayResponsePayload::Compacted { text } => Ok(text),
             _ => bail!("relay returned an unexpected compaction response"),
         }
+    }
+
+    /// Start the second-opinion reviewer beside this session, or report the
+    /// running one when it already matches `config`.
+    ///
+    /// The reviewer's profile must already be staged on the target. Starting
+    /// can take as long as opening any harness session, so this uses the
+    /// handshake deadline rather than the bookkeeping one.
+    pub async fn start_reviewer(
+        &mut self,
+        config: ReviewerLaunchConfig,
+    ) -> Result<StartedReviewer> {
+        let request = self.reviewer_request(ReviewerRequest::Start {
+            config: Box::new(config),
+        })?;
+        match self
+            .call_with_timeout(request, RELAY_HANDSHAKE_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::ReviewerStarted {
+                native_session_id,
+                config_options,
+                reused,
+                state,
+            } => Ok(StartedReviewer {
+                native_session_id,
+                config_options,
+                reused,
+                state: *state,
+            }),
+            _ => bail!("relay returned an unexpected reviewer start response"),
+        }
+    }
+
+    /// Replay the reviewer's journal from a cursor, exactly as [`Self::attach`]
+    /// does for the primary.
+    pub async fn attach_reviewer(
+        &mut self,
+        after_ordinal: u64,
+        after_digest: impl Into<String>,
+    ) -> Result<RelayAttachment> {
+        let after_digest = after_digest.into();
+        let request = self.reviewer_request(ReviewerRequest::Attach {
+            after_ordinal,
+            after_digest: after_digest.clone(),
+        })?;
+        let payload = self
+            .call_with_timeout(request, RELAY_HISTORY_TIMEOUT)
+            .await?;
+        let RelayResponsePayload::Attached {
+            state,
+            events,
+            through_ordinal,
+            through_digest,
+        } = payload
+        else {
+            bail!("relay returned an unexpected reviewer attach response");
+        };
+        // The reviewer's journal is verified the same way the primary's is: a
+        // sidecar's history is not exempt from the chain check.
+        let mut cursor = RelayCursor {
+            ordinal: after_ordinal,
+            digest: after_digest,
+        };
+        for event in &events {
+            validate_relay_event(cursor.ordinal, &cursor.digest, event)
+                .context("verify reviewer attachment event chain")?;
+            cursor.ordinal = event.ordinal;
+            cursor.digest.clone_from(&event.digest);
+        }
+        if cursor.ordinal != through_ordinal || cursor.digest != through_digest {
+            bail!("reviewer attachment frontier does not match its event chain");
+        }
+        Ok(RelayAttachment {
+            state,
+            events,
+            through_ordinal,
+            through_digest,
+        })
+    }
+
+    /// Advance the reviewer's acknowledged frontier so its journal can be
+    /// pruned once the controller has the events durably.
+    pub async fn acknowledge_reviewer(
+        &mut self,
+        through_ordinal: u64,
+        through_digest: impl Into<String>,
+    ) -> Result<RelayCursor> {
+        let request = self.reviewer_request(ReviewerRequest::Acknowledge {
+            through_ordinal,
+            through_digest: through_digest.into(),
+        })?;
+        match self
+            .call_with_timeout(request, RELAY_ACKNOWLEDGE_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::Acknowledged {
+                through_ordinal,
+                through_digest,
+            } => Ok(RelayCursor {
+                ordinal: through_ordinal,
+                digest: through_digest,
+            }),
+            _ => bail!("relay returned an unexpected reviewer acknowledgement response"),
+        }
+    }
+
+    /// Queue one command on the reviewer's own relay.
+    pub async fn submit_to_reviewer(
+        &mut self,
+        command_id: impl Into<String>,
+        command: RelayCommand,
+    ) -> Result<u64> {
+        let command_id = command_id.into();
+        let request = self.reviewer_request(ReviewerRequest::Submit {
+            command_id: command_id.clone(),
+            command,
+        })?;
+        match self.call(request).await? {
+            RelayResponsePayload::Accepted {
+                command_id: accepted_id,
+                ordinal,
+            } if accepted_id == command_id => Ok(ordinal),
+            RelayResponsePayload::Accepted {
+                command_id: accepted_id,
+                ..
+            } => bail!("reviewer accepted command under ID {accepted_id}, expected {command_id}"),
+            _ => bail!("relay returned an unexpected reviewer command response"),
+        }
+    }
+
+    pub async fn reviewer_status(&mut self) -> Result<RelayOperationalState> {
+        let request = self.reviewer_request(ReviewerRequest::Status)?;
+        match self.call(request).await? {
+            RelayResponsePayload::Status(status) => Ok(status),
+            _ => bail!("relay returned an unexpected reviewer status response"),
+        }
+    }
+
+    /// Cancel any reviewer turn in flight and stop its process group, keeping
+    /// its staged profile, native session and journal for the next review.
+    pub async fn pause_reviewer(&mut self) -> Result<()> {
+        let request = self.reviewer_request(ReviewerRequest::Pause)?;
+        match self
+            .call_with_timeout(request, RELAY_ACKNOWLEDGE_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::ReviewerPaused => Ok(()),
+            _ => bail!("relay returned an unexpected reviewer pause response"),
+        }
+    }
+
+    /// Wraps a reviewer action, refusing it on a worker too old to know what a
+    /// reviewer is rather than sending a method it would reject as unknown.
+    fn reviewer_request(&self, request: ReviewerRequest) -> Result<RelayRequest> {
+        let request = RelayRequest::Reviewer { request };
+        if !request.supported_at(self.protocol_version) {
+            bail!(
+                "a second opinion requires relay protocol {}; this session negotiated {}",
+                request.minimum_protocol(),
+                self.protocol_version
+            );
+        }
+        Ok(request)
     }
 
     /// Answer an ACP form over the live relay connection. User-entered content

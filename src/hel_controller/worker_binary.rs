@@ -865,7 +865,7 @@ const DEEPSEEK_HARNESS_FALLBACK_VERSION: &str = "0.1.1-rc.2";
 
 const DEEPSEEK_ACP_FALLBACK_VERSION: &str = "0.10.0";
 
-fn bridge_launch(
+pub(super) fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
     executable: Option<&Path>,
     policy: crate::hel_config::ExecutionPolicy,
@@ -940,7 +940,10 @@ fn ensure_node_22_script() -> String {
 
 const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel disposable environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories under `/workspace`, including committed work, staged and unstaged changes, and untracked files. Hel then removes the container.\n\nEverything outside `/workspace`, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n";
 
-fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path) -> Result<()> {
+pub(super) fn stage_profile(
+    profile: &crate::hel_config::HarnessProfile,
+    destination: &Path,
+) -> Result<()> {
     let harness = profile.kind;
     let source = profile.home.as_path();
     std::fs::create_dir_all(destination)?;

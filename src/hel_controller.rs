@@ -8,6 +8,7 @@ mod provisioning;
 mod readiness;
 mod recovery_scan;
 mod resume;
+mod reviewer;
 #[cfg(test)]
 mod test_support;
 mod worker_binary;
