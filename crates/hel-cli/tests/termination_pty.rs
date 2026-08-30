@@ -176,6 +176,9 @@ fn spawn_dashboard_pty() -> DashboardPty {
         config_root.join("hel/config.toml"),
         r#"version = 1
 
+[phone]
+enabled = false
+
 [profiles.codex]
 kind = "codex"
 home = "/profiles/codex"

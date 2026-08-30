@@ -37,6 +37,7 @@ pub mod hel_setup;
 pub mod hel_skills;
 pub mod hel_state;
 pub mod hel_subprocess;
+pub mod hel_tailscale;
 pub mod hel_targets;
 pub mod hel_terminal;
 pub mod hel_text_input;

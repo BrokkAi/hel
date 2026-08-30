@@ -1748,6 +1748,7 @@ fn spawn_phone_server(
     state: Arc<RuntimeState>,
     worker: SessionManagerChannels,
 ) {
+    state.set_phone_status("starting");
     tokio::spawn(async move {
         let reporter = {
             let state = state.clone();

@@ -1,6 +1,7 @@
 //! The phone-oriented remote-control server: its HTTP surface, the controller
 //! actions phones request, and the concurrency limits that keep them safe.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -16,6 +17,7 @@ use hel::hel_server::{
 };
 use hel::hel_session_manager::{SessionManagerChannels, SessionManagerControl, new_command_id};
 use hel::hel_state::{HelState, SessionRecord};
+use hel::hel_tailscale::TailscaleTls;
 use hel::hel_targets::{CancellableProcessExecutor, CommandExecutor};
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_client::CredentialSyncCoordinator;
@@ -32,6 +34,7 @@ use crate::pollers::{
 #[derive(Debug, Clone)]
 pub(crate) struct ServerArgs {
     bind: String,
+    tailscale_detect: bool,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
 }
@@ -40,10 +43,157 @@ impl From<&PhoneConfig> for ServerArgs {
     fn from(config: &PhoneConfig) -> Self {
         Self {
             bind: config.bind.clone(),
+            tailscale_detect: config.tailscale_detect,
             tls_cert: config.tls_cert.clone(),
             tls_key: config.tls_key.clone(),
         }
     }
+}
+
+const TAILSCALE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const TAILSCALE_RENEW_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+struct ResolvedServerArgs {
+    bind: SocketAddr,
+    viewer_url: String,
+    tls_files: Option<(PathBuf, PathBuf)>,
+    tailscale: Option<TailscaleTls>,
+    fallback_reason: Option<String>,
+}
+
+async fn resolve_server_args(
+    args: ServerArgs,
+    termination: tokio_util::sync::CancellationToken,
+) -> Result<ResolvedServerArgs> {
+    let configured_bind: SocketAddr = args.bind.parse().context("parse web viewer bind address")?;
+    match (args.tls_cert, args.tls_key) {
+        (Some(cert), Some(key)) => {
+            let scheme = "https";
+            return Ok(ResolvedServerArgs {
+                bind: configured_bind,
+                viewer_url: format!("{scheme}://{configured_bind}"),
+                tls_files: Some((cert, key)),
+                tailscale: None,
+                fallback_reason: None,
+            });
+        }
+        (None, None) => {}
+        _ => bail!("web viewer TLS requires both a certificate and private key"),
+    }
+
+    if !args.tailscale_detect {
+        return Ok(loopback_server_args(
+            configured_bind,
+            Some("automatic Tailscale detection is disabled".into()),
+        ));
+    }
+
+    let tls_root = hel::hel_config::data_dir().join("viewer");
+    let prepared = run_tailscale_blocking(termination.clone(), move |executor| {
+        hel::hel_tailscale::prepare_tailscale_tls(&tls_root, executor)
+    })
+    .await;
+    match prepared {
+        Ok(tailscale) => {
+            let bind = tailscale_bind(configured_bind);
+            let viewer_url = format!(
+                "https://{}:{}",
+                tailscale.cert_domain(),
+                configured_bind.port()
+            );
+            Ok(ResolvedServerArgs {
+                bind,
+                viewer_url,
+                tls_files: Some((
+                    tailscale.cert_path().to_owned(),
+                    tailscale.key_path().to_owned(),
+                )),
+                tailscale: Some(tailscale),
+                fallback_reason: None,
+            })
+        }
+        Err(error) if termination.is_cancelled() => Err(error),
+        Err(error) => {
+            let reason = format!("{error:#}");
+            tracing::debug!(error = reason, "Tailscale HTTPS unavailable for web viewer");
+            Ok(loopback_server_args(configured_bind, Some(reason)))
+        }
+    }
+}
+
+fn tailscale_bind(configured_bind: SocketAddr) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::UNSPECIFIED, configured_bind.port()))
+}
+
+fn loopback_server_args(bind: SocketAddr, fallback_reason: Option<String>) -> ResolvedServerArgs {
+    ResolvedServerArgs {
+        bind,
+        viewer_url: format!("http://{bind}"),
+        tls_files: None,
+        tailscale: None,
+        fallback_reason,
+    }
+}
+
+async fn run_tailscale_blocking<T>(
+    termination: tokio_util::sync::CancellationToken,
+    operation: impl FnOnce(&CancellableProcessExecutor) -> Result<T> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let executor_cancelled = cancelled.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        let executor = CancellableProcessExecutor::new(executor_cancelled)
+            .with_deadline(TAILSCALE_COMMAND_TIMEOUT);
+        operation(&executor)
+    });
+    tokio::select! {
+        result = &mut task => result.context("Tailscale background task panicked")?,
+        _ = termination.cancelled() => {
+            cancelled.store(true, Ordering::Release);
+            let _ = task.await;
+            bail!("Tailscale operation cancelled during web viewer shutdown")
+        }
+    }
+}
+
+fn spawn_tailscale_cert_renewer(
+    tailscale: TailscaleTls,
+    rustls: axum_server::tls_rustls::RustlsConfig,
+    termination: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(TAILSCALE_RENEW_INTERVAL);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = termination.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+            let renewing = tailscale.clone();
+            let result = run_tailscale_blocking(termination.clone(), move |executor| {
+                renewing.renew(executor)
+            })
+            .await;
+            if let Err(error) = result {
+                if !termination.is_cancelled() {
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        "Tailscale certificate renewal failed"
+                    );
+                }
+                continue;
+            }
+            if let Err(error) = rustls
+                .reload_from_pem_file(tailscale.cert_path(), tailscale.key_path())
+                .await
+            {
+                tracing::warn!(%error, "could not activate renewed Tailscale certificate");
+            }
+        }
+    })
 }
 
 const MAX_CONCURRENT_PHONE_ACTIONS: usize = 4;
@@ -287,7 +437,8 @@ pub(crate) async fn run_server(
     worker: SessionManagerChannels,
     daemon_runtime: Arc<RuntimeState>,
 ) -> Result<()> {
-    let bind = args.bind.parse().context("parse --bind socket address")?;
+    let resolved = resolve_server_args(args, termination.clone()).await?;
+    let bind = resolved.bind;
     let mut controller = Controller::load()?;
     let phone_workspaces = tokio::task::spawn_blocking(hel::hel_database::list_workspaces)
         .await
@@ -337,10 +488,6 @@ pub(crate) async fn run_server(
     let mut credential_sync_notices = CredentialSyncNotices::default();
     let mut options =
         ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx, receipt_tx)?;
-    report_status(format!(
-        "starting on {bind}; viewer code {}",
-        options.viewer_code()
-    ));
     options.shutdown = termination.clone();
     // Session cookies are stateless, so a per-process key would sign every
     // phone out on every restart. Delete the key file to sign them out on
@@ -349,17 +496,34 @@ pub(crate) async fn run_server(
     options.set_cookie_key(hel::hel_server::load_or_create_cookie_key(
         &cookie_key_path,
     )?)?;
-    if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
-        options.set_tls_config(
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
-                .await
-                .context("load phone-server TLS certificate")?,
-        );
+    let renewal_cancellation = termination.child_token();
+    let mut renewal_task = None;
+    if let Some((cert, key)) = resolved.tls_files {
+        let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .context("load web viewer TLS certificate")?;
+        options.set_tls_config(rustls.clone());
+        if let Some(tailscale) = resolved.tailscale {
+            renewal_task = Some(spawn_tailscale_cert_renewer(
+                tailscale,
+                rustls,
+                renewal_cancellation.clone(),
+            ));
+        }
     } else if bind.ip().is_loopback() {
         options.secure_cookie = false;
     } else {
-        anyhow::bail!("non-loopback phone server requires --tls-cert and --tls-key");
+        anyhow::bail!("non-loopback web viewer requires TLS");
     }
+    let fallback = resolved
+        .fallback_reason
+        .map(|reason| format!("; local only because Tailscale HTTPS is unavailable: {reason}"))
+        .unwrap_or_default();
+    report_status(format!(
+        "{}; viewer code {}{fallback}",
+        resolved.viewer_url,
+        options.viewer_code()
+    ));
 
     let serve = hel::hel_server::run_server(options);
     let control = async {
@@ -807,6 +971,12 @@ pub(crate) async fn run_server(
         result = serve => result,
         result = control => result,
     };
+    renewal_cancellation.cancel();
+    if let Some(task) = renewal_task
+        && let Err(error) = task.await
+    {
+        tracing::warn!(%error, "Tailscale certificate renewal task failed");
+    }
     worker_shutdown
         .shutdown()
         .await
@@ -1182,6 +1352,65 @@ mod tests {
     use crate::pollers::QUOTA_REFRESH_INTERVAL;
     use hel::hel_config::{CONFIG_VERSION, HarnessKind, HelConfig};
     use hel::hel_state::SessionState;
+
+    #[tokio::test]
+    async fn explicit_tls_takes_precedence_over_tailscale_detection() {
+        let resolved = resolve_server_args(
+            ServerArgs {
+                bind: "0.0.0.0:4443".into(),
+                tailscale_detect: true,
+                tls_cert: Some(PathBuf::from("configured-cert.pem")),
+                tls_key: Some(PathBuf::from("configured-key.pem")),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.bind, "0.0.0.0:4443".parse().unwrap());
+        assert_eq!(resolved.viewer_url, "https://0.0.0.0:4443");
+        assert_eq!(
+            resolved.tls_files,
+            Some((
+                PathBuf::from("configured-cert.pem"),
+                PathBuf::from("configured-key.pem")
+            ))
+        );
+        assert!(resolved.tailscale.is_none());
+        assert!(resolved.fallback_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn disabling_detection_keeps_the_viewer_on_loopback() {
+        let resolved = resolve_server_args(
+            ServerArgs {
+                bind: "127.0.0.1:4765".into(),
+                tailscale_detect: false,
+                tls_cert: None,
+                tls_key: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.bind, "127.0.0.1:4765".parse().unwrap());
+        assert_eq!(resolved.viewer_url, "http://127.0.0.1:4765");
+        assert!(
+            resolved
+                .fallback_reason
+                .unwrap()
+                .contains("detection is disabled")
+        );
+    }
+
+    #[test]
+    fn tailscale_listener_preserves_the_configured_port() {
+        assert_eq!(
+            tailscale_bind("127.0.0.1:4765".parse().unwrap()),
+            "0.0.0.0:4765".parse().unwrap()
+        );
+    }
 
     fn controller_with_profiles(ids: &[&str]) -> Controller {
         Controller {
