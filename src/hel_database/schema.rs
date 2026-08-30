@@ -408,6 +408,23 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 17 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE second_opinion_reviews (
+                 session_id TEXT PRIMARY KEY
+                     REFERENCES sessions(session_id) ON DELETE CASCADE,
+                 workflow TEXT NOT NULL,
+                 generation INTEGER NOT NULL CHECK(generation >= 0),
+                 context_baseline INTEGER NOT NULL CHECK(context_baseline >= 0),
+                 native_lost INTEGER NOT NULL CHECK(native_lost IN (0, 1))
+             ) STRICT;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (17, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 17;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)

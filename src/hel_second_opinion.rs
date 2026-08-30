@@ -65,7 +65,7 @@ pub enum SetupRequest {
 }
 
 /// What confirming the last step produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewerSelection {
     pub profile_id: String,
     /// `None` when the harness advertises no model selector.
@@ -665,7 +665,8 @@ pub enum WorkflowRequest {
 }
 
 /// How far one review has got.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
 pub enum ReviewStage {
     /// The primary was asked to summarize what led to the plan.
     GatheringContext { command_id: String },
@@ -688,10 +689,12 @@ pub enum ReviewStage {
 /// other command is ignored. A reconnect that replays an already-applied
 /// completion therefore cannot send feedback twice or start a second reviewer
 /// turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewWorkflow {
     proposal_id: String,
     proposal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     stage: ReviewStage,
 }

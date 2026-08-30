@@ -275,6 +275,17 @@ impl Controller {
             .expect("destroying session disappeared")
             .clone();
         verify_installed_checkpoint_gate(session_id, verified)?;
+        // The reviewer's native session lives on the target that is about to
+        // go. Recording that now, before the target is torn down, is what
+        // stops a resumed session from trying to reload a conversation that no
+        // longer exists; its transcript is kept for reference either way.
+        if let Err(error) = crate::hel_database::lose_reviewer_continuity(session_id) {
+            tracing::warn!(
+                session_id,
+                error = format!("{error:#}"),
+                "could not record that the second-opinion conversation ends with this target"
+            );
+        }
         // The session's local Git origin ends here. Stopping the broker before
         // the target it bridges into disappears is what keeps a normal close
         // from reading as an unexpected broker death.

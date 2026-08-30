@@ -267,14 +267,7 @@ fn version_fourteen_database_gains_empty_host_container_sizes() {
     let database = directory.path().join("hel.sqlite3");
     save_session_to(&database, &session("session-1", "project-1")).unwrap();
     let connection = open(&database).unwrap();
-    connection
-        .execute_batch(
-            "DROP TABLE host_container_sizes;
-             DROP TABLE second_opinion_defaults;
-             DELETE FROM schema_migrations WHERE version >= 15;
-             PRAGMA user_version = 14;",
-        )
-        .unwrap();
+    rewind_schema_to(&connection, 14);
     drop(connection);
     forget_verified_schema(&database);
 
@@ -520,20 +513,34 @@ fn version_thirteen_restores_checkpointed_lost_sessions_to_recoverable_errors() 
     save_session_to(&database, &without_checkpoint).unwrap();
 
     let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "DROP TABLE host_container_sizes;
-             DROP TABLE second_opinion_defaults;
-             DELETE FROM schema_migrations WHERE version >= 13;
-                 PRAGMA user_version = 12;",
-        )
-        .unwrap();
+    rewind_schema_to(&connection, 12);
     drop(connection);
     forget_verified_schema(&database);
 
     let loaded = load_state_from(&database).unwrap();
     assert_eq!(loaded.sessions["session-1"].state, SessionState::Error);
     assert_eq!(loaded.sessions["session-2"].state, SessionState::Lost);
+}
+
+/// Rewinds a fixture database to `version`, removing what the migrations
+/// after it created. Re-running a migration over its own table fails, so a
+/// rewind has to undo the table as well as the version marker.
+fn rewind_schema_to(connection: &Connection, version: i64) {
+    for table in [
+        "second_opinion_reviews",
+        "second_opinion_defaults",
+        "host_container_sizes",
+    ] {
+        connection
+            .execute_batch(&format!("DROP TABLE IF EXISTS {table};"))
+            .unwrap();
+    }
+    connection
+        .execute_batch(&format!(
+            "DELETE FROM schema_migrations WHERE version > {version};
+             PRAGMA user_version = {version};"
+        ))
+        .unwrap();
 }
 
 #[test]
@@ -600,6 +607,84 @@ fn a_workspace_remembers_the_reviewer_it_last_confirmed() {
     assert_eq!(defaults.model("workspace-1", "codex"), Some("deep"));
     // The other workspace is untouched.
     assert_eq!(defaults.profile("workspace-2"), Some("codex"));
+}
+
+#[test]
+fn an_open_review_survives_a_restart_and_a_finished_one_does_not() {
+    use crate::hel_second_opinion::ReviewWorkflow;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    assert_eq!(active_review_in(&database, "session-1").unwrap(), None);
+
+    let (mut workflow, _) = ReviewWorkflow::start("plan-review-1", "1. Read\n2. Change", "ctx-1");
+    let stored = StoredReview {
+        workflow: workflow.clone(),
+        generation: 0,
+        context_baseline: 7,
+        native_lost: false,
+    };
+    save_active_review_in(&database, "session-1", &stored).unwrap();
+
+    let restored = active_review_in(&database, "session-1").unwrap().unwrap();
+    assert_eq!(restored, stored);
+    assert_eq!(restored.workflow.proposal(), "1. Read\n2. Change");
+    assert!(!restored.workflow.finished());
+
+    // Advancing the review updates the same row rather than adding another.
+    workflow.primary_context_completed("ctx-1", "the user asked for X", "review-1");
+    save_active_review_in(&database, "session-1", &StoredReview { workflow, ..stored }).unwrap();
+    let restored = active_review_in(&database, "session-1").unwrap().unwrap();
+    assert_eq!(restored.workflow.summary(), Some("the user asked for X"));
+
+    clear_active_review_in(&database, "session-1").unwrap();
+    assert_eq!(active_review_in(&database, "session-1").unwrap(), None);
+}
+
+#[test]
+fn losing_the_target_ends_the_reviewer_conversation_and_bumps_its_generation() {
+    use crate::hel_second_opinion::ReviewWorkflow;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+    // Nothing to lose when no review is open.
+    assert_eq!(
+        lose_reviewer_continuity_in(&database, "session-1").unwrap(),
+        0
+    );
+
+    let (workflow, _) = ReviewWorkflow::start("plan-review-1", "the plan", "ctx-1");
+    save_active_review_in(
+        &database,
+        "session-1",
+        &StoredReview {
+            workflow,
+            generation: 3,
+            context_baseline: 0,
+            native_lost: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        lose_reviewer_continuity_in(&database, "session-1").unwrap(),
+        4
+    );
+    let restored = active_review_in(&database, "session-1").unwrap().unwrap();
+    assert!(restored.native_lost);
+    assert_eq!(restored.generation, 4);
+    // The captured plan is kept for reference rather than discarded with the
+    // conversation.
+    assert_eq!(restored.workflow.proposal(), "the plan");
+
+    // Losing it twice must not keep bumping the generation.
+    assert_eq!(
+        lose_reviewer_continuity_in(&database, "session-1").unwrap(),
+        4
+    );
 }
 
 #[test]

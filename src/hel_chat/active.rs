@@ -697,6 +697,10 @@ pub struct ActiveChat {
     /// Preserve the stronger reconnect result when the initial sync, which
     /// independently reacquires the same actor, finishes just afterwards.
     reconnect_notice_pending_sync: bool,
+    /// The reviewer lifetime this session is on. It is bumped only when the
+    /// reviewer's native conversation is lost, never by an ordinary probe, so
+    /// a repeat review reloads the same conversation.
+    reviewer_generation: u64,
 }
 
 impl ActiveChat {
@@ -816,7 +820,42 @@ impl ActiveChat {
         }
         let mut diffstats_in_flight = 0;
         dispatch_diffstat_requests(&mut state, &chat_io_tx, &mut diffstats_in_flight);
-        Self {
+        // A review that was open when the UI stopped is picked back up. The
+        // reviewer's own journal on the target holds its conversation, so the
+        // split is restored by replaying it rather than by keeping a second
+        // copy of the transcript here.
+        let stored =
+            crate::hel_database::active_review(session.session_id()).unwrap_or_else(|error| {
+                tracing::debug!(error = %format!("{error:#}"), "could not read the open review");
+                None
+            });
+        let reviewer_generation = stored.as_ref().map_or(0, |review| review.generation);
+        if let Some(stored) = stored.filter(|stored| !stored.workflow.finished()) {
+            let captured = CapturedProposal {
+                request: crate::hel_acp::normalized_plan_review(
+                    stored.workflow.proposal_id().to_owned(),
+                    &serde_json::json!({ "plan": stored.workflow.proposal() }),
+                ),
+                proposal: stored.workflow.proposal().to_owned(),
+            };
+            state.open_second_opinion(
+                captured,
+                ReviewerSetup::new(
+                    String::new(),
+                    Vec::new(),
+                    crate::hel_second_opinion::ReviewerDefaults::default(),
+                ),
+            );
+            let status = if stored.native_lost {
+                "the reviewer's conversation did not survive; a new review starts fresh"
+            } else {
+                "reloading the review…"
+            };
+            if let Some(view) = state.second_opinion_mut() {
+                view.begin_review(stored.workflow, status, stored.context_baseline);
+            }
+        }
+        let chat = Self {
             state,
             session,
             session_manager: control,
@@ -834,7 +873,12 @@ impl ActiveChat {
             session_open: true,
             session_reconnect_in_flight: false,
             reconnect_notice_pending_sync: false,
+            reviewer_generation,
+        };
+        if chat.state.second_opinion_split() {
+            chat.poll_reviewer_events();
         }
+        chat
     }
 
     pub fn session_id(&self) -> &str {
@@ -951,6 +995,7 @@ impl ActiveChat {
         if let Some(view) = self.state.second_opinion_mut() {
             view.set_status("the reviewer is reading the plan…");
         }
+        self.persist_review();
         self.run_workflow_request(request);
     }
 
@@ -1393,6 +1438,10 @@ impl ActiveChat {
                 effort,
             } => self.confirm_reviewer(profile_id, model, effort),
             SecondOpinionIntent::Workflow(requests) => {
+                // Every workflow batch that reaches here ends the review, so
+                // the record goes before the steps run: a crash between them
+                // must not restore a split whose feedback already went out.
+                self.forget_review();
                 for request in requests {
                     self.run_workflow_request(request);
                 }
@@ -1414,6 +1463,31 @@ impl ActiveChat {
                 self.probe_reviewer(generation, profile_id, Some(model), None, true);
             }
             SetupRequest::CancelProbe { .. } => self.pause_reviewer(),
+        }
+    }
+
+    /// Persists the open review so a UI restart can pick it back up.
+    fn persist_review(&self) {
+        let Some(SecondOpinion::Review(review)) = self.state.second_opinion() else {
+            return;
+        };
+        let stored = crate::hel_database::StoredReview {
+            workflow: review.workflow.clone(),
+            generation: self.reviewer_generation,
+            context_baseline: review.context_baseline,
+            native_lost: false,
+        };
+        if let Err(error) =
+            crate::hel_database::save_active_review(self.session.session_id(), &stored)
+        {
+            tracing::debug!(error = %format!("{error:#}"), "could not record the open review");
+        }
+    }
+
+    /// Forgets a review that has finished, so nothing is restored for it.
+    fn forget_review(&self) {
+        if let Err(error) = crate::hel_database::clear_active_review(self.session.session_id()) {
+            tracing::debug!(error = %format!("{error:#}"), "could not clear the finished review");
         }
     }
 
@@ -1453,9 +1527,13 @@ impl ActiveChat {
         let session_id = self.session.session_id().to_owned();
         let session = self.session.clone();
         let updates = self.chat_io_tx.clone();
+        // The reviewer's lifetime generation is what decides whether the
+        // running reviewer can be kept; `generation` here only says which
+        // probe this answer belongs to.
+        let lifetime = self.reviewer_generation;
         tokio::spawn(async move {
             let staged = tokio::task::spawn_blocking(move || {
-                controller.stage_reviewer_profile(&session_id, &profile_id, generation)
+                controller.stage_reviewer_profile(&session_id, &profile_id, lifetime)
             })
             .await;
             let result = async {
@@ -1535,6 +1613,7 @@ impl ActiveChat {
             },
             &mut self.state,
         );
+        self.persist_review();
         self.run_workflow_request(request);
         self.poll_reviewer_events();
     }
@@ -1695,6 +1774,7 @@ impl ActiveChat {
         {
             view.set_status("Enter to act · Tab to choose");
         }
+        self.persist_review();
         if !finished {
             self.poll_reviewer_events();
         }
