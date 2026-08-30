@@ -1348,6 +1348,21 @@ impl DashboardContext {
         self.drain_import_tasks();
         self.drain_lifecycle_updates();
         self.drain_dashboard_io();
+        self.refresh_open_review();
+    }
+
+    /// Keeps the stop confirmation's warning current.
+    ///
+    /// A review can only be started from inside a chat, so the open chat is
+    /// the authority while there is one. This is an in-memory read: the loop
+    /// never touches the database for it.
+    fn refresh_open_review(&mut self) {
+        let Some(chat) = self.active_chat.as_ref() else {
+            return;
+        };
+        let session_id = chat.session_id().to_owned();
+        let open = chat.has_open_review();
+        self.dashboard.set_session_review_open(&session_id, open);
     }
 
     fn drain_quota_updates(&mut self) {

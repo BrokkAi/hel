@@ -88,6 +88,26 @@ for line in sys.stdin:
         }})
     elif method == "session/prompt":
         prompts += 1
+        if os.path.exists(os.path.join(here, "ask-form")):
+            # Ask the client a question, and answer nothing until it replies.
+            write({"jsonrpc": "2.0", "id": "form-1", "method": "elicitation/create",
+                   "params": {
+                       "sessionId": "reviewer-native",
+                       "mode": "form",
+                       "message": "Which branch should I compare against?",
+                       "requestedSchema": {
+                           "type": "object",
+                           "title": "Reviewer question",
+                           "properties": {},
+                       },
+                   }})
+            for reply in sys.stdin:
+                reply = reply.strip()
+                if not reply:
+                    continue
+                answered = json.loads(reply)
+                if answered.get("id") == "form-1":
+                    break
         text = "".join(
             block.get("text", "")
             for block in request["params"].get("prompt", [])
@@ -506,6 +526,72 @@ async fn a_review_survives_payloads_larger_than_a_pipe_buffer() {
         std::fs::read_to_string(directory.join("prompt-1")).unwrap(),
         plan
     );
+
+    fixture.sidecar.pause().await;
+}
+
+#[tokio::test]
+async fn a_reviewer_form_is_answered_on_the_connection() {
+    let mut fixture = Fixture::new(true);
+    let directory = fixture.script_directory();
+    write_options(&directory, "options.json", &[]);
+    // The harness asks a question mid-turn and only finishes once it is
+    // answered, so an unanswered form would stall this test rather than pass.
+    std::fs::write(directory.join("ask-form"), b"1").unwrap();
+
+    fixture.start(config(0)).await;
+    fixture
+        .request(ReviewerRequest::Submit {
+            command_id: "review-1".into(),
+            command: RelayCommand::Prompt {
+                prompt: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("critique this plan"),
+                )],
+            },
+        })
+        .await;
+
+    // Wait for the reviewer to journal the form it is waiting on.
+    let events = fixture
+        .await_events(Duration::from_secs(30), |events| {
+            events.iter().any(|event| {
+                matches!(
+                    &event.observation,
+                    RelayObservation::ElicitationRequested { .. }
+                )
+            })
+        })
+        .await;
+    let elicitation_id = events
+        .iter()
+        .find_map(|event| match &event.observation {
+            RelayObservation::ElicitationRequested { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("the reviewer journals the form it waits on");
+
+    let body = fixture
+        .request(ReviewerRequest::RespondElicitation {
+            elicitation_id: elicitation_id.clone(),
+            response: crate::hel_elicitation::ElicitationResponse::Decline,
+        })
+        .await;
+    assert!(
+        matches!(
+            &body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::ElicitationResolved { elicitation_id: resolved }
+            } if *resolved == elicitation_id
+        ),
+        "unexpected form answer response: {body:?}"
+    );
+
+    // Answering unblocks the turn, which is the whole point.
+    fixture
+        .await_events(Duration::from_secs(30), |events| {
+            collected_agent_text(events).contains("reviewed")
+        })
+        .await;
 
     fixture.sidecar.pause().await;
 }

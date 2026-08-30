@@ -9,6 +9,8 @@
 //! a reviewer answer arriving would move the reader's place in the primary
 //! transcript, and a drag started in one pane would run into the other.
 
+use std::sync::Arc;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -153,6 +155,17 @@ impl SecondOpinion {
         }
     }
 
+    /// Rebuilds the reviewer's pane from a stored transcript.
+    pub(super) fn restore_reviewer(
+        &mut self,
+        session_id: &str,
+        transcript: Vec<Arc<crate::hel_state::TranscriptItem>>,
+    ) {
+        if let Self::Review(review) = self {
+            review.reviewer.restore(session_id, transcript);
+        }
+    }
+
     /// Replaces the waterfall with the split once a reviewer is running.
     pub(super) fn begin_review(
         &mut self,
@@ -246,6 +259,45 @@ impl ReviewerPane {
                 super::transcript::materialized_chunks_text(chunks)
             })
             .filter(|text| !text.trim().is_empty())
+    }
+
+    /// What the pane has read of the reviewer's conversation, for the copy
+    /// the controller keeps against the target going away.
+    pub(super) fn transcript(&self) -> Vec<Arc<crate::hel_state::TranscriptItem>> {
+        self.session
+            .as_ref()
+            .map(|session| session.transcript.clone())
+            .unwrap_or_default()
+    }
+
+    /// Rebuilds a pane from a stored transcript, for a review restored after
+    /// the reviewer's own journal became unreachable.
+    pub(super) fn restore(
+        &mut self,
+        session_id: &str,
+        transcript: Vec<Arc<crate::hel_state::TranscriptItem>>,
+    ) {
+        if transcript.is_empty() {
+            return;
+        }
+        let mut session = MaterializedSession::empty(session_id);
+        session.applied_event_ordinal = transcript
+            .iter()
+            .map(|item| item.position)
+            .max()
+            .unwrap_or(0);
+        session.transcript = transcript;
+        self.entries = materialized_chat_entries_reusing(&session, 0, Vec::new());
+        self.session = Some(session);
+        self.width = 0;
+        self.follow = true;
+    }
+
+    /// Forms the reviewer's harness is waiting on.
+    pub(super) fn pending_elicitations(&self) -> &[ElicitationRequest] {
+        self.session
+            .as_ref()
+            .map_or(&[], |session| session.pending_elicitations.as_slice())
     }
 
     /// Whether the reviewer has produced anything yet.
@@ -491,6 +543,23 @@ impl super::ChatState {
         format!("second-opinion-{purpose}-{}", self.second_opinion_sequence)
     }
 
+    /// Activates the split action under the pointer, if any.
+    pub(super) fn click_split_action(&mut self, column: u16, row: u16) -> super::ChatAction {
+        let Some(action) = self
+            .split_action_areas
+            .iter()
+            .find(|(_, area)| area.contains(ratatui::layout::Position::new(column, row)))
+            .map(|(action, _)| *action)
+        else {
+            return super::ChatAction::None;
+        };
+        let Some(SecondOpinion::Review(review)) = self.second_opinion.as_mut() else {
+            return super::ChatAction::None;
+        };
+        review.action = action;
+        self.activate_split_action()
+    }
+
     /// Scrolls whichever pane the pointer is over.
     pub(super) fn scroll_second_opinion(&mut self, rows: isize) -> bool {
         let height = self.last_viewport_height.max(1);
@@ -646,15 +715,18 @@ pub(super) fn render_reviewer(
     (inner, top, total)
 }
 
-/// Draws the split's action bar.
+/// Draws the split's action bar and reports where each button landed, so a
+/// click can pick the same action the keyboard would.
 pub(super) fn render_split_actions(
     frame: &mut ratatui::Frame,
     area: Rect,
     workflow: &ReviewWorkflow,
     action: SplitAction,
     status: &str,
-) {
+) -> Vec<(SplitAction, Rect)> {
     let mut spans = Vec::new();
+    let mut buttons = Vec::new();
+    let mut column = area.x;
     for candidate in SplitAction::ORDER {
         let available = match candidate {
             SplitAction::Transfer => workflow.can_transfer(),
@@ -667,7 +739,16 @@ pub(super) fn render_split_actions(
         if candidate == action {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        spans.push(Span::styled(format!(" {} ", candidate.label()), style));
+        let label = format!(" {} ", candidate.label());
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        if column < area.right() {
+            buttons.push((
+                candidate,
+                Rect::new(column, area.y, width.min(area.right() - column), 1),
+            ));
+        }
+        column = column.saturating_add(width).saturating_add(2);
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw("  "));
     }
     let waiting = match workflow.stage() {
@@ -681,6 +762,7 @@ pub(super) fn render_split_actions(
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    buttons
 }
 
 /// Kept beside the pane so the projection helper and the pane agree on which
@@ -957,6 +1039,227 @@ mod tests {
             text.contains("reviewer line 0"),
             "the pane resolves its own rows: {text:?}"
         );
+    }
+
+    /// A live split, drawn once so its panes and buttons have real rects.
+    fn drawn_split() -> (ChatState, ratatui::layout::Rect) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        // Enough primary history to have somewhere to scroll to, so a wheel
+        // that reaches the primary is visible in its anchor.
+        chat.entries.extend((1..=60).map(|index| {
+            ChatEntry::plain(index, ChatRole::Agent, format!("primary line {index}"))
+        }));
+        let captured = captured();
+        let (mut workflow, _) =
+            ReviewWorkflow::start(captured.id(), captured.proposal.clone(), "context-1");
+        workflow.primary_context_completed("context-1", "context", "review-1");
+        workflow.reviewer_turn_completed("review-1", "the plan misses error handling");
+        chat.open_second_opinion(
+            captured,
+            ReviewerSetup::new("workspace-1", profiles(), ReviewerDefaults::default()),
+        );
+        chat.second_opinion_mut()
+            .expect("the view is open")
+            .begin_review(workflow, "ready", 0);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::hel_chat::active::render(frame, &mut chat, false))
+            .unwrap();
+        let reviewer = chat.reviewer_area.expect("the split draws a reviewer pane");
+        (chat, reviewer)
+    }
+
+    #[test]
+    fn the_wheel_scrolls_whichever_pane_it_is_over() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, reviewer) = drawn_split();
+        let primary_before = chat.anchor;
+
+        let wheel = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Over the reviewer: only the reviewer moves.
+        chat.handle_mouse(wheel(
+            MouseEventKind::ScrollUp,
+            reviewer.x + 1,
+            reviewer.y + 1,
+        ));
+        assert_eq!(chat.anchor, primary_before);
+
+        // Outside it: the primary transcript takes the wheel instead.
+        chat.handle_mouse(wheel(MouseEventKind::ScrollUp, 1, reviewer.y + 1));
+        assert_ne!(
+            chat.anchor, primary_before,
+            "a wheel outside the reviewer pane scrolls the primary"
+        );
+
+        let _ = MouseButton::Left;
+    }
+
+    #[test]
+    fn clicking_a_split_button_takes_the_same_action_as_the_keyboard() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _) = drawn_split();
+        let (action, area) = chat
+            .split_action_areas
+            .iter()
+            .find(|(action, _)| *action == SplitAction::Implement)
+            .copied()
+            .expect("the split draws its action buttons");
+        assert_eq!(action, SplitAction::Implement);
+
+        let outcome = chat.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let ChatAction::SecondOpinion(SecondOpinionIntent::Workflow(requests)) = outcome else {
+            panic!("clicking a button acts on it: {outcome:?}");
+        };
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            WorkflowRequest::PromptPrimary { prompt, .. } if prompt.contains("1. Read")
+        )));
+    }
+
+    #[test]
+    fn clicking_beside_the_buttons_does_nothing() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, reviewer) = drawn_split();
+        let outcome = chat.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: reviewer.x + 1,
+            row: reviewer.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(outcome, ChatAction::None);
+        assert!(chat.second_opinion_split(), "the split stays up");
+    }
+
+    /// A reviewer's form must be answered, or the review stalls waiting on a
+    /// harness nobody is talking to. It is shown in the ordinary dialog and
+    /// its answer is routed back to the reviewer, never to the planner.
+    #[test]
+    fn a_reviewer_form_is_answered_back_to_the_reviewer() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let form = crate::hel_elicitation::ElicitationRequest {
+            id: "reviewer-form-1".into(),
+            message: "Allow reading /etc?".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+        };
+        assert!(chat.show_reviewer_elicitation(form));
+        assert!(chat.reviewer_elicitation_open());
+
+        // The primary's own projection must not take a reviewer's form down.
+        chat.sync_elicitation(&[]);
+        assert!(chat.reviewer_elicitation_open());
+
+        let action = press(&mut chat, KeyCode::Esc);
+        let ChatAction::RespondReviewerElicitation { elicitation_id, .. } = action else {
+            panic!("a reviewer's answer goes to the reviewer: {action:?}");
+        };
+        assert_eq!(elicitation_id, "reviewer-form-1");
+        assert!(!chat.reviewer_elicitation_open());
+    }
+
+    #[test]
+    fn the_primary_form_keeps_the_screen_over_a_reviewer_one() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.restore_elicitation(plan_review());
+        let reviewer_form = crate::hel_elicitation::ElicitationRequest {
+            id: "reviewer-form-1".into(),
+            message: "Allow reading /etc?".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+        };
+        // An answer the planning harness is blocked on matters more than one
+        // its reviewer is.
+        assert!(!chat.show_reviewer_elicitation(reviewer_form));
+        assert!(!chat.reviewer_elicitation_open());
+    }
+
+    /// The prompts a review generates are Hel's, not the user's. Rendering
+    /// them as user messages would put words in their mouth and would make a
+    /// later resume replay them as if they had been typed.
+    #[test]
+    fn generated_review_prompts_never_read_as_the_user() {
+        use crate::hel_second_opinion::{
+            PRIMARY_CONTEXT_REQUEST, implement_original_note, is_control_origin_prompt,
+            review_request, transfer_note,
+        };
+
+        for generated in [
+            PRIMARY_CONTEXT_REQUEST.to_owned(),
+            review_request("context", "the plan"),
+            transfer_note("the review"),
+            implement_original_note("the plan"),
+        ] {
+            assert!(
+                is_control_origin_prompt(&generated),
+                "a generated prompt must be recognizable as Hel's: {generated:?}"
+            );
+        }
+        // Something a person typed is not, even when it mentions one.
+        assert!(!is_control_origin_prompt(
+            "please add a [HARNESS NOTE: ...] to the docs"
+        ));
+        assert!(!is_control_origin_prompt("fix the parser"));
+
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(ChatEntry::plain(
+            1,
+            ChatRole::System,
+            PRIMARY_CONTEXT_REQUEST,
+        ));
+        assert_eq!(chat.entries[0].role, ChatRole::System);
+    }
+
+    /// A review whose target is gone still has to be readable: the reviewer's
+    /// own journal died with it, so the pane is rebuilt from the copy the
+    /// controller kept.
+    #[test]
+    fn a_reviewer_pane_rebuilds_from_a_stored_transcript() {
+        let item = std::sync::Arc::new(crate::hel_state::TranscriptItem {
+            stable_id: "agent:1".into(),
+            position: 1,
+            latest_content_event_ordinal: Some(1),
+            created_at_ms: 0,
+            last_changed_at_ms: 0,
+            body: crate::hel_state::TranscriptBody::Agent {
+                chunks: vec![serde_json::json!({
+                    "content": {"type": "text", "text": "the plan misses error handling"}
+                })],
+                streaming: false,
+            },
+        });
+
+        let mut pane = ReviewerPane::default();
+        assert!(pane.is_empty());
+        pane.restore("session-1-reviewer", vec![item]);
+
+        assert!(!pane.is_empty());
+        assert_eq!(
+            pane.latest_answer().as_deref(),
+            Some("the plan misses error handling"),
+            "a restored review can still be read, and transferred from"
+        );
+        // Restoring nothing leaves the pane alone rather than clearing it.
+        pane.restore("session-1-reviewer", Vec::new());
+        assert!(!pane.is_empty());
     }
 
     #[test]

@@ -371,19 +371,7 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
     entry.start_seq == item.position
         && entry.recorded_at_ms == Some(item.created_at_ms)
         && entry.revision == u64::try_from(item.last_changed_at_ms).unwrap_or_default()
-        && matches!(
-            (&entry.role, &item.body),
-            (ChatRole::User, TranscriptBody::User { .. })
-                | (ChatRole::Agent, TranscriptBody::Agent { .. })
-                | (ChatRole::Thought, TranscriptBody::Thought { .. })
-                | (ChatRole::Tool, TranscriptBody::Tool { .. })
-                | (ChatRole::Plan, TranscriptBody::Plan { .. })
-                | (ChatRole::PlanProposal, TranscriptBody::PlanProposal { .. })
-                | (
-                    ChatRole::System,
-                    TranscriptBody::System { .. } | TranscriptBody::TerminalOutput { .. }
-                )
-        )
+        && entry.role == entry_role(item)
         && match &item.body {
             TranscriptBody::Agent { .. } | TranscriptBody::Thought { .. } => {
                 entry.message_id.as_deref() == Some(item.stable_id.as_str())
@@ -393,6 +381,33 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
             }
             _ => true,
         }
+}
+
+/// The role one transcript item renders under.
+///
+/// The matcher and the builder both read it, so an entry is reused only when
+/// it would be rebuilt the same way.
+fn entry_role(item: &TranscriptItem) -> ChatRole {
+    match &item.body {
+        // A prompt Hel generated for a review is a control-origin record.
+        // Rendering it as the user's would put words in their mouth, so it
+        // reads as Hel's own line instead.
+        TranscriptBody::User { content } => {
+            if crate::hel_second_opinion::is_control_origin_prompt(&materialized_content_text(
+                content,
+            )) {
+                ChatRole::System
+            } else {
+                ChatRole::User
+            }
+        }
+        TranscriptBody::Agent { .. } => ChatRole::Agent,
+        TranscriptBody::Thought { .. } => ChatRole::Thought,
+        TranscriptBody::Tool { .. } => ChatRole::Tool,
+        TranscriptBody::Plan { .. } => ChatRole::Plan,
+        TranscriptBody::PlanProposal { .. } => ChatRole::PlanProposal,
+        TranscriptBody::System { .. } | TranscriptBody::TerminalOutput { .. } => ChatRole::System,
+    }
 }
 
 fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEntry {
@@ -435,7 +450,7 @@ fn materialized_chat_entry_with_diffstats(
     let mut entry = match &item.body {
         TranscriptBody::User { content } => ChatEntry::plain(
             item.position,
-            ChatRole::User,
+            entry_role(item),
             materialized_content_text(content),
         ),
         TranscriptBody::Agent { chunks, .. } => ChatEntry::plain(

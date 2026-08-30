@@ -347,6 +347,12 @@ pub enum ReviewerAction {
         through_digest: String,
     },
     Status,
+    /// Answer a form the reviewer's harness is waiting on. A reviewer left
+    /// waiting on one stalls the whole review.
+    RespondElicitation {
+        elicitation_id: String,
+        response: ElicitationResponse,
+    },
     Pause,
 }
 
@@ -358,6 +364,7 @@ impl ReviewerAction {
             Self::Attach { .. } => "reviewer_attach",
             Self::Acknowledge { .. } => "reviewer_acknowledge",
             Self::Status => "reviewer_status",
+            Self::RespondElicitation { .. } => "reviewer_respond_elicitation",
             Self::Pause => "reviewer_pause",
         }
     }
@@ -372,6 +379,7 @@ pub enum ReviewerOutcome {
     Attached(Box<RelayAttachment>),
     Acknowledged(RelayCursor),
     Status(Box<RelayOperationalState>),
+    ElicitationResolved,
     Paused,
 }
 
@@ -2081,6 +2089,13 @@ async fn drive_reviewer(
         ),
         ReviewerAction::Status => {
             ReviewerOutcome::Status(Box::new(client.reviewer_status().await?))
+        }
+        ReviewerAction::RespondElicitation {
+            elicitation_id,
+            response,
+        } => {
+            client.respond_to_reviewer(elicitation_id, response).await?;
+            ReviewerOutcome::ElicitationResolved
         }
         ReviewerAction::Pause => {
             client.pause_reviewer().await?;

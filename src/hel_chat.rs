@@ -138,6 +138,12 @@ pub enum ChatAction {
     },
     /// Work the second-opinion view asked the session to perform.
     SecondOpinion(SecondOpinionIntent),
+    /// An answer to a form the reviewer's harness is waiting on. It is routed
+    /// to the reviewer, never to the primary.
+    RespondReviewerElicitation {
+        elicitation_id: String,
+        response: ElicitationResponse,
+    },
     PasteFromClipboard,
     ToggleVoice,
     SwitchSession {
@@ -316,8 +322,14 @@ pub struct ChatState {
     /// Where the reviewer pane sat on the last frame, so hover can decide
     /// which transcript the wheel drives.
     reviewer_area: Option<Rect>,
+    /// Where the split's action buttons sat on the last frame, so a click
+    /// picks the same action the keyboard would.
+    split_action_areas: Vec<(second_opinion::SplitAction, Rect)>,
     /// Distinguishes the command ids the review's own steps submit.
     second_opinion_sequence: u64,
+    /// Whether the dialog on screen belongs to the reviewer rather than the
+    /// primary, so its answer is routed to the harness that asked.
+    elicitation_is_reviewers: bool,
     recovery_phase: Option<RecoveryCheckpointPhase>,
     goal_prompt_active: bool,
     acp_surface: AcpSessionSurface,
@@ -400,7 +412,9 @@ impl ChatState {
             elicitation: None,
             second_opinion: None,
             reviewer_area: None,
+            split_action_areas: Vec::new(),
             second_opinion_sequence: 0,
+            elicitation_is_reviewers: false,
             recovery_phase: None,
             goal_prompt_active: snapshot
                 .active_prompt
@@ -636,6 +650,11 @@ impl ChatState {
     }
 
     fn sync_elicitation(&mut self, pending: &[ElicitationRequest]) {
+        // A reviewer's form is not in the primary's pending list, so the
+        // primary's projection must not take it down.
+        if self.elicitation_is_reviewers {
+            return;
+        }
         if self
             .elicitation
             .as_ref()
@@ -644,6 +663,24 @@ impl ChatState {
             return;
         }
         self.elicitation = pending.first().cloned().map(ElicitationDialog::new);
+    }
+
+    /// Puts a form the reviewer is waiting on in front of the user.
+    ///
+    /// The primary's own dialog wins the screen: an answer the planning
+    /// harness is blocked on matters more than one its reviewer is.
+    pub(super) fn show_reviewer_elicitation(&mut self, request: ElicitationRequest) -> bool {
+        if self.elicitation.is_some() {
+            return false;
+        }
+        self.elicitation_is_reviewers = true;
+        self.elicitation = Some(ElicitationDialog::new(request));
+        true
+    }
+
+    /// Whether a reviewer's form is currently on screen.
+    pub(super) fn reviewer_elicitation_open(&self) -> bool {
+        self.elicitation_is_reviewers && self.elicitation.is_some()
     }
 
     fn restore_elicitation(&mut self, request: ElicitationRequest) {
@@ -1381,6 +1418,12 @@ impl ChatState {
             let request = dialog.request().clone();
             if let Some(response) = dialog.handle_key(code, modifiers) {
                 self.elicitation = None;
+                if std::mem::take(&mut self.elicitation_is_reviewers) {
+                    return ChatAction::RespondReviewerElicitation {
+                        elicitation_id: request.id,
+                        response,
+                    };
+                }
                 // A second opinion is Hel's own decision. Sending it to the
                 // harness would consume the plan review before the reviewer
                 // exists, so it never becomes an elicitation response.
@@ -1695,6 +1738,9 @@ impl ChatState {
                 }
                 (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
                 (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+                (MouseEventKind::Down(MouseButton::Left), _) => {
+                    return self.click_split_action(mouse.column, mouse.row);
+                }
                 _ => {}
             }
             return ChatAction::None;

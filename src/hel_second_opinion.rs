@@ -65,7 +65,7 @@ pub enum SetupRequest {
 }
 
 /// What confirming the last step produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewerSelection {
     pub profile_id: String,
     /// `None` when the harness advertises no model selector.
@@ -607,6 +607,20 @@ impl ReviewerDefaults {
     }
 }
 
+/// Opening marker of every prompt Hel generates for a review.
+///
+/// These are control-origin records: Hel wrote them, not the user, and the
+/// transcript says so rather than attributing them to whoever asked for the
+/// review. Generating and recognizing them share this one marker.
+pub const HARNESS_NOTE_MARKER: &str = "[HARNESS NOTE:";
+
+/// Whether this prompt text is one Hel generated rather than one a person
+/// typed.
+#[must_use]
+pub fn is_control_origin_prompt(text: &str) -> bool {
+    text.trim_start().starts_with(HARNESS_NOTE_MARKER)
+}
+
 /// The harness note that asks the primary for the context a reviewer needs.
 ///
 /// The plan itself is already captured, so the primary is asked only for what
@@ -665,7 +679,8 @@ pub enum WorkflowRequest {
 }
 
 /// How far one review has got.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
 pub enum ReviewStage {
     /// The primary was asked to summarize what led to the plan.
     GatheringContext { command_id: String },
@@ -688,10 +703,12 @@ pub enum ReviewStage {
 /// other command is ignored. A reconnect that replays an already-applied
 /// completion therefore cannot send feedback twice or start a second reviewer
 /// turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewWorkflow {
     proposal_id: String,
     proposal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     stage: ReviewStage,
 }

@@ -24,7 +24,7 @@ use crate::hel_workspace::{
     normalize_workspace_name,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 18;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -1958,6 +1958,127 @@ fn remember_reviewer_selection_in(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// A second-opinion review that was still open when the UI last stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredReview {
+    pub workflow: crate::hel_second_opinion::ReviewWorkflow,
+    /// Reviewer lifetime this review belongs to. It is bumped when native
+    /// continuity is lost, so a resumed session starts a new conversation
+    /// rather than pretending to reload one that is gone.
+    pub generation: u64,
+    /// The primary's transcript frontier when the context request went out.
+    pub context_baseline: u64,
+    /// Whether the reviewer's native session is known to be gone.
+    pub native_lost: bool,
+    /// What the controller has read of the reviewer's conversation. The
+    /// reviewer's own journal is the source, but it dies with the target, so
+    /// this copy is what keeps a finished review readable afterwards.
+    pub reviewer_transcript: Vec<std::sync::Arc<crate::hel_state::TranscriptItem>>,
+}
+
+/// The open review for `session_id`, if the session has one.
+pub fn active_review(session_id: &str) -> Result<Option<StoredReview>> {
+    active_review_in(&database_path(), session_id)
+}
+
+fn active_review_in(path: &Path, session_id: &str) -> Result<Option<StoredReview>> {
+    let connection = open(path)?;
+    let row = connection
+        .query_row(
+            "SELECT workflow, generation, context_baseline, native_lost, reviewer_transcript
+             FROM second_opinion_reviews WHERE session_id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((workflow, generation, baseline, native_lost, transcript)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(StoredReview {
+        workflow: serde_json::from_str(&workflow).context("parse the stored review workflow")?,
+        generation: u64::try_from(generation).unwrap_or_default(),
+        context_baseline: u64::try_from(baseline).unwrap_or_default(),
+        native_lost: native_lost != 0,
+        reviewer_transcript: serde_json::from_str(&transcript)
+            .context("parse the stored reviewer transcript")?,
+    }))
+}
+
+/// Records the open review, replacing any earlier one for this session.
+pub fn save_active_review(session_id: &str, review: &StoredReview) -> Result<()> {
+    save_active_review_in(&database_path(), session_id, review)
+}
+
+fn save_active_review_in(path: &Path, session_id: &str, review: &StoredReview) -> Result<()> {
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT INTO second_opinion_reviews(
+             session_id, workflow, generation, context_baseline, native_lost,
+             reviewer_transcript
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+             workflow = excluded.workflow,
+             generation = excluded.generation,
+             context_baseline = excluded.context_baseline,
+             native_lost = excluded.native_lost,
+             reviewer_transcript = excluded.reviewer_transcript",
+        params![
+            session_id,
+            serde_json::to_string(&review.workflow)?,
+            i64::try_from(review.generation).unwrap_or(i64::MAX),
+            i64::try_from(review.context_baseline).unwrap_or(i64::MAX),
+            i64::from(review.native_lost),
+            serde_json::to_string(&review.reviewer_transcript)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Forgets the open review once it has finished.
+pub fn clear_active_review(session_id: &str) -> Result<()> {
+    clear_active_review_in(&database_path(), session_id)
+}
+
+fn clear_active_review_in(path: &Path, session_id: &str) -> Result<()> {
+    let connection = open(path)?;
+    connection.execute(
+        "DELETE FROM second_opinion_reviews WHERE session_id = ?1",
+        [session_id],
+    )?;
+    Ok(())
+}
+
+/// Marks this session's reviewer conversation as no longer continuable, and
+/// reports the generation a future review must start under.
+///
+/// Losing the target takes the reviewer's native session with it. The
+/// materialized transcript is kept for reference, but the next review is a new
+/// conversation, so it runs under a new generation.
+pub fn lose_reviewer_continuity(session_id: &str) -> Result<u64> {
+    lose_reviewer_continuity_in(&database_path(), session_id)
+}
+
+fn lose_reviewer_continuity_in(path: &Path, session_id: &str) -> Result<u64> {
+    let Some(mut review) = active_review_in(path, session_id)? else {
+        return Ok(0);
+    };
+    if review.native_lost {
+        return Ok(review.generation);
+    }
+    review.native_lost = true;
+    review.generation = review.generation.saturating_add(1);
+    save_active_review_in(path, session_id, &review)?;
+    Ok(review.generation)
 }
 
 pub fn replace_mount_history(host: &str, sources: &[PathBuf]) -> Result<()> {

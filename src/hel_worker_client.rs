@@ -839,6 +839,27 @@ impl RelayClient {
         }
     }
 
+    /// Answer a form the reviewer's harness is waiting on.
+    pub async fn respond_to_reviewer(
+        &mut self,
+        elicitation_id: String,
+        response: ElicitationResponse,
+    ) -> Result<()> {
+        let request = self.reviewer_request(ReviewerRequest::RespondElicitation {
+            elicitation_id: elicitation_id.clone(),
+            response,
+        })?;
+        match self.call(request).await? {
+            RelayResponsePayload::ElicitationResolved {
+                elicitation_id: resolved,
+            } if resolved == elicitation_id => Ok(()),
+            RelayResponsePayload::ElicitationResolved {
+                elicitation_id: resolved,
+            } => bail!("reviewer resolved elicitation {resolved:?}, expected {elicitation_id:?}"),
+            _ => bail!("relay returned an unexpected reviewer elicitation response"),
+        }
+    }
+
     /// Cancel any reviewer turn in flight and stop its process group, keeping
     /// its staged profile, native session and journal for the next review.
     pub async fn pause_reviewer(&mut self) -> Result<()> {

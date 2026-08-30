@@ -408,6 +408,38 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 17 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE second_opinion_reviews (
+                 session_id TEXT PRIMARY KEY
+                     REFERENCES sessions(session_id) ON DELETE CASCADE,
+                 workflow TEXT NOT NULL,
+                 generation INTEGER NOT NULL CHECK(generation >= 0),
+                 context_baseline INTEGER NOT NULL CHECK(context_baseline >= 0),
+                 native_lost INTEGER NOT NULL CHECK(native_lost IN (0, 1))
+             ) STRICT;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (17, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 17;
+             COMMIT;",
+        )?;
+    }
+    if version < 18 {
+        // The reviewer's conversation lives in its own journal on the target.
+        // Losing the target takes that journal with it, so the controller
+        // keeps a copy of what it has already read: the conversation stays
+        // readable for reference even though it can no longer be continued.
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE second_opinion_reviews
+                 ADD COLUMN reviewer_transcript TEXT NOT NULL DEFAULT '[]';
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (18, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 18;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
