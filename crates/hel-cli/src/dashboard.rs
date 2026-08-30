@@ -1687,7 +1687,7 @@ impl DashboardContext {
                             self.dashboard.finish_import();
                             self.dashboard.set_notice("Saving imported session…");
                             io::spawn_imported_session_apply(
-                                imported,
+                                *imported,
                                 pending,
                                 self.dashboard_io_tx.clone(),
                                 self.critical_operations.clone(),

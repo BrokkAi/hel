@@ -400,7 +400,7 @@ pub(crate) struct DashboardImportSuccess {
 
 pub(crate) enum DashboardImportTaskResult {
     NeedsBundle(ImportBundlePrompt),
-    Imported(DashboardImportSuccess),
+    Imported(Box<DashboardImportSuccess>),
     Cancelled,
 }
 
@@ -737,13 +737,13 @@ fn import_session_from_profile(
         &control,
     )?;
     report(4, Some(4), "Finalizing imported session…", true);
-    Ok(DashboardImportTaskResult::Imported(
+    Ok(DashboardImportTaskResult::Imported(Box::new(
         DashboardImportSuccess {
             harness: profile.kind.display_name(),
             session_id: imported.session_id,
             controller,
         },
-    ))
+    )))
 }
 
 #[cfg(test)]
