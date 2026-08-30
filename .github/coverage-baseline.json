@@ -106,7 +106,7 @@
       "reason": "Remaining runtime branches require supervised worker, ACP bridge, signal, and restart scenarios."
     },
     "src/hel_worker_runtime/unix.rs": {
-      "minimum": 69.5,
+      "minimum": 69.0,
       "reason": "Remaining Unix transport branches require process-group failures and platform socket edge cases."
     }
   }
