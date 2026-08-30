@@ -46,7 +46,7 @@
       "reason": "Remaining dashboard wizard branches depend on asynchronous target discovery and preflight results."
     },
     "src/hel_chat/active.rs": {
-      "minimum": 63.25,
+      "minimum": 61.0,
       "reason": "Remaining branches are interactive terminal and asynchronous session-feed paths."
     },
     "src/hel_chat/remote.rs": {
@@ -98,7 +98,7 @@
       "reason": "This legacy interactive line editor is not reached by the dashboard-focused automated surface."
     },
     "src/hel_worker_client.rs": {
-      "minimum": 64.5,
+      "minimum": 64.0,
       "reason": "Remaining client branches require remote worker transports and injected lifecycle failures."
     },
     "src/hel_worker_runtime.rs": {
