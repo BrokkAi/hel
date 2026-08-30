@@ -2260,8 +2260,8 @@ mod terminals {
             &mut runtime.agent,
             serde_json::json!({
                 "sessionId": "scripted",
-                "command": "/bin/sh",
-                "args": ["-c", "printf running; sleep 300"],
+                "command": "printf running; exec sleep 300",
+                "args": [],
             }),
         )
         .await;
@@ -2340,8 +2340,8 @@ mod terminals {
             &mut runtime.agent,
             serde_json::json!({
                 "sessionId": "scripted",
-                "command": "/bin/sh",
-                "args": ["-c", "printf running; sleep 300"],
+                "command": "printf running; exec sleep 300",
+                "args": [],
             }),
         )
         .await;
