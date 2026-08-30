@@ -463,6 +463,7 @@ fn render_sessions(
             ));
         }
         let detail = dashboard.session_details.get(id);
+        let unreachable = dashboard.unreachable_sessions.contains(id);
         let target = session_target_label(
             session,
             dashboard.session_operations.get(id),
@@ -489,6 +490,7 @@ fn render_sessions(
                 prefix,
                 session,
                 detail,
+                unreachable,
                 dashboard.session_operations.get(id),
                 now_epoch_seconds,
                 &target,
@@ -547,6 +549,7 @@ fn render_sessions(
                 prefix,
                 &target,
                 detail,
+                unreachable,
                 now_epoch_seconds,
                 usize::from(active_area.width.saturating_sub(4)),
                 permission,
@@ -634,6 +637,7 @@ fn collapsed_session_line(
     prefix: &str,
     target: &str,
     detail: Option<&SessionDetail>,
+    unreachable: bool,
     now_epoch_seconds: u64,
     width: usize,
     permission: Option<Span<'static>>,
@@ -647,7 +651,7 @@ fn collapsed_session_line(
         .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("No messages yet")
         .trim();
-    let style = Style::default().fg(session_band_color(detail));
+    let style = Style::default().fg(session_band_color(detail, unreachable));
     let mut lead_width = prefix.chars().count() + target.chars().count() + 2;
     let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
     if let Some(permission) = permission {
@@ -667,10 +671,12 @@ fn collapsed_session_line(
     Line::from(spans).style(style)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_top_line(
     prefix: &str,
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
+    unreachable: bool,
     operation: Option<&SessionOperationDisplay>,
     now_epoch_seconds: u64,
     target: &str,
@@ -717,7 +723,7 @@ fn session_top_line(
     let summary_tail = summary
         .strip_prefix(target)
         .expect("session summary starts with its target");
-    let style = Style::default().fg(session_band_color(detail));
+    let style = Style::default().fg(session_band_color(detail, unreachable));
     let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
     if let Some(permission) = permission {
         spans.push(Span::styled("  ", style));
@@ -973,9 +979,13 @@ fn session_name(session: &SessionRecord) -> &str {
     session.display_title()
 }
 
-/// Color of an active session's summary band. A session whose detail has not
-/// loaded yet keeps the default.
-fn session_band_color(detail: Option<&SessionDetail>) -> Color {
+/// Color of an active session's summary band. An unreachable target is red so
+/// it stands out; otherwise unread sessions are highlighted and the rest keep
+/// the default. A session whose detail has not loaded yet keeps the default.
+fn session_band_color(detail: Option<&SessionDetail>, unreachable: bool) -> Color {
+    if unreachable {
+        return Color::Red;
+    }
     match detail {
         Some(detail) if detail.has_unread() && detail.current_turn_started_at.is_none() => {
             Color::LightBlue
@@ -2000,29 +2010,33 @@ mod tests {
             current_turn_started_at: Some(1),
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&normal)), Color::Yellow);
+        assert_eq!(session_band_color(Some(&normal), false), Color::Yellow);
 
         let unread = SessionDetail {
             current_turn_started_at: Some(1),
             unread_agent_messages: 1,
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&unread)), Color::LightYellow);
+        assert_eq!(session_band_color(Some(&unread), false), Color::LightYellow);
 
         let unread_idle = SessionDetail {
             unread_agent_messages: 1,
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&unread_idle)), Color::LightBlue);
+        assert_eq!(session_band_color(Some(&unread_idle), false), Color::LightBlue);
 
-        let collapsed = collapsed_session_line("› ", "podman", Some(&unread_idle), 1, 80, None);
+        let collapsed =
+            collapsed_session_line("› ", "podman", Some(&unread_idle), false, 1, 80, None);
         assert_eq!(collapsed.style.fg, Some(Color::LightBlue));
 
         let restarted_idle = SessionDetail {
             unread_session_restarts: 1,
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&restarted_idle)), Color::LightBlue);
+        assert_eq!(
+            session_band_color(Some(&restarted_idle), false),
+            Color::LightBlue
+        );
 
         let restarted_running = SessionDetail {
             current_turn_started_at: Some(1),
@@ -2030,9 +2044,16 @@ mod tests {
             ..SessionDetail::default()
         };
         assert_eq!(
-            session_band_color(Some(&restarted_running)),
+            session_band_color(Some(&restarted_running), false),
             Color::LightYellow
         );
+
+        // An unreachable target is red, overriding every other state.
+        assert_eq!(session_band_color(Some(&unread), true), Color::Red);
+        assert_eq!(session_band_color(None, true), Color::Red);
+        let unreachable_line =
+            collapsed_session_line("› ", "podman", Some(&unread_idle), true, 1, 80, None);
+        assert_eq!(unreachable_line.style.fg, Some(Color::Red));
     }
 
     #[test]

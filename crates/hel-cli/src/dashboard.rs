@@ -1417,6 +1417,12 @@ impl DashboardContext {
                 .and_then(|snapshot| snapshot.operational.last_acp_activity_at_ms);
             self.dashboard
                 .set_last_acp_activity(&session_id, last_acp_activity_at_ms);
+            // A view is published as disconnected only once the relay has
+            // failed past the unreachable threshold, so this reddens the band
+            // exactly when the target is genuinely unreachable and clears it on
+            // recovery.
+            self.dashboard
+                .set_session_connectivity(&session_id, connected);
             match apply_worker_poll_update(
                 &mut self.controller,
                 &mut self.dashboard,
