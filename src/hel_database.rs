@@ -24,7 +24,7 @@ use crate::hel_workspace::{
     normalize_workspace_name,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -1850,6 +1850,70 @@ pub fn remember_mount_sources(host: &str, mounts: &[AdditionalMount]) -> Result<
 
 /// Replace one host's remembered mount sources with exactly this list, so the
 /// dashboard can forget a directory the user no longer wants suggested.
+/// What each workspace last chose for a second opinion.
+///
+/// The selection is remembered so a repeat review does not ask again, and it
+/// is workspace scoped because a reviewer that suits one project rarely suits
+/// the next. Values are validated against what the harness advertises now
+/// before they are used, so a retired profile is harmless here.
+pub fn reviewer_defaults() -> Result<crate::hel_second_opinion::ReviewerDefaults> {
+    reviewer_defaults_in(&database_path())
+}
+
+fn reviewer_defaults_in(path: &Path) -> Result<crate::hel_second_opinion::ReviewerDefaults> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT workspace_id, profile_id, model, effort FROM second_opinion_defaults
+         ORDER BY workspace_id, profile_id, model",
+    )?;
+    let mut defaults = crate::hel_second_opinion::ReviewerDefaults::default();
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let workspace_id: String = row.get(0)?;
+        let profile_id: String = row.get(1)?;
+        let model: String = row.get(2)?;
+        let effort: String = row.get(3)?;
+        defaults.restore(&workspace_id, &profile_id, &model, &effort);
+    }
+    Ok(defaults)
+}
+
+/// Record one confirmed selection.
+pub fn remember_reviewer_selection(
+    workspace_id: &str,
+    selection: &crate::hel_second_opinion::ReviewerSelection,
+) -> Result<()> {
+    remember_reviewer_selection_in(&database_path(), workspace_id, selection)
+}
+
+fn remember_reviewer_selection_in(
+    path: &Path,
+    workspace_id: &str,
+    selection: &crate::hel_second_opinion::ReviewerSelection,
+) -> Result<()> {
+    ensure!(
+        !workspace_id.trim().is_empty(),
+        "second-opinion defaults need a workspace"
+    );
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (profile_id, model, effort) = selection.stored_values();
+    // One profile is the workspace's reviewer at a time, so the rows for the
+    // others stop being the remembered choice rather than accumulating.
+    tx.execute(
+        "DELETE FROM second_opinion_defaults WHERE workspace_id = ?1 AND profile_id <> ?2",
+        params![workspace_id, profile_id],
+    )?;
+    tx.execute(
+        "INSERT INTO second_opinion_defaults(workspace_id, profile_id, model, effort)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(workspace_id, profile_id, model) DO UPDATE SET effort = excluded.effort",
+        params![workspace_id, profile_id, model, effort],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn replace_mount_history(host: &str, sources: &[PathBuf]) -> Result<()> {
     replace_mount_history_in(&database_path(), host, sources)
 }

@@ -85,6 +85,48 @@ pub fn plan_review_proposal(request: &ElicitationRequest) -> Option<&str> {
     request.message.strip_prefix(PLAN_REVIEW_MESSAGE_PREFIX)
 }
 
+/// The plan decision Hel answers itself instead of forwarding to the harness.
+/// Every other decision maps to a native option through the dialect bridge.
+pub const PLAN_REVIEW_SECOND_OPINION: &str = "second_opinion";
+
+/// The proposal to review when this answer asked for a second opinion.
+///
+/// A second opinion is local: the harness's decision stays pending while Hel
+/// sets the reviewer up, so this answer must never reach ACP. Callers use the
+/// returned proposal as the captured text they hand to the reviewer.
+#[must_use]
+pub fn plan_review_second_opinion<'a>(
+    request: &'a ElicitationRequest,
+    response: &ElicitationResponse,
+) -> Option<&'a str> {
+    let proposal = plan_review_proposal(request)?;
+    let ElicitationResponse::Accept { content } = response else {
+        return None;
+    };
+    match content.get(PLAN_REVIEW_ACTION) {
+        Some(ElicitationValue::String(action)) if action == PLAN_REVIEW_SECOND_OPINION => {
+            Some(proposal)
+        }
+        _ => None,
+    }
+}
+
+/// The answer Hel gives the harness once a second opinion has been set up.
+///
+/// Gathering context needs an idle planning session, so the pending decision
+/// has to be resolved first. Declining keeps plan mode active, which is why
+/// the captured proposal is the only copy of the plan that survives and why
+/// cancelling a review owes the user a Hel-owned decision in its place.
+#[must_use]
+pub fn plan_review_keep_planning() -> ElicitationResponse {
+    ElicitationResponse::Accept {
+        content: std::collections::BTreeMap::from([(
+            PLAN_REVIEW_ACTION.to_owned(),
+            ElicitationValue::String("keep_planning".to_owned()),
+        )]),
+    }
+}
+
 /// Private ACP metadata is provider-local and has no Hel projection. In
 /// particular, Codex can replay terminal-output metadata for old tool calls on
 /// every `session/load`; journaling those invisible deltas grows the relay and
@@ -699,6 +741,14 @@ pub(crate) fn normalized_plan_review(id: String, value: &serde_json::Value) -> E
                             preview: None,
                         },
                         ElicitationOption {
+                            value: PLAN_REVIEW_SECOND_OPINION.into(),
+                            title: "Get a second opinion".into(),
+                            description: Some(
+                                "Ask another agent to review this plan before you decide".into(),
+                            ),
+                            preview: None,
+                        },
+                        ElicitationOption {
                             value: "keep_planning".into(),
                             title: "Keep planning".into(),
                             description: Some("Decline this plan without leaving plan mode".into()),
@@ -762,6 +812,9 @@ fn permission_plan_response(
         "implement" => &["implement_plan", "plan_approve", "default", "approve"],
         "revise" => &["plan_revise", "revise"],
         "exit" => &["reject_and_exit", "exit"],
+        // A second opinion is answered locally and never reaches here. If one
+        // ever did, it must not approve the plan, so it declines like every
+        // other non-approval and leaves the session in plan mode.
         _ => &[],
     };
     let selected = request

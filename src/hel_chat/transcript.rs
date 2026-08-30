@@ -2014,6 +2014,18 @@ struct TranscriptViewport {
     top: AnchorRow,
 }
 
+/// One entry's rows, header included, at `width`.
+///
+/// The reviewer pane draws with this so its conversation looks exactly like
+/// the primary's rather than growing a second renderer.
+pub(super) fn render_entry_rows(
+    entry: &ChatEntry,
+    width: usize,
+    mode: TranscriptRenderMode,
+) -> Vec<Line<'static>> {
+    render_transcript_entry(entry, width, mode)
+}
+
 fn render_transcript_entry(
     entry: &ChatEntry,
     width: usize,

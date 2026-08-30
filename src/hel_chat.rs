@@ -14,6 +14,7 @@ mod history;
 mod input;
 mod remote;
 mod rendering;
+mod second_opinion;
 mod transcript;
 
 #[cfg(test)]
@@ -62,6 +63,7 @@ use autocomplete::{
 use elicitation::ElicitationDialog;
 use history::{HistorySearch, HistorySearchRequest};
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
+use second_opinion::{SecondOpinion, SecondOpinionIntent};
 use transcript::{
     TAIL_SEED_ITEMS, ToolDiffstatRequest, TranscriptAnchor, TranscriptRenderCache,
     TranscriptSelectionSpace, content_block_text, materialized_chat_entries_reusing, plan_status,
@@ -71,6 +73,7 @@ use transcript::{
 const MOUSE_SCROLL_ROWS: usize = 3;
 
 pub use active::ActiveChat;
+pub use second_opinion::SecondOpinionIntent as SecondOpinionRequest;
 pub use transcript::{
     BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, format_event_time,
     materialized_chunks_text, materialized_content_text, materialized_tool_diffstats,
@@ -125,6 +128,16 @@ pub enum ChatAction {
         request: ElicitationRequest,
         response: ElicitationResponse,
     },
+    /// The user asked for a second opinion on `request`'s plan. Hel answers
+    /// this decision itself, so the harness's review stays pending until the
+    /// reviewer is set up.
+    StartSecondOpinion {
+        request: ElicitationRequest,
+        /// The proposal text as the harness sent it.
+        proposal: String,
+    },
+    /// Work the second-opinion view asked the session to perform.
+    SecondOpinion(SecondOpinionIntent),
     PasteFromClipboard,
     ToggleVoice,
     SwitchSession {
@@ -293,6 +306,14 @@ pub struct ChatState {
     active_agent_terminals: Vec<ActiveAgentTerminal>,
     claimed_agent_terminals: BTreeMap<String, i64>,
     elicitation: Option<ElicitationDialog>,
+    /// The second-opinion view, when one is open. It owns the frame while it
+    /// is up, so the composer and the elicitation dialog stand down.
+    second_opinion: Option<SecondOpinion>,
+    /// Where the reviewer pane sat on the last frame, so hover can decide
+    /// which transcript the wheel drives.
+    reviewer_area: Option<Rect>,
+    /// Distinguishes the command ids the review's own steps submit.
+    second_opinion_sequence: u64,
     recovery_phase: Option<RecoveryCheckpointPhase>,
     goal_prompt_active: bool,
     acp_surface: AcpSessionSurface,
@@ -372,6 +393,9 @@ impl ChatState {
             active_agent_terminals: Vec::new(),
             claimed_agent_terminals: BTreeMap::new(),
             elicitation: None,
+            second_opinion: None,
+            reviewer_area: None,
+            second_opinion_sequence: 0,
             recovery_phase: None,
             goal_prompt_active: snapshot
                 .active_prompt
@@ -759,6 +783,23 @@ impl ChatState {
 
     fn set_last_acp_activity(&mut self, timestamp_ms: Option<i64>) {
         self.last_acp_activity_at_ms = timestamp_ms.and_then(|value| u64::try_from(value).ok());
+    }
+
+    /// The full text of the newest agent message recorded after `seq`.
+    ///
+    /// A review's context request is answered by the planner's next agent
+    /// message, so this is how the answer to a specific request is picked out
+    /// of the conversation rather than by taking whatever is last.
+    pub(super) fn latest_agent_text_after(&self, seq: u64) -> Option<String> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.role == ChatRole::Agent
+                    && entry.start_seq > seq
+                    && !entry.text.trim().is_empty()
+            })
+            .map(|entry| entry.text.clone())
     }
 
     /// Last line of this session's most recent agent message that has text.
@@ -1273,6 +1314,12 @@ impl ChatState {
             return ChatAction::QuitDetach;
         }
 
+        // The second-opinion view owns the frame while it is up: the composer
+        // and the plan decision behind it are both part of what it is deciding.
+        if self.second_opinion_active() {
+            return self.handle_second_opinion_key(code, modifiers);
+        }
+
         if let Some(dialog) = self.elicitation.as_mut() {
             if code == KeyCode::Char('v')
                 && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -1282,6 +1329,15 @@ impl ChatState {
             let request = dialog.request().clone();
             if let Some(response) = dialog.handle_key(code, modifiers) {
                 self.elicitation = None;
+                // A second opinion is Hel's own decision. Sending it to the
+                // harness would consume the plan review before the reviewer
+                // exists, so it never becomes an elicitation response.
+                if let Some(proposal) =
+                    crate::hel_acp::plan_review_second_opinion(&request, &response)
+                {
+                    let proposal = proposal.to_owned();
+                    return ChatAction::StartSecondOpinion { request, proposal };
+                }
                 return ChatAction::RespondElicitation { request, response };
             }
             return ChatAction::None;
@@ -1571,6 +1627,26 @@ impl ChatState {
     /// scrollback repaints whole TUI frames and is unusably slow on long
     /// sessions.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChatAction {
+        // Hover decides which transcript scrolls while the split is up, so a
+        // reviewer answer never moves the reader's place in the primary.
+        if self.second_opinion_split() {
+            let over_reviewer = self
+                .reviewer_area
+                .is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)));
+            let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(1);
+            match (mouse.kind, over_reviewer) {
+                (MouseEventKind::ScrollUp, true) => {
+                    self.scroll_second_opinion(-rows);
+                }
+                (MouseEventKind::ScrollDown, true) => {
+                    self.scroll_second_opinion(rows);
+                }
+                (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
+                (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+                _ => {}
+            }
+            return ChatAction::None;
+        }
         if let Some(dialog) = self.elicitation.as_mut() {
             dialog.handle_mouse(mouse);
             return ChatAction::None;

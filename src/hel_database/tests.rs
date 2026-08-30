@@ -270,7 +270,8 @@ fn version_fourteen_database_gains_empty_host_container_sizes() {
     connection
         .execute_batch(
             "DROP TABLE host_container_sizes;
-             DELETE FROM schema_migrations WHERE version = 15;
+             DROP TABLE second_opinion_defaults;
+             DELETE FROM schema_migrations WHERE version >= 15;
              PRAGMA user_version = 14;",
         )
         .unwrap();
@@ -280,11 +281,13 @@ fn version_fourteen_database_gains_empty_host_container_sizes() {
     let loaded = load_state_from(&database).unwrap();
     assert!(loaded.container_sizes.is_empty());
     let connection = open(&database).unwrap();
+    // Migrating from 14 runs every later migration, so the database ends at
+    // whatever the current schema is rather than at one fixed step.
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        SCHEMA_VERSION
     );
 }
 
@@ -520,6 +523,7 @@ fn version_thirteen_restores_checkpointed_lost_sessions_to_recoverable_errors() 
     connection
         .execute_batch(
             "DROP TABLE host_container_sizes;
+             DROP TABLE second_opinion_defaults;
              DELETE FROM schema_migrations WHERE version >= 13;
                  PRAGMA user_version = 12;",
         )
@@ -530,6 +534,91 @@ fn version_thirteen_restores_checkpointed_lost_sessions_to_recoverable_errors() 
     let loaded = load_state_from(&database).unwrap();
     assert_eq!(loaded.sessions["session-1"].state, SessionState::Error);
     assert_eq!(loaded.sessions["session-2"].state, SessionState::Lost);
+}
+
+#[test]
+fn a_workspace_remembers_the_reviewer_it_last_confirmed() {
+    use crate::hel_second_opinion::{HARNESS_DEFAULT_VALUE, ReviewerSelection};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+    remember_reviewer_selection_in(
+        &database,
+        "workspace-1",
+        &ReviewerSelection {
+            profile_id: "claude".into(),
+            model: Some("sonnet".into()),
+            effort: Some("high".into()),
+        },
+    )
+    .unwrap();
+    // A harness that advertises no model stores its default under the
+    // sentinel, so the same row is preselected next time.
+    remember_reviewer_selection_in(
+        &database,
+        "workspace-2",
+        &ReviewerSelection {
+            profile_id: "codex".into(),
+            model: None,
+            effort: None,
+        },
+    )
+    .unwrap();
+
+    let defaults = reviewer_defaults_in(&database).unwrap();
+    assert_eq!(defaults.profile("workspace-1"), Some("claude"));
+    assert_eq!(defaults.model("workspace-1", "claude"), Some("sonnet"));
+    assert_eq!(
+        defaults.effort("workspace-1", "claude", "sonnet"),
+        Some("high")
+    );
+    assert_eq!(defaults.profile("workspace-2"), Some("codex"));
+    assert_eq!(
+        defaults.model("workspace-2", "codex"),
+        Some(HARNESS_DEFAULT_VALUE)
+    );
+    // Workspaces do not share a reviewer.
+    assert_eq!(defaults.model("workspace-2", "claude"), None);
+
+    // Confirming a different profile replaces the workspace's choice rather
+    // than leaving two remembered reviewers behind.
+    remember_reviewer_selection_in(
+        &database,
+        "workspace-1",
+        &ReviewerSelection {
+            profile_id: "codex".into(),
+            model: Some("deep".into()),
+            effort: None,
+        },
+    )
+    .unwrap();
+    let defaults = reviewer_defaults_in(&database).unwrap();
+    assert_eq!(defaults.profile("workspace-1"), Some("codex"));
+    assert_eq!(defaults.model("workspace-1", "claude"), None);
+    assert_eq!(defaults.model("workspace-1", "codex"), Some("deep"));
+    // The other workspace is untouched.
+    assert_eq!(defaults.profile("workspace-2"), Some("codex"));
+}
+
+#[test]
+fn a_workspaceless_reviewer_selection_is_refused() {
+    use crate::hel_second_opinion::ReviewerSelection;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let error = remember_reviewer_selection_in(
+        &database,
+        "  ",
+        &ReviewerSelection {
+            profile_id: "codex".into(),
+            model: None,
+            effort: None,
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("workspace"));
 }
 
 #[test]

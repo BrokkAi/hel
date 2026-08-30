@@ -73,6 +73,8 @@ pub(crate) fn plan_response(response: ElicitationResponse) -> serde_json::Value 
             || serde_json::json!({ "outcome": "cancelled" }),
             |feedback| serde_json::json!({ "outcome": "cancelled", "feedback": feedback }),
         ),
+        // Keep planning, and a second opinion if one ever reached here rather
+        // than being answered locally: neither approves the plan.
         _ => serde_json::json!({ "outcome": "cancelled" }),
     }
 }

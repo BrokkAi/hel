@@ -16,7 +16,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_selection::{FrameSurfaces, SelectionRange, SurfaceFrame, SurfaceId};
 use crate::hel_session_manager::{
-    ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
+    ManagedSessionHandle, ManagedSessionView, ReviewerAction, ReviewerOutcome,
+    SessionManagerControl, ViewError, new_command_id,
 };
 use crate::hel_state::{
     MaterializedSession, RecoveryCheckpointPhase, RecoveryContext, TranscriptBody, TranscriptItem,
@@ -34,6 +35,10 @@ use super::remote::{
     queue_chat_remote_operation, restore_unsent_input,
 };
 use super::rendering::{display_width, truncate_line_to_width, truncate_to_width};
+use super::second_opinion::{
+    CapturedProposal, SecondOpinion, SecondOpinionIntent, render_reviewer, render_setup,
+    render_split_actions, reviewer_session_id,
+};
 use super::transcript::{
     ToolDiffstatRequest, TranscriptAnchor, materialized_chunks_text, materialized_prefix_entries,
     render_transcript,
@@ -43,6 +48,11 @@ use super::{
     OtherSessionActivity, OtherSessionIdentity, SessionHeaderIdentity, last_nonempty_line,
     queued_prompt_preview, turn_band_color, turn_started_at_epoch_seconds,
 };
+use crate::hel_second_opinion::{
+    ReviewWorkflow, ReviewerDefaults, ReviewerProfileChoice, ReviewerSelection, ReviewerSetup,
+    SetupRequest, WorkflowRequest,
+};
+use agent_client_protocol::schema::v1::SessionConfigOption;
 
 use crate::clock::epoch_seconds;
 
@@ -74,6 +84,23 @@ enum ChatIoUpdate {
         result: std::result::Result<Vec<String>, String>,
     },
     SessionReconnected(std::result::Result<ManagedSessionHandle, String>),
+    /// A reviewer setup step finished. `generation` is the probe it belongs
+    /// to, so a result the user has already moved past is discarded.
+    ReviewerProbe {
+        generation: u64,
+        result: std::result::Result<Vec<SessionConfigOption>, String>,
+    },
+    /// A reviewer model change finished.
+    ReviewerConfigured {
+        generation: u64,
+        result: std::result::Result<Vec<SessionConfigOption>, String>,
+    },
+    /// The chosen reviewer is running and the review can begin.
+    ReviewerStarted(std::result::Result<(), String>),
+    /// A page of the reviewer's own relay events.
+    ReviewerEvents {
+        result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
+    },
 }
 
 /// How many times a refused prefix is rebuilt before the view settles for its
@@ -367,6 +394,12 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
             revision,
             result,
         } => chat.apply_diffstats(&tool_call_id, revision, result),
+        // Reviewer updates are handled where the session handle is, because
+        // acting on one starts more reviewer work.
+        ChatIoUpdate::ReviewerProbe { .. }
+        | ChatIoUpdate::ReviewerConfigured { .. }
+        | ChatIoUpdate::ReviewerStarted(_)
+        | ChatIoUpdate::ReviewerEvents { .. } => {}
         ChatIoUpdate::SessionReconnected(_) => {
             unreachable!("session reconnects are applied by ActiveChat")
         }
@@ -878,6 +911,47 @@ impl ActiveChat {
             let view = self.session.changed().await;
             self.apply_session_view(view);
         }
+        self.advance_review();
+    }
+
+    /// Moves a review on when the planner has answered the context request.
+    ///
+    /// The answer is the planner's next agent message after the request went
+    /// out, so a message already in the transcript can never be mistaken for
+    /// it, and a reconnect that replays the same completion starts no second
+    /// reviewer turn.
+    fn advance_review(&mut self) {
+        let Some(SecondOpinion::Review(review)) = self.state.second_opinion() else {
+            return;
+        };
+        let context_baseline = review.context_baseline;
+        let crate::hel_second_opinion::ReviewStage::GatheringContext { command_id } =
+            review.workflow.stage()
+        else {
+            return;
+        };
+        if self.state.phase != WorkerPhase::Idle {
+            return;
+        }
+        let command_id = command_id.clone();
+        let Some(summary) = self.state.latest_agent_text_after(context_baseline) else {
+            return;
+        };
+        let reviewer_command_id = self.state.next_second_opinion_command_id("review");
+        let Some(SecondOpinion::Review(review)) = self.state.second_opinion_mut() else {
+            return;
+        };
+        let Some(request) =
+            review
+                .workflow
+                .primary_context_completed(&command_id, summary, reviewer_command_id)
+        else {
+            return;
+        };
+        if let Some(view) = self.state.second_opinion_mut() {
+            view.set_status("the reviewer is reading the plan…");
+        }
+        self.run_workflow_request(request);
     }
 
     /// Reports a background worker that stopped on its own. Cheap enough to
@@ -899,6 +973,26 @@ impl ActiveChat {
         let update = match update {
             ChatIoUpdate::SessionReconnected(result) => {
                 self.finish_session_reconnect(result);
+                return;
+            }
+            ChatIoUpdate::ReviewerProbe { generation, result } => {
+                self.apply_reviewer_options(generation, result, false);
+                return;
+            }
+            ChatIoUpdate::ReviewerConfigured { generation, result } => {
+                self.apply_reviewer_options(generation, result, true);
+                return;
+            }
+            ChatIoUpdate::ReviewerStarted(result) => {
+                if let Err(error) = result
+                    && let Some(view) = self.state.second_opinion_mut()
+                {
+                    view.report_failure(error);
+                }
+                return;
+            }
+            ChatIoUpdate::ReviewerEvents { result } => {
+                self.apply_reviewer_events(result);
                 return;
             }
             update => update,
@@ -1165,6 +1259,12 @@ impl ActiveChat {
                     &mut self.state,
                 );
             }
+            ChatAction::StartSecondOpinion { request, proposal } => {
+                self.open_second_opinion(request, proposal);
+            }
+            ChatAction::SecondOpinion(intent) => {
+                self.run_second_opinion(intent);
+            }
             ChatAction::RespondElicitation { request, response } => {
                 let plan_followup = self.state.plan_review_followup(&request, &response);
                 self.state.set_notice("Sending answer…");
@@ -1239,6 +1339,367 @@ impl ActiveChat {
         ChatEventOutcome::Handled
     }
 
+    /// Opens the reviewer waterfall for a captured plan.
+    ///
+    /// The harness's decision stays pending: it is answered only once a
+    /// reviewer is running, because gathering context needs an idle planning
+    /// session and cancelling before then must leave the decision intact.
+    fn open_second_opinion(
+        &mut self,
+        request: crate::hel_elicitation::ElicitationRequest,
+        proposal: String,
+    ) {
+        let Some(recovery) = self.recovery.as_ref() else {
+            self.state
+                .set_notice("A second opinion needs this session's configuration");
+            self.state.restore_elicitation(request);
+            return;
+        };
+        let profiles = recovery
+            .config
+            .profiles
+            .iter()
+            .map(|(id, profile)| ReviewerProfileChoice {
+                id: id.clone(),
+                harness: profile.kind.id().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        if profiles.is_empty() {
+            self.state
+                .set_notice("Configure a second profile to review plans with");
+            self.state.restore_elicitation(request);
+            return;
+        }
+        let defaults = crate::hel_database::reviewer_defaults().unwrap_or_else(|error| {
+            tracing::debug!(%error, "could not read remembered reviewer choices");
+            ReviewerDefaults::default()
+        });
+        let setup = ReviewerSetup::new(recovery.session.workspace_id.clone(), profiles, defaults);
+        self.state
+            .open_second_opinion(CapturedProposal { request, proposal }, setup);
+    }
+
+    /// Performs the steps the second-opinion view asked for.
+    fn run_second_opinion(&mut self, intent: SecondOpinionIntent) {
+        match intent {
+            SecondOpinionIntent::Setup(requests) => {
+                for request in requests {
+                    self.run_setup_request(request);
+                }
+            }
+            SecondOpinionIntent::Confirmed {
+                profile_id,
+                model,
+                effort,
+            } => self.confirm_reviewer(profile_id, model, effort),
+            SecondOpinionIntent::Workflow(requests) => {
+                for request in requests {
+                    self.run_workflow_request(request);
+                }
+            }
+            SecondOpinionIntent::Closed => {}
+        }
+    }
+
+    fn run_setup_request(&mut self, request: SetupRequest) {
+        match request {
+            SetupRequest::Probe {
+                generation,
+                profile_id,
+            } => self.probe_reviewer(generation, profile_id, None, None, false),
+            SetupRequest::ApplyModel { generation, model } => {
+                let Some(profile_id) = self.setup_profile_id() else {
+                    return;
+                };
+                self.probe_reviewer(generation, profile_id, Some(model), None, true);
+            }
+            SetupRequest::CancelProbe { .. } => self.pause_reviewer(),
+        }
+    }
+
+    fn setup_profile_id(&self) -> Option<String> {
+        let SecondOpinion::Setup { setup, .. } = self.state.second_opinion()? else {
+            return None;
+        };
+        setup
+            .profiles()
+            .get(setup.profile_index())
+            .map(|profile| profile.id.clone())
+    }
+
+    /// Stages a profile and starts (or reconfigures) the reviewer under it,
+    /// reporting the options it advertises back to the waterfall.
+    fn probe_reviewer(
+        &mut self,
+        generation: u64,
+        profile_id: String,
+        model: Option<String>,
+        effort: Option<String>,
+        configuring: bool,
+    ) {
+        let Some(recovery) = self.recovery.as_ref() else {
+            return;
+        };
+        let controller = crate::hel_controller::Controller {
+            config: recovery.config.clone(),
+            state: crate::hel_state::HelState {
+                sessions: std::collections::BTreeMap::from([(
+                    recovery.session.id.clone(),
+                    recovery.session.clone(),
+                )]),
+                ..crate::hel_state::HelState::default()
+            },
+        };
+        let session_id = self.session.session_id().to_owned();
+        let session = self.session.clone();
+        let updates = self.chat_io_tx.clone();
+        tokio::spawn(async move {
+            let staged = tokio::task::spawn_blocking(move || {
+                controller.stage_reviewer_profile(&session_id, &profile_id, generation)
+            })
+            .await;
+            let result = async {
+                let mut config = match staged {
+                    Ok(Ok(config)) => config,
+                    Ok(Err(error)) => return Err(format!("{error:#}")),
+                    Err(error) => return Err(format!("staging the reviewer stopped: {error}")),
+                };
+                config.model = model;
+                config.effort = effort;
+                match session
+                    .reviewer(ReviewerAction::Start {
+                        config: Box::new(config),
+                    })
+                    .await
+                {
+                    Ok(ReviewerOutcome::Started(started)) => Ok(started.config_options),
+                    Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            }
+            .await;
+            let update = if configuring {
+                ChatIoUpdate::ReviewerConfigured { generation, result }
+            } else {
+                ChatIoUpdate::ReviewerProbe { generation, result }
+            };
+            if let Err(error) = updates.send(update) {
+                tracing::debug!(%error, "reviewer result dropped because the chat closed");
+            }
+        });
+    }
+
+    /// Confirms the chosen reviewer: remember it, answer the harness's own
+    /// plan decision, and ask the planner for the context the reviewer needs.
+    fn confirm_reviewer(
+        &mut self,
+        profile_id: String,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let Some(view) = self.state.second_opinion() else {
+            return;
+        };
+        let captured = view.captured().clone();
+        if let Some(recovery) = self.recovery.as_ref() {
+            let selection = ReviewerSelection {
+                profile_id,
+                model,
+                effort,
+            };
+            if let Err(error) = crate::hel_database::remember_reviewer_selection(
+                &recovery.session.workspace_id,
+                &selection,
+            ) {
+                tracing::debug!(%error, "could not remember the reviewer choice");
+            }
+        }
+        let command_id = self.state.next_second_opinion_command_id("context");
+        let (workflow, request) =
+            ReviewWorkflow::start(captured.id(), captured.proposal.clone(), command_id.clone());
+        let baseline = self.state.latest_seq();
+        if let Some(view) = self.state.second_opinion_mut() {
+            view.begin_review(workflow, "asking the planner for context…", baseline);
+        }
+        // The harness's decision is answered only now. Declining keeps plan
+        // mode active, which is what lets the planner answer a context
+        // question instead of starting to implement.
+        queue_chat_remote_operation(
+            self.remote.operations(),
+            ChatRemoteOperation::RespondElicitation {
+                request: captured.request.clone(),
+                response: crate::hel_acp::plan_review_keep_planning(),
+                plan_followup: None,
+                session_id: self.session.session_id().to_owned(),
+                bundle_id: self.bundle_id.clone(),
+            },
+            &mut self.state,
+        );
+        self.run_workflow_request(request);
+        self.poll_reviewer_events();
+    }
+
+    fn run_workflow_request(&mut self, request: WorkflowRequest) {
+        match request {
+            WorkflowRequest::PromptPrimary { command_id, prompt } => {
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::Prompt {
+                        command_id,
+                        text: prompt,
+                        session_id: self.session.session_id().to_owned(),
+                        bundle_id: self.bundle_id.clone(),
+                    },
+                    &mut self.state,
+                );
+            }
+            WorkflowRequest::PromptReviewer { command_id, prompt } => {
+                let session = self.session.clone();
+                let updates = self.chat_io_tx.clone();
+                tokio::spawn(async move {
+                    let result = session
+                        .reviewer(ReviewerAction::Submit {
+                            command_id,
+                            command: crate::hel_worker::RelayCommand::Prompt {
+                                prompt: vec![
+                                    agent_client_protocol::schema::v1::ContentBlock::Text(
+                                        agent_client_protocol::schema::v1::TextContent::new(prompt),
+                                    ),
+                                ],
+                            },
+                        })
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| format!("{error:#}"));
+                    if let Err(error) = updates.send(ChatIoUpdate::ReviewerStarted(result)) {
+                        tracing::debug!(%error, "reviewer prompt result dropped");
+                    }
+                });
+            }
+            WorkflowRequest::PauseReviewer => self.pause_reviewer(),
+            WorkflowRequest::RestoreDecision { proposal, .. } => {
+                // Gathering context consumed the harness's own approval, so
+                // only Hel can put this decision back in front of the user.
+                let restored = crate::hel_acp::normalized_plan_review(
+                    self.state.next_second_opinion_command_id("plan-review"),
+                    &serde_json::json!({ "plan": proposal }),
+                );
+                self.state.restore_elicitation(restored);
+            }
+        }
+    }
+
+    fn pause_reviewer(&self) {
+        let session = self.session.clone();
+        tokio::spawn(async move {
+            if let Err(error) = session.reviewer(ReviewerAction::Pause).await {
+                tracing::debug!(error = %format!("{error:#}"), "pausing the reviewer failed");
+            }
+        });
+    }
+
+    /// Reads the reviewer's journal from where the pane left off.
+    fn poll_reviewer_events(&self) {
+        let Some(reviewer) = self
+            .state
+            .second_opinion()
+            .and_then(SecondOpinion::reviewer)
+        else {
+            return;
+        };
+        let after_ordinal = reviewer.cursor_ordinal;
+        let after_digest = if reviewer.cursor_digest.is_empty() {
+            crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned()
+        } else {
+            reviewer.cursor_digest.clone()
+        };
+        let session = self.session.clone();
+        let updates = self.chat_io_tx.clone();
+        tokio::spawn(async move {
+            let result = match session
+                .reviewer(ReviewerAction::Attach {
+                    after_ordinal,
+                    after_digest,
+                })
+                .await
+            {
+                Ok(ReviewerOutcome::Attached(attachment)) => Ok(attachment.events),
+                Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            if let Err(error) = updates.send(ChatIoUpdate::ReviewerEvents { result }) {
+                tracing::debug!(%error, "reviewer events dropped because the chat closed");
+            }
+        });
+    }
+
+    /// Reports what the reviewer advertises back to the waterfall.
+    ///
+    /// A result from a probe the user has moved past is dropped by the state
+    /// machine, which also names the reviewer to stop, so a slow harness can
+    /// never overwrite a newer selection.
+    fn apply_reviewer_options(
+        &mut self,
+        generation: u64,
+        result: std::result::Result<Vec<SessionConfigOption>, String>,
+        configuring: bool,
+    ) {
+        let Some(SecondOpinion::Setup { setup, .. }) = self.state.second_opinion_mut() else {
+            return;
+        };
+        let stale = match result {
+            Ok(options) if configuring => setup.model_applied(generation, &options),
+            Ok(options) => setup.probe_succeeded(generation, &options),
+            Err(error) => {
+                setup.probe_failed(generation, error);
+                None
+            }
+        };
+        if let Some(request) = stale {
+            self.run_setup_request(request);
+        }
+    }
+
+    /// Folds a page of reviewer events into the pane and keeps reading.
+    fn apply_reviewer_events(
+        &mut self,
+        result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
+    ) {
+        let session_id = reviewer_session_id(self.session.session_id());
+        let events = match result {
+            Ok(events) => events,
+            Err(error) => {
+                if let Some(view) = self.state.second_opinion_mut() {
+                    view.report_failure(error);
+                }
+                return;
+            }
+        };
+        let Some(SecondOpinion::Review(review)) = self.state.second_opinion_mut() else {
+            return;
+        };
+        if !events.is_empty() {
+            review.reviewer.apply_events(&session_id, &events);
+            // A completed answer is what unlocks transfer. The workflow
+            // decides whether this is the turn it was waiting for.
+            if let Some(answer) = review.reviewer.latest_answer()
+                && let crate::hel_second_opinion::ReviewStage::Reviewing { command_id } =
+                    review.workflow.stage().clone()
+            {
+                review.workflow.reviewer_turn_completed(&command_id, answer);
+            }
+        }
+        let finished = review.workflow.finished();
+        if let Some(view) = self.state.second_opinion_mut()
+            && view.reviewer().is_some_and(|reviewer| !reviewer.is_empty())
+        {
+            view.set_status("Enter to act · Tab to choose");
+        }
+        if !finished {
+            self.poll_reviewer_events();
+        }
+    }
+
     /// Stops any dictation thread. The thread reports `Finished`, which clears
     /// the view's voice state, so this only asks it to stop.
     fn cancel_dictation(&mut self) {
@@ -1281,6 +1742,13 @@ impl ActiveChat {
         self.state.elicitation_selection_text(range)
     }
 
+    /// The text a selection in the reviewer pane covers. It is resolved
+    /// against that pane's own rows, so a drag there can never pick up the
+    /// primary transcript's text.
+    pub fn reviewer_selection_text(&self, range: &SelectionRange) -> Option<String> {
+        self.state.reviewer_selection_text(range)
+    }
+
     /// Whether the transcript's selection row space stopped describing the
     /// rows on screen since the last call.
     pub fn transcript_selection_invalidated(&mut self) -> bool {
@@ -1299,6 +1767,10 @@ impl ActiveChat {
             SurfaceId::ElicitationMessage => self
                 .state
                 .scroll_elicitation_message(if direction < 0 { -rows } else { rows }),
+            SurfaceId::ReviewerTranscript => {
+                self.state
+                    .scroll_second_opinion(if direction < 0 { -rows } else { rows });
+            }
             _ => {}
         }
     }
@@ -1409,69 +1881,112 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
             buffer[(x, y)].set_bg(Color::DarkGray);
         }
     }
-    render_transcript(frame, transcript_area, chat, transcript_selected);
-    let queued = chat.queued_prompts.len();
-    let prompt_title = prompt_title(chat, queued);
-    let prompt_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(prompt_border)
-        .title(prompt_title);
-    let prompt_inner = prompt_block.inner(prompt_area);
-    let mut prompt_lines = chat
-        .queued_prompts
-        .iter()
-        .rev()
-        .take(3)
-        .rev()
-        .enumerate()
-        .map(|(index, queued)| {
-            Line::from(Span::styled(
-                truncate_to_width(
-                    &format!(
-                        "{} {}: {}",
-                        queued.queue_label(),
-                        index + 1,
-                        queued_prompt_preview(&queued.text)
-                    ),
-                    usize::from(prompt_inner.width),
-                ),
-                Style::default().fg(Color::DarkGray),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let queue_rows = prompt_lines.len();
-    prompt_lines.extend(if let Some(search) = chat.history_search.as_ref() {
-        highlighted_input_lines(&chat.input, &search.query)
+    // While the split is up the primary keeps the left half and the reviewer
+    // takes the right. Each pane registers its own selection surface and keeps
+    // its own scroll, so neither moves the reader's place in the other.
+    let split = chat.second_opinion_split();
+    let (primary_area, reviewer_area) = if split {
+        let halves = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(transcript_area);
+        (halves[0], Some(halves[1]))
     } else {
-        chat.input
-            .split('\n')
-            .map(|line| Line::raw(line.to_owned()))
-            .collect()
-    });
-    let cursor_row =
-        input_cursor_visual_position(&chat.input, chat.input_cursor, prompt_width).1 + queue_rows;
-    let content_height = usize::from(prompt_inner.height).max(1);
-    let input_scroll = cursor_row.saturating_add(1).saturating_sub(content_height);
-    frame.render_widget(
-        Paragraph::new(prompt_lines)
-            .wrap(Wrap { trim: false })
-            .scroll((input_scroll as u16, 0))
-            .block(prompt_block),
-        prompt_area,
-    );
-    chat.frame_surfaces
-        .push(SurfaceFrame::fixed(SurfaceId::PromptInput, prompt_inner));
-    // The cursor belongs to whatever has focus, so the composer only shows one
-    // while the keyboard is driving it.
-    if chat.history_search.is_none() && chat.focus == ChatFocus::Prompt {
-        set_input_cursor(
+        (transcript_area, None)
+    };
+    render_transcript(frame, primary_area, chat, transcript_selected);
+    chat.reviewer_area = None;
+    if let Some(area) = reviewer_area {
+        let status = match chat.second_opinion() {
+            Some(SecondOpinion::Review(review)) => review.status.clone(),
+            _ => String::new(),
+        };
+        if let Some(SecondOpinion::Review(review)) = chat.second_opinion_mut() {
+            let (inner, top, total) = render_reviewer(frame, area, &mut review.reviewer, &status);
+            chat.reviewer_area = Some(inner);
+            chat.frame_surfaces.push(SurfaceFrame::scrollable(
+                SurfaceId::ReviewerTranscript,
+                inner,
+                top,
+                total,
+            ));
+        }
+    }
+    if let Some(SecondOpinion::Review(review)) = chat.second_opinion() {
+        // The split has no composer: the revised plan is the planner's to
+        // write, so the only input here is which of the three actions to take.
+        render_split_actions(
             frame,
-            prompt_inner,
-            &chat.input,
-            chat.input_cursor,
-            queue_rows,
-            input_scroll,
+            prompt_area,
+            &review.workflow,
+            review.action,
+            &review.status,
         );
+    } else {
+        let queued = chat.queued_prompts.len();
+        let prompt_title = prompt_title(chat, queued);
+        let prompt_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(prompt_border)
+            .title(prompt_title);
+        let prompt_inner = prompt_block.inner(prompt_area);
+        let mut prompt_lines = chat
+            .queued_prompts
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .enumerate()
+            .map(|(index, queued)| {
+                Line::from(Span::styled(
+                    truncate_to_width(
+                        &format!(
+                            "{} {}: {}",
+                            queued.queue_label(),
+                            index + 1,
+                            queued_prompt_preview(&queued.text)
+                        ),
+                        usize::from(prompt_inner.width),
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let queue_rows = prompt_lines.len();
+        prompt_lines.extend(if let Some(search) = chat.history_search.as_ref() {
+            highlighted_input_lines(&chat.input, &search.query)
+        } else {
+            chat.input
+                .split('\n')
+                .map(|line| Line::raw(line.to_owned()))
+                .collect()
+        });
+        let cursor_row = input_cursor_visual_position(&chat.input, chat.input_cursor, prompt_width)
+            .1
+            + queue_rows;
+        let content_height = usize::from(prompt_inner.height).max(1);
+        let input_scroll = cursor_row.saturating_add(1).saturating_sub(content_height);
+        frame.render_widget(
+            Paragraph::new(prompt_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((input_scroll as u16, 0))
+                .block(prompt_block),
+            prompt_area,
+        );
+        chat.frame_surfaces
+            .push(SurfaceFrame::fixed(SurfaceId::PromptInput, prompt_inner));
+        // The cursor belongs to whatever has focus, so the composer only shows one
+        // while the keyboard is driving it.
+        if chat.history_search.is_none() && chat.focus == ChatFocus::Prompt {
+            set_input_cursor(
+                frame,
+                prompt_inner,
+                &chat.input,
+                chat.input_cursor,
+                queue_rows,
+                input_scroll,
+            );
+        }
     }
     let default_footer = if chat.focus == ChatFocus::Conversations {
         "Ctrl-G dashboard · j/k or ↑/↓ switch conversation · PgUp/PgDn transcript · Enter/Tab prompt"
@@ -1515,6 +2030,16 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
         chat.frame_surfaces
             .push(SurfaceFrame::fixed(SurfaceId::AutocompletePopup, popup));
     }
+    if let Some(SecondOpinion::Setup { captured, setup }) = chat.second_opinion() {
+        // The waterfall owns the frame's interaction, so the chat behind it
+        // stops being selectable while a reviewer is being chosen.
+        let area = centered(inner, 60, 16);
+        let body = render_setup(frame, area, captured, setup);
+        chat.frame_surfaces.clear();
+        chat.frame_surfaces
+            .push(SurfaceFrame::fixed(SurfaceId::ModalBody, body));
+        return;
+    }
     if let Some(dialog) = chat.elicitation.as_ref() {
         // The dialog owns the frame's interaction while it is up, so the chat
         // behind it stops being selectable and the dialog registers its own
@@ -1522,6 +2047,18 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
         chat.frame_surfaces.clear();
         render_elicitation(frame, dialog, &mut chat.frame_surfaces);
     }
+}
+
+/// A box of at most `width` by `height`, centered in `area`.
+fn centered(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    ratatui::layout::Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    )
 }
 
 fn prompt_title(chat: &ChatState, queued: usize) -> String {

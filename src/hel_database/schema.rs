@@ -392,6 +392,22 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 16 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE second_opinion_defaults (
+                 workspace_id TEXT NOT NULL CHECK(length(trim(workspace_id)) > 0),
+                 profile_id TEXT NOT NULL CHECK(length(trim(profile_id)) > 0),
+                 model TEXT NOT NULL,
+                 effort TEXT NOT NULL,
+                 PRIMARY KEY (workspace_id, profile_id, model)
+             ) STRICT;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (16, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 16;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)

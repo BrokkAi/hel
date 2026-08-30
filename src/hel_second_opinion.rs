@@ -413,6 +413,14 @@ impl ReviewerSetup {
         None
     }
 
+    /// Reports that the step now running failed, whichever generation it
+    /// belongs to. Callers that lost track of the generation — a staging
+    /// failure before any probe started, say — use this.
+    pub fn probe_failed_current(&mut self, message: impl Into<String>) {
+        let generation = self.generation;
+        self.probe_failed(generation, message);
+    }
+
     /// Reports that discovery or configuration failed.
     pub fn probe_failed(&mut self, generation: u64, message: impl Into<String>) {
         if self.reject_stale(generation).is_some() {
@@ -523,7 +531,34 @@ struct WorkspaceReviewerDefaults {
     efforts: BTreeMap<String, BTreeMap<String, String>>,
 }
 
+impl ReviewerSelection {
+    /// The three values a store keeps, with a harness default written as its
+    /// sentinel so the same row is preselected next time.
+    #[must_use]
+    pub fn stored_values(&self) -> (&str, &str, &str) {
+        (
+            &self.profile_id,
+            self.model.as_deref().unwrap_or(HARNESS_DEFAULT_VALUE),
+            self.effort.as_deref().unwrap_or(HARNESS_DEFAULT_VALUE),
+        )
+    }
+}
+
 impl ReviewerDefaults {
+    /// Rebuilds one remembered row, as a store reads it back.
+    pub fn restore(&mut self, workspace_id: &str, profile_id: &str, model: &str, effort: &str) {
+        let workspace = self.workspaces.entry(workspace_id.to_owned()).or_default();
+        workspace.profile = Some(profile_id.to_owned());
+        workspace
+            .models
+            .insert(profile_id.to_owned(), model.to_owned());
+        workspace
+            .efforts
+            .entry(profile_id.to_owned())
+            .or_default()
+            .insert(model.to_owned(), effort.to_owned());
+    }
+
     #[must_use]
     pub fn profile(&self, workspace_id: &str) -> Option<&str> {
         self.workspaces.get(workspace_id)?.profile.as_deref()

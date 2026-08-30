@@ -22,6 +22,8 @@ use unicode_width::UnicodeWidthStr;
 pub enum SurfaceId {
     /// Chat transcript rows.
     Transcript,
+    /// Reviewer transcript rows, beside the primary's during a second opinion.
+    ReviewerTranscript,
     /// Scrollable message body of an elicitation dialog.
     ElicitationMessage,
     /// Conversation list beside the transcript.
