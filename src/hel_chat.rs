@@ -660,6 +660,14 @@ impl ChatState {
         self.acp_surface.supports_plan_mode()
     }
 
+    fn supports_fast_mode(&self) -> bool {
+        self.acp_surface.supports_fast_mode()
+    }
+
+    pub(super) fn fast_mode_active(&self) -> bool {
+        self.acp_surface.fast_mode_active()
+    }
+
     fn plan_control(&self, active: bool) -> Result<PlanControl, &'static str> {
         self.acp_surface
             .plan_control(active)
@@ -1142,6 +1150,28 @@ impl ChatState {
                     ChatAction::SetConfig {
                         key: key.to_owned(),
                         value: args.to_owned(),
+                    }
+                }
+                LocalCommand::Fast => {
+                    if !args.is_empty() {
+                        self.set_notice("usage: /fast");
+                        return ChatAction::None;
+                    }
+                    if !self.supports_fast_mode() {
+                        self.set_notice("Fast mode is unavailable for the active Codex model");
+                        return ChatAction::None;
+                    }
+                    if matches!(self.phase, WorkerPhase::Closing | WorkerPhase::Closed) {
+                        self.set_notice(
+                            "The worker is closing; this configuration change was not sent",
+                        );
+                        return ChatAction::None;
+                    }
+                    let value = if self.fast_mode_active() { "off" } else { "on" };
+                    self.clear_input();
+                    ChatAction::SetConfig {
+                        key: "fast-mode".to_owned(),
+                        value: value.to_owned(),
                     }
                 }
                 LocalCommand::Plan => {
@@ -2066,7 +2096,8 @@ fn last_nonempty_line(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::hel_chat::test_support::{
-        advertise, ctrl, grok_chat, key, mode_config_option, queued, select_config_option, snapshot,
+        advertise, ctrl, fast_mode_option, grok_chat, key, mode_config_option, queued,
+        select_config_option, snapshot,
     };
     use crate::hel_worker::ActivePrompt;
 
@@ -2508,6 +2539,47 @@ mod tests {
                 key: "effort".into(),
                 value: "xhigh".into(),
             }
+        );
+    }
+
+    #[test]
+    fn fast_toggles_the_advertised_codex_configuration_without_arguments() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&[fast_mode_option("off")]);
+        chat.input = "/fast".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "fast-mode".into(),
+                value: "on".into(),
+            }
+        );
+
+        chat.set_config_options(&[fast_mode_option("on")]);
+        chat.input = "/fast".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "fast-mode".into(),
+                value: "off".into(),
+            }
+        );
+
+        chat.input = "/fast on".into();
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.notice().as_deref(), Some("usage: /fast"));
+    }
+
+    #[test]
+    fn fast_stays_local_when_the_active_model_does_not_support_it() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.input = "/fast".into();
+
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.input, "/fast");
+        assert_eq!(
+            chat.notice().as_deref(),
+            Some("Fast mode is unavailable for the active Codex model")
         );
     }
 

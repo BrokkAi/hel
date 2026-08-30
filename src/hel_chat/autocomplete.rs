@@ -21,6 +21,7 @@ pub(super) enum LocalCommand {
     Detach,
     Model,
     Effort,
+    Fast,
     Plan,
     Implement,
 }
@@ -154,6 +155,14 @@ impl ChatState {
 
     pub(super) fn rebuild_command_choices(&mut self) {
         let mut commands = builtin_command_choices();
+        if self.supports_fast_mode() {
+            commands.push(CommandChoice {
+                name: "fast".to_owned(),
+                description: "toggle Codex Fast mode".to_owned(),
+                input_hint: None,
+                source: CommandSource::Hel,
+            });
+        }
         if self.supports_plan_mode() {
             commands.push(CommandChoice {
                 name: "plan".to_owned(),
@@ -171,7 +180,10 @@ impl ChatState {
         for command in self.acp_surface.agent_commands() {
             let name = command.name.trim();
             if name.is_empty()
-                || matches!(name.to_ascii_lowercase().as_str(), "plan" | "implement")
+                || matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "fast" | "plan" | "implement"
+                )
                 || commands
                     .iter()
                     .any(|existing| existing.name.eq_ignore_ascii_case(name))
@@ -298,6 +310,7 @@ pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> 
         "detach" => LocalCommand::Detach,
         "model" => LocalCommand::Model,
         "effort" => LocalCommand::Effort,
+        "fast" => LocalCommand::Fast,
         "plan" => LocalCommand::Plan,
         "implement" => LocalCommand::Implement,
         _ => return None,
@@ -446,7 +459,9 @@ fn config_value_row(choice: &ConfigValueChoice) -> Option<String> {
 mod tests {
     use super::*;
     use crate::hel_chat::ChatAction;
-    use crate::hel_chat::test_support::{advertise, grok_chat, key, mode_config_option, snapshot};
+    use crate::hel_chat::test_support::{
+        advertise, fast_mode_option, grok_chat, key, mode_config_option, snapshot,
+    };
     use crossterm::event::KeyCode;
 
     #[test]
@@ -624,6 +639,33 @@ mod tests {
                 key: "effort".into(),
                 value: "max".into(),
             }
+        );
+    }
+
+    #[test]
+    fn fast_is_a_hel_command_only_while_the_codex_selector_is_available() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        advertise(&mut chat, 1, &["fast"]);
+        assert!(
+            !chat
+                .command_choices
+                .iter()
+                .any(|command| command.name == "fast")
+        );
+
+        chat.set_config_options(&[fast_mode_option("off")]);
+        assert!(
+            chat.command_choices
+                .iter()
+                .any(|command| { command.name == "fast" && command.source == CommandSource::Hel })
+        );
+
+        chat.set_config_options(&[]);
+        assert!(
+            !chat
+                .command_choices
+                .iter()
+                .any(|command| command.name == "fast")
         );
     }
 

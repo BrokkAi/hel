@@ -15,6 +15,10 @@ use crate::hel_config::HarnessKind;
 
 use super::{dialect::grok, find_session_config_option, select_contains};
 
+const FAST_MODE_CONFIG_ID: &str = "fast-mode";
+const FAST_MODE_ON: &str = "on";
+const FAST_MODE_OFF: &str = "off";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanControl {
     SetConfig { key: String, value: String },
@@ -131,6 +135,20 @@ impl AcpSessionSurface {
 
     pub(crate) fn current_effort(&self) -> Option<&str> {
         self.current_effort.as_deref()
+    }
+
+    pub(crate) fn supports_fast_mode(&self) -> bool {
+        self.config_options.iter().any(|option| {
+            option.id.to_string() == FAST_MODE_CONFIG_ID
+                && select_contains(&option.kind, FAST_MODE_ON)
+                && select_contains(&option.kind, FAST_MODE_OFF)
+        })
+    }
+
+    pub(crate) fn fast_mode_active(&self) -> bool {
+        self.supports_fast_mode()
+            && config_current_value(&self.config_options, FAST_MODE_CONFIG_ID).as_deref()
+                == Some(FAST_MODE_ON)
     }
 
     pub(crate) fn current_mode(&self) -> Option<&str> {
@@ -283,6 +301,20 @@ mod tests {
         )
     }
 
+    fn fast_mode_option(current: &str) -> SessionConfigOption {
+        SessionConfigOption::new(
+            SessionConfigId::new(FAST_MODE_CONFIG_ID),
+            "Fast mode",
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                SessionConfigValueId::new(current),
+                SessionConfigSelectOptions::Ungrouped(vec![
+                    SessionConfigSelectOption::new(FAST_MODE_OFF, "Off"),
+                    SessionConfigSelectOption::new(FAST_MODE_ON, "On"),
+                ]),
+            )),
+        )
+    }
+
     #[test]
     fn config_churn_does_not_revert_an_in_flight_plan_change() {
         let mut surface = AcpSessionSurface::default();
@@ -315,5 +347,24 @@ mod tests {
             Value::String("plan".into()),
         )]));
         assert_eq!(surface.current_mode(), Some("plan"));
+    }
+
+    #[test]
+    fn fast_mode_requires_the_codex_selector_and_tracks_its_current_value() {
+        let mut surface = AcpSessionSurface::default();
+        assert!(!surface.supports_fast_mode());
+        assert!(!surface.fast_mode_active());
+
+        surface.set_config_options(&[fast_mode_option(FAST_MODE_OFF)]);
+        assert!(surface.supports_fast_mode());
+        assert!(!surface.fast_mode_active());
+
+        surface.set_config_options(&[fast_mode_option(FAST_MODE_ON)]);
+        assert!(surface.supports_fast_mode());
+        assert!(surface.fast_mode_active());
+
+        surface.set_config_options(&[]);
+        assert!(!surface.supports_fast_mode());
+        assert!(!surface.fast_mode_active());
     }
 }

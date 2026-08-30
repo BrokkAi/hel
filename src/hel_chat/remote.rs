@@ -1072,4 +1072,24 @@ mod tests {
 
         assert_eq!(chat.input, "!cargo test");
     }
+
+    #[test]
+    fn failed_fast_update_restores_the_user_facing_toggle_command() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        apply_chat_remote_result(
+            &mut chat,
+            ChatRemoteResult::SetConfig {
+                key: "fast-mode".into(),
+                value: "on".into(),
+                result: Err("rejected".into()),
+            },
+        );
+
+        assert_eq!(chat.input, "/fast");
+        assert_eq!(
+            chat.notice().as_deref(),
+            Some("Configuration was not changed: rejected")
+        );
+    }
 }

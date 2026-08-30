@@ -1547,6 +1547,9 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
         .flatten()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    if chat.fast_mode_active() {
+        parts.push("Fast".into());
+    }
     if let Some(recovery_phase) = chat.recovery_phase {
         parts.push(
             match recovery_phase {
@@ -1646,8 +1649,8 @@ mod tests {
         assert_eq!(line.style.fg, Some(Color::Yellow));
     }
     use crate::hel_chat::test_support::{
-        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, key, mouse_at_row,
-        mouse_in, queued, snapshot,
+        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, fast_mode_option, key,
+        mouse_at_row, mouse_in, queued, snapshot,
     };
     use crate::hel_elicitation::ElicitationRequest;
     use crate::hel_state::MaterializedExecutionState;
@@ -2191,6 +2194,19 @@ mod tests {
         // not a re-introduced session title bar).
         assert!(!rendered.contains("HEL /"));
         assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
+    }
+
+    #[test]
+    fn composer_title_shows_fast_only_while_the_confirmed_mode_is_active() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&[fast_mode_option("off")]);
+        assert!(!prompt_title(&chat, 0).contains("Fast"));
+
+        chat.set_config_options(&[fast_mode_option("on")]);
+        assert_eq!(prompt_title(&chat, 0), " Fast · Prompt ");
+
+        chat.set_config_options(&[]);
+        assert!(!prompt_title(&chat, 0).contains("Fast"));
     }
 
     #[test]
