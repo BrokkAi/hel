@@ -1780,10 +1780,8 @@ impl RelayReplayPlan {
                 // corruption so the controller resynchronizes from there
                 // instead of retrying the same unparseable bytes forever.
                 if let Some(gap) = error.downcast_ref::<UnreadableRelaySpan>() {
-                    let recover_after = gap.recover_after;
-                    let recover_digest = self.digest_at(recover_after)?.ok_or_else(|| {
-                        anyhow!("relay digest missing at recovery boundary {recover_after}")
-                    })?;
+                    let (earliest_available, earliest_digest) =
+                        self.recovery_cursor_after(gap.recover_after);
                     return Ok(Err(relay_protocol_error(
                         RelayErrorCode::Desynchronized,
                         error.to_string(),
@@ -1791,8 +1789,8 @@ impl RelayReplayPlan {
                         Some(RelayErrorDetail::Desynchronized {
                             requested_after: after_ordinal,
                             requested_digest: after_digest.to_owned(),
-                            earliest_available: recover_after,
-                            earliest_digest: recover_digest,
+                            earliest_available,
+                            earliest_digest,
                             latest: self.latest_ordinal,
                             latest_digest: self.latest_digest.clone(),
                         }),
@@ -1808,6 +1806,34 @@ impl RelayReplayPlan {
             through_ordinal: page.through_ordinal,
             through_digest: page.through_digest,
         }))
+    }
+
+    /// A resync cursor the controller can attach at to recover history past an
+    /// unreadable span. It must name an ordinal whose digest is resolvable
+    /// *without* the corrupt span, so it points at the first readable, self-
+    /// valid event strictly after the corruption. The controller re-attaches
+    /// after it and recovers every later event; at most the corrupt span and
+    /// that one boundary event are lost. When nothing readable remains, it
+    /// resumes live at the frontier.
+    fn recovery_cursor_after(&self, corrupt_last_ordinal: u64) -> (u64, String) {
+        for span in &self.spans {
+            if span.file_last_ordinal <= corrupt_last_ordinal {
+                continue;
+            }
+            let mut found = None;
+            let _ = visit_relay_journal_file(&span.path, JournalReadMode::Recover, |event, _| {
+                if event.ordinal > corrupt_last_ordinal && validate_relay_event_self(&event).is_ok()
+                {
+                    found = Some((event.ordinal, event.digest));
+                    return Ok(ControlFlow::Break(()));
+                }
+                Ok(ControlFlow::Continue(()))
+            });
+            if let Some(cursor) = found {
+                return cursor;
+            }
+        }
+        (self.latest_ordinal, self.latest_digest.clone())
     }
 
     fn validate_cursor(&self, after_ordinal: u64, after_digest: &str) -> Result<()> {

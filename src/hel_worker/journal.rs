@@ -19,7 +19,7 @@ use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedPrompt;
 
 use super::snapshot::{
-    RELAY_EVENT_FORMAT_V1, RelayCommand, RelayCommandOutcome, RelayDispatchState, RelayEvent,
+    RELAY_EVENT_FORMAT_V2, RelayCommand, RelayCommandOutcome, RelayDispatchState, RelayEvent,
     RelayObservation, RelaySnapshot, apply_relay_event, clamp_observation, ensure_byte_budget,
     ensure_serialized_budget, observation_changes_state, relay_event_digest, validate_relay_digest,
     validate_relay_event, validate_relay_event_self,
@@ -700,10 +700,14 @@ impl DurableRelay {
             observation,
             RELAY_EVENT_BYTE_BUDGET - RELAY_EVENT_ENVELOPE_RESERVE,
         )?;
+        // v2: self-describing records carry no chain link, so a corrupt record
+        // can never invalidate the events after it. The frontier is still
+        // tracked by `latest_digest` for cursor validation; it just is not
+        // folded into the next record's digest.
         let event = RelayEvent {
-            format: RELAY_EVENT_FORMAT_V1,
+            format: RELAY_EVENT_FORMAT_V2,
             ordinal,
-            previous_digest: self.snapshot.latest_digest.clone(),
+            previous_digest: String::new(),
             digest: String::new(),
             recorded_at_ms: epoch_millis(),
             command_id: command_id.map(str::to_owned),
@@ -1113,9 +1117,9 @@ mod tests {
     use super::*;
     use crate::hel_worker::test_support::*;
     use crate::hel_worker::{
-        ClaimedRelayCommand, RELAY_EVENT_GENESIS_DIGEST, RelayCommandKind, RelayCommandOutcome,
-        RelayCursor, RelayErrorCode, RelayErrorDetail, RelayExecutionState, RelayProtocolError,
-        RelayRequest, RelayResponseBody, RelayResponsePayload,
+        ClaimedRelayCommand, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_GENESIS_DIGEST, RelayCommandKind,
+        RelayCommandOutcome, RelayCursor, RelayErrorCode, RelayErrorDetail, RelayExecutionState,
+        RelayProtocolError, RelayRequest, RelayResponseBody, RelayResponsePayload,
     };
 
     /// Streamed chunk cost, measured both ways in one process so a loaded
