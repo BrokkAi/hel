@@ -855,6 +855,16 @@ impl DashboardState {
             .last_acp_activity_at_ms = timestamp_ms.and_then(|value| u64::try_from(value).ok());
     }
 
+    /// Record whether the controller can currently reach a session's relay
+    /// worker. An unreachable session renders its summary band red.
+    pub fn set_session_connectivity(&mut self, session_id: &str, connected: bool) {
+        if connected {
+            self.unreachable_sessions.remove(session_id);
+        } else {
+            self.unreachable_sessions.insert(session_id.to_owned());
+        }
+    }
+
     pub fn mark_transcript_unavailable(&mut self, session_id: &str) {
         self.session_details
             .entry(session_id.to_string())
