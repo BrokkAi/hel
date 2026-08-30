@@ -607,6 +607,20 @@ impl ReviewerDefaults {
     }
 }
 
+/// Opening marker of every prompt Hel generates for a review.
+///
+/// These are control-origin records: Hel wrote them, not the user, and the
+/// transcript says so rather than attributing them to whoever asked for the
+/// review. Generating and recognizing them share this one marker.
+pub const HARNESS_NOTE_MARKER: &str = "[HARNESS NOTE:";
+
+/// Whether this prompt text is one Hel generated rather than one a person
+/// typed.
+#[must_use]
+pub fn is_control_origin_prompt(text: &str) -> bool {
+    text.trim_start().starts_with(HARNESS_NOTE_MARKER)
+}
+
 /// The harness note that asks the primary for the context a reviewer needs.
 ///
 /// The plan itself is already captured, so the primary is asked only for what

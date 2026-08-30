@@ -18,6 +18,50 @@ fn wheel(kind: MouseEventKind) -> MouseEvent {
     mouse_in(kind, Rect::new(0, 10, 40, 1))
 }
 
+/// A prompt Hel generated for a review is stored as a User item, because that
+/// is what the harness received, but it must never render as the user's.
+#[test]
+fn a_generated_review_prompt_renders_as_hels_own_line() {
+    let item = std::sync::Arc::new(TranscriptItem {
+        stable_id: "user:1".into(),
+        position: 1,
+        latest_content_event_ordinal: None,
+        created_at_ms: 0,
+        last_changed_at_ms: 0,
+        body: TranscriptBody::User {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": crate::hel_second_opinion::PRIMARY_CONTEXT_REQUEST,
+            })],
+        },
+    });
+    let typed = std::sync::Arc::new(TranscriptItem {
+        stable_id: "user:2".into(),
+        position: 2,
+        latest_content_event_ordinal: None,
+        created_at_ms: 0,
+        last_changed_at_ms: 0,
+        body: TranscriptBody::User {
+            content: vec![serde_json::json!({"type": "text", "text": "fix the parser"})],
+        },
+    });
+    let session = MaterializedSession {
+        transcript: vec![item, typed],
+        applied_event_ordinal: 2,
+        ..MaterializedSession::empty("session-1")
+    };
+
+    let entries = materialized_chat_entries_reusing(&session, 0, Vec::new());
+    assert_eq!(entries[0].role, ChatRole::System);
+    assert_eq!(entries[1].role, ChatRole::User);
+
+    // Rebuilding reuses the entries rather than flipping their roles.
+    let again = materialized_chat_entries_reusing(&session, 0, entries.clone());
+    assert_eq!(again[0].role, ChatRole::System);
+    assert_eq!(again[1].role, ChatRole::User);
+    assert_eq!(again[0].text, entries[0].text);
+}
+
 #[test]
 fn an_empty_conversation_identifies_initial_relay_loading() {
     let mut chat = ChatState::new(&snapshot(), &[]);

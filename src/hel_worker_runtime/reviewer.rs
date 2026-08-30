@@ -239,6 +239,7 @@ impl ReviewerSidecar {
         if !reused {
             self.launch(&config).await?;
         }
+        self.request_plan_mode(&config).await;
         self.apply_configuration(&config).await?;
         let state = self.state()?;
         Ok(RelayResponseBody::Ok {
@@ -352,6 +353,63 @@ impl ReviewerSidecar {
             bail!("{failure}");
         }
         Ok(())
+    }
+
+    /// Asks the reviewer's harness for plan mode when it has one.
+    ///
+    /// This is a request, not a guarantee: Hel does not claim the reviewer is
+    /// read-only, and its prompt says not to implement for the same reason. A
+    /// harness with no plan mode simply keeps the one it has.
+    async fn request_plan_mode(&mut self, config: &ReviewerLaunchConfig) {
+        let Ok(state) = self.state() else {
+            return;
+        };
+        // The same harness-aware decision the primary's /plan uses, so a
+        // reviewer asks for plan mode exactly the way a session does.
+        let mut surface = crate::hel_acp::surface::AcpSessionSurface::default();
+        surface.set_harness_kind(config.harness);
+        surface.set_config_options(&state.config_options);
+        surface.set_session_modes(state.modes.clone());
+        let Ok(control) = surface.plan_control(true) else {
+            return;
+        };
+        let command = match control {
+            crate::hel_acp::PlanControl::SetConfig { key, value } => {
+                RelayCommand::SetConfig { key, value }
+            }
+            crate::hel_acp::PlanControl::SetSessionMode { mode_id } => {
+                RelayCommand::SetSessionMode { mode_id }
+            }
+        };
+        self.config_sequence += 1;
+        let command_id = format!("reviewer-plan-mode-{}", self.config_sequence);
+        let cursor = match self.cursor() {
+            Ok(cursor) => cursor,
+            Err(_) => return,
+        };
+        if self
+            .forward(RelayRequest::Submit {
+                command_id: command_id.clone(),
+                command,
+            })
+            .is_err()
+        {
+            return;
+        }
+        self.wake_dispatch();
+        // A harness that refuses plan mode is not a failure: the review still
+        // runs, and the prompt is what actually asks the reviewer not to act.
+        let _ = self
+            .wait_for_observation(CONFIGURE_TIMEOUT, &cursor, |observation| {
+                matches!(
+                    observation,
+                    RelayObservation::CommandCompleted { command_id: done, .. }
+                        | RelayObservation::CommandRejected { command_id: done, .. }
+                        | RelayObservation::CommandInterrupted { command_id: done, .. }
+                    if *done == command_id
+                )
+            })
+            .await;
     }
 
     /// Applies the chosen model and effort on the live reviewer. A `None`

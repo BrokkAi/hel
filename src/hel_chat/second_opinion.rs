@@ -1147,6 +1147,42 @@ mod tests {
         assert!(!chat.reviewer_elicitation_open());
     }
 
+    /// The prompts a review generates are Hel's, not the user's. Rendering
+    /// them as user messages would put words in their mouth and would make a
+    /// later resume replay them as if they had been typed.
+    #[test]
+    fn generated_review_prompts_never_read_as_the_user() {
+        use crate::hel_second_opinion::{
+            PRIMARY_CONTEXT_REQUEST, implement_original_note, is_control_origin_prompt,
+            review_request, transfer_note,
+        };
+
+        for generated in [
+            PRIMARY_CONTEXT_REQUEST.to_owned(),
+            review_request("context", "the plan"),
+            transfer_note("the review"),
+            implement_original_note("the plan"),
+        ] {
+            assert!(
+                is_control_origin_prompt(&generated),
+                "a generated prompt must be recognizable as Hel's: {generated:?}"
+            );
+        }
+        // Something a person typed is not, even when it mentions one.
+        assert!(!is_control_origin_prompt(
+            "please add a [HARNESS NOTE: ...] to the docs"
+        ));
+        assert!(!is_control_origin_prompt("fix the parser"));
+
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(ChatEntry::plain(
+            1,
+            ChatRole::System,
+            PRIMARY_CONTEXT_REQUEST,
+        ));
+        assert_eq!(chat.entries[0].role, ChatRole::System);
+    }
+
     #[test]
     fn an_empty_reviewer_has_no_answer_to_transfer() {
         let pane = pane_from_entries(Vec::new());
