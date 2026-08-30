@@ -1,8 +1,9 @@
 name: Coverage
 
 on:
-  # Coverage is intentionally opt-in: it is useful for diagnostics, but it is
-  # not a CI gate.
+  pull_request: {}
+  push:
+    branches: [ 'master' ]
   workflow_dispatch: {}
 
 permissions:

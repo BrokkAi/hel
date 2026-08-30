@@ -18,7 +18,7 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 - [x] (2026-08-30 16:04Z) Milestone 2: added the isolated replayable runtime lab, made daemon state live across web/TUI clients, centralized recovery ownership, and passed the three-client lifecycle scenario twice at seed 1 plus seed 2.
 - [x] (2026-08-30 16:50Z) Milestone 3: added generated multi-segment journal faults, compiled-out named crash hooks, a table-driven six-boundary process matrix, and fixed the relay projection/revision races it reproduced.
 - [x] (2026-08-30 17:20Z) Milestone 4: added pinned real-browser/TUI coverage, PTY resize and stale-browser recovery, and a reproducible local Luna tmux campaign.
-- [ ] Milestone 5: establish pull-request, nightly, and beta acceptance gates and complete an end-to-end demonstration.
+- [x] (2026-08-30 17:31Z) Milestone 5: established pull-request and scheduled reliability gates, validated a five-iteration local soak, and added an evidence-based beta acceptance ledger.
 
 ## Surprises & Discoveries
 
@@ -73,6 +73,12 @@ The visible proof is not a coverage percentage. It is a test run in which two te
 - Observation: the real web New form correctly requires a project directory for local-bare targets, which the initial browser driver omitted.
   Evidence: native form validation prevented submission and the locator waited forever for a session that had never been requested. The Playwright scenario now fills the visible required directory and logs only non-secret stage names.
 
+- Observation: the existing CI formatting job could not serve as a required gate because four committed Rust sources did not match the repository's current rustfmt.
+  Evidence: `cargo fmt --all -- --check` consistently reported `src/hel_acp.rs`, `src/hel_acp/tests.rs`, `src/hel_worker.rs`, and `src/hel_worker/snapshot.rs`. Their mechanical formatting was isolated in commit `5c4b9cc`; the repository-wide formatting check then passed.
+
+- Observation: a duration-bounded soak can finish slightly after its requested wall time because an iteration that starts before the deadline is allowed to complete and validate cleanup.
+  Evidence: a one-minute validation ran seeds 500 through 504 and passed five complete three-client iterations in 65 seconds. No new iteration started after the deadline, and every completed iteration reported three clients and zero leaks.
+
 ## Decision Log
 
 - Decision: defer all `cargo-mutants` installation, configuration, and execution from this ExecPlan.
@@ -111,6 +117,10 @@ The visible proof is not a coverage percentage. It is a test run in which two te
   Rationale: `session_restart_chaos.sh` validates a single live worker topology across proxy, helper, bridge, supervisor, and worker deaths. `run-test-hook-chaos.sh` is table-driven across fresh full-stack roots because every durability boundary needs independent daemon, database, PTY, and web state. Combining their setup would weaken isolation and make failures harder to replay.
   Date/Author: 2026-08-30, Codex.
 
+- Decision: automation completion does not itself declare a beta candidate ready.
+  Rationale: seven scheduled runs, a current-commit 30-to-60-minute soak, and a completed Luna campaign are observations that require elapsed time and retained artifacts. `.agents/docs/beta-acceptance.md` therefore keeps the product explicitly unapproved until those fields and the stop-ship audit are complete.
+  Date/Author: 2026-08-30, Codex.
+
 ## Outcomes & Retrospective
 
 Milestones 1 through 3 are complete. Coverage now measures `hel-core`, `hel-cli`, and `hel-tui` without collapsing same-named source paths, and the baseline records the real 78.12% aggregate with reviewed runtime exceptions. The full instrumented suite passed: 65 `hel-cli` unit tests, its logging and two PTY integration tests, 1,355 `hel-core` tests with four ignored, and 197 `hel-tui` tests with one ignored. The log worker now uses a bounded flush barrier while remaining valid for the lifetime of the global tracing subscriber, so detached runtime diagnostics cannot corrupt the restored terminal.
@@ -121,13 +131,15 @@ The crash layer now adds a 128-case generated multi-segment journal property (mo
 
 The surface layer pins Playwright 1.62.1 and its Chromium revision under `tests/e2e/web`. Seed 413 passed the real HTTPS viewer with QR-token exchange, code login, mobile rendering, web session creation, conversation open, a browser held offline while the TUI resized and stopped the same session, explicit SSE recovery, browser resume and stop, cookie expiry, logout, bounded terminal quit, clean SQLite, a valid trace archive, and zero leaked processes. The run exposed and drove fixes for stale non-phone lifecycle state and online EventSource recovery. `.agents/docs/luna-reliability-runbook.md` and `prepare-luna-lab.py` provide an isolated fake-harness tmux campaign with eight mission cards and a mandatory evidence schema. Remaining work is tiered CI/nightly automation and recording the operational beta gates.
 
+The reliability program is now implemented end to end. Pull requests run cross-platform formatting, Clippy, tests, dependency policy, corrected three-package coverage, and a separate no-Podman daemon/two-TUI/web scenario capped at fifteen minutes. The scheduled/manual Reliability workflow separates the six-hook plus topology crash layer, real Chromium/TUI convergence, one-thread and sixteen-thread full suites, and a configurable 30-to-60-minute seeded soak; every job uploads its diagnostics even after failure. The local one-minute demonstration passed five consecutive seeds, the lifecycle crash-hook smoke passed seed 414, both the one-thread and sixteen-thread schedules passed with fixed Proptest seed 700001, `cargo test` passed 66 CLI tests plus logging and two PTY tests, 1,356 core tests with four ignored, and 197 TUI tests with one ignored, and all-target Clippy and repository formatting passed. `.agents/docs/beta-acceptance.md` turns the remaining seven-night, candidate-soak, and Luna observations into explicit evidence fields and stop-ship checks. Those operational fields are intentionally blank, so this implementation makes beta readiness evaluable but does not prematurely claim the candidate is approved.
+
 ## Context and Orientation
 
 Hel has three default workspace packages. `hel-core`, rooted at `src/lib.rs`, owns durable state, relay journals, controllers, workers, checkpointing, and session management. `hel-tui`, rooted at `crates/hel-tui/src/lib.rs`, is a pure terminal view and input reducer; it intentionally returns actions instead of performing I/O. `hel-cli`, rooted at `crates/hel-cli/src/main.rs`, contains both historical one-shot commands and the important long-running controller surfaces. Its `crates/hel-cli/src/daemon.rs` owns the persistent per-user daemon and shared session runtime, `crates/hel-cli/src/dashboard.rs` drives the terminal event loop, `crates/hel-cli/src/dashboard/actions.rs` and `dashboard/io.rs` move blocking work off that loop, `pollers.rs` feeds capacity, quota, credentials, and remote state, and `server.rs` adapts the daemon state to the web viewer implemented by `src/hel_server.rs`.
 
 A relay is the target-side durable event log for one coding-agent session. An acknowledged relay event is one for which the controller has observed a committed ordinal and digest. A projection is the controller's materialized transcript and operational state derived from those relay events. A lifecycle operation is a create, resume, close, force-stop, or destroy action whose ownership must be unique even when several UI clients request it concurrently.
 
-Existing tests are split according to repository policy. Module-level unit tests live next to the code. `crates/hel-cli/tests/termination_pty.rs` owns real pseudo-terminal shutdown checks. Shell and expect-style system harnesses live under `tests/e2e/`. `tests/e2e/session_restart_chaos.sh` already provides a safe pattern: it refuses to signal processes unless `HEL_CHAOS_ISOLATED=1` is present inside a disposable environment. `src/hel_worker/journal_chaos.rs` is the starting point for generated durability tests. `.github/workflows/ci.yml` is the required cross-platform build and test workflow, while `.github/workflows/coverage.yml` is currently manual and incomplete.
+Existing tests are split according to repository policy. Module-level unit tests live next to the code. `crates/hel-cli/tests/termination_pty.rs` owns real pseudo-terminal shutdown checks. Shell and expect-style system harnesses live under `tests/e2e/`. `tests/e2e/session_restart_chaos.sh` provides a safe pattern: it refuses to signal processes unless `HEL_CHAOS_ISOLATED=1` is present inside a disposable environment. `src/hel_worker/journal_chaos.rs` contains the generated durability model. `.github/workflows/ci.yml` is the required cross-platform build, test, and fast system-smoke workflow; `.github/workflows/coverage.yml` gates the corrected three-package baseline; and `.github/workflows/reliability.yml` owns scheduled crash, browser, scheduling-pressure, and soak work.
 
 The user's `AGENTS.md` change that introduced ExecPlans is already present as an unrelated working-tree modification. Preserve it and do not stage it with implementation commits unless the user separately asks for that file to be committed.
 
@@ -246,3 +258,5 @@ Use the repository's existing Proptest dependency. Do not add `proptest-state-ma
 Pin Playwright and its Chromium version in the test package lockfile. Browser installation belongs only to the reliability workflow and local runbook, not the normal Rust build.
 
 Change note, 2026-08-30: Initial ExecPlan created from the agreed beta-reliability strategy. It explicitly defers mutation testing, narrows `hel-cli` work to runtime orchestration, and makes the local Luna runbook a required artifact rather than a CI dependency.
+
+Change note, 2026-08-30: Implementation completed through Milestone 5. The plan now records the browser-discovered cross-client fixes, pinned workflows, validated soak behavior, and the distinction between a complete reliability system and a beta candidate that still needs seven nights of external evidence.
