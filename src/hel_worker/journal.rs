@@ -394,6 +394,28 @@ fn sealed_relay_journal_metadata(path: &Path) -> Result<RelayJournalSpan> {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override of the seal threshold so tests build multi-segment
+    /// journals from a handful of small records instead of megabytes.
+    static SEAL_BYTE_LIMIT_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear) the active-segment seal threshold for the current test thread.
+#[cfg(test)]
+pub(crate) fn set_seal_byte_limit_override(limit: Option<u64>) {
+    SEAL_BYTE_LIMIT_OVERRIDE.with(|cell| cell.set(limit));
+}
+
+fn relay_segment_byte_limit() -> u64 {
+    #[cfg(test)]
+    if let Some(limit) = SEAL_BYTE_LIMIT_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    RELAY_SEGMENT_BYTE_LIMIT
+}
+
 pub(crate) fn visit_relay_journal_file(
     path: &Path,
     mode: JournalReadMode,
@@ -536,6 +558,27 @@ fn visit_relay_journal_reader(
                     .with_context(|| format!("parse relay journal {}", path.display()));
             }
         };
+        // A record that parses but whose bytes were altered fails to recompute
+        // its own digest. In recovery that is corruption too — skip it so a
+        // flipped byte cannot be served as a valid but wrong record, and so it
+        // cannot poison its neighbours. Strict/RepairTail leave this to the
+        // caller's own validation, as before.
+        if mode == JournalReadMode::Recover
+            && let Err(error) = validate_relay_event_self(&event)
+        {
+            tracing::warn!(
+                journal = %path.display(),
+                byte_offset = record_offset,
+                bytes = line.len(),
+                %error,
+                "skipping relay journal record that failed self-validation during recovery",
+            );
+            gaps.push(RelayJournalGap {
+                byte_offset: record_offset,
+                byte_len: line.len(),
+            });
+            continue;
+        }
         if visitor(event, line.len())?.is_break() {
             return Ok(RelayJournalScan {
                 truncate_to: None,
@@ -804,7 +847,7 @@ impl DurableRelay {
     fn seal_active_segment_if_needed(&mut self) -> Result<()> {
         let journal = self.root.join(RELAY_JOURNAL_DIR);
         let active = journal.join(RELAY_ACTIVE_SEGMENT);
-        if !active.exists() || active.metadata()?.len() < RELAY_SEGMENT_BYTE_LIMIT {
+        if !active.exists() || active.metadata()?.len() < relay_segment_byte_limit() {
             return Ok(());
         }
         let Some(index) = self
@@ -1108,6 +1151,10 @@ impl DurableRelay {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "journal_chaos.rs"]
+mod chaos;
 
 #[cfg(test)]
 mod tests {
