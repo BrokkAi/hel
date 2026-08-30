@@ -21,8 +21,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     RELAY_EVENT_DIGEST_DOMAIN, RELAY_EVENT_DIGEST_DOMAIN_V2, RELAY_EVENT_GENESIS_DIGEST,
-    RELAY_STATE_VERSION,
-    RELAY_TRUNCATION_FLOOR,
+    RELAY_STATE_VERSION, RELAY_TRUNCATION_FLOOR,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

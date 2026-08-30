@@ -624,8 +624,7 @@ fn is_plan_permission(request: &RequestPermissionRequest) -> bool {
     // option-id heuristic, so key on the tool kind and the plan payload.
     nested_string_matches(&value, &["kind"], &|kind| {
         kind == "plan_review" || kind == "switch_mode"
-    })
-        || nested_string(&value, &["planFilePath", "plan_file_path"]).is_some()
+    }) || nested_string(&value, &["planFilePath", "plan_file_path"]).is_some()
         || nested_string_matches(&value, &["title", "name"], &|name| {
             let normalized = name.to_ascii_lowercase().replace([' ', '_'], "");
             normalized.contains("implementthisplan") || normalized.contains("exitplanmode")

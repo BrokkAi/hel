@@ -860,8 +860,10 @@ fn claude_exit_plan_mode_request_is_detected_and_mapped() {
         "Claude's switch_mode request must be classified as a plan review"
     );
 
-    let review =
-        normalized_plan_review("plan-review-1".into(), &serde_json::to_value(&request).unwrap());
+    let review = normalized_plan_review(
+        "plan-review-1".into(),
+        &serde_json::to_value(&request).unwrap(),
+    );
     assert!(review.message.contains("Add --version flag"));
 
     // Implement approves with the least-privileged edit option, never a
