@@ -27,6 +27,18 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
   const screenshotPath = required('HEL_BROWSER_SCREENSHOT');
   const stage = value => process.stdout.write(`browser-stage: ${value}\n`);
 
+  // A protected conversation route must remain a login page while its
+  // snapshot request is unauthorized; route restoration cannot dereference
+  // an absent snapshot.
+  const lockedContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const lockedPage = await lockedContext.newPage();
+  const lockedErrors = [];
+  lockedPage.on('pageerror', error => lockedErrors.push(error.message));
+  await lockedPage.goto(`${baseUrl}/#conversation/not-authenticated`);
+  await expect(lockedPage.locator('#login')).toBeVisible();
+  await expect.poll(() => lockedErrors).toEqual([]);
+  await lockedContext.close();
+
   // Authentication secrets are intentionally kept out of Playwright traces.
   stage('qr-login');
   const qrContext = await browser.newContext({ ignoreHTTPSErrors: true });
@@ -42,6 +54,14 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     viewport: { width: 390, height: 844 },
   });
   const page = await context.newPage();
+  const responseErrors = [];
+  page.on('console', message => {
+    const text = message.text();
+    if (text.includes('Unexpected end of JSON input')) responseErrors.push(text);
+  });
+  page.on('pageerror', error => {
+    if (error.message.includes("reading 'sessions'")) responseErrors.push(error.message);
+  });
   try {
     await codeLogin(page, baseUrl, code);
     await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
@@ -73,6 +93,8 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     page.once('dialog', dialog => dialog.accept());
     await session.getByRole('button', { name: 'Stop' }).click();
     await expect(session).toContainText('stopped');
+    await expect(page.locator('#action-error')).toHaveText('');
+    expect(responseErrors).toEqual([]);
 
     await context.tracing.stop({ path: tracePath });
 
@@ -85,6 +107,7 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await page.reload();
     await expect(page.locator('#login')).toBeVisible();
     await codeLogin(page, baseUrl, code);
+    expect(responseErrors).toEqual([]);
     await page.getByRole('button', { name: 'Sign out' }).click();
     await expect(page.locator('#login')).toBeVisible();
   } catch (error) {

@@ -2156,7 +2156,11 @@ async fn handle_action(
             ))
         }
         DaemonAction::CreateWorkspace { name } => {
-            let workspace = blocking(move || hel::hel_database::create_workspace(&name)).await?;
+            // Two setup selectors can both have observed an empty workspace
+            // list. The daemon operation is create-or-get so both attach to
+            // the same normalized name instead of leaking a SQLite conflict.
+            let workspace =
+                blocking(move || hel::hel_database::create_or_get_workspace(&name)).await?;
             refresh_runtime_workspaces(state).await?;
             Ok(DaemonReply::Workspace(workspace))
         }

@@ -1171,6 +1171,43 @@ pub(crate) struct RemoteDashboardWorkerPoller {
     pub(crate) records: tokio::sync::watch::Receiver<Vec<SessionRecord>>,
 }
 
+const PROJECTION_CONVERGENCE_RETRIES: u8 = 20;
+const PROJECTION_CONVERGENCE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionMismatch {
+    published_ordinal: u64,
+    published_digest: String,
+    durable_ordinal: u64,
+    durable_digest: String,
+}
+
+#[derive(Default)]
+struct ProjectionConvergence {
+    attempts: std::collections::BTreeMap<String, (ProjectionMismatch, u8)>,
+}
+
+impl ProjectionConvergence {
+    fn converged(&mut self, session_id: &str) {
+        self.attempts.remove(session_id);
+    }
+
+    /// Give a lifecycle rollback and the daemon's cached relay view a bounded
+    /// window to converge. Repeating the same mismatch eventually reports the
+    /// integrity failure instead of hiding it indefinitely.
+    fn should_retry(&mut self, session_id: &str, mismatch: ProjectionMismatch) -> bool {
+        let entry = self
+            .attempts
+            .entry(session_id.to_owned())
+            .or_insert_with(|| (mismatch.clone(), 0));
+        if entry.0 != mismatch {
+            *entry = (mismatch, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= PROJECTION_CONVERGENCE_RETRIES
+    }
+}
+
 pub(crate) fn spawn_remote_dashboard_worker_poller(
     workspace_id: String,
 ) -> Result<RemoteDashboardWorkerPoller> {
@@ -1189,6 +1226,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
     tokio::spawn(async move {
         let mut revision = 0_u64;
         let mut requests_open = true;
+        let mut projection_convergence = ProjectionConvergence::default();
         loop {
             tokio::select! {
                 request = requests.recv(), if requests_open => {
@@ -1201,7 +1239,8 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                 snapshot = poll_daemon_runtime(workspace_id.clone(), revision) => {
                     match snapshot {
                         Ok(snapshot) => {
-                            revision = revision.max(snapshot.revision);
+                            let snapshot_revision = snapshot.revision;
+                            let mut retry_projection = false;
                             config_tx.send_if_modified(|config| {
                                 if *config == snapshot.config {
                                     false
@@ -1229,8 +1268,11 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                         }).await;
                                         match loaded {
                                             Ok(Ok(Some(materialized)))
-                                                if materialized.applied_event_ordinal >= runtime.projection_ordinal =>
+                                                if materialized.applied_event_ordinal > runtime.projection_ordinal
+                                                    || (materialized.applied_event_ordinal == runtime.projection_ordinal
+                                                        && materialized.applied_event_digest == runtime.projection_digest) =>
                                             {
+                                                projection_convergence.converged(&session_id);
                                                 ManagedSessionView {
                                                     snapshot: Some(ManagedSessionSnapshot {
                                                         materialized,
@@ -1242,15 +1284,37 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                                     error: runtime.error,
                                                 }
                                             }
-                                            Ok(Ok(Some(materialized))) => ManagedSessionView {
-                                                snapshot: None,
-                                                connected: false,
-                                                error: Some(ViewError::ProjectionIntegrity(format!(
-                                                    "daemon published projection {} but SQLite contains only {}",
-                                                    runtime.projection_ordinal,
-                                                    materialized.applied_event_ordinal,
-                                                ))),
-                                            },
+                                            Ok(Ok(Some(materialized))) => {
+                                                let mismatch = ProjectionMismatch {
+                                                    published_ordinal: runtime.projection_ordinal,
+                                                    published_digest: runtime.projection_digest.clone(),
+                                                    durable_ordinal: materialized.applied_event_ordinal,
+                                                    durable_digest: materialized.applied_event_digest.clone(),
+                                                };
+                                                if projection_convergence.should_retry(&session_id, mismatch) {
+                                                    retry_projection = true;
+                                                    continue;
+                                                }
+                                                let detail = if materialized.applied_event_ordinal
+                                                    < runtime.projection_ordinal
+                                                {
+                                                    format!(
+                                                        "daemon published projection {} but SQLite contains only {} after a bounded convergence retry",
+                                                        runtime.projection_ordinal,
+                                                        materialized.applied_event_ordinal,
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "daemon and SQLite projection digests differ at ordinal {} after a bounded convergence retry",
+                                                        runtime.projection_ordinal,
+                                                    )
+                                                };
+                                                ManagedSessionView {
+                                                    snapshot: None,
+                                                    connected: false,
+                                                    error: Some(ViewError::ProjectionIntegrity(detail)),
+                                                }
+                                            }
                                             Ok(Ok(None)) => ManagedSessionView {
                                                 snapshot: None,
                                                 connected: false,
@@ -1283,6 +1347,11 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                 if publisher.publish(session_id, view).await.is_err() {
                                     return;
                                 }
+                            }
+                            if retry_projection {
+                                tokio::time::sleep(PROJECTION_CONVERGENCE_RETRY_DELAY).await;
+                            } else {
+                                revision = revision.max(snapshot_revision);
                             }
                         }
                         Err(error) => {
@@ -1761,6 +1830,50 @@ mod tests {
         let recoverable_error = podman_controller(SessionState::Error);
         assert!(dashboard_worker_targets(&recoverable_error).is_empty());
         assert!(dashboard_resource_targets(&recoverable_error).is_empty());
+    }
+
+    #[test]
+    fn projection_rollback_race_retries_before_reporting_integrity_failure() {
+        let mismatch = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "published".into(),
+            durable_ordinal: 36,
+            durable_digest: "durable".into(),
+        };
+        let mut convergence = ProjectionConvergence::default();
+
+        for _ in 0..PROJECTION_CONVERGENCE_RETRIES {
+            assert!(convergence.should_retry("session-1", mismatch.clone()));
+        }
+        assert!(
+            !convergence.should_retry("session-1", mismatch),
+            "a persistent mismatch must still become an integrity error"
+        );
+
+        convergence.converged("session-1");
+        assert!(convergence.attempts.is_empty());
+    }
+
+    #[test]
+    fn a_changed_projection_mismatch_gets_its_own_convergence_window() {
+        let mut convergence = ProjectionConvergence::default();
+        let stale_lineage = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "old-lineage".into(),
+            durable_ordinal: 36,
+            durable_digest: "checkpoint".into(),
+        };
+        for _ in 0..=PROJECTION_CONVERGENCE_RETRIES {
+            convergence.should_retry("session-1", stale_lineage.clone());
+        }
+        let equal_frontier_different_lineage = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "old-lineage".into(),
+            durable_ordinal: 39,
+            durable_digest: "new-lineage".into(),
+        };
+
+        assert!(convergence.should_retry("session-1", equal_frontier_different_lineage));
     }
 
     #[test]
