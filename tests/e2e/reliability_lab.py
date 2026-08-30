@@ -342,7 +342,7 @@ class Lab:
             listener.bind(("127.0.0.1", 0))
             return int(listener.getsockname()[1])
 
-    def prepare(self, *, phone_tls: bool = False) -> int:
+    def prepare(self, *, phone_tls: bool = False, fake_acp_delay_ms: int = 0) -> int:
         self.git_output(["init", "--initial-branch=main"], self.project)
         self.git_output(["config", "user.name", "Hel Reliability"], self.project)
         self.git_output(["config", "user.email", "reliability@invalid"], self.project)
@@ -359,6 +359,7 @@ class Lab:
 import json
 import os
 import sys
+import time
 
 session_id = "reliability-native"
 log_path = os.environ["HEL_FAKE_ACP_LOG"]
@@ -371,6 +372,11 @@ def log(payload):
     with open(log_path, "a", encoding="utf-8") as output:
         output.write(json.dumps(payload, sort_keys=True) + "\\n")
 
+def delay():
+    delay_ms = int(os.environ.get("HEL_FAKE_ACP_DELAY_MS", "0"))
+    if delay_ms > 0:
+        time.sleep(delay_ms / 1000)
+
 for line in sys.stdin:
     message = json.loads(line)
     log(message)
@@ -379,6 +385,7 @@ for line in sys.stdin:
     if method == "initialize":
         result = {"protocolVersion": 1}
     elif method in ("session/new", "session/load"):
+        delay()
         rollout_dir = os.path.join(os.environ["CODEX_HOME"], "sessions", "2026", "08", "30")
         os.makedirs(rollout_dir, exist_ok=True)
         rollout = os.path.join(rollout_dir, "rollout-" + session_id + ".jsonl")
@@ -405,6 +412,7 @@ for line in sys.stdin:
                 },
             },
         })
+        delay()
         send({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -480,7 +488,7 @@ tailscale_detect = false
 kind = "codex"
 home = {json.dumps(str(self.profile))}
 executable = {json.dumps(str(bridge))}
-environment = {{ HEL_FAKE_ACP_LOG = {json.dumps(str(self.runtime_root / "fake-acp.log"))}, PATH = {json.dumps(str(fixture_bin))} }}
+environment = {{ HEL_FAKE_ACP_LOG = {json.dumps(str(self.runtime_root / "fake-acp.log"))}, HEL_FAKE_ACP_DELAY_MS = {json.dumps(str(fake_acp_delay_ms))}, PATH = {json.dumps(str(fixture_bin))} }}
 
 [bundles.fixture]
 primary_repo = "fixture"
