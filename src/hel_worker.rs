@@ -29,9 +29,10 @@ pub use protocol::{
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
     ActiveAgentTerminal, ActiveRelayPrompt, ActiveUserShell, ClaimedRelayCommand,
-    QueuedRelayPrompt, RelayCommand, RelayCommandKind, RelayCommandOutcome, RelayCursor,
-    RelayEvent, RelayExecutionState, RelayObservation, RelayOperationalState, UserShellResult,
-    UserShellStatus, relay_event_digest, validate_relay_event,
+    QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_FORMAT_V2, RelayCommand, RelayCommandKind,
+    RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState, RelayObservation,
+    RelayOperationalState, UserShellResult, UserShellStatus, relay_event_digest,
+    validate_relay_event,
 };
 pub use types::{
     ActivePrompt, Attachment, QueuedPrompt, SequencedEvent, WorkerEvent, WorkerPhase,
@@ -96,8 +97,18 @@ pub const RELAY_PROTOCOL_VERSION: u32 = 5;
 pub const RELAY_MIN_PROTOCOL_VERSION: u32 = 1;
 /// Digest for the empty relay event prefix (ordinal zero).
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
-const RELAY_EVENT_DIGEST_DOMAIN: &[u8] = b"hel-relay-event-v1\0";
-const RELAY_STATE_VERSION: u32 = 1;
+/// Domain separator for a v1 (chained) relay event digest. v1 records fold
+/// `previous_digest` into the hash, forming a linked chain.
+pub(crate) const RELAY_EVENT_DIGEST_DOMAIN: &[u8] = b"hel-relay-event-v1\0";
+/// Domain separator for a v2 (self-describing) relay event digest. v2 records
+/// carry no `previous_digest`; the digest depends only on the record's own
+/// content, so a corrupt record can never invalidate its neighbours.
+pub(crate) const RELAY_EVENT_DIGEST_DOMAIN_V2: &[u8] = b"hel-relay-event-v2\0";
+/// Snapshots at or below this schema are readable; a newer schema is rejected.
+/// A v1 snapshot is upgraded in place to the current schema on open (its stored
+/// frontier digests stay valid, since each is recomputed with the formula that
+/// matches the record's format).
+const RELAY_STATE_VERSION: u32 = 2;
 /// The relay snapshot inside a worker root. Teardown and restore name it from
 /// here rather than repeating the literal.
 pub const RELAY_STATE_FILE: &str = "relay-state.json";
@@ -224,14 +235,19 @@ impl DurableRelay {
             let bytes =
                 fs::read(&state_path).with_context(|| format!("read {}", state_path.display()))?;
             ensure_byte_budget(bytes.len(), RELAY_SNAPSHOT_BYTE_BUDGET, "relay snapshot")?;
-            let snapshot: RelaySnapshot = serde_json::from_slice(&bytes)
+            let mut snapshot: RelaySnapshot = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse {}", state_path.display()))?;
-            if snapshot.format_version != RELAY_STATE_VERSION {
+            if snapshot.format_version > RELAY_STATE_VERSION {
                 bail!(
-                    "relay state schema {} is incompatible with schema {RELAY_STATE_VERSION}",
+                    "relay state schema {} is newer than supported schema {RELAY_STATE_VERSION}",
                     snapshot.format_version
                 );
             }
+            // Upgrade an older snapshot in place. The stored frontier digests
+            // stay valid — each is recomputed with the formula matching the
+            // record's format — so only the schema marker advances; the next
+            // persist writes it back at the current version.
+            snapshot.format_version = RELAY_STATE_VERSION;
             if snapshot.session_id != session_id {
                 bail!(
                     "relay state belongs to session {}, not {session_id}",

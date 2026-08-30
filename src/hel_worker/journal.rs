@@ -19,8 +19,8 @@ use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedPrompt;
 
 use super::snapshot::{
-    RelayCommand, RelayCommandOutcome, RelayDispatchState, RelayEvent, RelayObservation,
-    RelaySnapshot, apply_relay_event, clamp_observation, ensure_byte_budget,
+    RELAY_EVENT_FORMAT_V1, RelayCommand, RelayCommandOutcome, RelayDispatchState, RelayEvent,
+    RelayObservation, RelaySnapshot, apply_relay_event, clamp_observation, ensure_byte_budget,
     ensure_serialized_budget, observation_changes_state, relay_event_digest, validate_relay_digest,
     validate_relay_event,
 };
@@ -623,6 +623,7 @@ impl DurableRelay {
             RELAY_EVENT_BYTE_BUDGET - RELAY_EVENT_ENVELOPE_RESERVE,
         )?;
         let event = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V1,
             ordinal,
             previous_digest: self.snapshot.latest_digest.clone(),
             digest: String::new(),
@@ -1598,6 +1599,7 @@ mod tests {
         let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
         drop(relay);
         let event = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V1,
             ordinal: 1,
             previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
             digest: String::new(),
@@ -1683,6 +1685,7 @@ mod tests {
         let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
         for ordinal in 1..=3 {
             let event = RelayEvent {
+                format: RELAY_EVENT_FORMAT_V1,
                 ordinal,
                 previous_digest: previous_digest.clone(),
                 digest: String::new(),

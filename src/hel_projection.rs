@@ -1709,6 +1709,7 @@ mod tests {
 
     fn event(previous: &MaterializedSession, observation: RelayObservation) -> RelayEvent {
         let mut event = RelayEvent {
+            format: crate::hel_worker::RELAY_EVENT_FORMAT_V1,
             ordinal: previous.applied_event_ordinal + 1,
             previous_digest: previous.applied_event_digest.clone(),
             digest: String::new(),

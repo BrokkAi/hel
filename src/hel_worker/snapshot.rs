@@ -20,7 +20,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    RELAY_EVENT_DIGEST_DOMAIN, RELAY_EVENT_GENESIS_DIGEST, RELAY_STATE_VERSION,
+    RELAY_EVENT_DIGEST_DOMAIN, RELAY_EVENT_DIGEST_DOMAIN_V2, RELAY_EVENT_GENESIS_DIGEST,
+    RELAY_STATE_VERSION,
     RELAY_TRUNCATION_FLOOR,
 };
 
@@ -349,9 +350,36 @@ pub struct RelayOperationalState {
     pub last_acp_activity_at_ms: Option<i64>,
 }
 
+/// On-disk record format for a relay event.
+/// - `1` (chained): folds `previous_digest` into the digest, forming a hash
+///   chain. This is the legacy format; a record with no `format` key on disk is
+///   read as v1.
+/// - `2` (self-describing): carries no `previous_digest`; the digest depends
+///   only on the record's own content, so a corrupt record cannot invalidate
+///   its neighbours.
+pub const RELAY_EVENT_FORMAT_V1: u8 = 1;
+pub const RELAY_EVENT_FORMAT_V2: u8 = 2;
+
+fn default_relay_event_format() -> u8 {
+    RELAY_EVENT_FORMAT_V1
+}
+
+fn is_relay_event_format_v1(format: &u8) -> bool {
+    *format == RELAY_EVENT_FORMAT_V1
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RelayEvent {
+    /// Record format. Skipped on the wire when v1 so existing v1 journals
+    /// round-trip byte-for-byte and old records (no `format` key) read as v1.
+    #[serde(
+        default = "default_relay_event_format",
+        skip_serializing_if = "is_relay_event_format_v1"
+    )]
+    pub format: u8,
     pub ordinal: u64,
+    /// Predecessor digest, forming the v1 chain. Absent (empty) for v2 records.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub previous_digest: String,
     pub digest: String,
     pub recorded_at_ms: i64,
@@ -825,6 +853,9 @@ pub(crate) fn clamp_observation(
     }
 }
 
+/// v1 digest payload: folds `previous_digest` into the hash (the chain link).
+/// Its exact field order and serde attributes are load-bearing — changing them
+/// would invalidate every stored v1 digest.
 #[derive(Serialize)]
 struct RelayEventDigestPayload<'a> {
     ordinal: u64,
@@ -835,27 +866,76 @@ struct RelayEventDigestPayload<'a> {
     observation: &'a RelayObservation,
 }
 
-/// Compute the domain-separated SHA-256 digest for a relay event. The digest
-/// field itself is excluded; every other wire-significant field is included.
-pub fn relay_event_digest(event: &RelayEvent) -> Result<String> {
-    validate_relay_digest(&event.previous_digest, "previous event digest")?;
-    let payload = RelayEventDigestPayload {
-        ordinal: event.ordinal,
-        previous_digest: &event.previous_digest,
-        recorded_at_ms: event.recorded_at_ms,
-        command_id: event.command_id.as_deref(),
-        observation: &event.observation,
-    };
-    let encoded = serde_json::to_vec(&payload).context("serialize relay event digest payload")?;
+/// v2 digest payload: identical to v1 but with no `previous_digest`, so the
+/// digest depends only on the record's own content.
+#[derive(Serialize)]
+struct RelayEventDigestPayloadV2<'a> {
+    ordinal: u64,
+    recorded_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_id: Option<&'a str>,
+    observation: &'a RelayObservation,
+}
+
+fn digest_over(domain: &[u8], encoded: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(RELAY_EVENT_DIGEST_DOMAIN);
+    hasher.update(domain);
     hasher.update(encoded);
-    Ok(format!("{:x}", hasher.finalize()))
+    format!("{:x}", hasher.finalize())
+}
+
+/// Compute the domain-separated SHA-256 digest for a relay event, using the
+/// formula that matches the record's format. The `digest` field itself is
+/// excluded; for v2 so is `previous_digest`.
+pub fn relay_event_digest(event: &RelayEvent) -> Result<String> {
+    match event.format {
+        RELAY_EVENT_FORMAT_V1 => {
+            validate_relay_digest(&event.previous_digest, "previous event digest")?;
+            let payload = RelayEventDigestPayload {
+                ordinal: event.ordinal,
+                previous_digest: &event.previous_digest,
+                recorded_at_ms: event.recorded_at_ms,
+                command_id: event.command_id.as_deref(),
+                observation: &event.observation,
+            };
+            let encoded =
+                serde_json::to_vec(&payload).context("serialize relay event digest payload")?;
+            Ok(digest_over(RELAY_EVENT_DIGEST_DOMAIN, &encoded))
+        }
+        RELAY_EVENT_FORMAT_V2 => {
+            if !event.previous_digest.is_empty() {
+                bail!(
+                    "v2 relay event {} must not carry a previous_digest",
+                    event.ordinal
+                );
+            }
+            let payload = RelayEventDigestPayloadV2 {
+                ordinal: event.ordinal,
+                recorded_at_ms: event.recorded_at_ms,
+                command_id: event.command_id.as_deref(),
+                observation: &event.observation,
+            };
+            let encoded =
+                serde_json::to_vec(&payload).context("serialize relay event digest payload")?;
+            Ok(digest_over(RELAY_EVENT_DIGEST_DOMAIN_V2, &encoded))
+        }
+        other => bail!(
+            "unknown relay event format {other} at event {}",
+            event.ordinal
+        ),
+    }
 }
 
 /// Verify an event against the exact previously applied event cursor. This is
 /// the shared validation contract for both the relay journal and controller
 /// projections.
+///
+/// Every event is validated by its **own** recomputed digest (self-contained)
+/// plus ordinal contiguity. For v1 records the in-record `previous_digest` link
+/// to the cursor is also enforced; v2 records carry no link — their continuity
+/// to the cursor is proven by the digest anchor at the cursor ordinal
+/// (`validate_cursor`) and by the page/frontier endpoint, not by an in-record
+/// back-reference. This keeps a corrupt record from invalidating its successors.
 pub fn validate_relay_event(
     previous_ordinal: u64,
     previous_digest: &str,
@@ -871,7 +951,7 @@ pub fn validate_relay_event(
             event.ordinal
         );
     }
-    if event.previous_digest != previous_digest {
+    if event.format == RELAY_EVENT_FORMAT_V1 && event.previous_digest != previous_digest {
         bail!(
             "relay event {} previous digest does not match cursor",
             event.ordinal
@@ -1618,6 +1698,7 @@ mod tests {
             );
             let mut snapshot = RelaySnapshot::new(SESSION.to_owned());
             let event = RelayEvent {
+                format: RELAY_EVENT_FORMAT_V1,
                 ordinal: 1,
                 previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
                 digest: String::new(),
@@ -1660,6 +1741,74 @@ mod tests {
                 "{observation:?} can grow the snapshot and must be budget-checked"
             );
         }
+    }
+
+    #[test]
+    fn v1_events_round_trip_byte_identically_and_v2_omits_the_chain() {
+        let observation = || RelayObservation::Warning {
+            message: "hi".into(),
+        };
+
+        // v1: no `format` key on the wire, keeps previous_digest, chains to its
+        // cursor. Existing journals stay byte-for-byte identical.
+        let mut v1 = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V1,
+            ordinal: 1,
+            previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+            digest: String::new(),
+            recorded_at_ms: 42,
+            command_id: None,
+            observation: observation(),
+        };
+        v1.digest = relay_event_digest(&v1).unwrap();
+        let v1_json = serde_json::to_string(&v1).unwrap();
+        assert!(
+            !v1_json.contains("\"format\""),
+            "v1 must not write a format key: {v1_json}"
+        );
+        assert!(v1_json.contains("previous_digest"));
+        validate_relay_event(0, RELAY_EVENT_GENESIS_DIGEST, &v1).unwrap();
+
+        // v2: tags its format, carries no chain link, and self-validates
+        // regardless of the cursor digest.
+        let mut v2 = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V2,
+            ordinal: 1,
+            previous_digest: String::new(),
+            digest: String::new(),
+            recorded_at_ms: 42,
+            command_id: None,
+            observation: observation(),
+        };
+        v2.digest = relay_event_digest(&v2).unwrap();
+        let v2_json = serde_json::to_string(&v2).unwrap();
+        assert!(
+            v2_json.contains("\"format\":2"),
+            "v2 must tag its format: {v2_json}"
+        );
+        assert!(
+            !v2_json.contains("previous_digest"),
+            "v2 must not write a chain link: {v2_json}"
+        );
+        validate_relay_event(0, RELAY_EVENT_GENESIS_DIGEST, &v2).unwrap();
+        validate_relay_event(0, &"a".repeat(64), &v2)
+            .expect("a v2 event has no in-record link, so any cursor digest is accepted");
+
+        // Same ordinal + content, different format → different digest (domain
+        // separation + payload), so v1 and v2 never collide.
+        assert_ne!(v1.digest, v2.digest);
+
+        // Round-trip both, and confirm an old record with no `format` key reads
+        // as v1.
+        let v1_back: RelayEvent = serde_json::from_str(&v1_json).unwrap();
+        assert_eq!(v1_back, v1);
+        let v2_back: RelayEvent = serde_json::from_str(&v2_json).unwrap();
+        assert_eq!(v2_back, v2);
+        assert_eq!(v2_back.previous_digest, "");
+        let legacy: RelayEvent =
+            serde_json::from_str(r#"{"ordinal":1,"previous_digest":"","digest":"x","recorded_at_ms":0,"observation":{"type":"warning","data":{"message":"m"}}}"#)
+                .unwrap();
+        assert_eq!(legacy.format, RELAY_EVENT_FORMAT_V1);
     }
 
     #[test]

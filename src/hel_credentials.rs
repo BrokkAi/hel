@@ -1090,6 +1090,7 @@ mod tests {
         };
 
         let event = |observation| RelayEvent {
+            format: crate::hel_worker::RELAY_EVENT_FORMAT_V1,
             ordinal: 1,
             previous_digest: crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.into(),
             digest: "a".repeat(64),
