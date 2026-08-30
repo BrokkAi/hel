@@ -47,7 +47,7 @@ use tokio_stream::StreamExt as _;
 
 use crate::dashboard::io::{
     ActiveLifecycleOperation, DashboardIoUpdate, LifecycleReload, checkpoint_archive_targets,
-    spawn_checkpoint_archive_size_refresh, spawn_clipboard_write, spawn_lifecycle_reload,
+    spawn_checkpoint_archive_size_refresh, spawn_clipboard_write, spawn_io, spawn_lifecycle_reload,
     spawn_materialized_session_projection, spawn_project_source_resolution, spawn_recovery_reload,
     spawn_stored_session_summary,
 };
@@ -259,10 +259,13 @@ pub(crate) struct DashboardContext {
     quota_profiles_tx: watch::Sender<QuotaRefreshBatch>,
     quota: Feed<Receiver<QuotaUpdate>>,
     pub(crate) manual_quota_refresh_generation: Option<u64>,
+    pub(crate) target_test_cancel: Option<Arc<AtomicBool>>,
 
     worker_targets_tx: watch::Sender<Vec<WorkerPollTarget>>,
     worker: Feed<SessionManagerUpdates>,
     runtime_lifecycles: Feed<watch::Receiver<Vec<crate::daemon::RuntimeLifecycleView>>>,
+    runtime_config: Feed<watch::Receiver<HelConfig>>,
+    config_reload_in_flight: bool,
     remote_lifecycle_sessions: BTreeSet<String>,
     pub(crate) worker_commands_tx: SessionManagerControl,
     worker_shutdown: Option<SessionManagerShutdown>,
@@ -285,6 +288,7 @@ pub(crate) struct DashboardContext {
     resource: Feed<Receiver<ResourcePollUpdate>>,
 
     capacity_targets_tx: watch::Sender<Vec<DeploymentCapacityTarget>>,
+    capacity_triggers_tx: Sender<()>,
     capacity: Feed<Receiver<CapacityPollUpdate>>,
 
     pub(crate) aws_resource_options_tx: AwsResourceOptionsSender,
@@ -494,6 +498,10 @@ pub(crate) async fn run_dashboard_for_workspace(
             }
             update = context.runtime_lifecycles.wait(), if context.runtime_lifecycles.is_open() => {
                 let woke = context.runtime_lifecycles.accept(update);
+                context.dirty |= woke;
+            }
+            update = context.runtime_config.wait(), if context.runtime_config.is_open() => {
+                let woke = context.runtime_config.accept(update);
                 context.dirty |= woke;
             }
             result = context.recovery.wait(), if context.recovery.is_open() => {
@@ -760,6 +768,7 @@ impl DashboardContext {
         let worker_commands_tx = remote_worker.control;
         let worker_shutdown = remote_worker.shutdown;
         let runtime_lifecycles_rx = remote_worker.lifecycles;
+        let runtime_config_rx = remote_worker.config;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
         let recovery = RecoveryCoordinator::spawn(worker_commands_tx.clone());
         let recovery_observer = recovery.observer();
@@ -771,7 +780,8 @@ impl DashboardContext {
         let credential_sync_handle = credential_sync.handle();
         let (resource_targets_tx, resource_triggers_tx, resource_updates_rx) =
             spawn_dashboard_resource_poller();
-        let (capacity_targets_tx, capacity_updates_rx) = spawn_dashboard_capacity_poller();
+        let (capacity_targets_tx, capacity_triggers_tx, capacity_updates_rx) =
+            spawn_dashboard_capacity_poller();
         let (aws_resource_options_tx, aws_resource_options_rx) =
             tokio::sync::mpsc::unbounded_channel::<AwsResourceOptions>();
         refresh_dashboard_poll_targets(
@@ -814,9 +824,12 @@ impl DashboardContext {
             quota_profiles_tx,
             quota: Feed::new(quota_updates_rx),
             manual_quota_refresh_generation: None,
+            target_test_cancel: None,
             worker_targets_tx,
             worker: Feed::new(worker_updates_rx),
             runtime_lifecycles: Feed::new(runtime_lifecycles_rx),
+            runtime_config: Feed::new(runtime_config_rx),
+            config_reload_in_flight: false,
             remote_lifecycle_sessions: BTreeSet::new(),
             worker_commands_tx,
             worker_shutdown: Some(worker_shutdown),
@@ -834,6 +847,7 @@ impl DashboardContext {
             resource_triggers_tx,
             resource: Feed::new(resource_updates_rx),
             capacity_targets_tx,
+            capacity_triggers_tx,
             capacity: Feed::new(capacity_updates_rx),
             aws_resource_options_tx,
             aws_options: Feed::new(aws_resource_options_rx),
@@ -1329,6 +1343,7 @@ impl DashboardContext {
         self.drain_quota_updates();
         self.drain_worker_updates();
         self.drain_runtime_lifecycles();
+        self.drain_runtime_config();
         schedule_due_credential_syncs(
             &mut self.credential_sync_signals,
             &self.credential_sync_handle,
@@ -1503,6 +1518,36 @@ impl DashboardContext {
         self.controller_changed = true;
     }
 
+    fn drain_runtime_config(&mut self) {
+        let mut latest = None;
+        while let Some(config) = self.runtime_config.next_ready() {
+            latest = Some(config);
+        }
+        let Some(config) = latest else {
+            return;
+        };
+        if config == self.controller.config || self.config_reload_in_flight {
+            return;
+        }
+        self.controller.config = config.clone();
+        self.dashboard.set_config(config);
+        self.refresh_poll_targets();
+        self.request_quota_refresh();
+        self.config_reload_in_flight = true;
+        let workspace_id = self.workspace_id.clone();
+        let client_id = self.client_id.clone();
+        spawn_io(
+            "reload daemon configuration",
+            self.dashboard_io_tx.clone(),
+            move || {
+                let mut controller = Controller::load()?;
+                retain_workspace_sessions(&mut controller, &workspace_id, &client_id)?;
+                Ok(controller)
+            },
+            DashboardIoUpdate::ConfigReloaded,
+        );
+    }
+
     fn drain_recovery_results(&mut self) {
         while let Some(result) = self.recovery.next_ready() {
             spawn_recovery_reload(result, self.dashboard_io_tx.clone());
@@ -1532,6 +1577,19 @@ impl DashboardContext {
                 update.result,
                 update.sampled_at_epoch_seconds,
             );
+        }
+    }
+
+    pub(crate) fn request_capacity_refresh(&mut self) {
+        self.dashboard.begin_capacity_refresh();
+        match self.capacity_triggers_tx.try_send(()) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                self.dashboard.set_notice("Refreshing target capacity…");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                self.dashboard
+                    .set_notice("Could not refresh target capacity: poller stopped.");
+            }
         }
     }
 

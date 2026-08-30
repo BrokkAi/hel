@@ -13,16 +13,34 @@ mod test_support;
 mod worker_binary;
 mod worktree;
 
-use std::fs::{File, OpenOptions};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 
 use crate::hel_config::{
-    HelConfig, SshConnection, TargetTemplate, container_size_host, data_dir,
-    is_bare_project_target, mount_history_host,
+    HelConfig, SshConnection, TargetTemplate, atomic_write, config_path, container_size_host,
+    data_dir, is_bare_project_target, mount_history_host,
 };
+
+const CONFIG_RENAME_JOURNAL: &str = "config-rename.json";
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConfigRenameKind {
+    Profile,
+    Target,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigRenameJournal {
+    kind: ConfigRenameKind,
+    old_id: String,
+    new_id: String,
+}
 use crate::hel_local_git::dirty_local_repositories;
 use crate::hel_state::{
     HelState, HostContainerSize, SessionRecord, SessionResourceAllocation, SessionState,
@@ -467,6 +485,143 @@ impl Controller {
         Ok(title)
     }
 
+    pub fn rename_profile_id(&mut self, old_id: &str, new_id: &str) -> Result<()> {
+        crate::hel_config::validate_id("profile", new_id)?;
+        ensure!(
+            self.config.profiles.contains_key(old_id),
+            "unknown profile {old_id:?}"
+        );
+        ensure!(
+            old_id == new_id || !self.config.profiles.contains_key(new_id),
+            "profile {new_id:?} already exists"
+        );
+        if old_id == new_id {
+            return Ok(());
+        }
+        let journal = ConfigRenameJournal {
+            kind: ConfigRenameKind::Profile,
+            old_id: old_id.to_owned(),
+            new_id: new_id.to_owned(),
+        };
+        write_config_rename_journal(&journal)?;
+        let previous = self.config.clone();
+        let profile = self
+            .config
+            .profiles
+            .remove(old_id)
+            .expect("profile checked");
+        self.config.profiles.insert(new_id.to_owned(), profile);
+        if let Err(error) = self.config.save() {
+            self.config = previous;
+            remove_config_rename_journal()
+                .context("remove profile rename journal after config save failed")?;
+            return Err(error).context("save renamed profile configuration");
+        }
+        if let Err(error) = crate::hel_database::rename_profile_references(old_id, new_id) {
+            if let Err(restore_error) = previous.save() {
+                return Err(error).context(format!(
+                    "rename profile references; additionally failed to restore config: {restore_error:#}"
+                ));
+            }
+            self.config = previous;
+            remove_config_rename_journal()?;
+            return Err(error).context("rename profile references");
+        }
+        for session in self.state.sessions.values_mut() {
+            if session.last_profile == old_id {
+                session.last_profile = new_id.to_owned();
+            }
+        }
+        remove_config_rename_journal()?;
+        Ok(())
+    }
+
+    pub fn rename_target_id(&mut self, old_id: &str, new_id: &str) -> Result<()> {
+        crate::hel_config::validate_id("target template", new_id)?;
+        ensure!(
+            self.config.targets.contains_key(old_id),
+            "unknown target {old_id:?}"
+        );
+        ensure!(
+            old_id == new_id || !self.config.targets.contains_key(new_id),
+            "target {new_id:?} already exists"
+        );
+        if old_id == new_id {
+            return Ok(());
+        }
+        let journal = ConfigRenameJournal {
+            kind: ConfigRenameKind::Target,
+            old_id: old_id.to_owned(),
+            new_id: new_id.to_owned(),
+        };
+        write_config_rename_journal(&journal)?;
+        let previous = self.config.clone();
+        let target = self.config.targets.remove(old_id).expect("target checked");
+        self.config.targets.insert(new_id.to_owned(), target);
+        if let Err(error) = self.config.save() {
+            self.config = previous;
+            remove_config_rename_journal()
+                .context("remove target rename journal after config save failed")?;
+            return Err(error).context("save renamed target configuration");
+        }
+        if let Err(error) = crate::hel_database::rename_target_references(old_id, new_id) {
+            if let Err(restore_error) = previous.save() {
+                return Err(error).context(format!(
+                    "rename target references; additionally failed to restore config: {restore_error:#}"
+                ));
+            }
+            self.config = previous;
+            remove_config_rename_journal()?;
+            return Err(error).context("rename target references");
+        }
+        for session in self.state.sessions.values_mut() {
+            if session.target_template_id == old_id {
+                session.target_template_id = new_id.to_owned();
+            }
+        }
+        remove_config_rename_journal()?;
+        Ok(())
+    }
+
+    /// Finish a profile/target id rename interrupted between the atomic config
+    /// replacement and SQLite transaction. Each step is idempotent, so a
+    /// second crash leaves the same intent available for the next startup.
+    pub fn recover_config_id_rename() -> Result<bool> {
+        let path = config_rename_journal_path();
+        let body = match fs::read(&path) {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context(format!("read {}", path.display())),
+        };
+        let journal: ConfigRenameJournal =
+            serde_json::from_slice(&body).with_context(|| format!("parse {}", path.display()))?;
+        let mut config = HelConfig::load_from(&config_path())?;
+        match journal.kind {
+            ConfigRenameKind::Profile => {
+                finish_config_map_rename(
+                    &mut config.profiles,
+                    &journal.old_id,
+                    &journal.new_id,
+                    "profile",
+                )?;
+                config.save()?;
+                crate::hel_database::rename_profile_references(&journal.old_id, &journal.new_id)?;
+            }
+            ConfigRenameKind::Target => {
+                finish_config_map_rename(
+                    &mut config.targets,
+                    &journal.old_id,
+                    &journal.new_id,
+                    "target",
+                )?;
+                config.save()?;
+                crate::hel_database::rename_target_references(&journal.old_id, &journal.new_id)?;
+            }
+        }
+        remove_config_rename_journal()?;
+        Ok(true)
+    }
+
     /// Record the per-session container size overrides and attached
     /// directories. Nothing is applied to a running container: the values are
     /// read the next time the session's container is created.
@@ -521,6 +676,46 @@ impl Controller {
         record.updated_at = updated_at;
         Ok(())
     }
+}
+
+fn config_rename_journal_path() -> PathBuf {
+    data_dir().join(CONFIG_RENAME_JOURNAL)
+}
+
+fn write_config_rename_journal(journal: &ConfigRenameJournal) -> Result<()> {
+    let path = config_rename_journal_path();
+    let body = serde_json::to_vec(journal).context("serialize config rename journal")?;
+    atomic_write(&path, &body).with_context(|| format!("write {}", path.display()))
+}
+
+fn remove_config_rename_journal() -> Result<()> {
+    let path = config_rename_journal_path();
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn finish_config_map_rename<T>(
+    entries: &mut BTreeMap<String, T>,
+    old_id: &str,
+    new_id: &str,
+    kind: &str,
+) -> Result<()> {
+    if let Some(entry) = entries.remove(old_id) {
+        ensure!(
+            !entries.contains_key(new_id),
+            "cannot recover {kind} rename: both {old_id:?} and {new_id:?} exist"
+        );
+        entries.insert(new_id.to_owned(), entry);
+    } else {
+        ensure!(
+            entries.contains_key(new_id),
+            "cannot recover {kind} rename: neither {old_id:?} nor {new_id:?} exists"
+        );
+    }
+    Ok(())
 }
 
 fn target_kind(locator: &hel_targets::TargetLocator) -> &'static str {
@@ -801,6 +996,7 @@ mod tests {
             ])
             .env(marker, "1")
             .env("HEL_DATA_DIR", data_directory)
+            .env("HEL_CONFIG_DIR", data_directory)
             .output()
             .unwrap();
         assert!(
@@ -812,6 +1008,51 @@ mod tests {
     }
 
     const UNPERSISTABLE_SESSION_CHILD: &str = "HEL_TEST_UNPERSISTABLE_SESSION_CHILD";
+
+    const CONFIG_ID_RENAME_CHILD: &str = "HEL_TEST_CONFIG_ID_RENAME_CHILD";
+
+    #[test]
+    fn configuration_id_rename_rewrites_durable_session_references() {
+        if std::env::var_os(CONFIG_ID_RENAME_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            run_registration_child(
+                CONFIG_ID_RENAME_CHILD,
+                "configuration_id_rename_rewrites_durable_session_references",
+                directory.path(),
+            );
+            return;
+        }
+
+        let mut controller = Controller {
+            config: registration_config(),
+            state: HelState::default(),
+        };
+        controller.config.save().unwrap();
+        let session_id = controller
+            .register_session_with_resources(
+                "codex",
+                "project",
+                "podman",
+                "rename references",
+                launch_options(Vec::new()),
+            )
+            .unwrap();
+
+        controller
+            .rename_profile_id("codex", "codex-renamed")
+            .unwrap();
+        controller
+            .rename_target_id("podman", "podman-renamed")
+            .unwrap();
+
+        let loaded = Controller::load().unwrap();
+        let session = &loaded.state.sessions[&session_id];
+        assert_eq!(session.last_profile, "codex-renamed");
+        assert_eq!(session.target_template_id, "podman-renamed");
+        assert!(loaded.config.profiles.contains_key("codex-renamed"));
+        assert!(loaded.config.targets.contains_key("podman-renamed"));
+        assert!(!config_rename_journal_path().exists());
+    }
 
     #[test]
     fn a_session_the_database_rejects_is_never_left_in_memory() {

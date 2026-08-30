@@ -10,13 +10,15 @@ use anyhow::{Result, bail};
 use hel::hel_controller::{Controller, ResumeRepositorySourceReceipt};
 use hel::hel_setup::SetupOutcome;
 use hel::hel_targets::CancellableProcessExecutor;
+use hel_tui::WebViewerAccess;
 use hel_tui::{DashboardAction, SessionOperationKind};
 
 use crate::daemon;
 use crate::dashboard::io::{
-    ArchiveWriteTarget, ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest,
-    ResumeRepositoryPreflightApply, config_only_controller, spawn_archive_write,
-    spawn_cancellable_io, spawn_clipboard_read, spawn_create_bundle,
+    ArchiveWriteTarget, ConfigRenameRequest, ContainerSettingsRequest, DashboardIoUpdate,
+    LifecycleOperationRequest, ResumeRepositoryPreflightApply, config_only_controller,
+    spawn_archive_write, spawn_cancellable_io, spawn_cancellable_io_with_token,
+    spawn_clipboard_read, spawn_config_rename, spawn_create_bundle,
     spawn_dashboard_container_settings, spawn_dashboard_create_session, spawn_dashboard_rename,
     spawn_io, spawn_lifecycle_operation,
 };
@@ -63,6 +65,96 @@ pub(crate) async fn apply_dashboard_action(
         DashboardAction::RefreshQuotas => {
             context.manual_quota_refresh_generation = Some(context.request_quota_refresh());
             context.dashboard.set_notice(QUOTA_REFRESH_NOTICE);
+        }
+        DashboardAction::RefreshCapacity => context.request_capacity_refresh(),
+        DashboardAction::LoadWebAccess => {
+            let updates = context.dashboard_io_tx.clone();
+            tokio::spawn(async move {
+                let access = match async {
+                    let mut daemon = daemon::connect_existing().await?;
+                    daemon.status().await
+                }
+                .await
+                {
+                    Ok(status) => match status.phone_status {
+                        daemon::WebViewerStatus::Ready {
+                            viewer_url,
+                            viewer_code,
+                            qr_login_url,
+                            fallback_reason,
+                        } => WebViewerAccess::Ready {
+                            viewer_url,
+                            viewer_code,
+                            qr_login_url,
+                            fallback_reason,
+                        },
+                        other => WebViewerAccess::Unavailable(other.to_string()),
+                    },
+                    Err(error) => WebViewerAccess::Unavailable(format!(
+                        "Could not load web viewer access: {error:#}"
+                    )),
+                };
+                if let Err(error) = updates.send(DashboardIoUpdate::WebAccess(access)) {
+                    tracing::debug!(%error, "web viewer access result dropped after dashboard shutdown");
+                }
+            });
+        }
+        DashboardAction::TestTarget { target_id } => {
+            let config = context.controller.config.clone();
+            let reported_id = target_id.clone();
+            let (cancelled, _) = spawn_cancellable_io_with_token(
+                context.critical_operations.clone(),
+                format!("testing target {target_id}"),
+                context.dashboard_io_tx.clone(),
+                move |cancelled| {
+                    if cancelled.load(Ordering::Acquire) {
+                        anyhow::bail!("target test cancelled");
+                    }
+                    let executor = CancellableProcessExecutor::new(cancelled)
+                        .with_deadline(std::time::Duration::from_secs(15));
+                    config_only_controller(config).test_target(&target_id, &executor)
+                },
+                move |result| DashboardIoUpdate::TargetTest {
+                    target_id: reported_id,
+                    result,
+                },
+            );
+            context.target_test_cancel = Some(cancelled);
+        }
+        DashboardAction::CancelTargetTest => {
+            if let Some(cancelled) = context.target_test_cancel.take() {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
+        DashboardAction::RenameProfile { old_id, new_id } => {
+            let what = format!("profile {old_id} to {new_id}");
+            spawn_config_rename(
+                ConfigRenameRequest {
+                    what,
+                    old_id,
+                    new_id,
+                    profile: true,
+                    workspace_id: context.workspace_id.clone(),
+                    client_id: context.client_id.clone(),
+                },
+                context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
+            );
+        }
+        DashboardAction::RenameTarget { old_id, new_id } => {
+            let what = format!("target {old_id} to {new_id}");
+            spawn_config_rename(
+                ConfigRenameRequest {
+                    what,
+                    old_id,
+                    new_id,
+                    profile: false,
+                    workspace_id: context.workspace_id.clone(),
+                    client_id: context.client_id.clone(),
+                },
+                context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
+            );
         }
         DashboardAction::PasteFromClipboard => {
             if !context.clipboard_read_in_flight {

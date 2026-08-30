@@ -969,11 +969,13 @@ async fn collect_session_resource_usage(
 
 pub(crate) fn spawn_dashboard_capacity_poller() -> (
     tokio::sync::watch::Sender<Vec<DeploymentCapacityTarget>>,
+    tokio::sync::mpsc::Sender<()>,
     tokio::sync::mpsc::Receiver<CapacityPollUpdate>,
 ) {
     let (targets_tx, mut targets_rx) =
         tokio::sync::watch::channel(Vec::<DeploymentCapacityTarget>::new());
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(64);
+    let (triggers_tx, mut triggers_rx) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {
         let mut targets = Vec::new();
         let mut interval = tokio::time::interval(CAPACITY_POLL_INTERVAL);
@@ -991,10 +993,16 @@ pub(crate) fn spawn_dashboard_capacity_poller() -> (
                     targets = targets_rx.borrow_and_update().clone();
                     schedule_capacity_samples(&targets, &updates_tx);
                 }
+                trigger = triggers_rx.recv() => {
+                    if trigger.is_none() {
+                        break;
+                    }
+                    schedule_capacity_samples(&targets, &updates_tx);
+                }
             }
         }
     });
-    (targets_tx, updates_rx)
+    (targets_tx, triggers_tx, updates_rx)
 }
 
 fn schedule_capacity_samples(
@@ -1159,6 +1167,7 @@ pub(crate) struct RemoteDashboardWorkerPoller {
     pub(crate) control: SessionManagerControl,
     pub(crate) shutdown: SessionManagerShutdown,
     pub(crate) lifecycles: tokio::sync::watch::Receiver<Vec<daemon::RuntimeLifecycleView>>,
+    pub(crate) config: tokio::sync::watch::Receiver<hel::hel_config::HelConfig>,
 }
 
 pub(crate) fn spawn_remote_dashboard_worker_poller(
@@ -1174,6 +1183,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         mut requests,
     } = channels;
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::watch::channel(Vec::new());
+    let (config_tx, config_rx) = tokio::sync::watch::channel(hel::hel_config::HelConfig::default());
     tokio::spawn(async move {
         let mut revision = 0_u64;
         let mut requests_open = true;
@@ -1190,6 +1200,14 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                     match snapshot {
                         Ok(snapshot) => {
                             revision = revision.max(snapshot.revision);
+                            config_tx.send_if_modified(|config| {
+                                if *config == snapshot.config {
+                                    false
+                                } else {
+                                    *config = snapshot.config.clone();
+                                    true
+                                }
+                            });
                             lifecycle_tx.send_replace(snapshot.lifecycles);
                             for runtime in snapshot.sessions {
                                 let session_id = runtime.session_id.clone();
@@ -1275,6 +1293,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         control,
         shutdown,
         lifecycles: lifecycle_rx,
+        config: config_rx,
     })
 }
 

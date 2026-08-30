@@ -3,6 +3,8 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
+use qrcode::QrCode;
+use qrcode::types::{Color as QrColor, EcLevel};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -21,8 +23,8 @@ use crate::widgets::{
 };
 use crate::wizards::read_only_marker;
 use crate::{
-    ButtonKey, DashboardAction, DashboardState, Mode, button_row_key, cycle_button_focus,
-    cycle_control, move_index,
+    ButtonKey, DashboardAction, DashboardState, Mode, WebViewerAccess, button_row_key,
+    cycle_button_focus, cycle_control, move_index,
 };
 
 pub(crate) const FORCE_STOP_CONFIRMATION: &str = "STOP";
@@ -60,6 +62,85 @@ pub(crate) struct RenameEditor {
     pub(crate) session_id: String,
     pub(crate) title: TextInput,
     pub(crate) focus: RenameFocus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionEditDialog {
+    pub(crate) session_id: String,
+    pub(crate) container_backed: bool,
+    pub(crate) focus: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigEntryKind {
+    Profile,
+    Target,
+}
+
+impl ConfigEntryKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::Target => "target",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigIdEditor {
+    pub(crate) kind: ConfigEntryKind,
+    pub(crate) old_id: String,
+    pub(crate) value: TextInput,
+    pub(crate) focus: RenameFocus,
+    pub(crate) return_to_targets: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetActionsDialog {
+    pub(crate) target_ids: Vec<String>,
+    pub(crate) target_index: usize,
+    pub(crate) focus: usize,
+    pub(crate) testing: Option<String>,
+    pub(crate) result: Option<(String, Result<(), String>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebDialog {
+    pub(crate) loading: bool,
+    pub(crate) viewer_url: Option<String>,
+    pub(crate) viewer_code: Option<String>,
+    pub(crate) fallback_reason: Option<String>,
+    pub(crate) message: Option<String>,
+    pub(crate) qr: Option<String>,
+}
+
+impl WebDialog {
+    pub(crate) fn loading() -> Self {
+        Self {
+            loading: true,
+            viewer_url: None,
+            viewer_code: None,
+            fallback_reason: None,
+            message: None,
+            qr: None,
+        }
+    }
+}
+
+const TARGET_ACTION_BUTTONS: &[&str] = &["Rename", "Test", "Close"];
+
+impl SessionEditDialog {
+    fn actions(&self) -> &'static [&'static str] {
+        if self.container_backed {
+            &["Rename", "Container settings", "Stop", "Cancel"]
+        } else {
+            &["Rename", "Stop", "Cancel"]
+        }
+    }
+
+    fn stop_index(&self) -> usize {
+        usize::from(self.container_backed) + 1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,6 +742,258 @@ pub(crate) fn render_rename_editor(
     frame.render_widget(paragraph, popup);
 }
 
+pub(crate) fn render_session_edit(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &SessionEditDialog,
+    surfaces: &mut FrameSurfaces,
+) {
+    let actions = dialog.actions();
+    let paragraph = Paragraph::new(vec![
+        Line::raw(format!("Session: {}", dialog.session_id)),
+        Line::raw(""),
+        focused_buttons(actions, dialog.focus),
+        Line::raw(""),
+        Line::styled(
+            "Left/Right or Tab selects · Enter opens · Esc closes",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Edit session "),
+    );
+    let popup = centered_modal(surfaces, 72, popup_height(&paragraph, 72, 8, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+pub(crate) fn render_config_id_editor(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &ConfigIdEditor,
+    surfaces: &mut FrameSurfaces,
+) {
+    let paragraph = Paragraph::new(vec![
+        Line::raw(format!(
+            "Current {} ID: {}",
+            editor.kind.label(),
+            editor.old_id
+        )),
+        Line::raw(""),
+        Line::styled(
+            if editor.focus == RenameFocus::Field {
+                editor.value.with_cursor_marker("▏")
+            } else {
+                editor.value.to_string()
+            },
+            Style::default().fg(Color::Cyan),
+        ),
+        Line::raw(""),
+        focused_buttons(RENAME_BUTTONS, editor.focus.button_index()),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Rename {} ID ", editor.kind.label())),
+    );
+    let popup = centered_modal(surfaces, 60, popup_height(&paragraph, 60, 8, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+pub(crate) fn render_target_actions(
+    frame: &mut Frame,
+    area: Rect,
+    dashboard: &DashboardState,
+    dialog: &TargetActionsDialog,
+    surfaces: &mut FrameSurfaces,
+) {
+    let mut lines = dialog
+        .target_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let kind = dashboard
+                .config
+                .targets
+                .get(id)
+                .map(target_kind_label)
+                .unwrap_or("missing");
+            Line::styled(
+                format!(
+                    "{} {id:<24} {kind}",
+                    if index == dialog.target_index {
+                        '›'
+                    } else {
+                        ' '
+                    }
+                ),
+                if index == dialog.target_index {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::raw("No targets configured."));
+    }
+    lines.push(Line::raw(""));
+    if let Some(target_id) = &dialog.testing {
+        lines.push(Line::styled(
+            format!("Testing {target_id}…"),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if let Some((target_id, result)) = &dialog.result {
+        lines.push(Line::styled(
+            match result {
+                Ok(()) => format!("{target_id}: ready"),
+                Err(error) => format!("{target_id}: {error}"),
+            },
+            Style::default().fg(if result.is_ok() {
+                Color::Green
+            } else {
+                Color::Yellow
+            }),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(focused_buttons(TARGET_ACTION_BUTTONS, dialog.focus));
+    lines.push(Line::styled(
+        "Up/Down selects target · Tab selects action · Esc closes",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Target actions "),
+        )
+        .wrap(Wrap { trim: false });
+    let popup = centered_modal(surfaces, 72, popup_height(&paragraph, 72, 12, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+fn target_kind_label(target: &hel::hel_config::TargetTemplate) -> &'static str {
+    match target {
+        hel::hel_config::TargetTemplate::LocalBare => "local bare",
+        hel::hel_config::TargetTemplate::LocalPodman { .. } => "local Podman",
+        hel::hel_config::TargetTemplate::AppleContainer { .. } => "Apple container",
+        hel::hel_config::TargetTemplate::AwsEc2 { .. } => "AWS EC2",
+        hel::hel_config::TargetTemplate::SshBare { .. } => "SSH bare",
+        hel::hel_config::TargetTemplate::SshPodman { .. } => "SSH Podman",
+    }
+}
+
+pub(crate) fn render_web_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &WebDialog,
+    surfaces: &mut FrameSurfaces,
+) {
+    let mut lines = Vec::new();
+    if dialog.loading {
+        lines.push(Line::styled(
+            "Loading web viewer access…",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if let Some(message) = &dialog.message {
+        lines.push(Line::styled(
+            message.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else {
+        if let Some(qr) = &dialog.qr {
+            let qr_width = qr
+                .lines()
+                .map(str::chars)
+                .map(Iterator::count)
+                .max()
+                .unwrap_or(0);
+            let qr_height = qr.lines().count();
+            if usize::from(area.width) >= qr_width + 6 && usize::from(area.height) >= qr_height + 10
+            {
+                lines.extend(qr.lines().map(|line| Line::raw(line.to_owned())));
+                lines.push(Line::raw(""));
+            } else {
+                lines.push(Line::styled(
+                    "Terminal is too small for a scannable QR code.",
+                    Style::default().fg(Color::Yellow),
+                ));
+                lines.push(Line::raw(""));
+            }
+        }
+        if let Some(url) = &dialog.viewer_url {
+            lines.push(Line::raw(format!("Web: {url}")));
+        }
+        if let Some(code) = &dialog.viewer_code {
+            lines.push(Line::raw(format!("Viewer code: {code}")));
+        }
+        if let Some(reason) = &dialog.fallback_reason {
+            lines.push(Line::styled(
+                format!("Local fallback: {reason}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Enter or Esc closes",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" Web viewer "))
+        .wrap(Wrap { trim: false });
+    let width = dialog
+        .qr
+        .as_deref()
+        .and_then(|qr| qr.lines().map(str::chars).map(Iterator::count).max())
+        .and_then(|width| u16::try_from(width + 4).ok())
+        .unwrap_or(72)
+        .max(52);
+    let popup = centered_modal(
+        surfaces,
+        width,
+        popup_height(&paragraph, width, 10, area),
+        area,
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_qr(data: &str) -> Result<String, String> {
+    const QUIET_ZONE: usize = 4;
+    let qr = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)
+        .map_err(|error| format!("encode web login QR: {error}"))?;
+    let total = qr.width() + QUIET_ZONE * 2;
+    let mut output = String::new();
+    for y in (0..total).step_by(2) {
+        for x in 0..total {
+            let module = |x: usize, y: usize| {
+                let Some(x) = x.checked_sub(QUIET_ZONE) else {
+                    return false;
+                };
+                let Some(y) = y.checked_sub(QUIET_ZONE) else {
+                    return false;
+                };
+                x < qr.width() && y < qr.width() && qr[(x, y)] == QrColor::Dark
+            };
+            output.push(match (module(x, y), module(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 pub(crate) fn render_repository_origin(
     frame: &mut Frame,
     area: Rect,
@@ -831,6 +1164,274 @@ pub(crate) fn render_confirmation(
 }
 
 impl DashboardState {
+    pub fn apply_web_access(&mut self, access: WebViewerAccess) {
+        let dialog = match access {
+            WebViewerAccess::Ready {
+                viewer_url,
+                viewer_code,
+                qr_login_url,
+                fallback_reason,
+            } => {
+                let (qr, message) = match qr_login_url {
+                    Some(url) => match render_qr(&url) {
+                        Ok(qr) => (Some(qr), None),
+                        Err(error) => (None, Some(error)),
+                    },
+                    None => (None, None),
+                };
+                WebDialog {
+                    loading: false,
+                    viewer_url: Some(viewer_url),
+                    viewer_code: Some(viewer_code),
+                    fallback_reason,
+                    message,
+                    qr,
+                }
+            }
+            WebViewerAccess::Unavailable(message) => WebDialog {
+                loading: false,
+                viewer_url: None,
+                viewer_code: None,
+                fallback_reason: None,
+                message: Some(message),
+                qr: None,
+            },
+        };
+        if matches!(self.mode, Mode::Web(_)) {
+            self.mode = Mode::Web(dialog);
+        }
+    }
+
+    pub(crate) fn begin_profile_rename(&mut self) {
+        let Some(old_id) = self.config.profiles.keys().nth(self.quota_index).cloned() else {
+            self.notices.set("No profile is selected.");
+            return;
+        };
+        self.mode = Mode::ConfigId(ConfigIdEditor {
+            kind: ConfigEntryKind::Profile,
+            value: TextInput::from_value(old_id.clone()).with_max_chars(64),
+            old_id,
+            focus: RenameFocus::Field,
+            return_to_targets: false,
+        });
+    }
+
+    pub(crate) fn begin_target_actions(&mut self) {
+        let preferred = self
+            .capacity_details
+            .values()
+            .nth(self.capacity_index)
+            .and_then(|detail| detail.target.target_ids.first())
+            .cloned();
+        let target_ids = self.config.targets.keys().cloned().collect::<Vec<_>>();
+        let target_index = preferred
+            .as_ref()
+            .and_then(|id| target_ids.iter().position(|candidate| candidate == id))
+            .unwrap_or(0);
+        self.mode = Mode::TargetActions(TargetActionsDialog {
+            target_ids,
+            target_index,
+            focus: 0,
+            testing: None,
+            result: None,
+        });
+    }
+
+    pub(crate) fn handle_target_actions_key(
+        &mut self,
+        key: KeyEvent,
+        mut dialog: TargetActionsDialog,
+    ) -> DashboardAction {
+        if dialog.testing.is_some()
+            && crate::dashboard_accelerator(key.modifiers)
+            && key.code == KeyCode::Char('x')
+        {
+            dialog.testing = None;
+            dialog.result = Some(("Target test".into(), Err("cancelled".into())));
+            self.mode = Mode::TargetActions(dialog);
+            return DashboardAction::CancelTargetTest;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_index(&mut dialog.target_index, dialog.target_ids.len(), -1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_index(&mut dialog.target_index, dialog.target_ids.len(), 1);
+            }
+            KeyCode::Tab | KeyCode::Right => {
+                dialog.focus = cycle_button_focus(dialog.focus, TARGET_ACTION_BUTTONS.len(), false);
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                dialog.focus = cycle_button_focus(dialog.focus, TARGET_ACTION_BUTTONS.len(), true);
+            }
+            KeyCode::Enter => {
+                let Some(target_id) = dialog.target_ids.get(dialog.target_index).cloned() else {
+                    self.cancel_modal();
+                    return DashboardAction::None;
+                };
+                match dialog.focus {
+                    0 => {
+                        self.mode = Mode::ConfigId(ConfigIdEditor {
+                            kind: ConfigEntryKind::Target,
+                            value: TextInput::from_value(target_id.clone()).with_max_chars(64),
+                            old_id: target_id,
+                            focus: RenameFocus::Field,
+                            return_to_targets: true,
+                        });
+                        return DashboardAction::None;
+                    }
+                    1 if dialog.testing.is_none() => {
+                        dialog.testing = Some(target_id.clone());
+                        dialog.result = None;
+                        self.mode = Mode::TargetActions(dialog);
+                        return DashboardAction::TestTarget { target_id };
+                    }
+                    2 => {
+                        self.cancel_modal();
+                        return DashboardAction::None;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::TargetActions(dialog);
+        DashboardAction::None
+    }
+
+    pub(crate) fn handle_config_id_key(
+        &mut self,
+        key: KeyEvent,
+        mut editor: ConfigIdEditor,
+    ) -> DashboardAction {
+        match key.code {
+            KeyCode::Esc => {
+                if editor.return_to_targets {
+                    self.begin_target_actions();
+                } else {
+                    self.cancel_modal();
+                }
+                DashboardAction::None
+            }
+            KeyCode::Enter if editor.focus == RenameFocus::Cancel => {
+                if editor.return_to_targets {
+                    self.begin_target_actions();
+                } else {
+                    self.cancel_modal();
+                }
+                DashboardAction::None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                editor.focus = cycle_control(
+                    editor.focus,
+                    &RENAME_FOCUS_ORDER,
+                    key.code == KeyCode::BackTab,
+                );
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+            KeyCode::Left | KeyCode::Right if editor.focus != RenameFocus::Field => {
+                editor.focus = RenameFocus::from_button_index(cycle_button_focus(
+                    editor.focus.button_index(),
+                    RENAME_BUTTONS.len(),
+                    key.code == KeyCode::Left,
+                ));
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+            KeyCode::Enter if editor.value.trim().is_empty() => {
+                self.notices.set("Configuration ID cannot be empty.");
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+            KeyCode::Enter => {
+                self.cancel_modal();
+                match editor.kind {
+                    ConfigEntryKind::Profile => DashboardAction::RenameProfile {
+                        old_id: editor.old_id,
+                        new_id: editor.value.into_value(),
+                    },
+                    ConfigEntryKind::Target => DashboardAction::RenameTarget {
+                        old_id: editor.old_id,
+                        new_id: editor.value.into_value(),
+                    },
+                }
+            }
+            _ if editor.focus == RenameFocus::Field => {
+                editor.value.handle_key(key);
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+            _ => {
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+        }
+    }
+
+    pub fn apply_target_test(&mut self, target_id: String, result: Result<(), String>) {
+        if let Mode::TargetActions(dialog) = &mut self.mode
+            && dialog.testing.as_deref() == Some(&target_id)
+        {
+            dialog.testing = None;
+            dialog.result = Some((target_id, result));
+        }
+    }
+
+    pub(crate) fn begin_session_edit(&mut self) {
+        if self.reject_selected_operation() {
+            return;
+        }
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        self.mode = Mode::SessionEdit(SessionEditDialog {
+            session_id: session.id.clone(),
+            container_backed: self.selected_container_session().is_some(),
+            focus: 0,
+        });
+    }
+
+    pub(crate) fn handle_session_edit_key(
+        &mut self,
+        key: KeyEvent,
+        mut dialog: SessionEditDialog,
+    ) -> DashboardAction {
+        let actions = dialog.actions();
+        match button_row_key(key.code, dialog.focus, actions.len()) {
+            ButtonKey::Focus(focus) => dialog.focus = focus,
+            ButtonKey::Cancel => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            ButtonKey::Activate(0) => {
+                self.begin_rename();
+                return DashboardAction::None;
+            }
+            ButtonKey::Activate(index) if dialog.container_backed && index == 1 => {
+                self.begin_container_edit();
+                return DashboardAction::None;
+            }
+            ButtonKey::Activate(index) if index == dialog.stop_index() => {
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
+                    session_id: dialog.session_id,
+                }));
+                return DashboardAction::None;
+            }
+            ButtonKey::Activate(_) => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            ButtonKey::Ignored => {}
+        }
+        self.mode = Mode::SessionEdit(dialog);
+        DashboardAction::None
+    }
+
     pub fn show_repository_origin_dialog(
         &mut self,
         session_id: String,
@@ -1388,6 +1989,17 @@ mod tests {
     use crate::render::render;
     use crate::{DashboardAction, DashboardState, Mode};
 
+    #[test]
+    fn web_qr_has_a_four_module_quiet_zone() {
+        let qr = render_qr("https://example.test/auth/login?token=secret").unwrap();
+        let lines = qr.lines().collect::<Vec<_>>();
+        assert!(lines.len() > 4);
+        assert!(lines[0].chars().all(|character| character == ' '));
+        assert!(lines[1].chars().all(|character| character == ' '));
+        assert!(lines.iter().all(|line| line.starts_with("    ")));
+        assert!(lines.iter().all(|line| line.ends_with("    ")));
+    }
+
     fn dashboard_with_container_session() -> DashboardState {
         let mut session = running_session();
         session.additional_mounts = vec![AdditionalMount {
@@ -1410,6 +2022,38 @@ mod tests {
         editor
     }
 
+    fn open_container_editor(dashboard: &mut DashboardState) {
+        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Right));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(dashboard.mode, Mode::EditContainer(_)));
+    }
+
+    fn open_rename_editor(dashboard: &mut DashboardState) {
+        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(dashboard.mode, Mode::Rename(_)));
+    }
+
+    fn open_stop_dialog(dashboard: &mut DashboardState) {
+        dashboard.handle_key(ctrl_key('e'));
+        let stop_index = match &dashboard.mode {
+            Mode::SessionEdit(dialog) => dialog.stop_index(),
+            _ => panic!("expected session edit dialog"),
+        };
+        for _ in 0..stop_index {
+            dashboard.handle_key(key(KeyCode::Right));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            dashboard.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::Close { .. },
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn ctrl_e_opens_the_container_editor_only_once_setup_is_done() {
         let mut empty = DashboardState::new(
@@ -1427,7 +2071,7 @@ mod tests {
         assert!(matches!(empty.mode, Mode::Dashboard));
 
         let mut dashboard = dashboard_with_container_session();
-        assert_eq!(dashboard.handle_key(ctrl_key('e')), DashboardAction::None);
+        open_container_editor(&mut dashboard);
         let editor = container_editor(&dashboard);
         assert_eq!(editor.session_id, "session-1");
         assert_eq!(editor.mounts.len(), 1);
@@ -1437,7 +2081,7 @@ mod tests {
     #[test]
     fn container_editor_saves_edited_size_mounts_and_remembered_sources() {
         let mut dashboard = dashboard_with_container_session();
-        dashboard.handle_key(ctrl_key('e'));
+        open_container_editor(&mut dashboard);
         for character in "4".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
@@ -1509,7 +2153,7 @@ mod tests {
     #[test]
     fn container_editor_marks_new_and_existing_mounts_read_only() {
         let mut dashboard = dashboard_with_container_session();
-        dashboard.handle_key(ctrl_key('e'));
+        open_container_editor(&mut dashboard);
 
         // Space on the checkbox attaches the next directory read-only.
         while container_editor(&dashboard).focus != ContainerEditFocus::Source {
@@ -1568,7 +2212,7 @@ mod tests {
     #[test]
     fn container_editor_says_when_the_change_takes_effect() {
         let mut dashboard = dashboard_with_container_session();
-        dashboard.handle_key(ctrl_key('e'));
+        open_container_editor(&mut dashboard);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
         terminal
             .draw(|frame| crate::render::render(frame, &mut dashboard))
@@ -1581,7 +2225,7 @@ mod tests {
     #[test]
     fn rename_uses_acp_title_as_the_initial_value() {
         let mut dashboard = dashboard_with_session(running_session());
-        dashboard.handle_key(ctrl_key('r'));
+        open_rename_editor(&mut dashboard);
         let Mode::Rename(editor) = &dashboard.mode else {
             panic!("expected rename editor");
         };
@@ -1619,8 +2263,7 @@ mod tests {
 
     fn dashboard_with_rename_editor() -> DashboardState {
         let mut dashboard = dashboard_with_session(running_session());
-        dashboard.handle_key(ctrl_key('r'));
-        assert!(matches!(dashboard.mode, Mode::Rename(_)));
+        open_rename_editor(&mut dashboard);
         dashboard
     }
 
@@ -2018,7 +2661,7 @@ mod tests {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(ctrl_key('p'));
+        open_stop_dialog(&mut dashboard);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
@@ -2104,14 +2747,7 @@ mod tests {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(ctrl_key('p'));
-        assert!(matches!(
-            dashboard.mode,
-            Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::Close { .. },
-                ..
-            })
-        ));
+        open_stop_dialog(&mut dashboard);
         dashboard
     }
 

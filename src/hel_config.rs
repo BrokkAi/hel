@@ -15,13 +15,23 @@ fn default_phone_bind() -> String {
     "127.0.0.1:3765".to_owned()
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhoneConfig {
-    #[serde(default)]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
     #[serde(default = "default_phone_bind")]
     pub bind: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub tailscale_detect: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_cert: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,8 +41,9 @@ pub struct PhoneConfig {
 impl Default for PhoneConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             bind: default_phone_bind(),
+            tailscale_detect: true,
             tls_cert: None,
             tls_key: None,
         }
@@ -1482,10 +1493,39 @@ mod tests {
     #[test]
     fn missing_config_uses_clean_v1_defaults() {
         let directory = tempfile::tempdir().unwrap();
-        assert_eq!(
-            HelConfig::load_from(&directory.path().join("missing.toml")).unwrap(),
-            HelConfig::default()
-        );
+        let config = HelConfig::load_from(&directory.path().join("missing.toml")).unwrap();
+        assert_eq!(config, HelConfig::default());
+        assert!(config.phone.enabled);
+        assert!(config.phone.tailscale_detect);
+    }
+
+    #[test]
+    fn omitted_phone_fields_enable_the_web_viewer_and_tailscale_detection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "version = 1\n[phone]\nbind = \"127.0.0.1:4765\"\n").unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+
+        assert!(config.phone.enabled);
+        assert!(config.phone.tailscale_detect);
+        assert_eq!(config.phone.bind, "127.0.0.1:4765");
+    }
+
+    #[test]
+    fn explicit_web_viewer_opt_out_survives_serialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = HelConfig::default();
+        config.phone.enabled = false;
+        config.phone.tailscale_detect = false;
+
+        config.save_to(&path).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+
+        assert!(body.contains("enabled = false"), "{body}");
+        assert!(body.contains("tailscale_detect = false"), "{body}");
+        assert_eq!(HelConfig::load_from(&path).unwrap(), config);
     }
 
     #[test]

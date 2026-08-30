@@ -622,7 +622,7 @@ async fn daemon_command(args: DaemonArgs) -> Result<()> {
                 .context("Hel daemon is not running")?;
             let status = daemon.status().await?;
             println!(
-                "Hel daemon {} (version {}) started {}; {} attached client{}; phone {}",
+                "Hel daemon {} (version {}) started {}; {} attached client{}; web viewer {}",
                 status.pid,
                 status.build_version,
                 status.started_at,

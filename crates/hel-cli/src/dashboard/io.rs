@@ -24,7 +24,7 @@ use hel::hel_state::{
 use hel::hel_targets::CancellableProcessExecutor;
 use hel_tui::{
     DashboardAction, PreparedMaterializedSessionDetail, PreparedMaterializedSessionSummary,
-    SessionOperationKind,
+    SessionOperationKind, WebViewerAccess,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -70,6 +70,16 @@ pub(crate) enum DashboardIoUpdate {
         session_id: String,
         result: std::result::Result<Controller, String>,
     },
+    TargetTest {
+        target_id: String,
+        result: std::result::Result<(), String>,
+    },
+    ConfigRename {
+        what: String,
+        result: std::result::Result<Controller, String>,
+    },
+    ConfigReloaded(std::result::Result<Controller, String>),
+    WebAccess(WebViewerAccess),
     SetupReloaded(std::result::Result<Controller, String>),
     DetachedSessionState {
         session_id: String,
@@ -304,11 +314,25 @@ pub(crate) fn spawn_cancellable_io<T>(
 where
     T: Send + 'static,
 {
+    spawn_cancellable_io_with_token(tracker, label, updates, work, report).1
+}
+
+pub(crate) fn spawn_cancellable_io_with_token<T>(
+    tracker: CriticalOperationTracker,
+    label: impl Into<String>,
+    updates: UnboundedSender<DashboardIoUpdate>,
+    work: impl FnOnce(Arc<AtomicBool>) -> Result<T> + Send + 'static,
+    report: impl FnOnce(std::result::Result<T, String>) -> DashboardIoUpdate + Send + 'static,
+) -> (Arc<AtomicBool>, JoinHandle<()>)
+where
+    T: Send + 'static,
+{
     let label = label.into();
     let cancelled = Arc::new(AtomicBool::new(false));
     let guard = tracker.begin_cancellable(label.clone(), cancelled.clone());
-    tokio::task::spawn_blocking(move || {
-        let result = work(cancelled).map_err(|error| {
+    let worker_cancelled = cancelled.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let result = work(worker_cancelled).map_err(|error| {
             let error = format!("{error:#}");
             tracing::warn!(operation = %label, %error, "cancellable dashboard operation failed");
             error
@@ -317,7 +341,8 @@ where
             tracing::debug!(operation = %label, %error, "cancellable dashboard result dropped after shutdown");
         }
         drop(guard);
-    })
+    });
+    (cancelled, worker)
 }
 
 /// Reads the hidden-session set out of Hel's own database. Called when the
@@ -548,6 +573,54 @@ pub(crate) fn spawn_dashboard_rename(
             result,
         },
     );
+}
+
+pub(crate) struct ConfigRenameRequest {
+    pub(crate) what: String,
+    pub(crate) old_id: String,
+    pub(crate) new_id: String,
+    pub(crate) profile: bool,
+    pub(crate) workspace_id: String,
+    pub(crate) client_id: String,
+}
+
+pub(crate) fn spawn_config_rename(
+    request: ConfigRenameRequest,
+    updates: UnboundedSender<DashboardIoUpdate>,
+    tracker: CriticalOperationTracker,
+) {
+    let ConfigRenameRequest {
+        what,
+        old_id,
+        new_id,
+        profile,
+        workspace_id,
+        client_id,
+    } = request;
+    let guard = tracker.begin(format!("renaming {what}"));
+    tokio::spawn(async move {
+        let result = async {
+            let mut daemon = daemon::connect_existing().await?;
+            if profile {
+                daemon.rename_profile(old_id, new_id).await?;
+            } else {
+                daemon.rename_target(old_id, new_id).await?;
+            }
+            tokio::task::spawn_blocking(move || {
+                let mut controller = Controller::load()?;
+                super::retain_workspace_sessions(&mut controller, &workspace_id, &client_id)?;
+                Ok::<_, anyhow::Error>(controller)
+            })
+            .await
+            .context("configuration reload task panicked")?
+        }
+        .await
+        .map_err(|error: anyhow::Error| format!("{error:#}"));
+        drop(guard);
+        if let Err(error) = updates.send(DashboardIoUpdate::ConfigRename { what, result }) {
+            tracing::debug!(%error, "config rename result dropped after dashboard shutdown");
+        }
+    });
 }
 
 /// What the container editor asks the controller to persist.
@@ -1092,6 +1165,38 @@ impl DashboardContext {
                     short_id(&session_id)
                 )),
             },
+            DashboardIoUpdate::TargetTest { target_id, result } => {
+                self.target_test_cancel = None;
+                self.dashboard.apply_target_test(target_id, result);
+            }
+            DashboardIoUpdate::ConfigRename { what, result } => match result {
+                Ok(controller) => {
+                    self.controller = controller;
+                    self.dashboard.set_config(self.controller.config.clone());
+                    self.dashboard.set_state(self.controller.state.clone());
+                    self.refresh_poll_targets();
+                    self.request_quota_refresh();
+                    self.dashboard.set_notice(format!("Renamed {what}."));
+                }
+                Err(error) => self
+                    .dashboard
+                    .set_notice(format!("Could not rename {what}: {error}")),
+            },
+            DashboardIoUpdate::ConfigReloaded(result) => {
+                self.config_reload_in_flight = false;
+                match result {
+                    Ok(controller) => {
+                        self.controller = controller;
+                        self.dashboard.set_config(self.controller.config.clone());
+                        self.dashboard.set_state(self.controller.state.clone());
+                        self.refresh_poll_targets();
+                    }
+                    Err(error) => self
+                        .dashboard
+                        .set_notice(format!("Could not reload configuration: {error}")),
+                }
+            }
+            DashboardIoUpdate::WebAccess(access) => self.dashboard.apply_web_access(access),
             DashboardIoUpdate::SetupReloaded(result) => match result {
                 Ok(controller) => {
                     self.controller = controller;

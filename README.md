@@ -138,8 +138,8 @@ to build your own.
 3. In the dashboard, create a session: pick a profile, a repository bundle,
    and a target, then send your first prompt.
 4. Detach whenever you like (`Ctrl+Q`). The session keeps running and your
-   queued prompts keep executing. Reattach from the dashboard, or enable
-   `[phone]` and drive every workspace from the daemon's phone viewer.
+   queued prompts keep executing. Reattach from the dashboard, or open the
+   daemon-owned web viewer shown by `hel daemon status`.
 
 In an attached TUI or the phone viewer, start a message with `!` to run the
 rest as `bash -lc` inside that session's target. Shell commands run in the
@@ -154,10 +154,6 @@ setup; everything beyond that is edited in TOML. A minimal example:
 
 ```toml
 version = 1
-
-[phone]
-enabled = true
-bind = "127.0.0.1:3765"
 
 [profiles.codex-1]
 kind = "codex"
@@ -199,6 +195,34 @@ Target prerequisites and full option lists are covered in
 [docs/PODMAN.md](docs/PODMAN.md), [docs/SSH.md](docs/SSH.md), and
 [docs/AWS.md](docs/AWS.md).
 
+### Web viewer and Tailscale
+
+The daemon starts the authenticated web viewer by default. Run
+`hel daemon status` for its URL and six-digit login code. Without Tailscale it
+serves HTTP only on `127.0.0.1:3765`.
+
+When the local Tailscale node has MagicDNS and HTTPS Certificates enabled, Hel
+automatically requests the node's trusted `ts.net` certificate and serves HTTPS
+on all interfaces at the same port. Certificate issuance runs in the background
+and may take about 30 seconds the first time; certificates renew daily without a
+daemon restart. If HTTPS Certificates are unavailable, the status output keeps
+the viewer loopback-only and explains how to enable them. After changing the
+tailnet setting, run `hel daemon restart`.
+
+The historical configuration section remains `[phone]`. Explicit certificate
+configuration takes precedence over automatic Tailscale detection:
+
+```toml
+[phone]
+# Set false to disable the web viewer entirely.
+enabled = true
+bind = "127.0.0.1:3765"
+# Set false to keep the viewer loopback-only without probing Tailscale.
+tailscale_detect = true
+# tls_cert = "/path/to/cert.pem"
+# tls_key = "/path/to/key.pem"
+```
+
 ## Security and isolation model
 
 - Execution policy is selected by target, then translated into each harness's
@@ -227,9 +251,9 @@ Target prerequisites and full option lists are covered in
   LFS is not supported through the bridge.
 - Attached directories reject symbolic links, so an attachment cannot escape
   its source or destination tree.
-- The daemon's phone service binds only to loopback unless `tls_cert` and
-  `tls_key` are configured. `hel daemon status` shows its viewer code; the code
-  is exchanged for a signed session cookie.
+- The daemon's web viewer requires a six-digit code exchanged for a signed
+  session cookie. It binds only to loopback unless explicit TLS is configured
+  or automatic Tailscale detection obtains a trusted `ts.net` certificate.
 
 ## Durability
 
