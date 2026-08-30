@@ -1863,10 +1863,30 @@ impl DashboardContext {
 /// displayed Provisioning state indefinitely.
 fn remote_lifecycle_settled(kind: SessionOperationKind, state: Option<SessionState>) -> bool {
     match kind {
-        SessionOperationKind::Launching
-        | SessionOperationKind::Resuming
-        | SessionOperationKind::Connecting
-        | SessionOperationKind::Importing => state.is_some_and(|state| {
+        SessionOperationKind::Launching | SessionOperationKind::Importing => {
+            state.is_none_or(|state| {
+                matches!(
+                    state,
+                    SessionState::Running
+                        | SessionState::Disconnected
+                        | SessionState::Lost
+                        | SessionState::Error
+                        | SessionState::DestroyedWithDataLoss
+                )
+            })
+        }
+        SessionOperationKind::Resuming => state.is_none_or(|state| {
+            matches!(
+                state,
+                SessionState::Running
+                    | SessionState::Disconnected
+                    | SessionState::Stopped
+                    | SessionState::Lost
+                    | SessionState::Error
+                    | SessionState::DestroyedWithDataLoss
+            )
+        }),
+        SessionOperationKind::Connecting => state.is_some_and(|state| {
             matches!(
                 state,
                 SessionState::Running
@@ -2225,6 +2245,14 @@ mod tests {
         assert!(remote_lifecycle_settled(
             SessionOperationKind::Stopping,
             Some(SessionState::Stopped)
+        ));
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Resuming,
+            Some(SessionState::Stopped)
+        ));
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Launching,
+            None
         ));
         assert!(remote_lifecycle_settled(
             SessionOperationKind::Destroying,
