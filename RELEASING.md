@@ -33,7 +33,7 @@ product version.
 
    ```bash
    node scripts/release-version.mjs sync
-   cargo metadata --no-deps --format-version 1 >/dev/null
+   cargo metadata --format-version 1 >/dev/null
    cargo about generate --workspace --offline --config licenses/about.toml \
      --locked --fail licenses/about.hbs -o licenses/THIRD_PARTY_LICENSES.html
    ```
@@ -42,7 +42,7 @@ product version.
 
    ```bash
    node scripts/release-version.mjs check vX.Y.Z
-   cargo metadata --locked --no-deps --format-version 1 >/dev/null
+   cargo metadata --locked --format-version 1 >/dev/null
    cargo fmt --check
    cargo test
    cargo clippy --all-targets -- -D warnings

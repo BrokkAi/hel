@@ -44,7 +44,7 @@ jobs:
       - name: Verify tag, manifests, and lockfile agree
         run: |
           node scripts/release-version.mjs check "$RELEASE_TAG"
-          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          cargo metadata --locked --format-version 1 >/dev/null
 
       - name: Package crates
         run: |

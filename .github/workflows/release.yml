@@ -21,7 +21,7 @@ jobs:
       - name: Verify tag, manifests, and lockfile agree
         run: |
           node scripts/release-version.mjs check "$GITHUB_REF_NAME"
-          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          cargo metadata --locked --format-version 1 >/dev/null
 
   build-linux-amd64:
     name: Build hel for x86_64-unknown-linux-musl
