@@ -1005,6 +1005,17 @@ fn recovery_warning_name(session: &SessionRecord, name: String, now_epoch_second
     }
 }
 
+/// How many machines an EC2 fleet is running, as the fleet's answer to the
+/// "In Use" question.
+///
+/// A fleet gets one probe per live instance, so the probe list is the fleet's
+/// size. A fleet has no CPU percentage of its own, and how many machines are
+/// up is what it costs.
+fn fleet_vm_label(detail: &CapacityDetail) -> String {
+    let count = detail.target.probes.len();
+    format!("{count} VM{}", if count == 1 { "" } else { "s" })
+}
+
 /// A reading older than this stopped tracking the host: the poller samples
 /// every 30 seconds, so three missed rounds mean the number on screen is no
 /// longer what the host is doing.
@@ -1051,12 +1062,17 @@ pub(crate) fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut Das
                     )
                 }
                 (DeploymentCapacityKind::AwsFleet, Some(usage)) => format!(
-                    "{} cores · {} RAM · {} disk",
+                    "{} · {} cores · {} RAM · {} disk",
+                    fleet_vm_label(detail),
                     usage.logical_cores,
                     format_resource_bytes(usage.memory_total_bytes),
                     format_resource_bytes(usage.disk_total_bytes.unwrap_or(0))
                 ),
-                (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => "on demand".into(),
+                // A fleet with nothing running has no capacity figures, and
+                // the count is the whole answer.
+                (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => {
+                    fleet_vm_label(detail)
+                }
                 _ => "unavailable".into(),
             }
         };
@@ -1164,11 +1180,11 @@ pub(crate) fn minimized_targets_line(dashboard: &DashboardState, width: u16) -> 
                     Some(cpu) => (format!("{cpu}%"), Some(cpu)),
                     None => ("no CPU".to_string(), None),
                 },
-                // Fleet probes report cores, memory and disk; they never carry
-                // a CPU percentage.
-                (DeploymentCapacityKind::AwsFleet, Some(_)) => ("no CPU".to_string(), None),
+                // A fleet has no CPU percentage of its own, so what it reports
+                // is how many machines it is running.
+                (DeploymentCapacityKind::AwsFleet, Some(_)) => (fleet_vm_label(detail), None),
                 (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => {
-                    ("on demand".to_string(), None)
+                    (fleet_vm_label(detail), None)
                 }
                 _ => ("unavailable".to_string(), None),
             };
@@ -2627,6 +2643,65 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A fleet with `count` machines running, which is what its probe list
+    /// records: one probe per live instance.
+    fn fleet_target(count: usize) -> hel::hel_targets::DeploymentCapacityTarget {
+        hel::hel_targets::DeploymentCapacityTarget {
+            id: "aws:ec2".into(),
+            host: "ec2".into(),
+            target_ids: vec!["ec2".into()],
+            kind: DeploymentCapacityKind::AwsFleet,
+            local: false,
+            probes: (0..count)
+                .map(|index| {
+                    hel::hel_targets::CommandSpec::new("true", [format!("instance-{index}")])
+                })
+                .collect(),
+            probe_error: None,
+        }
+    }
+
+    /// A fleet has no CPU percentage of its own, so what it reports in use is
+    /// how many machines it is running - including when that is none, which
+    /// used to read "on demand" and said nothing about the fleet's state.
+    #[test]
+    fn a_fleet_reports_how_many_machines_it_is_running() {
+        for (count, expected) in [(0, "0 VMs"), (1, "1 VM"), (3, "3 VMs")] {
+            let mut dashboard = dashboard_with_session(running_session());
+            dashboard.set_deployment_capacity_targets(vec![fleet_target(count)]);
+            if count > 0 {
+                dashboard.apply_deployment_capacity(
+                    "aws:ec2",
+                    Ok(Some(hel::hel_targets::DeploymentCapacityUsage {
+                        cpu_percent: None,
+                        memory_used_bytes: 0,
+                        memory_total_bytes: 8,
+                        logical_cores: 4,
+                        disk_total_bytes: Some(64),
+                    })),
+                    now_seconds(),
+                );
+            } else {
+                dashboard.apply_deployment_capacity("aws:ec2", Ok(None), now_seconds());
+            }
+
+            let open = drawn(&mut dashboard, 140, 34).join("\n");
+            assert!(open.contains(expected), "open pane, {count}: {open}");
+            assert!(!open.contains("on demand"), "open pane, {count}: {open}");
+
+            dashboard.cycle_pane_layout();
+            let collapsed = drawn(&mut dashboard, 140, 34)
+                .into_iter()
+                .find(|line| line.contains("─ Targets ──"))
+                .expect("the collapsed Targets row");
+            assert!(
+                collapsed.contains(&format!("ec2 {expected}")),
+                "collapsed row, {count}: {collapsed}"
+            );
+            assert!(!collapsed.contains("no CPU"), "collapsed row, {count}");
+        }
     }
 
     /// An exhausted profile reads 0%, the same as the open pane's bar. Showing

@@ -163,7 +163,8 @@ room than the last, and it wraps back to the first:
 
 1. every pane at full size;
 2. Targets and Quota collapsed to one summary row each — host names with CPU
-   load, profile names with weekly quota remaining;
+   load, EC2 fleets with how many machines they are running, profile names
+   with weekly quota remaining;
 3. those, and the session list down to one line per session.
 
 `Ctrl+G` always leaves the keyboard in Prompt: asking for room around the
