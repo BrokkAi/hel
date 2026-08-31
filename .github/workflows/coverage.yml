@@ -32,13 +32,16 @@ jobs:
         sudo apt-get update
         sudo apt-get install --no-install-recommends --assume-yes musl-tools
 
-    - name: Cache cargo registry and coverage build
+    # Deliberately excludes `target/llvm-cov-target`: a restored cache brings
+    # back stale `.profraw` profiles and instrumented binaries from an earlier
+    # commit, which silently mixes into the reported percentage that
+    # `scripts/check-coverage.mjs` gates on.
+    - name: Cache cargo registry
       uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-          target/llvm-cov-target
         key: coverage-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
           coverage-cargo-${{ steps.toolchain.outputs.cachekey }}-
