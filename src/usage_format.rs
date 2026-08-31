@@ -1,4 +1,4 @@
-//! Shared formatting for provider quota and rate-limit displays.
+//! Shared formatting for live-session, provider quota, and rate-limit displays.
 
 use chrono::{DateTime, Datelike, Days, FixedOffset, Local, NaiveDate, NaiveTime, TimeZone};
 
@@ -135,6 +135,35 @@ pub fn format_turn_clock(now_epoch_seconds: u64, current_turn_started_at: Option
     "[idle]".into()
 }
 
+/// Format the dashboard's live-session summary without its trailing session
+/// name. The chat transcript uses the same text as its pane title.
+pub fn format_session_summary(
+    target: &str,
+    queued_prompts: usize,
+    now_epoch_seconds: u64,
+    current_turn_started_at: Option<u64>,
+    last_acp_activity_at_ms: Option<u64>,
+    profile: &str,
+) -> String {
+    let mut columns = vec![target.to_owned()];
+    if queued_prompts > 0 {
+        columns.push(format!("[Q {queued_prompts}]"));
+    }
+    if let Some(turn_started) = current_turn_started_at {
+        let turn = format_turn_clock(now_epoch_seconds, Some(turn_started));
+        let step_started = last_acp_activity_at_ms
+            .map(|value| value / 1_000)
+            .unwrap_or(turn_started)
+            .max(turn_started);
+        let step = format_turn_clock(now_epoch_seconds, Some(step_started));
+        columns.extend([format!("Turn {turn}"), format!("Step {step}")]);
+    } else {
+        columns.push("[idle]".into());
+    }
+    columns.push(profile.to_owned());
+    columns.join("  ")
+}
+
 /// Pure formatter split from local-zone discovery for deterministic tests.
 fn format_reset_label(reset: DateTime<FixedOffset>) -> String {
     reset.format("%H:%M %b %-d").to_string()
@@ -212,5 +241,24 @@ mod tests {
         assert_eq!(format_turn_clock(500, Some(375)), "00:02:05");
         assert_eq!(format_turn_clock(400_000, Some(1_000)), "110:50:00");
         assert_eq!(format_turn_clock(5_000, None), "[idle]");
+    }
+
+    #[test]
+    fn session_summary_matches_the_dashboard_without_the_session_name() {
+        assert_eq!(
+            format_session_summary(
+                "precision-3260/bifrost-fuzz",
+                0,
+                20_000,
+                Some(7_847),
+                Some(20_000_000),
+                "kimi",
+            ),
+            "precision-3260/bifrost-fuzz  Turn 03:22:33  Step 00:00:00  kimi"
+        );
+        assert_eq!(
+            format_session_summary("morannon", 2, 20_000, None, None, "codex"),
+            "morannon  [Q 2]  [idle]  codex"
+        );
     }
 }

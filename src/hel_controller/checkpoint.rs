@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -12,8 +12,10 @@ use crate::hel_archive::{
     verify_archive_streaming,
 };
 use crate::hel_checkpoint::{
-    CHECKPOINT_EXPORT_PROTOCOL_VERSION, CheckpointExportSpec, CheckpointRepositoryCapture,
-    CheckpointRepositorySpec, CheckpointTransfer, export_command, export_stdin_command,
+    CHECKPOINT_EXPORT_PROTOCOL_VERSION, CHECKPOINT_STAGING_PROTOCOL_VERSION, CapturedCheckpoint,
+    CheckpointCaptureSpec, CheckpointExportSpec, CheckpointPackSpec, CheckpointRepositoryCapture,
+    CheckpointRepositorySpec, CheckpointTransfer, canonical_session_contains_prompt,
+    capture_stdin_command, export_command, export_stdin_command, pack_stdin_command,
 };
 use crate::hel_config::sessions_dir;
 use crate::hel_projection::canonical_session_from_materialized;
@@ -22,7 +24,8 @@ use crate::hel_session_manager::{
     new_command_id, worker_connect_needs_restart,
 };
 use crate::hel_state::{
-    CheckpointMetadata, HelState, ManagedSessionSnapshot, SessionRecord, SessionState,
+    CheckpointMetadata, HelState, ManagedSessionSnapshot, RecoveryCheckpointPhase, SessionRecord,
+    SessionState,
 };
 use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, ProcessExecutor};
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
@@ -255,9 +258,9 @@ pub(super) enum CheckpointCompletion {
     /// advances the relay's recovery floor in one durable step; abandoning it
     /// cancels the barrier and leaves the floor alone.
     HeldBarrier,
-    /// The worker already resumed dispatch when the export finished. All that
+    /// The worker already resumed dispatch when target capture finished. All that
     /// is left for a durably installed archive is the recovery floor move.
-    ReleasedAfterExport,
+    ReleasedAfterCapture,
 }
 
 pub(super) struct LatchedCheckpoint {
@@ -286,7 +289,7 @@ impl LatchedCheckpoint {
             ),
             // The worker that accepted the early release also understands the
             // floor move; they were added together.
-            CheckpointCompletion::ReleasedAfterExport => (
+            CheckpointCompletion::ReleasedAfterCapture => (
                 "checkpoint-floor",
                 RelayCommand::AdvanceRecoveryFloor {
                     through: self.cursor.clone(),
@@ -303,8 +306,8 @@ impl LatchedCheckpoint {
     /// stay healthy for the rest of the session, so nothing else would ever
     /// end this barrier.
     async fn abandon(mut self, session_id: &str) {
-        if self.completion == CheckpointCompletion::ReleasedAfterExport {
-            // Dispatch resumed when the export finished, so there is no barrier
+        if self.completion == CheckpointCompletion::ReleasedAfterCapture {
+            // Dispatch resumed when target capture finished, so there is no barrier
             // left to cancel, and the recovery floor must stay behind an
             // archive that was never installed. Doing nothing is the exit.
             return;
@@ -405,11 +408,21 @@ impl Controller {
                 manager,
                 LatchExclusivity::ReleaseAfterLatch,
                 CheckpointExportPolicy::Always,
+                None,
             )
             .await
         {
             Ok(latched) => {
                 let artifact = latched.artifact.clone();
+                if let Err(error) = crate::hel_test_hooks::reach_test_hook(
+                    "checkpoint_archive_before_database_publication",
+                ) {
+                    latched.abandon(session_id).await;
+                    return Err(remove_uninstalled_checkpoint(
+                        &artifact.metadata.archive_path,
+                        error,
+                    ));
+                }
                 {
                     let record = self.state.sessions.get_mut(session_id).unwrap();
                     record.state = SessionState::Running;
@@ -419,6 +432,7 @@ impl Controller {
                     record.last_error = None;
                     record.last_checkpoint_error = None;
                 }
+                let persist_started = Instant::now();
                 if let Err(error) = self.persist_checkpoint_transition_or_restore(
                     session_id,
                     &previous,
@@ -427,6 +441,11 @@ impl Controller {
                     latched.abandon(session_id).await;
                     return Err(error);
                 }
+                tracing::info!(
+                    session_id,
+                    persist_ms = persist_started.elapsed().as_millis() as u64,
+                    "checkpoint metadata persisted"
+                );
                 prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
                 if let Err(error) = latched.complete().await {
                     // Only journal retention is at stake. A barrier that is
@@ -463,8 +482,9 @@ impl Controller {
         session_id: &str,
         manager: &SessionManagerControl,
         executor: &(impl CommandExecutor + Sync),
+        progress: &(dyn Fn(RecoveryCheckpointPhase) + Sync),
     ) -> Result<CheckpointArtifact> {
-        self.create_recovery_checkpoint_with_manager(session_id, Some(manager), executor)
+        self.create_recovery_checkpoint_with_manager(session_id, Some(manager), executor, progress)
             .await
     }
 
@@ -473,6 +493,7 @@ impl Controller {
         session_id: &str,
         manager: Option<&SessionManagerControl>,
         executor: &(impl CommandExecutor + Sync),
+        progress: &(dyn Fn(RecoveryCheckpointPhase) + Sync),
     ) -> Result<CheckpointArtifact> {
         let previous_checkpoint = self
             .state
@@ -488,6 +509,7 @@ impl Controller {
                 manager,
                 LatchExclusivity::ReleaseAfterLatch,
                 CheckpointExportPolicy::Always,
+                Some(progress),
             )
             .await?;
         let artifact = latched.artifact.clone();
@@ -498,6 +520,16 @@ impl Controller {
                 error.context("final recovery checkpoint verification"),
             ));
         }
+        if let Err(error) =
+            crate::hel_test_hooks::reach_test_hook("checkpoint_archive_before_database_publication")
+        {
+            latched.abandon(session_id).await;
+            return Err(remove_uninstalled_checkpoint(
+                &artifact.metadata.archive_path,
+                error,
+            ));
+        }
+        let persist_started = Instant::now();
         if let Err(error) = crate::hel_database::record_recovery_success(
             session_id,
             &artifact.native_session_id,
@@ -507,6 +539,11 @@ impl Controller {
             return Err(error
                 .context("persist verified recovery checkpoint before releasing relay history"));
         }
+        tracing::info!(
+            session_id,
+            persist_ms = persist_started.elapsed().as_millis() as u64,
+            "recovery checkpoint metadata persisted"
+        );
         if let Err(error) = latched.complete().await {
             // Only journal retention is at stake. A barrier that is still open
             // cannot dangle: the actor retries a failed submission over a fresh
@@ -528,6 +565,7 @@ impl Controller {
         manager: Option<&SessionManagerControl>,
         exclusivity: LatchExclusivity,
         export_policy: CheckpointExportPolicy,
+        progress: Option<&(dyn Fn(RecoveryCheckpointPhase) + Sync)>,
     ) -> Result<LatchedCheckpoint> {
         let session = self
             .state
@@ -556,6 +594,139 @@ impl Controller {
             .next()
             .context("reconnect plan is empty")?;
         let worker_root = hel_targets::worker_root(&backend, session_id)?;
+        let harness_home = target_profile_home(&backend, session_id, profile);
+        let (workspace_root, primary_repository, repositories) =
+            if let Some(project_directory) = &session.project_directory {
+                let parent = project_directory
+                    .parent()
+                    .context("bare project directory has no parent")?;
+                let destination = project_directory
+                    .file_name()
+                    .context("bare project directory cannot be the filesystem root")?;
+                (
+                    parent.to_string_lossy().into_owned(),
+                    "project".to_owned(),
+                    vec![CheckpointRepositorySpec {
+                        id: "project".into(),
+                        relative_destination: PathBuf::from(destination),
+                        capture: CheckpointRepositoryCapture::MetadataOnly,
+                        origin_override: None,
+                    }],
+                )
+            } else {
+                let bundle = bundle.context("session bundle is missing")?;
+                let workspace_root = match &backend {
+                    hel_targets::TargetLocator::LocalPodman { .. }
+                    | hel_targets::TargetLocator::AppleContainer { .. }
+                    | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
+                    hel_targets::TargetLocator::AwsEc2 { workspace, .. }
+                    | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
+                    hel_targets::TargetLocator::LocalBare { worker_root } => worker_root.clone(),
+                };
+                let repositories = bundle
+                    .repositories
+                    .iter()
+                    .map(|repository| CheckpointRepositorySpec {
+                        id: repository.id.clone(),
+                        relative_destination: repository.destination.clone(),
+                        capture: CheckpointRepositoryCapture::SessionDelta,
+                        origin_override: repository
+                            .is_local()
+                            .then(|| format!("hel-local:{}", repository.id)),
+                    })
+                    .collect();
+                (workspace_root, bundle.primary_repo.clone(), repositories)
+            };
+        let target_path = |path: &str| match &backend {
+            hel_targets::TargetLocator::AwsEc2 { .. }
+            | hel_targets::TargetLocator::SshBare { .. }
+                if !path.starts_with('/') =>
+            {
+                PathBuf::from(format!("~/{path}"))
+            }
+            _ => PathBuf::from(path),
+        };
+        let remote_spec = format!("{worker_root}/checkpoint-spec.json");
+        let remote_archive = format!("{worker_root}/checkpoint.hel.zip");
+        let remote_stage = format!(
+            "{worker_root}/checkpoint-stage-{}",
+            new_command_id("capture")?
+        );
+        let checkpointed_at = now();
+        let target_manifest = TargetManifest {
+            template_id: session.target_template_id.clone(),
+            target_kind: target_kind(&backend).into(),
+            details: Default::default(),
+        };
+        let bundle_manifest = BundleManifest {
+            id: session.bundle_id.clone(),
+            primary_repository,
+        };
+        let session_manifest = |native_session_id: &str| SessionManifest {
+            id: session.id.clone(),
+            title: session.title.clone(),
+            harness_kind: session.harness_kind,
+            profile_id: session.last_profile.clone(),
+            native_session_id: native_session_id.to_owned(),
+            created_at: session.created_at.clone(),
+            checkpointed_at: checkpointed_at.clone(),
+            hel_version: env!("CARGO_PKG_VERSION").into(),
+            relay_version: env!("CARGO_PKG_VERSION").into(),
+            adapter_version: "acp-v1".into(),
+        };
+        let releases_after_capture = exclusivity == LatchExclusivity::ReleaseAfterLatch;
+        if releases_after_capture
+            && let Some(native_session_id) = session.native_session_id.as_deref()
+        {
+            let prestage = CheckpointCaptureSpec {
+                protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
+                session: session_manifest(native_session_id),
+                target: target_manifest.clone(),
+                bundle: bundle_manifest.clone(),
+                relay_root: target_path(&worker_root),
+                harness_home: target_path(&harness_home),
+                workspace_root: target_path(&workspace_root),
+                repositories: repositories.clone(),
+                allow_empty_native: false,
+                stage_path: target_path(&remote_stage),
+                refresh_existing: false,
+            };
+            let prestage_started = Instant::now();
+            match run_checkpoint_staging_command(
+                executor,
+                &backend,
+                session_id,
+                &prestage,
+                capture_stdin_command,
+                "prestage target checkpoint",
+            ) {
+                Ok(output) => match serde_json::from_slice::<CapturedCheckpoint>(&output.stdout) {
+                    Ok(captured) => tracing::info!(
+                        session_id,
+                        prestage_ms = prestage_started.elapsed().as_millis() as u64,
+                        native_bytes = captured.native_bytes,
+                        repository_bytes = captured.repository_bytes,
+                        reused_native = captured.reused_native,
+                        "checkpoint target state prestaged while ACP dispatch remained active"
+                    ),
+                    Err(error) => tracing::warn!(
+                        session_id,
+                        error = format!("{error:#}"),
+                        "checkpoint prestage returned an invalid result; barrier capture will replace it"
+                    ),
+                },
+                Err(error) => {
+                    if executor.cancellation_requested() {
+                        return Err(error.context("checkpoint prestage was cancelled"));
+                    }
+                    tracing::warn!(
+                        session_id,
+                        error = format!("{error:#}"),
+                        "checkpoint prestage failed; barrier capture will collect a fresh generation"
+                    );
+                }
+            }
+        }
         let (mut relay, mut restarted_worker) = self
             .open_checkpoint_relay(
                 session_id,
@@ -566,6 +737,9 @@ impl Controller {
                 &reconnect,
             )
             .await?;
+        if let Some(progress) = progress {
+            progress(RecoveryCheckpointPhase::Snapshotting);
+        }
         let (barrier, barrier_command_id) = loop {
             let barrier_command_id = new_command_id("checkpoint")?;
             let timeout = if restarted_worker {
@@ -609,6 +783,15 @@ impl Controller {
                 Err(error) => return Err(error),
             }
         };
+        let barrier_ready_at = Instant::now();
+        // Project memory is checkpoint state, not relay connection state.
+        // Reconcile it once while the checkpoint barrier keeps the harness
+        // idle. Ordinary attach and polling deliberately never touch it.
+        relay
+            .connection_mut()
+            .sync_project_memory()
+            .await
+            .context("synchronize project memory for checkpoint")?;
         let cursor = barrier
             .operational
             .checkpoint_ready
@@ -673,88 +856,13 @@ impl Controller {
         // export. `completion` also records whether an error path still has a
         // barrier to cancel.
         let mut completion = CheckpointCompletion::HeldBarrier;
-        let releases_after_export = exclusivity == LatchExclusivity::ReleaseAfterLatch;
 
         let exported: Result<CheckpointArtifact> = async {
-            let worker_root = hel_targets::worker_root(&backend, session_id)?;
-            let harness_home = target_profile_home(&backend, session_id, profile);
-            let (workspace_root, primary_repository, repositories) =
-                if let Some(project_directory) = &session.project_directory {
-                    let parent = project_directory
-                        .parent()
-                        .context("bare project directory has no parent")?;
-                    let destination = project_directory
-                        .file_name()
-                        .context("bare project directory cannot be the filesystem root")?;
-                    (
-                        parent.to_string_lossy().into_owned(),
-                        "project".to_owned(),
-                        vec![CheckpointRepositorySpec {
-                            id: "project".into(),
-                            relative_destination: PathBuf::from(destination),
-                            capture: CheckpointRepositoryCapture::MetadataOnly,
-                            origin_override: None,
-                        }],
-                    )
-                } else {
-                    let bundle = bundle.context("session bundle is missing")?;
-                    let workspace_root = match &backend {
-                        hel_targets::TargetLocator::LocalPodman { .. }
-                        | hel_targets::TargetLocator::AppleContainer { .. }
-                        | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
-                        hel_targets::TargetLocator::AwsEc2 { workspace, .. }
-                        | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
-                        hel_targets::TargetLocator::LocalBare { worker_root } => worker_root.clone(),
-                    };
-                    let repositories = bundle
-                        .repositories
-                        .iter()
-                        .map(|repository| CheckpointRepositorySpec {
-                            id: repository.id.clone(),
-                            relative_destination: repository.destination.clone(),
-                            capture: CheckpointRepositoryCapture::SessionDelta,
-                            origin_override: repository
-                                .is_local()
-                                .then(|| format!("hel-local:{}", repository.id)),
-                        })
-                        .collect();
-                    (workspace_root, bundle.primary_repo.clone(), repositories)
-                };
-            let target_path = |path: &str| match &backend {
-                hel_targets::TargetLocator::AwsEc2 { .. }
-                | hel_targets::TargetLocator::SshBare { .. }
-                    if !path.starts_with('/') =>
-                {
-                    PathBuf::from(format!("~/{path}"))
-                }
-                _ => PathBuf::from(path),
-            };
-            let remote_spec = format!("{worker_root}/checkpoint-spec.json");
-            let remote_archive = format!("{worker_root}/checkpoint.hel.zip");
-            let checkpointed_at = now();
             let spec = CheckpointExportSpec {
                 protocol_version: CHECKPOINT_EXPORT_PROTOCOL_VERSION,
-                session: SessionManifest {
-                    id: session.id.clone(),
-                    title: session.title.clone(),
-                    harness_kind: session.harness_kind,
-                    profile_id: session.last_profile.clone(),
-                    native_session_id: native_session_id.clone(),
-                    created_at: session.created_at.clone(),
-                    checkpointed_at: checkpointed_at.clone(),
-                    hel_version: env!("CARGO_PKG_VERSION").into(),
-                    relay_version: env!("CARGO_PKG_VERSION").into(),
-                    adapter_version: "acp-v1".into(),
-                },
-                target: TargetManifest {
-                    template_id: session.target_template_id.clone(),
-                    target_kind: target_kind(&backend).into(),
-                    details: Default::default(),
-                },
-                bundle: BundleManifest {
-                    id: session.bundle_id.clone(),
-                    primary_repository,
-                },
+                session: session_manifest(&native_session_id),
+                target: target_manifest,
+                bundle: bundle_manifest,
                 relay_root: target_path(&worker_root),
                 harness_home: target_path(&harness_home),
                 workspace_root: target_path(&workspace_root),
@@ -762,8 +870,77 @@ impl Controller {
                 canonical_session,
                 output_path: target_path(&remote_archive),
             };
-            let exported =
-                export_target_checkpoint(executor, &backend, session_id, &spec, &remote_spec)?;
+            let exported = if releases_after_capture {
+                let capture_spec = CheckpointCaptureSpec {
+                    protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
+                    session: spec.session.clone(),
+                    target: spec.target.clone(),
+                    bundle: spec.bundle.clone(),
+                    relay_root: spec.relay_root.clone(),
+                    harness_home: spec.harness_home.clone(),
+                    workspace_root: spec.workspace_root.clone(),
+                    repositories: spec.repositories.clone(),
+                    allow_empty_native: !canonical_session_contains_prompt(&spec.canonical_session),
+                    stage_path: target_path(&remote_stage),
+                    refresh_existing: true,
+                };
+                let capture_started = Instant::now();
+                let captured = run_checkpoint_staging_command(
+                    executor,
+                    &backend,
+                    session_id,
+                    &capture_spec,
+                    capture_stdin_command,
+                    "capture target checkpoint",
+                )?;
+                let captured: CapturedCheckpoint = serde_json::from_slice(&captured.stdout)
+                    .context("decode captured checkpoint result")?;
+                tracing::info!(
+                    session_id,
+                    capture_ms = capture_started.elapsed().as_millis() as u64,
+                    barrier_held_ms = barrier_ready_at.elapsed().as_millis() as u64,
+                    native_bytes = captured.native_bytes,
+                    repository_bytes = captured.repository_bytes,
+                    reused_native = captured.reused_native,
+                    "checkpoint target state captured; releasing ACP dispatch"
+                );
+                completion = release_checkpoint_after_capture(
+                    &mut relay,
+                    session_id,
+                    &barrier_command_id,
+                    &cursor,
+                )
+                .await?;
+                if completion == CheckpointCompletion::ReleasedAfterCapture
+                    && let Some(progress) = progress
+                {
+                    progress(RecoveryCheckpointPhase::Saving);
+                }
+                let pack_spec = CheckpointPackSpec {
+                    protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
+                    relay_root: spec.relay_root.clone(),
+                    stage_path: target_path(&remote_stage),
+                    canonical_session: spec.canonical_session.clone(),
+                    output_path: spec.output_path.clone(),
+                };
+                let pack_started = Instant::now();
+                let output = run_checkpoint_staging_command(
+                    executor,
+                    &backend,
+                    session_id,
+                    &pack_spec,
+                    pack_stdin_command,
+                    "pack target checkpoint",
+                )?;
+                tracing::info!(
+                    session_id,
+                    pack_ms = pack_started.elapsed().as_millis() as u64,
+                    "checkpoint archive packaged after ACP dispatch resumed"
+                );
+                output
+            } else {
+                export_target_checkpoint(executor, &backend, session_id, &spec, &remote_spec)?
+            };
             let target_checkpoint: crate::hel_checkpoint::TargetCheckpoint =
                 serde_json::from_slice(&exported.stdout)
                     .context("decode target checkpoint result")?;
@@ -775,17 +952,6 @@ impl Controller {
             }
             if target_checkpoint.event_frontier_digest != expected_digest {
                 bail!("target checkpoint event frontier digest changed");
-            }
-
-            // The archive exists, so ACP dispatch no longer has to stay frozen.
-            if releases_after_export {
-                completion = release_checkpoint_after_export(
-                    &mut relay,
-                    session_id,
-                    &barrier_command_id,
-                    &cursor,
-                )
-                .await?;
             }
 
             // Checkpoint archives are immutable once controller metadata points
@@ -805,7 +971,13 @@ impl Controller {
                 expected_event_frontier: Some(target_checkpoint.event_frontier),
                 expected_event_frontier_digest: Some(&target_checkpoint.event_frontier_digest),
             };
+            let transfer_started = Instant::now();
             let verified = transfer.execute(executor)?;
+            tracing::info!(
+                session_id,
+                transfer_and_verify_ms = transfer_started.elapsed().as_millis() as u64,
+                "checkpoint archive transferred and verified"
+            );
             let installed_archive = verified.archive_path().to_path_buf();
             let validate_transferred = || -> Result<()> {
                 ensure!(
@@ -847,7 +1019,7 @@ impl Controller {
             let metadata = CheckpointMetadata {
                 archive_path: verified.archive_path().to_path_buf(),
                 sha256: verified.sha256().to_string(),
-                created_at: checkpointed_at,
+                created_at: checkpointed_at.clone(),
                 event_frontier: verified.event_frontier(),
             };
             Ok(CheckpointArtifact {
@@ -898,7 +1070,17 @@ impl Controller {
         worker_root: &str,
         reconnect: &hel_targets::CommandSpec,
     ) -> Result<(ControllerRelayLease, bool)> {
-        let project_memory = self.project_memory_sync_target(session_id).ok();
+        let project_memory = match self.project_memory_sync_target(session_id) {
+            Ok(target) => Some(target),
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "project memory will not be synchronized during checkpoint reconnect"
+                );
+                None
+            }
+        };
         match connect_checkpoint_relay(session_id, manager, reconnect, project_memory.clone()).await
         {
             Ok(relay) => Ok((relay, false)),
@@ -966,7 +1148,18 @@ impl Controller {
                 );
             }
         };
-        connection.set_project_memory_target(self.project_memory_sync_target(session_id).ok());
+        let project_memory = match self.project_memory_sync_target(session_id) {
+            Ok(target) => Some(target),
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "project memory will not be synchronized after checkpoint worker restart"
+                );
+                None
+            }
+        };
+        connection.set_project_memory_target(project_memory);
         wait_for_native_session(&mut connection, executor)
             .await
             .context("wait for ACP session after restarting the worker for checkpoint")?;
@@ -987,7 +1180,10 @@ async fn connect_checkpoint_relay(
         let handle = manager
             .wait_for_session(session_id, Duration::from_secs(5))
             .await?;
-        let lease = handle.lease_connection().await?;
+        let mut lease = handle.lease_connection().await?;
+        lease
+            .connection_mut()
+            .set_project_memory_target(project_memory);
         Ok(ControllerRelayLease::Managed {
             handle,
             lease: Some(lease),
@@ -1174,18 +1370,18 @@ pub(super) async fn wait_for_relay_closed(relay: &mut StandaloneSession) -> Resu
     }
 }
 
-/// Hand ACP dispatch back as soon as the archive exists on the target.
+/// Hand ACP dispatch back as soon as target-owned state is sealed.
 ///
 /// Proving the barrier first moves the workspace-consistency proof ahead of the
 /// release: the same barrier still holding the same ready cursor means nothing
-/// the harness could write reached the workspace while the archive was built.
+/// the harness could write reached the workspace while the stage was captured.
 /// The recovery floor stays put, because nothing yet proves the archive reached
 /// the controller's disk.
 ///
 /// A worker that does not understand the release keeps its barrier, and the
 /// caller falls back to ending it only after the archive is installed. That is
 /// slower, not wrong, so it is not a checkpoint failure.
-async fn release_checkpoint_after_export(
+async fn release_checkpoint_after_capture(
     relay: &mut ControllerRelayLease,
     session_id: &str,
     barrier_command_id: &str,
@@ -1197,7 +1393,7 @@ async fn release_checkpoint_after_export(
         .and_then(|snapshot| {
             validate_checkpoint_barrier_snapshot(&snapshot, barrier_command_id, cursor)
         })
-        .context("checkpoint barrier changed while exporting its archive")?;
+        .context("checkpoint barrier changed while capturing target state")?;
     match relay
         .submit(
             new_command_id("checkpoint-release")?,
@@ -1207,7 +1403,7 @@ async fn release_checkpoint_after_export(
         )
         .await
     {
-        Ok(_) => Ok(CheckpointCompletion::ReleasedAfterExport),
+        Ok(_) => Ok(CheckpointCompletion::ReleasedAfterCapture),
         Err(error) => {
             tracing::debug!(
                 session_id,
@@ -1215,6 +1411,42 @@ async fn release_checkpoint_after_export(
             );
             Ok(CheckpointCompletion::HeldBarrier)
         }
+    }
+}
+
+fn run_checkpoint_staging_command<T: serde::Serialize>(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    spec: &T,
+    command: fn(&hel_targets::TargetLocator, &str) -> Result<CommandSpec>,
+    operation: &str,
+) -> Result<CommandOutput> {
+    let body = serde_json::to_vec(spec).with_context(|| format!("serialize {operation} spec"))?;
+    let mut replaced_worker = false;
+    loop {
+        let command = command(locator, session_id)?;
+        let output = executor.execute_with_stdin(&command, &mut body.as_slice())?;
+        if output.status == 0 {
+            return Ok(output);
+        }
+        let failure = String::from_utf8_lossy(&output.stderr).into_owned();
+        if staging_protocol_unsupported(&failure)
+            && replace_stale_export_worker(
+                executor,
+                locator,
+                session_id,
+                None,
+                &failure,
+                &mut replaced_worker,
+            )?
+        {
+            continue;
+        }
+        bail!(
+            "{operation} failed with status {}: {failure}",
+            output.status
+        );
     }
 }
 
@@ -1318,7 +1550,7 @@ fn replace_stale_export_worker(
     failure: &str,
     replaced_worker: &mut bool,
 ) -> Result<bool> {
-    if *replaced_worker || !export_protocol_unsupported(failure) {
+    if *replaced_worker || !staging_protocol_unsupported(failure) {
         return Ok(false);
     }
     tracing::debug!(
@@ -1355,13 +1587,19 @@ fn export_spec_stdin_unsupported(failure: &str) -> bool {
 /// `deny_unknown_fields`, so a controller that gained a field such as
 /// `terminal_refs` cannot pause a session whose installed `hel` predates it.
 fn export_spec_schema_unsupported(failure: &str) -> bool {
-    failure.contains("parse checkpoint export spec")
+    failure.contains("parse checkpoint")
         && (failure.contains("unknown field") || failure.contains("unknown variant"))
 }
 
 fn export_protocol_unsupported(failure: &str) -> bool {
     export_spec_schema_unsupported(failure)
         || failure.contains("unsupported checkpoint export protocol version")
+}
+
+fn staging_protocol_unsupported(failure: &str) -> bool {
+    export_protocol_unsupported(failure)
+        || failure.contains("unrecognized subcommand")
+        || failure.contains("unexpected argument")
 }
 
 pub(super) fn upload_checkpoint_spec(
@@ -2464,13 +2702,13 @@ mod tests {
     /// recovery floor waits for the installed archive.
     #[cfg(unix)]
     #[tokio::test]
-    async fn releasing_a_checkpoint_after_export_defers_only_the_recovery_floor() {
+    async fn releasing_a_checkpoint_after_capture_defers_only_the_recovery_floor() {
         // HEL_DATA_DIR is process-global, so run the database-backed half in an
         // exact child test instead of racing unrelated tests in this process.
         if std::env::var_os(RELEASE_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
             let test_name = format!(
-                "{}::releasing_a_checkpoint_after_export_defers_only_the_recovery_floor",
+                "{}::releasing_a_checkpoint_after_capture_defers_only_the_recovery_floor",
                 module_path!()
                     .strip_prefix("hel::")
                     .unwrap_or(module_path!())
@@ -2494,7 +2732,7 @@ mod tests {
         // it, so turn a stall into a hard error.
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(120));
-            eprintln!("the exported checkpoint never released its barrier");
+            eprintln!("the captured checkpoint never released its barrier");
             std::process::exit(101);
         });
 
@@ -2504,9 +2742,9 @@ mod tests {
         relay.end_latch();
         wait_until_the_actor_serves_again(&handle).await;
 
-        // The export has just finished. Releasing proves the barrier first and
+        // Target state capture has just finished. Releasing proves the barrier first and
         // then hands ACP dispatch back.
-        let completion = release_checkpoint_after_export(
+        let completion = release_checkpoint_after_capture(
             &mut relay,
             LATCH_RELAY_SESSION,
             &barrier_command_id,
@@ -2514,7 +2752,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(completion, CheckpointCompletion::ReleasedAfterExport);
+        assert_eq!(completion, CheckpointCompletion::ReleasedAfterCapture);
         let released = relay.sync_snapshot().await.unwrap();
         assert_eq!(released.operational.checkpoint_barrier, None);
         assert_eq!(released.operational.checkpoint_ready, None);
@@ -2552,7 +2790,7 @@ mod tests {
             relay,
             barrier_command_id,
             cursor.clone(),
-            CheckpointCompletion::ReleasedAfterExport,
+            CheckpointCompletion::ReleasedAfterCapture,
         )
         .complete()
         .await
@@ -2615,7 +2853,7 @@ mod tests {
         relay.end_latch();
         wait_until_the_actor_serves_again(&handle).await;
 
-        let completion = release_checkpoint_after_export(
+        let completion = release_checkpoint_after_capture(
             &mut relay,
             LATCH_RELAY_SESSION,
             &barrier_command_id,
@@ -2864,6 +3102,7 @@ mod tests {
                 Some(&channels.control),
                 LatchExclusivity::HoldThroughClose,
                 CheckpointExportPolicy::ReuseUnchangedArchive,
+                None,
             )
             .await
             .unwrap();
@@ -2912,6 +3151,7 @@ mod tests {
                 Some(&channels.control),
                 LatchExclusivity::HoldThroughClose,
                 CheckpointExportPolicy::ReuseUnchangedArchive,
+                None,
             )
             .await;
         let Err(error) = changed else {

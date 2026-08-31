@@ -103,6 +103,16 @@ pub enum RelayRequest {
     InstallSkills {
         data: String,
     },
+    /// Report whether this worker has a synchronized GitHub CLI token and its
+    /// non-secret fingerprint. This request is connection-only.
+    GithubTokenState,
+    /// Install the controller's current GitHub CLI token into worker-private
+    /// runtime storage. The token never enters durable relay state.
+    InstallGithubToken {
+        data: String,
+    },
+    /// Remove the worker's synchronized GitHub CLI token.
+    RemoveGithubToken,
     /// Run a prompt in a disposable ACP session and return its text. The
     /// runtime answers this on the connection: a scratch prompt is not session
     /// history, so it never reaches the durable relay, its journal, or its
@@ -115,6 +125,68 @@ pub enum RelayRequest {
         elicitation_id: String,
         response: ElicitationResponse,
     },
+    /// Drive the second-opinion reviewer that runs beside this session.
+    ///
+    /// The reviewer is a sidecar, not a session: it shares this worker's
+    /// target and working directory and owns nothing else. Its own durable
+    /// relay answers the attach, acknowledge, submit and status requests
+    /// nested here, so the reviewer's conversation is journaled and replayed
+    /// the same way the primary's is.
+    Reviewer {
+        request: ReviewerRequest,
+    },
+}
+
+/// What a controller asks of the second-opinion reviewer sidecar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "params", rename_all = "snake_case")]
+pub enum ReviewerRequest {
+    /// Start the reviewer, or report the running one when `config` matches it.
+    /// The reviewer's profile must already be staged under the worker root.
+    Start {
+        config: Box<crate::hel_worker_runtime::ReviewerLaunchConfig>,
+    },
+    /// Replay the reviewer's journal from a cursor, as `Attach` does for the
+    /// primary.
+    Attach {
+        after_ordinal: u64,
+        after_digest: String,
+    },
+    Acknowledge {
+        through_ordinal: u64,
+        through_digest: String,
+    },
+    Submit {
+        command_id: String,
+        command: RelayCommand,
+    },
+    Status,
+    /// Answer a form the reviewer's harness is waiting on.
+    ///
+    /// A reviewer that asks for permission and is never answered stalls the
+    /// whole review, so its forms travel the same connection-only path the
+    /// primary's do.
+    RespondElicitation {
+        elicitation_id: String,
+        response: ElicitationResponse,
+    },
+    /// Cancel any turn in flight and stop the reviewer's process group,
+    /// keeping its staged profile, native session and journal for next time.
+    Pause,
+}
+
+impl ReviewerRequest {
+    pub const fn action_name(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "reviewer_start",
+            Self::Attach { .. } => "reviewer_attach",
+            Self::Acknowledge { .. } => "reviewer_acknowledge",
+            Self::Submit { .. } => "reviewer_submit",
+            Self::Status => "reviewer_status",
+            Self::RespondElicitation { .. } => "reviewer_respond_elicitation",
+            Self::Pause => "reviewer_pause",
+        }
+    }
 }
 
 impl RelayRequest {
@@ -133,20 +205,25 @@ impl RelayRequest {
             Self::InstallCredentials { .. } => "install_credentials",
             Self::SkillsState => "skills_state",
             Self::InstallSkills { .. } => "install_skills",
+            Self::GithubTokenState => "github_token_state",
+            Self::InstallGithubToken { .. } => "install_github_token",
+            Self::RemoveGithubToken => "remove_github_token",
             Self::Compact { .. } => "compact",
             Self::RespondElicitation { .. } => "respond_elicitation",
+            Self::Reviewer { request } => request.action_name(),
         }
     }
 
     /// Oldest protocol that understands this method or command payload. Form
     /// answers landed in protocol 2, hidden context in 3, project-memory sync
-    /// in 4, and user shell commands in 5.
+    /// in 4, user shell commands in 5, and the reviewer sidecar in 6.
     pub const fn minimum_protocol(&self) -> u32 {
         match self {
             Self::RespondElicitation { .. } => 2,
             Self::InstallPromptContext { .. } => 3,
             Self::ProjectMemorySnapshot | Self::InstallProjectMemorySnapshot { .. } => 4,
             Self::Submit { command, .. } => command.minimum_protocol(),
+            Self::Reviewer { .. } => 6,
             _ => RELAY_MIN_PROTOCOL_VERSION,
         }
     }
@@ -252,6 +329,11 @@ pub enum RelayResponsePayload {
         present: bool,
         fingerprint: String,
     },
+    /// Presence and fingerprint of the worker-private GitHub CLI token.
+    GithubTokenState {
+        present: bool,
+        fingerprint: String,
+    },
     /// Agent text from a disposable ACP compaction session.
     Compacted {
         text: String,
@@ -259,6 +341,19 @@ pub enum RelayResponsePayload {
     ElicitationResolved {
         elicitation_id: String,
     },
+    /// The reviewer sidecar is running under the requested configuration.
+    ReviewerStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_session_id: Option<String>,
+        /// What the reviewer's harness advertises right now, which is what the
+        /// waterfall offers the user.
+        config_options: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+        /// Whether this call reused an already-running reviewer.
+        reused: bool,
+        state: Box<RelayOperationalState>,
+    },
+    /// The reviewer's process group has been stopped; its files remain.
+    ReviewerPaused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

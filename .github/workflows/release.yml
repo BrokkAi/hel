@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-linux-amd64:
-    name: Build hel for x86_64-unknown-linux-gnu
+    name: Build hel for x86_64-unknown-linux-musl
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -18,22 +18,45 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-musl
 
-      # Ubuntu 22.04 keeps the glibc requirement compatible with older
-      # supported Linux hosts.
-      - name: Build controller
-        run: cargo build --release --locked --bin hel --target x86_64-unknown-linux-gnu
+      - name: Install musl linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --assume-yes musl-tools
+
+      - name: Build static controller and worker
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --bin hel --target x86_64-unknown-linux-musl
+
+      - name: Verify static binary
+        run: |
+          binary=target/x86_64-unknown-linux-musl/release/hel
+          if readelf -lW "$binary" | grep 'Requesting program interpreter' >/dev/null; then
+            echo 'Linux release unexpectedly has a dynamic program interpreter' >&2
+            exit 1
+          fi
+          if readelf -dW "$binary" | grep '(NEEDED)' >/dev/null; then
+            echo 'Linux release unexpectedly needs a dynamic library' >&2
+            exit 1
+          fi
+          nm "$binary" | grep ' T mi_free$' >/dev/null || {
+            echo 'Linux release does not contain mimalloc' >&2
+            exit 1
+          }
+          "$binary" --version
 
       - name: Upload controller
         uses: actions/upload-artifact@v7
         with:
-          name: hel-controller-x86_64-unknown-linux-gnu
-          path: target/x86_64-unknown-linux-gnu/release/hel
+          name: hel-controller-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/hel
           if-no-files-found: error
 
   build-linux-arm64:
-    name: Build hel for aarch64-unknown-linux-gnu
+    name: Build hel for aarch64-unknown-linux-musl
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v6
@@ -41,16 +64,41 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-gnu
+          targets: aarch64-unknown-linux-musl
 
-      - name: Build controller
-        run: cargo build --release --locked --bin hel --target aarch64-unknown-linux-gnu
+      - name: Install musl linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --assume-yes musl-tools
+
+      - name: Build static controller and worker
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --bin hel --target aarch64-unknown-linux-musl
+
+      - name: Verify static binary
+        run: |
+          binary=target/aarch64-unknown-linux-musl/release/hel
+          if readelf -lW "$binary" | grep 'Requesting program interpreter' >/dev/null; then
+            echo 'Linux release unexpectedly has a dynamic program interpreter' >&2
+            exit 1
+          fi
+          if readelf -dW "$binary" | grep '(NEEDED)' >/dev/null; then
+            echo 'Linux release unexpectedly needs a dynamic library' >&2
+            exit 1
+          fi
+          nm "$binary" | grep ' T mi_free$' >/dev/null || {
+            echo 'Linux release does not contain mimalloc' >&2
+            exit 1
+          }
+          "$binary" --version
 
       - name: Upload controller
         uses: actions/upload-artifact@v7
         with:
-          name: hel-controller-aarch64-unknown-linux-gnu
-          path: target/aarch64-unknown-linux-gnu/release/hel
+          name: hel-controller-aarch64-unknown-linux-musl
+          path: target/aarch64-unknown-linux-musl/release/hel
           if-no-files-found: error
 
   build-macos-arm64:
@@ -74,92 +122,20 @@ jobs:
           path: target/aarch64-apple-darwin/release/hel
           if-no-files-found: error
 
-  build-worker-amd64:
-    name: Build worker for x86_64-unknown-linux-musl
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Install musl linker
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --assume-yes musl-tools
-
-      - name: Build static worker
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked --bin hel --target x86_64-unknown-linux-musl
-
-      - name: Stage named worker
-        run: |
-          mkdir workers
-          cp target/x86_64-unknown-linux-musl/release/hel \
-            workers/hel-worker-x86_64-unknown-linux-musl
-
-      - name: Upload worker
-        uses: actions/upload-artifact@v7
-        with:
-          name: hel-worker-x86_64-unknown-linux-musl
-          path: workers/hel-worker-x86_64-unknown-linux-musl
-          if-no-files-found: error
-
-  build-worker-arm64:
-    name: Build worker for aarch64-unknown-linux-musl
-    runs-on: ubuntu-22.04-arm
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-
-      - name: Install musl linker
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --assume-yes musl-tools
-
-      - name: Build static worker
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked --bin hel --target aarch64-unknown-linux-musl
-
-      - name: Stage named worker
-        run: |
-          mkdir workers
-          cp target/aarch64-unknown-linux-musl/release/hel \
-            workers/hel-worker-aarch64-unknown-linux-musl
-
-      - name: Upload worker
-        uses: actions/upload-artifact@v7
-        with:
-          name: hel-worker-aarch64-unknown-linux-musl
-          path: workers/hel-worker-aarch64-unknown-linux-musl
-          if-no-files-found: error
-
   package:
     name: Package ${{ matrix.target }}
     needs:
       - build-linux-amd64
       - build-linux-arm64
       - build-macos-arm64
-      - build-worker-amd64
-      - build-worker-arm64
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         target:
           - aarch64-apple-darwin
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v6
 
@@ -172,14 +148,14 @@ jobs:
       - name: Download x86_64 worker
         uses: actions/download-artifact@v8
         with:
-          name: hel-worker-x86_64-unknown-linux-musl
-          path: staging/workers
+          name: hel-controller-x86_64-unknown-linux-musl
+          path: staging/workers/x86_64
 
       - name: Download aarch64 worker
         uses: actions/download-artifact@v8
         with:
-          name: hel-worker-aarch64-unknown-linux-musl
-          path: staging/workers
+          name: hel-controller-aarch64-unknown-linux-musl
+          path: staging/workers/aarch64
 
       - name: Create archive and checksum
         shell: bash
@@ -188,8 +164,22 @@ jobs:
           archive="hel-${{ matrix.target }}"
           mkdir -p "dist/$archive"
           cp staging/controller/hel "dist/$archive/hel"
-          cp staging/workers/hel-worker-x86_64-unknown-linux-musl "dist/$archive/"
-          cp staging/workers/hel-worker-aarch64-unknown-linux-musl "dist/$archive/"
+          case '${{ matrix.target }}' in
+            x86_64-unknown-linux-musl)
+              cp staging/workers/aarch64/hel \
+                "dist/$archive/hel-worker-aarch64-unknown-linux-musl"
+              ;;
+            aarch64-unknown-linux-musl)
+              cp staging/workers/x86_64/hel \
+                "dist/$archive/hel-worker-x86_64-unknown-linux-musl"
+              ;;
+            aarch64-apple-darwin)
+              cp staging/workers/x86_64/hel \
+                "dist/$archive/hel-worker-x86_64-unknown-linux-musl"
+              cp staging/workers/aarch64/hel \
+                "dist/$archive/hel-worker-aarch64-unknown-linux-musl"
+              ;;
+          esac
           cp LICENSE "dist/$archive/"
           chmod 0755 "dist/$archive/hel" "dist/$archive"/hel-worker-*
           tar -C dist -czf "$archive.tar.gz" "$archive"

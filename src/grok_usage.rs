@@ -226,8 +226,14 @@ impl GrokUsageSession {
 
     async fn shutdown(mut self) {
         drop(self.stdin);
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        if let Err(error) = self.child.start_kill()
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "could not stop the Grok usage process");
+        }
+        if let Err(error) = self.child.wait().await {
+            tracing::warn!(%error, "could not reap the Grok usage process");
+        }
     }
 }
 

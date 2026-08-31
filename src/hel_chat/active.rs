@@ -14,11 +14,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
+use crate::hel_selection::{FrameSurfaces, SelectionRange, SurfaceFrame, SurfaceId};
 use crate::hel_session_manager::{
-    ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
+    ManagedSessionHandle, ManagedSessionView, ReviewerAction, ReviewerOutcome,
+    SessionManagerControl, ViewError, new_command_id,
 };
 use crate::hel_state::{
-    MaterializedSession, RecoveryContext, TranscriptBody, TranscriptItem, config_command_text,
+    MaterializedSession, RecoveryCheckpointPhase, RecoveryContext, TranscriptBody, TranscriptItem,
+    config_command_text,
 };
 use crate::hel_transcript::ChatEntry;
 use crate::hel_worker::WorkerPhase;
@@ -32,15 +35,24 @@ use super::remote::{
     queue_chat_remote_operation, restore_unsent_input,
 };
 use super::rendering::{display_width, truncate_line_to_width, truncate_to_width};
+use super::second_opinion::{
+    CapturedProposal, SecondOpinion, SecondOpinionIntent, render_reviewer, render_setup,
+    render_split_actions, reviewer_session_id,
+};
 use super::transcript::{
     ToolDiffstatRequest, TranscriptAnchor, materialized_chunks_text, materialized_prefix_entries,
     render_transcript,
 };
 use super::{
-    ChatAction, ChatEventOutcome, ChatFocus, ChatState, Notices, OtherSessionActivity,
-    OtherSessionIdentity, SessionHeaderIdentity, last_nonempty_line, queued_prompt_preview,
-    turn_band_color, turn_started_at_epoch_seconds,
+    ChatAction, ChatEventOutcome, ChatFocus, ChatState, MOUSE_SCROLL_ROWS, Notices,
+    OtherSessionActivity, OtherSessionIdentity, SessionHeaderIdentity, last_nonempty_line,
+    queued_prompt_preview, turn_band_color, turn_started_at_epoch_seconds,
 };
+use crate::hel_second_opinion::{
+    ReviewWorkflow, ReviewerDefaults, ReviewerProfileChoice, ReviewerSelection, ReviewerSetup,
+    SetupRequest, WorkflowRequest,
+};
+use agent_client_protocol::schema::v1::SessionConfigOption;
 
 use crate::clock::epoch_seconds;
 
@@ -48,6 +60,7 @@ use crate::clock::epoch_seconds;
 /// of the screen, so the list stays a window however many sessions are open.
 const CONVERSATIONS_PANE_MAX_ROWS: usize = 7;
 const MAX_DIFFSTAT_TASKS: usize = 2;
+const SESSION_ACTOR_RECONNECT_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 enum ChatIoUpdate {
@@ -69,6 +82,24 @@ enum ChatIoUpdate {
         tool_call_id: String,
         revision: u64,
         result: std::result::Result<Vec<String>, String>,
+    },
+    SessionReconnected(std::result::Result<ManagedSessionHandle, String>),
+    /// A reviewer setup step finished. `generation` is the probe it belongs
+    /// to, so a result the user has already moved past is discarded.
+    ReviewerProbe {
+        generation: u64,
+        result: std::result::Result<Vec<SessionConfigOption>, String>,
+    },
+    /// A reviewer model change finished.
+    ReviewerConfigured {
+        generation: u64,
+        result: std::result::Result<Vec<SessionConfigOption>, String>,
+    },
+    /// The chosen reviewer is running and the review can begin.
+    ReviewerStarted(std::result::Result<(), String>),
+    /// A page of the reviewer's own relay events.
+    ReviewerEvents {
+        result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
     },
 }
 
@@ -230,7 +261,10 @@ fn dispatch_history_search_request(
             Ok(result) => result,
             Err(error) => Err(format!("history search task failed: {error}")),
         };
-        let _ = updates.send(ChatIoUpdate::HistorySearchResults { generation, result });
+        if let Err(error) = updates.send(ChatIoUpdate::HistorySearchResults { generation, result })
+        {
+            tracing::debug!(%error, "history search result dropped because the chat closed");
+        }
     });
 }
 
@@ -250,11 +284,13 @@ fn dispatch_diffstat_requests(
                 Ok(result) => result,
                 Err(error) => Err(format!("diff summary task failed: {error}")),
             };
-            let _ = updates.send(ChatIoUpdate::ToolDiffstats {
+            if let Err(error) = updates.send(ChatIoUpdate::ToolDiffstats {
                 tool_call_id,
                 revision,
                 result,
-            });
+            }) {
+                tracing::debug!(%error, "tool diff summary dropped because the chat closed");
+            }
         });
     }
 }
@@ -299,7 +335,9 @@ fn spawn_transcript_prefix(
             Ok(entries) => Ok(entries),
             Err(error) => Err(format!("history conversion task failed: {error}")),
         };
-        let _ = updates.send(ChatIoUpdate::TranscriptPrefix { attempt, result });
+        if let Err(error) = updates.send(ChatIoUpdate::TranscriptPrefix { attempt, result }) {
+            tracing::debug!(%error, "transcript conversion result dropped because the chat closed");
+        }
     });
 }
 
@@ -332,10 +370,14 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
                     attempt: attempt.saturating_add(1),
                 };
             }
-            Err(error) => chat.set_notice(format!("Earlier messages failed to load: {error}")),
+            Err(error) => {
+                tracing::warn!(%error, "earlier chat history could not be converted");
+                chat.set_notice(format!("Earlier messages failed to load: {error}"));
+            }
         },
         ChatIoUpdate::ProjectHistoryPrefetched(Ok(entries)) => chat.set_project_history(entries),
         ChatIoUpdate::ProjectHistoryPrefetched(Err(error)) => {
+            tracing::warn!(%error, "project chat history prefetch failed");
             chat.set_project_history_unavailable(error);
         }
         ChatIoUpdate::HistorySearchResults { generation, result } => {
@@ -343,6 +385,7 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
         }
         ChatIoUpdate::ClipboardText(Ok(text)) => chat.handle_paste(&text),
         ChatIoUpdate::ClipboardText(Err(error)) => {
+            tracing::warn!(%error, "clipboard read failed and was shown in the UI");
             chat.set_notice(format!("Paste failed: {error}"));
         }
         ChatIoUpdate::OtherSessions(sessions) => chat.other_sessions = sessions,
@@ -351,6 +394,15 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
             revision,
             result,
         } => chat.apply_diffstats(&tool_call_id, revision, result),
+        // Reviewer updates are handled where the session handle is, because
+        // acting on one starts more reviewer work.
+        ChatIoUpdate::ReviewerProbe { .. }
+        | ChatIoUpdate::ReviewerConfigured { .. }
+        | ChatIoUpdate::ReviewerStarted(_)
+        | ChatIoUpdate::ReviewerEvents { .. } => {}
+        ChatIoUpdate::SessionReconnected(_) => {
+            unreachable!("session reconnects are applied by ActiveChat")
+        }
     }
     PrefixRebuild::NotNeeded
 }
@@ -536,10 +588,8 @@ fn spawn_other_session_poller(
                 resolved.remove(&session_id);
             }
             if summaries != sent {
-                if updates
-                    .send(ChatIoUpdate::OtherSessions(summaries.clone()))
-                    .is_err()
-                {
+                if let Err(error) = updates.send(ChatIoUpdate::OtherSessions(summaries.clone())) {
+                    tracing::debug!(%error, "other-session activity result dropped because the chat closed");
                     return;
                 }
                 sent = summaries;
@@ -550,8 +600,9 @@ fn spawn_other_session_poller(
     });
 }
 
-/// Applies one session view to the chat. `false` means the session manager has
-/// stopped and can never send again, so its feed must not be awaited any more.
+/// Applies one session view to the chat. `false` means this particular actor's
+/// feed has closed, so it must not be awaited while the chat reacquires the
+/// manager's replacement actor.
 ///
 /// This runs whether or not the chat is on screen: a warm chat behind the
 /// session list stays as current as one the user is watching.
@@ -561,10 +612,17 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
         Err(error) => {
             // Keep the transcript readable rather than tearing the dashboard
             // down around a stopped manager.
+            tracing::warn!(error = format!("{error:#}"), "chat session view failed");
             state.set_notice(format!("connection lost: {error:#}"));
             return false;
         }
     };
+    // A transient connection error does not make an as-yet-unavailable
+    // transcript empty. The actor keeps retrying, so retain the loading row
+    // until a real projection arrives; the error still appears in the notice.
+    if view.snapshot.is_some() {
+        state.set_transcript_loading(false);
+    }
     if let Some(snapshot) = view.snapshot {
         state.apply_materialized(
             &snapshot.materialized,
@@ -577,16 +635,20 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
             &snapshot.operational.active_agent_terminals,
             &snapshot.materialized,
         );
+        state.set_last_acp_activity(snapshot.operational.last_acp_activity_at_ms);
     }
     if let Some(error) = view.error {
         match error {
             ViewError::Unreachable(detail) => {
+                tracing::warn!(%detail, "chat session became unreachable");
                 state.set_notice(format!("connection lost: {detail}"))
             }
             ViewError::TargetMissing(detail) => {
+                tracing::warn!(%detail, "chat session target is missing");
                 state.set_notice(format!("managed target lost: {detail}"))
             }
             ViewError::ProjectionIntegrity(detail) => {
+                tracing::error!(%detail, "chat transcript projection failed");
                 state.set_notice(format!("transcript projection failed: {detail}"))
             }
         }
@@ -613,6 +675,7 @@ fn detach_chat(state: &mut ChatState) -> u64 {
 pub struct ActiveChat {
     state: ChatState,
     session: ManagedSessionHandle,
+    session_manager: SessionManagerControl,
     bundle_id: String,
     recovery: Option<RecoveryContext>,
     remote: ChatRemoteSupervisor,
@@ -630,6 +693,19 @@ pub struct ActiveChat {
     /// permanently ready. Each flag retires its own arm instead.
     remote_open: bool,
     session_open: bool,
+    session_reconnect_in_flight: bool,
+    session_feed_expected: bool,
+    /// Preserve the stronger reconnect result when the initial sync, which
+    /// independently reacquires the same actor, finishes just afterwards.
+    reconnect_notice_pending_sync: bool,
+    /// The reviewer lifetime this session is on. It is bumped only when the
+    /// reviewer's native conversation is lost, never by an ordinary probe, so
+    /// a repeat review reloads the same conversation.
+    reviewer_generation: u64,
+    /// The remembered selection a resumed review is starting under, if this
+    /// workspace has already chosen a reviewer. It short-circuits the
+    /// waterfall: the choice is only asked again when this fails.
+    resuming_reviewer: Option<ReviewerSelection>,
 }
 
 impl ActiveChat {
@@ -694,12 +770,14 @@ impl ActiveChat {
                     &snapshot.operational.active_agent_terminals,
                     &snapshot.materialized,
                 );
+                state.set_last_acp_activity(snapshot.operational.last_acp_activity_at_ms);
             }
             let pending = PendingPrefix::of(materialized, state.unconverted_prefix());
             (state, pending)
         };
         state.set_history_context(bundle_id);
         state.set_header_position(header.position);
+        state.set_header_summary(header.target, header.profile);
         state.restore_draft(draft);
         state.notices = notices;
         let (chat_io_tx, chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
@@ -722,13 +800,15 @@ impl ActiveChat {
                     Ok(result) => result,
                     Err(error) => Err(format!("history prefetch task failed: {error}")),
                 };
-                let _ = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result));
+                if let Err(error) = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result)) {
+                    tracing::debug!(%error, "project history result dropped because the chat closed");
+                }
             });
         }
         if let Some(pending) = pending_prefix {
             spawn_transcript_prefix(pending, 1, chat_io_tx.clone());
         }
-        spawn_other_session_poller(control, header.others, chat_io_tx.clone());
+        spawn_other_session_poller(control.clone(), header.others, chat_io_tx.clone());
         if let Some(detail) = recovery
             .as_ref()
             .and_then(|recovery| recovery.session.last_checkpoint_error.as_deref())
@@ -737,16 +817,61 @@ impl ActiveChat {
         }
         let (voice_updates_tx, voice_updates_rx) =
             tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
-        let remote = ChatRemoteSupervisor::spawn(session.clone());
+        let remote = ChatRemoteSupervisor::spawn(session.clone(), control.clone());
         if needs_initial_sync {
+            state.set_transcript_loading(true);
             state.set_notice("Connecting to session relay…");
             queue_chat_remote_operation(remote.operations(), ChatRemoteOperation::Sync, &mut state);
         }
         let mut diffstats_in_flight = 0;
         dispatch_diffstat_requests(&mut state, &chat_io_tx, &mut diffstats_in_flight);
-        Self {
+        // A review that was open when the UI stopped is picked back up. The
+        // reviewer's own journal on the target holds its conversation, so the
+        // split is restored by replaying it rather than by keeping a second
+        // copy of the transcript here.
+        let stored =
+            crate::hel_database::active_review(session.session_id()).unwrap_or_else(|error| {
+                tracing::debug!(error = %format!("{error:#}"), "could not read the open review");
+                None
+            });
+        let reviewer_generation = stored.as_ref().map_or(0, |review| review.generation);
+        if let Some(stored) = stored.filter(|stored| !stored.workflow.finished()) {
+            let captured = CapturedProposal {
+                request: crate::hel_acp::normalized_plan_review(
+                    stored.workflow.proposal_id().to_owned(),
+                    &serde_json::json!({ "plan": stored.workflow.proposal() }),
+                ),
+                proposal: stored.workflow.proposal().to_owned(),
+            };
+            state.open_second_opinion(
+                captured,
+                ReviewerSetup::new(
+                    String::new(),
+                    Vec::new(),
+                    crate::hel_second_opinion::ReviewerDefaults::default(),
+                ),
+            );
+            let status = if stored.native_lost {
+                "the reviewer's conversation did not survive; a new review starts fresh"
+            } else {
+                "reloading the review…"
+            };
+            let reviewer_transcript = stored.reviewer_transcript;
+            if let Some(view) = state.second_opinion_mut() {
+                view.begin_review(stored.workflow, status, stored.context_baseline);
+                // The reviewer's own journal is the source while the target
+                // lives; this copy is what keeps the conversation readable
+                // once it does not.
+                view.restore_reviewer(
+                    &reviewer_session_id(session.session_id()),
+                    reviewer_transcript,
+                );
+            }
+        }
+        let chat = Self {
             state,
             session,
+            session_manager: control,
             bundle_id: bundle_id.to_owned(),
             recovery,
             remote,
@@ -759,21 +884,48 @@ impl ActiveChat {
             voice_prefix: String::new(),
             remote_open: true,
             session_open: true,
+            session_reconnect_in_flight: false,
+            session_feed_expected: false,
+            reconnect_notice_pending_sync: false,
+            reviewer_generation,
+            resuming_reviewer: None,
+        };
+        if chat.state.second_opinion_split() {
+            chat.poll_reviewer_events();
         }
+        chat
     }
 
     pub fn session_id(&self) -> &str {
         self.session.session_id()
     }
 
+    /// Whether a second opinion is open on this session.
+    ///
+    /// Stopping the session tears its target down, which takes the reviewer's
+    /// conversation with it, so the stop confirmation asks about this.
+    pub fn has_open_review(&self) -> bool {
+        self.state.second_opinion_active()
+    }
+
     /// Whether this view is still attached to a live session actor.
     ///
     /// Pause, destroy, and a replaced target retire the actor and close this
-    /// feed. A warm chat whose feed is closed still holds the last snapshot,
-    /// including a Closing/Closed phase, so the dashboard must open a new view
-    /// instead of redrawing this one.
+    /// feed. A visible chat reacquires replacements in place; the flag remains
+    /// useful while that asynchronous handoff is in flight.
     pub fn session_feed_open(&self) -> bool {
         self.session_open
+    }
+
+    /// Keeps a visible chat attached when another control surface makes its
+    /// session runnable again. A stopped actor gets one bounded handoff attempt
+    /// on its own; a durable active record means replacement should keep being
+    /// retried until the actor appears or another record retires the session.
+    pub fn set_session_feed_expected(&mut self, expected: bool) {
+        self.session_feed_expected = expected;
+        if expected && !self.session_open {
+            self.begin_session_reconnect();
+        }
     }
 
     /// The composer's current text. The dashboard saves this on detach so
@@ -813,7 +965,7 @@ impl ActiveChat {
             view = chat.session.changed(), if chat.session_open => Wakeup::View(Box::new(view)),
         };
         match wakeup {
-            Wakeup::Remote(Some(result)) => apply_chat_remote_result(&mut chat.state, result),
+            Wakeup::Remote(Some(result)) => chat.apply_remote_result(result),
             Wakeup::Remote(None) => chat.remote_open = false,
             Wakeup::Io(update) => chat.apply_io_update(update),
             Wakeup::Voice(update) => chat.apply_voice_update(update),
@@ -825,7 +977,7 @@ impl ActiveChat {
 
     async fn drain(&mut self) {
         while let Ok(result) = self.remote.try_recv() {
-            apply_chat_remote_result(&mut self.state, result);
+            self.apply_remote_result(result);
         }
         while let Ok(update) = self.chat_io_rx.try_recv() {
             self.apply_io_update(update);
@@ -837,6 +989,48 @@ impl ActiveChat {
             let view = self.session.changed().await;
             self.apply_session_view(view);
         }
+        self.advance_review();
+    }
+
+    /// Moves a review on when the planner has answered the context request.
+    ///
+    /// The answer is the planner's next agent message after the request went
+    /// out, so a message already in the transcript can never be mistaken for
+    /// it, and a reconnect that replays the same completion starts no second
+    /// reviewer turn.
+    fn advance_review(&mut self) {
+        let Some(SecondOpinion::Review(review)) = self.state.second_opinion() else {
+            return;
+        };
+        let context_baseline = review.context_baseline;
+        let crate::hel_second_opinion::ReviewStage::GatheringContext { command_id } =
+            review.workflow.stage()
+        else {
+            return;
+        };
+        if self.state.phase != WorkerPhase::Idle {
+            return;
+        }
+        let command_id = command_id.clone();
+        let Some(summary) = self.state.latest_agent_text_after(context_baseline) else {
+            return;
+        };
+        let reviewer_command_id = self.state.next_second_opinion_command_id("review");
+        let Some(SecondOpinion::Review(review)) = self.state.second_opinion_mut() else {
+            return;
+        };
+        let Some(request) =
+            review
+                .workflow
+                .primary_context_completed(&command_id, summary, reviewer_command_id)
+        else {
+            return;
+        };
+        if let Some(view) = self.state.second_opinion_mut() {
+            view.set_status("the reviewer is reading the plan…");
+        }
+        self.persist_review();
+        self.run_workflow_request(request);
     }
 
     /// Reports a background worker that stopped on its own. Cheap enough to
@@ -855,6 +1049,33 @@ impl ActiveChat {
     }
 
     fn apply_io_update(&mut self, update: ChatIoUpdate) {
+        let update = match update {
+            ChatIoUpdate::SessionReconnected(result) => {
+                self.finish_session_reconnect(result);
+                return;
+            }
+            ChatIoUpdate::ReviewerProbe { generation, result } => {
+                self.apply_reviewer_options(generation, result, false);
+                return;
+            }
+            ChatIoUpdate::ReviewerConfigured { generation, result } => {
+                self.apply_reviewer_options(generation, result, true);
+                return;
+            }
+            ChatIoUpdate::ReviewerStarted(result) => {
+                if let Err(error) = result
+                    && let Some(view) = self.state.second_opinion_mut()
+                {
+                    view.report_failure(error);
+                }
+                return;
+            }
+            ChatIoUpdate::ReviewerEvents { result } => {
+                self.apply_reviewer_events(result);
+                return;
+            }
+            update => update,
+        };
         if matches!(&update, ChatIoUpdate::ToolDiffstats { .. }) {
             self.diffstats_in_flight = self.diffstats_in_flight.saturating_sub(1);
         }
@@ -910,11 +1131,76 @@ impl ActiveChat {
 
     fn apply_session_view(&mut self, view: Result<ManagedSessionView>) {
         self.session_open = apply_session_view(&mut self.state, view);
+        if !self.session_open {
+            self.begin_session_reconnect();
+        }
         dispatch_diffstat_requests(
             &mut self.state,
             &self.chat_io_tx,
             &mut self.diffstats_in_flight,
         );
+    }
+
+    fn apply_remote_result(&mut self, result: ChatRemoteResult) {
+        let sync_succeeded = matches!(&result, ChatRemoteResult::Sync(Ok(())));
+        let sync_finished = matches!(&result, ChatRemoteResult::Sync(_));
+        apply_chat_remote_result(&mut self.state, result);
+        if sync_finished {
+            if sync_succeeded && self.reconnect_notice_pending_sync {
+                self.state.set_notice("Reconnected to session relay");
+            }
+            self.reconnect_notice_pending_sync = false;
+        }
+    }
+
+    fn begin_session_reconnect(&mut self) {
+        if self.session_reconnect_in_flight {
+            return;
+        }
+        self.session_reconnect_in_flight = true;
+        let session_id = self.session.session_id().to_owned();
+        let session_manager = self.session_manager.clone();
+        let updates = self.chat_io_tx.clone();
+        tokio::spawn(async move {
+            let result = session_manager
+                .wait_for_session(&session_id, SESSION_ACTOR_RECONNECT_WAIT)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            if let Err(error) = updates.send(ChatIoUpdate::SessionReconnected(result)) {
+                tracing::debug!(
+                    %error,
+                    %session_id,
+                    "session reconnect result dropped because the chat closed"
+                );
+            }
+        });
+    }
+
+    fn finish_session_reconnect(
+        &mut self,
+        result: std::result::Result<ManagedSessionHandle, String>,
+    ) {
+        self.session_reconnect_in_flight = false;
+        match result {
+            Ok(session) => {
+                let view = session.view();
+                self.session = session;
+                self.session_open = apply_session_view(&mut self.state, Ok(view));
+                if self.session_open {
+                    self.reconnect_notice_pending_sync = true;
+                    self.state.set_notice("Reconnected to session relay");
+                } else {
+                    self.begin_session_reconnect();
+                }
+            }
+            Err(error) => {
+                self.state
+                    .set_notice(format!("Could not reconnect to session relay: {error}"));
+                if self.session_feed_expected {
+                    self.begin_session_reconnect();
+                }
+            }
+        }
     }
 
     /// Applies one terminal event and reports what it asked for.
@@ -985,6 +1271,7 @@ impl ActiveChat {
             }
             ChatAction::RemoveQueuedPrompt { id, text, kind } => {
                 let Some(command_id) = self.command_id("remove-prompt") else {
+                    self.state.fail_queued_prompt_removal(id, text, kind);
                     return ChatEventOutcome::Handled;
                 };
                 self.state.set_notice("Removing queued prompt…");
@@ -1015,20 +1302,6 @@ impl ActiveChat {
                     &mut self.state,
                 );
             }
-            ChatAction::SetSessionMode { mode_id } => {
-                let Some(command_id) = self.command_id("set-session-mode") else {
-                    self.state.current_mode = None;
-                    return ChatEventOutcome::Handled;
-                };
-                queue_chat_remote_operation(
-                    self.remote.operations(),
-                    ChatRemoteOperation::SetSessionMode {
-                        command_id,
-                        mode_id,
-                    },
-                    &mut self.state,
-                );
-            }
             ChatAction::PlanCommand {
                 original,
                 control,
@@ -1037,6 +1310,7 @@ impl ActiveChat {
             } => {
                 let Some(command_id) = self.command_id("plan-mode") else {
                     self.state.plan_command_pending = false;
+                    self.state.finish_plan_mode_change(!requested_active);
                     restore_unsent_input(&mut self.state, &original);
                     return ChatEventOutcome::Handled;
                 };
@@ -1069,6 +1343,16 @@ impl ActiveChat {
                     &mut self.state,
                 );
             }
+            ChatAction::StartSecondOpinion { request, proposal } => {
+                self.open_second_opinion(request, proposal);
+            }
+            ChatAction::SecondOpinion(intent) => {
+                self.run_second_opinion(intent);
+            }
+            ChatAction::RespondReviewerElicitation {
+                elicitation_id,
+                response,
+            } => self.answer_reviewer(elicitation_id, response),
             ChatAction::RespondElicitation { request, response } => {
                 let plan_followup = self.state.plan_review_followup(&request, &response);
                 self.state.set_notice("Sending answer…");
@@ -1095,7 +1379,9 @@ impl ActiveChat {
                         Ok(result) => result,
                         Err(error) => Err(format!("clipboard task failed: {error}")),
                     };
-                    let _ = updates.send(ChatIoUpdate::ClipboardText(result));
+                    if let Err(error) = updates.send(ChatIoUpdate::ClipboardText(result)) {
+                        tracing::debug!(%error, "clipboard result dropped because the chat closed");
+                    }
                 });
             }
             ChatAction::ToggleVoice => {
@@ -1141,6 +1427,512 @@ impl ActiveChat {
         ChatEventOutcome::Handled
     }
 
+    /// Opens the reviewer waterfall for a captured plan.
+    ///
+    /// The harness's decision stays pending: it is answered only once a
+    /// reviewer is running, because gathering context needs an idle planning
+    /// session and cancelling before then must leave the decision intact.
+    fn open_second_opinion(
+        &mut self,
+        request: crate::hel_elicitation::ElicitationRequest,
+        proposal: String,
+    ) {
+        let Some(recovery) = self.recovery.as_ref() else {
+            self.state
+                .set_notice("A second opinion needs this session's configuration");
+            self.state.restore_elicitation(request);
+            return;
+        };
+        let profiles = recovery
+            .config
+            .profiles
+            .iter()
+            .map(|(id, profile)| ReviewerProfileChoice {
+                id: id.clone(),
+                harness: profile.kind.id().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        if profiles.is_empty() {
+            self.state
+                .set_notice("Configure a second profile to review plans with");
+            self.state.restore_elicitation(request);
+            return;
+        }
+        let defaults = crate::hel_database::reviewer_defaults().unwrap_or_else(|error| {
+            tracing::debug!(%error, "could not read remembered reviewer choices");
+            ReviewerDefaults::default()
+        });
+        let workspace_id = recovery.session.workspace_id.clone();
+        // A workspace that has already chosen a reviewer does not choose
+        // again: the same reviewer resumes with its own conversation. The
+        // waterfall reopens only when starting it that way fails.
+        let remembered = defaults
+            .profile(&workspace_id)
+            .filter(|id| recovery.config.profiles.contains_key(*id))
+            .map(|profile_id| ReviewerSelection {
+                profile_id: profile_id.to_owned(),
+                model: remembered_value(defaults.model(&workspace_id, profile_id)),
+                effort: remembered_value(
+                    defaults.effort(
+                        &workspace_id,
+                        profile_id,
+                        defaults
+                            .model(&workspace_id, profile_id)
+                            .unwrap_or(crate::hel_second_opinion::HARNESS_DEFAULT_VALUE),
+                    ),
+                ),
+            });
+        let setup = ReviewerSetup::new(workspace_id, profiles, defaults);
+        self.state
+            .open_second_opinion(CapturedProposal { request, proposal }, setup);
+        if let Some(selection) = remembered {
+            if let Some(view) = self.state.second_opinion_mut() {
+                view.set_status("resuming the reviewer…");
+            }
+            self.probe_reviewer(
+                0,
+                selection.profile_id.clone(),
+                selection.model.clone(),
+                selection.effort.clone(),
+                false,
+            );
+            self.resuming_reviewer = Some(selection);
+        }
+    }
+
+    /// Performs the steps the second-opinion view asked for.
+    fn run_second_opinion(&mut self, intent: SecondOpinionIntent) {
+        match intent {
+            SecondOpinionIntent::Setup(requests) => {
+                for request in requests {
+                    self.run_setup_request(request);
+                }
+            }
+            SecondOpinionIntent::Confirmed {
+                profile_id,
+                model,
+                effort,
+            } => self.confirm_reviewer(profile_id, model, effort),
+            SecondOpinionIntent::Workflow(requests) => {
+                // Every workflow batch that reaches here ends the review, so
+                // the record goes before the steps run: a crash between them
+                // must not restore a split whose feedback already went out.
+                self.forget_review();
+                for request in requests {
+                    self.run_workflow_request(request);
+                }
+            }
+            SecondOpinionIntent::Closed => {}
+        }
+    }
+
+    fn run_setup_request(&mut self, request: SetupRequest) {
+        match request {
+            SetupRequest::Probe {
+                generation,
+                profile_id,
+            } => self.probe_reviewer(generation, profile_id, None, None, false),
+            SetupRequest::ApplyModel { generation, model } => {
+                let Some(profile_id) = self.setup_profile_id() else {
+                    return;
+                };
+                self.probe_reviewer(generation, profile_id, Some(model), None, true);
+            }
+            SetupRequest::CancelProbe { .. } => self.pause_reviewer(),
+        }
+    }
+
+    /// Persists the open review so a UI restart can pick it back up.
+    fn persist_review(&self) {
+        let Some(SecondOpinion::Review(review)) = self.state.second_opinion() else {
+            return;
+        };
+        let stored = crate::hel_database::StoredReview {
+            workflow: review.workflow.clone(),
+            generation: self.reviewer_generation,
+            context_baseline: review.context_baseline,
+            native_lost: false,
+            reviewer_transcript: review.reviewer.transcript(),
+        };
+        if let Err(error) =
+            crate::hel_database::save_active_review(self.session.session_id(), &stored)
+        {
+            tracing::debug!(error = %format!("{error:#}"), "could not record the open review");
+        }
+    }
+
+    /// Forgets a review that has finished, so nothing is restored for it.
+    fn forget_review(&self) {
+        if let Err(error) = crate::hel_database::clear_active_review(self.session.session_id()) {
+            tracing::debug!(error = %format!("{error:#}"), "could not clear the finished review");
+        }
+    }
+
+    fn setup_profile_id(&self) -> Option<String> {
+        let SecondOpinion::Setup { setup, .. } = self.state.second_opinion()? else {
+            return None;
+        };
+        setup
+            .profiles()
+            .get(setup.profile_index())
+            .map(|profile| profile.id.clone())
+    }
+
+    /// Stages a profile and starts (or reconfigures) the reviewer under it,
+    /// reporting the options it advertises back to the waterfall.
+    fn probe_reviewer(
+        &mut self,
+        generation: u64,
+        profile_id: String,
+        model: Option<String>,
+        effort: Option<String>,
+        configuring: bool,
+    ) {
+        let Some(recovery) = self.recovery.as_ref() else {
+            return;
+        };
+        let controller = crate::hel_controller::Controller {
+            config: recovery.config.clone(),
+            state: crate::hel_state::HelState {
+                sessions: std::collections::BTreeMap::from([(
+                    recovery.session.id.clone(),
+                    recovery.session.clone(),
+                )]),
+                ..crate::hel_state::HelState::default()
+            },
+        };
+        let session_id = self.session.session_id().to_owned();
+        let session = self.session.clone();
+        let updates = self.chat_io_tx.clone();
+        // The reviewer's lifetime generation is what decides whether the
+        // running reviewer can be kept; `generation` here only says which
+        // probe this answer belongs to.
+        let lifetime = self.reviewer_generation;
+        tokio::spawn(async move {
+            let staged = tokio::task::spawn_blocking(move || {
+                controller.stage_reviewer_profile(&session_id, &profile_id, lifetime)
+            })
+            .await;
+            let result = async {
+                let mut config = match staged {
+                    Ok(Ok(config)) => config,
+                    Ok(Err(error)) => return Err(format!("{error:#}")),
+                    Err(error) => return Err(format!("staging the reviewer stopped: {error}")),
+                };
+                config.model = model;
+                config.effort = effort;
+                match session
+                    .reviewer(ReviewerAction::Start {
+                        config: Box::new(config),
+                    })
+                    .await
+                {
+                    Ok(ReviewerOutcome::Started(started)) => Ok(started.config_options),
+                    Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            }
+            .await;
+            let update = if configuring {
+                ChatIoUpdate::ReviewerConfigured { generation, result }
+            } else {
+                ChatIoUpdate::ReviewerProbe { generation, result }
+            };
+            if let Err(error) = updates.send(update) {
+                tracing::debug!(%error, "reviewer result dropped because the chat closed");
+            }
+        });
+    }
+
+    /// Confirms the chosen reviewer: remember it, answer the harness's own
+    /// plan decision, and ask the planner for the context the reviewer needs.
+    fn confirm_reviewer(
+        &mut self,
+        profile_id: String,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let Some(view) = self.state.second_opinion() else {
+            return;
+        };
+        let captured = view.captured().clone();
+        if let Some(recovery) = self.recovery.as_ref() {
+            let selection = ReviewerSelection {
+                profile_id,
+                model,
+                effort,
+            };
+            if let Err(error) = crate::hel_database::remember_reviewer_selection(
+                &recovery.session.workspace_id,
+                &selection,
+            ) {
+                tracing::debug!(%error, "could not remember the reviewer choice");
+            }
+        }
+        let command_id = self.state.next_second_opinion_command_id("context");
+        let (workflow, request) =
+            ReviewWorkflow::start(captured.id(), captured.proposal.clone(), command_id.clone());
+        let baseline = self.state.latest_seq();
+        if let Some(view) = self.state.second_opinion_mut() {
+            view.begin_review(workflow, "asking the planner for context…", baseline);
+        }
+        // The harness's decision is answered only now. Declining keeps plan
+        // mode active, which is what lets the planner answer a context
+        // question instead of starting to implement.
+        queue_chat_remote_operation(
+            self.remote.operations(),
+            ChatRemoteOperation::RespondElicitation {
+                request: captured.request.clone(),
+                response: crate::hel_acp::plan_review_keep_planning(),
+                plan_followup: None,
+                session_id: self.session.session_id().to_owned(),
+                bundle_id: self.bundle_id.clone(),
+            },
+            &mut self.state,
+        );
+        self.persist_review();
+        self.run_workflow_request(request);
+        self.poll_reviewer_events();
+    }
+
+    fn run_workflow_request(&mut self, request: WorkflowRequest) {
+        match request {
+            WorkflowRequest::PromptPrimary { command_id, prompt } => {
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::Prompt {
+                        command_id,
+                        text: prompt,
+                        session_id: self.session.session_id().to_owned(),
+                        bundle_id: self.bundle_id.clone(),
+                    },
+                    &mut self.state,
+                );
+            }
+            WorkflowRequest::PromptReviewer { command_id, prompt } => {
+                let session = self.session.clone();
+                let updates = self.chat_io_tx.clone();
+                tokio::spawn(async move {
+                    let result = session
+                        .reviewer(ReviewerAction::Submit {
+                            command_id,
+                            command: crate::hel_worker::RelayCommand::Prompt {
+                                prompt: vec![
+                                    agent_client_protocol::schema::v1::ContentBlock::Text(
+                                        agent_client_protocol::schema::v1::TextContent::new(prompt),
+                                    ),
+                                ],
+                            },
+                        })
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| format!("{error:#}"));
+                    if let Err(error) = updates.send(ChatIoUpdate::ReviewerStarted(result)) {
+                        tracing::debug!(%error, "reviewer prompt result dropped");
+                    }
+                });
+            }
+            WorkflowRequest::PauseReviewer => self.pause_reviewer(),
+            WorkflowRequest::RestoreDecision { proposal, .. } => {
+                // Gathering context consumed the harness's own approval, so
+                // only Hel can put this decision back in front of the user.
+                let restored = crate::hel_acp::normalized_plan_review(
+                    self.state.next_second_opinion_command_id("plan-review"),
+                    &serde_json::json!({ "plan": proposal }),
+                );
+                self.state.restore_elicitation(restored);
+            }
+        }
+    }
+
+    fn pause_reviewer(&self) {
+        let session = self.session.clone();
+        tokio::spawn(async move {
+            if let Err(error) = session.reviewer(ReviewerAction::Pause).await {
+                tracing::debug!(error = %format!("{error:#}"), "pausing the reviewer failed");
+            }
+        });
+    }
+
+    /// Answers a form the reviewer's harness is waiting on.
+    fn answer_reviewer(
+        &mut self,
+        elicitation_id: String,
+        response: crate::hel_elicitation::ElicitationResponse,
+    ) {
+        let session = self.session.clone();
+        let updates = self.chat_io_tx.clone();
+        tokio::spawn(async move {
+            let result = session
+                .reviewer(ReviewerAction::RespondElicitation {
+                    elicitation_id,
+                    response,
+                })
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"));
+            if let Err(error) = updates.send(ChatIoUpdate::ReviewerStarted(result)) {
+                tracing::debug!(%error, "reviewer form answer result dropped");
+            }
+        });
+        // The answer unblocks the reviewer's turn, so keep reading its journal.
+        self.poll_reviewer_events();
+    }
+
+    /// Puts a form the reviewer is waiting on in front of the user, or answers
+    /// it for them when it is not theirs to answer.
+    fn surface_reviewer_elicitations(&mut self) {
+        let Some(pending) = self
+            .state
+            .second_opinion()
+            .and_then(SecondOpinion::reviewer)
+            .map(|reviewer| reviewer.pending_elicitations().to_vec())
+        else {
+            return;
+        };
+        for request in pending {
+            // A reviewer's plan decision is the reviewer proposing work, not
+            // the plan under review. It is never shown as the primary's
+            // decision; the reviewer was asked to critique, not to implement,
+            // so it is declined and its critique stands as the answer.
+            if crate::hel_acp::is_plan_review_id(&request.id) {
+                self.answer_reviewer(request.id, crate::hel_acp::plan_review_keep_planning());
+                continue;
+            }
+            if self.state.reviewer_elicitation_open() {
+                return;
+            }
+            if !self.state.show_reviewer_elicitation(request) {
+                return;
+            }
+        }
+    }
+
+    /// Reads the reviewer's journal from where the pane left off.
+    fn poll_reviewer_events(&self) {
+        let Some(reviewer) = self
+            .state
+            .second_opinion()
+            .and_then(SecondOpinion::reviewer)
+        else {
+            return;
+        };
+        let after_ordinal = reviewer.cursor_ordinal;
+        let after_digest = if reviewer.cursor_digest.is_empty() {
+            crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned()
+        } else {
+            reviewer.cursor_digest.clone()
+        };
+        let session = self.session.clone();
+        let updates = self.chat_io_tx.clone();
+        tokio::spawn(async move {
+            let result = match session
+                .reviewer(ReviewerAction::Attach {
+                    after_ordinal,
+                    after_digest,
+                })
+                .await
+            {
+                Ok(ReviewerOutcome::Attached(attachment)) => Ok(attachment.events),
+                Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            if let Err(error) = updates.send(ChatIoUpdate::ReviewerEvents { result }) {
+                tracing::debug!(%error, "reviewer events dropped because the chat closed");
+            }
+        });
+    }
+
+    /// Reports what the reviewer advertises back to the waterfall.
+    ///
+    /// A result from a probe the user has moved past is dropped by the state
+    /// machine, which also names the reviewer to stop, so a slow harness can
+    /// never overwrite a newer selection.
+    fn apply_reviewer_options(
+        &mut self,
+        generation: u64,
+        result: std::result::Result<Vec<SessionConfigOption>, String>,
+        configuring: bool,
+    ) {
+        // A resumed review never shows the waterfall: the choice was already
+        // made, so a successful start goes straight to the review and only a
+        // failure falls back to asking again.
+        if let Some(selection) = self.resuming_reviewer.clone() {
+            match result {
+                Ok(_) => {
+                    self.resuming_reviewer = None;
+                    self.confirm_reviewer(selection.profile_id, selection.model, selection.effort);
+                    return;
+                }
+                Err(error) => {
+                    self.resuming_reviewer = None;
+                    if let Some(view) = self.state.second_opinion_mut() {
+                        view.report_failure(format!(
+                            "the remembered reviewer could not start: {error}"
+                        ));
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(SecondOpinion::Setup { setup, .. }) = self.state.second_opinion_mut() else {
+            return;
+        };
+        let stale = match result {
+            Ok(options) if configuring => setup.model_applied(generation, &options),
+            Ok(options) => setup.probe_succeeded(generation, &options),
+            Err(error) => {
+                setup.probe_failed(generation, error);
+                None
+            }
+        };
+        if let Some(request) = stale {
+            self.run_setup_request(request);
+        }
+    }
+
+    /// Folds a page of reviewer events into the pane and keeps reading.
+    fn apply_reviewer_events(
+        &mut self,
+        result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
+    ) {
+        let session_id = reviewer_session_id(self.session.session_id());
+        let events = match result {
+            Ok(events) => events,
+            Err(error) => {
+                if let Some(view) = self.state.second_opinion_mut() {
+                    view.report_failure(error);
+                }
+                return;
+            }
+        };
+        let Some(SecondOpinion::Review(review)) = self.state.second_opinion_mut() else {
+            return;
+        };
+        if !events.is_empty() {
+            review.reviewer.apply_events(&session_id, &events);
+            // A completed answer is what unlocks transfer. The workflow
+            // decides whether this is the turn it was waiting for.
+            if let Some(answer) = review.reviewer.latest_answer()
+                && let crate::hel_second_opinion::ReviewStage::Reviewing { command_id } =
+                    review.workflow.stage().clone()
+            {
+                review.workflow.reviewer_turn_completed(&command_id, answer);
+            }
+        }
+        let finished = review.workflow.finished();
+        if let Some(view) = self.state.second_opinion_mut()
+            && view.reviewer().is_some_and(|reviewer| !reviewer.is_empty())
+        {
+            view.set_status("Enter to act · Tab to choose");
+        }
+        self.persist_review();
+        self.surface_reviewer_elicitations();
+        if !finished {
+            self.poll_reviewer_events();
+        }
+    }
+
     /// Stops any dictation thread. The thread reports `Finished`, which clears
     /// the view's voice state, so this only asks it to stop.
     fn cancel_dictation(&mut self) {
@@ -1156,20 +1948,73 @@ impl ActiveChat {
         self.state.focus_conversations();
     }
 
-    /// Draws the view. The recovery flag is read here rather than tracked,
-    /// because the checkpoint gate moves without telling the dashboard.
-    pub fn draw(&mut self, frame: &mut Frame) {
-        self.state.recovery_busy = self.recovery_busy();
-        render(frame, &mut self.state);
+    /// The surfaces the last frame registered, for the selection engine.
+    pub fn frame_surfaces(&self) -> &FrameSurfaces {
+        self.state.frame_surfaces()
     }
 
-    fn recovery_busy(&self) -> bool {
-        self.recovery.as_ref().is_some_and(RecoveryContext::is_busy)
+    /// Draws the view. The recovery phase is read here rather than tracked,
+    /// because the checkpoint gate moves without telling the dashboard.
+    ///
+    /// `transcript_selected` says whether the engine still owns a selection on
+    /// the transcript. The transcript measures selections in a row space
+    /// pinned to the viewport top, and that base has to stay frozen for as
+    /// long as a selection is measured against it.
+    pub fn draw(&mut self, frame: &mut Frame, transcript_selected: bool) {
+        self.state.recovery_phase = self.recovery_phase();
+        render(frame, &mut self.state, transcript_selected);
+    }
+
+    /// The transcript text a finished selection covers.
+    pub fn transcript_selection_text(&mut self, range: &SelectionRange) -> Option<String> {
+        self.state.transcript_selection_text(range)
+    }
+
+    /// The message text a selection in the elicitation pane covers.
+    pub fn elicitation_selection_text(&self, range: &SelectionRange) -> Option<String> {
+        self.state.elicitation_selection_text(range)
+    }
+
+    /// The text a selection in the reviewer pane covers. It is resolved
+    /// against that pane's own rows, so a drag there can never pick up the
+    /// primary transcript's text.
+    pub fn reviewer_selection_text(&self, range: &SelectionRange) -> Option<String> {
+        self.state.reviewer_selection_text(range)
+    }
+
+    /// Whether the transcript's selection row space stopped describing the
+    /// rows on screen since the last call.
+    pub fn transcript_selection_invalidated(&mut self) -> bool {
+        self.state.transcript_selection_invalidated()
+    }
+
+    /// Scrolls the surface a drag is holding against one of its edges.
+    /// `direction` is negative for up and positive for down.
+    pub fn autoscroll_selection(&mut self, surface: SurfaceId, direction: i8) {
+        let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(1);
+        match surface {
+            SurfaceId::Transcript if direction < 0 => {
+                self.state.scroll_history_up(MOUSE_SCROLL_ROWS)
+            }
+            SurfaceId::Transcript => self.state.scroll_history_down(MOUSE_SCROLL_ROWS),
+            SurfaceId::ElicitationMessage => self
+                .state
+                .scroll_elicitation_message(if direction < 0 { -rows } else { rows }),
+            SurfaceId::ReviewerTranscript => {
+                self.state
+                    .scroll_second_opinion(if direction < 0 { -rows } else { rows });
+            }
+            _ => {}
+        }
+    }
+
+    fn recovery_phase(&self) -> Option<RecoveryCheckpointPhase> {
+        self.recovery.as_ref().and_then(RecoveryContext::phase)
     }
 
     /// Whether the checkpoint title on screen is stale.
     pub fn recovery_title_is_stale(&self) -> bool {
-        self.recovery_busy() != self.state.recovery_busy
+        self.recovery_phase() != self.state.recovery_phase
     }
 
     /// Whether a clock tick has anything to redraw for: a running turn in the
@@ -1193,7 +2038,8 @@ impl Drop for ActiveChat {
     }
 }
 
-pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
+pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selected: bool) {
+    chat.frame_surfaces.clear();
     let inner = frame.area();
     // The pane never takes more than a third of the screen. Its border eats
     // two columns, so the text inside wraps to that narrower width.
@@ -1247,6 +2093,10 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
     // Consumers (mouse hover/click/scroll) map a screen row against this
     // rect, so it must be the pane's inner area, not the bordered outline.
     chat.conversations_area = Some(conversations_inner);
+    chat.frame_surfaces.push(SurfaceFrame::fixed(
+        SurfaceId::Conversations,
+        conversations_inner,
+    ));
     frame.render_widget(conversations_block, conversations_area);
     frame.render_widget(Paragraph::new(pane.lines), conversations_inner);
     if chat.focus == ChatFocus::Conversations
@@ -1264,76 +2114,123 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
             buffer[(x, y)].set_bg(Color::DarkGray);
         }
     }
-    render_transcript(frame, transcript_area, chat);
-    let queued = chat.queued_prompts.len();
-    let prompt_title = prompt_title(chat, queued);
-    let prompt_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(prompt_border)
-        .title(prompt_title);
-    let prompt_inner = prompt_block.inner(prompt_area);
-    let mut prompt_lines = chat
-        .queued_prompts
-        .iter()
-        .rev()
-        .take(3)
-        .rev()
-        .enumerate()
-        .map(|(index, queued)| {
-            Line::from(Span::styled(
-                truncate_to_width(
-                    &format!(
-                        "{} {}: {}",
-                        queued.queue_label(),
-                        index + 1,
-                        queued_prompt_preview(&queued.text)
-                    ),
-                    usize::from(prompt_inner.width),
-                ),
-                Style::default().fg(Color::DarkGray),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let queue_rows = prompt_lines.len();
-    prompt_lines.extend(if let Some(search) = chat.history_search.as_ref() {
-        highlighted_input_lines(&chat.input, &search.query)
+    // While the split is up the primary keeps the left half and the reviewer
+    // takes the right. Each pane registers its own selection surface and keeps
+    // its own scroll, so neither moves the reader's place in the other.
+    let split = chat.second_opinion_split();
+    let (primary_area, reviewer_area) = if split {
+        let halves = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(transcript_area);
+        (halves[0], Some(halves[1]))
     } else {
-        chat.input
-            .split('\n')
-            .map(|line| Line::raw(line.to_owned()))
-            .collect()
-    });
-    let cursor_row =
-        input_cursor_visual_position(&chat.input, chat.input_cursor, prompt_width).1 + queue_rows;
-    let content_height = usize::from(prompt_inner.height).max(1);
-    let input_scroll = cursor_row.saturating_add(1).saturating_sub(content_height);
-    frame.render_widget(
-        Paragraph::new(prompt_lines)
-            .wrap(Wrap { trim: false })
-            .scroll((input_scroll as u16, 0))
-            .block(prompt_block),
-        prompt_area,
-    );
-    // The cursor belongs to whatever has focus, so the composer only shows one
-    // while the keyboard is driving it.
-    if chat.history_search.is_none() && chat.focus == ChatFocus::Prompt {
-        set_input_cursor(
+        (transcript_area, None)
+    };
+    render_transcript(frame, primary_area, chat, transcript_selected);
+    chat.reviewer_area = None;
+    if let Some(area) = reviewer_area {
+        let status = match chat.second_opinion() {
+            Some(SecondOpinion::Review(review)) => review.status.clone(),
+            _ => String::new(),
+        };
+        if let Some(SecondOpinion::Review(review)) = chat.second_opinion_mut() {
+            let (inner, top, total) = render_reviewer(frame, area, &mut review.reviewer, &status);
+            chat.reviewer_area = Some(inner);
+            chat.frame_surfaces.push(SurfaceFrame::scrollable(
+                SurfaceId::ReviewerTranscript,
+                inner,
+                top,
+                total,
+            ));
+        }
+    }
+    if let Some(SecondOpinion::Review(review)) = chat.second_opinion() {
+        // The split has no composer: the revised plan is the planner's to
+        // write, so the only input here is which of the three actions to take.
+        let buttons = render_split_actions(
             frame,
-            prompt_inner,
-            &chat.input,
-            chat.input_cursor,
-            queue_rows,
-            input_scroll,
+            prompt_area,
+            &review.workflow,
+            review.action,
+            &review.status,
         );
+        chat.split_action_areas = buttons;
+    } else {
+        chat.split_action_areas.clear();
+        let queued = chat.queued_prompts.len();
+        let prompt_title = prompt_title(chat, queued);
+        let prompt_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(prompt_border)
+            .title(prompt_title);
+        let prompt_inner = prompt_block.inner(prompt_area);
+        let mut prompt_lines = chat
+            .queued_prompts
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .enumerate()
+            .map(|(index, queued)| {
+                Line::from(Span::styled(
+                    truncate_to_width(
+                        &format!(
+                            "{} {}: {}",
+                            queued.queue_label(),
+                            index + 1,
+                            queued_prompt_preview(&queued.text)
+                        ),
+                        usize::from(prompt_inner.width),
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let queue_rows = prompt_lines.len();
+        prompt_lines.extend(if let Some(search) = chat.history_search.as_ref() {
+            highlighted_input_lines(&chat.input, &search.query)
+        } else {
+            chat.input
+                .split('\n')
+                .map(|line| Line::raw(line.to_owned()))
+                .collect()
+        });
+        let cursor_row = input_cursor_visual_position(&chat.input, chat.input_cursor, prompt_width)
+            .1
+            + queue_rows;
+        let content_height = usize::from(prompt_inner.height).max(1);
+        let input_scroll = cursor_row.saturating_add(1).saturating_sub(content_height);
+        frame.render_widget(
+            Paragraph::new(prompt_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((input_scroll as u16, 0))
+                .block(prompt_block),
+            prompt_area,
+        );
+        chat.frame_surfaces
+            .push(SurfaceFrame::fixed(SurfaceId::PromptInput, prompt_inner));
+        // The cursor belongs to whatever has focus, so the composer only shows one
+        // while the keyboard is driving it.
+        if chat.history_search.is_none() && chat.focus == ChatFocus::Prompt {
+            set_input_cursor(
+                frame,
+                prompt_inner,
+                &chat.input,
+                chat.input_cursor,
+                queue_rows,
+                input_scroll,
+            );
+        }
     }
     let default_footer = if chat.focus == ChatFocus::Conversations {
-        "j/k or ↑/↓ switch conversation · Enter/Tab prompt · Ctrl-G dashboard"
+        "Ctrl-G dashboard · j/k or ↑/↓ switch conversation · PgUp/PgDn transcript · Enter/Tab prompt"
     } else if chat.voice_active {
-        "Listening… Alt-V stop · Ctrl-G dashboard"
+        "Ctrl-G dashboard · Listening… Alt-V stop · PgUp/PgDn transcript"
     } else if !chat.queued_prompts.is_empty() {
-        "Up/Ctrl-P edit last queued · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel · Ctrl-G dashboard"
+        "Ctrl-G dashboard · Up/Ctrl-P edit last queued · PgUp/PgDn transcript · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel"
     } else {
-        "Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T transcript · Esc cancel · Ctrl-G dashboard"
+        "Ctrl-G dashboard · PgUp/PgDn transcript · Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T rendering · Esc cancel"
     };
     let search_footer = chat.history_search.as_ref().map(history_search_footer);
     let notice = chat.notices.current();
@@ -1362,24 +2259,72 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
             footer_area.y,
         ));
     }
-    render_autocomplete(frame, prompt_area, chat);
+    // The popup overlays the prompt and whatever sits above it, so it
+    // registers last and wins the cells it covers.
+    if let Some(popup) = render_autocomplete(frame, prompt_area, chat) {
+        chat.frame_surfaces
+            .push(SurfaceFrame::fixed(SurfaceId::AutocompletePopup, popup));
+    }
+    if let Some(SecondOpinion::Setup { captured, setup }) = chat.second_opinion() {
+        // The waterfall owns the frame's interaction, so the chat behind it
+        // stops being selectable while a reviewer is being chosen.
+        let area = centered(inner, 60, 16);
+        let body = render_setup(frame, area, captured, setup);
+        chat.frame_surfaces.clear();
+        chat.frame_surfaces
+            .push(SurfaceFrame::fixed(SurfaceId::ModalBody, body));
+        return;
+    }
     if let Some(dialog) = chat.elicitation.as_ref() {
-        render_elicitation(frame, dialog);
+        // The dialog owns the frame's interaction while it is up, so the chat
+        // behind it stops being selectable and the dialog registers its own
+        // surfaces in its place.
+        chat.frame_surfaces.clear();
+        render_elicitation(frame, dialog, &mut chat.frame_surfaces);
     }
 }
 
+/// A remembered configuration value, or `None` when it stands for the
+/// harness's own default and nothing should be applied.
+fn remembered_value(stored: Option<&str>) -> Option<String> {
+    stored
+        .filter(|value| *value != crate::hel_second_opinion::HARNESS_DEFAULT_VALUE)
+        .map(str::to_owned)
+}
+
+/// A box of at most `width` by `height`, centered in `area`.
+fn centered(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    ratatui::layout::Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    )
+}
+
 fn prompt_title(chat: &ChatState, queued: usize) -> String {
-    let mut parts = [
-        chat.current_model.as_deref(),
-        chat.current_effort.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
-    if chat.recovery_busy {
-        parts.push("Saving checkpoint…".into());
-        parts.push(format!("{queued} queued"));
+    let mut parts = [chat.current_model(), chat.current_effort()]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if chat.fast_mode_active() {
+        parts.push("Fast".into());
+    }
+    if let Some(recovery_phase) = chat.recovery_phase {
+        parts.push(
+            match recovery_phase {
+                RecoveryCheckpointPhase::Prestaging => "Preparing checkpoint…",
+                RecoveryCheckpointPhase::Snapshotting => "Snapshotting checkpoint…",
+                RecoveryCheckpointPhase::Saving => "Saving checkpoint…",
+            }
+            .into(),
+        );
+        if queued > 0 {
+            parts.push(format!("{queued} queued"));
+        }
     } else {
         if chat.plan_mode_active() {
             parts.push("Prompt — PLAN MODE".into());
@@ -1417,15 +2362,21 @@ fn spawn_dictation(
         let status_updates = updates.clone();
         let result = crate::speech::run_dictation(
             move |text| {
-                let _ = partial_updates.send(VoiceUpdate::Partial(text));
+                if let Err(error) = partial_updates.send(VoiceUpdate::Partial(text)) {
+                    tracing::debug!(%error, "voice partial result dropped because the chat closed");
+                }
             },
             |_| {},
             move |status| {
-                let _ = status_updates.send(VoiceUpdate::Status(status));
+                if let Err(error) = status_updates.send(VoiceUpdate::Status(status)) {
+                    tracing::debug!(%error, "voice status dropped because the chat closed");
+                }
             },
             cancel,
         );
-        let _ = updates.send(VoiceUpdate::Finished(result));
+        if let Err(error) = updates.send(VoiceUpdate::Finished(result)) {
+            tracing::debug!(%error, "voice result dropped because the chat closed");
+        }
     });
 }
 
@@ -1461,10 +2412,12 @@ mod tests {
         assert_eq!(line.style.fg, Some(Color::Yellow));
     }
     use crate::hel_chat::test_support::{
-        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, key, mouse_at_row,
-        mouse_in, queued, snapshot,
+        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, fast_mode_option, key,
+        mouse_at_row, mouse_in, queued, snapshot,
     };
+    use crate::hel_elicitation::ElicitationRequest;
     use crate::hel_state::MaterializedExecutionState;
+    use crate::hel_transcript::ChatRole;
     use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
     use crate::hel_worker::{SequencedEvent, WorkerEvent};
     use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigOptionCategory};
@@ -1627,37 +2580,268 @@ mod tests {
     }
 
     #[test]
+    fn an_elicitation_overlays_the_chat_instead_of_replacing_it() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(ChatEntry::plain(
+            1,
+            ChatRole::Agent,
+            "UNDERLYING CHAT SENTINEL",
+        ));
+        chat.elicitation = Some(super::super::elicitation::ElicitationDialog::new(
+            ElicitationRequest {
+                id: "question-1".into(),
+                message: "Visible dialog message".into(),
+                title: Some("Overlaid dialog".into()),
+                description: None,
+                fields: Vec::new(),
+            },
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut chat, false))
+            .expect("draw elicitation");
+        let buffer = terminal.backend().buffer();
+        let lines = (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let row_of = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle} in {lines:#?}"))
+        };
+
+        let popup_top = row_of("Overlaid dialog");
+        row_of("Visible dialog message");
+        // The chat underneath still shows through above and below the
+        // dialog's centred popup.
+        assert!(row_of("UNDERLYING CHAT SENTINEL") < popup_top);
+        assert!(row_of("Ctrl-G dashboard") > popup_top);
+    }
+
+    #[test]
+    fn drawing_the_chat_registers_the_conversations_and_prompt_interiors() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        drawn_transcript(&mut chat, 80, 24);
+
+        let surfaces = chat.frame_surfaces();
+        let conversations = surfaces
+            .surface(SurfaceId::Conversations)
+            .expect("conversations pane registered");
+        let prompt = surfaces
+            .surface(SurfaceId::PromptInput)
+            .expect("prompt registered");
+        // The registered rect is the text inside each border, which is what
+        // the wheel already hit-tests against.
+        assert_eq!(Some(conversations.rect), chat.conversations_area);
+        assert_eq!(
+            surfaces
+                .surface_at(conversations.rect.x, conversations.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::Conversations)
+        );
+        assert_eq!(
+            surfaces
+                .surface_at(prompt.rect.x, prompt.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::PromptInput)
+        );
+        // The border above the conversations text belongs to no surface.
+        assert!(
+            surfaces
+                .surface_at(conversations.rect.x, conversations.rect.y - 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_autocomplete_popup_takes_the_cells_it_covers() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("/".into());
+
+        drawn_transcript(&mut chat, 80, 24);
+
+        let surfaces = chat.frame_surfaces();
+        let popup = surfaces
+            .surface(SurfaceId::AutocompletePopup)
+            .expect("popup registered");
+        assert_eq!(
+            surfaces
+                .surface_at(popup.rect.x, popup.rect.bottom() - 1)
+                .map(|surface| surface.id),
+            Some(SurfaceId::AutocompletePopup)
+        );
+    }
+
+    #[test]
+    fn an_open_elicitation_replaces_the_chats_surfaces_with_its_own() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.elicitation = Some(super::super::elicitation::ElicitationDialog::new(
+            ElicitationRequest {
+                id: "question-1".into(),
+                message: "Visible dialog message".into(),
+                title: Some("Overlaid dialog".into()),
+                description: None,
+                fields: Vec::new(),
+            },
+        ));
+
+        drawn_transcript(&mut chat, 80, 24);
+
+        // The dialog owns the frame while it is up, so no drag reaches the
+        // chat underneath it and only the dialog's own panes are selectable.
+        let surfaces = chat.frame_surfaces();
+        let message = surfaces
+            .surface(SurfaceId::ElicitationMessage)
+            .expect("message pane registered");
+        assert!(surfaces.surface(SurfaceId::ModalBody).is_some());
+        assert!(surfaces.surface(SurfaceId::Transcript).is_none());
+        assert!(surfaces.surface(SurfaceId::PromptInput).is_none());
+        assert_eq!(
+            surfaces
+                .surface_at(message.rect.x, message.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::ElicitationMessage)
+        );
+    }
+
+    #[test]
     fn an_off_screen_chat_follows_the_session_view() {
         let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
         let mut session = MaterializedSession::empty("session-warm");
         session.applied_event_ordinal = 5;
         session.applied_event_digest = "a".repeat(64);
         session.transcript = vec![agent_transcript_item("first", 5)];
 
-        assert!(apply_session_view(
-            &mut chat,
-            Ok(managed_view(session.clone()))
-        ));
+        let mut first_view = managed_view(session.clone());
+        first_view
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .operational
+            .last_acp_activity_at_ms = Some(12_345);
+        assert!(apply_session_view(&mut chat, Ok(first_view)));
         assert_eq!(chat.latest_seq(), 5);
         assert_eq!(chat.entries.len(), 1);
+        assert_eq!(chat.last_acp_activity_at_ms, Some(12_345));
+        assert!(!chat.transcript_loading);
 
         session.applied_event_ordinal = 8;
         session.transcript.push(agent_transcript_item("second", 8));
         assert!(apply_session_view(&mut chat, Ok(managed_view(session))));
         assert_eq!(chat.latest_seq(), 8);
         assert_eq!(chat.entries.len(), 2);
+        assert_eq!(chat.last_acp_activity_at_ms, None);
+    }
+
+    #[test]
+    fn a_transient_error_before_the_first_snapshot_keeps_the_loading_row() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
+        let view = ManagedSessionView {
+            snapshot: None,
+            connected: false,
+            error: Some(ViewError::Unreachable("database is busy".into())),
+        };
+
+        assert!(apply_session_view(&mut chat, Ok(view)));
+        assert!(chat.transcript_loading);
+        assert_eq!(
+            chat.notice().as_deref(),
+            Some("connection lost: database is busy")
+        );
+        assert_eq!(
+            super::super::test_support::transcript_text(&mut chat, 80),
+            ["Loading…"]
+        );
     }
 
     #[test]
     fn a_stopped_session_manager_retires_its_feed_and_says_so() {
         let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_transcript_loading(true);
 
         let open = apply_session_view(&mut chat, Err(anyhow::anyhow!("session manager stopped")));
 
         assert!(!open);
+        assert!(chat.transcript_loading);
         assert_eq!(
             chat.notice().as_deref(),
             Some("connection lost: session manager stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_chat_hands_off_to_a_replacement_actor_without_losing_its_draft() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-replaced", 73);
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            None,
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            "half-written prompt".into(),
+            Notices::default(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                ActiveChat::pump(Some(&mut chat)).await;
+                if chat.session_feed_open() && !chat.session.is_stopped() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the replacement actor became the live chat feed");
+
+        assert_eq!(chat.draft(), "half-written prompt");
+        assert_eq!(
+            chat.state.notice().as_deref(),
+            Some("Reconnected to session relay")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_runtime_record_rearms_a_chat_after_its_handoff_timed_out() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-resumed", 74);
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            None,
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            "still drafting".into(),
+            Notices::default(),
+        );
+        chat.session_open = false;
+        chat.finish_session_reconnect(Err("session session-resumed is not managed".into()));
+
+        chat.set_session_feed_expected(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                ActiveChat::pump(Some(&mut chat)).await;
+                if chat.session_feed_open() && !chat.session.is_stopped() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the active runtime record restarted the session handoff");
+
+        assert_eq!(chat.draft(), "still drafting");
+        assert_eq!(
+            chat.state.notice().as_deref(),
+            Some("Reconnected to session relay")
         );
     }
 
@@ -1703,7 +2887,7 @@ mod tests {
         // would.
         shared.set("Background import finished");
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         let buffer = terminal.backend().buffer();
         let footer_row = buffer.area.bottom() - 1;
@@ -1715,7 +2899,7 @@ mod tests {
 
         shared.clear();
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         let buffer = terminal.backend().buffer();
         let footer_text = (buffer.area.x..buffer.area.right())
@@ -1758,7 +2942,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         let buffer = terminal.backend().buffer();
         let rendered = buffer
@@ -1776,12 +2960,40 @@ mod tests {
     }
 
     #[test]
+    fn composer_title_shows_fast_only_while_the_confirmed_mode_is_active() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&[fast_mode_option("off")]);
+        assert!(!prompt_title(&chat, 0).contains("Fast"));
+
+        chat.set_config_options(&[fast_mode_option("on")]);
+        assert_eq!(prompt_title(&chat, 0), " Fast · Prompt ");
+
+        chat.set_config_options(&[]);
+        assert!(!prompt_title(&chat, 0).contains("Fast"));
+    }
+
+    #[test]
     fn composer_title_names_plan_mode_even_during_a_turn() {
         let mut chat = crate::hel_chat::test_support::grok_chat();
-        chat.current_mode = Some("plan".into());
+        chat.finish_plan_mode_change(true);
         chat.phase = WorkerPhase::Running;
 
         assert!(prompt_title(&chat, 0).contains("Prompt — PLAN MODE"));
+    }
+
+    #[test]
+    fn composer_title_distinguishes_blocking_checkpoint_capture_from_background_save() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.recovery_phase = Some(RecoveryCheckpointPhase::Prestaging);
+        assert!(prompt_title(&chat, 0).contains("Preparing checkpoint…"));
+
+        chat.recovery_phase = Some(RecoveryCheckpointPhase::Snapshotting);
+        assert!(prompt_title(&chat, 2).contains("Snapshotting checkpoint…"));
+        assert!(prompt_title(&chat, 2).contains("2 queued"));
+
+        chat.recovery_phase = Some(RecoveryCheckpointPhase::Saving);
+        assert!(prompt_title(&chat, 0).contains("Saving checkpoint…"));
+        assert!(!prompt_title(&chat, 0).contains("queued"));
     }
 
     #[test]
@@ -2185,7 +3397,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         // The band only covers the pane's inner hitbox: the border columns to
         // either side keep drawing border characters, not the band.
@@ -2209,7 +3421,7 @@ mod tests {
 
         chat.handle_key(key(KeyCode::Enter));
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         assert!(!banded(&terminal, 2), "an unfocused pane draws no band");
         let cursor = terminal
@@ -2228,7 +3440,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
 
         let buffer = terminal.backend().buffer();
@@ -2248,7 +3460,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         // Both panes sit at the left edge, so their top border's row is
         // identified by which corner glyph it draws, not a hardcoded y. The
@@ -2276,7 +3488,7 @@ mod tests {
         chat.handle_key(key(KeyCode::Tab));
         assert_eq!(chat.focus, ChatFocus::Prompt);
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
 
         assert_eq!(
@@ -2374,6 +3586,7 @@ mod tests {
     #[test]
     fn chat_view_draws_one_header_row_per_session_above_the_transcript() {
         let mut chat = header_chat("current", 0, Vec::new());
+        chat.set_header_summary("precision-3260/bifrost-fuzz", "kimi");
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
         let row = |terminal: &Terminal<TestBackend>, offset: u16| {
             let buffer = terminal.backend().buffer();
@@ -2393,26 +3606,26 @@ mod tests {
         };
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         // Row 0 is the pane's own top border; the header row sits inside it.
         assert_eq!(bordered_row(&terminal, 1), "› [idle]");
         // Row 2 is the pane's bottom border, so the transcript's chrome
         // starts at row 3.
-        assert!(row(&terminal, 3).contains("Conversation"));
+        assert!(row(&terminal, 3).contains("precision-3260/bifrost-fuzz  [idle]  kimi"));
 
         apply_chat_io_update(
             &mut chat,
             ChatIoUpdate::OtherSessions(vec![other_session(1, "docs", None, "wrote the guide")]),
         );
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         assert_eq!(bordered_row(&terminal, 1), "› [idle]");
         assert_eq!(bordered_row(&terminal, 2), "  [idle] wrote the guide");
         // The transcript keeps its own chrome, below the header and the
         // pane's now-taller bottom border.
-        assert!(row(&terminal, 4).contains("Conversation"));
+        assert!(row(&terminal, 4).contains("precision-3260/bifrost-fuzz  [idle]  kimi"));
     }
 
     /// A conversation long enough that opening it converts the tail only.

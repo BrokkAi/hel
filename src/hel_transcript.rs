@@ -10,6 +10,9 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+pub const SESSION_RESTART_TEXT: &str = "[session restarted]";
+pub const SESSION_RESTART_ITEM_PREFIX: &str = "system:session-restarted:";
+
 /// The current value of one logical transcript item. ACP structures whose
 /// schemas can grow are kept as JSON values, while logical item identity and
 /// lifecycle remain controller-owned and stable.
@@ -59,6 +62,17 @@ pub enum TranscriptBody {
         /// Complete current ACP `Plan`, including entry priorities and all
         /// plan- and entry-level metadata.
         plan: serde_json::Value,
+    },
+    /// A plan the harness asked the user to approve, captured where the
+    /// decision happened so it renders inline and survives restart and export.
+    ///
+    /// It is a record of the proposal, not conversation input: Hel never
+    /// replays it to a model as a user or agent message.
+    PlanProposal {
+        /// Identity of the plan review that carried this proposal.
+        proposal_id: String,
+        /// Exact proposal text the harness sent.
+        plan: String,
     },
     System {
         text: String,
@@ -142,6 +156,10 @@ pub struct TranscriptItem {
 }
 
 impl TranscriptItem {
+    pub fn is_session_restart(&self) -> bool {
+        self.stable_id.starts_with(SESSION_RESTART_ITEM_PREFIX)
+    }
+
     pub fn is_nonempty_agent_message(&self) -> bool {
         let TranscriptBody::Agent { chunks, .. } = &self.body else {
             return false;
@@ -210,6 +228,8 @@ pub enum ChatRole {
     Tool,
     /// Current agent plan.
     Plan,
+    /// A plan proposal awaiting, or already given, a decision.
+    PlanProposal,
     System,
 }
 

@@ -72,10 +72,10 @@ detect_platform() {
       TARGET="aarch64-apple-darwin"
       ;;
     Linux/x86_64 | Linux/amd64)
-      TARGET="x86_64-unknown-linux-gnu"
+      TARGET="x86_64-unknown-linux-musl"
       ;;
     Linux/arm64 | Linux/aarch64)
-      TARGET="aarch64-unknown-linux-gnu"
+      TARGET="aarch64-unknown-linux-musl"
       ;;
     Darwin/*)
       die "unsupported macOS architecture: ${arch_name}; Apple silicon is currently supported"
@@ -232,16 +232,32 @@ main() {
   tar -xzf "$archive_path" -C "$extract_dir"
   archive_root="$extract_dir/hel-$TARGET"
   [ -f "$archive_root/hel" ] || die "archive did not contain hel"
-  [ -f "$archive_root/hel-worker-x86_64-unknown-linux-musl" ] ||
-    die "archive did not contain the x86_64 Linux worker"
-  [ -f "$archive_root/hel-worker-aarch64-unknown-linux-musl" ] ||
-    die "archive did not contain the aarch64 Linux worker"
+  case "$TARGET" in
+    x86_64-unknown-linux-musl)
+      [ -f "$archive_root/hel-worker-aarch64-unknown-linux-musl" ] ||
+        die "archive did not contain the aarch64 Linux worker"
+      ;;
+    aarch64-unknown-linux-musl)
+      [ -f "$archive_root/hel-worker-x86_64-unknown-linux-musl" ] ||
+        die "archive did not contain the x86_64 Linux worker"
+      ;;
+    aarch64-apple-darwin)
+      [ -f "$archive_root/hel-worker-x86_64-unknown-linux-musl" ] ||
+        die "archive did not contain the x86_64 Linux worker"
+      [ -f "$archive_root/hel-worker-aarch64-unknown-linux-musl" ] ||
+        die "archive did not contain the aarch64 Linux worker"
+      ;;
+  esac
 
   install_binary "$archive_root/hel" hel
-  install_binary "$archive_root/hel-worker-x86_64-unknown-linux-musl" \
-    hel-worker-x86_64-unknown-linux-musl
-  install_binary "$archive_root/hel-worker-aarch64-unknown-linux-musl" \
+  for worker in \
+    hel-worker-x86_64-unknown-linux-musl \
     hel-worker-aarch64-unknown-linux-musl
+  do
+    if [ -f "$archive_root/$worker" ]; then
+      install_binary "$archive_root/$worker" "$worker"
+    fi
+  done
 
   log "installed Hel to ${BIN_DIR} (installer ${SCRIPT_VERSION})"
   print_next_steps

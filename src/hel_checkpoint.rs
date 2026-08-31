@@ -34,6 +34,8 @@ const MAX_NATIVE_FILE: u64 = 1024 * 1024 * 1024;
 const MAX_NATIVE_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
 /// Version of the controller-to-exporter checkpoint specification contract.
 pub const CHECKPOINT_EXPORT_PROTOCOL_VERSION: u32 = 1;
+/// Version of the two-phase capture/pack contract used by ordinary checkpoints.
+pub const CHECKPOINT_STAGING_PROTOCOL_VERSION: u32 = 1;
 /// Clock-skew slack subtracted from a Codex session's own creation time before
 /// it is used as an mtime floor for content probes.
 const CODEX_PROBE_FLOOR_SLACK_MS: i64 = 48 * 3600 * 1000;
@@ -75,6 +77,46 @@ pub struct CheckpointExportSpec {
     /// Controller projection latched at the relay's checkpoint barrier.
     pub canonical_session: CanonicalSessionSnapshot,
     pub output_path: PathBuf,
+}
+
+/// Small target-side input used while the relay checkpoint barrier is held.
+/// Canonical controller history is deliberately absent: it is streamed only
+/// after the captured target state has been sealed and ACP dispatch resumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointCaptureSpec {
+    pub protocol_version: u32,
+    pub session: SessionManifest,
+    pub target: TargetManifest,
+    pub bundle: BundleManifest,
+    pub relay_root: PathBuf,
+    pub harness_home: PathBuf,
+    pub workspace_root: PathBuf,
+    pub repositories: Vec<CheckpointRepositorySpec>,
+    pub allow_empty_native: bool,
+    pub stage_path: PathBuf,
+    /// Refresh a prestaged generation when its native source tree is unchanged.
+    #[serde(default)]
+    pub refresh_existing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointPackSpec {
+    pub protocol_version: u32,
+    pub relay_root: PathBuf,
+    pub stage_path: PathBuf,
+    pub canonical_session: CanonicalSessionSnapshot,
+    pub output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedCheckpoint {
+    pub stage_path: PathBuf,
+    pub native_bytes: u64,
+    pub repository_bytes: u64,
+    pub reused_native: bool,
 }
 
 impl CheckpointExportSpec {
@@ -137,6 +179,59 @@ pub fn export_from_spec_file(path: &Path) -> Result<TargetCheckpoint> {
 
 pub fn export_from_spec_reader(reader: &mut impl std::io::Read) -> Result<TargetCheckpoint> {
     export_checkpoint(&CheckpointExportSpec::read_from(reader)?)
+}
+
+pub fn capture_from_spec_reader(reader: &mut impl std::io::Read) -> Result<CapturedCheckpoint> {
+    let spec: CheckpointCaptureSpec = read_json_from(reader, "checkpoint capture spec")?;
+    capture_checkpoint(&spec, &SystemGit)
+}
+
+pub fn pack_from_spec_reader(reader: &mut impl std::io::Read) -> Result<TargetCheckpoint> {
+    let spec: CheckpointPackSpec = read_json_from(reader, "checkpoint pack spec")?;
+    pack_checkpoint(&spec)
+}
+
+fn read_json_from<T: serde::de::DeserializeOwned>(
+    reader: &mut impl std::io::Read,
+    description: &str,
+) -> Result<T> {
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .with_context(|| format!("read {description} from standard input"))?;
+    serde_json::from_slice(&body)
+        .with_context(|| format!("parse {description} from standard input"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointStageManifest {
+    protocol_version: u32,
+    session: SessionManifest,
+    target: TargetManifest,
+    bundle: BundleManifest,
+    source_fingerprint: Option<String>,
+    native_artifacts: Vec<StagedNativeArtifact>,
+    repositories: Vec<StagedRepository>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedNativeArtifact {
+    relative_path: PathBuf,
+    mode: u32,
+    size: u64,
+    body_path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedRepository {
+    metadata: crate::hel_archive::RepositoryMetadata,
+    committed_bundle_path: PathBuf,
+    staged_patch_path: PathBuf,
+    unstaged_patch_path: PathBuf,
+    untracked_tar_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -747,6 +842,437 @@ fn write_private_file(root: &Path, relative: &Path, bytes: &[u8], mode: u32) -> 
     Ok(())
 }
 
+const CHECKPOINT_STAGE_MANIFEST: &str = "stage.json";
+
+/// Capture mutable target-owned state into a sealed, uncompressed generation.
+/// The caller holds the relay barrier only for this operation; packaging the
+/// generation is intentionally a separate command.
+pub fn capture_checkpoint(
+    spec: &CheckpointCaptureSpec,
+    git: &dyn GitCommandRunner,
+) -> Result<CapturedCheckpoint> {
+    ensure!(
+        spec.protocol_version == CHECKPOINT_STAGING_PROTOCOL_VERSION,
+        "unsupported checkpoint staging protocol version {}; worker supports {}",
+        spec.protocol_version,
+        CHECKPOINT_STAGING_PROTOCOL_VERSION
+    );
+    let mut resolved = spec.clone();
+    resolved.relay_root = resolve_target_path(&resolved.relay_root)?;
+    resolved.harness_home = resolve_target_path(&resolved.harness_home)?;
+    resolved.workspace_root = resolve_target_path(&resolved.workspace_root)?;
+    resolved.stage_path = resolve_target_path(&resolved.stage_path)?;
+    validate_capture_spec(&resolved)?;
+
+    let source_fingerprint_before = native_source_fingerprint(&resolved.harness_home)?;
+    if resolved.refresh_existing && resolved.stage_path.is_dir() {
+        if let Some(captured) =
+            refresh_checkpoint_stage(&resolved, &source_fingerprint_before, git)?
+        {
+            return Ok(captured);
+        }
+        fs::remove_dir_all(&resolved.stage_path).with_context(|| {
+            format!(
+                "remove stale checkpoint prestage {}",
+                resolved.stage_path.display()
+            )
+        })?;
+    }
+
+    let native_artifacts = collect_checkpoint_native_artifacts(
+        &resolved.session,
+        &resolved.relay_root,
+        &resolved.harness_home,
+        resolved.allow_empty_native,
+    )?;
+    let repositories =
+        collect_checkpoint_repositories(&resolved.workspace_root, &resolved.repositories, git)?;
+    let native_bytes = native_artifacts
+        .iter()
+        .try_fold(0_u64, |total, artifact| {
+            total.checked_add(artifact.data.len() as u64)
+        })
+        .context("native checkpoint size overflow")?;
+    let repository_bytes = checkpoint_repository_bytes(&repositories)?;
+
+    let parent = resolved
+        .stage_path
+        .parent()
+        .context("checkpoint stage has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create checkpoint stage parent {}", parent.display()))?;
+    ensure!(
+        !resolved.stage_path.exists(),
+        "checkpoint stage already exists at {}",
+        resolved.stage_path.display()
+    );
+    let temporary = tempfile::Builder::new()
+        .prefix(".checkpoint-capture-")
+        .tempdir_in(parent)
+        .with_context(|| format!("create temporary checkpoint stage in {}", parent.display()))?;
+
+    let mut staged_native = Vec::with_capacity(native_artifacts.len());
+    for (index, artifact) in native_artifacts.into_iter().enumerate() {
+        let body_path = PathBuf::from(format!("native/{index:08}"));
+        write_private_file(temporary.path(), &body_path, &artifact.data, 0o600)?;
+        staged_native.push(StagedNativeArtifact {
+            relative_path: artifact.relative_path,
+            mode: artifact.mode,
+            size: artifact.data.len() as u64,
+            body_path,
+        });
+    }
+    let staged_repositories = write_staged_repositories(temporary.path(), repositories)?;
+    let source_fingerprint_after = native_source_fingerprint(&resolved.harness_home)?;
+    let manifest = CheckpointStageManifest {
+        protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
+        session: resolved.session,
+        target: resolved.target,
+        bundle: resolved.bundle,
+        source_fingerprint: (source_fingerprint_before == source_fingerprint_after)
+            .then_some(source_fingerprint_after),
+        native_artifacts: staged_native,
+        repositories: staged_repositories,
+    };
+    write_private_file(
+        temporary.path(),
+        Path::new(CHECKPOINT_STAGE_MANIFEST),
+        &serde_json::to_vec(&manifest).context("serialize checkpoint stage manifest")?,
+        0o600,
+    )?;
+    fs::rename(temporary.path(), &resolved.stage_path)
+        .with_context(|| format!("seal checkpoint stage {}", resolved.stage_path.display()))?;
+
+    Ok(CapturedCheckpoint {
+        stage_path: resolved.stage_path,
+        native_bytes,
+        repository_bytes,
+        reused_native: false,
+    })
+}
+
+fn refresh_checkpoint_stage(
+    spec: &CheckpointCaptureSpec,
+    source_fingerprint_before: &str,
+    git: &dyn GitCommandRunner,
+) -> Result<Option<CapturedCheckpoint>> {
+    let manifest_body = read_staged_file(
+        &spec.stage_path,
+        Path::new(CHECKPOINT_STAGE_MANIFEST),
+        8 * 1024 * 1024,
+    )?;
+    let mut manifest: CheckpointStageManifest =
+        serde_json::from_slice(&manifest_body).context("parse checkpoint stage manifest")?;
+    ensure!(
+        manifest.protocol_version == CHECKPOINT_STAGING_PROTOCOL_VERSION,
+        "unsupported sealed checkpoint stage version {}",
+        manifest.protocol_version
+    );
+    if manifest.session != spec.session
+        || manifest.target != spec.target
+        || manifest.bundle != spec.bundle
+        || manifest.source_fingerprint.as_deref() != Some(source_fingerprint_before)
+    {
+        return Ok(None);
+    }
+
+    let repositories =
+        collect_checkpoint_repositories(&spec.workspace_root, &spec.repositories, git)?;
+    let repository_bytes = checkpoint_repository_bytes(&repositories)?;
+    let source_fingerprint_after = native_source_fingerprint(&spec.harness_home)?;
+    if source_fingerprint_after != source_fingerprint_before {
+        return Ok(None);
+    }
+    let repositories_root = spec.stage_path.join("repositories");
+    if repositories_root.exists() {
+        fs::remove_dir_all(&repositories_root).with_context(|| {
+            format!(
+                "replace prestaged repository state {}",
+                repositories_root.display()
+            )
+        })?;
+    }
+    manifest.repositories = write_staged_repositories(&spec.stage_path, repositories)?;
+    manifest.source_fingerprint = Some(source_fingerprint_after);
+    write_private_file(
+        &spec.stage_path,
+        Path::new(CHECKPOINT_STAGE_MANIFEST),
+        &serde_json::to_vec(&manifest).context("serialize refreshed checkpoint stage manifest")?,
+        0o600,
+    )?;
+    let native_bytes = manifest
+        .native_artifacts
+        .iter()
+        .try_fold(0_u64, |total, artifact| total.checked_add(artifact.size))
+        .context("native checkpoint size overflow")?;
+    Ok(Some(CapturedCheckpoint {
+        stage_path: spec.stage_path.clone(),
+        native_bytes,
+        repository_bytes,
+        reused_native: true,
+    }))
+}
+
+fn checkpoint_repository_bytes(repositories: &[RepositorySnapshot]) -> Result<u64> {
+    repositories
+        .iter()
+        .try_fold(0_u64, |total, repository| {
+            [
+                repository.committed_bundle.len(),
+                repository.staged_patch.len(),
+                repository.unstaged_patch.len(),
+                repository.untracked_tar.len(),
+            ]
+            .into_iter()
+            .try_fold(total, |total, size| total.checked_add(size as u64))
+        })
+        .context("repository checkpoint size overflow")
+}
+
+fn write_staged_repositories(
+    stage_root: &Path,
+    repositories: Vec<RepositorySnapshot>,
+) -> Result<Vec<StagedRepository>> {
+    repositories
+        .into_iter()
+        .enumerate()
+        .map(|(index, repository)| {
+            let root = PathBuf::from(format!("repositories/{index:08}"));
+            let committed_bundle_path = root.join("committed.bundle");
+            let staged_patch_path = root.join("staged.patch");
+            let unstaged_patch_path = root.join("unstaged.patch");
+            let untracked_tar_path = root.join("untracked.tar");
+            write_private_file(
+                stage_root,
+                &committed_bundle_path,
+                &repository.committed_bundle,
+                0o600,
+            )?;
+            write_private_file(
+                stage_root,
+                &staged_patch_path,
+                &repository.staged_patch,
+                0o600,
+            )?;
+            write_private_file(
+                stage_root,
+                &unstaged_patch_path,
+                &repository.unstaged_patch,
+                0o600,
+            )?;
+            write_private_file(
+                stage_root,
+                &untracked_tar_path,
+                &repository.untracked_tar,
+                0o600,
+            )?;
+            Ok(StagedRepository {
+                metadata: repository.metadata,
+                committed_bundle_path,
+                staged_patch_path,
+                unstaged_patch_path,
+                untracked_tar_path,
+            })
+        })
+        .collect()
+}
+
+fn native_source_fingerprint(root: &Path) -> Result<String> {
+    let mut digest = Sha256::new();
+    fingerprint_tree(root, root, &mut digest)?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn fingerprint_tree(root: &Path, path: &Path, digest: &mut Sha256) -> Result<()> {
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("scan checkpoint source {}", path.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .context("checkpoint source escaped its root")?;
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect checkpoint source {}", path.display()))?;
+        digest.update(relative.to_string_lossy().as_bytes());
+        digest.update([0]);
+        digest.update(metadata.len().to_le_bytes());
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        digest.update(modified.to_le_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            digest.update(metadata.mode().to_le_bytes());
+        }
+        if metadata.is_dir() {
+            digest.update(b"directory");
+            fingerprint_tree(root, &path, digest)?;
+        } else if metadata.is_file() {
+            digest.update(b"file");
+        } else {
+            digest.update(b"other");
+        }
+    }
+    Ok(())
+}
+
+/// Package a previously sealed target generation with the controller's
+/// canonical projection. This operation runs after ACP dispatch resumes.
+pub fn pack_checkpoint(spec: &CheckpointPackSpec) -> Result<TargetCheckpoint> {
+    ensure!(
+        spec.protocol_version == CHECKPOINT_STAGING_PROTOCOL_VERSION,
+        "unsupported checkpoint staging protocol version {}; worker supports {}",
+        spec.protocol_version,
+        CHECKPOINT_STAGING_PROTOCOL_VERSION
+    );
+    spec.canonical_session.validate()?;
+    let relay_root = resolve_target_path(&spec.relay_root)?;
+    let stage_path = resolve_target_path(&spec.stage_path)?;
+    let output_path = resolve_target_path(&spec.output_path)?;
+    validate_stage_path(&relay_root, &stage_path, "checkpoint stage")?;
+    validate_stage_path(&relay_root, &output_path, "checkpoint archive")?;
+    ensure!(stage_path.is_dir(), "checkpoint stage is missing");
+
+    let result = (|| -> Result<TargetCheckpoint> {
+        let manifest_body = read_staged_file(
+            &stage_path,
+            Path::new(CHECKPOINT_STAGE_MANIFEST),
+            8 * 1024 * 1024,
+        )?;
+        let manifest: CheckpointStageManifest =
+            serde_json::from_slice(&manifest_body).context("parse checkpoint stage manifest")?;
+        ensure!(
+            manifest.protocol_version == CHECKPOINT_STAGING_PROTOCOL_VERSION,
+            "unsupported sealed checkpoint stage version {}",
+            manifest.protocol_version
+        );
+        let native_artifacts = manifest
+            .native_artifacts
+            .into_iter()
+            .map(|artifact| {
+                let data = read_staged_file(&stage_path, &artifact.body_path, MAX_NATIVE_FILE)?;
+                ensure!(
+                    data.len() as u64 == artifact.size,
+                    "staged native artifact size changed"
+                );
+                Ok(NativeArtifact {
+                    relative_path: artifact.relative_path,
+                    data,
+                    mode: artifact.mode,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let repositories = manifest
+            .repositories
+            .into_iter()
+            .map(|repository| {
+                Ok(RepositorySnapshot {
+                    metadata: repository.metadata,
+                    committed_bundle: read_staged_file(
+                        &stage_path,
+                        &repository.committed_bundle_path,
+                        MAX_NATIVE_TOTAL,
+                    )?,
+                    staged_patch: read_staged_file(
+                        &stage_path,
+                        &repository.staged_patch_path,
+                        MAX_NATIVE_TOTAL,
+                    )?,
+                    unstaged_patch: read_staged_file(
+                        &stage_path,
+                        &repository.unstaged_patch_path,
+                        MAX_NATIVE_TOTAL,
+                    )?,
+                    untracked_tar: read_staged_file(
+                        &stage_path,
+                        &repository.untracked_tar_path,
+                        MAX_NATIVE_TOTAL,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let event_frontier = spec.canonical_session.event_frontier;
+        let event_frontier_digest = spec.canonical_session.event_frontier_digest.clone();
+        let sha256 = write_archive_hashed(
+            &output_path,
+            &ArchiveInput {
+                session: manifest.session,
+                target: manifest.target,
+                bundle: manifest.bundle,
+                canonical_session: spec.canonical_session.clone(),
+                native_artifacts,
+                repositories,
+            },
+        )?;
+        Ok(TargetCheckpoint {
+            path: output_path.clone(),
+            sha256,
+            event_frontier,
+            event_frontier_digest,
+        })
+    })();
+    if let Err(cleanup_error) = fs::remove_dir_all(&stage_path)
+        && cleanup_error.kind() != std::io::ErrorKind::NotFound
+    {
+        return match result {
+            Ok(_) => Err(cleanup_error).with_context(|| {
+                format!("remove consumed checkpoint stage {}", stage_path.display())
+            }),
+            Err(error) => Err(error.context(format!(
+                "also failed to remove checkpoint stage {}: {cleanup_error}",
+                stage_path.display()
+            ))),
+        };
+    }
+    result
+}
+
+fn validate_stage_path(relay_root: &Path, path: &Path, name: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure!(
+        parent.starts_with(relay_root),
+        "{name} must be beneath relay root"
+    );
+    Ok(())
+}
+
+fn read_staged_file(root: &Path, relative: &Path, maximum: u64) -> Result<Vec<u8>> {
+    validate_relative_path(relative)?;
+    ensure_no_symlink_ancestors(root, relative)?;
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect staged checkpoint file {}", path.display()))?;
+    ensure!(metadata.is_file(), "staged checkpoint path is not a file");
+    ensure!(
+        metadata.len() <= maximum,
+        "staged checkpoint file is too large"
+    );
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("open staged checkpoint file {}", path.display()))?;
+    let mut body = Vec::with_capacity(metadata.len().min(usize::MAX as u64) as usize);
+    std::io::Read::read_to_end(&mut file, &mut body)
+        .with_context(|| format!("read staged checkpoint file {}", path.display()))?;
+    ensure!(
+        body.len() as u64 == metadata.len(),
+        "staged checkpoint file size changed"
+    );
+    Ok(body)
+}
+
 pub fn export_checkpoint(spec: &CheckpointExportSpec) -> Result<TargetCheckpoint> {
     export_checkpoint_with_git(spec, &SystemGit)
 }
@@ -774,14 +1300,48 @@ pub fn export_checkpoint_with_git(
     // harness artifacts yet; requiring them would make an unused session
     // impossible to close cleanly.
     let prompted = canonical_session_contains_prompt(&spec.canonical_session);
-    let native_artifacts = collect_export_native_artifacts(spec, !prompted)?;
+    let native_artifacts = collect_checkpoint_native_artifacts(
+        &spec.session,
+        &spec.relay_root,
+        &spec.harness_home,
+        !prompted,
+    )?;
+    let repositories =
+        collect_checkpoint_repositories(&spec.workspace_root, &spec.repositories, git)?;
+    // The export runs while the relay's barrier freezes ACP dispatch, so it
+    // hashes the archive it just wrote instead of structurally re-reading it.
+    // `CheckpointTransfer::execute` performs the one full structural verify,
+    // on the copy the controller actually installs.
+    let sha256 = write_archive_hashed(
+        &spec.output_path,
+        &ArchiveInput {
+            session: spec.session.clone(),
+            target: spec.target.clone(),
+            bundle: spec.bundle.clone(),
+            canonical_session: spec.canonical_session.clone(),
+            native_artifacts,
+            repositories,
+        },
+    )?;
+    Ok(TargetCheckpoint {
+        path: spec.output_path.clone(),
+        sha256,
+        event_frontier,
+        event_frontier_digest,
+    })
+}
+
+fn collect_checkpoint_repositories(
+    workspace_root: &Path,
+    specifications: &[CheckpointRepositorySpec],
+    git: &dyn GitCommandRunner,
+) -> Result<Vec<RepositorySnapshot>> {
     // Indexed parallel iteration preserves the spec order, which in turn keeps
     // the manifest and ZIP entry order deterministic.
-    let repositories = spec
-        .repositories
+    specifications
         .par_iter()
         .map(|repository| {
-            let path = spec.workspace_root.join(&repository.relative_destination);
+            let path = workspace_root.join(&repository.relative_destination);
             ensure!(path.is_dir(), "repository {} is missing", path.display());
             let history = match &repository.capture {
                 CheckpointRepositoryCapture::MetadataOnly => {
@@ -819,70 +1379,46 @@ pub fn export_checkpoint_with_git(
             )
             .with_context(|| format!("repository '{}'", repository.id))
         })
-        .collect::<Result<Vec<_>>>()?;
-    // The export runs while the relay's barrier freezes ACP dispatch, so it
-    // hashes the archive it just wrote instead of structurally re-reading it.
-    // `CheckpointTransfer::execute` performs the one full structural verify,
-    // on the copy the controller actually installs.
-    let sha256 = write_archive_hashed(
-        &spec.output_path,
-        &ArchiveInput {
-            session: spec.session.clone(),
-            target: spec.target.clone(),
-            bundle: spec.bundle.clone(),
-            canonical_session: spec.canonical_session.clone(),
-            native_artifacts,
-            repositories,
-        },
-    )?;
-    Ok(TargetCheckpoint {
-        path: spec.output_path.clone(),
-        sha256,
-        event_frontier,
-        event_frontier_digest,
-    })
+        .collect()
 }
 
 /// Codex exports carry the relay-root scan cache so that a long-lived session
 /// probes each unrelated rollout at most once.
-fn collect_export_native_artifacts(
-    spec: &CheckpointExportSpec,
+fn collect_checkpoint_native_artifacts(
+    session: &SessionManifest,
+    relay_root: &Path,
+    harness_home: &Path,
     allow_empty: bool,
 ) -> Result<Vec<NativeArtifact>> {
-    let session_id = &spec.session.native_session_id;
-    let mut artifacts = if spec.session.harness_kind != HarnessKind::Codex {
-        collect_native_artifacts(
-            spec.session.harness_kind,
-            &spec.harness_home,
-            session_id,
-            allow_empty,
-        )?
+    let session_id = &session.native_session_id;
+    let mut artifacts = if session.harness_kind != HarnessKind::Codex {
+        collect_native_artifacts(session.harness_kind, harness_home, session_id, allow_empty)?
     } else {
-        let mut cache = load_codex_scan_cache(&spec.relay_root, session_id);
+        let mut cache = load_codex_scan_cache(relay_root, session_id);
         let known = cache.not_ours.len();
         let artifacts = collect_native_artifacts_cached(
             HarnessKind::Codex,
-            &spec.harness_home,
+            harness_home,
             session_id,
             allow_empty,
             Some(&mut cache),
         )?;
         if cache.not_ours.len() != known {
-            save_codex_scan_cache(&spec.relay_root, &cache)?;
+            save_codex_scan_cache(relay_root, &cache)?;
         }
         artifacts
     };
-    let launch_path = spec.relay_root.join("launch.json");
-    match crate::hel_worker_runtime::WorkerLaunchConfig::read(&launch_path) {
+    let launch_path = relay_root.join("launch.json");
+    match read_project_memory_checkpoint_endpoint(&launch_path) {
         Ok(launch) => {
             if let Some(memory) = launch.project_memory {
                 let root = resolve_home_relative_target_path(&memory.root)?;
                 anyhow::ensure!(
-                    root.starts_with(&spec.harness_home),
+                    root.starts_with(harness_home),
                     "project memory replica is outside the harness home"
                 );
                 if root.is_dir() {
-                    collect_claude_memory_tree(&spec.harness_home, &root, &mut artifacts)?;
+                    collect_claude_memory_tree(harness_home, &root, &mut artifacts)?;
                 }
             }
         }
@@ -899,6 +1435,27 @@ fn collect_export_native_artifacts(
         "native session artifacts are too large"
     );
     Ok(artifacts)
+}
+
+/// Checkpoint exporters can be refreshed independently of the live worker, so
+/// read only the stable launch fields needed for collection. Fully parsing the
+/// current worker config would reject launch files written by older versions.
+#[derive(Deserialize)]
+struct ProjectMemoryCheckpointLaunch {
+    #[serde(default)]
+    project_memory: Option<ProjectMemoryCheckpointEndpoint>,
+}
+
+#[derive(Deserialize)]
+struct ProjectMemoryCheckpointEndpoint {
+    root: PathBuf,
+}
+
+fn read_project_memory_checkpoint_endpoint(path: &Path) -> Result<ProjectMemoryCheckpointLaunch> {
+    let body =
+        fs::read(path).with_context(|| format!("read worker launch config {}", path.display()))?;
+    serde_json::from_slice(&body)
+        .with_context(|| format!("parse worker launch config {}", path.display()))
 }
 
 /// A session delta is measured against every origin ref, so a repository that
@@ -939,18 +1496,43 @@ fn repair_origin_refs(git: &dyn GitCommandRunner, path: &Path, id: &str) -> Resu
 
 fn validate_export_spec(spec: &CheckpointExportSpec) -> Result<()> {
     spec.canonical_session.validate()?;
-    validate_component(&spec.session.id, "session ID")?;
-    validate_component(&spec.session.native_session_id, "native session ID")?;
-    ensure!(spec.relay_root.is_dir(), "relay root is missing");
-    ensure!(spec.harness_home.is_dir(), "harness home is missing");
-    ensure!(spec.workspace_root.is_dir(), "workspace root is missing");
-    ensure!(
-        !spec.repositories.is_empty(),
-        "checkpoint has no repositories"
-    );
+    validate_checkpoint_source(
+        &spec.session,
+        &spec.relay_root,
+        &spec.harness_home,
+        &spec.workspace_root,
+        &spec.repositories,
+    )?;
+    validate_stage_path(&spec.relay_root, &spec.output_path, "checkpoint archive")
+}
+
+fn validate_capture_spec(spec: &CheckpointCaptureSpec) -> Result<()> {
+    validate_checkpoint_source(
+        &spec.session,
+        &spec.relay_root,
+        &spec.harness_home,
+        &spec.workspace_root,
+        &spec.repositories,
+    )?;
+    validate_stage_path(&spec.relay_root, &spec.stage_path, "checkpoint stage")
+}
+
+fn validate_checkpoint_source(
+    session: &SessionManifest,
+    relay_root: &Path,
+    harness_home: &Path,
+    workspace_root: &Path,
+    repositories: &[CheckpointRepositorySpec],
+) -> Result<()> {
+    validate_component(&session.id, "session ID")?;
+    validate_component(&session.native_session_id, "native session ID")?;
+    ensure!(relay_root.is_dir(), "relay root is missing");
+    ensure!(harness_home.is_dir(), "harness home is missing");
+    ensure!(workspace_root.is_dir(), "workspace root is missing");
+    ensure!(!repositories.is_empty(), "checkpoint has no repositories");
     let mut ids = BTreeSet::new();
     let mut destinations = BTreeSet::new();
-    for repository in &spec.repositories {
+    for repository in repositories {
         validate_component(&repository.id, "repository ID")?;
         validate_relative_path(&repository.relative_destination)?;
         if let CheckpointRepositoryCapture::DeltaFrom { base_commit } = &repository.capture {
@@ -962,15 +1544,10 @@ fn validate_export_spec(spec: &CheckpointExportSpec) -> Result<()> {
             "duplicate destination"
         );
     }
-    let parent = spec.output_path.parent().unwrap_or_else(|| Path::new("."));
-    ensure!(
-        parent.starts_with(&spec.relay_root),
-        "archive must be beneath relay root"
-    );
     Ok(())
 }
 
-fn canonical_session_contains_prompt(snapshot: &CanonicalSessionSnapshot) -> bool {
+pub(crate) fn canonical_session_contains_prompt(snapshot: &CanonicalSessionSnapshot) -> bool {
     snapshot
         .transcript
         .iter()
@@ -1532,6 +2109,58 @@ fn reject_dirty_submodules(runner: &dyn GitCommandRunner, repository: &Path) -> 
 /// engines are invoked with `exec -i` and `ssh` forwards stdin by default.
 pub fn export_stdin_command(locator: &TargetLocator, session_id: &str) -> Result<CommandSpec> {
     export_command(locator, session_id, EXPORT_SPEC_STDIN)
+}
+
+pub fn capture_stdin_command(locator: &TargetLocator, session_id: &str) -> Result<CommandSpec> {
+    checkpoint_stdin_command(
+        locator,
+        session_id,
+        "capture-checkpoint",
+        "capture target checkpoint",
+    )
+}
+
+pub fn pack_stdin_command(locator: &TargetLocator, session_id: &str) -> Result<CommandSpec> {
+    checkpoint_stdin_command(
+        locator,
+        session_id,
+        "pack-checkpoint",
+        "pack target checkpoint",
+    )
+}
+
+fn checkpoint_stdin_command(
+    locator: &TargetLocator,
+    session_id: &str,
+    subcommand: &str,
+    purpose: &str,
+) -> Result<CommandSpec> {
+    let root = worker_root(locator, session_id)?;
+    let args = vec![format!("{root}/hel"), "worker".into(), subcommand.into()];
+    let command = match locator {
+        TargetLocator::LocalBare { .. } => {
+            let mut args = args;
+            CommandSpec::new(args.remove(0), args)
+        }
+        TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
+        TargetLocator::AppleContainer { container_id } => {
+            container_exec("container", container_id, args)
+        }
+        TargetLocator::AwsEc2 { ssh, .. } | TargetLocator::SshBare { ssh, .. } => {
+            ssh_command(ssh, args)
+        }
+        TargetLocator::SshPodman { ssh, container_id } => {
+            let mut remote = vec![
+                "podman".into(),
+                "exec".into(),
+                "-i".into(),
+                container_id.clone(),
+            ];
+            remote.extend(args);
+            ssh_command(ssh, remote)
+        }
+    };
+    Ok(command.purpose(purpose))
 }
 
 pub fn export_command(
@@ -2920,6 +3549,229 @@ mod tests {
     }
 
     #[test]
+    fn staged_checkpoint_preserves_export_contents_and_defers_canonical_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let (export_spec, legacy_path) = fixture(temp.path());
+        let large_native = export_spec
+            .harness_home
+            .join(format!("sessions/2026/08/09/rollout-{NATIVE}.jsonl"));
+        fs::write(&large_native, vec![b'n'; 128 * 1024]).unwrap();
+        export_checkpoint(&export_spec).unwrap();
+
+        let stage_path = export_spec.relay_root.join("checkpoint-stage-test");
+        let capture_spec = CheckpointCaptureSpec {
+            protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
+            session: export_spec.session.clone(),
+            target: export_spec.target.clone(),
+            bundle: export_spec.bundle.clone(),
+            relay_root: export_spec.relay_root.clone(),
+            harness_home: export_spec.harness_home.clone(),
+            workspace_root: export_spec.workspace_root.clone(),
+            repositories: export_spec.repositories.clone(),
+            allow_empty_native: false,
+            stage_path: stage_path.clone(),
+            refresh_existing: false,
+        };
+        let capture_json = serde_json::to_vec(&capture_spec).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&capture_json).contains("queued-1"),
+            "canonical history crossed the barrier in the capture request"
+        );
+        let captured = capture_checkpoint(&capture_spec, &SystemGit).unwrap();
+        assert!(!captured.reused_native);
+        assert!(captured.native_bytes >= 128 * 1024);
+        assert!(stage_path.join(CHECKPOINT_STAGE_MANIFEST).is_file());
+        let native_stage = stage_path.join("native/00000000");
+        let native_stage_modified = fs::metadata(&native_stage).unwrap().modified().unwrap();
+        let mut refresh_spec = capture_spec.clone();
+        refresh_spec.refresh_existing = true;
+        let refreshed = capture_checkpoint(&refresh_spec, &SystemGit).unwrap();
+        assert!(refreshed.reused_native);
+        assert_eq!(refreshed.native_bytes, captured.native_bytes);
+        assert_eq!(
+            fs::metadata(&native_stage).unwrap().modified().unwrap(),
+            native_stage_modified,
+            "barrier catch-up rewrote unchanged native history"
+        );
+
+        let staged_path = export_spec.relay_root.join("staged.hel.zip");
+        let pack_spec = CheckpointPackSpec {
+            protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
+            relay_root: export_spec.relay_root.clone(),
+            stage_path: stage_path.clone(),
+            canonical_session: export_spec.canonical_session.clone(),
+            output_path: staged_path.clone(),
+        };
+        let packed = pack_checkpoint(&pack_spec).unwrap();
+        assert_eq!(
+            packed.event_frontier,
+            export_spec.canonical_session.event_frontier
+        );
+        assert!(!stage_path.exists(), "consumed stage was not removed");
+
+        let legacy = read_archive_verified(&legacy_path).unwrap();
+        let staged = read_archive_verified(&staged_path).unwrap();
+        assert_eq!(staged.manifest, legacy.manifest);
+        assert_eq!(staged.payloads, legacy.payloads);
+    }
+
+    #[test]
+    fn prestage_catch_up_recaptures_native_history_that_changed_before_the_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let (export_spec, _) = fixture(temp.path());
+        let stage_path = export_spec.relay_root.join("checkpoint-stage-test");
+        let mut capture_spec = CheckpointCaptureSpec {
+            protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
+            session: export_spec.session,
+            target: export_spec.target,
+            bundle: export_spec.bundle,
+            relay_root: export_spec.relay_root,
+            harness_home: export_spec.harness_home,
+            workspace_root: export_spec.workspace_root,
+            repositories: export_spec.repositories,
+            allow_empty_native: false,
+            stage_path,
+            refresh_existing: false,
+        };
+        let first = capture_checkpoint(&capture_spec, &SystemGit).unwrap();
+        assert!(!first.reused_native);
+        let rollout = capture_spec
+            .harness_home
+            .join(format!("sessions/2026/08/09/rollout-{NATIVE}.jsonl"));
+        fs::write(&rollout, b"native changed before barrier").unwrap();
+
+        capture_spec.refresh_existing = true;
+        let refreshed = capture_checkpoint(&capture_spec, &SystemGit).unwrap();
+        assert!(!refreshed.reused_native);
+        assert!(refreshed.native_bytes > first.native_bytes);
+    }
+
+    #[test]
+    #[ignore = "timing measurement against HEL_CHECKPOINT_BENCH_ARCHIVE"]
+    fn checkpoint_packaging_throughput() {
+        let source = std::env::var_os("HEL_CHECKPOINT_BENCH_ARCHIVE")
+            .map(PathBuf::from)
+            .expect("set HEL_CHECKPOINT_BENCH_ARCHIVE");
+        let read_started = std::time::Instant::now();
+        let archive = read_archive_verified(&source).unwrap();
+        let canonical_session = archive.canonical_session().unwrap();
+        let native_artifacts = archive
+            .manifest
+            .payloads
+            .iter()
+            .filter_map(|descriptor| {
+                let PayloadRole::NativeArtifact { relative_path } = &descriptor.role else {
+                    return None;
+                };
+                Some(NativeArtifact {
+                    relative_path: relative_path.clone(),
+                    data: archive.payload(descriptor).unwrap().to_vec(),
+                    mode: descriptor.mode,
+                })
+            })
+            .collect::<Vec<_>>();
+        let repositories = archive
+            .manifest
+            .repositories
+            .iter()
+            .map(|repository| archived_repository_snapshot(&archive, repository).unwrap())
+            .collect::<Vec<_>>();
+        let payload_bytes = native_artifacts
+            .iter()
+            .map(|artifact| artifact.data.len() as u64)
+            .chain(repositories.iter().flat_map(|repository| {
+                [
+                    repository.committed_bundle.len() as u64,
+                    repository.staged_patch.len() as u64,
+                    repository.unstaged_patch.len() as u64,
+                    repository.untracked_tar.len() as u64,
+                ]
+            }))
+            .sum::<u64>()
+            + serde_json::to_vec(&canonical_session).unwrap().len() as u64;
+        let read_elapsed = read_started.elapsed();
+        let stage_fixture = tempfile::tempdir().unwrap();
+        let relay_root = stage_fixture.path().join("worker");
+        let harness_home = stage_fixture.path().join("harness");
+        let workspace_root = stage_fixture.path().join("workspace");
+        let repository_root = workspace_root.join("app");
+        fs::create_dir_all(&relay_root).unwrap();
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::create_dir_all(&repository_root).unwrap();
+        for artifact in &native_artifacts {
+            write_private_file(
+                &harness_home,
+                &artifact.relative_path,
+                &artifact.data,
+                artifact.mode,
+            )
+            .unwrap();
+        }
+        git(&repository_root, &["init"]);
+        git(
+            &repository_root,
+            &["config", "user.email", "hel@example.test"],
+        );
+        git(&repository_root, &["config", "user.name", "Hel Test"]);
+        fs::write(repository_root.join("README.md"), b"benchmark").unwrap();
+        git(&repository_root, &["add", "."]);
+        git(&repository_root, &["commit", "-m", "benchmark"]);
+        let capture_spec = CheckpointCaptureSpec {
+            protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
+            session: archive.manifest.session.clone(),
+            target: archive.manifest.target.clone(),
+            bundle: archive.manifest.bundle.clone(),
+            relay_root,
+            harness_home,
+            workspace_root,
+            repositories: vec![CheckpointRepositorySpec {
+                id: "app".into(),
+                relative_destination: "app".into(),
+                capture: CheckpointRepositoryCapture::MetadataOnly,
+                origin_override: None,
+            }],
+            allow_empty_native: false,
+            stage_path: stage_fixture.path().join("worker/checkpoint-stage"),
+            refresh_existing: false,
+        };
+        let prestage_started = std::time::Instant::now();
+        capture_checkpoint(&capture_spec, &SystemGit).unwrap();
+        let prestage_elapsed = prestage_started.elapsed();
+        let catch_up_started = std::time::Instant::now();
+        capture_checkpoint(
+            &CheckpointCaptureSpec {
+                refresh_existing: true,
+                ..capture_spec
+            },
+            &SystemGit,
+        )
+        .unwrap();
+        let catch_up_elapsed = catch_up_started.elapsed();
+        let output_directory = tempfile::tempdir().unwrap();
+        let output = output_directory.path().join("benchmark.hel.zip");
+        let pack_started = std::time::Instant::now();
+        write_archive_hashed(
+            &output,
+            &ArchiveInput {
+                session: archive.manifest.session,
+                target: archive.manifest.target,
+                bundle: archive.manifest.bundle,
+                canonical_session,
+                native_artifacts,
+                repositories,
+            },
+        )
+        .unwrap();
+        eprintln!(
+            "checkpoint benchmark: payload_bytes={payload_bytes} read_ms={} prestage_ms={} catch_up_ms={} pack_ms={}",
+            read_elapsed.as_millis(),
+            prestage_elapsed.as_millis(),
+            catch_up_elapsed.as_millis(),
+            pack_started.elapsed().as_millis()
+        );
+    }
+
+    #[test]
     fn checkpoint_collects_the_configured_memory_replica_for_non_claude_harnesses() {
         let temp = tempfile::tempdir().unwrap();
         let (spec, _) = fixture(temp.path());
@@ -2949,10 +3801,59 @@ mod tests {
         .write(&spec.relay_root.join("launch.json"))
         .unwrap();
 
-        let artifacts = collect_export_native_artifacts(&spec, false).unwrap();
+        let artifacts = collect_checkpoint_native_artifacts(
+            &spec.session,
+            &spec.relay_root,
+            &spec.harness_home,
+            false,
+        )
+        .unwrap();
         assert!(artifacts.iter().any(|artifact| {
             artifact.relative_path == Path::new("projects/replica/memory/MEMORY.md")
                 && artifact.data == b"remember this"
+        }));
+    }
+
+    #[test]
+    fn checkpoint_collects_memory_from_a_legacy_worker_launch_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        let memory_root = spec.harness_home.join("projects/replica/memory");
+        fs::create_dir_all(&memory_root).unwrap();
+        fs::write(memory_root.join("MEMORY.md"), "legacy memory").unwrap();
+        let legacy_launch = json!({
+            "session_id": SESSION,
+            "harness": "codex",
+            "bridge_command": "codex-acp",
+            "bridge_args": [],
+            "environment": {},
+            "cwd": spec.workspace_root.join("app"),
+            "native_session_id": NATIVE,
+            "project_memory": {
+                "project_key": "project",
+                "root": memory_root,
+                "baseline_root": spec.harness_home.join("projects/replica/.hel-memory-baseline"),
+                "repository_roots": {}
+            },
+            "force_unrestricted_mode": true
+        });
+        fs::write(
+            spec.relay_root.join("launch.json"),
+            serde_json::to_vec_pretty(&legacy_launch).unwrap(),
+        )
+        .unwrap();
+
+        let artifacts = collect_checkpoint_native_artifacts(
+            &spec.session,
+            &spec.relay_root,
+            &spec.harness_home,
+            false,
+        )
+        .unwrap();
+
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.relative_path == Path::new("projects/replica/memory/MEMORY.md")
+                && artifact.data == b"legacy memory"
         }));
     }
 
@@ -3239,6 +4140,70 @@ mod tests {
                 .unwrap()
                 .archive_sha256,
             streamed.sha256
+        );
+    }
+
+    /// A second opinion keeps its whole world — profile, native session and
+    /// relay — inside the primary worker root. A v1 checkpoint is single
+    /// session, so none of it may end up in the archive.
+    #[test]
+    fn a_checkpoint_excludes_everything_the_reviewer_owns() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        let reviewer = spec.relay_root.join("reviewer");
+        let reviewer_home = reviewer.join("profile");
+        // A reviewer that ran: a staged profile with its own native rollout,
+        // its own relay journal, and its own supervisor spec.
+        let reviewer_native = reviewer_home.join("sessions/2026/08/09");
+        fs::create_dir_all(&reviewer_native).unwrap();
+        fs::write(
+            reviewer_native.join("rollout-reviewer-native.jsonl"),
+            b"reviewer native session",
+        )
+        .unwrap();
+        fs::create_dir_all(reviewer.join("relay-journal")).unwrap();
+        fs::write(
+            reviewer.join("relay-journal/active.jsonl"),
+            b"reviewer relay events",
+        )
+        .unwrap();
+        fs::write(reviewer.join("relay-state.json"), b"reviewer relay state").unwrap();
+        fs::write(reviewer.join("acp-supervisor.json"), b"reviewer bridge").unwrap();
+
+        export_checkpoint(&spec).unwrap();
+
+        let archive = read_archive_verified(&spec.output_path).unwrap();
+        let native = archive
+            .manifest
+            .payloads
+            .iter()
+            .filter_map(|payload| match &payload.role {
+                PayloadRole::NativeArtifact { relative_path } => {
+                    Some(relative_path.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            native.iter().all(|path| !path.contains("reviewer")),
+            "a reviewer's files must stay out of the checkpoint: {native:?}"
+        );
+        let bytes = fs::read(&spec.output_path).unwrap();
+        for secret in [
+            b"reviewer native session".as_slice(),
+            b"reviewer relay events".as_slice(),
+            b"reviewer relay state".as_slice(),
+        ] {
+            assert!(
+                !bytes.windows(secret.len()).any(|window| window == secret),
+                "the archive must not carry the reviewer's content"
+            );
+        }
+        // The primary's own native session is still captured, so this proves
+        // exclusion rather than an export that captured nothing.
+        assert!(
+            !native.is_empty(),
+            "the primary's native session must still be exported"
         );
     }
 

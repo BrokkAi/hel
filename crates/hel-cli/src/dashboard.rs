@@ -20,16 +20,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
 use hel::hel_credentials::CredentialSyncHandle;
-use hel::hel_recovery::RecoveryCoordinator;
-use hel::hel_session_manager::{SessionManagerControl, SessionManagerUpdates, ViewError};
-use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_state::{
-    MaterializedSession, RecoveryObserver, SessionResourceAllocation, SessionState,
+use hel::hel_selection::{
+    FrameSurfaces, SelectionAction, SelectionRange, SelectionState, SurfaceId,
 };
+use hel::hel_session_manager::{
+    SessionManagerControl, SessionManagerShutdown, SessionManagerUpdates, ViewError,
+};
+use hel::hel_setup::{SetupOutcome, run_setup_dialog};
+use hel::hel_state::{MaterializedSession, SessionRecord, SessionResourceAllocation, SessionState};
 use hel::hel_targets::DeploymentCapacityTarget;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::{
@@ -42,23 +46,22 @@ use tokio_stream::StreamExt as _;
 
 use crate::dashboard::io::{
     ActiveLifecycleOperation, DashboardIoUpdate, LifecycleReload, checkpoint_archive_targets,
-    spawn_checkpoint_archive_size_refresh, spawn_lifecycle_reload,
+    spawn_checkpoint_archive_size_refresh, spawn_clipboard_write, spawn_io, spawn_lifecycle_reload,
     spawn_materialized_session_projection, spawn_project_source_resolution,
     spawn_stored_session_summary,
 };
 use crate::import::{
-    DashboardImportTaskResult, DashboardImportUpdate, PendingDashboardImport,
-    spawn_dashboard_import,
+    DashboardImportRequest, DashboardImportTaskResult, DashboardImportUpdate,
+    PendingDashboardImport, spawn_dashboard_import,
 };
 use crate::pollers::{
     CapacityPollUpdate, CredentialSyncNotices, CredentialSyncSignalTracker, Feed, LifecycleUpdate,
     QuotaRefreshBatch, QuotaUpdate, ResourcePollTarget, ResourcePollUpdate, WorkerDiagnosisTracker,
     WorkerPollTarget, apply_worker_poll_update, complete_manual_quota_refresh,
-    dashboard_worker_targets, interrupted_close_session_ids, merge_recovery_result,
-    projected_queued_prompts, quota_refresh_profiles, refresh_dashboard_poll_targets,
-    schedule_due_credential_syncs, spawn_dashboard_capacity_poller,
-    spawn_dashboard_resource_poller, spawn_dashboard_worker_poller,
-    spawn_interrupted_close_recovery, spawn_quota_refresher, spawn_worker_diagnosis,
+    dashboard_worker_targets, projected_queued_prompts, quota_refresh_profiles,
+    refresh_dashboard_poll_targets, schedule_due_credential_syncs, session_target_is_pollable,
+    spawn_dashboard_capacity_poller, spawn_dashboard_resource_poller, spawn_quota_refresher,
+    spawn_remote_dashboard_worker_poller, spawn_worker_diagnosis,
 };
 use crate::{TerminalGuard, short_id, startup_greeting};
 
@@ -67,6 +70,8 @@ use crate::{TerminalGuard, short_id, startup_greeting};
 const DASHBOARD_CLOCK_TICK: Duration = Duration::from_secs(1);
 /// Redraw cadence while a dialog animates on its own.
 const IMPORT_PROGRESS_TICK: Duration = Duration::from_millis(125);
+/// Scroll cadence while a drag is held past a scrollable surface's edge.
+const SELECTION_AUTOSCROLL_TICK: Duration = Duration::from_millis(80);
 pub(crate) const QUOTA_REFRESH_NOTICE: &str = "Refreshing profile quotas…";
 pub(crate) const QUOTA_REFRESHED_NOTICE: &str = "Profile quotas refreshed.";
 
@@ -75,6 +80,7 @@ pub(crate) enum DashboardExit {
     Normal,
     Detached,
     Interrupted,
+    WorkspacePicker,
 }
 
 #[derive(Clone)]
@@ -214,6 +220,8 @@ pub(crate) struct ActiveDashboardImport {
 pub(crate) struct DashboardContext {
     terminal: TerminalGuard,
     pub(crate) controller: Controller,
+    pub(crate) workspace_id: String,
+    pub(crate) client_id: String,
     pub(crate) dashboard: DashboardState,
     /// One notifications bar for the whole process: the dashboard and every
     /// chat view opened from it report through this shared handle.
@@ -225,6 +233,12 @@ pub(crate) struct DashboardContext {
     /// At most one chat stays warm: the session opened last. Its feeds keep
     /// running off screen, so reopening it costs a draw rather than a rebuild.
     pub(crate) active_chat: Option<hel::hel_chat::ActiveChat>,
+    /// Session-manager attachment is asynchronous: an actor may need to
+    /// answer from a worker or relay before a chat can be built.
+    pub(crate) opening_chat_session: Option<String>,
+    /// Conversation-to-conversation navigation asks the newly opened chat to
+    /// retain focus in its conversation list after the async attachment.
+    pub(crate) opening_chat_focus_conversations: bool,
     /// The first pass always draws; after that a redraw needs a wakeup.
     pub(crate) dirty: bool,
     /// The notice generation the frame on screen was drawn from. Background
@@ -236,6 +250,7 @@ pub(crate) struct DashboardContext {
     /// changed.
     pub(crate) controller_changed: bool,
     pub(crate) quit_detached: bool,
+    workspace_switch_requested: bool,
     shutdown_requested: bool,
     pub(crate) critical_operations: CriticalOperationTracker,
     critical_operations_changed: watch::Receiver<u64>,
@@ -243,14 +258,18 @@ pub(crate) struct DashboardContext {
     quota_profiles_tx: watch::Sender<QuotaRefreshBatch>,
     quota: Feed<Receiver<QuotaUpdate>>,
     pub(crate) manual_quota_refresh_generation: Option<u64>,
+    pub(crate) target_test_cancel: Option<Arc<AtomicBool>>,
 
     worker_targets_tx: watch::Sender<Vec<WorkerPollTarget>>,
     worker: Feed<SessionManagerUpdates>,
+    runtime_lifecycles: Feed<watch::Receiver<Vec<crate::daemon::RuntimeLifecycleView>>>,
+    runtime_config: Feed<watch::Receiver<HelConfig>>,
+    runtime_records: Feed<watch::Receiver<Vec<SessionRecord>>>,
+    config_reload_in_flight: bool,
+    remote_lifecycle_sessions: BTreeSet<String>,
     pub(crate) worker_commands_tx: SessionManagerControl,
+    worker_shutdown: Option<SessionManagerShutdown>,
     worker_diagnoses: WorkerDiagnosisTracker,
-
-    recovery: Feed<RecoveryCoordinator>,
-    pub(crate) recovery_observer: RecoveryObserver,
 
     pub(crate) lifecycle_updates_tx: UnboundedSender<LifecycleUpdate>,
     lifecycle: Feed<UnboundedReceiver<LifecycleUpdate>>,
@@ -266,6 +285,7 @@ pub(crate) struct DashboardContext {
     resource: Feed<Receiver<ResourcePollUpdate>>,
 
     capacity_targets_tx: watch::Sender<Vec<DeploymentCapacityTarget>>,
+    capacity_triggers_tx: Sender<()>,
     capacity: Feed<Receiver<CapacityPollUpdate>>,
 
     pub(crate) aws_resource_options_tx: AwsResourceOptionsSender,
@@ -280,6 +300,16 @@ pub(crate) struct DashboardContext {
     pub(crate) import_discovery_id: u64,
     pub(crate) next_import_task_id: u64,
     pub(crate) active_import: Option<ActiveDashboardImport>,
+    /// At most one desktop clipboard IPC request is allowed at a time. The
+    /// request itself runs on a blocking worker; this flag keeps repeated
+    /// Ctrl-V key repeats from creating an unbounded queue of reads.
+    pub(crate) clipboard_read_in_flight: bool,
+    /// Pane-scoped text selection, driven by the mouse events this loop
+    /// intercepts before the views see them.
+    selection: SelectionState,
+    /// Text under the selection, read out of the buffer the last draw
+    /// produced. Copy redraws first, so it never reads a stale frame.
+    selection_text: Option<String>,
 
     pub(crate) dashboard_io_tx: UnboundedSender<DashboardIoUpdate>,
     dashboard_io: Feed<UnboundedReceiver<DashboardIoUpdate>>,
@@ -321,7 +351,36 @@ fn enqueue_materialized_projection(
     Some((materialized, viewed_through_event_ordinal))
 }
 
-pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
+pub(super) fn retain_workspace_sessions(
+    controller: &mut Controller,
+    workspace_id: &str,
+    client_id: &str,
+) -> Result<()> {
+    let session_ids = hel::hel_database::session_ids_for_workspace(workspace_id)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    controller
+        .state
+        .sessions
+        .retain(|session_id, _| session_ids.contains(session_id));
+    for session in controller.state.sessions.values_mut() {
+        let frontier =
+            hel::hel_database::client_read_frontier(client_id, workspace_id, &session.id)?;
+        hel::hel_database::advance_client_read_frontier(
+            client_id,
+            workspace_id,
+            &session.id,
+            frontier,
+        )?;
+        session.viewed_through_event_ordinal = frontier;
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_dashboard_for_workspace(
+    workspace_id: &str,
+    client_id: &str,
+) -> Result<DashboardExit> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin())
         || !std::io::IsTerminal::is_terminal(&std::io::stdout())
     {
@@ -330,7 +389,7 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
         return Ok(DashboardExit::Normal);
     }
 
-    let Some(mut context) = DashboardContext::open()? else {
+    let Some(mut context) = DashboardContext::open(workspace_id, client_id)? else {
         return Ok(DashboardExit::Normal);
     };
     let termination = hel::termination::Coordinator::install().token();
@@ -347,6 +406,10 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
         IMPORT_PROGRESS_TICK,
     );
     import_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Only armed while a held pointer sits at a scrollable surface's edge, so
+    // an idle dashboard never ticks on it.
+    let mut autoscroll_tick = tokio::time::interval(SELECTION_AUTOSCROLL_TICK);
+    autoscroll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         if !context.shutdown_requested {
@@ -373,15 +436,25 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
                 // that asks for work ends the batch so that dispatch still
                 // follows input order.
                 loop {
-                    let batched = match (context.view, context.active_chat.as_mut()) {
-                        (View::Chat, Some(chat)) => {
-                            chat_outcome = chat.handle_event(event);
-                            matches!(chat_outcome, hel::hel_chat::ChatEventOutcome::None)
-                        }
-                        _ => {
-                            action = dashboard_event_action(&mut context.dashboard, event);
-                            context.controller_changed = true;
-                            matches!(action, DashboardAction::None)
+                    let batched = if workspace_picker_event(&event) {
+                        action = DashboardAction::OpenWorkspacePicker;
+                        false
+                    } else {
+                        // Selection sees mouse and Esc first: a drag inside a
+                        // pane belongs to the engine, and everything else
+                        // comes back out for the view.
+                        match context.route_selection(event) {
+                            SelectionRouting::Consumed => true,
+                            SelectionRouting::Copy { surface, range } => {
+                                context.copy_selection(surface, range)?;
+                                true
+                            }
+                            SelectionRouting::Forward(event) => dispatch_to_view(
+                                &mut context,
+                                event,
+                                &mut action,
+                                &mut chat_outcome,
+                            ),
                         }
                     };
                     if !batched {
@@ -420,8 +493,16 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
                 let woke = context.worker.accept(update);
                 context.dirty |= woke;
             }
-            result = context.recovery.wait(), if context.recovery.is_open() => {
-                let woke = context.recovery.accept(result);
+            update = context.runtime_lifecycles.wait(), if context.runtime_lifecycles.is_open() => {
+                let woke = context.runtime_lifecycles.accept(update);
+                context.dirty |= woke;
+            }
+            update = context.runtime_config.wait(), if context.runtime_config.is_open() => {
+                let woke = context.runtime_config.accept(update);
+                context.dirty |= woke;
+            }
+            update = context.runtime_records.wait(), if context.runtime_records.is_open() => {
+                let woke = context.runtime_records.accept(update);
                 context.dirty |= woke;
             }
             result = context.credential_sync.wait(), if context.credential_sync.is_open() => {
@@ -483,6 +564,12 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
             {
                 context.dirty = true;
             }
+            // A drag held past a scrollable surface's edge keeps scrolling it
+            // and keeps extending the selection, the way a held pointer does
+            // in a terminal's own selection.
+            _ = autoscroll_tick.tick(), if context.autoscroll_request().is_some() => {
+                context.apply_autoscroll()?;
+            }
         }
         context.drain_feeds();
         if !context.shutdown_requested {
@@ -498,11 +585,20 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
     }
     context.cancel_background_work();
     let quit_detached = context.quit_detached;
+    let workspace_switch_requested = context.workspace_switch_requested;
     // Hand the terminal back before saying anything on it; the warm chat and
     // the background feeds are torn down after, as the rest of the context
     // drops.
     drop(context.terminal);
-    Ok(if quit_detached {
+    if let Some(shutdown) = context.worker_shutdown.take() {
+        shutdown
+            .shutdown()
+            .await
+            .context("shut down dashboard session manager")?;
+    }
+    Ok(if workspace_switch_requested {
+        DashboardExit::WorkspacePicker
+    } else if quit_detached {
         DashboardExit::Detached
     } else if context.shutdown_requested {
         DashboardExit::Interrupted
@@ -514,6 +610,11 @@ pub(crate) async fn run_dashboard() -> Result<DashboardExit> {
 impl DashboardContext {
     pub(crate) fn request_shutdown(&mut self) {
         self.begin_shutdown(true);
+    }
+
+    pub(crate) fn request_workspace_switch(&mut self) {
+        self.workspace_switch_requested = true;
+        self.begin_shutdown(false);
     }
 
     fn begin_shutdown(&mut self, detached: bool) {
@@ -590,6 +691,8 @@ impl DashboardContext {
     fn spawn_read_receipt(&mut self, session_id: String, through: u64) {
         self.read_receipt_in_flight = Some(session_id.clone());
         io::spawn_read_receipt_persist(
+            self.client_id.clone(),
+            self.workspace_id.clone(),
             session_id,
             through,
             self.dashboard_io_tx.clone(),
@@ -617,9 +720,15 @@ impl DashboardContext {
     /// Loads state, takes the terminal, and starts every background feed.
     /// `Ok(None)` means first-run setup was cancelled and there is nothing to
     /// run.
-    fn open() -> Result<Option<Self>> {
+    fn open(workspace_id: &str, client_id: &str) -> Result<Option<Self>> {
         let mut controller = Controller::load()?;
-        let greeting = startup_greeting(&controller);
+        retain_workspace_sessions(&mut controller, workspace_id, client_id)?;
+        let workspace_name = hel::hel_database::list_workspaces()?
+            .into_iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("unknown workspace {workspace_id:?}"))?
+            .name;
+        let greeting = format!("{workspace_name}  ·  {}", startup_greeting(&controller));
         let mut dashboard = DashboardState::new(
             controller.config.clone(),
             controller.state.clone(),
@@ -639,6 +748,7 @@ impl DashboardContext {
             match setup_result? {
                 SetupOutcome::Written => {
                     controller.reload()?;
+                    retain_workspace_sessions(&mut controller, workspace_id, client_id)?;
                     dashboard.set_config(controller.config.clone());
                     dashboard.set_state(controller.state.clone());
                     dashboard
@@ -649,45 +759,25 @@ impl DashboardContext {
         }
 
         let (quota_profiles_tx, quota_updates_rx) = spawn_quota_refresher();
-        let (worker_targets_tx, worker_updates_rx, worker_commands_tx) =
-            spawn_dashboard_worker_poller()?;
+        let remote_worker = spawn_remote_dashboard_worker_poller(workspace_id.to_owned())?;
+        let worker_targets_tx = remote_worker.targets;
+        let worker_updates_rx = remote_worker.updates;
+        let worker_commands_tx = remote_worker.control;
+        let worker_shutdown = remote_worker.shutdown;
+        let runtime_lifecycles_rx = remote_worker.lifecycles;
+        let runtime_config_rx = remote_worker.config;
+        let runtime_records_rx = remote_worker.records;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
-        let recovery = RecoveryCoordinator::spawn(worker_commands_tx.clone());
-        let recovery_observer = recovery.observer();
         let (lifecycle_updates_tx, lifecycle_updates_rx) =
             tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
         let (critical_operations, critical_operations_changed) = CriticalOperationTracker::new();
-        let mut lifecycle_operations = BTreeMap::<String, ActiveLifecycleOperation>::new();
-        for session_id in interrupted_close_session_ids(&controller) {
-            let state = controller.state.sessions[&session_id].state;
-            let kind = if state == SessionState::Destroying {
-                SessionOperationKind::Destroying
-            } else {
-                SessionOperationKind::Stopping
-            };
-            let cancelled = Arc::new(AtomicBool::new(false));
-            lifecycle_operations.insert(
-                session_id.clone(),
-                ActiveLifecycleOperation {
-                    cancelled: cancelled.clone(),
-                    kind,
-                },
-            );
-            dashboard.begin_session_operation(session_id.clone(), kind, None);
-            spawn_interrupted_close_recovery(
-                session_id,
-                worker_commands_tx.clone(),
-                recovery_observer.clone(),
-                cancelled,
-                lifecycle_updates_tx.clone(),
-                Some(critical_operations.clone()),
-            );
-        }
+        let lifecycle_operations = BTreeMap::<String, ActiveLifecycleOperation>::new();
         let credential_sync = CredentialSyncCoordinator::spawn();
         let credential_sync_handle = credential_sync.handle();
         let (resource_targets_tx, resource_triggers_tx, resource_updates_rx) =
             spawn_dashboard_resource_poller();
-        let (capacity_targets_tx, capacity_updates_rx) = spawn_dashboard_capacity_poller();
+        let (capacity_targets_tx, capacity_triggers_tx, capacity_updates_rx) =
+            spawn_dashboard_capacity_poller();
         let (aws_resource_options_tx, aws_resource_options_rx) =
             tokio::sync::mpsc::unbounded_channel::<AwsResourceOptions>();
         refresh_dashboard_poll_targets(
@@ -710,27 +800,37 @@ impl DashboardContext {
         let mut context = Self {
             terminal,
             controller,
+            workspace_id: workspace_id.to_owned(),
+            client_id: client_id.to_owned(),
             dashboard,
             notices,
             events: Some(event::EventStream::new()),
             view: View::Dashboard,
             active_chat: None,
+            opening_chat_session: None,
+            opening_chat_focus_conversations: false,
             dirty: true,
             drawn_notice_generation: 0,
             controller_changed: true,
             quit_detached: false,
+            workspace_switch_requested: false,
             shutdown_requested: false,
             critical_operations,
             critical_operations_changed,
             quota_profiles_tx,
             quota: Feed::new(quota_updates_rx),
             manual_quota_refresh_generation: None,
+            target_test_cancel: None,
             worker_targets_tx,
             worker: Feed::new(worker_updates_rx),
+            runtime_lifecycles: Feed::new(runtime_lifecycles_rx),
+            runtime_config: Feed::new(runtime_config_rx),
+            runtime_records: Feed::new(runtime_records_rx),
+            config_reload_in_flight: false,
+            remote_lifecycle_sessions: BTreeSet::new(),
             worker_commands_tx,
+            worker_shutdown: Some(worker_shutdown),
             worker_diagnoses: WorkerDiagnosisTracker::default(),
-            recovery: Feed::new(recovery),
-            recovery_observer,
             lifecycle_updates_tx,
             lifecycle: Feed::new(lifecycle_updates_rx),
             lifecycle_operations,
@@ -742,6 +842,7 @@ impl DashboardContext {
             resource_triggers_tx,
             resource: Feed::new(resource_updates_rx),
             capacity_targets_tx,
+            capacity_triggers_tx,
             capacity: Feed::new(capacity_updates_rx),
             aws_resource_options_tx,
             aws_options: Feed::new(aws_resource_options_rx),
@@ -754,6 +855,9 @@ impl DashboardContext {
             import_discovery_id: 0,
             next_import_task_id: 0,
             active_import: None,
+            clipboard_read_in_flight: false,
+            selection: SelectionState::new(),
+            selection_text: None,
             dashboard_io_tx,
             dashboard_io: Feed::new(dashboard_io_rx),
             materialized_projection_permits: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -882,16 +986,149 @@ impl DashboardContext {
             dashboard,
             active_chat,
             view,
+            selection,
+            selection_text,
             ..
         } = self;
+        let transcript_selected = selection.active_surface() == Some(SurfaceId::Transcript);
+        // The highlight and the extraction both run inside the draw closure,
+        // once the view has drawn: the surfaces are registered by that render
+        // and the cells the selection covers only exist in this frame.
         match (*view, active_chat.as_mut()) {
             (View::Chat, Some(chat)) => {
-                terminal.terminal.draw(|frame| chat.draw(frame))?;
+                terminal.terminal.draw(|frame| {
+                    chat.draw(frame, transcript_selected);
+                    *selection_text = draw_selection(frame, selection, chat.frame_surfaces());
+                })?;
             }
             _ => {
-                terminal.terminal.draw(|frame| render(frame, dashboard))?;
+                terminal.terminal.draw(|frame| {
+                    render(frame, dashboard);
+                    *selection_text = draw_selection(frame, selection, dashboard.frame_surfaces());
+                })?;
             }
         }
+        // The transcript reports a row space it can no longer measure the
+        // selection in — a width change, a rebuilt cache, a jump across the
+        // deep past. Dropping the selection is the honest answer; walking
+        // history to rescue it is the full-transcript probe this design exists
+        // to avoid.
+        let invalidated = self
+            .active_chat
+            .as_mut()
+            .is_some_and(hel::hel_chat::ActiveChat::transcript_selection_invalidated);
+        if invalidated && self.selection.active_surface() == Some(SurfaceId::Transcript) {
+            self.selection.clear();
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// The surfaces the view on screen registered on its last frame.
+    fn frame_surfaces(&self) -> &FrameSurfaces {
+        match (self.view, self.active_chat.as_ref()) {
+            (View::Chat, Some(chat)) => chat.frame_surfaces(),
+            _ => self.dashboard.frame_surfaces(),
+        }
+    }
+
+    /// The surface a held drag is asking to scroll, if any.
+    fn autoscroll_request(&self) -> Option<(SurfaceId, i8)> {
+        self.selection.autoscroll_request(self.frame_surfaces())
+    }
+
+    /// Scrolls the surface a drag is holding against its edge, then re-resolves
+    /// the still pointer against the frame that scroll produced.
+    ///
+    /// The pointer emits no events while it is held still, so the rows that
+    /// moved under it only join the selection once the registry is rebuilt,
+    /// which needs the redraw in between.
+    fn apply_autoscroll(&mut self) -> Result<()> {
+        let Some((surface, direction)) = self.autoscroll_request() else {
+            return Ok(());
+        };
+        let Some(chat) = self.active_chat.as_mut() else {
+            return Ok(());
+        };
+        chat.autoscroll_selection(surface, direction);
+        self.dirty = true;
+        self.draw()?;
+        let Self {
+            selection,
+            active_chat,
+            dashboard,
+            view,
+            ..
+        } = self;
+        let surfaces = match (*view, active_chat.as_ref()) {
+            (View::Chat, Some(chat)) => chat.frame_surfaces(),
+            _ => dashboard.frame_surfaces(),
+        };
+        selection.retrack(surfaces);
+        Ok(())
+    }
+
+    /// Routes one terminal event through the selection engine, hit-testing
+    /// against the surfaces the view on screen registered.
+    fn route_selection(&mut self, event: Event) -> SelectionRouting {
+        let Self {
+            selection,
+            active_chat,
+            dashboard,
+            view,
+            ..
+        } = self;
+        let surfaces = match (*view, active_chat.as_ref()) {
+            (View::Chat, Some(chat)) => chat.frame_surfaces(),
+            _ => dashboard.frame_surfaces(),
+        };
+        route_selection_event(selection, surfaces, event)
+    }
+
+    /// Copies the finished selection to the system and terminal clipboards.
+    ///
+    /// The frame on screen predates the release that finished the drag, so
+    /// this redraws before reading. Surfaces that scroll their own rows own
+    /// the text a selection covers, because most of it is not on the frame the
+    /// stash is read from; everything else comes out of that stash.
+    fn copy_selection(&mut self, surface: SurfaceId, range: SelectionRange) -> Result<()> {
+        self.dirty = true;
+        self.draw()?;
+        let extracted = match surface {
+            SurfaceId::Transcript => self
+                .active_chat
+                .as_mut()
+                .and_then(|chat| chat.transcript_selection_text(&range)),
+            SurfaceId::ElicitationMessage => self
+                .active_chat
+                .as_ref()
+                .and_then(|chat| chat.elicitation_selection_text(&range)),
+            // The reviewer pane scrolls its own rows, so the text a selection
+            // covers comes out of that pane rather than off this frame.
+            SurfaceId::ReviewerTranscript => self
+                .active_chat
+                .as_ref()
+                .and_then(|chat| chat.reviewer_selection_text(&range)),
+            _ => self.selection_text.take(),
+        };
+        let Some(text) = extracted.filter(|text| !text.trim().is_empty()) else {
+            tracing::debug!(?surface, ?range, "selection covered no text");
+            return Ok(());
+        };
+        // The desktop clipboard opens a blocking platform connection, so it
+        // runs on a blocking task; OSC 52 is one escape sequence and also
+        // reaches a terminal Hel is talking to over SSH.
+        spawn_clipboard_write(text.clone(), self.dashboard_io_tx.clone());
+        if let Err(error) = self.terminal.copy_to_terminal_clipboard(&text) {
+            self.dashboard
+                .set_failure_notice(format!("Copy to the terminal clipboard failed: {error:#}"));
+            return Ok(());
+        }
+        let lines = text.lines().count().max(1);
+        self.dashboard.set_notice(format!(
+            "Copied {lines} line{}",
+            if lines == 1 { "" } else { "s" }
+        ));
         Ok(())
     }
 
@@ -969,27 +1206,96 @@ impl DashboardContext {
         }
     }
 
-    /// Opens or reveals the chat for `session_id`, reporting a failure as a
-    /// notice rather than ending the run.
-    pub(crate) async fn hold_chat_session(&mut self, session_id: &str) -> Result<(), ()> {
-        match hold_chat_session(
-            &self.controller,
-            &self.dashboard,
-            &mut self.active_chat,
-            session_id,
-            &self.worker_commands_tx,
-            &self.recovery_observer,
-            self.notices.clone(),
-        )
-        .await
+    /// Opens or reveals the chat for `session_id` without waiting on the
+    /// session manager. Attaching can involve worker/relay I/O, so the result
+    /// comes back through the dashboard I/O channel and the current view stays
+    /// responsive while it is in flight.
+    pub(crate) fn open_chat_session(&mut self, session_id: &str) {
+        self.open_chat_session_with_focus(session_id, false);
+    }
+
+    fn open_chat_session_with_focus(&mut self, session_id: &str, focus_conversations: bool) {
+        if self
+            .active_chat
+            .as_ref()
+            .is_some_and(|chat| chat.session_id() == session_id && chat.session_feed_open())
         {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.dashboard
-                    .set_notice(format!("Could not open session: {error:#}"));
-                Err(())
+            if focus_conversations && let Some(chat) = self.active_chat.as_mut() {
+                chat.focus_conversations();
+            }
+            self.view = View::Chat;
+            self.acknowledge_visible_chat();
+            self.dirty = true;
+            return;
+        }
+        if self.opening_chat_session.as_deref() == Some(session_id) {
+            self.opening_chat_focus_conversations |= focus_conversations;
+            return;
+        }
+        if self.opening_chat_session.is_some() {
+            self.dashboard.set_notice("A session is already opening…");
+            return;
+        }
+        let Some(session_record) = self.controller.state.sessions.get(session_id).cloned() else {
+            self.dashboard.set_notice(format!(
+                "Could not open session: unknown session {session_id}"
+            ));
+            return;
+        };
+        let project_key = self.dashboard.project_source(&session_record).key;
+        let mut active = self
+            .controller
+            .state
+            .sessions
+            .values()
+            .filter(|record| {
+                record.state.is_active() && self.dashboard.project_source(record).key == project_key
+            })
+            .collect::<Vec<_>>();
+        active.sort_by(|left, right| left.compare_by_creation(right));
+        let mut header = hel::hel_chat::SessionHeaderIdentity {
+            target: session_record
+                .project_target(&self.controller.config, &session_record.target_template_id),
+            profile: session_record.last_profile.clone(),
+            ..Default::default()
+        };
+        for (position, record) in active.into_iter().enumerate() {
+            if record.id == session_id {
+                header.position = position;
+            } else {
+                header.others.push(hel::hel_chat::OtherSessionIdentity {
+                    session_id: record.id.clone(),
+                    position,
+                });
             }
         }
+        let sessions = self.worker_commands_tx.clone();
+        let notices = self.notices.clone();
+        let updates = self.dashboard_io_tx.clone();
+        let session_id = session_id.to_owned();
+        let bundle_id = session_record.bundle_id.clone();
+        let draft = session_record.draft_input.clone();
+        self.opening_chat_session = Some(session_id.clone());
+        self.opening_chat_focus_conversations = focus_conversations;
+        self.dashboard.set_notice("Opening session…");
+        tokio::spawn(async move {
+            let result = sessions
+                .session(session_id.clone())
+                .await
+                .map(|managed| {
+                    hel::hel_chat::ActiveChat::open(
+                        managed, &bundle_id, None, sessions, header, draft, notices,
+                    )
+                })
+                .map_err(|error| format!("{error:#}"));
+            if let Err(error) = updates.send(DashboardIoUpdate::ChatOpened {
+                session_id,
+                result: Box::new(result),
+            }) {
+                tracing::debug!(%error, "chat-open result dropped after dashboard shutdown");
+            }
+        });
+        self.dirty = true;
     }
 
     /// Suspends the terminal for the setup dialog and takes back what it
@@ -1025,13 +1331,15 @@ impl DashboardContext {
     /// feed, in the order the UI depends on.
     fn drain_feeds(&mut self) {
         self.drain_quota_updates();
+        self.drain_runtime_records();
         self.drain_worker_updates();
+        self.drain_runtime_lifecycles();
+        self.drain_runtime_config();
         schedule_due_credential_syncs(
             &mut self.credential_sync_signals,
             &self.credential_sync_handle,
             Instant::now(),
         );
-        self.drain_recovery_results();
         self.drain_credential_results();
         self.drain_resource_updates();
         self.drain_capacity_updates();
@@ -1040,6 +1348,21 @@ impl DashboardContext {
         self.drain_import_tasks();
         self.drain_lifecycle_updates();
         self.drain_dashboard_io();
+        self.refresh_open_review();
+    }
+
+    /// Keeps the stop confirmation's warning current.
+    ///
+    /// A review can only be started from inside a chat, so the open chat is
+    /// the authority while there is one. This is an in-memory read: the loop
+    /// never touches the database for it.
+    fn refresh_open_review(&mut self) {
+        let Some(chat) = self.active_chat.as_ref() else {
+            return;
+        };
+        let session_id = chat.session_id().to_owned();
+        let open = chat.has_open_review();
+        self.dashboard.set_session_review_open(&session_id, open);
     }
 
     fn drain_quota_updates(&mut self) {
@@ -1082,24 +1405,10 @@ impl DashboardContext {
             };
             if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = self.controller.state.sessions.get(&session_id).cloned()
+                && let Some(signal) = snapshot.latest_credential_sync_signal.clone()
             {
-                if let Some(signal) = snapshot.latest_credential_sync_signal.clone() {
-                    self.credential_sync_signals.observe(
-                        &session_id,
-                        &session.last_profile,
-                        signal,
-                    );
-                }
-                // Queued, never awaited: the copy decision belongs to the
-                // coordinator, and the dashboard loop must stay free to draw.
-                self.recovery_observer
-                    .observe(hel::hel_state::RecoveryObservation {
-                        session,
-                        config: self.controller.config.clone(),
-                        latest_completed_turn_ordinal:
-                            hel::hel_state::latest_completed_turn_ordinal(&snapshot.materialized),
-                        execution: snapshot.materialized.execution,
-                    });
+                self.credential_sync_signals
+                    .observe(&session_id, &session.last_profile, signal);
             }
             let materialized = update
                 .view
@@ -1113,6 +1422,12 @@ impl DashboardContext {
                 .and_then(|snapshot| snapshot.operational.last_acp_activity_at_ms);
             self.dashboard
                 .set_last_acp_activity(&session_id, last_acp_activity_at_ms);
+            // A view is published as disconnected only once the relay has
+            // failed past the unreachable threshold, so this reddens the band
+            // exactly when the target is genuinely unreachable and clears it on
+            // recovery.
+            self.dashboard
+                .set_session_connectivity(&session_id, connected);
             match apply_worker_poll_update(
                 &mut self.controller,
                 &mut self.dashboard,
@@ -1156,15 +1471,143 @@ impl DashboardContext {
         }
     }
 
-    fn drain_recovery_results(&mut self) {
-        while let Some(result) = self.recovery.next_ready() {
-            self.controller_changed = true;
-            apply_recovery_result(&mut self.controller, &mut self.dashboard, result);
+    fn drain_runtime_lifecycles(&mut self) {
+        let mut latest = None;
+        while let Some(lifecycles) = self.runtime_lifecycles.next_ready() {
+            latest = Some(lifecycles);
         }
+        let Some(lifecycles) = latest else {
+            return;
+        };
+        let active = lifecycles
+            .iter()
+            .map(|lifecycle| lifecycle.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        for session_id in self
+            .remote_lifecycle_sessions
+            .difference(&active)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.dashboard.finish_session_operation(&session_id);
+            self.remote_lifecycle_sessions.remove(&session_id);
+        }
+        for lifecycle in lifecycles {
+            let kind = match lifecycle.kind {
+                crate::daemon::RuntimeLifecycleKind::Create => SessionOperationKind::Launching,
+                crate::daemon::RuntimeLifecycleKind::Close
+                | crate::daemon::RuntimeLifecycleKind::ForceStop => SessionOperationKind::Stopping,
+                crate::daemon::RuntimeLifecycleKind::Resume => SessionOperationKind::Resuming,
+                crate::daemon::RuntimeLifecycleKind::DestroyStopped => {
+                    SessionOperationKind::Destroying
+                }
+            };
+            if !self
+                .lifecycle_operations
+                .contains_key(&lifecycle.session_id)
+                && self
+                    .remote_lifecycle_sessions
+                    .insert(lifecycle.session_id.clone())
+            {
+                self.dashboard.begin_session_operation_at(
+                    lifecycle.session_id.clone(),
+                    kind,
+                    None,
+                    lifecycle.started_at_epoch_seconds,
+                );
+            }
+            self.dashboard
+                .replace_session_operation_stages(&lifecycle.session_id, lifecycle.active_stages);
+            if let Some((profile_id, target_id)) = lifecycle.resume_destination {
+                self.dashboard
+                    .set_resume_destination(&lifecycle.session_id, profile_id, target_id);
+            }
+            if let Some(notice) = lifecycle.notice {
+                self.dashboard.set_notice(notice);
+            }
+        }
+        self.controller_changed = true;
+    }
+
+    fn drain_runtime_config(&mut self) {
+        let mut latest = None;
+        while let Some(config) = self.runtime_config.next_ready() {
+            latest = Some(config);
+        }
+        let Some(config) = latest else {
+            return;
+        };
+        if config == self.controller.config || self.config_reload_in_flight {
+            return;
+        }
+        self.controller.config = config.clone();
+        self.dashboard.set_config(config);
+        self.refresh_poll_targets();
+        self.request_quota_refresh();
+        self.config_reload_in_flight = true;
+        let workspace_id = self.workspace_id.clone();
+        let client_id = self.client_id.clone();
+        spawn_io(
+            "reload daemon configuration",
+            self.dashboard_io_tx.clone(),
+            move || {
+                let mut controller = Controller::load()?;
+                retain_workspace_sessions(&mut controller, &workspace_id, &client_id)?;
+                Ok(controller)
+            },
+            DashboardIoUpdate::ConfigReloaded,
+        );
+    }
+
+    fn drain_runtime_records(&mut self) {
+        let mut latest = None;
+        while let Some(records) = self.runtime_records.next_ready() {
+            latest = Some(records);
+        }
+        let Some(records) = latest else {
+            return;
+        };
+        let sessions: BTreeMap<String, SessionRecord> = records
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect();
+        let settled_remote_operations = self
+            .remote_lifecycle_sessions
+            .iter()
+            .filter(|session_id| {
+                self.dashboard
+                    .session_operation_kind(session_id)
+                    .is_some_and(|kind| {
+                        remote_lifecycle_settled(
+                            kind,
+                            sessions.get(*session_id).map(|session| session.state),
+                        )
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in settled_remote_operations {
+            self.dashboard.finish_session_operation(&session_id);
+            self.remote_lifecycle_sessions.remove(&session_id);
+        }
+        if let Some(chat) = self.active_chat.as_mut() {
+            let feed_expected = sessions
+                .get(chat.session_id())
+                .is_some_and(session_target_is_pollable);
+            chat.set_session_feed_expected(feed_expected);
+        }
+        if self.controller.state.sessions == sessions {
+            return;
+        }
+        self.controller.state.sessions = sessions;
+        self.dashboard.set_state(self.controller.state.clone());
+        self.controller_changed = true;
+        self.refresh_poll_targets();
     }
 
     fn drain_credential_results(&mut self) {
         while let Some(result) = self.credential_sync.next_ready() {
+            crate::pollers::log_credential_sync_actions(&result);
             if let Some(notice) = self.credential_sync_notices.notice(&result) {
                 self.dashboard.set_notice(notice);
             }
@@ -1185,6 +1628,19 @@ impl DashboardContext {
                 update.result,
                 update.sampled_at_epoch_seconds,
             );
+        }
+    }
+
+    pub(crate) fn request_capacity_refresh(&mut self) {
+        self.dashboard.begin_capacity_refresh();
+        match self.capacity_triggers_tx.try_send(()) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                self.dashboard.set_notice("Refreshing target capacity…");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                self.dashboard
+                    .set_notice("Could not refresh target capacity: poller stopped.");
+            }
         }
     }
 
@@ -1232,7 +1688,7 @@ impl DashboardContext {
                         continue;
                     }
                     self.active_import = None;
-                    match result {
+                    match *result {
                         Ok(DashboardImportTaskResult::NeedsBundle(prompt)) => {
                             self.pending_import = Some(pending);
                             self.dashboard.show_import_bundle_confirmation(
@@ -1246,7 +1702,7 @@ impl DashboardContext {
                             self.dashboard.finish_import();
                             self.dashboard.set_notice("Saving imported session…");
                             io::spawn_imported_session_apply(
-                                imported,
+                                *imported,
                                 pending,
                                 self.dashboard_io_tx.clone(),
                                 self.critical_operations.clone(),
@@ -1340,10 +1796,13 @@ impl DashboardContext {
         });
         spawn_dashboard_import(
             &self.controller,
-            pending,
-            safety,
-            self.next_import_task_id,
-            cancelled,
+            DashboardImportRequest {
+                workspace_id: self.workspace_id.clone(),
+                pending,
+                safety,
+                task_id: self.next_import_task_id,
+                cancelled,
+            },
             self.import_task_tx.clone(),
             self.critical_operations.clone(),
         );
@@ -1368,13 +1827,7 @@ impl DashboardContext {
                 //
                 // The user arrived by walking the list, so the pane keeps focus
                 // and the next key walks on from here.
-                if self.hold_chat_session(&session_id).await.is_ok()
-                    && let Some(chat) = self.active_chat.as_mut()
-                {
-                    chat.focus_conversations();
-                    self.acknowledge_visible_chat();
-                }
-                self.dirty = true;
+                self.open_chat_session_with_focus(&session_id, true);
             }
             hel::hel_chat::ChatEventOutcome::Back {
                 last_seen_event_ordinal,
@@ -1417,12 +1870,71 @@ impl DashboardContext {
         record_chat_detach_state(
             &mut self.controller,
             &mut self.dashboard,
-            &session_id,
-            last_seen_event_ordinal,
-            &draft,
+            DetachedChatState {
+                client_id: &self.client_id,
+                workspace_id: &self.workspace_id,
+                session_id: &session_id,
+                event_ordinal: last_seen_event_ordinal,
+                draft: &draft,
+            },
             &self.dashboard_io_tx,
             self.critical_operations.clone(),
         )
+    }
+}
+
+/// A durable terminal lifecycle state is authoritative over a remote UI
+/// overlay. The daemon lifecycle feed normally removes the overlay first, but
+/// records and lifecycles travel on separate watch channels; retaining a
+/// completed overlay would otherwise force a fresh Running record back to a
+/// displayed Provisioning state indefinitely.
+fn remote_lifecycle_settled(kind: SessionOperationKind, state: Option<SessionState>) -> bool {
+    match kind {
+        SessionOperationKind::Launching | SessionOperationKind::Importing => {
+            state.is_none_or(|state| {
+                matches!(
+                    state,
+                    SessionState::Running
+                        | SessionState::Disconnected
+                        | SessionState::Lost
+                        | SessionState::Error
+                        | SessionState::DestroyedWithDataLoss
+                )
+            })
+        }
+        SessionOperationKind::Resuming => state.is_none_or(|state| {
+            matches!(
+                state,
+                SessionState::Running
+                    | SessionState::Disconnected
+                    | SessionState::Stopped
+                    | SessionState::Lost
+                    | SessionState::Error
+                    | SessionState::DestroyedWithDataLoss
+            )
+        }),
+        SessionOperationKind::Connecting => state.is_some_and(|state| {
+            matches!(
+                state,
+                SessionState::Running
+                    | SessionState::Disconnected
+                    | SessionState::Lost
+                    | SessionState::Error
+                    | SessionState::DestroyedWithDataLoss
+            )
+        }),
+        SessionOperationKind::Stopping => state.is_some_and(|state| {
+            matches!(
+                state,
+                SessionState::Stopped
+                    | SessionState::Lost
+                    | SessionState::Error
+                    | SessionState::DestroyedWithDataLoss
+            )
+        }),
+        SessionOperationKind::Destroying => {
+            state.is_none_or(|state| matches!(state, SessionState::DestroyedWithDataLoss))
+        }
     }
 }
 
@@ -1440,137 +1952,174 @@ async fn next_terminal_event(
 
 /// Builds a chat view for one session: its identity, the other sessions it
 /// reports activity for, and its recovery context.
-async fn open_chat_view(
-    controller: &Controller,
-    dashboard: &DashboardState,
-    session_id: &str,
-    sessions: &SessionManagerControl,
-    recovery_observer: &RecoveryObserver,
-    notices: hel::hel_chat::Notices,
-) -> Result<hel::hel_chat::ActiveChat> {
-    let session_record = controller
-        .state
-        .sessions
-        .get(session_id)
-        .with_context(|| format!("unknown session {session_id}"))?
-        .clone();
-    let bundle_id = session_record.bundle_id.clone();
-    // Only a fresh view is seeded: a warm chat the loop kept alive holds newer
-    // input than this saved copy.
-    let saved_draft = session_record.draft_input.clone();
-    // Conversation switching stays inside the canonical source project. A
-    // managed worktree and its source checkout therefore remain together,
-    // while unrelated repositories never crowd this pane.
-    let project_key = dashboard.project_source(&session_record).key;
-    let mut active = controller
-        .state
-        .sessions
-        .values()
-        .filter(|record| {
-            record.state.is_active() && dashboard.project_source(record).key == project_key
-        })
-        .collect::<Vec<_>>();
-    active.sort_by(|left, right| left.compare_by_creation(right));
-    let mut header = hel::hel_chat::SessionHeaderIdentity::default();
-    for (position, record) in active.into_iter().enumerate() {
-        if record.id == session_id {
-            header.position = position;
-            continue;
-        }
-        header.others.push(hel::hel_chat::OtherSessionIdentity {
-            session_id: record.id.clone(),
-            position,
-        });
-    }
-    let recovery_context = hel::hel_state::RecoveryContext {
-        observer: recovery_observer.clone(),
-        session: session_record,
-        config: controller.config.clone(),
-    };
-    let managed = sessions.session(session_id.to_owned()).await?;
-    Ok(hel::hel_chat::ActiveChat::open(
-        managed,
-        &bundle_id,
-        Some(recovery_context),
-        sessions.clone(),
-        header,
-        saved_draft,
-        notices,
-    ))
-}
-
-/// Makes `session_id` the chat the loop holds. A warm chat for the same
-/// session is left as it is, so showing it costs a draw; any other session is
-/// opened fresh, which drops the previous chat and detaches its proxy.
-///
-/// A warm chat whose session actor has already been retired is not reused.
-/// Pause closes that actor after sealing the worker, and the view keeps the
-/// Closing/Closed snapshot; reopening attaches to the worker resume started.
-async fn hold_chat_session(
-    controller: &Controller,
-    dashboard: &DashboardState,
-    active_chat: &mut Option<hel::hel_chat::ActiveChat>,
-    session_id: &str,
-    sessions: &SessionManagerControl,
-    recovery_observer: &RecoveryObserver,
-    notices: hel::hel_chat::Notices,
-) -> Result<()> {
-    if active_chat
-        .as_ref()
-        .is_some_and(|chat| chat.session_id() == session_id && chat.session_feed_open())
-    {
-        // The warm chat is this session and still follows its worker, so
-        // showing it is only a redraw.
-        return Ok(());
-    }
-    let chat = open_chat_view(
-        controller,
-        dashboard,
-        session_id,
-        sessions,
-        recovery_observer,
-        notices,
-    )
-    .await?;
-    // Only one chat stays warm, so the previous one is dropped here; its
-    // supervisor detaches on drop.
-    *active_chat = Some(chat);
-    Ok(())
-}
-
 /// Records what leaving a chat produced — how far the user has read and the
 /// input they left unsent — and persists both in the background. A missing
 /// session is reported rather than fatal: the session itself is unaffected.
 ///
 /// The returned handle lets the quit path wait for the write. `None` means
 /// nothing was queued.
+struct DetachedChatState<'a> {
+    client_id: &'a str,
+    workspace_id: &'a str,
+    session_id: &'a str,
+    event_ordinal: u64,
+    draft: &'a str,
+}
+
 fn record_chat_detach_state(
     controller: &mut Controller,
     dashboard: &mut DashboardState,
-    session_id: &str,
-    event_ordinal: u64,
-    draft: &str,
+    detached: DetachedChatState<'_>,
     updates: &UnboundedSender<DashboardIoUpdate>,
     tracker: CriticalOperationTracker,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(session) = controller.state.sessions.get_mut(session_id) else {
+    let Some(session) = controller.state.sessions.get_mut(detached.session_id) else {
         dashboard.set_notice(format!(
             "Could not save draft and read status for {}: unknown session",
-            short_id(session_id)
+            short_id(detached.session_id)
         ));
         return None;
     };
-    session.viewed_through_event_ordinal = session.viewed_through_event_ordinal.max(event_ordinal);
-    session.draft_input = draft.to_owned();
+    session.viewed_through_event_ordinal = session
+        .viewed_through_event_ordinal
+        .max(detached.event_ordinal);
+    session.draft_input = detached.draft.to_owned();
     dashboard.set_state(controller.state.clone());
     dashboard.clear_notice();
     Some(io::spawn_detached_session_state_persist(
-        session_id.to_owned(),
-        event_ordinal,
-        draft.to_owned(),
+        detached.client_id.to_owned(),
+        detached.workspace_id.to_owned(),
+        detached.session_id.to_owned(),
+        detached.event_ordinal,
+        detached.draft.to_owned(),
         updates.clone(),
         tracker,
     ))
+}
+
+/// Hands one event to the view on screen and reports whether the loop may keep
+/// batching, which it may while the event asked for no work.
+fn dispatch_to_view(
+    context: &mut DashboardContext,
+    event: Event,
+    action: &mut DashboardAction,
+    chat_outcome: &mut hel::hel_chat::ChatEventOutcome,
+) -> bool {
+    match (context.view, context.active_chat.as_mut()) {
+        (View::Chat, Some(chat)) => {
+            *chat_outcome = chat.handle_event(event);
+            matches!(*chat_outcome, hel::hel_chat::ChatEventOutcome::None)
+        }
+        _ => {
+            *action = dashboard_event_action(&mut context.dashboard, event);
+            context.controller_changed = true;
+            matches!(*action, DashboardAction::None)
+        }
+    }
+}
+
+/// Highlights the live selection on the frame the view just drew and returns
+/// the text it covers.
+///
+/// Both halves read the same frame, so the copied text is exactly what the
+/// highlight marks. Surfaces that scroll their own content extract from their
+/// row cache instead: only the visible band of such a selection is on this
+/// frame, and the highlight is all that band is good for.
+fn draw_selection(
+    frame: &mut ratatui::Frame,
+    selection: &SelectionState,
+    surfaces: &FrameSurfaces,
+) -> Option<String> {
+    let id = selection.active_surface()?;
+    let range = selection.range()?;
+    let surface = *surfaces.surface(id)?;
+    hel::hel_selection::highlight(frame.buffer_mut(), &surface, &range);
+    if matches!(
+        id,
+        SurfaceId::Transcript | SurfaceId::ElicitationMessage | SurfaceId::ReviewerTranscript
+    ) {
+        return None;
+    }
+    Some(hel::hel_selection::extract_rows(
+        frame.buffer_mut(),
+        &surface,
+        &range,
+    ))
+}
+
+/// What the selection engine decided about one terminal event.
+#[derive(Debug, PartialEq, Eq)]
+enum SelectionRouting {
+    /// The engine took the event; the frame only needs redrawing.
+    Consumed,
+    /// The engine wants nothing to do with this event; hand it to the view.
+    /// A release that never dragged arrives here as the press the view's
+    /// click handling expects.
+    Forward(Event),
+    /// A drag finished. The caller extracts the selected text and copies it.
+    Copy {
+        surface: SurfaceId,
+        range: SelectionRange,
+    },
+}
+
+/// Routes one terminal event between the selection engine and the view.
+///
+/// The engine only claims left-button gestures that start on a registered
+/// surface: a press elsewhere, the wheel, and every other mouse kind stay the
+/// view's. Esc drops a finished selection instead of reaching the view, so the
+/// key that clears the highlight cannot also quit or cancel.
+fn route_selection_event(
+    selection: &mut SelectionState,
+    surfaces: &FrameSurfaces,
+    event: Event,
+) -> SelectionRouting {
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                selection.on_mouse_down(mouse.column, mouse.row, surfaces);
+                if selection.active_surface().is_some() {
+                    SelectionRouting::Consumed
+                } else {
+                    SelectionRouting::Forward(Event::Mouse(mouse))
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if selection.active_surface().is_some() => {
+                selection.on_mouse_drag(mouse.column, mouse.row, surfaces);
+                SelectionRouting::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) if selection.active_surface().is_some() => {
+                match selection.on_mouse_up(mouse.column, mouse.row, surfaces) {
+                    // The views key their click and double-click handling on
+                    // presses, so a click that the engine held back is
+                    // replayed as one when the button comes up.
+                    SelectionAction::Click { column, row } => {
+                        SelectionRouting::Forward(Event::Mouse(MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row,
+                            modifiers: KeyModifiers::NONE,
+                        }))
+                    }
+                    SelectionAction::CopyRequested { surface, range } => {
+                        SelectionRouting::Copy { surface, range }
+                    }
+                    SelectionAction::None => SelectionRouting::Consumed,
+                }
+            }
+            _ => SelectionRouting::Forward(Event::Mouse(mouse)),
+        },
+        Event::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == KeyCode::Esc
+                && key.modifiers == KeyModifiers::NONE
+                && selection.range().is_some() =>
+        {
+            selection.clear();
+            SelectionRouting::Consumed
+        }
+        event => SelectionRouting::Forward(event),
+    }
 }
 
 /// Applies one terminal event to the dashboard and reports the work it asks
@@ -1589,27 +2138,18 @@ fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> Dashb
     }
 }
 
-fn apply_recovery_result(
-    controller: &mut Controller,
-    dashboard: &mut DashboardState,
-    result: hel::hel_recovery::RecoveryResult,
-) {
-    let session_id = result.session_id.clone();
-    let failure = if result.cancelled {
-        // A copy the user preempted is not a failure worth reporting.
-        None
-    } else {
-        result.outcome.as_ref().err().cloned()
+fn workspace_picker_event(event: &Event) -> bool {
+    let Event::Key(key) = event else {
+        return false;
     };
-    if merge_recovery_result(controller, result) {
-        dashboard.set_state(controller.state.clone());
-        if let Some(detail) = failure {
-            dashboard.set_notice(format!(
-                "Recovery copy for {} failed: {detail}",
-                short_id(&session_id)
-            ));
-        }
-    }
+    let accelerator = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && key.modifiers.contains(accelerator)
+        && key.code == KeyCode::Char('w')
 }
 
 pub(crate) fn resume_progress_notice(
@@ -1630,7 +2170,390 @@ fn configuration_needs_setup(config: &HelConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hel::hel_selection::SurfaceFrame;
     use hel::hel_state::HelState;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::Modifier;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn escape() -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))
+    }
+
+    /// A dashboard with profiles and a target, so the adaptive layout draws
+    /// its three panes with text in them.
+    fn populated_dashboard() -> DashboardState {
+        let mut config = HelConfig::default();
+        for (id, kind) in [
+            ("claude-1", hel::hel_config::HarnessKind::Claude),
+            ("codex-1", hel::hel_config::HarnessKind::Codex),
+        ] {
+            config.profiles.insert(
+                id.into(),
+                hel::hel_config::HarnessProfile {
+                    context_window_bytes: None,
+                    kind,
+                    home: std::path::PathBuf::from("/profiles").join(id),
+                    executable: None,
+                    environment: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+        config.targets.insert(
+            "podman".into(),
+            hel::hel_config::TargetTemplate::LocalPodman {
+                container: hel::hel_config::ContainerTemplate {
+                    image: "ubuntu:24.04".into(),
+                    pull_policy: Default::default(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: std::collections::BTreeMap::new(),
+                },
+            },
+        );
+        let mut state = HelState::default();
+        for (id, title) in [("session-1", "First"), ("session-2", "Second")] {
+            state.sessions.insert(
+                id.into(),
+                hel::hel_state::SessionRecord {
+                    workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
+                    archived: false,
+                    container_cpus: None,
+                    container_memory: None,
+                    id: id.into(),
+                    title: title.into(),
+                    harness_kind: hel::hel_config::HarnessKind::Codex,
+                    last_profile: "codex-1".into(),
+                    bundle_id: "hel".into(),
+                    project_directory: None,
+                    managed_worktree: None,
+                    target_template_id: "podman".into(),
+                    resource_allocation: None,
+                    additional_mounts: Vec::new(),
+                    state: hel::hel_state::SessionState::Running,
+                    target: None,
+                    native_session_id: None,
+                    acp_session_title: None,
+                    session_title_override: None,
+                    created_at: "2026-08-14T00:00:00Z".into(),
+                    updated_at: "2026-08-14T00:00:00Z".into(),
+                    viewed_through_event_ordinal: 0,
+                    draft_input: String::new(),
+                    last_error: None,
+                    last_checkpoint_error: None,
+                    checkpoint: None,
+                },
+            );
+        }
+        DashboardState::new(config, state, std::collections::BTreeMap::new())
+    }
+
+    #[test]
+    fn durable_terminal_state_settles_remote_lifecycle_overlay() {
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Launching,
+            Some(SessionState::Running)
+        ));
+        assert!(!remote_lifecycle_settled(
+            SessionOperationKind::Stopping,
+            Some(SessionState::Running)
+        ));
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Stopping,
+            Some(SessionState::Stopped)
+        ));
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Resuming,
+            Some(SessionState::Stopped)
+        ));
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Launching,
+            None
+        ));
+        assert!(remote_lifecycle_settled(
+            SessionOperationKind::Destroying,
+            None
+        ));
+    }
+
+    /// Draws the dashboard exactly as the loop does, so the highlight and the
+    /// extraction see the frame the view just produced.
+    fn draw_with_selection(
+        terminal: &mut Terminal<TestBackend>,
+        dashboard: &mut DashboardState,
+        selection: &SelectionState,
+    ) -> Option<String> {
+        let mut text = None;
+        terminal
+            .draw(|frame| {
+                render(frame, dashboard);
+                text = draw_selection(frame, selection, dashboard.frame_surfaces());
+            })
+            .expect("draw dashboard");
+        text
+    }
+
+    fn reversed_cells(terminal: &Terminal<TestBackend>) -> Vec<(u16, u16)> {
+        let buffer = terminal.backend().buffer();
+        (buffer.area.y..buffer.area.bottom())
+            .flat_map(|y| (buffer.area.x..buffer.area.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buffer
+                    .cell(Position::new(x, y))
+                    .expect("cell")
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect()
+    }
+
+    /// Screen row of the first line holding `needle`.
+    fn row_containing(terminal: &Terminal<TestBackend>, needle: &str) -> u16 {
+        let buffer = terminal.backend().buffer();
+        (buffer.area.y..buffer.area.bottom())
+            .find(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("missing {needle} on screen"))
+    }
+
+    /// A drag inside a pane belongs to that pane: the range stops at its last
+    /// row even though the pointer left it, and the copied text is the pane's
+    /// own rows without borders or anything drawn around it.
+    #[test]
+    fn dragging_inside_a_pane_copies_only_that_panes_rows() {
+        let mut dashboard = populated_dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        let mut selection = SelectionState::new();
+        draw_with_selection(&mut terminal, &mut dashboard, &selection);
+        let quotas = *dashboard
+            .frame_surfaces()
+            .surface(SurfaceId::DashboardPane(2))
+            .expect("quotas pane registered");
+
+        let press = (quotas.rect.x, quotas.rect.y + 1);
+        // Drag out past the pane's bottom-right corner, into the footer.
+        let release = (quotas.rect.right() + 10, quotas.rect.bottom() + 5);
+        assert_eq!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Down(MouseButton::Left), press.0, press.1),
+            ),
+            SelectionRouting::Consumed
+        );
+        assert_eq!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    release.0,
+                    release.1
+                ),
+            ),
+            SelectionRouting::Consumed
+        );
+        assert_eq!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Up(MouseButton::Left), release.0, release.1),
+            ),
+            SelectionRouting::Copy {
+                surface: SurfaceId::DashboardPane(2),
+                range: SelectionRange {
+                    start: hel::hel_selection::ContentPos::new(1, 0),
+                    end: hel::hel_selection::ContentPos::new(2, quotas.rect.width - 1),
+                },
+            }
+        );
+
+        let text = draw_with_selection(&mut terminal, &mut dashboard, &selection)
+            .expect("the selection covers text");
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec![
+                "  claude-1  Claude Code  refreshing…",
+                "  codex-1   Codex        refreshing…",
+            ]
+        );
+        // Exactly the two selected pane rows are reversed, border columns and
+        // the pane above included.
+        let expected = (quotas.rect.y + 1..quotas.rect.bottom())
+            .flat_map(|y| (quotas.rect.x..quotas.rect.right()).map(move |x| (x, y)))
+            .collect::<Vec<_>>();
+        assert_eq!(reversed_cells(&terminal), expected);
+    }
+
+    /// A press is held back until the button comes up, then replayed to the
+    /// view, so clicking still selects and a second gesture still opens.
+    #[test]
+    fn click_gestures_reach_the_view_as_presses_and_still_double_click() {
+        let mut dashboard = populated_dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        let mut selection = SelectionState::new();
+        draw_with_selection(&mut terminal, &mut dashboard, &selection);
+        let row = row_containing(&terminal, "session-2");
+        let column = dashboard
+            .frame_surfaces()
+            .surface(SurfaceId::DashboardPane(0))
+            .expect("active pane registered")
+            .rect
+            .x;
+
+        let mut click = || {
+            assert_eq!(
+                route_selection_event(
+                    &mut selection,
+                    dashboard.frame_surfaces(),
+                    mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+                ),
+                SelectionRouting::Consumed,
+                "the press waits for the release"
+            );
+            let SelectionRouting::Forward(event) = route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Up(MouseButton::Left), column, row),
+            ) else {
+                panic!("a release without movement forwards a press");
+            };
+            assert_eq!(
+                event,
+                mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+            );
+            dashboard_event_action(&mut dashboard, event)
+        };
+
+        assert_eq!(click(), DashboardAction::None, "the first click selects");
+        assert_eq!(
+            click(),
+            DashboardAction::Open {
+                session_id: "session-2".into(),
+            },
+            "a second gesture on the same row opens it"
+        );
+    }
+
+    #[test]
+    fn presses_off_every_surface_and_wheel_events_reach_the_view() {
+        let mut surfaces = FrameSurfaces::new();
+        surfaces.push(SurfaceFrame::fixed(
+            SurfaceId::ModalBody,
+            Rect::new(10, 5, 20, 4),
+        ));
+        let mut selection = SelectionState::new();
+
+        let outside = mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, outside.clone()),
+            SelectionRouting::Forward(outside)
+        );
+        assert_eq!(selection.active_surface(), None);
+
+        // The wheel scrolls whatever it is over, even inside a surface.
+        let wheel = mouse(MouseEventKind::ScrollDown, 12, 6);
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, wheel.clone()),
+            SelectionRouting::Forward(wheel)
+        );
+        // A drag that never started on a surface is the view's too.
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 12, 6);
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, drag.clone()),
+            SelectionRouting::Forward(drag)
+        );
+    }
+
+    /// A surface that scrolls its own rows still gets highlighted, but its
+    /// text is not read back from the frame: most of the selection is off it,
+    /// and the surface's own row cache is what holds those rows.
+    #[test]
+    fn a_scrollable_surface_is_highlighted_without_stashing_frame_text() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).expect("terminal");
+        let mut surfaces = FrameSurfaces::new();
+        surfaces.push(SurfaceFrame::scrollable(
+            SurfaceId::Transcript,
+            Rect::new(0, 1, 20, 3),
+            400,
+            9_000,
+        ));
+        let mut selection = SelectionState::new();
+        route_selection_event(
+            &mut selection,
+            &surfaces,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 1),
+        );
+        route_selection_event(
+            &mut selection,
+            &surfaces,
+            mouse(MouseEventKind::Up(MouseButton::Left), 19, 3),
+        );
+
+        let mut text = Some("stale".to_owned());
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("visible transcript row"),
+                    Rect::new(0, 1, 20, 3),
+                );
+                text = draw_selection(frame, &selection, &surfaces);
+            })
+            .expect("draw");
+
+        assert_eq!(text, None, "the extraction is the transcript's own job");
+        assert_eq!(reversed_cells(&terminal).len(), 60, "all three rows lit up");
+    }
+
+    #[test]
+    fn escape_clears_a_finished_selection_before_the_view_sees_it() {
+        let mut surfaces = FrameSurfaces::new();
+        surfaces.push(SurfaceFrame::fixed(
+            SurfaceId::ModalBody,
+            Rect::new(10, 5, 20, 4),
+        ));
+        let mut selection = SelectionState::new();
+        route_selection_event(
+            &mut selection,
+            &surfaces,
+            mouse(MouseEventKind::Down(MouseButton::Left), 11, 6),
+        );
+        route_selection_event(
+            &mut selection,
+            &surfaces,
+            mouse(MouseEventKind::Up(MouseButton::Left), 15, 7),
+        );
+        assert!(selection.range().is_some(), "the drag left a selection");
+
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, escape()),
+            SelectionRouting::Consumed
+        );
+        assert_eq!(selection.range(), None);
+        // With nothing selected, Esc is the view's key again.
+        assert_eq!(
+            route_selection_event(&mut selection, &surfaces, escape()),
+            SelectionRouting::Forward(escape())
+        );
+    }
 
     /// The dashboard loop batches buffered input and stops at the first event
     /// that asks for work, so events that only need a redraw must report no

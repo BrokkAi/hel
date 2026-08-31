@@ -483,7 +483,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(14, 12)).expect("terminal");
 
         terminal
-            .draw(|frame| render(frame, &mut chat))
+            .draw(|frame| render(frame, &mut chat, false))
             .expect("draw chat");
         let (word_end_x, word_row) = {
             let buffer = terminal.backend().buffer();

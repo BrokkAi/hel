@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
@@ -27,38 +27,73 @@ use crate::hel_worker::{
     RELAY_PROTOCOL_VERSION, RelayCommand, RelayCursor, RelayErrorCode, RelayEvent,
     RelayOperationalState, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
     RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload, RelayVersionRange,
-    validate_relay_event,
+    ReviewerRequest, validate_relay_event,
 };
+use crate::hel_worker_runtime::ReviewerLaunchConfig;
 
 const RELAY_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_SLOW_OPERATION_WARNING: Duration = Duration::from_secs(5);
+/// Starting a target-side proxy may page the full worker executable in and
+/// traverse a container runtime before the relay sees `hello`. That is worker
+/// startup latency, not an ordinary in-connection RPC.
+const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
+/// An attachment can decompress a transport-sized page from cold journal
+/// segments. It remains bounded by the relay frame budget, but cold or loaded
+/// storage needs a filesystem deadline rather than an in-memory RPC deadline.
+const RELAY_HISTORY_TIMEOUT: Duration = Duration::from_secs(900);
+/// Advancing an acknowledgement can durably prune a large relay journal. The
+/// worker performs that maintenance before replying, so it needs a deadline
+/// sized for filesystem work rather than ordinary relay bookkeeping.
+const RELAY_ACKNOWLEDGE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A compaction request runs a full model turn in a scratch ACP session, so it
 /// outlives the deadline that suits the relay's bookkeeping calls.
 const RELAY_COMPACT_TIMEOUT: Duration = Duration::from_secs(600);
+const RELAY_PROXY_DETACH_GRACE: Duration = Duration::from_millis(500);
+const RELAY_PROXY_REAP_POLL: Duration = Duration::from_millis(10);
 
 /// Forward a relay proxy's stderr to the log, one line at a time, until the
 /// child closes it. Reporting rather than dropping keeps connect failures
 /// diagnosable now that the controller no longer shares its terminal.
-async fn drain_proxy_stderr(errors: tokio::process::ChildStderr, purpose: String) {
+async fn drain_proxy_stderr(
+    errors: tokio::process::ChildStderr,
+    purpose: String,
+    session_id: String,
+) {
     let mut lines = BufReader::new(errors).lines();
     loop {
         match lines.next_line().await {
             Ok(Some(line)) if line.trim().is_empty() => continue,
-            Ok(Some(line)) => tracing::warn!(%purpose, %line, "relay proxy stderr"),
+            Ok(Some(line)) => {
+                tracing::warn!(%session_id, %purpose, %line, "relay proxy stderr")
+            }
             Ok(None) => return,
             Err(error) => {
-                tracing::warn!(%purpose, %error, "read relay proxy stderr");
+                tracing::warn!(%session_id, %purpose, %error, "read relay proxy stderr");
                 return;
             }
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RelayAttachment {
     pub state: RelayOperationalState,
     pub events: Vec<RelayEvent>,
     pub through_ordinal: u64,
     pub through_digest: String,
+}
+
+/// What the reviewer sidecar reports once it is running.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StartedReviewer {
+    /// The reviewer's own native session, distinct from the primary's.
+    pub native_session_id: Option<String>,
+    /// What the reviewer's harness advertises right now, which is what the
+    /// selection waterfall offers the user.
+    pub config_options: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+    /// Whether an already-running reviewer served this request.
+    pub reused: bool,
+    pub state: RelayOperationalState,
 }
 
 /// One bounded page in a catch-up whose upper frontier was fixed before any
@@ -152,9 +187,9 @@ impl RelayTransportDead {
     }
 
     /// Whether the worker was reachable enough to run its liveness probe but
-    /// still failed to serve a fresh relay handshake. After repeated failures,
-    /// restarting that exact managed worker is safe: a shared target outage
-    /// cannot pass the liveness probe, while merely slow calls are not marked.
+    /// the proxy then disconnected or failed I/O during a fresh handshake.
+    /// Timeouts are deliberately not marked: a live proxy can be waiting on a
+    /// loaded container runtime or filesystem, which restarting only worsens.
     pub fn marks_failed_handshake(error: &anyhow::Error) -> bool {
         error
             .downcast_ref::<Self>()
@@ -165,9 +200,9 @@ impl RelayTransportDead {
 /// Whether an exchange is the handshake that proves the transport carries
 /// traffic at all.
 ///
-/// A handshake that never answers means the worker is not serving; a later
-/// call's timeout can just be a busy worker, and restarting that worker would
-/// be worse than waiting for it.
+/// A disconnected handshake proves the new transport never became usable. A
+/// timeout does not: the proxy launcher or worker can still be alive and slow,
+/// so timeout classification is handled separately in [`RelayClient::exchange`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExchangeKind {
     Handshake,
@@ -176,9 +211,9 @@ enum ExchangeKind {
 
 /// Controller-side connection to the durable ACP relay protocol.
 ///
-/// This type does not construct transcript state or request an unbounded
-/// history. Callers persist each attachment page, then acknowledge its
-/// `through` frontier only after committing it locally.
+/// This type does not construct transcript state or request unbounded history.
+/// Callers persist bounded attachment pages, then acknowledge only a frontier
+/// that is already durable locally.
 pub struct RelayClient {
     child: Option<Child>,
     input: Option<ChildStdin>,
@@ -198,13 +233,30 @@ pub struct RelayClient {
 
 impl RelayClient {
     pub async fn connect(spec: &CommandSpec, expected_session_id: &str) -> Result<Self> {
-        Self::connect_with_timeout(spec, expected_session_id, RELAY_RPC_TIMEOUT).await
+        Self::connect_with_timeouts(
+            spec,
+            expected_session_id,
+            RELAY_RPC_TIMEOUT,
+            RELAY_HANDSHAKE_TIMEOUT,
+        )
+        .await
     }
 
+    #[cfg(all(test, unix))]
     async fn connect_with_timeout(
         spec: &CommandSpec,
         expected_session_id: &str,
         request_timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_with_timeouts(spec, expected_session_id, request_timeout, request_timeout)
+            .await
+    }
+
+    async fn connect_with_timeouts(
+        spec: &CommandSpec,
+        expected_session_id: &str,
+        request_timeout: Duration,
+        handshake_timeout: Duration,
     ) -> Result<Self> {
         let mut child = Command::new(&spec.program)
             .args(&spec.args)
@@ -217,22 +269,61 @@ impl RelayClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("start session relay proxy for {}", spec.purpose))?;
+            .with_context(|| format!("start session relay proxy for {}", spec.purpose))
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %expected_session_id,
+                    operation = "connect",
+                    purpose = %spec.purpose,
+                    error = %error,
+                    "could not start relay proxy"
+                );
+                error
+            })?;
         if let Some(errors) = child.stderr.take() {
             let purpose = spec.purpose.clone();
-            tokio::spawn(drain_proxy_stderr(errors, purpose));
+            let session_id = expected_session_id.to_owned();
+            tokio::spawn(drain_proxy_stderr(errors, purpose, session_id));
         }
         let input = child
             .stdin
             .take()
-            .context("relay proxy stdin unavailable")?;
+            .context("relay proxy stdin unavailable")
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %expected_session_id,
+                    operation = "connect",
+                    purpose = %spec.purpose,
+                    error = %error,
+                    "relay proxy did not provide stdin"
+                );
+                error
+            })?;
         let output = child
             .stdout
             .take()
-            .context("relay proxy stdout unavailable")?;
+            .context("relay proxy stdout unavailable")
+            .map_err(|error| {
+                tracing::warn!(
+                    session_id = %expected_session_id,
+                    operation = "connect",
+                    purpose = %spec.purpose,
+                    error = %error,
+                    "relay proxy did not provide stdout"
+                );
+                error
+            })?;
         let mut nonce_bytes = [0_u8; 8];
-        getrandom::fill(&mut nonce_bytes)
-            .map_err(|error| anyhow!("generate relay request nonce: {error}"))?;
+        getrandom::fill(&mut nonce_bytes).map_err(|error| {
+            let error = anyhow!("generate relay request nonce: {error}");
+            tracing::warn!(
+                session_id = %expected_session_id,
+                operation = "connect",
+                error = %error,
+                "could not initialize relay request nonce"
+            );
+            error
+        })?;
         let mut client = Self {
             child: Some(child),
             input: Some(input),
@@ -242,16 +333,22 @@ impl RelayClient {
             next_request: 1,
             connection_nonce: u64::from_le_bytes(nonce_bytes),
             protocol_version: RELAY_PROTOCOL_VERSION,
-            session_id: String::new(),
+            // Keep the expected identity from process creation onward so a
+            // handshake failure and the dropped proxy that follows it remain
+            // attributable even when Hello never returns a session ID.
+            session_id: expected_session_id.to_owned(),
             relay_version: String::new(),
             latest_ordinal: 0,
             latest_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
         };
         let response = client
-            .call_hello(RelayRequest::Hello {
-                controller_version: env!("CARGO_PKG_VERSION").to_owned(),
-                supported: RelayVersionRange::CURRENT,
-            })
+            .call_hello(
+                RelayRequest::Hello {
+                    controller_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    supported: RelayVersionRange::CURRENT,
+                },
+                handshake_timeout,
+            )
             .await?;
         let RelayResponsePayload::Hello {
             negotiated,
@@ -259,17 +356,23 @@ impl RelayClient {
             session_id,
         } = response
         else {
-            bail!("relay returned an unexpected hello response")
+            let error = anyhow!("relay returned an unexpected hello response");
+            log_relay_client_failure(&client, "hello", "relay-hello", &error);
+            return Err(error);
         };
         if session_id != expected_session_id {
-            bail!("relay belongs to session {session_id}, not {expected_session_id}");
+            let error = anyhow!("relay belongs to session {session_id}, not {expected_session_id}");
+            log_relay_client_failure(&client, "hello", "relay-hello", &error);
+            return Err(error);
         }
         if !RelayVersionRange::CURRENT.contains(negotiated) {
-            bail!(
+            let error = anyhow!(
                 "relay negotiated unsupported protocol {negotiated}; this controller supports {}-{}",
                 RELAY_MIN_PROTOCOL_VERSION,
                 RELAY_PROTOCOL_VERSION
             );
+            log_relay_client_failure(&client, "hello", "relay-hello", &error);
+            return Err(error);
         }
         client.protocol_version = negotiated;
         client.session_id = session_id;
@@ -308,10 +411,13 @@ impl RelayClient {
     ) -> Result<RelayAttachment> {
         let after_digest = after_digest.into();
         match self
-            .call(RelayRequest::Attach {
-                after_ordinal,
-                after_digest: after_digest.clone(),
-            })
+            .call_with_timeout(
+                RelayRequest::Attach {
+                    after_ordinal,
+                    after_digest: after_digest.clone(),
+                },
+                RELAY_HISTORY_TIMEOUT,
+            )
             .await?
         {
             RelayResponsePayload::Attached {
@@ -347,8 +453,9 @@ impl RelayClient {
     }
 
     /// Start a bounded catch-up by capturing the relay frontier before the
-    /// caller applies anything. Callers persist and acknowledge `first_page`,
-    /// then request further pages with [`Self::next_catch_up_page`].
+    /// caller applies anything. Callers persist `first_page`, request further
+    /// pages with [`Self::next_catch_up_page`], and may acknowledge the fixed
+    /// frontier after all of those pages are durable.
     pub async fn begin_catch_up(
         &mut self,
         after_ordinal: u64,
@@ -396,10 +503,13 @@ impl RelayClient {
         through_digest: impl Into<String>,
     ) -> Result<RelayCursor> {
         match self
-            .call(RelayRequest::Acknowledge {
-                through_ordinal,
-                through_digest: through_digest.into(),
-            })
+            .call_with_timeout(
+                RelayRequest::Acknowledge {
+                    through_ordinal,
+                    through_digest: through_digest.into(),
+                },
+                RELAY_ACKNOWLEDGE_TIMEOUT,
+            )
             .await?
         {
             RelayResponsePayload::Acknowledged {
@@ -450,6 +560,30 @@ impl RelayClient {
             })
             .await?,
         )
+    }
+
+    pub async fn github_token_state(
+        &mut self,
+    ) -> Result<crate::hel_credentials::GithubTokenSnapshot> {
+        github_token_snapshot(self.call(RelayRequest::GithubTokenState).await?)
+    }
+
+    pub async fn install_github_token(
+        &mut self,
+        token: &str,
+    ) -> Result<crate::hel_credentials::GithubTokenSnapshot> {
+        github_token_snapshot(
+            self.call(RelayRequest::InstallGithubToken {
+                data: BASE64.encode(token.as_bytes()),
+            })
+            .await?,
+        )
+    }
+
+    pub async fn remove_github_token(
+        &mut self,
+    ) -> Result<crate::hel_credentials::GithubTokenSnapshot> {
+        github_token_snapshot(self.call(RelayRequest::RemoveGithubToken).await?)
     }
 
     /// Return the fingerprint of this session's synced skills trees without
@@ -568,6 +702,191 @@ impl RelayClient {
         }
     }
 
+    /// Start the second-opinion reviewer beside this session, or report the
+    /// running one when it already matches `config`.
+    ///
+    /// The reviewer's profile must already be staged on the target. Starting
+    /// can take as long as opening any harness session, so this uses the
+    /// handshake deadline rather than the bookkeeping one.
+    pub async fn start_reviewer(
+        &mut self,
+        config: ReviewerLaunchConfig,
+    ) -> Result<StartedReviewer> {
+        let request = self.reviewer_request(ReviewerRequest::Start {
+            config: Box::new(config),
+        })?;
+        match self
+            .call_with_timeout(request, RELAY_HANDSHAKE_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::ReviewerStarted {
+                native_session_id,
+                config_options,
+                reused,
+                state,
+            } => Ok(StartedReviewer {
+                native_session_id,
+                config_options,
+                reused,
+                state: *state,
+            }),
+            _ => bail!("relay returned an unexpected reviewer start response"),
+        }
+    }
+
+    /// Replay the reviewer's journal from a cursor, exactly as [`Self::attach`]
+    /// does for the primary.
+    pub async fn attach_reviewer(
+        &mut self,
+        after_ordinal: u64,
+        after_digest: impl Into<String>,
+    ) -> Result<RelayAttachment> {
+        let after_digest = after_digest.into();
+        let request = self.reviewer_request(ReviewerRequest::Attach {
+            after_ordinal,
+            after_digest: after_digest.clone(),
+        })?;
+        let payload = self
+            .call_with_timeout(request, RELAY_HISTORY_TIMEOUT)
+            .await?;
+        let RelayResponsePayload::Attached {
+            state,
+            events,
+            through_ordinal,
+            through_digest,
+        } = payload
+        else {
+            bail!("relay returned an unexpected reviewer attach response");
+        };
+        // The reviewer's journal is verified the same way the primary's is: a
+        // sidecar's history is not exempt from the chain check.
+        let mut cursor = RelayCursor {
+            ordinal: after_ordinal,
+            digest: after_digest,
+        };
+        for event in &events {
+            validate_relay_event(cursor.ordinal, &cursor.digest, event)
+                .context("verify reviewer attachment event chain")?;
+            cursor.ordinal = event.ordinal;
+            cursor.digest.clone_from(&event.digest);
+        }
+        if cursor.ordinal != through_ordinal || cursor.digest != through_digest {
+            bail!("reviewer attachment frontier does not match its event chain");
+        }
+        Ok(RelayAttachment {
+            state,
+            events,
+            through_ordinal,
+            through_digest,
+        })
+    }
+
+    /// Advance the reviewer's acknowledged frontier so its journal can be
+    /// pruned once the controller has the events durably.
+    pub async fn acknowledge_reviewer(
+        &mut self,
+        through_ordinal: u64,
+        through_digest: impl Into<String>,
+    ) -> Result<RelayCursor> {
+        let request = self.reviewer_request(ReviewerRequest::Acknowledge {
+            through_ordinal,
+            through_digest: through_digest.into(),
+        })?;
+        match self
+            .call_with_timeout(request, RELAY_ACKNOWLEDGE_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::Acknowledged {
+                through_ordinal,
+                through_digest,
+            } => Ok(RelayCursor {
+                ordinal: through_ordinal,
+                digest: through_digest,
+            }),
+            _ => bail!("relay returned an unexpected reviewer acknowledgement response"),
+        }
+    }
+
+    /// Queue one command on the reviewer's own relay.
+    pub async fn submit_to_reviewer(
+        &mut self,
+        command_id: impl Into<String>,
+        command: RelayCommand,
+    ) -> Result<u64> {
+        let command_id = command_id.into();
+        let request = self.reviewer_request(ReviewerRequest::Submit {
+            command_id: command_id.clone(),
+            command,
+        })?;
+        match self.call(request).await? {
+            RelayResponsePayload::Accepted {
+                command_id: accepted_id,
+                ordinal,
+            } if accepted_id == command_id => Ok(ordinal),
+            RelayResponsePayload::Accepted {
+                command_id: accepted_id,
+                ..
+            } => bail!("reviewer accepted command under ID {accepted_id}, expected {command_id}"),
+            _ => bail!("relay returned an unexpected reviewer command response"),
+        }
+    }
+
+    pub async fn reviewer_status(&mut self) -> Result<RelayOperationalState> {
+        let request = self.reviewer_request(ReviewerRequest::Status)?;
+        match self.call(request).await? {
+            RelayResponsePayload::Status(status) => Ok(status),
+            _ => bail!("relay returned an unexpected reviewer status response"),
+        }
+    }
+
+    /// Answer a form the reviewer's harness is waiting on.
+    pub async fn respond_to_reviewer(
+        &mut self,
+        elicitation_id: String,
+        response: ElicitationResponse,
+    ) -> Result<()> {
+        let request = self.reviewer_request(ReviewerRequest::RespondElicitation {
+            elicitation_id: elicitation_id.clone(),
+            response,
+        })?;
+        match self.call(request).await? {
+            RelayResponsePayload::ElicitationResolved {
+                elicitation_id: resolved,
+            } if resolved == elicitation_id => Ok(()),
+            RelayResponsePayload::ElicitationResolved {
+                elicitation_id: resolved,
+            } => bail!("reviewer resolved elicitation {resolved:?}, expected {elicitation_id:?}"),
+            _ => bail!("relay returned an unexpected reviewer elicitation response"),
+        }
+    }
+
+    /// Cancel any reviewer turn in flight and stop its process group, keeping
+    /// its staged profile, native session and journal for the next review.
+    pub async fn pause_reviewer(&mut self) -> Result<()> {
+        let request = self.reviewer_request(ReviewerRequest::Pause)?;
+        match self
+            .call_with_timeout(request, RELAY_ACKNOWLEDGE_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::ReviewerPaused => Ok(()),
+            _ => bail!("relay returned an unexpected reviewer pause response"),
+        }
+    }
+
+    /// Wraps a reviewer action, refusing it on a worker too old to know what a
+    /// reviewer is rather than sending a method it would reject as unknown.
+    fn reviewer_request(&self, request: ReviewerRequest) -> Result<RelayRequest> {
+        let request = RelayRequest::Reviewer { request };
+        if !request.supported_at(self.protocol_version) {
+            bail!(
+                "a second opinion requires relay protocol {}; this session negotiated {}",
+                request.minimum_protocol(),
+                self.protocol_version
+            );
+        }
+        Ok(request)
+    }
+
     /// Answer an ACP form over the live relay connection. User-entered content
     /// is intentionally excluded from the relay's durable command path.
     pub async fn respond_elicitation(
@@ -605,13 +924,28 @@ impl RelayClient {
             .await
             .context("close relay proxy stdin")?;
         let mut child = self.child.take().expect("connected relay owns proxy child");
-        match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await {
+        match tokio::time::timeout(RELAY_PROXY_DETACH_GRACE, child.wait()).await {
             Ok(status) => {
                 status.context("wait for relay proxy")?;
             }
             Err(_) => {
-                child.start_kill().context("stop relay proxy")?;
-                let _ = child.wait().await;
+                if let Err(error) = child.start_kill().context("stop relay proxy") {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        operation = "detach",
+                        %error,
+                        "could not stop relay proxy after detach timeout"
+                    );
+                    return Err(error);
+                }
+                if let Err(error) = child.wait().await {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        operation = "detach",
+                        %error,
+                        "could not reap relay proxy after stopping it"
+                    );
+                }
             }
         }
         Ok(())
@@ -633,14 +967,29 @@ impl RelayClient {
             protocol_version: self.protocol_version,
             request,
         };
-        let line = self
+        let line = match self
             .exchange(&envelope, operation, timeout, ExchangeKind::Call)
-            .await?;
-        decode_relay_response(&line, &request_id, self.protocol_version)
-            .with_context(|| format!("relay {} could not perform {operation}", self.relay_version))
+            .await
+        {
+            Ok(line) => line,
+            Err(error) => {
+                log_relay_client_failure(self, operation, &request_id, &error);
+                return Err(error);
+            }
+        };
+        let result = decode_relay_response(&line, &request_id, self.protocol_version)
+            .with_context(|| format!("relay {} could not perform {operation}", self.relay_version));
+        if let Err(error) = &result {
+            log_relay_client_failure(self, operation, &request_id, error);
+        }
+        result
     }
 
-    async fn call_hello(&mut self, request: RelayRequest) -> Result<RelayResponsePayload> {
+    async fn call_hello(
+        &mut self,
+        request: RelayRequest,
+        timeout: Duration,
+    ) -> Result<RelayResponsePayload> {
         let operation = request.method_name();
         let request_id = self.request_id();
         let envelope = RelayRequestEnvelope {
@@ -648,11 +997,21 @@ impl RelayClient {
             protocol_version: RELAY_PROTOCOL_VERSION,
             request,
         };
-        let timeout = self.request_timeout;
-        let line = self
+        let line = match self
             .exchange(&envelope, operation, timeout, ExchangeKind::Handshake)
-            .await?;
-        decode_relay_hello_response(&line, &request_id)
+            .await
+        {
+            Ok(line) => line,
+            Err(error) => {
+                log_relay_client_failure(self, operation, &request_id, &error);
+                return Err(error);
+            }
+        };
+        let result = decode_relay_hello_response(&line, &request_id);
+        if let Err(error) = &result {
+            log_relay_client_failure(self, operation, &request_id, error);
+        }
+        result
     }
 
     /// Write one request frame and read the reply that belongs to it.
@@ -679,6 +1038,7 @@ impl RelayClient {
             bail!("relay {operation} request frame is too large");
         }
         frame.push(b'\n');
+        let session_id = self.session_id.clone();
         let exchanged = tokio::time::timeout(timeout, async {
             self.input
                 .as_mut()
@@ -694,8 +1054,22 @@ impl RelayClient {
                 .await
                 .map_err(|error| RelayTransportDead::from_io(error, kind))
                 .with_context(|| format!("flush relay {operation} request"))?;
-            read_bounded_frame(&mut self.output, kind)
-                .await
+            let response = read_bounded_frame(&mut self.output, kind);
+            tokio::pin!(response);
+            let response = tokio::select! {
+                response = &mut response => response,
+                () = tokio::time::sleep(RELAY_SLOW_OPERATION_WARNING) => {
+                    tracing::warn!(
+                        %session_id,
+                        %operation,
+                        warning_after_seconds = RELAY_SLOW_OPERATION_WARNING.as_secs_f64(),
+                        timeout_seconds = timeout.as_secs_f64(),
+                        "relay operation is still waiting for its response"
+                    );
+                    response.await
+                }
+            };
+            response
                 .with_context(|| format!("read relay {operation} response"))?
                 .ok_or_else(|| {
                     anyhow::Error::new(RelayTransportDead::during_exchange(
@@ -709,16 +1083,17 @@ impl RelayClient {
             Ok(line) => line,
             Err(_elapsed) => {
                 let seconds = timeout.as_secs_f64();
+                tracing::warn!(
+                    %session_id,
+                    %operation,
+                    timeout_seconds = seconds,
+                    "relay operation timed out; abandoning its sequential connection"
+                );
                 self.abandoned = Some(format!(
                     "relay connection abandoned after {operation} timed out after {seconds} seconds"
                 ));
                 let timed_out = format!("relay {operation} timed out after {seconds} seconds");
-                match kind {
-                    ExchangeKind::Handshake => Err(anyhow::Error::new(
-                        RelayTransportDead::during_exchange(timed_out, kind),
-                    )),
-                    ExchangeKind::Call => Err(anyhow!(timed_out)),
-                }
+                Err(anyhow!(timed_out))
             }
         }
     }
@@ -730,42 +1105,119 @@ impl RelayClient {
     }
 }
 
+/// Keep transport, protocol, and explicit relay rejections visible at the
+/// point where a request fails. Callers often turn these into a user-facing
+/// string or a retry, which otherwise loses the operation and request ID that
+/// make concurrent session failures diagnosable.
+fn log_relay_client_failure(
+    client: &RelayClient,
+    operation: &str,
+    request_id: &str,
+    error: &anyhow::Error,
+) {
+    let rejection = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<RelayRejected>()
+            .map(|rejected| &rejected.0)
+    });
+    let transport_dead = RelayTransportDead::marks(error);
+    match rejection {
+        Some(rejection) => tracing::warn!(
+            session_id = %client.session_id,
+            relay_version = %client.relay_version,
+            %operation,
+            %request_id,
+            relay_error_code = ?rejection.code,
+            relay_retryable = rejection.retryable,
+            transport_dead,
+            error = %error,
+            "relay request rejected"
+        ),
+        None => tracing::warn!(
+            session_id = %client.session_id,
+            relay_version = %client.relay_version,
+            %operation,
+            %request_id,
+            transport_dead,
+            error = %error,
+            "relay request failed"
+        ),
+    }
+}
+
 impl Drop for RelayClient {
     fn drop(&mut self) {
-        // Closing stdin while the proxy launcher is still alive lets `podman
-        // exec -i` and ssh forward EOF to the target-side proxy. Killing the
-        // launcher first can strand that proxy (and its worker socket) after a
-        // controller-side connection is replaced.
+        // Async owners call `detach` so EOF has a bounded chance to propagate
+        // through Podman or SSH before the launcher is stopped. Drop is the
+        // shutdown-safe fallback: it may run while Tokio's drivers are already
+        // gone, so its bounded reaper cannot use runtime work or Tokio timers.
         drop(self.input.take());
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            if let Err(error) = child.start_kill() {
-                tracing::warn!(%error, "could not stop dropped relay proxy without a runtime");
-            }
+        let Some(child) = self.child.take() else {
             return;
         };
         let session_id = self.session_id.clone();
-        runtime.spawn(async move {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await {
-                Ok(Ok(status)) if status.success() => {}
-                Ok(Ok(status)) => {
-                    tracing::warn!(%session_id, %status, "dropped relay proxy exited unsuccessfully");
+        if let Err(error) = std::thread::Builder::new()
+            .name("hel-relay-reaper".into())
+            .spawn(move || reap_dropped_relay_proxy(child, session_id))
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                %error,
+                "could not start dropped relay proxy reaper"
+            );
+        }
+    }
+}
+
+/// Let EOF traverse a proxy launcher, then stop and reap it without relying on
+/// an async runtime that may already be shutting down.
+fn reap_dropped_relay_proxy(mut child: Child, session_id: String) {
+    let deadline = Instant::now() + RELAY_PROXY_DETACH_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    tracing::warn!(
+                        %session_id,
+                        %status,
+                        "dropped relay proxy exited unsuccessfully"
+                    );
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(%session_id, %error, "could not reap dropped relay proxy");
-                }
-                Err(_) => {
-                    if let Err(error) = child.start_kill() {
-                        tracing::warn!(%session_id, %error, "could not stop dropped relay proxy");
-                    }
-                    if let Err(error) = child.wait().await {
-                        tracing::warn!(%session_id, %error, "could not reap stopped relay proxy");
-                    }
-                }
+                return;
             }
-        });
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(RELAY_PROXY_REAP_POLL);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "could not reap dropped relay proxy");
+                return;
+            }
+        }
+    }
+
+    if let Err(error) = child.start_kill()
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%session_id, %error, "could not stop dropped relay proxy");
+        return;
+    }
+    let deadline = Instant::now() + RELAY_PROXY_DETACH_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(RELAY_PROXY_REAP_POLL);
+            }
+            Ok(None) => {
+                tracing::warn!(%session_id, "stopped relay proxy could not be reaped in time");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "could not reap stopped relay proxy");
+                return;
+            }
+        }
     }
 }
 
@@ -794,6 +1246,21 @@ fn skills_sync_state(payload: RelayResponsePayload) -> Result<crate::hel_skills:
             fingerprint,
         }),
         _ => bail!("relay returned an unexpected skills state response"),
+    }
+}
+
+fn github_token_snapshot(
+    payload: RelayResponsePayload,
+) -> Result<crate::hel_credentials::GithubTokenSnapshot> {
+    match payload {
+        RelayResponsePayload::GithubTokenState {
+            present,
+            fingerprint,
+        } => Ok(crate::hel_credentials::GithubTokenSnapshot {
+            present,
+            fingerprint,
+        }),
+        _ => bail!("relay returned an unexpected GitHub token state response"),
     }
 }
 
@@ -965,12 +1432,15 @@ pub struct CredentialSyncCoordinator {
 
 impl CredentialSyncCoordinator {
     pub fn spawn() -> Self {
-        let (targets_tx, targets_rx) = watch::channel(Vec::new());
+        let (targets_tx, mut targets_rx) = watch::channel(Vec::new());
         let (triggers_tx, mut triggers_rx) = mpsc::unbounded_channel::<SyncTrigger>();
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<CredentialSyncResult>();
         let (results_tx, results_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(SYNC_INTERVAL);
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + SYNC_INTERVAL,
+                SYNC_INTERVAL,
+            );
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // A pull rewrites the canonical file, so one profile is never
             // reconciled twice at once.
@@ -979,6 +1449,12 @@ impl CredentialSyncCoordinator {
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
+                        for profile_id in profiles_with_targets(&targets_rx.borrow()) {
+                            enqueue(&mut queue, SyncTrigger { profile_id, cause: None });
+                        }
+                    }
+                    changed = targets_rx.changed() => {
+                        if changed.is_err() { break; }
                         for profile_id in profiles_with_targets(&targets_rx.borrow()) {
                             enqueue(&mut queue, SyncTrigger { profile_id, cause: None });
                         }
@@ -994,7 +1470,14 @@ impl CredentialSyncCoordinator {
                             || result.failure.is_some()
                             || !result.outcomes.is_empty()
                         {
-                            let _ = results_tx.send(result);
+                            let profile_id = result.profile_id.clone();
+                            if results_tx.send(result).is_err() {
+                                tracing::debug!(
+                                    %profile_id,
+                                    operation = "credential_sync_result",
+                                    "credential sync result receiver was already closed"
+                                );
+                            }
                         }
                     }
                 }
@@ -1013,12 +1496,22 @@ impl CredentialSyncCoordinator {
                         .collect();
                     if targets.is_empty() {
                         if trigger.cause.is_some() {
-                            let _ = results_tx.send(CredentialSyncResult {
-                                profile_id: trigger.profile_id,
-                                trigger: trigger.cause,
-                                failure: None,
-                                outcomes: Vec::new(),
-                            });
+                            let profile_id = trigger.profile_id.clone();
+                            if results_tx
+                                .send(CredentialSyncResult {
+                                    profile_id: trigger.profile_id,
+                                    trigger: trigger.cause,
+                                    failure: None,
+                                    outcomes: Vec::new(),
+                                })
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    %profile_id,
+                                    operation = "credential_sync_result",
+                                    "credential sync result receiver was already closed"
+                                );
+                            }
                         }
                         continue;
                     }
@@ -1036,12 +1529,22 @@ impl CredentialSyncCoordinator {
                             Ok(outcomes) => (None, outcomes),
                             Err(error) => (Some(format!("sync task stopped: {error}")), Vec::new()),
                         };
-                        let _ = completed_tx.send(CredentialSyncResult {
-                            profile_id: trigger.profile_id,
-                            trigger: trigger.cause,
-                            failure,
-                            outcomes,
-                        });
+                        let profile_id = trigger.profile_id.clone();
+                        if completed_tx
+                            .send(CredentialSyncResult {
+                                profile_id: trigger.profile_id,
+                                trigger: trigger.cause,
+                                failure,
+                                outcomes,
+                            })
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                %profile_id,
+                                operation = "credential_sync_completion",
+                                "credential sync coordinator stopped before receiving completion"
+                            );
+                        }
                     });
                 }
                 queue = deferred;
@@ -1081,11 +1584,16 @@ impl CredentialSyncCoordinator {
 /// second cannot pull anything the first did not already see unless a harness
 /// refreshed mid-cycle, and that lands in the next cycle.
 async fn reconcile_profile(targets: &[CredentialSyncTarget]) -> Vec<CredentialSyncOutcome> {
+    let github_token = targets
+        .iter()
+        .any(|target| target.sync_github_token)
+        .then(crate::hel_controller::controller_github_token)
+        .flatten();
     let mut outcomes = BTreeMap::<String, CredentialSyncOutcome>::new();
     for pass in 0..2 {
         let mut pulled = false;
         for target in targets {
-            match reconcile_session(target).await {
+            match reconcile_session(target, github_token.as_deref()).await {
                 Ok(actions) if actions.is_empty() => {}
                 Ok(actions) => {
                     pulled |= actions.contains(&CredentialSyncAction::Pulled);
@@ -1098,6 +1606,13 @@ async fn reconcile_profile(targets: &[CredentialSyncTarget]) -> Vec<CredentialSy
                     );
                 }
                 Err(error) => {
+                    tracing::warn!(
+                        session_id = %target.session_id,
+                        profile_id = %target.profile_id,
+                        pass = pass + 1,
+                        error = %error,
+                        "credential synchronization failed for relay session"
+                    );
                     outcomes.insert(
                         target.session_id.clone(),
                         CredentialSyncOutcome {
@@ -1116,7 +1631,10 @@ async fn reconcile_profile(targets: &[CredentialSyncTarget]) -> Vec<CredentialSy
 }
 
 /// Returns every action taken; an empty list means the copies already agree.
-async fn reconcile_session(target: &CredentialSyncTarget) -> Result<Vec<CredentialSyncAction>> {
+async fn reconcile_session(
+    target: &CredentialSyncTarget,
+    github_token: Option<&str>,
+) -> Result<Vec<CredentialSyncAction>> {
     let canonical_path = harness_authentication_marker(target.harness, &target.profile_home);
     let (canonical, canonical_bytes) = read_credential_file(target.harness, &canonical_path)?;
     let canonical_skills = crate::hel_skills::collect_skills(target.harness, &target.profile_home)
@@ -1135,6 +1653,7 @@ async fn reconcile_session(target: &CredentialSyncTarget) -> Result<Vec<Credenti
         &canonical,
         &canonical_bytes,
         &canonical_skills,
+        github_token,
     )
     .await;
     // Detach even when the exchange failed; the worker and harness keep
@@ -1156,6 +1675,7 @@ async fn reconcile_connected(
     canonical: &CredentialSnapshot,
     canonical_bytes: &[u8],
     canonical_skills: &crate::hel_skills::SkillsArchive,
+    github_token: Option<&str>,
 ) -> Result<Vec<CredentialSyncAction>> {
     let mut actions = Vec::new();
     let session = client.credential_state().await?;
@@ -1198,7 +1718,58 @@ async fn reconcile_connected(
     if reconcile_skills(client, target, canonical_skills).await? {
         actions.push(CredentialSyncAction::SkillsPushed);
     }
+    if target.sync_github_token
+        && let Some(action) = reconcile_github_token(client, target, github_token).await?
+    {
+        actions.push(action);
+    }
     Ok(actions)
+}
+
+async fn reconcile_github_token(
+    client: &mut RelayClient,
+    target: &CredentialSyncTarget,
+    canonical: Option<&str>,
+) -> Result<Option<CredentialSyncAction>> {
+    let session = match client.github_token_state().await {
+        Ok(state) => state,
+        Err(error) if sync_method_unsupported(&error) => {
+            tracing::debug!(
+                session_id = %target.session_id,
+                profile_id = %target.profile_id,
+                "worker predates GitHub token sync; skipping until the target is re-provisioned"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    match canonical {
+        Some(token) => {
+            let canonical = crate::hel_credentials::GithubTokenSnapshot::of(token);
+            if session == canonical {
+                return Ok(None);
+            }
+            let installed = client.install_github_token(token).await?;
+            if installed != canonical {
+                bail!(
+                    "session {} GitHub token fingerprint does not match the controller after install",
+                    target.session_id
+                );
+            }
+            Ok(Some(CredentialSyncAction::GithubTokenPushed))
+        }
+        None if session.present => {
+            let removed = client.remove_github_token().await?;
+            if removed.present {
+                bail!(
+                    "session {} retained its GitHub token after removal",
+                    target.session_id
+                );
+            }
+            Ok(Some(CredentialSyncAction::GithubTokenRemoved))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Converge the session's synced skills trees onto the canonical archive.
@@ -1213,7 +1784,7 @@ async fn reconcile_skills(
     let canonical_state = canonical.state();
     let session = match client.skills_state().await {
         Ok(state) => state,
-        Err(error) if skills_sync_unsupported(&error) => {
+        Err(error) if sync_method_unsupported(&error) => {
             tracing::debug!(
                 session_id = %target.session_id,
                 profile_id = %target.profile_id,
@@ -1238,7 +1809,7 @@ async fn reconcile_skills(
     Ok(true)
 }
 
-fn skills_sync_unsupported(error: &anyhow::Error) -> bool {
+fn sync_method_unsupported(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<RelayRejected>()
         .is_some_and(|rejected| rejected.0.code == RelayErrorCode::InvalidRequest)
@@ -1458,9 +2029,11 @@ sys.stdin.read()
             .expect("silent relay must time out");
 
         assert!(error.to_string().contains("relay hello timed out"));
-        // A handshake that never answers means the transport carries nothing.
-        assert!(RelayTransportDead::marks(&error), "{error:#}");
-        assert!(RelayTransportDead::marks_failed_handshake(&error));
+        // The launcher is still alive. A loaded target can look exactly like
+        // this while starting its proxy, so worker recovery must not restart
+        // the native session merely because the deadline elapsed.
+        assert!(!RelayTransportDead::marks(&error), "{error:#}");
+        assert!(!RelayTransportDead::marks_failed_handshake(&error));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -1544,7 +2117,29 @@ cat > /dev/null
         );
         let encoded = serde_json::to_string(&response).unwrap();
         let error = decode_relay_response(&encoded, "relay-1", RELAY_PROTOCOL_VERSION).unwrap_err();
-        assert!(skills_sync_unsupported(&error), "{error:#}");
+        assert!(sync_method_unsupported(&error), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn publishing_new_targets_starts_reconciliation_without_waiting_for_the_tick() {
+        let profile = tempfile::tempdir().unwrap();
+        let mut coordinator = CredentialSyncCoordinator::spawn();
+        coordinator.handle().set_targets(vec![CredentialSyncTarget {
+            session_id: SESSION_ID.into(),
+            profile_id: "work".into(),
+            harness: crate::hel_config::HarnessKind::Codex,
+            profile_home: profile.path().to_path_buf(),
+            sync_github_token: false,
+            spec: CommandSpec::new("sh", ["-c", "exit 1"]),
+        }]);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), coordinator.result())
+            .await
+            .expect("target publication must not wait for the 60-second periodic tick")
+            .expect("credential coordinator stopped");
+        assert_eq!(result.profile_id, "work");
+        assert_eq!(result.outcomes.len(), 1);
+        assert!(result.outcomes[0].outcome.is_err());
     }
 
     #[tokio::test]

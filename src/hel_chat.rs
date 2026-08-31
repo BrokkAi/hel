@@ -14,6 +14,7 @@ mod history;
 mod input;
 mod remote;
 mod rendering;
+mod second_opinion;
 mod transcript;
 
 #[cfg(test)]
@@ -35,13 +36,17 @@ use ratatui::style::Color;
 use sha2::{Digest, Sha256};
 
 use crate::clock::epoch_seconds;
-use crate::hel_acp::{RuntimeEvent, find_session_config_option, select_contains};
+pub use crate::hel_acp::PlanControl;
+use crate::hel_acp::SessionConfigChoice;
+use crate::hel_acp::surface::{AcpSessionSurface, PlanControlError};
+use crate::hel_acp::{RuntimeEvent, plan_review_carries_native_feedback};
 use crate::hel_config::HarnessKind;
 use crate::hel_elicitation::ElicitationValue;
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
+use crate::hel_selection::{FrameSurfaces, SelectionRange};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
-    TranscriptBody, TranscriptItem,
+    RecoveryCheckpointPhase, TranscriptBody, TranscriptItem,
 };
 use crate::hel_transcript::{
     ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
@@ -52,26 +57,28 @@ use crate::hel_worker::{
 };
 
 use autocomplete::{
-    Autocomplete, CommandChoice, ConfigValueChoice, LocalCommand, builtin_command_choices,
-    config_current_value, is_goal_prompt, parse_local_command,
+    Autocomplete, CommandChoice, LocalCommand, builtin_command_choices, parse_local_command,
+    prompt_invokes_command,
 };
 use elicitation::ElicitationDialog;
 use history::{HistorySearch, HistorySearchRequest};
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
+use second_opinion::{SecondOpinion, SecondOpinionIntent};
 use transcript::{
     TAIL_SEED_ITEMS, ToolDiffstatRequest, TranscriptAnchor, TranscriptRenderCache,
-    content_block_text, materialized_chat_entries_reusing, plan_status, tool_content_details,
-    tool_diff_paths, tool_location_details, tool_status,
-};
-
-pub use active::ActiveChat;
-pub use transcript::{
-    BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, materialized_chunks_text,
-    materialized_content_text, materialized_tool_diffstats, render_agent_message_head,
-    render_agent_message_tail,
+    TranscriptSelectionSpace, content_block_text, materialized_chat_entries_reusing, plan_status,
+    tool_content_details, tool_diff_paths, tool_location_details, tool_status,
 };
 
 const MOUSE_SCROLL_ROWS: usize = 3;
+
+pub use active::ActiveChat;
+pub use second_opinion::SecondOpinionIntent as SecondOpinionRequest;
+pub use transcript::{
+    BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, format_event_time,
+    materialized_chunks_text, materialized_content_text, materialized_tool_diffstats,
+    render_agent_message_head, render_agent_message_tail,
+};
 
 /// What one terminal event asked the chat to do.
 ///
@@ -110,9 +117,6 @@ pub enum ChatAction {
         key: String,
         value: String,
     },
-    SetSessionMode {
-        mode_id: String,
-    },
     PlanCommand {
         original: String,
         control: PlanControl,
@@ -124,6 +128,22 @@ pub enum ChatAction {
         request: ElicitationRequest,
         response: ElicitationResponse,
     },
+    /// The user asked for a second opinion on `request`'s plan. Hel answers
+    /// this decision itself, so the harness's review stays pending until the
+    /// reviewer is set up.
+    StartSecondOpinion {
+        request: ElicitationRequest,
+        /// The proposal text as the harness sent it.
+        proposal: String,
+    },
+    /// Work the second-opinion view asked the session to perform.
+    SecondOpinion(SecondOpinionIntent),
+    /// An answer to a form the reviewer's harness is waiting on. It is routed
+    /// to the reviewer, never to the primary.
+    RespondReviewerElicitation {
+        elicitation_id: String,
+        response: ElicitationResponse,
+    },
     PasteFromClipboard,
     ToggleVoice,
     SwitchSession {
@@ -131,12 +151,6 @@ pub enum ChatAction {
     },
     Back,
     QuitDetach,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanControl {
-    SetConfig { key: String, value: String },
-    SetSessionMode { mode_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +185,10 @@ impl QueuedPrompt {
 pub struct SessionHeaderIdentity {
     pub position: usize,
     pub others: Vec<OtherSessionIdentity>,
+    /// Dashboard target label, including the project suffix for bare targets.
+    pub target: String,
+    /// Profile column from the dashboard's live-session summary.
+    pub profile: String,
 }
 
 /// Identity of another same-project session, snapshotted when the chat opens.
@@ -268,6 +286,10 @@ pub struct ChatState {
     /// prefix has to end at to be spliced in front of the tail. `None`
     /// whenever the projection is complete.
     prefix_seam: Option<Arc<TranscriptItem>>,
+    /// The session actor has not produced its first relay projection yet.
+    /// Empty transcripts render a loading marker until that connection attempt
+    /// either yields a snapshot or fails.
+    transcript_loading: bool,
     input: String,
     input_cursor: usize,
     /// Stored prompts from other sessions in this project, oldest-first.
@@ -286,36 +308,51 @@ pub struct ChatState {
     next_history_search_generation: u64,
     pending_history_search: Option<HistorySearchRequest>,
     queued_prompts: VecDeque<QueuedPrompt>,
+    /// Queue entries optimistically moved back into the composer. A relay
+    /// snapshot can still contain one until its removal command is projected,
+    /// so keep its identity hidden across those stale snapshots.
+    pending_queue_removals: BTreeSet<String>,
     active_user_shells: Vec<String>,
     active_agent_terminals: Vec<ActiveAgentTerminal>,
     claimed_agent_terminals: BTreeMap<String, i64>,
     elicitation: Option<ElicitationDialog>,
-    recovery_busy: bool,
+    /// The second-opinion view, when one is open. It owns the frame while it
+    /// is up, so the composer and the elicitation dialog stand down.
+    second_opinion: Option<SecondOpinion>,
+    /// Where the reviewer pane sat on the last frame, so hover can decide
+    /// which transcript the wheel drives.
+    reviewer_area: Option<Rect>,
+    /// Where the split's action buttons sat on the last frame, so a click
+    /// picks the same action the keyboard would.
+    split_action_areas: Vec<(second_opinion::SplitAction, Rect)>,
+    /// Distinguishes the command ids the review's own steps submit.
+    second_opinion_sequence: u64,
+    /// Whether the dialog on screen belongs to the reviewer rather than the
+    /// primary, so its answer is routed to the harness that asked.
+    elicitation_is_reviewers: bool,
+    recovery_phase: Option<RecoveryCheckpointPhase>,
     goal_prompt_active: bool,
-    config_options: Vec<SessionConfigOption>,
-    session_modes: Option<SessionModeState>,
-    /// Latest ACP session mode, from `current_mode_update` by way of the
-    /// projection, or set optimistically when Hel asks for a change.
-    current_mode: Option<String>,
-    harness_kind: Option<HarnessKind>,
+    acp_surface: AcpSessionSurface,
     plan_command_pending: bool,
-    agent_commands: Vec<AvailableCommand>,
     command_choices: Vec<CommandChoice>,
-    model_values: Vec<ConfigValueChoice>,
-    effort_values: Vec<ConfigValueChoice>,
-    current_model: Option<String>,
-    current_effort: Option<String>,
+    model_values: Vec<SessionConfigChoice>,
+    effort_values: Vec<SessionConfigChoice>,
     autocomplete: Option<Autocomplete>,
     anchor: TranscriptAnchor,
+    /// On entry, reveal the response advertised by the dashboard when later
+    /// tool activity would otherwise push it above the first viewport.
+    reveal_latest_agent_on_draw: bool,
     last_viewport_height: usize,
     render_mode: TranscriptRenderMode,
     render_cache: TranscriptRenderCache,
     notices: Notices,
     voice_active: bool,
-    /// Project name and header position of this session, snapshotted when the
-    /// chat opened.
+    /// Dashboard identity and header position snapshotted when the chat opened.
     position: usize,
+    header_target: String,
+    header_profile: String,
     turn_started_at_epoch_seconds: Option<u64>,
+    last_acp_activity_at_ms: Option<u64>,
     other_sessions: Vec<OtherSessionActivity>,
     focus: ChatFocus,
     /// Where the conversations pane's window starts. `None` centres it on the
@@ -325,6 +362,18 @@ pub struct ChatState {
     /// The pane's hitbox, recorded each frame so the wheel knows what it is
     /// over. `None` before the first draw.
     conversations_area: Option<Rect>,
+    /// Selectable surfaces, rebuilt by every frame in render order so the
+    /// selection engine can hit-test the screen the user is looking at.
+    pub(super) frame_surfaces: FrameSurfaces,
+    /// The row space transcript selections are measured in, re-pinned by every
+    /// frame the engine is not holding a transcript selection through.
+    transcript_selection: Option<TranscriptSelectionSpace>,
+    /// The frozen row space stopped describing the rows on screen. Read and
+    /// cleared after each draw; the caller drops the selection.
+    transcript_selection_invalid: bool,
+    /// Bumped whenever the cached rows are dropped wholesale, so a frozen row
+    /// space can tell that the rows it was pinned against are gone.
+    render_cache_generation: u64,
 }
 
 impl ChatState {
@@ -340,6 +389,7 @@ impl ChatState {
             scheduled_diffstats: BTreeSet::new(),
             unconverted_prefix: 0,
             prefix_seam: None,
+            transcript_loading: false,
             input: String::new(),
             input_cursor: 0,
             project_history: Vec::new(),
@@ -355,51 +405,47 @@ impl ChatState {
             next_history_search_generation: 0,
             pending_history_search: None,
             queued_prompts: VecDeque::new(),
+            pending_queue_removals: BTreeSet::new(),
             active_user_shells: Vec::new(),
             active_agent_terminals: Vec::new(),
             claimed_agent_terminals: BTreeMap::new(),
             elicitation: None,
-            recovery_busy: false,
+            second_opinion: None,
+            reviewer_area: None,
+            split_action_areas: Vec::new(),
+            second_opinion_sequence: 0,
+            elicitation_is_reviewers: false,
+            recovery_phase: None,
             goal_prompt_active: snapshot
                 .active_prompt
                 .as_ref()
-                .is_some_and(|prompt| is_goal_prompt(&prompt.text)),
-            config_options: Vec::new(),
-            session_modes: None,
-            current_mode: snapshot
-                .config
-                .get("mode")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            harness_kind: None,
+                .is_some_and(|prompt| prompt_invokes_command(&prompt.text, "goal")),
+            acp_surface: AcpSessionSurface::from_configuration(&snapshot.config),
             plan_command_pending: false,
-            agent_commands: Vec::new(),
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
             effort_values: Vec::new(),
-            current_model: snapshot
-                .config
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            current_effort: snapshot
-                .config
-                .get("effort")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
             autocomplete: None,
             anchor: TranscriptAnchor::Bottom,
+            reveal_latest_agent_on_draw: true,
             last_viewport_height: 0,
             render_mode: TranscriptRenderMode::Rich,
             render_cache: TranscriptRenderCache::default(),
             notices: Notices::default(),
             voice_active: false,
             position: 0,
+            header_target: String::new(),
+            header_profile: String::new(),
             turn_started_at_epoch_seconds: None,
+            last_acp_activity_at_ms: None,
             other_sessions: Vec::new(),
             focus: ChatFocus::Prompt,
             conversations_window_start: None,
             conversations_area: None,
+            frame_surfaces: FrameSurfaces::new(),
+            transcript_selection: None,
+            transcript_selection_invalid: false,
+            render_cache_generation: 0,
         };
         state.apply_events(events);
         // Bootstrap replays the full canonical log for transcript projection,
@@ -508,6 +554,10 @@ impl ChatState {
                 self.unconverted_prefix,
                 std::mem::take(&mut self.entries),
             );
+            // Reusing entry rows is safe only after the collapse topology is
+            // recomputed. A tool can become completed without changing the
+            // transcript length, joining or splitting a collapsed streak.
+            self.invalidate_render_cache();
             // Re-read the seam from the projection that produced this tail, so
             // a prefix converted against replaced history is refused.
             self.prefix_seam = self
@@ -524,46 +574,34 @@ impl ChatState {
                     self.pending_diffstats.push_back(request);
                 }
             }
-            self.queued_prompts = session
-                .queued_prompts
-                .iter()
-                .map(|prompt| QueuedPrompt {
-                    id: prompt.command_id.clone(),
-                    text: materialized_content_text(&prompt.content),
-                    kind: prompt.kind.clone(),
-                })
-                .collect();
         }
+        // Queue persistence can reach the materialized view independently of
+        // transcript projection. Keep the small queue authoritative even when
+        // the transcript frontier has not moved and its expensive rebuild is
+        // correctly skipped.
+        let projected_queue_ids = session
+            .queued_prompts
+            .iter()
+            .map(|prompt| prompt.command_id.as_str())
+            .collect::<BTreeSet<_>>();
+        self.pending_queue_removals
+            .retain(|id| projected_queue_ids.contains(id.as_str()));
+        self.queued_prompts = session
+            .queued_prompts
+            .iter()
+            .filter(|prompt| !self.pending_queue_removals.contains(&prompt.command_id))
+            .map(|prompt| QueuedPrompt {
+                id: prompt.command_id.clone(),
+                text: materialized_content_text(&prompt.content),
+                kind: prompt.kind.clone(),
+            })
+            .collect();
         self.set_config_options(config_options);
-        // `current_mode_update` lands in the projected configuration. Only
-        // overwrite when it is there, so an optimistic toggle survives until
-        // the agent confirms it.
-        let plan_mode_key = if self.harness_kind == Some(HarnessKind::Codex) {
-            "collaboration_mode"
-        } else {
-            "mode"
-        };
-        if let Some(mode) = session
-            .configuration
-            .get(plan_mode_key)
-            .and_then(serde_json::Value::as_str)
-        {
-            self.current_mode = Some(mode.to_owned());
-        }
-        self.agent_commands = available_commands.to_vec();
+        self.acp_surface
+            .apply_projected_configuration(&session.configuration);
+        self.acp_surface
+            .set_agent_commands(available_commands.to_vec());
         self.rebuild_command_choices();
-        self.current_model = session
-            .configuration
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| config_current_value(config_options, "model"));
-        self.current_effort = session
-            .configuration
-            .get("effort")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| config_current_value(config_options, "effort"));
     }
 
     fn take_diffstat_requests(&mut self, maximum: usize) -> Vec<ToolDiffstatRequest> {
@@ -600,12 +638,23 @@ impl ChatState {
             }
             Err(error) => {
                 self.scheduled_diffstats.remove(&key);
+                tracing::warn!(
+                    tool_call_id,
+                    revision,
+                    %error,
+                    "could not calculate a tool diff summary"
+                );
                 self.set_notice(format!("Could not calculate diff summary: {error}"));
             }
         }
     }
 
     fn sync_elicitation(&mut self, pending: &[ElicitationRequest]) {
+        // A reviewer's form is not in the primary's pending list, so the
+        // primary's projection must not take it down.
+        if self.elicitation_is_reviewers {
+            return;
+        }
         if self
             .elicitation
             .as_ref()
@@ -614,6 +663,24 @@ impl ChatState {
             return;
         }
         self.elicitation = pending.first().cloned().map(ElicitationDialog::new);
+    }
+
+    /// Puts a form the reviewer is waiting on in front of the user.
+    ///
+    /// The primary's own dialog wins the screen: an answer the planning
+    /// harness is blocked on matters more than one its reviewer is.
+    pub(super) fn show_reviewer_elicitation(&mut self, request: ElicitationRequest) -> bool {
+        if self.elicitation.is_some() {
+            return false;
+        }
+        self.elicitation_is_reviewers = true;
+        self.elicitation = Some(ElicitationDialog::new(request));
+        true
+    }
+
+    /// Whether a reviewer's form is currently on screen.
+    pub(super) fn reviewer_elicitation_open(&self) -> bool {
+        self.elicitation_is_reviewers && self.elicitation.is_some()
     }
 
     fn restore_elicitation(&mut self, request: ElicitationRequest) {
@@ -646,113 +713,65 @@ impl ChatState {
         self.phase
     }
 
+    pub(super) fn set_transcript_loading(&mut self, loading: bool) {
+        self.transcript_loading = loading;
+    }
+
     pub fn set_history_context(&mut self, bundle_id: impl Into<String>) {
         self.bundle_id = Some(bundle_id.into());
     }
 
     pub fn set_session_modes(&mut self, modes: Option<SessionModeState>) {
-        let changed = self.session_modes != modes;
-        self.session_modes = modes;
-        if changed || self.current_mode.is_none() {
-            self.set_plan_mode_from_surfaces();
-        }
+        self.acp_surface.set_session_modes(modes);
         self.rebuild_command_choices();
     }
 
     pub fn set_harness_kind(&mut self, harness_kind: HarnessKind) {
-        self.harness_kind = Some(harness_kind);
-        self.set_plan_mode_from_surfaces();
+        self.acp_surface.set_harness_kind(harness_kind);
         self.rebuild_command_choices();
     }
 
-    fn set_plan_mode_from_surfaces(&mut self) {
-        let config_key = match self.harness_kind {
-            Some(HarnessKind::Codex) => "collaboration_mode",
-            Some(HarnessKind::Claude | HarnessKind::Kimi) => "mode",
-            _ => "mode",
-        };
-        if let Some(value) = config_current_value(&self.config_options, config_key) {
-            self.current_mode = Some(value);
-        } else if self.harness_kind != Some(HarnessKind::Codex) {
-            self.current_mode = self
-                .session_modes
-                .as_ref()
-                .map(|modes| modes.current_mode_id.to_string());
-        }
-    }
-
     fn supports_plan_mode(&self) -> bool {
-        self.plan_control(true).is_ok()
+        self.acp_surface.supports_plan_mode()
     }
 
-    fn advertised_plan_modes(&self) -> bool {
-        self.session_modes.as_ref().is_some_and(|modes| {
-            ["plan", "default"].into_iter().all(|desired| {
-                modes
-                    .available_modes
-                    .iter()
-                    .any(|mode| mode.id.to_string() == desired)
-            })
-        })
+    fn supports_fast_mode(&self) -> bool {
+        self.acp_surface.supports_fast_mode()
     }
 
-    fn config_has_plan_pair(&self, key: &str) -> bool {
-        find_session_config_option(&self.config_options, key).is_some_and(|option| {
-            select_contains(&option.kind, "plan") && select_contains(&option.kind, "default")
-        })
-    }
-
-    fn exact_config_has_plan_pair(&self, key: &str) -> bool {
-        self.config_options.iter().any(|option| {
-            option.id.to_string() == key
-                && select_contains(&option.kind, "plan")
-                && select_contains(&option.kind, "default")
-        })
+    pub(super) fn fast_mode_active(&self) -> bool {
+        self.acp_surface.fast_mode_active()
     }
 
     fn plan_control(&self, active: bool) -> Result<PlanControl, &'static str> {
-        let value = if active { "plan" } else { "default" };
-        match self.harness_kind {
-            Some(HarnessKind::Deepseek) => Err("Plan mode is unsupported in DSH."),
-            Some(HarnessKind::Codex) => self
-                .exact_config_has_plan_pair("collaboration_mode")
-                .then(|| PlanControl::SetConfig {
-                    key: "collaboration_mode".into(),
-                    value: value.into(),
-                })
-                .ok_or("This Codex ACP version does not expose collaboration_mode with plan/default values."),
-            Some(HarnessKind::Claude | HarnessKind::Kimi) => {
-                if self.exact_config_has_plan_pair("mode") {
-                    Ok(PlanControl::SetConfig {
-                        key: "mode".into(),
-                        value: value.into(),
-                    })
-                } else if self.advertised_plan_modes() {
-                    Ok(PlanControl::SetSessionMode { mode_id: value.into() })
-                } else {
-                    Err("This ACP harness does not expose compatible plan/default modes.")
-                }
-            }
-            Some(HarnessKind::Grok) => Ok(PlanControl::SetSessionMode {
-                mode_id: value.into(),
-            }),
-            None => {
-                if self.config_has_plan_pair("mode") {
-                    Ok(PlanControl::SetConfig {
-                        key: "mode".into(),
-                        value: value.into(),
-                    })
-                } else if self.advertised_plan_modes() {
-                    Ok(PlanControl::SetSessionMode { mode_id: value.into() })
-                } else {
-                    Err("This ACP harness does not expose compatible plan/default modes.")
-                }
-            }
-        }
+        self.acp_surface
+            .plan_control(active)
+            .map_err(plan_control_error_message)
     }
 
     fn plan_mode_active(&self) -> bool {
-        self.supports_plan_mode() && self.current_mode.as_deref() == Some("plan")
+        self.acp_surface.plan_mode_active()
+    }
+
+    pub(super) fn begin_plan_mode_change(&mut self, active: bool) {
+        self.acp_surface.begin_plan_mode_change(active);
+    }
+
+    pub(super) fn finish_plan_mode_change(&mut self, active: bool) {
+        self.acp_surface.finish_plan_mode_change(active);
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_mode(&self) -> Option<&str> {
+        self.acp_surface.current_mode()
+    }
+
+    pub(super) fn current_model(&self) -> Option<&str> {
+        self.acp_surface.current_model()
+    }
+
+    pub(super) fn current_effort(&self) -> Option<&str> {
+        self.acp_surface.current_effort()
     }
 
     fn plan_review_followup(
@@ -760,7 +779,7 @@ impl ChatState {
         request: &ElicitationRequest,
         response: &ElicitationResponse,
     ) -> Option<PlanReviewFollowup> {
-        if !request.id.starts_with("plan-review-") {
+        if !crate::hel_acp::is_plan_review_id(&request.id) {
             return None;
         }
         let ElicitationResponse::Accept { content } = response else {
@@ -796,7 +815,7 @@ impl ChatState {
                 control: None,
                 // Grok carries feedback in its native response. Standard ACP
                 // permission responses cannot, so send it as the next planning turn.
-                prompt: (!request.id.starts_with("plan-review-grok-"))
+                prompt: (!plan_review_carries_native_feedback(&request.id))
                     .then_some(feedback)
                     .flatten(),
             },
@@ -808,10 +827,37 @@ impl ChatState {
         })
     }
 
-    /// Names this session in the header and places its line among the other
-    /// sessions. Both are fixed for the visit.
+    /// Places this session's line among the other sessions. The position is
+    /// fixed for the visit.
     pub fn set_header_position(&mut self, position: usize) {
         self.position = position;
+    }
+
+    /// Installs the stable dashboard columns used by the conversation title.
+    pub fn set_header_summary(&mut self, target: impl Into<String>, profile: impl Into<String>) {
+        self.header_target = target.into();
+        self.header_profile = profile.into();
+    }
+
+    fn set_last_acp_activity(&mut self, timestamp_ms: Option<i64>) {
+        self.last_acp_activity_at_ms = timestamp_ms.and_then(|value| u64::try_from(value).ok());
+    }
+
+    /// The full text of the newest agent message recorded after `seq`.
+    ///
+    /// A review's context request is answered by the planner's next agent
+    /// message, so this is how the answer to a specific request is picked out
+    /// of the conversation rather than by taking whatever is last.
+    pub(super) fn latest_agent_text_after(&self, seq: u64) -> Option<String> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.role == ChatRole::Agent
+                    && entry.start_seq > seq
+                    && !entry.text.trim().is_empty()
+            })
+            .map(|entry| entry.text.clone())
     }
 
     /// Last line of this session's most recent agent message that has text.
@@ -829,7 +875,7 @@ impl ChatState {
 
     fn mark_prompt_submitted(&mut self, prompt: &str) {
         self.phase = WorkerPhase::Running;
-        self.goal_prompt_active = is_goal_prompt(prompt);
+        self.goal_prompt_active = prompt_invokes_command(prompt, "goal");
         self.notices.clear();
         // Local echo: start the clock now so the header moves with the send.
         // The next materialized update replaces this with the recorded start.
@@ -847,11 +893,7 @@ impl ChatState {
     }
 
     fn pursuing_goal(&self) -> bool {
-        self.goal_prompt_active
-            && self
-                .agent_commands
-                .iter()
-                .any(|command| command.name == "goal")
+        self.goal_prompt_active && self.acp_surface.advertises_command("goal")
     }
     pub fn entries(&self) -> &[ChatEntry] {
         &self.entries
@@ -882,6 +924,7 @@ impl ChatState {
                         |id| format!("tool:{id}"),
                     ),
                     ChatRole::Plan => format!("plan:{}", entry.start_seq),
+                    ChatRole::PlanProposal => format!("plan-proposal:{}", entry.start_seq),
                     ChatRole::System => format!("system:{}", entry.start_seq),
                 };
                 let stable_id = if stable_ids.insert(base_id.clone()) {
@@ -973,6 +1016,10 @@ impl ChatState {
                         ))
                         .expect("ACP plan serialization cannot fail"),
                     },
+                    ChatRole::PlanProposal => TranscriptBody::PlanProposal {
+                        proposal_id: format!("legacy:{}", entry.start_seq),
+                        plan: entry.text.clone(),
+                    },
                     ChatRole::System => TranscriptBody::System {
                         text: entry.text.clone(),
                     },
@@ -997,11 +1044,14 @@ impl ChatState {
             .and_then(|entry| entry.recorded_at_ms)
             .unwrap_or_default();
         let mut configuration = BTreeMap::new();
-        if let Some(model) = &self.current_model {
-            configuration.insert("model".into(), serde_json::Value::String(model.clone()));
+        if let Some(model) = self.acp_surface.current_model() {
+            configuration.insert("model".into(), serde_json::Value::String(model.to_owned()));
         }
-        if let Some(effort) = &self.current_effort {
-            configuration.insert("effort".into(), serde_json::Value::String(effort.clone()));
+        if let Some(effort) = self.acp_surface.current_effort() {
+            configuration.insert(
+                "effort".into(),
+                serde_json::Value::String(effort.to_owned()),
+            );
         }
         let applied_event_digest = if self.latest_seq == 0 {
             RELAY_EVENT_GENESIS_DIGEST.to_owned()
@@ -1073,12 +1123,16 @@ impl ChatState {
     }
 
     pub fn apply_events(&mut self, events: &[SequencedEvent]) {
+        let original_seq = self.latest_seq;
         for event in events {
             if event.seq <= self.latest_seq {
                 continue;
             }
             self.apply_event(event);
             self.latest_seq = event.seq;
+        }
+        if self.latest_seq != original_seq {
+            self.invalidate_render_cache();
         }
     }
 
@@ -1091,6 +1145,7 @@ impl ChatState {
         self.queued_prompts.clear();
         self.autocomplete = None;
         self.anchor = TranscriptAnchor::Bottom;
+        self.reveal_latest_agent_on_draw = true;
         self.last_viewport_height = 0;
         self.render_mode = TranscriptRenderMode::Rich;
         self.notices.clear();
@@ -1124,6 +1179,7 @@ impl ChatState {
         let Some(queued) = self.queued_prompts.pop_back() else {
             return ChatAction::None;
         };
+        self.pending_queue_removals.insert(queued.id.clone());
         self.set_input(queued.text.clone());
         self.set_notice(if queued.kind.is_prompt() {
             "Editing the most recently queued prompt"
@@ -1134,6 +1190,14 @@ impl ChatState {
             id: queued.id,
             text: queued.text,
             kind: queued.kind,
+        }
+    }
+
+    fn fail_queued_prompt_removal(&mut self, id: String, text: String, kind: QueuedCommandKind) {
+        self.pending_queue_removals.remove(&id);
+        if !self.queued_prompts.iter().any(|prompt| prompt.id == id) {
+            self.queued_prompts
+                .push_back(QueuedPrompt { id, text, kind });
         }
     }
 
@@ -1194,6 +1258,28 @@ impl ChatState {
                         value: args.to_owned(),
                     }
                 }
+                LocalCommand::Fast => {
+                    if !args.is_empty() {
+                        self.set_notice("usage: /fast");
+                        return ChatAction::None;
+                    }
+                    if !self.supports_fast_mode() {
+                        self.set_notice("Fast mode is unavailable for the active Codex model");
+                        return ChatAction::None;
+                    }
+                    if matches!(self.phase, WorkerPhase::Closing | WorkerPhase::Closed) {
+                        self.set_notice(
+                            "The worker is closing; this configuration change was not sent",
+                        );
+                        return ChatAction::None;
+                    }
+                    let value = if self.fast_mode_active() { "off" } else { "on" };
+                    self.clear_input();
+                    ChatAction::SetConfig {
+                        key: "fast-mode".to_owned(),
+                        value: value.to_owned(),
+                    }
+                }
                 LocalCommand::Plan => {
                     let (requested, followup) = match args.to_ascii_lowercase().as_str() {
                         "" => (!self.plan_mode_active(), None),
@@ -1229,7 +1315,7 @@ impl ChatState {
                     };
                     self.record_prompt_history(&prompt);
                     self.clear_input();
-                    self.current_mode = Some(if requested { "plan" } else { "default" }.into());
+                    self.begin_plan_mode_change(requested);
                     self.plan_command_pending = true;
                     self.set_notice(if requested {
                         "Plan mode on"
@@ -1269,7 +1355,7 @@ impl ChatState {
                     };
                     self.record_prompt_history(&prompt);
                     self.clear_input();
-                    self.current_mode = Some("default".into());
+                    self.begin_plan_mode_change(false);
                     self.plan_command_pending = true;
                     ChatAction::PlanCommand {
                         original: prompt,
@@ -1317,6 +1403,12 @@ impl ChatState {
             return ChatAction::QuitDetach;
         }
 
+        // The second-opinion view owns the frame while it is up: the composer
+        // and the plan decision behind it are both part of what it is deciding.
+        if self.second_opinion_active() {
+            return self.handle_second_opinion_key(code, modifiers);
+        }
+
         if let Some(dialog) = self.elicitation.as_mut() {
             if code == KeyCode::Char('v')
                 && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -1326,6 +1418,21 @@ impl ChatState {
             let request = dialog.request().clone();
             if let Some(response) = dialog.handle_key(code, modifiers) {
                 self.elicitation = None;
+                if std::mem::take(&mut self.elicitation_is_reviewers) {
+                    return ChatAction::RespondReviewerElicitation {
+                        elicitation_id: request.id,
+                        response,
+                    };
+                }
+                // A second opinion is Hel's own decision. Sending it to the
+                // harness would consume the plan review before the reviewer
+                // exists, so it never becomes an elicitation response.
+                if let Some(proposal) =
+                    crate::hel_acp::plan_review_second_opinion(&request, &response)
+                {
+                    let proposal = proposal.to_owned();
+                    return ChatAction::StartSecondOpinion { request, proposal };
+                }
                 return ChatAction::RespondElicitation { request, response };
             }
             return ChatAction::None;
@@ -1592,7 +1699,56 @@ impl ChatState {
         });
     }
 
+    /// The surfaces the last frame registered, for the selection engine.
+    pub fn frame_surfaces(&self) -> &FrameSurfaces {
+        &self.frame_surfaces
+    }
+
+    /// Scrolls the elicitation message pane, for a drag held at its edge.
+    pub(super) fn scroll_elicitation_message(&self, rows: isize) {
+        if let Some(dialog) = self.elicitation.as_ref() {
+            dialog.scroll_message(rows);
+        }
+    }
+
+    /// The message text a selection in the elicitation pane covers.
+    pub fn elicitation_selection_text(&self, range: &SelectionRange) -> Option<String> {
+        let dialog = self.elicitation.as_ref()?;
+        let width = dialog.message_area()?.width;
+        Some(dialog.selection_text(range, width))
+    }
+
+    /// Capture is on for every surface, so the app owns the wheel: terminal
+    /// scrollback repaints whole TUI frames and is unusably slow on long
+    /// sessions.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChatAction {
+        // Hover decides which transcript scrolls while the split is up, so a
+        // reviewer answer never moves the reader's place in the primary.
+        if self.second_opinion_split() {
+            let over_reviewer = self
+                .reviewer_area
+                .is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)));
+            let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(1);
+            match (mouse.kind, over_reviewer) {
+                (MouseEventKind::ScrollUp, true) => {
+                    self.scroll_second_opinion(-rows);
+                }
+                (MouseEventKind::ScrollDown, true) => {
+                    self.scroll_second_opinion(rows);
+                }
+                (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
+                (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+                (MouseEventKind::Down(MouseButton::Left), _) => {
+                    return self.click_split_action(mouse.column, mouse.row);
+                }
+                _ => {}
+            }
+            return ChatAction::None;
+        }
+        if let Some(dialog) = self.elicitation.as_mut() {
+            dialog.handle_mouse(mouse);
+            return ChatAction::None;
+        }
         // Hover decides what scrolls; only Tab moves focus.
         let over_conversations = self
             .conversations_area
@@ -1641,17 +1797,21 @@ impl ChatState {
                 self.apply_adapter(event.seq, event.recorded_at_ms, payload)
             }
             WorkerEvent::QueuedPromptAdded { prompt } => {
-                self.queued_prompts.push_back(QueuedPrompt {
-                    id: prompt.id.clone(),
-                    text: prompt.text.clone(),
-                    kind: QueuedCommandKind::Prompt,
-                });
+                if !self.pending_queue_removals.contains(&prompt.id) {
+                    self.queued_prompts.push_back(QueuedPrompt {
+                        id: prompt.id.clone(),
+                        text: prompt.text.clone(),
+                        kind: QueuedCommandKind::Prompt,
+                    });
+                }
             }
             WorkerEvent::QueuedPromptRemoved { queue_id } => {
                 self.queued_prompts.retain(|prompt| prompt.id != *queue_id);
+                self.pending_queue_removals.remove(queue_id);
             }
             WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
                 self.queued_prompts.retain(|queued| queued.id != prompt.id);
+                self.pending_queue_removals.remove(&prompt.id);
                 self.phase = WorkerPhase::Running;
                 self.start_turn_clock(event.recorded_at_ms);
                 self.entries.push(
@@ -1659,7 +1819,10 @@ impl ChatState {
                         .with_recorded_at(event.recorded_at_ms),
                 );
             }
-            WorkerEvent::QueuedPromptsCleared => self.queued_prompts.clear(),
+            WorkerEvent::QueuedPromptsCleared => {
+                self.queued_prompts.clear();
+                self.pending_queue_removals.clear();
+            }
             WorkerEvent::ConfigChanged { .. } => {}
         }
     }
@@ -1670,8 +1833,16 @@ impl ChatState {
         recorded_at_ms: Option<i64>,
         payload: &serde_json::Value,
     ) {
-        let Ok(runtime) = serde_json::from_value::<RuntimeEvent>(payload.clone()) else {
-            return;
+        let runtime = match serde_json::from_value::<RuntimeEvent>(payload.clone()) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!(
+                    seq,
+                    %error,
+                    "ignoring malformed persisted runtime event"
+                );
+                return;
+            }
         };
         match runtime {
             RuntimeEvent::SessionUpdate { update } => {
@@ -1691,15 +1862,10 @@ impl ChatState {
                 self.set_config_options(&config_options)
             }
             RuntimeEvent::SessionModesConfigured { modes } => self.set_session_modes(modes),
-            RuntimeEvent::SessionStarted { resumed, .. } => self.entries.push(ChatEntry::plain(
-                seq,
-                ChatRole::System,
-                if resumed {
-                    "harness session resumed"
-                } else {
-                    "harness session started"
-                },
-            )),
+            RuntimeEvent::SessionStarted { resumed: false, .. } => self.entries.push(
+                ChatEntry::plain(seq, ChatRole::System, "harness session started"),
+            ),
+            RuntimeEvent::SessionStarted { resumed: true, .. } => {}
             _ => {}
         }
     }
@@ -1806,20 +1972,16 @@ impl ChatState {
                 }
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
-                self.agent_commands = update.available_commands;
+                self.acp_surface
+                    .set_agent_commands(update.available_commands);
                 self.rebuild_command_choices();
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.set_config_options(&update.config_options);
             }
-            SessionUpdate::CurrentModeUpdate(update)
-                if self.harness_kind != Some(HarnessKind::Codex) =>
-            {
-                self.current_mode = Some(update.current_mode_id.to_string());
-                if let Some(modes) = self.session_modes.as_mut() {
-                    modes.current_mode_id = update.current_mode_id;
-                }
-            }
+            SessionUpdate::CurrentModeUpdate(update) => self
+                .acp_surface
+                .apply_current_mode_update(update.current_mode_id.to_string()),
             _ => {}
         }
     }
@@ -1856,6 +2018,21 @@ impl ChatState {
         let mut entry = ChatEntry::plain(seq, role, text).with_recorded_at(recorded_at_ms);
         entry.message_id = message_id;
         self.entries.push(entry);
+    }
+}
+
+fn plan_control_error_message(error: PlanControlError) -> &'static str {
+    match error {
+        PlanControlError::DeepseekUnsupported => "Plan mode is unsupported in DSH.",
+        PlanControlError::CodexIncompatible => {
+            "This Codex ACP version does not expose collaboration_mode with plan/default values."
+        }
+        PlanControlError::GrokIncompatible => {
+            "This Grok Build version does not expose compatible plan/default modes."
+        }
+        PlanControlError::Incompatible => {
+            "This ACP harness does not expose compatible plan/default modes."
+        }
     }
 }
 
@@ -1912,6 +2089,7 @@ pub const NOTICE_MINIMUM_DISPLAY: std::time::Duration = std::time::Duration::fro
 struct Notice {
     text: String,
     set_at: std::time::Instant,
+    protected: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1945,9 +2123,28 @@ impl Notices {
     /// cannot corrupt the footer row.
     pub fn set(&self, notice: impl Into<String>) {
         let text = sanitize_terminal_text(&notice.into());
+        let mut slot = self.lock();
+        if slot.notice.as_ref().is_some_and(|current| {
+            current.protected && current.set_at.elapsed() < NOTICE_MINIMUM_DISPLAY
+        }) {
+            return;
+        }
+        slot.write(Some(Notice {
+            text,
+            set_at: std::time::Instant::now(),
+            protected: false,
+        }));
+    }
+
+    /// Sets a failure notice that routine background updates cannot replace
+    /// before it has been readable for [`NOTICE_MINIMUM_DISPLAY`]. A newer
+    /// failure still replaces it immediately.
+    pub fn set_failure(&self, notice: impl Into<String>) {
+        let text = sanitize_terminal_text(&notice.into());
         self.lock().write(Some(Notice {
             text,
             set_at: std::time::Instant::now(),
+            protected: true,
         }));
     }
 
@@ -1965,6 +2162,7 @@ impl Notices {
         slot.write(Some(Notice {
             text,
             set_at: std::time::Instant::now(),
+            protected: false,
         }));
         true
     }
@@ -2055,7 +2253,8 @@ fn last_nonempty_line(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::hel_chat::test_support::{
-        advertise, ctrl, grok_chat, key, mode_config_option, queued, select_config_option, snapshot,
+        advertise, ctrl, fast_mode_option, grok_chat, key, mode_config_option, queued,
+        select_config_option, snapshot,
     };
     use crate::hel_worker::ActivePrompt;
 
@@ -2260,6 +2459,32 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_failure_notice_survives_routine_background_notices() {
+        let notices = Notices::default();
+        notices.set_failure("Resume failed: archived transcript is invalid");
+
+        notices.set("Profile quotas refreshed");
+        assert_eq!(
+            notices.current().as_deref(),
+            Some("Resume failed: archived transcript is invalid")
+        );
+
+        notices.set_failure("Resume failed: target disconnected");
+        assert_eq!(
+            notices.current().as_deref(),
+            Some("Resume failed: target disconnected")
+        );
+
+        let after_set = std::time::Instant::now();
+        assert!(notices.dismiss(after_set + NOTICE_MINIMUM_DISPLAY));
+        notices.set("Profile quotas refreshed");
+        assert_eq!(
+            notices.current().as_deref(),
+            Some("Profile quotas refreshed")
+        );
+    }
+
+    #[test]
     fn cloned_notices_share_one_slot() {
         let notices = Notices::default();
         let clone = notices.clone();
@@ -2324,6 +2549,7 @@ mod tests {
                 required: false,
                 secret: false,
                 custom_answer_for: None,
+                custom_answer_option: None,
                 kind: crate::hel_elicitation::ElicitationFieldKind::Text {
                     default: None,
                     min_length: None,
@@ -2474,6 +2700,47 @@ mod tests {
     }
 
     #[test]
+    fn fast_toggles_the_advertised_codex_configuration_without_arguments() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&[fast_mode_option("off")]);
+        chat.input = "/fast".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "fast-mode".into(),
+                value: "on".into(),
+            }
+        );
+
+        chat.set_config_options(&[fast_mode_option("on")]);
+        chat.input = "/fast".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "fast-mode".into(),
+                value: "off".into(),
+            }
+        );
+
+        chat.input = "/fast on".into();
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.notice().as_deref(), Some("usage: /fast"));
+    }
+
+    #[test]
+    fn fast_stays_local_when_the_active_model_does_not_support_it() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.input = "/fast".into();
+
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.input, "/fast");
+        assert_eq!(
+            chat.notice().as_deref(),
+            Some("Fast mode is unavailable for the active Codex model")
+        );
+    }
+
+    #[test]
     fn config_commands_are_queued_while_the_agent_is_busy() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.phase = WorkerPhase::Running;
@@ -2546,6 +2813,71 @@ mod tests {
                 value: "sonnet".into(),
             }
         );
+    }
+
+    #[test]
+    fn stale_projection_does_not_restore_a_queue_entry_being_edited() {
+        let mut session = MaterializedSession::empty("session-queue-edit");
+        session.applied_event_ordinal = 5;
+        session.queued_prompts.push(MaterializedQueuedPrompt {
+            command_id: "queued-prompt".into(),
+            kind: QueuedCommandKind::Prompt,
+            content: vec![serde_json::json!({"type": "text", "text": "revise me"})],
+            queued_at_ms: 10,
+        });
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Up)),
+            ChatAction::RemoveQueuedPrompt {
+                id: "queued-prompt".into(),
+                text: "revise me".into(),
+                kind: QueuedCommandKind::Prompt,
+            }
+        );
+        remote::apply_chat_remote_result(
+            &mut chat,
+            remote::ChatRemoteResult::RemoveQueuedPrompt {
+                id: "queued-prompt".into(),
+                text: "revise me".into(),
+                kind: QueuedCommandKind::Prompt,
+                result: Ok(()),
+            },
+        );
+
+        // The relay accepted the removal, but its previously published view
+        // can still arrive before the projection containing that command.
+        chat.apply_materialized(&session, &[], &[]);
+        assert_eq!(chat.input, "revise me");
+        assert!(chat.queued_prompts.is_empty());
+        assert!(chat.pending_queue_removals.contains("queued-prompt"));
+
+        session.applied_event_ordinal = 6;
+        session.queued_prompts.clear();
+        chat.apply_materialized(&session, &[], &[]);
+        assert!(chat.pending_queue_removals.is_empty());
+    }
+
+    #[test]
+    fn failed_queue_removal_restores_the_peeled_entry() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.queued_prompts
+            .push_back(queued("queued-prompt", "revise me"));
+        chat.handle_key(ctrl('p'));
+
+        remote::apply_chat_remote_result(
+            &mut chat,
+            remote::ChatRemoteResult::RemoveQueuedPrompt {
+                id: "queued-prompt".into(),
+                text: "revise me".into(),
+                kind: QueuedCommandKind::Prompt,
+                result: Err("relay rejected removal".into()),
+            },
+        );
+
+        assert!(chat.pending_queue_removals.is_empty());
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].id, "queued-prompt");
     }
 
     #[test]
@@ -2770,7 +3102,7 @@ mod tests {
     #[test]
     fn implement_exits_plan_mode_before_submitting_the_instruction() {
         let mut chat = grok_chat();
-        chat.current_mode = Some("plan".into());
+        chat.finish_plan_mode_change(true);
         chat.set_input("/implement start with the parser".into());
         assert_eq!(
             chat.submit_input(),
@@ -2788,7 +3120,7 @@ mod tests {
     #[test]
     fn plan_review_choices_have_distinct_followup_directions() {
         let mut chat = grok_chat();
-        chat.current_mode = Some("plan".into());
+        chat.finish_plan_mode_change(true);
         let standard = ElicitationRequest {
             id: "plan-review-1".into(),
             message: "review".into(),
@@ -3125,7 +3457,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_materialized_skips_rebuild_at_same_ordinal() {
+    fn same_ordinal_materialized_update_keeps_transcript_cache_but_refreshes_queue() {
         let mut session = MaterializedSession::empty("session-same-ordinal");
         session.applied_event_ordinal = 1;
         session.transcript.push(Arc::new(TranscriptItem {
@@ -3154,7 +3486,8 @@ mod tests {
         chat.apply_materialized(&session, &[], &[]);
 
         assert_eq!(chat.entries[0].text, "first");
-        assert!(chat.queued_prompts.is_empty());
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].text, "queued prompt");
     }
 
     #[test]

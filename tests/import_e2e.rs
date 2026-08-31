@@ -69,6 +69,7 @@ async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> 
 
     let mut config = HelConfig {
         version: CONFIG_VERSION,
+        phone: Default::default(),
         profiles: BTreeMap::from([(
             "claude-e2e".into(),
             HarnessProfile {
@@ -176,6 +177,7 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
     let image = std::env::var("HEL_IMPORT_E2E_IMAGE")?;
     let config = HelConfig {
         version: CONFIG_VERSION,
+        phone: Default::default(),
         profiles: BTreeMap::from([(
             "kimi-e2e".into(),
             HarnessProfile {
@@ -290,6 +292,7 @@ async fn imported_grok_session_resumes_natively_async() -> anyhow::Result<()> {
     let image = std::env::var("HEL_IMPORT_E2E_IMAGE")?;
     let config = HelConfig {
         version: CONFIG_VERSION,
+        phone: Default::default(),
         profiles: BTreeMap::from([(
             "grok-e2e".into(),
             HarnessProfile {
@@ -511,6 +514,7 @@ async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
     let image = std::env::var("HEL_IMPORT_E2E_IMAGE")?;
     let config = HelConfig {
         version: CONFIG_VERSION,
+        phone: Default::default(),
         profiles: BTreeMap::from([(
             "codex-e2e".into(),
             HarnessProfile {

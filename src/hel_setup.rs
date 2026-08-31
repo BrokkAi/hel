@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::hel_config::{
-    AwsAddressSource, ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, ProjectBundle,
-    ProjectRepository, SshConnection, TargetTemplate, validate_id,
+    AwsAddressSource, ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, PermissionMode,
+    ProjectBundle, ProjectRepository, SshConnection, TargetTemplate, validate_id,
 };
 use crate::hel_doctor::{
     CheckStatus, DoctorCheck, DoctorOptions, all_ready, apple_container_daemon_check,
@@ -117,7 +117,7 @@ pub struct AwsTargetInput {
 /// Which kind of SSH target the user chose in the SSH step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshTargetKind {
-    Bare,
+    Bare { permissions: PermissionMode },
     Podman { image: String },
 }
 
@@ -155,10 +155,10 @@ pub fn run_setup_dialog(config_path: &Path) -> Result<SetupOutcome> {
     // may pull an image, is allowed to take as long as it needs.
     let probes = probe_executor();
     let discovery = discover_current(&probes);
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    run_setup_dialog_with(
-        &mut stdin.lock(),
+    let mut input = ReadlinePrompter::default();
+    run_setup_dialog_inner(
+        &mut input,
         &mut stdout.lock(),
         config_path,
         &discovery,
@@ -602,8 +602,9 @@ fn build_config_with_runtime(
             extra_args: vec![],
         };
         let target = match &ssh.kind {
-            SshTargetKind::Bare => TargetTemplate::SshBare {
+            SshTargetKind::Bare { permissions } => TargetTemplate::SshBare {
                 ssh: connection,
+                permissions: *permissions,
                 workspace_prefix: default_ssh_workspace_prefix(),
             },
             SshTargetKind::Podman { image } => TargetTemplate::SshPodman {
@@ -671,6 +672,24 @@ fn config_id(value: &str) -> String {
 /// or be reported as a fixable check.
 pub fn run_setup_dialog_with(
     input: &mut impl BufRead,
+    output: &mut impl Write,
+    config_path: &Path,
+    discovery: &SetupDiscovery,
+    smoke_executor: &impl CommandExecutor,
+    probe_executor: &impl CommandExecutor,
+) -> Result<SetupOutcome> {
+    run_setup_dialog_inner(
+        input,
+        output,
+        config_path,
+        discovery,
+        smoke_executor,
+        probe_executor,
+    )
+}
+
+fn run_setup_dialog_inner(
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     config_path: &Path,
     discovery: &SetupDiscovery,
@@ -833,7 +852,7 @@ fn write_runtimes(output: &mut impl Write, runtimes: &[RuntimeProbe]) -> Result<
 /// Offer an AWS EC2 target, but only when this host already has working AWS
 /// credentials. Without them the step prints one line and asks nothing.
 fn prompt_aws_target(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     account: Option<&AwsAccount>,
 ) -> Result<Option<AwsTargetInput>> {
@@ -905,7 +924,7 @@ fn prompt_aws_target(
 /// With no aliases the step prints one line and asks nothing, the same way the
 /// AWS step reports skipping.
 fn prompt_ssh_target(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     aliases: &[String],
     configured: &BTreeMap<String, TargetTemplate>,
@@ -942,7 +961,19 @@ fn prompt_ssh_target(
 
     let kind = prompt(input, output, "Run agents in Podman on that host? [Y/n]: ")?;
     let kind = if matches!(kind.to_ascii_lowercase().as_str(), "n" | "no") {
-        SshTargetKind::Bare
+        let permissions = loop {
+            let mode = prompt(
+                input,
+                output,
+                "Raw-host permissions, guardian or yolo [guardian]: ",
+            )?;
+            match mode.to_ascii_lowercase().as_str() {
+                "" | "guardian" => break PermissionMode::Guardian,
+                "yolo" => break PermissionMode::Yolo,
+                _ => writeln!(output, "Permissions must be `guardian` or `yolo`.")?,
+            }
+        };
+        SshTargetKind::Bare { permissions }
     } else {
         let image = prompt(
             input,
@@ -972,7 +1003,7 @@ fn prompt_ssh_target(
 /// dialog, and a name that is already taken would silently replace the target
 /// it collides with.
 fn prompt_ssh_target_name(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     host: &str,
     configured: &BTreeMap<String, TargetTemplate>,
@@ -1049,7 +1080,7 @@ fn write_doctor_report(
 }
 
 fn select_runtime(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     runtimes: &[RuntimeProbe],
     recommended: RuntimeKind,
@@ -1081,7 +1112,7 @@ fn select_runtime(
     Ok(selected)
 }
 
-fn prompt(input: &mut impl BufRead, output: &mut impl Write, label: &str) -> Result<String> {
+fn prompt(input: &mut impl SetupPrompter, output: &mut impl Write, label: &str) -> Result<String> {
     Ok(prompt_line(input, output, label)?.unwrap_or_default())
 }
 
@@ -1091,17 +1122,35 @@ fn prompt(input: &mut impl BufRead, output: &mut impl Write, label: &str) -> Res
 /// its default. A question that must be asked again until it is answered needs
 /// the difference, or it would loop forever against a closed stdin.
 fn prompt_line(
-    input: &mut impl BufRead,
+    input: &mut impl SetupPrompter,
     output: &mut impl Write,
     label: &str,
 ) -> Result<Option<String>> {
-    write!(output, "{label}")?;
-    output.flush()?;
-    let mut answer = String::new();
-    let read = input
-        .read_line(&mut answer)
-        .context("read setup response")?;
-    Ok((read > 0).then(|| answer.trim().to_owned()))
+    input.read_prompt(output, label)
+}
+
+trait SetupPrompter {
+    fn read_prompt(&mut self, output: &mut dyn Write, label: &str) -> Result<Option<String>>;
+}
+
+impl<R: BufRead> SetupPrompter for R {
+    fn read_prompt(&mut self, output: &mut dyn Write, label: &str) -> Result<Option<String>> {
+        write!(output, "{label}")?;
+        output.flush()?;
+        let mut answer = String::new();
+        let read = self.read_line(&mut answer).context("read setup response")?;
+        Ok((read > 0).then(|| answer.trim().to_owned()))
+    }
+}
+
+#[derive(Default)]
+struct ReadlinePrompter(crate::hel_readline::LineReader);
+
+impl SetupPrompter for ReadlinePrompter {
+    fn read_prompt(&mut self, output: &mut dyn Write, label: &str) -> Result<Option<String>> {
+        output.flush()?;
+        self.0.read_line(label).context("read setup response")
+    }
 }
 
 fn write_summary(
@@ -1145,7 +1194,7 @@ fn write_summary(
             TargetTemplate::SshBare { ssh, .. } => {
                 writeln!(output, "  SSH target {id} on {} (no container)", ssh.host)?;
             }
-            TargetTemplate::SshPodman { ssh, container } => {
+            TargetTemplate::SshPodman { ssh, container, .. } => {
                 writeln!(
                     output,
                     "  SSH target {id} on {} using Podman image {}",
@@ -1718,7 +1767,7 @@ Host builder
     #[test]
     fn accepting_the_ssh_step_writes_an_ssh_podman_target_with_the_default_image() {
         let aliases = vec!["builder".to_owned(), "bastion".to_owned()];
-        // yes, host 1, podman (default), default image, default name.
+        // yes, host 1, podman (default), default image and name.
         let mut input = b"y\n1\n\n\n\n".as_slice();
         let mut output = Vec::new();
 
@@ -1737,7 +1786,7 @@ Host builder
             }
         );
         let config = build_config_with_runtime(&[], None, None, None, Some(&ssh));
-        let TargetTemplate::SshPodman { ssh, container } = &config.targets["builder"] else {
+        let TargetTemplate::SshPodman { ssh, container, .. } = &config.targets["builder"] else {
             panic!("setup must write an ssh-podman target");
         };
         assert_eq!(ssh.host, "builder");
@@ -1750,8 +1799,8 @@ Host builder
     #[test]
     fn accepting_the_ssh_step_writes_an_ssh_bare_target_under_a_chosen_name() {
         let aliases = vec!["builder".to_owned()];
-        // yes, typed host, no podman, custom target name.
-        let mut input = b"y\nother.example.com\nn\nremote\n".as_slice();
+        // yes, typed host, default guardian permissions, no podman, custom name.
+        let mut input = b"y\nother.example.com\nn\n\nremote\n".as_slice();
         let mut output = Vec::new();
 
         let ssh = prompt_ssh_target(&mut input, &mut output, &aliases, &BTreeMap::new())
@@ -1763,14 +1812,20 @@ Host builder
             SshTargetInput {
                 name: "remote".into(),
                 host: "other.example.com".into(),
-                kind: SshTargetKind::Bare,
+                kind: SshTargetKind::Bare {
+                    permissions: PermissionMode::Guardian,
+                },
             }
         );
         let config = build_config_with_runtime(&[], None, None, None, Some(&ssh));
-        let TargetTemplate::SshBare { ssh, .. } = &config.targets["remote"] else {
+        let TargetTemplate::SshBare {
+            ssh, permissions, ..
+        } = &config.targets["remote"]
+        else {
             panic!("setup must write an ssh-bare target");
         };
         assert_eq!(ssh.host, "other.example.com");
+        assert_eq!(*permissions, PermissionMode::Guardian);
         config.validate().unwrap();
     }
 
@@ -1787,7 +1842,7 @@ Host builder
         .targets;
         // yes, host 1, no podman, then: a name that is already taken, a name
         // that is not a usable id, and finally a free one.
-        let mut input = b"y\n1\nn\npodman\nbuild host\nbuilder\n".as_slice();
+        let mut input = b"y\n1\nn\n\npodman\nbuild host\nbuilder\n".as_slice();
         let mut output = Vec::new();
 
         let ssh = prompt_ssh_target(&mut input, &mut output, &aliases, &configured)
@@ -1816,7 +1871,7 @@ Host builder
         .targets;
         // yes, host 1, no podman, then nothing: the default name collides, so
         // the question can never be answered.
-        let mut input = b"y\n1\nn\n".as_slice();
+        let mut input = b"y\n1\nn\n\n".as_slice();
         let mut output = Vec::new();
 
         assert_eq!(
@@ -1832,7 +1887,9 @@ Host builder
         let ssh = SshTargetInput {
             name: "podman".into(),
             host: "builder".into(),
-            kind: SshTargetKind::Bare,
+            kind: SshTargetKind::Bare {
+                permissions: PermissionMode::Guardian,
+            },
         };
 
         let config = build_config_with_runtime(

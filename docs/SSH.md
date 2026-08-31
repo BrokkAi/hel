@@ -8,7 +8,7 @@ Hel has two target kinds that run a session on a remote machine over SSH:
   (same model as `local-podman`, just reached over SSH) and runs the session
   inside it.
 
-Both shell out to the local `ssh` CLI (`src/hel_targets.rs`, `ssh_command`/
+Both shell out to the local `ssh` CLI (`src/hel_targets/ssh.rs`, `ssh_command`/
 `ssh_command_owned`); Hel does not use an SSH library or persistent
 connection multiplexing of its own.
 
@@ -44,17 +44,20 @@ Shared SSH connection keys (flattened into both target kinds):
 
 | Key | Required | Notes |
 | --- | --- | --- |
+| `permissions` | yes | `guardian` preserves configured harness approvals; `yolo` runs unconstrained. |
 | `workspace_prefix` | no | Remote directory session workspaces are created under. Defaults to `.local/share/hel/workspaces` (relative to the login home). |
 
 ```toml
 [targets.builder]
 kind = "ssh-bare"
 host = "builder"
+permissions = "guardian"
 workspace_prefix = ".local/share/hel/workspaces"
 ```
 
-`ssh-podman` also takes the same container keys as `local-podman`
-(`image`, and optionally `platform`, `cpus`, `memory`, `environment`):
+`ssh-podman` always runs unconstrained and does not accept `permissions`. It
+also takes the same container keys as `local-podman` (`image`, and optionally
+`platform`, `cpus`, `memory`, `environment`):
 
 ```toml
 [targets.builder-podman]

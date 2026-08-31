@@ -46,6 +46,27 @@ unavailable.
 container from the configured image. The fast runtime probes themselves never
 pull an image; image refresh happens in the supervised provisioning task.
 
+### Git clone cache
+
+For GitHub-backed bundles, Hel keeps bare object mirrors under
+`~/.cache/hel/git/mirrors` on the Podman host. A launch refreshes the mirror,
+creates a session-specific local snapshot under `~/.cache/hel/git/sessions`,
+and mounts only that snapshot read-only into the container. The normal clone
+then uses it as a Git object reference, avoiding repeated object downloads
+while preserving the image's checkout behavior. Git object files are
+immutable, so local snapshots can share them with hardlinks; filesystem
+reflink or ZFS permissions are not required.
+
+The cache is opportunistic. Missing host Git, authentication trouble, or a
+cache preparation failure produces a launch notice and falls back to the
+ordinary in-container clone. A first cache miss still downloads the complete
+mirror; later launches fetch only updates. Hel removes session snapshots after
+their owning container and prunes mirrors unused for 30 days, then applies a
+20 GiB least-recently-used soft cap. Cache directories are private to the
+Podman user because they may retain objects from private repositories. You can
+remove `~/.cache/hel/git/mirrors` while no launch is updating it; do not remove
+the `sessions` directory while managed containers are running.
+
 `hel doctor --json` runs those three checks only when a `local-podman` target
 exists, and then checks `podman image exists` for each configured
 `local-podman` image. `hel doctor --json --smoke` replaces that presence check

@@ -244,8 +244,17 @@ fn install_tree(home: &Path, dir: &str, entries: &[&SkillsEntry]) -> Result<()> 
             destination.display()
         );
     }
-    let _ = std::fs::remove_dir_all(&incoming);
-    let _ = std::fs::remove_dir_all(&retired);
+    for path in [&incoming, &retired] {
+        if let Err(error) = std::fs::remove_dir_all(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not remove stale skills staging tree"
+            );
+        }
+    }
     if !entries.is_empty() {
         for entry in entries {
             let relative = entry
@@ -263,16 +272,41 @@ fn install_tree(home: &Path, dir: &str, entries: &[&SkillsEntry]) -> Result<()> 
         std::fs::rename(&destination, &retired)?;
     }
     if entries.is_empty() {
-        std::fs::remove_dir_all(&retired).ok();
+        if let Err(error) = std::fs::remove_dir_all(&retired)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %retired.display(),
+                %error,
+                "could not remove retired skills tree"
+            );
+        }
         return Ok(());
     }
     if let Err(error) = std::fs::rename(&incoming, &destination) {
         // Restore the previous tree so a failed swap never strands a session
         // without skills it had before.
-        let _ = std::fs::rename(&retired, &destination);
+        if let Err(restore_error) = std::fs::rename(&retired, &destination) {
+            tracing::error!(
+                destination = %destination.display(),
+                error = %restore_error,
+                "could not restore the previous skills tree after a failed swap"
+            );
+            return Err(error).context(format!(
+                "swap refreshed skills tree into place; restoring the previous tree also failed: {restore_error}"
+            ));
+        }
         return Err(error).context("swap refreshed skills tree into place");
     }
-    let _ = std::fs::remove_dir_all(&retired);
+    if let Err(error) = std::fs::remove_dir_all(&retired)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %retired.display(),
+            %error,
+            "could not remove retired skills tree after a successful swap"
+        );
+    }
     Ok(())
 }
 

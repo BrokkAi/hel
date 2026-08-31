@@ -16,6 +16,34 @@ use std::{
 const READY_MARKER: &[u8] = b"Active";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The DECSET pair crossterm 0.29 writes for `EnableMouseCapture` and
+/// `DisableMouseCapture`. Both are single writes, so any one sequence stands
+/// for the whole switch.
+const MOUSE_CAPTURE_ENABLE: [&str; 5] = [
+    "\x1b[?1000h",
+    "\x1b[?1002h",
+    "\x1b[?1003h",
+    "\x1b[?1015h",
+    "\x1b[?1006h",
+];
+const MOUSE_CAPTURE_DISABLE: [&str; 5] = [
+    "\x1b[?1006l",
+    "\x1b[?1015l",
+    "\x1b[?1003l",
+    "\x1b[?1002l",
+    "\x1b[?1000l",
+];
+
+/// The last offset at which any of `sequences` appears, so ordering against
+/// the alternate-screen leave does not depend on which one the write ended on.
+fn last_index(output: &str, sequences: [&str; 5]) -> usize {
+    sequences
+        .iter()
+        .filter_map(|sequence| output.rfind(sequence))
+        .max()
+        .unwrap_or_else(|| panic!("missing mouse capture disable: {output:?}"))
+}
+
 struct ReapChild(Option<Child>);
 
 impl ReapChild {
@@ -106,8 +134,25 @@ fn wait_for_exit(
             return status;
         }
         if Instant::now() >= deadline {
+            let signal_status = fs::read_to_string(format!("/proc/{}/status", child.id()))
+                .ok()
+                .map(|status| {
+                    status
+                        .lines()
+                        .filter(|line| {
+                            [
+                                "State:", "Threads:", "SigQ:", "SigPnd:", "ShdPnd:", "SigBlk:",
+                                "SigIgn:", "SigCgt:",
+                            ]
+                            .iter()
+                            .any(|prefix| line.starts_with(prefix))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "unavailable".into());
             panic!(
-                "PTY child did not exit after {reason}; output: {:?}",
+                "PTY child did not exit after {reason}; process status: {signal_status}; output: {:?}",
                 String::from_utf8_lossy(output)
             );
         }
@@ -119,6 +164,7 @@ struct DashboardPty {
     _storage: tempfile::TempDir,
     master: File,
     slave: File,
+    original_termios: libc::termios,
     child: ReapChild,
 }
 
@@ -129,6 +175,9 @@ fn spawn_dashboard_pty() -> DashboardPty {
     fs::write(
         config_root.join("hel/config.toml"),
         r#"version = 1
+
+[phone]
+enabled = false
 
 [profiles.codex]
 kind = "codex"
@@ -171,8 +220,9 @@ image = "ubuntu:24.04"
         0,
         "create PTY"
     );
-    let master = unsafe { File::from_raw_fd(master_fd) };
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let original_termios = termios(slave.as_raw_fd());
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "read PTY master flags");
     assert_eq!(
@@ -187,7 +237,8 @@ image = "ubuntu:24.04"
         .stdout(Stdio::from(duplicate(slave.as_raw_fd())))
         .stderr(Stdio::from(duplicate(slave.as_raw_fd())))
         .env("HEL_CONFIG_DIR", config_root.join("hel"))
-        .env("HEL_DATA_DIR", storage.path().join("data/hel"));
+        .env("HEL_DATA_DIR", storage.path().join("data/hel"))
+        .env("HEL_DAEMON_EXIT_WHEN_IDLE", "1");
     // Libtest may alter its signal mask. A real `hel` invocation should start
     // with SIGTERM unmasked, so establish that condition across exec.
     unsafe {
@@ -207,10 +258,21 @@ image = "ubuntu:24.04"
         });
     }
     let child = command.spawn().expect("spawn hel PTY helper");
+    let mut startup = Vec::new();
+    wait_for_output(
+        &mut master,
+        &mut startup,
+        b"Workspaces",
+        Instant::now() + TIMEOUT,
+    );
+    master
+        .write_all(b"\r\r")
+        .expect("accept suggested workspace name");
     DashboardPty {
         _storage: storage,
         master,
         slave,
+        original_termios,
         child: ReapChild(Some(child)),
     }
 }
@@ -221,9 +283,9 @@ fn sigterm_restores_real_pty_terminal() {
         _storage,
         mut master,
         slave,
+        original_termios: before,
         mut child,
     } = spawn_dashboard_pty();
-    let before = termios(slave.as_raw_fd());
 
     let mut output = Vec::new();
     wait_for_output(
@@ -260,6 +322,22 @@ fn sigterm_restores_real_pty_terminal() {
         output.contains("\x1b[?1049l"),
         "missing alternate-screen leave: {output:?}"
     );
+    // Mouse capture is unconditional, and crossterm 0.29 turns it on with
+    // button, drag, and SGR tracking in one write.
+    for sequence in MOUSE_CAPTURE_ENABLE {
+        assert!(
+            output.contains(sequence),
+            "missing mouse capture enable {sequence:?}: {output:?}"
+        );
+    }
+    let disable_mouse_capture = last_index(&output, MOUSE_CAPTURE_DISABLE);
+    let leave_screen = output
+        .rfind("\x1b[?1049l")
+        .unwrap_or_else(|| panic!("missing alternate-screen leave: {output:?}"));
+    assert!(
+        disable_mouse_capture < leave_screen,
+        "mouse capture was disabled after leaving the alternate screen: {output:?}"
+    );
     assert!(
         output.contains("\x1b[?25h"),
         "missing cursor restoration: {output:?}"
@@ -274,9 +352,9 @@ fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
         _storage,
         mut master,
         slave,
+        original_termios: before,
         mut child,
     } = spawn_dashboard_pty();
-    let before = termios(slave.as_raw_fd());
     let mut output = Vec::new();
     wait_for_output(
         &mut master,
@@ -315,6 +393,11 @@ fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
     let leave_screen = output
         .rfind("\x1b[?1049l")
         .unwrap_or_else(|| panic!("missing alternate-screen leave: {output:?}"));
+    let disable_mouse_capture = last_index(&output, MOUSE_CAPTURE_DISABLE);
+    assert!(
+        disable_mouse_capture < leave_screen,
+        "mouse capture was disabled after leaving the alternate screen: {output:?}"
+    );
     let message = output
         .find(REATTACH_MESSAGE)
         .unwrap_or_else(|| panic!("missing reattachment message: {output:?}"));

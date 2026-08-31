@@ -14,18 +14,20 @@ use ratatui::widgets::{
 use hel::hel_chat::render_agent_message_head;
 #[cfg(test)]
 use hel::hel_chat::render_agent_message_tail;
-use hel::hel_config::{HarnessKind, HelConfig};
+use hel::hel_config::{HarnessKind, HelConfig, PermissionMode};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
+use hel::hel_selection::{SurfaceFrame, SurfaceId};
 use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
 
 use crate::dialogs::{
-    render_confirmation, render_container_editor, render_import_bundle_confirmation,
-    render_import_progress, render_rename_editor, render_repository_origin,
+    render_config_id_editor, render_confirmation, render_container_editor,
+    render_import_bundle_confirmation, render_import_progress, render_rename_editor,
+    render_repository_origin, render_session_edit, render_target_actions, render_web_dialog,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::{render_resume_dialog, resume_sessions_pane};
-use crate::widgets::{focus_border, format_resource_bytes};
+use crate::widgets::{bordered_content, focus_border, format_resource_bytes};
 use crate::wizards::{render_new_wizard, render_resume_wizard};
 use crate::{DASHBOARD_PANE_COUNT, DashboardState, Focus, Mode, SessionOperationKind};
 
@@ -44,6 +46,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
     dashboard.active_row_areas.clear();
     dashboard.project_heading_areas.clear();
+    dashboard.frame_surfaces.clear();
     let area = frame.area();
     if area.width < MINIMUM_TERMINAL_WIDTH {
         render_terminal_too_small(
@@ -76,21 +79,41 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     render_capacity(frame, layout[2], dashboard);
     render_quotas(frame, layout[3], dashboard);
     render_footer(frame, layout[4], dashboard);
+    render_modal(frame, area, dashboard);
+}
 
+/// Draws the active modal over the dashboard already on the frame. Each modal
+/// clears its own centered rect, so the panes stay visible around it.
+///
+/// The registry moves out for the call because the modal renderers read the
+/// rest of the dashboard while they register their own surfaces.
+fn render_modal(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
+    let mut surfaces = std::mem::take(&mut dashboard.frame_surfaces);
     match &dashboard.mode {
-        Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
-        Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
-        Mode::ResumeDialog(dialog) => render_resume_dialog(frame, area, dashboard, dialog),
-        Mode::RepositoryOrigin(dialog) => render_repository_origin(frame, area, dialog),
-        Mode::Rename(editor) => render_rename_editor(frame, area, editor),
-        Mode::EditContainer(editor) => render_container_editor(frame, area, editor),
-        Mode::Importing(progress) => render_import_progress(frame, area, progress),
-        Mode::ConfirmImportBundle(confirmation) => {
-            render_import_bundle_confirmation(frame, area, confirmation)
+        Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard, &mut surfaces),
+        Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard, &mut surfaces),
+        Mode::ResumeDialog(dialog) => {
+            render_resume_dialog(frame, area, dashboard, dialog, &mut surfaces)
         }
-        Mode::Confirm(dialog) => render_confirmation(frame, area, dialog),
+        Mode::RepositoryOrigin(dialog) => {
+            render_repository_origin(frame, area, dialog, &mut surfaces)
+        }
+        Mode::SessionEdit(dialog) => render_session_edit(frame, area, dialog, &mut surfaces),
+        Mode::ConfigId(editor) => render_config_id_editor(frame, area, editor, &mut surfaces),
+        Mode::TargetActions(dialog) => {
+            render_target_actions(frame, area, dashboard, dialog, &mut surfaces)
+        }
+        Mode::Web(dialog) => render_web_dialog(frame, area, dialog, &mut surfaces),
+        Mode::Rename(editor) => render_rename_editor(frame, area, editor, &mut surfaces),
+        Mode::EditContainer(editor) => render_container_editor(frame, area, editor, &mut surfaces),
+        Mode::Importing(progress) => render_import_progress(frame, area, progress, &mut surfaces),
+        Mode::ConfirmImportBundle(confirmation) => {
+            render_import_bundle_confirmation(frame, area, confirmation, &mut surfaces)
+        }
+        Mode::Confirm(dialog) => render_confirmation(frame, area, dialog, &mut surfaces),
         Mode::Dashboard => {}
     }
+    dashboard.frame_surfaces = surfaces;
 }
 
 fn render_dashboard_title(frame: &mut Frame, area: Rect, greeting: &str) {
@@ -253,27 +276,21 @@ fn render_adaptive_dashboard(
         )
         .split(fixed[1]);
     dashboard.pane_areas = Some([panes[0], panes[1], panes[2]]);
+    for (index, pane) in panes.iter().take(DASHBOARD_PANE_COUNT).enumerate() {
+        // The selectable area is the text inside the border, so a selection
+        // never picks up border glyphs or the scrollbar column.
+        dashboard.frame_surfaces.push(SurfaceFrame::fixed(
+            SurfaceId::DashboardPane(index as u8),
+            bordered_content(*pane),
+        ));
+    }
     let rendered_rows = render_sessions(frame, panes[0], dashboard, &active);
     dashboard.active_row_areas = rendered_rows.active_row_areas;
     dashboard.project_heading_areas = rendered_rows.project_heading_areas;
     render_capacity(frame, panes[1], dashboard);
     render_quotas(frame, panes[2], dashboard);
     render_footer(frame, fixed[2], dashboard);
-
-    match &dashboard.mode {
-        Mode::New(wizard) => render_new_wizard(frame, frame_area, dashboard, wizard),
-        Mode::Resume(wizard) => render_resume_wizard(frame, frame_area, dashboard, wizard),
-        Mode::ResumeDialog(dialog) => render_resume_dialog(frame, frame_area, dashboard, dialog),
-        Mode::RepositoryOrigin(dialog) => render_repository_origin(frame, frame_area, dialog),
-        Mode::Rename(editor) => render_rename_editor(frame, frame_area, editor),
-        Mode::EditContainer(editor) => render_container_editor(frame, frame_area, editor),
-        Mode::Importing(progress) => render_import_progress(frame, frame_area, progress),
-        Mode::ConfirmImportBundle(confirmation) => {
-            render_import_bundle_confirmation(frame, frame_area, confirmation)
-        }
-        Mode::Confirm(dialog) => render_confirmation(frame, frame_area, dialog),
-        Mode::Dashboard => {}
-    }
+    render_modal(frame, frame_area, dashboard);
 }
 
 fn plain_table_height(rows: usize) -> u16 {
@@ -446,6 +463,7 @@ fn render_sessions(
             ));
         }
         let detail = dashboard.session_details.get(id);
+        let unreachable = dashboard.unreachable_sessions.contains(id);
         let target = session_target_label(
             session,
             dashboard.session_operations.get(id),
@@ -462,31 +480,52 @@ fn render_sessions(
         let expanded = dashboard.project_is_expanded(session);
         let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
         let prefix = if selected { "› " } else { "  " };
+        let permission = session_permission_badge(
+            session,
+            dashboard.session_operations.get(id),
+            &dashboard.config,
+        );
         if expanded {
             lines.push(session_top_line(
                 prefix,
                 session,
                 detail,
+                unreachable,
                 dashboard.session_operations.get(id),
                 now_epoch_seconds,
                 &target,
+                permission,
             ));
             lines.push(prefixed_summary_line(
                 "  ",
                 "You: ",
                 detail.and_then(|detail| detail.last_user_message.as_deref()),
                 usize::from(active_area.width.saturating_sub(4)),
+                detail.is_some_and(|detail| detail.last_agent_message_follows_last_user),
             ));
+            let agent_excerpt = detail.and_then(|detail| {
+                if detail.last_user_message.is_none() || detail.last_agent_message_follows_last_user
+                {
+                    detail.last_agent_message.as_deref()
+                } else {
+                    detail.latest_agent_activity_after_last_user.as_deref()
+                }
+            });
             let show_agent_excerpt = detail.is_none_or(|detail| {
-                detail.last_user_message.is_none() || detail.last_agent_message_follows_last_user
+                detail.last_user_message.is_none()
+                    || detail.last_agent_message_follows_last_user
+                    || detail.latest_agent_activity_after_last_user.is_some()
             });
             if show_agent_excerpt {
-                let mut agent = detail
-                    .and_then(|detail| detail.last_agent_message.as_deref())
+                let prefixes = dashboard_agent_prefixes(now_epoch_seconds, detail);
+                let prefix_width = prefixes.iter().map(String::len).max().unwrap_or_default();
+                let mut agent = agent_excerpt
                     .map(|message| {
                         render_agent_message_head(
                             message,
-                            usize::from(active_area.width.saturating_sub(11)),
+                            usize::from(active_area.width.saturating_sub(
+                                u16::try_from(prefix_width + 5).unwrap_or(u16::MAX),
+                            )),
                             2,
                         )
                     })
@@ -498,11 +537,7 @@ fn render_sessions(
                 for (agent_index, mut line) in agent.into_iter().take(2).enumerate() {
                     let mut spans = vec![Span::raw("  ")];
                     spans.push(Span::styled(
-                        if agent_index == 0 {
-                            "Agent: "
-                        } else {
-                            "       "
-                        },
+                        format!("{} ", prefixes[agent_index]),
                         Style::default().add_modifier(Modifier::BOLD),
                     ));
                     spans.append(&mut line.spans);
@@ -514,8 +549,10 @@ fn render_sessions(
                 prefix,
                 &target,
                 detail,
+                unreachable,
                 now_epoch_seconds,
                 usize::from(active_area.width.saturating_sub(4)),
+                permission,
             ));
         }
         let heading = usize::from(first);
@@ -600,8 +637,10 @@ fn collapsed_session_line(
     prefix: &str,
     target: &str,
     detail: Option<&SessionDetail>,
+    unreachable: bool,
     now_epoch_seconds: u64,
     width: usize,
+    permission: Option<Span<'static>>,
 ) -> Line<'static> {
     let clock = hel::usage_format::format_turn_clock(
         now_epoch_seconds,
@@ -612,23 +651,36 @@ fn collapsed_session_line(
         .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("No messages yet")
         .trim();
-    let lead = format!("{prefix}{target}  {clock} ");
-    Line::styled(
+    let style = Style::default().fg(session_band_color(detail, unreachable));
+    let mut lead_width = prefix.chars().count() + target.chars().count() + 2;
+    let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
+    if let Some(permission) = permission {
+        spans.push(Span::styled("  ", style));
+        lead_width += permission.width() + 2;
+        spans.push(permission);
+    }
+    spans.push(Span::styled("  ", style));
+    lead_width += clock.chars().count() + 1;
+    spans.push(Span::styled(
         format!(
-            "{lead}{}",
-            crate::widgets::truncate_text(fragment, width.saturating_sub(lead.chars().count()))
+            "{clock} {}",
+            crate::widgets::truncate_text(fragment, width.saturating_sub(lead_width))
         ),
-        Style::default().fg(session_band_color(detail)),
-    )
+        style,
+    ));
+    Line::from(spans).style(style)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_top_line(
     prefix: &str,
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
+    unreachable: bool,
     operation: Option<&SessionOperationDisplay>,
     now_epoch_seconds: u64,
     target: &str,
+    permission: Option<Span<'static>>,
 ) -> Line<'static> {
     let (profile, _) = operation
         .and_then(|operation| operation.resume_destination.clone())
@@ -639,52 +691,88 @@ fn session_top_line(
             )
         });
     let status_columns = if let Some(operation) = operation {
-        let (label, started_at) = match (operation.stage, operation.kind) {
-            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
-                stage.label(),
-                operation
-                    .stage_started_at_epoch_seconds
-                    .unwrap_or(operation.started_at_epoch_seconds),
-            ),
-            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
-        };
-        vec![format!(
+        let (label, started_at) = operation_status(operation);
+        Some(vec![format!(
             "{label} {}",
             format_elapsed(now_epoch_seconds.saturating_sub(started_at))
-        )]
+        )])
     } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
-        vec![format!(
+        Some(vec![format!(
             "Launch {}",
             format_elapsed(now_epoch_seconds.saturating_sub(started_at))
-        )]
-    } else if let Some(turn_started) = detail.and_then(|detail| detail.current_turn_started_at) {
-        let turn = hel::usage_format::format_turn_clock(now_epoch_seconds, Some(turn_started));
-        let step_started = detail
-            .and_then(|detail| detail.last_acp_activity_at_ms)
-            .map(|value| value / 1_000)
-            .unwrap_or(turn_started)
-            .max(turn_started);
-        let step = hel::usage_format::format_turn_clock(now_epoch_seconds, Some(step_started));
-        vec![format!("Turn {turn}"), format!("Step {step}")]
+        )])
     } else {
-        vec!["[idle]".into()]
+        None
     };
-    let queued = detail
-        .map(|detail| detail.queued_prompts.len())
-        .filter(|count| *count > 0)
-        .map(|count| format!("[Q {count}]"));
+    let queued_prompts = detail.map_or(0, |detail| detail.queued_prompts.len());
     let mut columns = vec![target.to_owned()];
-    columns.extend(queued);
-    columns.extend(status_columns);
-    columns.push(profile);
-    columns.push(recovery_warning_name(
-        session,
-        session_name(session).to_owned(),
-        now_epoch_seconds,
+    if queued_prompts > 0 {
+        columns.push(format!("[Q {queued_prompts}]"));
+    }
+    let summary = if let Some(status_columns) = status_columns {
+        columns.extend(status_columns);
+        columns.push(profile.clone());
+        columns.join("  ")
+    } else {
+        columns.push(profile.clone());
+        columns.join("  ")
+    };
+    let session_name =
+        recovery_warning_name(session, session_name(session).to_owned(), now_epoch_seconds);
+    let summary_tail = summary
+        .strip_prefix(target)
+        .expect("session summary starts with its target");
+    let style = Style::default().fg(session_band_color(detail, unreachable));
+    let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
+    if let Some(permission) = permission {
+        spans.push(Span::styled("  ", style));
+        spans.push(permission);
+    }
+    spans.push(Span::styled(
+        format!("{summary_tail}  {session_name}"),
+        style,
     ));
-    let content = format!("{prefix}{}", columns.join("  "));
-    Line::styled(content, Style::default().fg(session_band_color(detail)))
+    Line::from(spans).style(style)
+}
+
+const DASHBOARD_CLOCK_WIDTH: usize = 6;
+
+fn compact_dashboard_clock(elapsed_seconds: u64) -> String {
+    let minutes = elapsed_seconds / 60;
+    if minutes > 99 {
+        format!("{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{:02}s", elapsed_seconds % 60)
+    } else {
+        format!("{}s", elapsed_seconds % 60)
+    }
+}
+
+fn dashboard_agent_prefixes(now_epoch_seconds: u64, detail: Option<&SessionDetail>) -> [String; 2] {
+    let Some(turn_started) = detail.and_then(|detail| detail.current_turn_started_at) else {
+        let time = detail
+            .and_then(|detail| detail.last_activity_at_ms)
+            .and_then(|value| i64::try_from(value).ok())
+            .and_then(|value| hel::hel_chat::format_event_time(Some(value)))
+            .unwrap_or_default();
+        return ["Agent:".into(), format!("{time:<6}")];
+    };
+    let step_started = detail
+        .and_then(|detail| detail.last_acp_activity_at_ms)
+        .map(|value| value / 1_000)
+        .unwrap_or(turn_started)
+        .max(turn_started);
+    [
+        format!(
+            "T {:>DASHBOARD_CLOCK_WIDTH$}",
+            compact_dashboard_clock(now_epoch_seconds.saturating_sub(turn_started))
+        ),
+        format!(
+            "S {:>DASHBOARD_CLOCK_WIDTH$}",
+            compact_dashboard_clock(now_epoch_seconds.saturating_sub(step_started))
+        ),
+    ]
 }
 
 fn session_target_label(
@@ -699,16 +787,66 @@ fn session_target_label(
     session.project_target(config, target_id)
 }
 
+fn session_permission_badge(
+    session: &SessionRecord,
+    operation: Option<&SessionOperationDisplay>,
+    config: &HelConfig,
+) -> Option<Span<'static>> {
+    let target_id = operation
+        .and_then(|operation| operation.resume_destination.as_ref())
+        .map(|(_, target_id)| target_id)
+        .unwrap_or(&session.target_template_id);
+    config
+        .targets
+        .get(target_id)
+        .and_then(|target| permission_badge(target.permission_mode()))
+}
+
+fn permission_badge(mode: Option<PermissionMode>) -> Option<Span<'static>> {
+    mode.map(|mode| match mode {
+        PermissionMode::Guardian => Span::styled(
+            "[G]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        PermissionMode::Yolo => Span::styled(
+            "[Y]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    })
+}
+
+fn capacity_target_labels(target_ids: &[String], config: &HelConfig) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, target_id) in target_ids.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(", "));
+        }
+        spans.push(Span::raw(target_id.clone()));
+        if let Some(badge) = config
+            .targets
+            .get(target_id)
+            .and_then(|target| permission_badge(target.permission_mode()))
+        {
+            spans.push(Span::raw(" "));
+            spans.push(badge);
+        }
+    }
+    Line::from(spans)
+}
+
 fn prefixed_summary_line(
     prefix: &str,
     label: &str,
     message: Option<&str>,
     width: usize,
+    muted: bool,
 ) -> Line<'static> {
     let message = message.unwrap_or("No messages yet");
     let flattened = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let lead = format!("{prefix}{label}");
-    Line::from(vec![
+    let line = Line::from(vec![
         Span::raw(prefix.to_owned()),
         Span::styled(
             label.to_owned(),
@@ -718,7 +856,12 @@ fn prefixed_summary_line(
             &flattened,
             width.saturating_sub(lead.chars().count()),
         )),
-    ])
+    ]);
+    if muted {
+        line.style(Style::default().fg(Color::DarkGray))
+    } else {
+        line
+    }
 }
 
 fn format_elapsed(elapsed: u64) -> String {
@@ -765,15 +908,7 @@ fn session_values(
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let clock = if let Some(operation) = operation {
-        let (label, started_at) = match (operation.stage, operation.kind) {
-            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
-                stage.label(),
-                operation
-                    .stage_started_at_epoch_seconds
-                    .unwrap_or(operation.started_at_epoch_seconds),
-            ),
-            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
-        };
+        let (label, started_at) = operation_status(operation);
         let elapsed = now_epoch_seconds.saturating_sub(started_at);
         format!("{label} {elapsed}s")
     } else if session.state == SessionState::Provisioning {
@@ -805,6 +940,33 @@ fn session_values(
     )
 }
 
+fn operation_status(operation: &SessionOperationDisplay) -> (String, u64) {
+    if matches!(
+        operation.kind,
+        SessionOperationKind::Launching | SessionOperationKind::Resuming
+    ) && !operation.active_stages.is_empty()
+    {
+        let label = operation
+            .active_stages
+            .keys()
+            .map(|stage| stage.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let started_at = operation
+            .active_stages
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(operation.started_at_epoch_seconds);
+        (label, started_at)
+    } else {
+        (
+            operation.kind.label().to_owned(),
+            operation.started_at_epoch_seconds,
+        )
+    }
+}
+
 fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
     chrono::DateTime::parse_from_rfc3339(&session.updated_at)
         .ok()?
@@ -817,16 +979,18 @@ fn session_name(session: &SessionRecord) -> &str {
     session.display_title()
 }
 
-/// Color of an active session's summary band. A session whose detail has not
-/// loaded yet keeps the default.
-fn session_band_color(detail: Option<&SessionDetail>) -> Color {
+/// Color of an active session's summary band. An unreachable target is red so
+/// it stands out; otherwise unread sessions are highlighted and the rest keep
+/// the default. A session whose detail has not loaded yet keeps the default.
+fn session_band_color(detail: Option<&SessionDetail>, unreachable: bool) -> Color {
+    if unreachable {
+        return Color::Red;
+    }
     match detail {
-        Some(detail)
-            if detail.unread_agent_messages > 0 && detail.current_turn_started_at.is_none() =>
-        {
+        Some(detail) if detail.has_unread() && detail.current_turn_started_at.is_none() => {
             Color::LightBlue
         }
-        Some(detail) if detail.unread_agent_messages > 0 => Color::LightYellow,
+        Some(detail) if detail.has_unread() => Color::LightYellow,
         // ANSI yellow is the orange/amber ink in common terminal palettes;
         // bright yellow remains distinct for unread sessions.
         _ => Color::Yellow,
@@ -917,28 +1081,32 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .unwrap_or_default()
         .as_secs();
     let rows = dashboard.capacity_details.values().map(|detail| {
-        let capacity = match (&detail.target.kind, &detail.usage) {
-            (DeploymentCapacityKind::Host, Some(usage)) => {
-                let memory_percent = if usage.memory_total_bytes == 0 {
-                    0
-                } else {
-                    (u128::from(usage.memory_used_bytes) * 100
-                        / u128::from(usage.memory_total_bytes))
-                    .min(100)
-                };
-                format!(
-                    "{}% CPU · {memory_percent}% RAM",
-                    usage.cpu_percent.unwrap_or(0)
-                )
+        let capacity = if detail.refreshing {
+            "refreshing…".into()
+        } else {
+            match (&detail.target.kind, &detail.usage) {
+                (DeploymentCapacityKind::Host, Some(usage)) => {
+                    let memory_percent = if usage.memory_total_bytes == 0 {
+                        0
+                    } else {
+                        (u128::from(usage.memory_used_bytes) * 100
+                            / u128::from(usage.memory_total_bytes))
+                        .min(100)
+                    };
+                    format!(
+                        "{}% CPU · {memory_percent}% RAM",
+                        usage.cpu_percent.unwrap_or(0)
+                    )
+                }
+                (DeploymentCapacityKind::AwsFleet, Some(usage)) => format!(
+                    "{} cores · {} RAM · {} disk",
+                    usage.logical_cores,
+                    format_resource_bytes(usage.memory_total_bytes),
+                    format_resource_bytes(usage.disk_total_bytes.unwrap_or(0))
+                ),
+                (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => "on demand".into(),
+                _ => "unavailable".into(),
             }
-            (DeploymentCapacityKind::AwsFleet, Some(usage)) => format!(
-                "{} cores · {} RAM · {} disk",
-                usage.logical_cores,
-                format_resource_bytes(usage.memory_total_bytes),
-                format_resource_bytes(usage.disk_total_bytes.unwrap_or(0))
-            ),
-            (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => "on demand".into(),
-            _ => "unavailable".into(),
         };
         let mut in_use = vec![Span::raw(capacity)];
         if let Some(staleness) = capacity_staleness(detail, now_epoch_seconds) {
@@ -949,7 +1117,10 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         }
         Row::new([
             Cell::from(detail.target.host.clone()),
-            Cell::from(detail.target.target_ids.join(", ")),
+            Cell::from(capacity_target_labels(
+                &detail.target.target_ids,
+                &dashboard.config,
+            )),
             Cell::from(Line::from(in_use)),
         ])
     });
@@ -1066,12 +1237,15 @@ fn api_quota_bar() -> Line<'static> {
     ])
 }
 
-fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
-    let weekly_exhausted = quota
+fn weekly_quota_exhausted(quota: &ProfileQuota) -> bool {
+    quota
         .weekly_window()
         .and_then(quota_remaining_percent)
-        .is_some_and(|remaining| remaining < 1);
-    let five_hour = if weekly_exhausted {
+        .is_some_and(|remaining| remaining < 1)
+}
+
+fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
+    let five_hour = if weekly_quota_exhausted(quota) {
         None
     } else {
         quota.five_hour_window()
@@ -1079,28 +1253,97 @@ fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
     quota_bar(five_hour)
 }
 
-fn quota_reset_summary(quota: &ProfileQuota) -> String {
-    let weekly = quota
-        .weekly_window()
-        .and_then(|window| window.resets.as_deref());
-    let five_hour = quota
-        .five_hour_projects_exhaustion()
-        .then(|| quota.five_hour_window())
-        .flatten()
-        .and_then(|window| window.resets.as_deref());
-    let mut summary = match (weekly, five_hour) {
-        (Some(weekly), Some(five_hour)) => format!("{weekly} / {five_hour}"),
-        (Some(weekly), None) => weekly.to_string(),
-        (None, Some(five_hour)) => five_hour.to_string(),
-        (None, None) => String::new(),
+fn quota_reset_countdown(now: u64, reset_at_epoch_seconds: i64) -> String {
+    let Ok(reset) = u64::try_from(reset_at_epoch_seconds) else {
+        return "now".into();
     };
-    if let Some(extra) = quota.extra.as_deref() {
-        if !summary.is_empty() {
-            summary.push_str(" · ");
-        }
-        summary.push_str(extra);
+    let remaining = reset.saturating_sub(now);
+    if remaining == 0 {
+        return "now".into();
     }
-    summary
+
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if remaining >= DAY {
+        let days = remaining / DAY;
+        let hours = remaining % DAY / HOUR;
+        if days == 1 && hours > 0 {
+            format!("{days}d{hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if remaining >= HOUR {
+        let hours = remaining / HOUR;
+        let minutes = remaining % HOUR / MINUTE;
+        if hours == 1 && minutes > 0 {
+            format!("{hours}h{minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if remaining >= MINUTE {
+        format!("{}m", remaining / MINUTE)
+    } else {
+        "<1m".into()
+    }
+}
+
+fn quota_reset_cell(window: Option<&QuotaWindow>, now: u64) -> String {
+    let Some(window) = window else {
+        return String::new();
+    };
+    window
+        .resets_at_epoch_seconds
+        .map(|reset| quota_reset_countdown(now, reset))
+        .or_else(|| window.resets.clone())
+        .unwrap_or_default()
+}
+
+fn quota_reset_cells(quota: &ProfileQuota, now: u64) -> (String, String) {
+    let mut weekly = quota_reset_cell(quota.weekly_window(), now);
+    if let Some(extra) = quota.extra.as_deref() {
+        if !weekly.is_empty() {
+            weekly.push_str(" · ");
+        }
+        weekly.push_str(extra);
+    }
+    let five_hour = if weekly_quota_exhausted(quota) {
+        String::new()
+    } else {
+        quota_reset_cell(quota.five_hour_window(), now)
+    };
+    (weekly, five_hour)
+}
+
+struct QuotaTableRow {
+    profile: String,
+    harness: String,
+    weekly: Line<'static>,
+    weekly_reset: String,
+    five_hour: Line<'static>,
+    five_hour_reset: String,
+}
+
+impl QuotaTableRow {
+    fn into_row(self) -> Row<'static> {
+        Row::new([
+            Cell::from(self.profile),
+            Cell::from(self.harness),
+            Cell::from(self.weekly),
+            Cell::from(self.weekly_reset),
+            Cell::from(self.five_hour),
+            Cell::from(self.five_hour_reset),
+        ])
+    }
+}
+
+fn quota_column_width(
+    header: &str,
+    content_widths: impl Iterator<Item = usize>,
+    maximum: u16,
+) -> u16 {
+    let width = content_widths.fold(Line::raw(header).width(), usize::max);
+    u16::try_from(width).unwrap_or(u16::MAX).min(maximum)
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -1108,38 +1351,65 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
-        let (weekly, five_hour, resets) = if profile.kind == HarnessKind::Deepseek {
-            (api_quota_bar(), Line::default(), String::new())
-        } else if dashboard.quota_refreshing.contains(id) {
-            (Line::raw("refreshing…"), Line::default(), String::new())
-        } else {
-            match dashboard.quotas.get(id) {
-                Some(quota) if quota.error.is_none() => (
-                    quota_bar(quota.weekly_window()),
-                    five_hour_quota_bar(quota),
-                    quota_reset_summary(quota),
-                ),
-                Some(quota) => (
-                    Line::raw(
-                        quota
-                            .error_label()
-                            .unwrap_or_else(|| "unavailable: unknown error".into()),
-                    ),
-                    Line::default(),
-                    String::new(),
-                ),
-                None => (Line::raw("refreshing…"), Line::default(), String::new()),
+    let rows = dashboard
+        .config
+        .profiles
+        .iter()
+        .map(|(id, profile)| {
+            let (weekly, weekly_reset, five_hour, five_hour_reset) =
+                if profile.kind == HarnessKind::Deepseek {
+                    (
+                        api_quota_bar(),
+                        String::new(),
+                        Line::default(),
+                        String::new(),
+                    )
+                } else if dashboard.quota_refreshing.contains(id) {
+                    (
+                        Line::raw("refreshing…"),
+                        String::new(),
+                        Line::default(),
+                        String::new(),
+                    )
+                } else {
+                    match dashboard.quotas.get(id) {
+                        Some(quota) if quota.error.is_none() => {
+                            let (weekly_reset, five_hour_reset) = quota_reset_cells(quota, now);
+                            (
+                                quota_bar(quota.weekly_window()),
+                                weekly_reset,
+                                five_hour_quota_bar(quota),
+                                five_hour_reset,
+                            )
+                        }
+                        Some(quota) => (
+                            Line::raw(
+                                quota
+                                    .error_label()
+                                    .unwrap_or_else(|| "unavailable: unknown error".into()),
+                            ),
+                            String::new(),
+                            Line::default(),
+                            String::new(),
+                        ),
+                        None => (
+                            Line::raw("refreshing…"),
+                            String::new(),
+                            Line::default(),
+                            String::new(),
+                        ),
+                    }
+                };
+            QuotaTableRow {
+                profile: id.clone(),
+                harness: profile.kind.display_name().into(),
+                weekly,
+                weekly_reset,
+                five_hour,
+                five_hour_reset,
             }
-        };
-        Row::new([
-            Cell::from(id.clone()),
-            Cell::from(profile.kind.display_name()),
-            Cell::from(weekly),
-            Cell::from(five_hour),
-            Cell::from(resets),
-        ])
-    });
+        })
+        .collect::<Vec<_>>();
     let refresh_status = if !dashboard.quota_refreshing.is_empty() {
         "refreshing…".to_string()
     } else {
@@ -1164,33 +1434,54 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
     } else {
         BorderType::Plain
     };
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(14),
-            Constraint::Percentage(10),
-            Constraint::Percentage(22),
-            Constraint::Percentage(22),
-            Constraint::Percentage(32),
-        ],
-    )
-    .header(
-        Row::new(["Profile", "Harness", "Weekly", "5H", "Resets"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .row_highlight_style(if quotas_focused {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
-    } else {
-        Style::default()
-    })
-    .highlight_symbol(if quotas_focused { "› " } else { "  " })
-    .highlight_spacing(HighlightSpacing::Always)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(border_type)
-            .title(title),
-    );
+    let widths = [
+        quota_column_width(
+            "Profile",
+            rows.iter()
+                .map(|row| Line::raw(row.profile.as_str()).width()),
+            24,
+        ),
+        quota_column_width(
+            "Harness",
+            rows.iter()
+                .map(|row| Line::raw(row.harness.as_str()).width()),
+            12,
+        ),
+        quota_column_width("Weekly", rows.iter().map(|row| row.weekly.width()), 32),
+        quota_column_width(
+            "Resets",
+            rows.iter()
+                .map(|row| Line::raw(row.weekly_reset.as_str()).width()),
+            24,
+        ),
+        quota_column_width("5H", rows.iter().map(|row| row.five_hour.width()), 15),
+        quota_column_width(
+            "Resets",
+            rows.iter()
+                .map(|row| Line::raw(row.five_hour_reset.as_str()).width()),
+            24,
+        ),
+    ]
+    .map(Constraint::Length);
+    let table = Table::new(rows.into_iter().map(QuotaTableRow::into_row), widths)
+        .column_spacing(2)
+        .header(
+            Row::new(["Profile", "Harness", "Weekly", "Resets", "5H", "Resets"])
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .row_highlight_style(if quotas_focused {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if quotas_focused { "› " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .title(title),
+        );
     let mut state = TableState::default()
         .with_selected((!dashboard.config.profiles.is_empty()).then_some(dashboard.quota_index));
     frame.render_stateful_widget(table, area, &mut state);
@@ -1211,14 +1502,10 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · [T] Resume · [R]ename · [E]dit container · sto[P] · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [S] Resume · [W]orkspaces · [E]dit · We[b] · mark [A]ll read · [Q]uit · Tab pane"
         }
-        Focus::Capacity => {
-            "[N]ew · [T] Resume · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
-        }
-        Focus::Quotas => {
-            "[N]ew · [T] Resume · [R]efresh · mark [A]ll read · [U]pdate quotas · [Q]uit · Tab pane"
-        }
+        Focus::Capacity => "[W]orkspaces · [E]dit targets · [R]efresh · We[b] · [Q]uit · Tab pane",
+        Focus::Quotas => "[W]orkspaces · [E]dit profile · [R]efresh · We[b] · [Q]uit · Tab pane",
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -1297,17 +1584,134 @@ mod tests {
         assert!(!rendered.contains("[1] hel"));
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
-        assert!(rendered.contains("podman  [Q 1]  Turn "));
-        assert!(rendered.contains("  Step "));
+        assert!(rendered.contains("podman  [Q 1]  codex-1  ACP pretty name"));
+        assert!(!rendered.contains("  Turn "));
+        assert!(!rendered.contains("  Step "));
         assert!(rendered.contains("  codex-1  ACP pretty name"));
         assert!(!rendered.contains("queued]"));
         assert!(rendered.contains("You: question 1"));
-        assert!(rendered.contains("Agent: "));
+        assert!(rendered.contains("T "));
+        assert!(rendered.contains("S "));
         assert!(rendered.contains("answer 1"));
+
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let (user_row, user_line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("You: question 1"))
+            .expect("user transcript line");
+        let user_column = cell_column(user_line, "You: question 1");
+        assert!((user_column..user_column + 15).all(|column| {
+            buffer[(buffer.area.x + column, buffer.area.y + user_row as u16)].fg == Color::DarkGray
+        }));
     }
 
     #[test]
-    fn expanded_dashboard_omits_an_agent_excerpt_older_than_the_last_user_message() {
+    fn a_modal_overlays_the_dashboard_instead_of_replacing_it() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_greeting("UNDERLYING DASHBOARD SENTINEL".into());
+        assert_eq!(
+            dashboard.handle_key(crate::test_support::ctrl_key('e')),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(crate::test_support::key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw rename dialog");
+        let lines = buffer_lines(terminal.backend().buffer());
+
+        let row_of = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle} in {lines:#?}"))
+        };
+        let popup_top = row_of("Rename session");
+        // The dashboard underneath still shows through every row the modal's
+        // centred popup does not cover.
+        assert!(row_of("UNDERLYING DASHBOARD SENTINEL") < popup_top);
+        assert!(row_of(" Active ") < popup_top);
+    }
+
+    #[test]
+    fn drawing_the_dashboard_registers_each_pane_interior_for_selection() {
+        let mut dashboard = dashboard_with_session(running_session());
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+
+        let panes = dashboard.pane_areas.expect("dashboard pane hitboxes");
+        let surfaces = dashboard.frame_surfaces();
+        for (index, pane) in panes.iter().enumerate() {
+            let id = SurfaceId::DashboardPane(index as u8);
+            let surface = surfaces
+                .surface(id)
+                .unwrap_or_else(|| panic!("pane {index} registered"));
+            assert_eq!(surface.rect, bordered_content(*pane));
+            assert_eq!(
+                surfaces
+                    .surface_at(surface.rect.x, surface.rect.y)
+                    .map(|surface| surface.id),
+                Some(id)
+            );
+        }
+        // The border rows and the scrollbar column stay out of every surface,
+        // so a selection can never pick up their glyphs.
+        assert!(surfaces.surface_at(panes[0].x, panes[0].y).is_none());
+        assert!(
+            surfaces
+                .surface_at(panes[0].right() - 1, panes[0].y + 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_open_dialog_registers_its_body_and_list_above_the_panes() {
+        let mut dashboard = dashboard_with_session(stopped_session());
+        dashboard.show_resume_dialog(1, Vec::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw resume dialog");
+
+        let surfaces = dashboard.frame_surfaces();
+        let body = surfaces.surface(SurfaceId::ModalBody).expect("dialog body");
+        let list = surfaces
+            .surface(SurfaceId::ResumeList)
+            .expect("session list");
+        // The dialog covers the panes, and its list covers the dialog.
+        assert_eq!(
+            surfaces
+                .surface_at(body.rect.x, body.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::ModalBody)
+        );
+        assert_eq!(
+            surfaces
+                .surface_at(list.rect.x, list.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::ResumeList)
+        );
+        // Beside the popup the pane underneath still owns its cells.
+        assert_eq!(
+            surfaces
+                .surface_at(body.rect.x - 2, body.rect.y)
+                .map(|surface| surface.id),
+            Some(SurfaceId::DashboardPane(0))
+        );
+    }
+
+    #[test]
+    fn unanswered_user_line_stays_bright_and_shows_the_latest_agent_activity() {
         let mut dashboard = dashboard_with_session(running_session());
         let mut transcript = numbered_conversation(1);
         transcript.push(transcript_item(
@@ -1319,7 +1723,67 @@ mod tests {
                 })],
             },
         ));
+        transcript.push(thought(4, "Checking the workspace"));
         apply_materialized_transcript(&mut dashboard, transcript);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("You: unanswered follow-up"));
+        assert!(rendered.contains("│ Checking the workspace"), "{rendered}");
+        assert!(!rendered.contains("Agent:"));
+        assert!(!rendered.contains("answer 0"));
+        let (user_row, user_line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("You: unanswered follow-up"))
+            .expect("user transcript line");
+        let user_column = cell_column(user_line, "You: unanswered follow-up");
+        assert_ne!(
+            buffer[(buffer.area.x + user_column, buffer.area.y + user_row as u16)].fg,
+            Color::DarkGray
+        );
+    }
+
+    #[test]
+    fn dashboard_agent_prefixes_show_active_clocks_and_idle_activity_time() {
+        let detail = SessionDetail {
+            current_turn_started_at: Some(1_000),
+            last_acp_activity_at_ms: Some(1_297_000),
+            ..SessionDetail::default()
+        };
+
+        assert_eq!(
+            dashboard_agent_prefixes(1_330, Some(&detail)),
+            ["T  5m30s", "S    33s"]
+        );
+        assert_eq!(compact_dashboard_clock(99 * 60 + 59), "99m59s");
+        assert_eq!(compact_dashboard_clock(100 * 60 + 59), "100m");
+
+        let idle = SessionDetail {
+            last_activity_at_ms: Some(1_297_000),
+            ..SessionDetail::default()
+        };
+        let activity_time = hel::hel_chat::format_event_time(Some(1_297_000)).unwrap();
+        assert_eq!(
+            dashboard_agent_prefixes(1_330, Some(&idle)),
+            ["Agent:".to_owned(), format!("{activity_time:<6}")]
+        );
+    }
+
+    #[test]
+    fn idle_dashboard_moves_state_and_activity_time_beside_the_agent_excerpt() {
+        let mut dashboard = dashboard_with_session(running_session());
+        let mut materialized =
+            materialized_session_for("session-1", vec![agent_message(2, "Finished work")]);
+        materialized.execution = MaterializedExecutionState::Idle;
+        dashboard.apply_materialized_session(&materialized);
+        let activity_time = hel::hel_chat::format_event_time(Some(2_000)).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
 
         terminal
@@ -1327,9 +1791,12 @@ mod tests {
             .expect("draw dashboard");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
-        assert!(rendered.contains("You: unanswered follow-up"));
-        assert!(!rendered.contains("Agent:"));
-        assert!(!rendered.contains("answer 0"));
+        assert!(!rendered.contains("[idle]"), "{rendered}");
+        assert!(rendered.contains("Agent: │ Finished work"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("{activity_time}  ")),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1347,6 +1814,7 @@ mod tests {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
@@ -1355,32 +1823,32 @@ mod tests {
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw dashboard");
 
-        let first_area = dashboard.active_row_areas[0].1;
         let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let first_y = lines
+            .iter()
+            .position(|line| line.contains("podman [1]"))
+            .expect("first session row") as u16;
+        let second_y = lines
+            .iter()
+            .position(|line| line.contains("podman [2]"))
+            .expect("second session row") as u16;
         assert!(
-            (first_area.y..first_area.bottom()).all(|y| {
-                (first_area.x..first_area.right()).all(|x| buffer[(x, y)].bg != Color::DarkGray)
+            (first_y..first_y + 4).all(|y| {
+                (buffer.area.x + 1..buffer.area.right() - 1)
+                    .all(|x| buffer[(x, y)].bg != Color::DarkGray)
             }),
             "selection must not paint a background"
         );
-        assert_eq!(buffer[(first_area.x, first_area.y)].symbol(), "›");
-        let first_line = (first_area.x..first_area.right())
-            .map(|x| buffer[(x, first_area.y)].symbol())
-            .collect::<String>();
-        let second_area = dashboard.active_row_areas[1].1;
-        let second_line = (second_area.x..second_area.right())
-            .map(|x| buffer[(x, second_area.y)].symbol())
-            .collect::<String>();
-        assert!(first_line.contains("podman [1]"));
-        assert!(second_line.contains("podman [2]"));
+        assert!(lines[first_y as usize].contains("› podman [1]"));
         assert_eq!(
-            second_area.y,
-            first_area.bottom() + 1,
+            second_y,
+            first_y + 5,
             "sessions in an expanded project have one blank row between them"
         );
         assert!(
-            (first_area.x..first_area.right())
-                .all(|x| buffer[(x, first_area.bottom())].symbol().trim().is_empty())
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .all(|x| buffer[(x, first_y + 4)].symbol().trim().is_empty())
         );
     }
 
@@ -1397,6 +1865,7 @@ mod tests {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
@@ -1405,10 +1874,18 @@ mod tests {
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw dashboard");
 
-        let first_bottom = dashboard.active_row_areas[0].1.bottom();
-        let second_heading_y = dashboard.project_heading_areas[1].1.y;
-        assert_eq!(second_heading_y, first_bottom + 1);
         let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let first_y = lines
+            .iter()
+            .position(|line| line.contains("› podman"))
+            .expect("first session row") as u16;
+        let second_heading_y = lines
+            .iter()
+            .position(|line| line.contains("beta"))
+            .expect("second project heading") as u16;
+        let first_bottom = first_y + 4;
+        assert_eq!(second_heading_y, first_bottom + 1);
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .all(|x| buffer[(x, first_bottom)].symbol().trim().is_empty())
@@ -1428,6 +1905,7 @@ mod tests {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         dashboard.apply_materialized_session(&materialized_session_for(
@@ -1494,6 +1972,7 @@ mod tests {
                 .map(|session| (session.id.clone(), session))
                 .collect(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         dashboard.apply_materialized_session(&materialized_session_for(
@@ -1531,23 +2010,53 @@ mod tests {
             current_turn_started_at: Some(1),
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&normal)), Color::Yellow);
+        assert_eq!(session_band_color(Some(&normal), false), Color::Yellow);
 
         let unread = SessionDetail {
             current_turn_started_at: Some(1),
             unread_agent_messages: 1,
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&unread)), Color::LightYellow);
+        assert_eq!(session_band_color(Some(&unread), false), Color::LightYellow);
 
         let unread_idle = SessionDetail {
             unread_agent_messages: 1,
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&unread_idle)), Color::LightBlue);
+        assert_eq!(
+            session_band_color(Some(&unread_idle), false),
+            Color::LightBlue
+        );
 
-        let collapsed = collapsed_session_line("› ", "podman", Some(&unread_idle), 1, 80);
+        let collapsed =
+            collapsed_session_line("› ", "podman", Some(&unread_idle), false, 1, 80, None);
         assert_eq!(collapsed.style.fg, Some(Color::LightBlue));
+
+        let restarted_idle = SessionDetail {
+            unread_session_restarts: 1,
+            ..SessionDetail::default()
+        };
+        assert_eq!(
+            session_band_color(Some(&restarted_idle), false),
+            Color::LightBlue
+        );
+
+        let restarted_running = SessionDetail {
+            current_turn_started_at: Some(1),
+            unread_session_restarts: 1,
+            ..SessionDetail::default()
+        };
+        assert_eq!(
+            session_band_color(Some(&restarted_running), false),
+            Color::LightYellow
+        );
+
+        // An unreachable target is red, overriding every other state.
+        assert_eq!(session_band_color(Some(&unread), true), Color::Red);
+        assert_eq!(session_band_color(None, true), Color::Red);
+        let unreachable_line =
+            collapsed_session_line("› ", "podman", Some(&unread_idle), true, 1, 80, None);
+        assert_eq!(unreachable_line.style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -1874,6 +2383,94 @@ mod tests {
         assert!(header.contains("In Use"));
     }
 
+    #[test]
+    fn dashboard_colors_named_host_permission_badges() {
+        let mut config = config();
+        let container = match config.targets["podman"].clone() {
+            hel::hel_config::TargetTemplate::LocalPodman { container } => container,
+            _ => unreachable!(),
+        };
+        let ssh = |host: &str| hel::hel_config::SshConnection {
+            host: host.into(),
+            user: None,
+            identity_file: None,
+            extra_args: Vec::new(),
+        };
+        config.targets.insert(
+            "precision-3260".into(),
+            hel::hel_config::TargetTemplate::SshBare {
+                ssh: ssh("precision-3260"),
+                permissions: PermissionMode::Yolo,
+                workspace_prefix: ".local/share/hel/workspaces".into(),
+            },
+        );
+        config.targets.insert(
+            "morannon-podman".into(),
+            hel::hel_config::TargetTemplate::SshPodman {
+                ssh: ssh("morannon"),
+                container,
+            },
+        );
+        config.targets.insert(
+            "morannon-raw".into(),
+            hel::hel_config::TargetTemplate::SshBare {
+                ssh: ssh("morannon"),
+                permissions: PermissionMode::Guardian,
+                workspace_prefix: ".local/share/hel/workspaces".into(),
+            },
+        );
+        let mut session = running_session();
+        session.target_template_id = "precision-3260".into();
+        session.project_directory = Some("/home/dev/hel".into());
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([(session.id.clone(), session)]),
+            mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
+        let capacity_target =
+            |host: &str, target_ids: &[&str]| hel::hel_targets::DeploymentCapacityTarget {
+                id: format!("ssh:{host}"),
+                host: host.into(),
+                target_ids: target_ids.iter().map(|id| (*id).into()).collect(),
+                kind: DeploymentCapacityKind::Host,
+                local: false,
+                probes: Vec::new(),
+                probe_error: None,
+            };
+        dashboard.set_deployment_capacity_targets(vec![
+            capacity_target("precision-3260", &["precision-3260"]),
+            capacity_target("morannon", &["morannon-podman", "morannon-raw"]),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let badge_has_color = |needle: &str, color: Color| {
+            lines.iter().enumerate().any(|(row, line)| {
+                let Some(byte) = line.find(needle) else {
+                    return false;
+                };
+                let x = buffer.area.x + line[..byte].chars().count() as u16;
+                (x..x + 3).all(|x| buffer[(x, buffer.area.y + row as u16)].fg == color)
+            })
+        };
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("precision-3260 [Y]"), "{rendered}");
+        assert!(
+            rendered.contains("morannon-podman, morannon-raw [G]"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("morannon-podman [G]"), "{rendered}");
+        assert!(badge_has_color("[Y]", Color::Red), "{rendered}");
+        assert!(badge_has_color("[G]", Color::Green), "{rendered}");
+    }
+
     fn now_epoch_seconds() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1977,6 +2574,7 @@ mod tests {
             version: STATE_VERSION,
             sessions,
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         for index in 0..6 {
@@ -2229,11 +2827,29 @@ mod tests {
         );
         // The operation started at 1_000 but the stage only began at 1_040;
         // the clock must count from the stage, not the whole operation.
-        operation.stage_started_at_epoch_seconds = Some(1_040);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Booting, 1_040);
 
         let (clock, _, _, _, _) =
             session_values(&session, None, Some(&operation), 1_052, &config());
         assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn launch_clock_names_concurrent_stages_in_lifecycle_order() {
+        let session = stopped_session();
+        let mut operation = operation(SessionOperationKind::Launching, None);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Syncing, 1_003);
+        operation
+            .active_stages
+            .insert(ProvisionStage::Cloning, 1_002);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Clone, Sync 10s");
     }
 
     #[test]
@@ -2319,6 +2935,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -2558,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_render_hides_five_hour_bar_when_weekly_quota_is_exhausted() {
+    fn quota_render_hides_five_hour_bar_and_reset_when_weekly_quota_is_exhausted() {
         let quota = ProfileQuota {
             profile_id: "codex-1".into(),
             harness: HarnessKind::Codex,
@@ -2603,11 +3220,43 @@ mod tests {
 
         assert!(rendered.contains("0%"));
         assert!(!rendered.contains("70%"));
+        assert!(!rendered.contains("4h"));
     }
 
     #[test]
-    fn quota_resets_add_five_hour_only_when_projected_to_exhaust() {
-        let mut quota = ProfileQuota {
+    fn quota_reset_countdowns_use_a_second_unit_only_after_one_first_unit() {
+        const MINUTE: u64 = 60;
+        const HOUR: u64 = 60 * MINUTE;
+        const DAY: u64 = 24 * HOUR;
+        let now = 100;
+
+        assert_eq!(
+            quota_reset_countdown(now, (now + 2 * DAY + 5 * HOUR) as i64),
+            "2d"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + DAY + 5 * HOUR) as i64),
+            "1d5h"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + 2 * HOUR + 5 * MINUTE) as i64),
+            "2h"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + HOUR + 5 * MINUTE) as i64),
+            "1h5m"
+        );
+        assert_eq!(
+            quota_reset_countdown(now, (now + 35 * MINUTE) as i64),
+            "35m"
+        );
+        assert_eq!(quota_reset_countdown(now, (now + 30) as i64), "<1m");
+        assert_eq!(quota_reset_countdown(now, now as i64), "now");
+    }
+
+    #[test]
+    fn weekly_and_five_hour_resets_are_independent() {
+        let quota = ProfileQuota {
             profile_id: "codex-1".into(),
             harness: HarnessKind::Codex,
             windows: vec![
@@ -2633,13 +3282,16 @@ mod tests {
             refreshed_at_epoch_seconds: 0,
         };
 
-        assert_eq!(quota_reset_summary(&quota), "09:00 Aug 20");
-        quota.windows[1].remaining_percent = Some(70);
-        assert_eq!(quota_reset_summary(&quota), "09:00 Aug 20 / 14:00 Aug 13");
+        assert_eq!(quota_reset_cells(&quota, 0), ("7d".into(), "4h".into()));
     }
 
     #[test]
     fn quota_render_uses_weekly_five_hour_and_reset_columns() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now = i64::try_from(now).unwrap();
         let quota = ProfileQuota {
             profile_id: "codex-1".into(),
             harness: HarnessKind::Codex,
@@ -2650,7 +3302,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: Some("09:00 Aug 20".into()),
-                    resets_at_epoch_seconds: Some(604_800),
+                    resets_at_epoch_seconds: Some(now + 2 * 24 * 60 * 60 + 30),
                 },
                 QuotaWindow {
                     label: "5H".into(),
@@ -2658,7 +3310,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: Some("14:00 Aug 13".into()),
-                    resets_at_epoch_seconds: Some(14_400),
+                    resets_at_epoch_seconds: Some(now + 60 * 60 + 5 * 60 + 30),
                 },
             ],
             extra: None,
@@ -2674,19 +3326,28 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let lines = buffer_lines(terminal.backend().buffer());
+        let rendered = lines.join("\n");
 
         assert!(rendered.contains("Weekly"));
         assert!(rendered.contains("5H"));
-        assert!(rendered.contains("Resets"));
+        assert_eq!(rendered.matches("Resets").count(), 2);
         assert!(rendered.contains("73%"));
         assert!(rendered.contains("70%"));
-        assert!(rendered.contains("09:00 Aug 20 / 14:00 Aug 13"));
+        assert!(rendered.contains("2d"));
+        assert!(rendered.contains("1h5m"));
+        assert!(!rendered.contains("09:00 Aug 20"));
+
+        let row = lines
+            .iter()
+            .find(|line| line.contains("codex-1"))
+            .expect("quota row");
+        let weekly_percent = cell_column(row, "73%");
+        let weekly_reset = cell_column(row, "2d");
+        let five_hour_percent = cell_column(row, "70%");
+        let five_hour_reset = cell_column(row, "1h5m");
+        assert_eq!(weekly_reset, weekly_percent + 3 + 2);
+        assert_eq!(five_hour_percent - 12, weekly_reset + 6 + 2);
+        assert_eq!(five_hour_reset, five_hour_percent + 3 + 2);
     }
 }

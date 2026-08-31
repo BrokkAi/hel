@@ -1,6 +1,7 @@
 //! Small drawing primitives shared by the dashboard, dialogs, and wizards.
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use hel::hel_selection::{FrameSurfaces, SurfaceFrame, SurfaceId};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{BorderType, Paragraph};
@@ -103,6 +104,33 @@ pub(crate) fn focused_buttons(labels: &[&'static str], focus: usize) -> Line<'st
         .map(|(index, label)| (*label, index == focus))
         .collect::<Vec<_>>();
     action_buttons(&buttons)
+}
+
+/// The drawn text inside a full border, which is the part of a widget a
+/// selection may cover.
+pub(crate) fn bordered_content(area: Rect) -> Rect {
+    area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    })
+}
+
+/// Centers a modal popup and registers its body as a selectable surface.
+///
+/// Modals draw over the dashboard, and the registry is z-ordered by render
+/// order, so registering here makes the body win the cells it covers.
+pub(crate) fn centered_modal(
+    surfaces: &mut FrameSurfaces,
+    width_percent: u16,
+    height: u16,
+    area: Rect,
+) -> Rect {
+    let popup = centered_rect(width_percent, height, area);
+    surfaces.push(SurfaceFrame::fixed(
+        SurfaceId::ModalBody,
+        bordered_content(popup),
+    ));
+    popup
 }
 
 pub(crate) fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {

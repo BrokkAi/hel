@@ -2,13 +2,20 @@
 //!
 //! This file owns the command-line surface and the one-shot subcommands. The
 //! long-running surfaces live beside it: [`dashboard`] drives the terminal UI,
-//! [`server`] the phone-oriented remote control, [`pollers`] the background
+//! [`server`] implements the daemon-owned phone control, [`pollers`] the background
 //! feeds both of them read, and [`import`] session adoption.
 
+mod daemon;
 mod dashboard;
 mod import;
+mod logging;
 mod pollers;
 mod server;
+mod workspace_selector;
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::io;
 use std::path::PathBuf;
@@ -16,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -25,7 +33,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use hel::hel_config::{HelConfig, config_path};
-use hel::hel_controller::{Controller, ControllerStoreGuard};
+use hel::hel_controller::Controller;
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
 use hel::hel_state::{SessionState, TargetLocator};
@@ -37,21 +45,28 @@ use hel::hel_worker_runtime::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::dashboard::{DashboardExit, run_dashboard};
+use crate::dashboard::{DashboardExit, run_dashboard_for_workspace};
 use crate::import::{ImportArgs, import};
-use crate::server::{ServerArgs, run_server};
 
 #[derive(Debug, Parser)]
 #[command(name = "hel", version, about = "ACP session control plane")]
 struct Cli {
+    /// Select a workspace by name for workspace-scoped commands.
+    #[arg(long, global = true)]
+    workspace: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start the phone-oriented remote-control server.
-    Server(ServerArgs),
+    /// Open the workspace selector even when Hel could auto-attach.
+    Workspaces,
+    /// Inspect or control the persistent per-user daemon.
+    Daemon(DaemonArgs),
+    /// Internal persistent controller process.
+    #[command(hide = true)]
+    DaemonRun,
     /// Internal target-side worker commands.
     #[command(hide = true)]
     Worker(WorkerArgs),
@@ -70,6 +85,22 @@ enum Command {
     Checkpoint(CheckpointArgs),
     /// Run a harness login for a profile so live sessions pick up fresh credentials.
     Login(LoginArgs),
+}
+
+#[derive(Debug, Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Show daemon PID, version, start time, and client count.
+    Status,
+    /// Gracefully stop the daemon. Detached workers keep running.
+    Stop,
+    /// Gracefully replace the daemon with this Hel build.
+    Restart,
 }
 
 #[derive(Debug, Args)]
@@ -190,6 +221,12 @@ enum WorkerCommand {
         #[arg(long)]
         spec: PathBuf,
     },
+    /// Seal target-owned checkpoint inputs while ACP dispatch is frozen.
+    #[command(hide = true)]
+    CaptureCheckpoint,
+    /// Package a sealed checkpoint after ACP dispatch has resumed.
+    #[command(hide = true)]
+    PackCheckpoint,
     /// Restore a verified archive into a freshly cloned target.
     RestoreCheckpoint {
         #[arg(long)]
@@ -239,10 +276,16 @@ fn write_worker_exit_record(root: &std::path::Path, reason: &str) {
         "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "version": env!("CARGO_PKG_VERSION"),
     });
-    let _ = std::fs::write(
-        root.join("worker-exit.json"),
-        serde_json::to_vec_pretty(&record).unwrap_or_default(),
-    );
+    let bytes = match serde_json::to_vec_pretty(&record) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("Hel: could not serialize worker exit record: {error}");
+            return;
+        }
+    };
+    if let Err(error) = std::fs::write(root.join("worker-exit.json"), bytes) {
+        eprintln!("Hel: could not write worker exit record: {error}");
+    }
 }
 
 /// Capture panics as last words too; the default hook then prints the
@@ -258,31 +301,33 @@ fn install_worker_last_words(root: &std::path::Path) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let is_controller_process = matches!(
-        &cli.command,
-        None | Some(
-            Command::Server(_)
-                | Command::Setup(_)
-                | Command::Import(_)
-                | Command::Recover(_)
-                | Command::Checkpoint(_)
-        )
-    );
-    let _controller_guard = is_controller_process
-        .then(ControllerStoreGuard::acquire)
-        .transpose()?;
-    if is_controller_process {
-        HelConfig::migrate_legacy_localhost_target()?;
-        hel::hel_database::recover_interrupted_checkpointing_sessions(
-            &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        )?;
-        hel::hel_controller::reconcile_managed_checkpoint_archives()?;
+    let is_user_process = !matches!(&cli.command, Some(Command::Worker(_) | Command::Broker(_)));
+    let log = if is_user_process {
+        Some(logging::ControllerLog::start(command_name(
+            cli.command.as_ref(),
+        ))?)
+    } else {
+        logging::start_stderr()?;
+        None
+    };
+    install_panic_logging();
+    let result = run(cli);
+    if let Err(error) = &result {
+        tracing::error!(error = format!("{error:#}"), "Hel exited with an error");
     }
+    if result.is_ok() {
+        tracing::info!("Hel stopped");
+    }
+    drop(log);
+    result
+}
+
+fn run(cli: Cli) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build Tokio runtime")?;
-    let result = runtime.block_on(run_command(cli.command));
+    let result = runtime.block_on(run_command(cli.command, cli.workspace));
     if matches!(
         result,
         Ok(DashboardExit::Detached | DashboardExit::Interrupted)
@@ -301,17 +346,48 @@ fn main() -> Result<()> {
     result.map(|_| ())
 }
 
+fn install_panic_logging() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(panic = %info, "Hel panicked");
+        default_hook(info);
+    }));
+}
+
+fn command_name(command: Option<&Command>) -> &'static str {
+    match command {
+        None => "dashboard",
+        Some(Command::Workspaces) => "workspaces",
+        Some(Command::Daemon(_)) => "daemon",
+        Some(Command::DaemonRun) => "daemon-run",
+        Some(Command::Doctor(_)) => "doctor",
+        Some(Command::Setup(_)) => "setup",
+        Some(Command::Import(_)) => "import",
+        Some(Command::Recover(_)) => "recover",
+        Some(Command::Checkpoint(_)) => "checkpoint",
+        Some(Command::Login(_)) => "login",
+        Some(Command::Worker(_)) => "worker",
+        Some(Command::Broker(_)) => "broker",
+    }
+}
+
 fn shutdown_dashboard_runtime(runtime: tokio::runtime::Runtime) {
     runtime.shutdown_background();
 }
 
-async fn run_command(command: Option<Command>) -> Result<DashboardExit> {
+async fn run_command(
+    command: Option<Command>,
+    requested_workspace: Option<String>,
+) -> Result<DashboardExit> {
     match command {
-        None => run_dashboard().await,
-        Some(Command::Server(args)) => {
-            run_server(args).await?;
-            Ok(DashboardExit::Normal)
+        None => run_workspace_dashboard(requested_workspace.as_deref(), false, None).await,
+        Some(Command::Workspaces) => {
+            run_workspace_dashboard(requested_workspace.as_deref(), true, None).await
         }
+        Some(Command::Daemon(args)) => daemon_command(args).await.map(|()| DashboardExit::Normal),
+        Some(Command::DaemonRun) => daemon::run_daemon_process()
+            .await
+            .map(|()| DashboardExit::Normal),
         Some(Command::Worker(args)) => match args.command {
             WorkerCommand::Run { root, config } => {
                 lead_process_group();
@@ -328,6 +404,18 @@ async fn run_command(command: Option<Command>) -> Result<DashboardExit> {
             }
             WorkerCommand::ExportCheckpoint { spec } => {
                 let checkpoint = hel::hel_checkpoint::export_from_spec_file(&spec)?;
+                println!("{}", serde_json::to_string(&checkpoint)?);
+                Ok(())
+            }
+            WorkerCommand::CaptureCheckpoint => {
+                let checkpoint =
+                    hel::hel_checkpoint::capture_from_spec_reader(&mut std::io::stdin().lock())?;
+                println!("{}", serde_json::to_string(&checkpoint)?);
+                Ok(())
+            }
+            WorkerCommand::PackCheckpoint => {
+                let checkpoint =
+                    hel::hel_checkpoint::pack_from_spec_reader(&mut std::io::stdin().lock())?;
                 println!("{}", serde_json::to_string(&checkpoint)?);
                 Ok(())
             }
@@ -354,7 +442,13 @@ async fn run_command(command: Option<Command>) -> Result<DashboardExit> {
             .map(|()| DashboardExit::Normal),
         Some(Command::Doctor(args)) => doctor(args).map(|()| DashboardExit::Normal),
         Some(Command::Setup(args)) => setup(args).map(|()| DashboardExit::Normal),
-        Some(Command::Import(args)) => import(args).map(|()| DashboardExit::Normal),
+        Some(Command::Import(args)) => {
+            let workspace_id = resolve_store_workspace(requested_workspace.as_deref()).await?;
+            tokio::task::spawn_blocking(move || import(args, &workspace_id))
+                .await
+                .context("import task panicked")??;
+            Ok(DashboardExit::Normal)
+        }
         Some(Command::Recover(args)) => recover(args).await.map(|()| DashboardExit::Normal),
         Some(Command::Checkpoint(args)) => {
             let mut controller = Controller::load()?;
@@ -367,6 +461,204 @@ async fn run_command(command: Option<Command>) -> Result<DashboardExit> {
         }
         Some(Command::Login(args)) => login(args).await.map(|()| DashboardExit::Normal),
     }
+}
+
+async fn run_workspace_dashboard(
+    requested_workspace: Option<&str>,
+    force_selector: bool,
+    fallback_workspace: Option<String>,
+) -> Result<DashboardExit> {
+    let mut daemon = daemon::connect_or_start().await?;
+    let mut workspaces = daemon.list_workspaces().await?;
+    let selected = if let Some(requested) = requested_workspace.filter(|_| !force_selector) {
+        workspaces
+            .iter()
+            .find(|candidate| {
+                candidate.workspace.name.to_lowercase() == requested.trim().to_lowercase()
+            })
+            .map(|candidate| candidate.workspace.id.clone())
+            .with_context(|| format!("unknown workspace {requested:?}"))?
+    } else if !force_selector && workspaces.len() == 1 && workspaces[0].attached_pids.is_empty() {
+        workspaces[0].workspace.id.clone()
+    } else if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        match workspaces.as_slice() {
+            [workspace] => workspace.workspace.id.clone(),
+            [] => bail!("no workspace exists; run `hel` in a terminal to create one"),
+            _ => bail!("several workspaces exist; pass `--workspace NAME`"),
+        }
+    } else {
+        loop {
+            let suggested = suggested_workspace_name(&workspaces)?;
+            let mut selector_entries = Vec::with_capacity(workspaces.len());
+            for listing in &workspaces {
+                let snapshot = daemon.snapshot(listing.workspace.id.clone()).await?;
+                selector_entries.push(workspace_selector::SelectorWorkspace {
+                    listing: listing.clone(),
+                    snapshot,
+                });
+            }
+            match workspace_selector::select_workspace(&selector_entries, &suggested)? {
+                workspace_selector::SelectorOutcome::Select(workspace_id) => break workspace_id,
+                workspace_selector::SelectorOutcome::Create(name) => {
+                    let workspace = daemon.create_workspace(name).await?;
+                    break workspace.id;
+                }
+                workspace_selector::SelectorOutcome::Rename { workspace_id, name } => {
+                    daemon.rename_workspace(workspace_id, name).await?;
+                    workspaces = daemon.list_workspaces().await?;
+                }
+                workspace_selector::SelectorOutcome::Delete(workspace_id) => {
+                    daemon.delete_workspace(workspace_id).await?;
+                    workspaces = daemon.list_workspaces().await?;
+                }
+                workspace_selector::SelectorOutcome::RecoverDraft(draft_id) => {
+                    daemon.recover_draft(draft_id).await?;
+                    workspaces = daemon.list_workspaces().await?;
+                }
+                workspace_selector::SelectorOutcome::Cancel => {
+                    if let Some(workspace_id) = &fallback_workspace {
+                        break workspace_id.clone();
+                    }
+                    return Ok(DashboardExit::Normal);
+                }
+            }
+        }
+    };
+
+    let client_id = format!(
+        "tui-{}-{}",
+        std::process::id(),
+        hel::hel_workspace::new_workspace_id()?
+    );
+    daemon
+        .attach(selected.clone(), client_id.clone(), std::process::id())
+        .await?;
+    let attachment_cancellation = tokio_util::sync::CancellationToken::new();
+    let attachment_task = daemon::maintain_attachment(
+        selected.clone(),
+        client_id.clone(),
+        std::process::id(),
+        attachment_cancellation.clone(),
+    );
+    let result = run_dashboard_for_workspace(&selected, &client_id).await;
+    attachment_cancellation.cancel();
+    if let Err(error) = attachment_task.await {
+        tracing::warn!(%error, "workspace attachment task failed");
+    }
+    match daemon::connect_existing().await {
+        Ok(mut current_daemon) => {
+            if let Err(error) = current_daemon.detach(client_id).await {
+                tracing::warn!(%error, "could not detach dashboard from workspace");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "daemon unavailable while dashboard detached"),
+    }
+    if matches!(result, Ok(DashboardExit::WorkspacePicker)) {
+        Box::pin(run_workspace_dashboard(None, true, Some(selected))).await
+    } else {
+        result
+    }
+}
+
+async fn resolve_store_workspace(requested: Option<&str>) -> Result<String> {
+    let mut daemon = daemon::connect_or_start().await?;
+    let workspaces = daemon.list_workspaces().await?;
+    if let Some(requested) = requested {
+        return workspaces
+            .iter()
+            .find(|candidate| {
+                candidate.workspace.name.to_lowercase() == requested.trim().to_lowercase()
+            })
+            .map(|candidate| candidate.workspace.id.clone())
+            .with_context(|| format!("unknown workspace {requested:?}"));
+    }
+    match workspaces.as_slice() {
+        [workspace] => Ok(workspace.workspace.id.clone()),
+        [] => bail!("no workspace exists; run `hel` to create one"),
+        _ => bail!("several workspaces exist; pass `--workspace NAME`"),
+    }
+}
+
+fn suggested_workspace_name(workspaces: &[daemon::WorkspaceListing]) -> Result<String> {
+    let base = std::env::current_dir()
+        .context("read current directory for workspace name")?
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("workspace")
+        .trim()
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let names = workspaces
+        .iter()
+        .map(|candidate| candidate.workspace.name.to_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !names.contains(&base.to_lowercase()) {
+        return Ok(base);
+    }
+    for number in 2..=10_000 {
+        let suffix = format!("-{number}");
+        let prefix_length = 64_usize.saturating_sub(suffix.chars().count());
+        let candidate = format!(
+            "{}{}",
+            base.chars().take(prefix_length).collect::<String>(),
+            suffix
+        );
+        if !names.contains(&candidate.to_lowercase()) {
+            return Ok(candidate);
+        }
+    }
+    Ok("workspace-1".to_owned())
+}
+
+async fn daemon_command(args: DaemonArgs) -> Result<()> {
+    match args.command {
+        DaemonCommand::Status => {
+            let mut daemon = daemon::connect_existing()
+                .await
+                .context("Hel daemon is not running")?;
+            let status = daemon.status().await?;
+            println!(
+                "Hel daemon {} (version {}) started {}; {} attached client{}; web viewer {}",
+                status.pid,
+                status.build_version,
+                status.started_at,
+                status.attached_clients,
+                if status.attached_clients == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                status.phone_status
+            );
+        }
+        DaemonCommand::Stop => {
+            let mut daemon = daemon::connect_existing()
+                .await
+                .context("Hel daemon is not running")?;
+            daemon.stop().await?;
+            println!("Hel daemon is stopping; detached workers remain active.");
+        }
+        DaemonCommand::Restart => {
+            if let Ok(mut daemon) = daemon::connect_existing().await {
+                daemon.stop().await?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if daemon::connect_existing().await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                }
+            }
+            let mut daemon = daemon::connect_or_start().await?;
+            let status = daemon.status().await?;
+            println!("Hel daemon restarted as PID {}.", status.pid);
+        }
+    }
+    Ok(())
 }
 
 /// Run the harness's own interactive login against a profile's canonical home.
@@ -410,7 +702,7 @@ async fn login(args: LoginArgs) -> Result<()> {
     let (after, _) = hel::hel_credentials::read_credential_file(profile.kind, &marker)?;
     if after.present && after.fingerprint != before.fingerprint {
         println!(
-            "Credentials updated for profile {profile_id}. Live sessions pick them up within about a minute while the Hel TUI or server is running."
+            "Credentials updated for profile {profile_id}. Live sessions pick them up within about a minute while the Hel daemon is running."
         );
     } else {
         println!("Credentials for profile {profile_id} are unchanged.");
@@ -648,6 +940,11 @@ impl TerminalGuard {
             )
             .context("enable unambiguous terminal key reporting")?;
         }
+        // Capture stays on for every surface: the app owns wheel scrolling
+        // because terminal scrollback repaints whole TUI frames and is
+        // unusably slow on long sessions, and pane-scoped selection needs the
+        // button and drag reports too. Shift+drag still reaches the
+        // terminal's own selection.
         execute!(
             stdout,
             EnterAlternateScreen,
@@ -660,6 +957,18 @@ impl TerminalGuard {
             terminal,
             keyboard_enhancement,
         })
+    }
+
+    /// Hands `text` to the terminal's own clipboard with OSC 52.
+    ///
+    /// This is the path that works over SSH and inside multiplexers, where
+    /// the desktop clipboard the process can reach is the wrong machine's.
+    pub(crate) fn copy_to_terminal_clipboard(&mut self, text: &str) -> Result<()> {
+        execute!(
+            self.terminal.backend_mut(),
+            CopyToClipboard::to_clipboard_from(text)
+        )
+        .context("copy selection to the terminal clipboard")
     }
 
     pub(crate) fn suspend(&mut self) -> Result<()> {
@@ -706,17 +1015,25 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if self.keyboard_enhancement {
-            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        if self.keyboard_enhancement
+            && let Err(error) = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags)
+        {
+            tracing::warn!(%error, "could not restore terminal keyboard enhancement flags");
         }
-        let _ = execute!(
+        if let Err(error) = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
-        );
-        let _ = disable_raw_mode();
-        let _ = self.terminal.show_cursor();
+        ) {
+            tracing::warn!(%error, "could not restore terminal screen and input modes");
+        }
+        if let Err(error) = disable_raw_mode() {
+            tracing::warn!(%error, "could not disable terminal raw mode");
+        }
+        if let Err(error) = self.terminal.show_cursor() {
+            tracing::warn!(%error, "could not show terminal cursor");
+        }
     }
 }
 
@@ -762,6 +1079,27 @@ mod tests {
             panic!("export-checkpoint did not parse as a worker command");
         };
         assert_eq!(spec, PathBuf::from("-"));
+    }
+
+    #[test]
+    fn two_phase_checkpoint_worker_commands_parse_without_file_arguments() {
+        for (name, expected) in [
+            ("capture-checkpoint", "capture"),
+            ("pack-checkpoint", "pack"),
+        ] {
+            let cli = Cli::try_parse_from(["hel", "worker", name]).unwrap();
+            let Some(Command::Worker(WorkerArgs { command })) = cli.command else {
+                panic!("{name} did not parse as a worker command");
+            };
+            assert!(
+                matches!(
+                    (command, expected),
+                    (WorkerCommand::CaptureCheckpoint, "capture")
+                        | (WorkerCommand::PackCheckpoint, "pack")
+                ),
+                "{name} parsed as the wrong worker command"
+            );
+        }
     }
 
     #[test]
@@ -855,6 +1193,7 @@ mod tests {
         state.sessions.insert(
             session_id.into(),
             SessionRecord {
+                workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
                 archived: false,
                 container_cpus: None,
                 container_memory: None,
@@ -894,7 +1233,7 @@ mod tests {
 
         assert!(
             controller
-                .delete_session_controlled(session_id, &ProcessExecutor)
+                .destroy_session_controlled(session_id, &ProcessExecutor)
                 .is_err()
         );
         assert!(controller.state.sessions.contains_key(session_id));

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::hel_config::{AwsAddressSource, HelConfig, ProjectBundle, TargetTemplate, data_dir};
 use crate::hel_state::{SessionRecord, SessionResourceAllocation, TargetLocator, allocation_cpus};
@@ -236,6 +236,15 @@ impl Controller {
         targets.sort_by(|left, right| left.id.cmp(&right.id));
         targets
     }
+
+    pub fn test_target(&self, target_id: &str, executor: &impl CommandExecutor) -> Result<()> {
+        let template = self
+            .config
+            .targets
+            .get(target_id)
+            .with_context(|| format!("unknown target template {target_id:?}"))?;
+        preflight_target(template, executor)
+    }
 }
 
 pub(super) fn preflight_target(
@@ -253,7 +262,11 @@ pub(super) fn preflight_target(
         TargetTemplate::SshPodman { ssh, .. } => {
             let ssh = backend_ssh(ssh);
             hel_targets::verify_ssh_podman(&ssh, executor)
-                .map(|_| ())
+                .map(|preflight| {
+                    for warning in preflight.warnings {
+                        executor.notify_notice(&warning.notice());
+                    }
+                })
                 .map_err(|error| {
                     anyhow::anyhow!(
                         "remote Podman preflight failed for {}; run `hel doctor` for actionable prerequisites: {error:#}",
@@ -279,7 +292,69 @@ pub(super) fn preflight_target(
             }
             Ok(())
         }
-        _ => Ok(()),
+        TargetTemplate::SshBare { ssh, .. } => {
+            let ssh = backend_ssh(ssh);
+            let command = hel_targets::ssh_connectivity_probe(&ssh);
+            let output = executor.execute(&command)?;
+            ensure!(
+                output.status == 0,
+                "SSH connectivity test failed for {} with status {}: {}",
+                ssh.destination,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Ok(())
+        }
+        TargetTemplate::AwsEc2 {
+            aws_profile,
+            region,
+            launch_template,
+            launch_template_version,
+            ..
+        } => {
+            let mut identity_args = vec!["sts".into(), "get-caller-identity".into()];
+            if let Some(profile) = aws_profile {
+                identity_args.extend(["--profile".into(), profile.clone()]);
+            }
+            let identity = CommandSpec::new("aws", identity_args)
+                .purpose("verify AWS credentials")
+                .stage(ProvisionStage::Provisioning);
+            let output = executor.execute(&identity)?;
+            ensure!(
+                output.status == 0,
+                "AWS credential test failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+
+            let mut launch_args = vec![
+                "ec2".into(),
+                "describe-launch-template-versions".into(),
+                "--region".into(),
+                region.clone(),
+                "--launch-template-name".into(),
+                launch_template.clone(),
+                "--versions".into(),
+                launch_template_version
+                    .clone()
+                    .unwrap_or_else(|| "$Default".into()),
+            ];
+            if let Some(profile) = aws_profile {
+                launch_args.extend(["--profile".into(), profile.clone()]);
+            }
+            let launch = CommandSpec::new("aws", launch_args)
+                .purpose("verify AWS launch template")
+                .stage(ProvisionStage::Provisioning);
+            let output = executor.execute(&launch)?;
+            ensure!(
+                output.status == 0,
+                "AWS launch-template test failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Ok(())
+        }
+        TargetTemplate::LocalBare => Ok(()),
     }
 }
 
@@ -294,6 +369,7 @@ pub(super) fn backend_bundle(bundle: &ProjectBundle) -> Result<ProjectBundleSpec
                 url: repository.github.as_deref().map(github_url),
                 destination: repository.destination.to_string_lossy().into_owned(),
                 git_ref: repository.git_ref.clone(),
+                reference: None,
             })
             .collect(),
     })
@@ -369,18 +445,21 @@ pub(super) fn backend_target(
         TargetTemplate::SshBare {
             ssh,
             workspace_prefix,
+            ..
         } => hel_targets::TargetTemplate::SshBare {
             ssh: backend_ssh(ssh),
             workspace_prefix: workspace_prefix.to_string_lossy().into_owned(),
         },
-        TargetTemplate::SshPodman { ssh, container } => hel_targets::TargetTemplate::SshPodman {
-            ssh: backend_ssh(ssh),
-            container: backend_container(container, allocation, overrides),
-        },
+        TargetTemplate::SshPodman { ssh, container, .. } => {
+            hel_targets::TargetTemplate::SshPodman {
+                ssh: backend_ssh(ssh),
+                container: backend_container(container, allocation, overrides),
+            }
+        }
     })
 }
 
-pub(super) fn controller_github_token() -> Option<String> {
+pub(crate) fn controller_github_token() -> Option<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)
             && let Some(token) = usable_github_token(&token)
@@ -388,19 +467,34 @@ pub(super) fn controller_github_token() -> Option<String> {
             return Some(token.to_owned());
         }
     }
-    let output = Command::new("gh")
+    let output = match Command::new("gh")
         .args(["auth", "token", "--hostname", "github.com"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then_some(())
-        .and_then(|()| std::str::from_utf8(&output.stdout).ok())
-        .and_then(usable_github_token)
-        .map(str::to_owned)
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(%error, "could not query the GitHub CLI for a token");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::debug!(status = ?output.status, "GitHub CLI did not return an authenticated token");
+        return None;
+    }
+    let token = match std::str::from_utf8(&output.stdout) {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::debug!(%error, "GitHub CLI returned a non-UTF-8 token");
+            return None;
+        }
+    };
+    let Some(token) = usable_github_token(token) else {
+        tracing::debug!("GitHub CLI returned an empty or invalid token");
+        return None;
+    };
+    Some(token.to_owned())
 }
 
 fn usable_github_token(token: &str) -> Option<&str> {
@@ -540,7 +634,6 @@ pub(super) fn locator_after_provision(
     session_id: &str,
     first_output: Option<&CommandOutput>,
     executor: &(impl CommandExecutor + Sync),
-    bundle: Option<&ProjectBundleSpec>,
 ) -> Result<TargetLocator> {
     let generated = hel_targets::resource_name(session_id)?;
     Ok(match canonical {
@@ -647,19 +740,6 @@ pub(super) fn locator_after_provision(
                 Instant::now,
                 std::thread::sleep,
             )?;
-            let backend_locator = hel_targets::TargetLocator::AwsEc2 {
-                profile: profile.clone(),
-                region: region.clone(),
-                instance_id: instance_id.clone(),
-                ssh,
-                workspace: format!(".local/share/hel/workspaces/{session_id}"),
-            };
-            hel_targets::provision_on_locator_plan(
-                &backend_locator,
-                session_id,
-                bundle.context("AWS provisioning requires a project bundle")?,
-            )?
-            .execute_concurrent(executor)?;
             TargetLocator::AwsEc2 {
                 instance_id,
                 address: Some(address),
@@ -935,6 +1015,7 @@ mod tests {
         std::fs::write(source.path().join("many/files/two"), b"two").unwrap();
         let session_id = "0123456789abcdef0123456789abcdef";
         let record = SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -969,6 +1050,7 @@ mod tests {
             version: crate::hel_state::STATE_VERSION,
             sessions: BTreeMap::from([(session_id.into(), record)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let backend = hel_targets::TargetLocator::AwsEc2 {
             profile: "default".into(),
@@ -1122,6 +1204,7 @@ mod tests {
                 url: Some("git@github.com:example/app.git".into()),
                 destination: "app".into(),
                 git_ref: None,
+                reference: None,
             }],
         };
         use_github_https_urls(&mut bundle);
@@ -1147,19 +1230,20 @@ mod tests {
             },
         );
         let executor = PreflightExecutor {
-                outputs: RefCell::new(vec![
-                    CommandOutput {
-                        status: 0,
-                        stdout: br#"{"LaunchTemplateVersions":[{"LaunchTemplateData":{"InstanceType":"m8i-flex.large"}}]}"#.to_vec(),
-                        stderr: Vec::new(),
-                    },
-                    CommandOutput {
-                        status: 0,
-                        stdout: br#"{"InstanceTypes":[{"InstanceType":"m8i-flex.4xlarge","VCpuInfo":{"DefaultVCpus":16},"MemoryInfo":{"SizeInMiB":65536}},{"InstanceType":"m8i-flex.2xlarge","VCpuInfo":{"DefaultVCpus":8},"MemoryInfo":{"SizeInMiB":32768}}]}"#.to_vec(),
-                        stderr: Vec::new(),
-                    },
-                ]),
-            };
+            outputs: RefCell::new(vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: br#"{"LaunchTemplateVersions":[{"LaunchTemplateData":{"InstanceType":"m8i-flex.large"}}]}"#.to_vec(),
+                    stderr: Vec::new(),
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: br#"{"InstanceTypes":[{"InstanceType":"m8i-flex.4xlarge","VCpuInfo":{"DefaultVCpus":16},"MemoryInfo":{"SizeInMiB":65536}},{"InstanceType":"m8i-flex.2xlarge","VCpuInfo":{"DefaultVCpus":8},"MemoryInfo":{"SizeInMiB":32768}}]}"#.to_vec(),
+                    stderr: Vec::new(),
+                },
+            ]),
+            notices: RefCell::new(vec![]),
+        };
         let controller = Controller {
             config,
             state: HelState::default(),
@@ -1191,6 +1275,7 @@ mod tests {
         };
         let config = HelConfig {
             version: crate::hel_config::CONFIG_VERSION,
+            phone: Default::default(),
             profiles: BTreeMap::new(),
             bundles: BTreeMap::new(),
             targets: BTreeMap::from([
@@ -1210,6 +1295,7 @@ mod tests {
                     "bare".into(),
                     TargetTemplate::SshBare {
                         ssh: ssh("builder"),
+                        permissions: crate::hel_config::PermissionMode::Yolo,
                         workspace_prefix: ".local/share/hel/workspaces".into(),
                     },
                 ),
@@ -1224,6 +1310,7 @@ mod tests {
                     "alias".into(),
                     TargetTemplate::SshBare {
                         ssh: ssh("builder-alias"),
+                        permissions: crate::hel_config::PermissionMode::Yolo,
                         workspace_prefix: ".local/share/hel/workspaces".into(),
                     },
                 ),
@@ -1253,10 +1340,15 @@ mod tests {
     }
     struct PreflightExecutor {
         outputs: RefCell<Vec<CommandOutput>>,
+        notices: RefCell<Vec<String>>,
     }
     impl CommandExecutor for PreflightExecutor {
         fn execute(&self, _command: &CommandSpec) -> Result<CommandOutput> {
             Ok(self.outputs.borrow_mut().remove(0))
+        }
+
+        fn notify_notice(&self, notice: &str) {
+            self.notices.borrow_mut().push(notice.to_owned());
         }
     }
     #[test]
@@ -1277,6 +1369,7 @@ mod tests {
                 stdout: b"podman version 3.4.7\n".to_vec(),
                 stderr: vec![],
             }]),
+            notices: RefCell::new(vec![]),
         };
 
         let error = preflight_target(&template, &executor)
@@ -1309,6 +1402,7 @@ mod tests {
                 stdout: b"podman version 3.4.7\n".to_vec(),
                 stderr: vec![],
             }]),
+            notices: RefCell::new(vec![]),
         };
 
         let error = preflight_target(&template, &executor)
@@ -1317,6 +1411,57 @@ mod tests {
         assert!(error.contains("hel doctor"));
         assert!(error.contains("dev@example.test"));
         assert!(error.contains("Podman 4.0.0"));
+    }
+    #[test]
+    fn ssh_podman_preflight_notifies_when_remote_user_lingering_is_disabled() {
+        let template = TargetTemplate::SshPodman {
+            ssh: SshConnection {
+                host: "example.test".into(),
+                user: Some("dev".into()),
+                identity_file: None,
+                extra_args: vec![],
+            },
+            container: ConfigContainer {
+                image: "ubuntu:24.04".into(),
+                pull_policy: Default::default(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: std::collections::BTreeMap::new(),
+            },
+        };
+        let executor = PreflightExecutor {
+            outputs: RefCell::new(vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: b"podman version 5.4.2\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"true\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"0 1000 1\n1 100000 65536\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"no\n".to_vec(),
+                    stderr: vec![],
+                },
+            ]),
+            notices: RefCell::new(vec![]),
+        };
+
+        preflight_target(&template, &executor).unwrap();
+
+        let notices = executor.notices.borrow();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("last SSH connection closes"));
+        assert!(notices[0].contains("sudo loginctl enable-linger"));
     }
     #[test]
     fn apple_container_preflight_failures_recommend_doctor() {
@@ -1336,6 +1481,7 @@ mod tests {
                 stdout: vec![],
                 stderr: b"daemon is not running".to_vec(),
             }]),
+            notices: RefCell::new(vec![]),
         };
 
         let error = preflight_target(&template, &executor)

@@ -21,6 +21,7 @@ const auditedStandaloneNotices = new Set(["cfg_aliases/NOTICES.md"]);
 const auditedLinksPackages = new Set([
   "alsa-sys",
   "bzip2-sys",
+  "libmimalloc-sys",
   "libsqlite3-sys",
   "prettyplease",
   // rayon-core uses `links` only to prevent multiple versions; its build
@@ -297,6 +298,14 @@ async function main() {
       "bzip2-1.0.8/LICENSE",
       "bzip2/libbzip2 1.0.8",
       "used while unpacking sherpa-onnx native libraries during the voice-worker build",
+    ),
+    await legalFile(
+      metadata,
+      "libmimalloc-sys",
+      "0.1.49",
+      "c_src/mimalloc/v3/LICENSE",
+      "mimalloc native allocator",
+      "statically linked into the musl Linux hel controller and worker",
     ),
     await sqliteNativePayload(metadata),
     await sherpaNativePayload(metadata),

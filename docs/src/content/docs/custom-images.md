@@ -27,8 +27,8 @@ passwordless `sudo` inside the container, plus one of those package managers.
 
 If your image runs as a non-root user with no `sudo`, or uses a different
 package manager, bake `git` and `gh` into the image yourself. Either way,
-`gh` is what lets HTTPS Git pushes work using the `GH_TOKEN` hel injects into
-the container (see [Container targets](/containers/)).
+`gh` is what lets HTTPS Git pushes work using the GitHub token hel syncs into
+the session (see [Container targets](/containers/)).
 
 ## ACP bridges
 
@@ -44,6 +44,12 @@ installer with `curl` instead, which needs `curl` in the image.
 Baking the bridges in, the way the reference image does, avoids that
 per-session install cost and pins the exact bridge version through the image
 instead of through hel's fallback.
+
+Hel-owned worker and bridge commands use non-login shells and do not source
+`/etc/profile` or user dotfiles. Images must therefore expose required tools on
+their ordinary process `PATH`; profile-only PATH setup is not part of the
+container contract. Agent-requested shell commands remain `bash -lc` because
+those commands intentionally use the session user's shell environment.
 
 The DeepSeek bridge is the third-party `dsh-acp-server` package. Hel pins both
 it and `@deepseek-ai/dsh`, launches its self-managed ACP profile over stdio,

@@ -12,8 +12,8 @@ use crate::hel_controller::{CheckpointArtifact, Controller};
 use crate::hel_database::record_recovery_failure;
 use crate::hel_session_manager::SessionManagerControl;
 use crate::hel_state::{
-    CheckpointMetadata, HelState, MaterializedExecutionState, RecoveryGate, RecoveryObservation,
-    RecoveryObserver,
+    CheckpointMetadata, HelState, MaterializedExecutionState, RecoveryCheckpointPhase,
+    RecoveryGate, RecoveryObservation, RecoveryObserver,
 };
 use crate::hel_targets::CancellableProcessExecutor;
 
@@ -95,6 +95,9 @@ impl RecoveryCoordinator {
                             let cancelled = copy_cancelled.clone();
                             let handle = tokio::runtime::Handle::current();
                             let task_session_id = session_id.clone();
+                            let progress_session_id = session_id.clone();
+                            let progress_gate = coordinator_gate.clone();
+                            let progress_tx = busy_tx.clone();
                             tokio::spawn(async move {
                                 let joined = tokio::task::spawn_blocking(move || {
                                     let mut state = HelState::default();
@@ -108,6 +111,10 @@ impl RecoveryCoordinator {
                                     };
                                     let executor = CancellableProcessExecutor::new(cancelled)
                                         .with_deadline(RECOVERY_CHECKPOINT_TIMEOUT);
+                                    let progress = |phase: RecoveryCheckpointPhase| {
+                                        progress_gate.set_phase(&progress_session_id, phase);
+                                        progress_tx.send_replace(progress_gate.busy_sessions());
+                                    };
                                     handle
                                         .block_on(
                                             controller
@@ -115,6 +122,7 @@ impl RecoveryCoordinator {
                                                     &task_session_id,
                                                     &session_manager,
                                                     &executor,
+                                                    &progress,
                                                 ),
                                         )
                                         .map_err(|error| format!("{error:#}"))
@@ -132,7 +140,14 @@ impl RecoveryCoordinator {
                                     outcome,
                                     cancelled: copy_cancelled.load(Ordering::Acquire),
                                 };
-                                let _ = completed_tx.send(result);
+                                let result_session_id = result.session_id.clone();
+                                if let Err(error) = completed_tx.send(result) {
+                                    tracing::debug!(
+                                        session_id = %result_session_id,
+                                        %error,
+                                        "recovery result dropped because the coordinator stopped"
+                                    );
+                                }
                             });
                         }
                     }
@@ -152,7 +167,14 @@ impl RecoveryCoordinator {
                                     // attempt nor be recorded as a checkpoint
                                     // failure against the session.
                                     policy.last_attempted_turn = None;
-                                    let _ = results_tx.send(result);
+                                    let result_session_id = result.session_id.clone();
+                                    if let Err(error) = results_tx.send(result) {
+                                        tracing::debug!(
+                                            session_id = %result_session_id,
+                                            %error,
+                                            "cancelled recovery result dropped because its consumer stopped"
+                                        );
+                                    }
                                     continue;
                                 }
                                 policy.record_failure(Utc::now());
@@ -169,7 +191,14 @@ impl RecoveryCoordinator {
                                 }
                             }
                         }
-                        let _ = results_tx.send(result);
+                        let result_session_id = result.session_id.clone();
+                        if let Err(error) = results_tx.send(result) {
+                            tracing::debug!(
+                                session_id = %result_session_id,
+                                %error,
+                                "recovery result dropped because its consumer stopped"
+                            );
+                        }
                     }
                 }
             }
@@ -334,6 +363,7 @@ mod tests {
 
     fn session_record(id: &str) -> SessionRecord {
         SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -446,6 +476,30 @@ mod tests {
         gate.cancel_busy("session-1");
         let next = gate.try_start("session-1").unwrap();
         assert!(!next.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn recovery_phase_distinguishes_the_blocking_snapshot_from_background_save() {
+        let gate = Arc::new(RecoveryGate::default());
+        gate.try_start("session-1").unwrap();
+        assert_eq!(
+            gate.phase("session-1"),
+            Some(RecoveryCheckpointPhase::Prestaging)
+        );
+
+        gate.set_phase("session-1", RecoveryCheckpointPhase::Snapshotting);
+        assert_eq!(
+            gate.phase("session-1"),
+            Some(RecoveryCheckpointPhase::Snapshotting)
+        );
+        gate.set_phase("session-1", RecoveryCheckpointPhase::Saving);
+        assert_eq!(
+            gate.phase("session-1"),
+            Some(RecoveryCheckpointPhase::Saving)
+        );
+
+        gate.finish("session-1");
+        assert_eq!(gate.phase("session-1"), None);
     }
 
     /// Cancelling a session that is not copying, or a session that never

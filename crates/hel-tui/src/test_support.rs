@@ -85,6 +85,7 @@ pub(crate) fn mouse_at_row(kind: MouseEventKind, area: Rect, row_offset: u16) ->
 pub(crate) fn config() -> HelConfig {
     HelConfig {
         version: CONFIG_VERSION,
+        phone: Default::default(),
         profiles: BTreeMap::from([
             (
                 "claude-1".into(),
@@ -148,6 +149,7 @@ pub(crate) fn config() -> HelConfig {
 
 pub(crate) fn stopped_session() -> SessionRecord {
     SessionRecord {
+        workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
         archived: false,
         container_cpus: None,
         container_memory: None,
@@ -207,6 +209,7 @@ pub(crate) fn dashboard_with_session(mut session: SessionRecord) -> DashboardSta
             version: STATE_VERSION,
             sessions: BTreeMap::from([(session.id.clone(), session)]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         },
         BTreeMap::new(),
     )
@@ -260,6 +263,21 @@ pub(crate) fn thought(position: u64, text: impl Into<String>) -> Arc<TranscriptI
             streaming: false,
         },
     )
+}
+
+pub(crate) fn session_restart(position: u64) -> Arc<TranscriptItem> {
+    let mut item = transcript_item(
+        position,
+        TranscriptBody::System {
+            text: hel::hel_transcript::SESSION_RESTART_TEXT.into(),
+        },
+    );
+    Arc::make_mut(&mut item).stable_id = format!(
+        "{}{}",
+        hel::hel_transcript::SESSION_RESTART_ITEM_PREFIX,
+        position
+    );
+    item
 }
 
 pub(crate) fn materialized_session_for(
@@ -329,12 +347,14 @@ pub(crate) fn operation(
     kind: SessionOperationKind,
     stage: Option<ProvisionStage>,
 ) -> SessionOperationDisplay {
+    let active_stages = stage
+        .map(|stage| [(stage, 1_000)].into_iter().collect())
+        .unwrap_or_default();
     SessionOperationDisplay {
         kind,
         started_at_epoch_seconds: 1_000,
         placeholder: None,
-        stage,
-        stage_started_at_epoch_seconds: stage.map(|_| 1_000),
+        active_stages,
         resume_destination: None,
     }
 }

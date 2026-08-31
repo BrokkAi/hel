@@ -11,13 +11,15 @@ use agent_client_protocol::schema::v1::{
     ToolCallContent, ToolCallLocation, ToolCallStatus,
 };
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
+use crate::hel_selection::{ContentPos, SelectionRange, SurfaceFrame, SurfaceId};
 use crate::hel_state::{MaterializedSession, TerminalOutputRecord, TranscriptBody, TranscriptItem};
 use crate::hel_transcript::{
     ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
@@ -369,18 +371,7 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
     entry.start_seq == item.position
         && entry.recorded_at_ms == Some(item.created_at_ms)
         && entry.revision == u64::try_from(item.last_changed_at_ms).unwrap_or_default()
-        && matches!(
-            (&entry.role, &item.body),
-            (ChatRole::User, TranscriptBody::User { .. })
-                | (ChatRole::Agent, TranscriptBody::Agent { .. })
-                | (ChatRole::Thought, TranscriptBody::Thought { .. })
-                | (ChatRole::Tool, TranscriptBody::Tool { .. })
-                | (ChatRole::Plan, TranscriptBody::Plan { .. })
-                | (
-                    ChatRole::System,
-                    TranscriptBody::System { .. } | TranscriptBody::TerminalOutput { .. }
-                )
-        )
+        && entry.role == entry_role(item)
         && match &item.body {
             TranscriptBody::Agent { .. } | TranscriptBody::Thought { .. } => {
                 entry.message_id.as_deref() == Some(item.stable_id.as_str())
@@ -390,6 +381,33 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
             }
             _ => true,
         }
+}
+
+/// The role one transcript item renders under.
+///
+/// The matcher and the builder both read it, so an entry is reused only when
+/// it would be rebuilt the same way.
+fn entry_role(item: &TranscriptItem) -> ChatRole {
+    match &item.body {
+        // A prompt Hel generated for a review is a control-origin record.
+        // Rendering it as the user's would put words in their mouth, so it
+        // reads as Hel's own line instead.
+        TranscriptBody::User { content } => {
+            if crate::hel_second_opinion::is_control_origin_prompt(&materialized_content_text(
+                content,
+            )) {
+                ChatRole::System
+            } else {
+                ChatRole::User
+            }
+        }
+        TranscriptBody::Agent { .. } => ChatRole::Agent,
+        TranscriptBody::Thought { .. } => ChatRole::Thought,
+        TranscriptBody::Tool { .. } => ChatRole::Tool,
+        TranscriptBody::Plan { .. } => ChatRole::Plan,
+        TranscriptBody::PlanProposal { .. } => ChatRole::PlanProposal,
+        TranscriptBody::System { .. } | TranscriptBody::TerminalOutput { .. } => ChatRole::System,
+    }
 }
 
 fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEntry {
@@ -410,7 +428,9 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
 fn item_update_ordinal(item: &TranscriptItem, frontier: u64) -> u64 {
     let latest = match &item.body {
         // Created once and never revisited, so the creating event is exact.
-        TranscriptBody::User { .. } | TranscriptBody::System { .. } => item.position,
+        TranscriptBody::User { .. }
+        | TranscriptBody::System { .. }
+        | TranscriptBody::PlanProposal { .. } => item.position,
         // Every appended chunk records the ordinal that appended it. Closing
         // the stream is the only other edit and nothing rendered reads it.
         TranscriptBody::Agent { .. } => item.latest_content_event_ordinal.unwrap_or(frontier),
@@ -430,7 +450,7 @@ fn materialized_chat_entry_with_diffstats(
     let mut entry = match &item.body {
         TranscriptBody::User { content } => ChatEntry::plain(
             item.position,
-            ChatRole::User,
+            entry_role(item),
             materialized_content_text(content),
         ),
         TranscriptBody::Agent { chunks, .. } => ChatEntry::plain(
@@ -448,7 +468,17 @@ fn materialized_chat_entry_with_diffstats(
             terminal_outputs,
             ..
         } => {
-            let call = ToolCall::deserialize(call).ok();
+            let call = match ToolCall::deserialize(call) {
+                Ok(call) => Some(call),
+                Err(error) => {
+                    tracing::warn!(
+                        stable_id = %item.stable_id,
+                        %error,
+                        "could not decode a stored tool call; rendering it as invalid"
+                    );
+                    None
+                }
+            };
             let mut entry = ChatEntry::tool(
                 item.position,
                 call.as_ref()
@@ -458,12 +488,28 @@ fn materialized_chat_entry_with_diffstats(
                     .map_or(ToolStatus::Pending, |call| tool_status(&call.status)),
             );
             if let Some(call) = call {
+                let fallback_terminal = crate::hel_acp::is_fallback_terminal_tool_call(&call);
                 entry.tool_content =
                     tool_content_details(&call.content, terminal_outputs, call.raw_output.as_ref());
                 entry.tool_diffstats = exact_diffstats
                     .cloned()
                     .unwrap_or_else(|| tool_diff_paths(&call.content));
                 entry.tool_locations = tool_location_details(&call.locations);
+                // Successful fallback calls replace the successful standalone
+                // terminal blocks Rich already omitted. Raw mode still keeps
+                // every command, while failures remain visible everywhere.
+                entry.raw_only = fallback_terminal
+                    && !terminal_outputs.is_empty()
+                    && terminal_outputs
+                        .iter()
+                        .all(TerminalOutputRecord::exited_cleanly);
+                if fallback_terminal && call.status == ToolCallStatus::Failed {
+                    let details = std::mem::take(&mut entry.tool_content);
+                    if !details.is_empty() {
+                        entry.text.push('\n');
+                        entry.text.push_str(&details.join("\n"));
+                    }
+                }
             }
             entry
         }
@@ -484,7 +530,14 @@ fn materialized_chat_entry_with_diffstats(
             item.position,
             Plan::deserialize(plan)
                 .map(|plan| plan.entries)
-                .unwrap_or_default()
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        stable_id = %item.stable_id,
+                        %error,
+                        "could not decode a stored plan; rendering it empty"
+                    );
+                    Vec::new()
+                })
                 .into_iter()
                 .map(|line| PlanLine {
                     text: sanitize_terminal_text(&line.content),
@@ -492,6 +545,9 @@ fn materialized_chat_entry_with_diffstats(
                 })
                 .collect(),
         ),
+        TranscriptBody::PlanProposal { plan, .. } => {
+            ChatEntry::plain(item.position, ChatRole::PlanProposal, plan)
+        }
         TranscriptBody::System { text } => ChatEntry::plain(item.position, ChatRole::System, text),
     };
     entry.seq = item_update_ordinal(item, frontier);
@@ -520,7 +576,13 @@ pub fn materialized_content_text(content: &[serde_json::Value]) -> String {
 pub fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
     chunks
         .iter()
-        .filter_map(|value| ContentChunk::deserialize(value).ok())
+        .filter_map(|value| match ContentChunk::deserialize(value) {
+            Ok(chunk) => Some(chunk),
+            Err(error) => {
+                tracing::warn!(%error, "could not decode a stored content chunk");
+                None
+            }
+        })
         .filter_map(|chunk| content_block_text(&chunk.content))
         .map(|text| sanitize_terminal_text(&text))
         .collect::<Vec<_>>()
@@ -552,6 +614,7 @@ fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
             ),
         ),
         ChatRole::Plan => ("plan", "Plan".to_owned()),
+        ChatRole::PlanProposal => ("plan-proposal", "Proposed plan".to_owned()),
         ChatRole::System => ("system", "Hel".to_owned()),
     };
     let source = if entry.role == ChatRole::Plan {
@@ -621,6 +684,75 @@ pub(super) enum TranscriptAnchor {
     Row { entry: usize, row: usize },
 }
 
+/// A concrete transcript position: `row` rendered rows into `entry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct AnchorRow {
+    entry: usize,
+    row: usize,
+}
+
+impl AnchorRow {
+    const fn anchor(self) -> TranscriptAnchor {
+        TranscriptAnchor::Row {
+            entry: self.entry,
+            row: self.row,
+        }
+    }
+}
+
+/// Content row the frozen base anchor of a transcript selection sits at.
+///
+/// Absolute transcript rows would need the rendered row count of every entry
+/// above the viewport, and those rows only exist once something renders them.
+/// A selection therefore lives in a drag-local row space whose origin is this
+/// constant, with enough headroom either side to scroll a long way in both
+/// directions without the space going negative.
+const SELECTION_BASE_ROW: i64 = 1 << 32;
+
+/// How far past the last visible row a scrolled-back transcript claims to
+/// reach. The engine only needs more rows than the viewport is tall to keep a
+/// drag's edge auto-scroll armed; the visible band is what clamps the cursor.
+const SELECTION_SCROLL_MARGIN_ROWS: usize = 4_096;
+
+/// Rows, or entries, one selection walk may cross before the row space is
+/// declared untrustworthy. A drag moves a few rows per frame; anything at this
+/// scale is a jump across history the selection cannot describe, and dropping
+/// it is cheaper and more honest than rendering the deep past to measure it.
+const SELECTION_WALK_BUDGET: usize = 20_000;
+
+/// The row space a transcript selection is measured in.
+///
+/// While no gesture is running the base is re-pinned to the viewport top every
+/// frame. A gesture freezes it, and each later frame reports its own top as
+/// the running sum of per-frame deltas — a handful of rows each, all warm in
+/// the render cache.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TranscriptSelectionSpace {
+    /// Viewport top when the base was pinned; content row [`SELECTION_BASE_ROW`].
+    base: AnchorRow,
+    /// Rows the current viewport top sits below `base`.
+    offset_rows: i64,
+    /// Viewport top the previous frame registered, to walk the delta from.
+    prev_top: AnchorRow,
+    /// Row layout the space was pinned against.
+    layout: TranscriptRowLayout,
+}
+
+/// What the transcript's rendered rows depend on wholesale. Any change moves
+/// rows under a frozen selection, so the space is re-pinned and the caller
+/// drops the selection instead of copying the wrong text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptRowLayout {
+    width: u16,
+    mode: TranscriptRenderMode,
+    generation: u64,
+}
+
+/// The content row `offset` rows from the base of a selection's row space.
+fn selection_row(offset: i64) -> usize {
+    usize::try_from(SELECTION_BASE_ROW.saturating_add(offset)).unwrap_or(0)
+}
+
 /// Drop cached rows that a width or mode change invalidated, and size the cache
 /// to the current entry count.
 fn prepare_render_cache(
@@ -629,12 +761,16 @@ fn prepare_render_cache(
     width: u16,
     mode: TranscriptRenderMode,
 ) {
-    if cache.width != width || cache.mode != mode {
+    let mode_changed = cache.mode != mode;
+    if cache.width != width || mode_changed {
         cache.width = width;
         cache.mode = mode;
         cache.entries.clear();
     }
     cache.entries.resize(entries.len(), None);
+    if !mode_changed && cache.collapse.len() == entries.len() {
+        return;
+    }
     let collapse = entry_collapse_states(entries, mode);
     for (index, state) in collapse.iter().enumerate() {
         if cache.collapse.get(index) != Some(state) {
@@ -646,6 +782,12 @@ fn prepare_render_cache(
 
 fn is_completed_tool(entry: &ChatEntry) -> bool {
     entry.role == ChatRole::Tool && entry.tool_status == Some(ToolStatus::Completed)
+}
+
+fn collapse_revision_fingerprint(entries: &[ChatEntry]) -> u64 {
+    entries.iter().fold(0u64, |accumulated, entry| {
+        accumulated.wrapping_mul(31).wrapping_add(entry.revision)
+    })
 }
 
 /// The newest completed tool keeps its full detail until a later user request,
@@ -726,9 +868,7 @@ fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> V
             // A member's update does not bump the head's revision, so fold the
             // streak's revisions into the head's state: its cached rows then
             // drop whenever any member changes.
-            let fingerprint = members.iter().fold(0u64, |accumulated, entry| {
-                accumulated.wrapping_mul(31).wrapping_add(entry.revision)
-            });
+            let fingerprint = collapse_revision_fingerprint(members);
             states[start] = EntryCollapse::Summary { end, fingerprint };
             // Omitted members render nothing either way, so one state covers
             // everything the head speaks for.
@@ -806,18 +946,32 @@ fn cached_entry_lines<'cache>(
     index: usize,
 ) -> &'cache [Line<'static>] {
     let entry = &entries[index];
-    let stale = cache.entries[index]
-        .as_ref()
-        .is_none_or(|cached| cached.revision != entry.revision);
+    let collapse = cache.collapse[index];
+    let stale_summary_fingerprint = match collapse {
+        EntryCollapse::Summary { end, fingerprint } => {
+            collapse_revision_fingerprint(&entries[index..end]) != fingerprint
+        }
+        _ => false,
+    };
+    let stale = stale_summary_fingerprint
+        || cache.entries[index]
+            .as_ref()
+            .is_none_or(|cached| cached.revision != entry.revision);
     if stale {
         let width = usize::from(cache.width);
-        let lines = match cache.collapse[index] {
+        let lines = match collapse {
             EntryCollapse::None => render_transcript_entry(entry, width, cache.mode),
             EntryCollapse::Hidden | EntryCollapse::Omitted => Vec::new(),
             EntryCollapse::Summary { end, .. } => {
                 collapsed_streak_lines(&entries[index..end], width, cache.mode)
             }
         };
+        if let EntryCollapse::Summary { end, .. } = collapse {
+            cache.collapse[index] = EntryCollapse::Summary {
+                end,
+                fingerprint: collapse_revision_fingerprint(&entries[index..end]),
+            };
+        }
         cache.entries[index] = Some(CachedEntry {
             revision: entry.revision,
             lines,
@@ -866,6 +1020,7 @@ impl ChatState {
     /// positions rather than editing one in place.
     pub(super) fn invalidate_render_cache(&mut self) {
         self.render_cache.clear();
+        self.render_cache_generation = self.render_cache_generation.wrapping_add(1);
     }
 
     /// How many leading transcript items this view has not converted yet. Zero
@@ -933,13 +1088,32 @@ impl ChatState {
             width,
             self.render_mode,
         );
-        let top = TranscriptAnchor::Row { entry: 0, row: 0 };
+        let top = AnchorRow { entry: 0, row: 0 };
         if self.entries.is_empty() && fallback.is_none() {
             return TranscriptViewport {
-                rows: vec![empty_transcript_row()],
+                rows: vec![empty_transcript_row(self.transcript_loading)],
                 anchor: TranscriptAnchor::Bottom,
                 top,
             };
+        }
+        if self.reveal_latest_agent_on_draw
+            && self.unconverted_prefix == 0
+            && self.anchor == TranscriptAnchor::Bottom
+        {
+            self.reveal_latest_agent_on_draw = false;
+            let tail = self.tail_viewport(height);
+            let latest_agent = self
+                .entries
+                .iter()
+                .rposition(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty());
+            let agent_is_above_tail = latest_agent.is_some_and(|agent| {
+                agent < tail.top.entry || agent == tail.top.entry && tail.top.row > 0
+            });
+            if let Some(entry) = latest_agent.filter(|_| agent_is_above_tail) {
+                self.anchor = TranscriptAnchor::Row { entry, row: 0 };
+            } else {
+                return tail;
+            }
         }
         if let TranscriptAnchor::Row { entry, row } = self.anchor
             && entry < self.entries.len()
@@ -972,11 +1146,11 @@ impl ChatState {
             // views already reach the newest row, so follow the tail instead of
             // painting a short page.
             if rows.len() == height {
-                let anchor = TranscriptAnchor::Row { entry, row };
+                let top = AnchorRow { entry, row };
                 return TranscriptViewport {
                     rows,
-                    anchor,
-                    top: anchor,
+                    anchor: top.anchor(),
+                    top,
                 };
             }
         }
@@ -987,7 +1161,7 @@ impl ChatState {
     /// rows always reach the newest row, so the anchor to store is `Bottom`.
     fn tail_viewport(&mut self, height: usize) -> TranscriptViewport {
         let mut rows: VecDeque<Line<'static>> = VecDeque::with_capacity(height);
-        let mut top = TranscriptAnchor::Row { entry: 0, row: 0 };
+        let mut top = AnchorRow { entry: 0, row: 0 };
         if height == 0 {
             return TranscriptViewport {
                 rows: rows.into(),
@@ -1016,7 +1190,7 @@ impl ChatState {
             for line in lines[start..].iter().rev() {
                 rows.push_front(line.clone());
             }
-            top = TranscriptAnchor::Row {
+            top = AnchorRow {
                 entry: index,
                 row: start,
             };
@@ -1067,8 +1241,10 @@ impl ChatState {
         ))
     }
 
-    /// Rendered row count for one entry, filling the cache on demand.
-    fn entry_rows(&mut self, index: usize) -> usize {
+    /// Bring the row cache in line with the current entries before a scroll
+    /// traversal. A collapsed run can cross hundreds of entries, so doing the
+    /// whole collapse pass again for every zero-row member would be quadratic.
+    fn prepare_entry_rows(&mut self) {
         let width = self.render_cache.width;
         prepare_render_cache(
             &self.entries,
@@ -1076,6 +1252,10 @@ impl ChatState {
             width,
             self.render_mode,
         );
+    }
+
+    /// Rendered row count for one entry after [`Self::prepare_entry_rows`].
+    fn entry_rows(&mut self, index: usize) -> usize {
         cached_entry_lines(&self.entries, &mut self.render_cache, index).len()
     }
 
@@ -1092,7 +1272,10 @@ impl ChatState {
             TranscriptAnchor::Row { entry, row } if entry < self.entries.len() => {
                 TranscriptAnchor::Row { entry, row }
             }
-            _ => self.tail_viewport(self.last_viewport_height.max(1)).top,
+            _ => self
+                .tail_viewport(self.last_viewport_height.max(1))
+                .top
+                .anchor(),
         })
     }
 
@@ -1102,6 +1285,7 @@ impl ChatState {
             // the viewport and has nothing above it.
             return;
         };
+        self.prepare_entry_rows();
         let mut remaining = rows;
         while remaining > 0 {
             if row > 0 {
@@ -1122,9 +1306,24 @@ impl ChatState {
         let Some(TranscriptAnchor::Row { mut entry, mut row }) = self.resolved_anchor() else {
             return;
         };
+        self.prepare_entry_rows();
         let mut remaining = rows;
         while remaining > 0 {
-            let below = self.entry_rows(entry).saturating_sub(row + 1);
+            let entry_rows = self.entry_rows(entry);
+            if entry_rows == 0 || row >= entry_rows {
+                // Rich rendering collapses a tool run into one summary entry
+                // and gives its other entries zero rows. They are not scroll
+                // distance: upward traversal already skips them, and charging
+                // for them here can strand the viewport in a long tool run.
+                if entry + 1 >= self.entries.len() {
+                    self.anchor = TranscriptAnchor::Bottom;
+                    return;
+                }
+                entry += 1;
+                row = 0;
+                continue;
+            }
+            let below = entry_rows - row - 1;
             if below >= remaining {
                 row += remaining;
                 break;
@@ -1137,8 +1336,275 @@ impl ChatState {
             entry += 1;
             row = 0;
         }
-        self.anchor = TranscriptAnchor::Row { entry, row };
+        let anchor = AnchorRow { entry, row };
+        // A scroll step can land exactly on the first row of the final
+        // screenful. That page fills the viewport, but it is still the live
+        // tail and must resume following new output. Resolve this on input so
+        // ordinary render frames do not have to scan the tail twice.
+        self.anchor = if self.tail_viewport(self.last_viewport_height.max(1)).top == anchor {
+            TranscriptAnchor::Bottom
+        } else {
+            anchor.anchor()
+        };
     }
+
+    /// What the current rendered rows depend on wholesale.
+    fn transcript_row_layout(&self) -> TranscriptRowLayout {
+        TranscriptRowLayout {
+            width: self.render_cache.width,
+            mode: self.render_mode,
+            generation: self.render_cache_generation,
+        }
+    }
+
+    /// Registers the transcript's selectable surface for this frame.
+    ///
+    /// `gesture_active` says whether the engine still owns a transcript
+    /// selection. While it does the base anchor stays frozen and this frame's
+    /// top is reported as an offset walked from the previous frame's; when it
+    /// does not, the base is re-pinned here so the next gesture starts from a
+    /// space that matches the screen.
+    fn register_transcript_surface(
+        &mut self,
+        inner: Rect,
+        top: AnchorRow,
+        visible_rows: usize,
+        at_tail: bool,
+        gesture_active: bool,
+    ) {
+        let layout = self.transcript_row_layout();
+        let frozen = self.transcript_selection.filter(|space| {
+            gesture_active && space.layout == layout && space.base.entry < self.entries.len()
+        });
+        if gesture_active && frozen.is_none() && self.transcript_selection.is_some() {
+            self.transcript_selection_invalid = true;
+        }
+        let top_row = match frozen {
+            Some(mut space) => match self.rows_between(space.prev_top, top) {
+                Some(delta) => {
+                    space.offset_rows = space.offset_rows.saturating_add(delta);
+                    space.prev_top = top;
+                    self.transcript_selection = Some(space);
+                    selection_row(space.offset_rows)
+                }
+                None => {
+                    self.transcript_selection_invalid = true;
+                    self.pin_transcript_selection(top, layout)
+                }
+            },
+            None => self.pin_transcript_selection(top, layout),
+        };
+        // A viewport that reaches the newest row reports its exact end, so a
+        // drag held below it stops extending; anything above the tail claims
+        // room beyond the screen, which is what keeps auto-scroll armed.
+        let total_rows = if at_tail {
+            top_row.saturating_add(visible_rows)
+        } else {
+            top_row
+                .saturating_add(visible_rows)
+                .saturating_add(SELECTION_SCROLL_MARGIN_ROWS)
+        };
+        self.frame_surfaces.push(SurfaceFrame::scrollable(
+            SurfaceId::Transcript,
+            inner,
+            top_row,
+            total_rows,
+        ));
+    }
+
+    /// Restarts the row space at the viewport top, and reports the content row
+    /// that top now sits at.
+    fn pin_transcript_selection(&mut self, top: AnchorRow, layout: TranscriptRowLayout) -> usize {
+        self.transcript_selection = Some(TranscriptSelectionSpace {
+            base: top,
+            offset_rows: 0,
+            prev_top: top,
+            layout,
+        });
+        selection_row(0)
+    }
+
+    /// Whether the transcript's selection row space stopped describing the
+    /// rows on screen since the last call, so the caller drops the selection.
+    pub fn transcript_selection_invalidated(&mut self) -> bool {
+        std::mem::take(&mut self.transcript_selection_invalid)
+    }
+
+    /// Rendered rows from `from` to `to`, negative when `to` sits above it.
+    ///
+    /// `None` when the walk would cross more rows or entries than
+    /// [`SELECTION_WALK_BUDGET`] allows: only a drag's own movement belongs in
+    /// this row space, and a jump across the deep past is not worth rendering
+    /// every entry in between to measure.
+    fn rows_between(&mut self, from: AnchorRow, to: AnchorRow) -> Option<i64> {
+        if from == to {
+            return Some(0);
+        }
+        let (start, end, sign) = if from < to {
+            (from, to, 1)
+        } else {
+            (to, from, -1)
+        };
+        if end.entry >= self.entries.len() || end.entry - start.entry > SELECTION_WALK_BUDGET {
+            return None;
+        }
+        self.prepare_entry_rows();
+        let rows = if start.entry == end.entry {
+            end.row.saturating_sub(start.row)
+        } else {
+            let mut rows = self.entry_rows(start.entry).saturating_sub(start.row);
+            for index in start.entry + 1..end.entry {
+                rows = rows.saturating_add(self.entry_rows(index));
+                if rows > SELECTION_WALK_BUDGET {
+                    return None;
+                }
+            }
+            rows.saturating_add(end.row)
+        };
+        if rows > SELECTION_WALK_BUDGET {
+            return None;
+        }
+        i64::try_from(rows).ok().map(|rows| sign * rows)
+    }
+
+    /// The position `offset` rendered rows from `from`, clamped to the ends of
+    /// the transcript. `None` when the walk exceeds the budget.
+    fn anchor_offset_by(&mut self, from: AnchorRow, offset: i64) -> Option<AnchorRow> {
+        if from.entry >= self.entries.len() {
+            return None;
+        }
+        let mut remaining = usize::try_from(offset.unsigned_abs()).ok()?;
+        if remaining > SELECTION_WALK_BUDGET {
+            return None;
+        }
+        self.prepare_entry_rows();
+        let mut entry = from.entry;
+        let mut row = from.row;
+        let mut steps = 0usize;
+        while remaining > 0 {
+            steps += 1;
+            if steps > SELECTION_WALK_BUDGET {
+                return None;
+            }
+            if offset > 0 {
+                let rows = self.entry_rows(entry);
+                let available = rows.saturating_sub(row);
+                if available > remaining {
+                    row += remaining;
+                    remaining = 0;
+                } else {
+                    remaining -= available;
+                    if entry + 1 >= self.entries.len() {
+                        row = rows;
+                        break;
+                    }
+                    entry += 1;
+                    row = 0;
+                }
+            } else if row > 0 {
+                let step = remaining.min(row);
+                row -= step;
+                remaining -= step;
+            } else if entry > 0 {
+                entry -= 1;
+                row = self.entry_rows(entry);
+            } else {
+                break;
+            }
+        }
+        Some(AnchorRow { entry, row })
+    }
+
+    /// `count` rendered rows starting at `start`, from the render cache.
+    fn transcript_rows_from(
+        &mut self,
+        start: AnchorRow,
+        count: usize,
+    ) -> Option<Vec<Line<'static>>> {
+        if start.entry >= self.entries.len() || count > SELECTION_WALK_BUDGET {
+            return None;
+        }
+        self.prepare_entry_rows();
+        let mut rows = Vec::with_capacity(count);
+        let mut skip = start.row;
+        for index in start.entry..self.entries.len() {
+            if index - start.entry > SELECTION_WALK_BUDGET {
+                return None;
+            }
+            let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
+            for line in lines.iter().skip(skip) {
+                if rows.len() == count {
+                    break;
+                }
+                rows.push(line.clone());
+            }
+            skip = 0;
+            if rows.len() == count {
+                break;
+            }
+        }
+        Some(rows)
+    }
+
+    /// The transcript text a finished selection covers.
+    ///
+    /// Rows come from the render cache, so rows scrolled out of the viewport
+    /// are copied without the frame buffer holding them. Only endpoints that
+    /// cut a row mid-column go back through a one-row render, which is what
+    /// gives the engine the cells it needs to slice wide characters.
+    pub fn transcript_selection_text(&mut self, range: &SelectionRange) -> Option<String> {
+        let space = self.transcript_selection?;
+        let width = self.render_cache.width;
+        if width == 0 {
+            return None;
+        }
+        let offset = i64::try_from(range.start.row).ok()? - SELECTION_BASE_ROW;
+        let start = self.anchor_offset_by(space.base, offset)?;
+        let count = range.end.row.checked_sub(range.start.row)?.checked_add(1)?;
+        let rows = self.transcript_rows_from(start, count)?;
+        let text = rows
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let row = range.start.row.saturating_add(index);
+                match range.columns_on(row, width) {
+                    Some((first, last)) if first > 0 || last + 1 < width => {
+                        sliced_row_text(line, width, first, last)
+                    }
+                    _ => row_text(line),
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(text.join("\n"))
+    }
+}
+
+/// One cached transcript row as plain text.
+fn row_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// One cached transcript row cut to `first..=last`.
+///
+/// The row is drawn the way the transcript draws it, so the engine slices the
+/// same cells that are on screen rather than a second column model.
+fn sliced_row_text(line: &Line<'static>, width: u16, first: u16, last: u16) -> String {
+    let area = Rect::new(0, 0, width, 1);
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(line.clone()).render(area, &mut buffer);
+    crate::hel_selection::extract_rows(
+        &buffer,
+        &SurfaceFrame::fixed(SurfaceId::Transcript, area),
+        &SelectionRange {
+            start: ContentPos::new(0, first),
+            end: ContentPos::new(0, last),
+        },
+    )
 }
 
 const TERMINAL_COMMAND_PREVIEW_CHARACTERS: usize = 160;
@@ -1310,7 +1776,17 @@ pub fn materialized_tool_diffstats(item: &TranscriptItem) -> Option<Vec<String>>
     let TranscriptBody::Tool { call, .. } = &item.body else {
         return None;
     };
-    let call = ToolCall::deserialize(call).ok()?;
+    let call = match ToolCall::deserialize(call) {
+        Ok(call) => call,
+        Err(error) => {
+            tracing::warn!(
+                stable_id = %item.stable_id,
+                %error,
+                "could not decode a stored tool call while reading diff summary"
+            );
+            return None;
+        }
+    };
     if !matches!(
         tool_status(&call.status),
         ToolStatus::Completed | ToolStatus::Failed
@@ -1333,7 +1809,17 @@ impl ToolDiffstatRequest {
         let TranscriptBody::Tool { call, .. } = &item.body else {
             return None;
         };
-        let call = ToolCall::deserialize(call).ok()?;
+        let call = match ToolCall::deserialize(call) {
+            Ok(call) => call,
+            Err(error) => {
+                tracing::warn!(
+                    stable_id = %item.stable_id,
+                    %error,
+                    "could not decode a stored tool call while scheduling diff summary"
+                );
+                return None;
+            }
+        };
         let terminal = matches!(
             tool_status(&call.status),
             ToolStatus::Completed | ToolStatus::Failed
@@ -1381,24 +1867,21 @@ pub(super) fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<Strin
         .collect()
 }
 
-pub(super) fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
+pub(super) fn render_transcript(
+    frame: &mut Frame,
+    area: Rect,
+    chat: &mut ChatState,
+    gesture_active: bool,
+) {
     let viewport_height = usize::from(area.height.saturating_sub(2));
     chat.last_viewport_height = viewport_height;
     let window = chat.viewport(area.width, viewport_height);
     // The window resolves and clamps the anchor: an anchor inside the last
     // screenful snaps back to following the tail.
     chat.anchor = window.anchor;
-    let title = match (chat.anchor, chat.render_mode) {
-        (TranscriptAnchor::Bottom, TranscriptRenderMode::Rich) => " Conversation ".to_owned(),
-        (TranscriptAnchor::Bottom, TranscriptRenderMode::Raw) => {
-            " Conversation · raw source ".to_owned()
-        }
-        (TranscriptAnchor::Row { entry, .. }, _) => format!(
-            " Conversation · message {} of {} · End to follow ",
-            entry.saturating_add(1),
-            chat.entries.len()
-        ),
-    };
+    let at_tail = window.anchor == TranscriptAnchor::Bottom;
+    let top = window.top;
+    let title = transcript_title(chat, crate::clock::epoch_seconds());
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .title(title)
@@ -1410,7 +1893,35 @@ pub(super) fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatSt
         .into_iter()
         .take(usize::from(inner.height))
         .collect::<Vec<_>>();
+    let visible_rows = visible.len();
     frame.render_widget(Paragraph::new(visible), inner);
+    chat.register_transcript_surface(inner, top, visible_rows, at_tail, gesture_active);
+}
+
+fn transcript_title(chat: &ChatState, now_epoch_seconds: u64) -> String {
+    let summary = if chat.header_target.is_empty() || chat.header_profile.is_empty() {
+        "Conversation".to_owned()
+    } else {
+        crate::usage_format::format_session_summary(
+            &chat.header_target,
+            chat.queued_prompts.len(),
+            now_epoch_seconds,
+            chat.turn_started_at_epoch_seconds,
+            chat.last_acp_activity_at_ms,
+            &chat.header_profile,
+        )
+    };
+    match (chat.anchor, chat.render_mode) {
+        (TranscriptAnchor::Bottom, TranscriptRenderMode::Rich) => format!(" {summary} "),
+        (TranscriptAnchor::Bottom, TranscriptRenderMode::Raw) => {
+            format!(" {summary} · raw source ")
+        }
+        (TranscriptAnchor::Row { entry, .. }, _) => format!(
+            " {summary} · message {} of {} · End to follow ",
+            entry.saturating_add(1),
+            chat.entries.len()
+        ),
+    }
 }
 
 const ROLE_GUTTER: &str = "│ ";
@@ -1490,14 +2001,18 @@ pub(super) fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'st
         ));
     }
     if lines.is_empty() {
-        lines.push(empty_transcript_row());
+        lines.push(empty_transcript_row(chat.transcript_loading));
     }
     lines
 }
 
-fn empty_transcript_row() -> Line<'static> {
+fn empty_transcript_row(loading: bool) -> Line<'static> {
     Line::from(Span::styled(
-        "No messages yet — send a prompt to begin.",
+        if loading {
+            "Loading…"
+        } else {
+            "No messages yet — send a prompt to begin."
+        },
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
@@ -1511,7 +2026,19 @@ struct TranscriptViewport {
     /// The anchor to store: `Bottom` whenever these rows reach the newest row.
     anchor: TranscriptAnchor,
     /// The entry and row the first visible row came from.
-    top: TranscriptAnchor,
+    top: AnchorRow,
+}
+
+/// One entry's rows, header included, at `width`.
+///
+/// The reviewer pane draws with this so its conversation looks exactly like
+/// the primary's rather than growing a second renderer.
+pub(super) fn render_entry_rows(
+    entry: &ChatEntry,
+    width: usize,
+    mode: TranscriptRenderMode,
+) -> Vec<Line<'static>> {
+    render_transcript_entry(entry, width, mode)
 }
 
 fn render_transcript_entry(
@@ -1559,7 +2086,8 @@ fn entry_body_rows(
         .collect()
 }
 
-fn format_event_time(recorded_at_ms: Option<i64>) -> Option<String> {
+/// Format an optional transcript event timestamp as local 24-hour time.
+pub fn format_event_time(recorded_at_ms: Option<i64>) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(recorded_at_ms?).map(|time| {
         time.with_timezone(&chrono::Local)
             .format("%H:%M")
@@ -1684,6 +2212,16 @@ fn entry_visual(entry: &ChatEntry) -> EntryVisual {
                 rail_style: style,
             }
         }
+        ChatRole::PlanProposal => {
+            let style = Style::default().fg(Color::LightMagenta);
+            EntryVisual {
+                glyph: "◈",
+                label: "Proposed plan".into(),
+                header_style: style,
+                body_style: Style::default(),
+                rail_style: style,
+            }
+        }
         ChatRole::System => {
             let style = Style::default().fg(Color::DarkGray);
             EntryVisual {
@@ -1720,2252 +2258,4 @@ fn line_is_empty(line: &Line<'_>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::hel_acp::RuntimeEvent;
-    use crate::hel_chat::test_support::{
-        agent_message_item, agent_transcript_item, drawn_transcript, key, line_text, mouse_in,
-        queued, snapshot, transcript_text,
-    };
-    use crate::hel_worker::{SequencedEvent, WorkerEvent};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-
-    fn completed_tool(seq: u64, title: &str) -> ChatEntry {
-        ChatEntry::tool(seq, title, None, ToolStatus::Completed)
-    }
-
-    #[test]
-    fn live_unclaimed_terminal_renders_a_quiet_running_card() {
-        let started_at_ms = crate::clock::epoch_millis();
-        let terminal = crate::hel_worker::ActiveAgentTerminal {
-            terminal_id: "term-1".into(),
-            command: "cargo mutants --in-diff diff".into(),
-            started_at_ms,
-        };
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        let session = MaterializedSession::empty("session-live-terminal");
-        chat.set_active_agent_terminals(std::slice::from_ref(&terminal), &session);
-
-        let rendered = transcript_text(&mut chat, 80);
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains("cargo mutants --in-diff diff")),
-            "the command identifies useful live work: {rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.contains("Running ·")),
-            "the card says that the command is still running: {rendered:?}"
-        );
-        assert!(
-            !rendered.iter().any(|line| line.contains("No messages yet")),
-            "live work replaces the misleading empty state: {rendered:?}"
-        );
-
-        chat.set_active_agent_terminals(&[], &session);
-        let after_exit = transcript_text(&mut chat, 80);
-        assert!(
-            after_exit
-                .iter()
-                .any(|line| line.contains("No messages yet")),
-            "a successful exit removes the provisional card: {after_exit:?}"
-        );
-    }
-
-    #[test]
-    fn real_tool_claim_suppresses_only_the_matching_terminal_incarnation() {
-        let claimed_at_ms = crate::clock::epoch_millis();
-        let mut session = MaterializedSession::empty("session-terminal-claim");
-        session.applied_event_ordinal = 1;
-        session.applied_event_digest = "a".repeat(64);
-        session.transcript = vec![Arc::new(TranscriptItem {
-            stable_id: "tool:shell".into(),
-            position: 1,
-            latest_content_event_ordinal: None,
-            created_at_ms: claimed_at_ms,
-            last_changed_at_ms: claimed_at_ms,
-            body: TranscriptBody::Tool {
-                call: serde_json::json!({
-                    "toolCallId": "shell",
-                    "title": "Shell",
-                    "status": "in_progress",
-                    "content": [{"type": "terminal", "terminalId": "term-1"}]
-                }),
-                terminal_outputs: Vec::new(),
-                terminal_refs: vec!["term-1".into()],
-            },
-        })];
-        let mut chat = ChatState::from_materialized(&session, &[], &[]);
-        chat.set_active_agent_terminals(
-            &[crate::hel_worker::ActiveAgentTerminal {
-                terminal_id: "term-1".into(),
-                command: "hidden fallback command".into(),
-                started_at_ms: claimed_at_ms,
-            }],
-            &session,
-        );
-
-        let claimed = transcript_text(&mut chat, 80);
-        assert!(
-            !claimed
-                .iter()
-                .any(|line| line.contains("hidden fallback command")),
-            "the ACP tool card owns its live terminal: {claimed:?}"
-        );
-
-        chat.set_active_agent_terminals(
-            &[crate::hel_worker::ActiveAgentTerminal {
-                terminal_id: "term-1".into(),
-                command: "new bridge command".into(),
-                started_at_ms: claimed_at_ms + 1,
-            }],
-            &session,
-        );
-        let reused = transcript_text(&mut chat, 80);
-        assert!(
-            reused
-                .iter()
-                .any(|line| line.contains("new bridge command")),
-            "an old claim cannot hide a reused id after restart: {reused:?}"
-        );
-    }
-
-    fn thought(seq: u64, text: &str) -> ChatEntry {
-        ChatEntry::plain(seq, ChatRole::Thought, text)
-    }
-
-    /// A chat with `count` single-line user messages, each naming its index so
-    /// scroll assertions can name the row they expect to see.
-    fn numbered_chat(count: usize) -> ChatState {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries = (0..count)
-            .map(|index| ChatEntry::plain(index as u64, ChatRole::User, format!("message {index}")))
-            .collect();
-        chat
-    }
-
-    fn mouse(kind: MouseEventKind) -> MouseEvent {
-        MouseEvent {
-            kind,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }
-    }
-
-    fn user_transcript_item(position: u64, text: &str) -> Arc<TranscriptItem> {
-        Arc::new(TranscriptItem {
-            stable_id: format!("user:{position}"),
-            position,
-            latest_content_event_ordinal: None,
-            created_at_ms: position as i64 * 10,
-            last_changed_at_ms: position as i64 * 10,
-            body: TranscriptBody::User {
-                content: vec![serde_json::json!(text)],
-            },
-        })
-    }
-
-    /// Transcript items for the tail-first tests. Every item carries the same
-    /// timestamps, so entries share a revision and a row cached at one position
-    /// would be served at any other position the cache still believes in.
-    const FIXTURE_MS: i64 = 7;
-
-    fn fixture_item(position: u64, stable_id: String, body: TranscriptBody) -> Arc<TranscriptItem> {
-        Arc::new(TranscriptItem {
-            stable_id,
-            position,
-            // The projection requires an agent message to carry the ordinal of
-            // its latest content chunk, and carries none for anything else.
-            latest_content_event_ordinal: matches!(body, TranscriptBody::Agent { .. })
-                .then_some(position),
-            created_at_ms: FIXTURE_MS,
-            last_changed_at_ms: FIXTURE_MS,
-            body,
-        })
-    }
-
-    fn fixture_user_item(position: u64) -> Arc<TranscriptItem> {
-        fixture_item(
-            position,
-            format!("user:{position}"),
-            TranscriptBody::User {
-                content: vec![serde_json::json!(format!("question {position}"))],
-            },
-        )
-    }
-
-    fn fixture_agent_item(position: u64) -> Arc<TranscriptItem> {
-        fixture_item(
-            position,
-            format!("agent:{position}"),
-            TranscriptBody::Agent {
-                // Multi-kilobyte, so the conversion cost is realistic.
-                chunks: (0..8)
-                    .map(|chunk| {
-                        serde_json::json!({
-                            "content": {
-                                "type": "text",
-                                "text": format!("answer {position}.{chunk} ").repeat(40)
-                            }
-                        })
-                    })
-                    .collect(),
-                streaming: false,
-            },
-        )
-    }
-
-    fn fixture_thought_item(position: u64) -> Arc<TranscriptItem> {
-        fixture_item(
-            position,
-            format!("thought:{position}"),
-            TranscriptBody::Thought {
-                chunks: vec![serde_json::json!({
-                    "content": {"type": "text", "text": format!("thinking about {position}")}
-                })],
-                streaming: false,
-            },
-        )
-    }
-
-    fn fixture_tool_item(position: u64) -> Arc<TranscriptItem> {
-        fixture_item(
-            position,
-            format!("tool:{position}"),
-            TranscriptBody::Tool {
-                call: serde_json::json!({
-                    "toolCallId": format!("call-{position}"),
-                    "title": format!("read file-{position}"),
-                    "status": "completed",
-                    "content": [{
-                        "type": "content",
-                        "content": {"type": "text", "text": "output ".repeat(600)}
-                    }],
-                    "locations": [{"path": format!("src/file-{position}.rs"), "line": 3}]
-                }),
-                terminal_outputs: Vec::new(),
-                terminal_refs: Vec::new(),
-            },
-        )
-    }
-
-    fn fixture_plan_item(position: u64) -> Arc<TranscriptItem> {
-        fixture_item(
-            position,
-            format!("plan:{position}"),
-            TranscriptBody::Plan {
-                plan: serde_json::json!({
-                    "entries": [{
-                        "content": format!("step {position}"),
-                        "priority": "medium",
-                        "status": "in_progress"
-                    }]
-                }),
-            },
-        )
-    }
-
-    fn fixture_system_item(position: u64) -> Arc<TranscriptItem> {
-        fixture_item(
-            position,
-            format!("system:{position}"),
-            TranscriptBody::System {
-                text: format!("notice {position}"),
-            },
-        )
-    }
-
-    /// A conversation with the mix of bodies a real session carries, its first
-    /// item at `first_position`. A compaction rewrite replaces the history in
-    /// place, so it produces the same shape of transcript at fresh ordinals.
-    fn materialized_session_from(first_position: u64, items: u64) -> MaterializedSession {
-        let mut session = MaterializedSession::empty("session-long");
-        session.transcript = (first_position..first_position + items)
-            .map(|position| match position % 6 {
-                0 => fixture_tool_item(position),
-                1 => fixture_user_item(position),
-                2 => fixture_agent_item(position),
-                3 => fixture_thought_item(position),
-                4 => fixture_plan_item(position),
-                _ => fixture_system_item(position),
-            })
-            .collect();
-        session.applied_event_ordinal = first_position + items;
-        session
-    }
-
-    /// A conversation with the mix of bodies a real session carries.
-    fn long_materialized_session(items: u64) -> MaterializedSession {
-        materialized_session_from(1, items)
-    }
-
-    fn entry_texts(entries: &[ChatEntry]) -> Vec<&str> {
-        entries.iter().map(|entry| entry.text.as_str()).collect()
-    }
-
-    fn converted_prefix(session: &MaterializedSession, chat: &ChatState) -> Vec<ChatEntry> {
-        materialized_prefix_entries(
-            &session.transcript[..chat.unconverted_prefix()],
-            session.applied_event_ordinal,
-        )
-    }
-
-    #[test]
-    fn materialized_conversion_preserves_each_transcript_body() {
-        let mut session = MaterializedSession::empty("session-bodies");
-        session.applied_event_ordinal = 9;
-        session.transcript = vec![
-            fixture_user_item(1),
-            fixture_agent_item(2),
-            fixture_thought_item(3),
-            fixture_tool_item(4),
-            fixture_plan_item(5),
-            fixture_system_item(6),
-        ];
-
-        let entries = materialized_chat_entries(&session);
-
-        let roles = entries.iter().map(|entry| entry.role).collect::<Vec<_>>();
-        assert_eq!(
-            roles,
-            [
-                ChatRole::User,
-                ChatRole::Agent,
-                ChatRole::Thought,
-                ChatRole::Tool,
-                ChatRole::Plan,
-                ChatRole::System,
-            ]
-        );
-        assert_eq!(entries[0].text, "question 1");
-        assert!(entries[1].text.starts_with("answer 2.0 "));
-        assert_eq!(entries[1].text.len(), 8 * 40 * "answer 2.0 ".len());
-        assert_eq!(entries[1].message_id.as_deref(), Some("agent:2"));
-        assert_eq!(entries[2].text, "thinking about 3");
-        assert_eq!(entries[3].text, "read file-4");
-        assert_eq!(entries[3].tool_status, Some(ToolStatus::Completed));
-        assert_eq!(entries[3].tool_call_id.as_deref(), Some("tool:4"));
-        assert_eq!(entries[3].tool_content.len(), 1);
-        assert_eq!(entries[3].tool_locations, ["src/file-4.rs:3"]);
-        assert_eq!(entries[4].plan.len(), 1);
-        assert_eq!(entries[4].plan[0].text, "step 5");
-        assert_eq!(entries[4].plan[0].status, PlanStatus::Running);
-        assert_eq!(entries[5].text, "notice 6");
-        for (index, entry) in entries.iter().enumerate() {
-            assert_eq!(entry.start_seq, index as u64 + 1);
-            assert_eq!(entry.recorded_at_ms, Some(FIXTURE_MS));
-            assert_eq!(entry.revision, FIXTURE_MS as u64);
-        }
-        // The bodies the projection records a change ordinal for keep their
-        // own cursor; the ones it edits in place without one keep the frontier.
-        assert_eq!(
-            entries.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
-            [1, 2, 9, 9, 9, 6]
-        );
-    }
-
-    #[test]
-    fn opening_a_long_session_converts_only_the_tail() {
-        let items = TAIL_SEED_ITEMS as u64 + 400;
-        let session = long_materialized_session(items);
-
-        let chat = ChatState::from_materialized_tail(&session, &[], &[]);
-
-        assert_eq!(chat.entries.len(), TAIL_SEED_ITEMS);
-        assert_eq!(chat.unconverted_prefix(), 400);
-        let eager = materialized_chat_entries(&session);
-        assert_eq!(chat.entries, eager[400..]);
-    }
-
-    #[test]
-    fn opening_a_short_session_converts_the_whole_transcript() {
-        let session = long_materialized_session(TAIL_SEED_ITEMS as u64);
-
-        let chat = ChatState::from_materialized_tail(&session, &[], &[]);
-
-        assert_eq!(chat.unconverted_prefix(), 0);
-        assert_eq!(chat.entries, materialized_chat_entries(&session));
-    }
-
-    #[test]
-    fn splicing_the_converted_prefix_matches_the_eager_projection() {
-        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 500);
-        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
-        let prefix = converted_prefix(&session, &chat);
-
-        assert!(chat.splice_transcript_prefix(prefix));
-
-        assert_eq!(chat.unconverted_prefix(), 0);
-        assert_eq!(chat.entries, materialized_chat_entries(&session));
-    }
-
-    #[test]
-    fn an_update_while_the_prefix_is_pending_keeps_the_tail_and_still_splices() {
-        let mut session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 300);
-        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
-        let prefix = converted_prefix(&session, &chat);
-        let pending = chat.unconverted_prefix();
-
-        let appended = session.transcript.len() as u64 + 1;
-        session.transcript.push(fixture_user_item(appended));
-        session.transcript.push(fixture_agent_item(appended + 1));
-        session.applied_event_ordinal = appended + 2;
-        chat.apply_materialized(&session, &[], &[]);
-
-        assert_eq!(chat.unconverted_prefix(), pending);
-        assert_eq!(chat.entries.len(), session.transcript.len() - pending);
-        assert_eq!(
-            entry_texts(&chat.entries),
-            entry_texts(&materialized_chat_entries(&session)[pending..])
-        );
-
-        assert!(chat.splice_transcript_prefix(prefix));
-        assert_eq!(
-            entry_texts(&chat.entries),
-            entry_texts(&materialized_chat_entries(&session))
-        );
-        assert!(
-            chat.entries
-                .windows(2)
-                .all(|pair| pair[0].start_seq < pair[1].start_seq)
-        );
-    }
-
-    #[test]
-    fn splicing_the_prefix_drops_render_rows_cached_at_the_old_positions() {
-        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 120);
-        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
-        let prefix = converted_prefix(&session, &chat);
-        // Fill the cache while the entries still stand for the tail only.
-        chat.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
-        let tail_top = drawn_transcript(&mut chat, 60, 24);
-        assert!(shows(&tail_top, "question 121"));
-
-        assert!(chat.splice_transcript_prefix(prefix));
-        chat.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
-        let spliced_top = drawn_transcript(&mut chat, 60, 24);
-
-        let mut eager = ChatState::from_materialized(&session, &[], &[]);
-        eager.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
-        assert_eq!(spliced_top, drawn_transcript(&mut eager, 60, 24));
-        assert!(shows(&spliced_top, "question 1"));
-        assert!(!shows(&spliced_top, "question 121"));
-    }
-
-    #[test]
-    fn a_prefix_that_no_longer_meets_the_tail_is_refused() {
-        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 60);
-        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
-        let pending = chat.unconverted_prefix();
-        // History from a compacted transcript: the right length, but it runs
-        // past the first entry the tail holds.
-        let stale = materialized_prefix_entries(
-            &session.transcript[session.transcript.len() - pending..],
-            session.applied_event_ordinal,
-        );
-
-        assert!(!chat.splice_transcript_prefix(stale));
-
-        assert_eq!(chat.unconverted_prefix(), pending);
-        assert_eq!(chat.entries.len(), TAIL_SEED_ITEMS);
-    }
-
-    #[test]
-    fn a_prefix_from_replaced_history_is_refused_when_the_rewrite_keeps_the_length() {
-        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 60);
-        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
-        let stale = converted_prefix(&session, &chat);
-        let pending = chat.unconverted_prefix();
-        assert_eq!(stale.len(), pending);
-
-        // Compaction rewrites the whole conversation at fresh ordinals and
-        // leaves it exactly as long, so counting alone still lines up.
-        let rewritten = materialized_session_from(1_000, session.transcript.len() as u64);
-        chat.apply_materialized(&rewritten, &[], &[]);
-        assert_eq!(chat.unconverted_prefix(), pending);
-        assert!(
-            stale.last().unwrap().start_seq < chat.entries[0].start_seq,
-            "the replaced history still sorts in front of the rewritten tail"
-        );
-
-        assert!(!chat.splice_transcript_prefix(stale));
-
-        assert_eq!(chat.unconverted_prefix(), pending);
-        assert_eq!(
-            entry_texts(&chat.entries),
-            entry_texts(&materialized_chat_entries(&rewritten)[pending..])
-        );
-    }
-
-    #[test]
-    fn compaction_below_the_pending_prefix_reseats_the_tail() {
-        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 500);
-        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
-        let prefix = converted_prefix(&session, &chat);
-
-        // Compaction leaves a transcript shorter than the pending prefix.
-        let mut compacted = long_materialized_session(TAIL_SEED_ITEMS as u64 + 100);
-        compacted.applied_event_ordinal = session.applied_event_ordinal + 1;
-        chat.apply_materialized(&compacted, &[], &[]);
-
-        assert_eq!(chat.unconverted_prefix(), 100);
-        assert_eq!(chat.entries.len(), TAIL_SEED_ITEMS);
-        assert_eq!(
-            entry_texts(&chat.entries),
-            entry_texts(&materialized_chat_entries(&compacted)[100..])
-        );
-        // The history built against the old transcript no longer fits.
-        assert!(!chat.splice_transcript_prefix(prefix));
-    }
-
-    fn shows(rows: &[String], needle: &str) -> bool {
-        rows.iter().any(|row| row.contains(needle))
-    }
-
-    /// The message bodies on screen, ignoring the title and composer chrome.
-    fn visible_messages(rows: &[String]) -> Vec<String> {
-        rows.iter()
-            .filter(|row| row.starts_with("│ message "))
-            .cloned()
-            .collect()
-    }
-
-    fn browser_tail_label(entry: &BrowserTranscriptEntry) -> String {
-        format!("{}: {}", entry.label, entry.lines[0])
-    }
-
-    #[test]
-    fn reset_interaction_preserves_projected_transcript_and_render_cache() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries
-            .push(ChatEntry::plain(1, ChatRole::Agent, "cached response"));
-        let _ = transcript_text(&mut chat, 80);
-        chat.set_input("draft".into());
-        chat.prompt_history.push("previous".into());
-        chat.queued_prompts.push_back(queued("queued-1", "queued"));
-        chat.anchor = TranscriptAnchor::Row { entry: 0, row: 4 };
-        chat.set_notice("temporary");
-        chat.voice_active = true;
-
-        chat.reset_interaction();
-
-        assert_eq!(chat.entries.len(), 1);
-        assert!(chat.render_cache.entries[0].is_some());
-        assert_eq!(chat.input, "draft");
-        assert_eq!(chat.input_cursor, "draft".len());
-        assert!(chat.prompt_history.is_empty());
-        assert!(chat.queued_prompts.is_empty());
-        assert_eq!(chat.anchor, TranscriptAnchor::Bottom);
-        assert!(chat.notice().is_none());
-        assert!(!chat.voice_active);
-    }
-
-    #[test]
-    fn user_and_agent_headers_show_first_event_time_as_local_hours_and_minutes() {
-        let expected = format_event_time(Some(0)).unwrap();
-        let runtime = |text| RuntimeEvent::SessionUpdate {
-            update: serde_json::json!({
-                "sessionUpdate": "agent_message_chunk",
-                "messageId": "message-1",
-                "content": {"type": "text", "text": text}
-            }),
-        };
-        let events = vec![
-            SequencedEvent {
-                seq: 1,
-                recorded_at_ms: Some(0),
-                request_id: Some("p".into()),
-                event: WorkerEvent::PromptAccepted {
-                    request_id: "p".into(),
-                    text: "work".into(),
-                    attachments: vec![],
-                },
-            },
-            SequencedEvent {
-                seq: 2,
-                recorded_at_ms: Some(0),
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::to_value(runtime("do")).unwrap(),
-                },
-            },
-            SequencedEvent {
-                seq: 3,
-                recorded_at_ms: Some(60_000),
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::to_value(runtime("ne")).unwrap(),
-                },
-            },
-        ];
-        let mut initial = snapshot();
-        initial.latest_seq = 3;
-        let mut chat = ChatState::new(&initial, &events);
-        let lines = transcript_text(&mut chat, 80);
-
-        assert!(lines.contains(&format!("❯ You · {expected}")));
-        assert!(lines.contains(&format!("● Agent · {expected}")));
-        assert_eq!(chat.entries[1].text, "done");
-        assert_eq!(chat.entries[1].recorded_at_ms, Some(0));
-    }
-
-    #[test]
-    fn tool_call_updates_refresh_the_rendered_status() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.apply_session_update(
-            1,
-            &serde_json::json!({
-                "sessionUpdate": "tool_call",
-                "toolCallId": "read-config",
-                "title": "read config",
-                "status": "pending"
-            }),
-        );
-        chat.apply_session_update(
-            2,
-            &serde_json::json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "read-config",
-                "status": "completed"
-            }),
-        );
-
-        assert_eq!(chat.entries.len(), 1);
-        assert_eq!(chat.entries[0].tool_status, Some(ToolStatus::Completed));
-        assert_eq!(tool_presentation(ToolStatus::Completed).1, "done");
-    }
-
-    #[test]
-    fn live_acp_diffs_render_paths_without_counting_lines_on_the_event_loop() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.apply_session_update(
-            1,
-            &serde_json::json!({
-                "sessionUpdate": "tool_call",
-                "toolCallId": "edit-lib",
-                "title": "Edit src/lib.rs",
-                "status": "in_progress",
-                "content": [{
-                    "type": "diff",
-                    "path": "/workspace/src/lib.rs",
-                    "oldText": "alpha\n",
-                    "newText": "alpha\nbeta\n"
-                }]
-            }),
-        );
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "● Tool · running",
-                "│ Edit src/lib.rs",
-                "│ /workspace/src/lib.rs",
-                ""
-            ]
-        );
-
-        chat.apply_session_update(
-            2,
-            &serde_json::json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "edit-lib",
-                "status": "completed",
-                "content": [{
-                    "type": "diff",
-                    "path": "/workspace/src/lib.rs",
-                    "oldText": "alpha\n",
-                    "newText": "gamma\n"
-                }]
-            }),
-        );
-
-        assert_eq!(chat.entries[0].tool_diffstats, ["/workspace/src/lib.rs"]);
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "✓ Tool · done",
-                "│ Edit src/lib.rs",
-                "│ /workspace/src/lib.rs",
-                ""
-            ]
-        );
-    }
-
-    #[test]
-    fn completed_tool_run_collapses_to_single_summary_cell() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
-        chat.entries.push(completed_tool(2, "grep -rn beta src"));
-        chat.entries.push(completed_tool(3, "cat notes.md"));
-
-        let text = transcript_text(&mut chat, 80);
-
-        assert_eq!(
-            text,
-            [
-                "✓ Tool · done",
-                "│ grep, grep",
-                "",
-                "✓ Tool · done",
-                "│ cat notes.md",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn kimi_shell_tool_run_collapses_to_command_names() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries
-            .push(completed_tool(1, "Running: rg -n project_memory src"));
-        chat.entries
-            .push(completed_tool(2, "Running: cargo test --lib"));
-        chat.entries
-            .push(completed_tool(3, "Starting background: npm run preview"));
-        chat.entries
-            .push(ChatEntry::plain(4, ChatRole::User, "continue"));
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "✓ Tool · done",
-                "│ rg, cargo, npm",
-                "",
-                "❯ You",
-                "│ continue",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn interleaved_tools_and_thoughts_render_latest_thinking_then_tool_cdl() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.extend([
-            completed_tool(1, "sed -n 1,260p .agents/PLANS.md"),
-            thought(2, "Planning coverage analysis with cargo llvm-cov"),
-            completed_tool(3, "cargo llvm-cov nextest --help"),
-            thought(4, "Requesting full main help information"),
-            completed_tool(5, "cargo llvm-cov --help"),
-            thought(6, "Planning durable coverage storage"),
-            completed_tool(7, "cargo llvm-cov report --help"),
-            thought(8, "Planning optimized coverage reporting"),
-            completed_tool(9, "Editing files"),
-            thought(10, "Preparing coverage environment cleanup"),
-        ]);
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "○ Thinking",
-                "│ Preparing coverage environment cleanup",
-                "",
-                "✓ Tool · done",
-                "│ sed, cargo, cargo, cargo, Editing",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn thought_only_streak_keeps_only_the_most_recent_block() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.extend([
-            thought(1, "first approach"),
-            thought(2, "second approach"),
-            thought(3, "final approach"),
-        ]);
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            ["○ Thinking", "│ final approach", ""]
-        );
-    }
-
-    #[test]
-    fn visible_nonmembers_break_tool_thought_streaks() {
-        let separators = [
-            ChatEntry::plain(3, ChatRole::User, "user boundary"),
-            ChatEntry::plain(3, ChatRole::Agent, "agent boundary"),
-            ChatEntry::plan(3, Vec::new()),
-            ChatEntry::plain(3, ChatRole::System, "system boundary"),
-            ChatEntry::tool(3, "waiting tool", None, ToolStatus::Pending),
-            ChatEntry::tool(3, "running tool", None, ToolStatus::Running),
-            ChatEntry::tool(3, "failed tool", None, ToolStatus::Failed),
-        ];
-
-        for separator in separators {
-            let mut chat = ChatState::new(&snapshot(), &[]);
-            chat.entries.extend([
-                thought(1, "thought before boundary"),
-                completed_tool(2, "grep -rn alpha src"),
-                separator,
-                thought(4, "thought after boundary"),
-                completed_tool(5, "cat notes.md"),
-                ChatEntry::plain(6, ChatRole::User, "release trailing tool"),
-            ]);
-
-            let rendered = transcript_text(&mut chat, 80);
-            assert!(rendered.contains(&"│ thought before boundary".to_owned()));
-            assert!(rendered.contains(&"│ thought after boundary".to_owned()));
-            assert!(rendered.contains(&"│ grep -rn alpha src".to_owned()));
-            assert!(rendered.contains(&"│ cat notes.md".to_owned()));
-            assert!(!rendered.contains(&"│ grep, cat".to_owned()));
-        }
-    }
-
-    #[test]
-    fn trailing_tool_stays_detailed_until_a_later_thought_appears() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.extend([
-            completed_tool(1, "grep -rn alpha src"),
-            thought(2, "checking the first result"),
-            completed_tool(3, "cat notes.md"),
-        ]);
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "○ Thinking",
-                "│ checking the first result",
-                "",
-                "✓ Tool · done",
-                "│ grep -rn alpha src",
-                "",
-                "✓ Tool · done",
-                "│ cat notes.md",
-                "",
-            ]
-        );
-
-        chat.entries
-            .push(thought(4, "checking the combined result"));
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "○ Thinking",
-                "│ checking the combined result",
-                "",
-                "✓ Tool · done",
-                "│ grep, cat",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn updating_the_latest_collapsed_thought_invalidates_the_summary_cache() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.extend([
-            completed_tool(1, "grep -rn alpha src"),
-            thought(2, "old thought"),
-            completed_tool(3, "cat notes.md"),
-            thought(4, "latest thought"),
-        ]);
-        assert!(transcript_text(&mut chat, 80).contains(&"│ latest thought".to_owned()));
-
-        chat.entries[3].text = "revised latest thought".into();
-        chat.entries[3].touch(5);
-
-        let rendered = transcript_text(&mut chat, 80);
-        assert!(rendered.contains(&"│ revised latest thought".to_owned()));
-        assert!(!rendered.contains(&"│ latest thought".to_owned()));
-    }
-
-    #[test]
-    fn completed_tool_run_collapses_fully_once_a_new_request_starts() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
-        chat.entries.push(completed_tool(2, "grep -rn beta src"));
-        chat.entries.push(completed_tool(3, "cat notes.md"));
-        chat.entries
-            .push(ChatEntry::plain(4, ChatRole::User, "now ship it"));
-
-        let text = transcript_text(&mut chat, 80);
-
-        assert_eq!(
-            text,
-            [
-                "✓ Tool · done",
-                "│ grep, grep, cat",
-                "",
-                "❯ You",
-                "│ now ship it",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn newest_completed_tool_leaves_a_lone_predecessor_expanded() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
-        chat.entries.push(completed_tool(2, "cat notes.md"));
-
-        let text = transcript_text(&mut chat, 80);
-
-        assert_eq!(
-            text,
-            [
-                "✓ Tool · done",
-                "│ grep -rn alpha src",
-                "",
-                "✓ Tool · done",
-                "│ cat notes.md",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_later_completed_tool_collapses_the_earlier_run_entirely() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
-        chat.entries.push(completed_tool(2, "grep -rn beta src"));
-        chat.entries.push(completed_tool(3, "cat notes.md"));
-        chat.entries
-            .push(ChatEntry::plain(4, ChatRole::Agent, "found it"));
-        chat.entries.push(completed_tool(5, "rg gamma src"));
-
-        let text = transcript_text(&mut chat, 80);
-
-        assert_eq!(
-            text,
-            [
-                "✓ Tool · done",
-                "│ grep, grep, cat",
-                "",
-                "● Agent",
-                "│ found it",
-                "",
-                "✓ Tool · done",
-                "│ rg gamma src",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn agent_message_between_completed_tools_prevents_collapsing() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
-        chat.entries
-            .push(ChatEntry::plain(2, ChatRole::Agent, "found it"));
-        chat.entries.push(completed_tool(3, "cat notes.md"));
-
-        let text = transcript_text(&mut chat, 80);
-
-        assert_eq!(
-            text,
-            [
-                "✓ Tool · done",
-                "│ grep -rn alpha src",
-                "",
-                "● Agent",
-                "│ found it",
-                "",
-                "✓ Tool · done",
-                "│ cat notes.md",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn failed_tool_renders_alone_and_breaks_the_collapsed_run() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
-        chat.entries.push(completed_tool(2, "grep -rn beta src"));
-        chat.entries.push(ChatEntry::tool(
-            3,
-            "cat missing.md",
-            None,
-            ToolStatus::Failed,
-        ));
-        chat.entries.push(completed_tool(4, "rg gamma src"));
-        chat.entries.push(completed_tool(5, "rg delta src"));
-
-        let text = transcript_text(&mut chat, 80);
-
-        // The trailing run's last member is the newest result, so it stays
-        // expanded and leaves its single predecessor alone.
-        assert_eq!(
-            text,
-            [
-                "✓ Tool · done",
-                "│ grep, grep",
-                "",
-                "× Tool · failed",
-                "│ cat missing.md",
-                "",
-                "✓ Tool · done",
-                "│ rg gamma src",
-                "",
-                "✓ Tool · done",
-                "│ rg delta src",
-                "",
-            ]
-        );
-
-        chat.entries
-            .push(ChatEntry::plain(6, ChatRole::User, "now ship it"));
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "✓ Tool · done",
-                "│ grep, grep",
-                "",
-                "× Tool · failed",
-                "│ cat missing.md",
-                "",
-                "✓ Tool · done",
-                "│ rg, rg",
-                "",
-                "❯ You",
-                "│ now ship it",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn raw_mode_renders_every_completed_tool_in_full() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.render_mode = TranscriptRenderMode::Raw;
-        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
-        chat.entries.push(completed_tool(2, "grep -rn beta src"));
-        chat.entries.push(completed_tool(3, "cat notes.md"));
-
-        let text = transcript_text(&mut chat, 80);
-
-        assert_eq!(
-            text,
-            [
-                "✓ Tool · done",
-                "│ grep -rn alpha src",
-                "",
-                "✓ Tool · done",
-                "│ grep -rn beta src",
-                "",
-                "✓ Tool · done",
-                "│ cat notes.md",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn raw_mode_preserves_interleaved_tools_and_thoughts_in_source_order() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.render_mode = TranscriptRenderMode::Raw;
-        chat.entries.extend([
-            completed_tool(1, "grep -rn alpha src"),
-            thought(2, "first thought"),
-            completed_tool(3, "cat notes.md"),
-            thought(4, "latest thought"),
-        ]);
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "✓ Tool · done",
-                "│ grep -rn alpha src",
-                "",
-                "○ Thinking",
-                "│ first thought",
-                "",
-                "✓ Tool · done",
-                "│ cat notes.md",
-                "",
-                "○ Thinking",
-                "│ latest thought",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_later_running_tool_releases_earlier_results_and_stays_expanded_when_completed() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
-        chat.entries.push(completed_tool(2, "grep -rn beta src"));
-        chat.entries.push(ChatEntry::tool(
-            3,
-            "cat notes.md",
-            None,
-            ToolStatus::Running,
-        ));
-
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "✓ Tool · done",
-                "│ grep, grep",
-                "",
-                "● Tool · running",
-                "│ cat notes.md",
-                "",
-            ]
-        );
-
-        chat.entries[2].touch(4);
-        chat.entries[2].tool_status = Some(ToolStatus::Completed);
-
-        // Once completed, the trailing tool protects its own full result.
-        assert_eq!(
-            transcript_text(&mut chat, 80),
-            [
-                "✓ Tool · done",
-                "│ grep, grep",
-                "",
-                "✓ Tool · done",
-                "│ cat notes.md",
-                "",
-            ]
-        );
-    }
-
-    #[test]
-    fn acp_new_file_diff_counts_each_inserted_line() {
-        let diff = agent_client_protocol::schema::v1::Diff::new("/workspace/new.txt", "one\ntwo\n");
-
-        assert_eq!(format_diffstat(&diff), "/workspace/new.txt  +2 −0");
-    }
-
-    #[test]
-    fn exact_diffstats_are_available_only_after_the_tool_finishes() {
-        let item = |status: &str| TranscriptItem {
-            stable_id: "tool:edit".into(),
-            position: 1,
-            latest_content_event_ordinal: None,
-            created_at_ms: 1,
-            last_changed_at_ms: 2,
-            body: TranscriptBody::Tool {
-                call: serde_json::json!({
-                    "toolCallId": "edit",
-                    "title": "Edit src/lib.rs",
-                    "status": status,
-                    "content": [{
-                        "type": "diff",
-                        "path": "/workspace/src/lib.rs",
-                        "oldText": "alpha\n",
-                        "newText": "alpha\nbeta\n"
-                    }]
-                }),
-                terminal_outputs: Vec::new(),
-                terminal_refs: Vec::new(),
-            },
-        };
-
-        assert_eq!(materialized_tool_diffstats(&item("in_progress")), None);
-        assert_eq!(
-            materialized_tool_diffstats(&item("completed")),
-            Some(vec!["/workspace/src/lib.rs  +1 −0".into()])
-        );
-    }
-
-    #[test]
-    fn transcript_blocks_keep_role_headers_and_wrapped_body_indented() {
-        let entry = ChatEntry::plain(1, ChatRole::User, "alpha beta gamma");
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(entry);
-        let text = transcript_text(&mut chat, 12);
-
-        assert_eq!(text, ["❯ You", "│ alpha beta", "│ gamma", ""]);
-    }
-
-    #[test]
-    fn agent_preview_tail_matches_the_conversation_body_rows() {
-        let text = "# heading\n\nfirst paragraph with some words to wrap\n\n- alpha\n- beta";
-        let entry = ChatEntry::plain(0, ChatRole::Agent, text);
-        let body = render_transcript_entry(&entry, 40, TranscriptRenderMode::Rich)
-            .into_iter()
-            .skip(1) // header row
-            .filter(|line| !line_is_empty(line))
-            .collect::<Vec<_>>();
-        assert!(!body.is_empty());
-
-        assert_eq!(render_agent_message_tail(text, 40, usize::MAX), body);
-        assert_eq!(
-            render_agent_message_tail(text, 40, 2),
-            body[body.len() - 2..].to_vec()
-        );
-    }
-
-    #[test]
-    fn agent_preview_head_removes_punctuation_before_its_ellipsis() {
-        let lines = render_agent_message_head(
-            "first line\n**late-corpus diagnostics,**\nthird line",
-            80,
-            2,
-        );
-        let rendered = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(rendered, ["│ first line", "│ late-corpus diagnostics…"]);
-        assert!(
-            lines[1]
-                .spans
-                .last()
-                .unwrap()
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD)
-        );
-    }
-
-    #[test]
-    fn blank_rows_inside_messages_keep_the_role_gutter() {
-        for (role, color) in [
-            (ChatRole::User, Color::Cyan),
-            (ChatRole::Agent, Color::Yellow),
-        ] {
-            let entry = ChatEntry::plain(1, role, "1. first\n\n2. second");
-            let lines = render_transcript_entry(&entry, 80, TranscriptRenderMode::Rich);
-            let blank = lines
-                .iter()
-                .find(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect::<String>()
-                        == ROLE_GUTTER
-                })
-                .expect("blank row with role gutter");
-
-            assert_eq!(blank.spans[0].style.fg, Some(color));
-            assert!(lines.last().is_some_and(line_is_empty));
-            assert!(lines.last().is_some_and(|line| line.spans.is_empty()));
-        }
-    }
-
-    #[test]
-    fn transcript_snapshot_tail_matches_rich_conversation_rows() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries
-            .push(ChatEntry::plain(1, ChatRole::User, "inspect the renderer"));
-        chat.entries.push(ChatEntry::plain(
-            2,
-            ChatRole::Agent,
-            "**Done.**\n\n- shared renderer\n- live tail",
-        ));
-        let expected = transcript_lines(&mut chat, 32)
-            .into_iter()
-            .filter(|line| !line_is_empty(line))
-            .collect::<Vec<_>>();
-        let expected = line_text(expected);
-        let expected = expected[expected.len().saturating_sub(6)..].to_vec();
-
-        let mut snapshot = chat.transcript_snapshot();
-        assert_eq!(line_text(snapshot.rich_tail(32, 6)), expected);
-    }
-
-    #[test]
-    fn transcript_snapshot_tail_counts_only_nonempty_rows() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(ChatEntry::plain(
-            1,
-            ChatRole::Agent,
-            "one\n\ntwo\n\nthree\n\nfour\n\nfive",
-        ));
-
-        let mut snapshot = chat.transcript_snapshot();
-        let tail = line_text(snapshot.rich_tail(80, 4));
-
-        assert_eq!(tail.len(), 4);
-        assert!(tail.iter().all(|line| !line.trim().is_empty()));
-        assert_eq!(tail, ["│ two", "│ three", "│ four", "│ five"]);
-    }
-
-    #[test]
-    fn browser_transcript_is_bounded_utf8_safe_and_supports_deltas() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(ChatEntry::plain(
-            1,
-            ChatRole::Agent,
-            (0..1_005)
-                .map(|line| format!("line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ));
-        chat.entries.push(ChatEntry::plain(
-            2,
-            ChatRole::Thought,
-            "🦀".repeat(BROWSER_LINE_BYTES),
-        ));
-        chat.latest_seq = 2;
-
-        let full = chat.transcript_snapshot().browser_transcript(None);
-        assert_eq!(
-            full.entries
-                .iter()
-                .map(|entry| entry.lines.len())
-                .sum::<usize>(),
-            BROWSER_TRANSCRIPT_LINES
-        );
-        assert_eq!(full.entries.last().unwrap().role, "thought");
-        assert!(
-            full.entries[0]
-                .lines
-                .first()
-                .is_some_and(|line| line.contains("earlier lines omitted"))
-        );
-        let truncated = &full.entries.last().unwrap().lines[0];
-        assert!(truncated.ends_with("… [truncated]"));
-        assert!(truncated.len() <= BROWSER_LINE_BYTES);
-        assert!(!full.reset);
-
-        let delta = chat.transcript_snapshot().browser_transcript(Some(1));
-        assert!(!delta.reset);
-        assert_eq!(delta.entries.len(), 1);
-        assert_eq!(delta.entries[0].updated_seq, 2);
-        assert!(chat.transcript_snapshot().browser_transcript(Some(0)).reset);
-    }
-
-    #[test]
-    fn browser_transcript_excludes_entries_before_provider_compaction() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries
-            .push(ChatEntry::plain(1, ChatRole::User, "old"));
-        chat.entries
-            .push(ChatEntry::plain(3, ChatRole::Agent, "current"));
-        chat.latest_seq = 3;
-        chat.last_compaction_seq = 2;
-
-        let browser = chat.transcript_snapshot().browser_transcript(None);
-        assert_eq!(browser.entries.len(), 1);
-        assert_eq!(browser.entries[0].lines, ["current"]);
-        assert_eq!(browser_tail_label(&browser.entries[0]), "Agent: current");
-    }
-
-    /// A delta has to be proportional to what changed, not to the window. The
-    /// bodies the projection records no change ordinal for still overshoot, so
-    /// this asserts a large reduction rather than a minimal one.
-    #[test]
-    fn a_delta_costs_a_fraction_of_the_window_it_updates() {
-        let mut session = long_materialized_session(600);
-        let frontier = session.applied_event_ordinal;
-        let bytes = |transcript: &BrowserTranscript| {
-            serde_json::to_string(&transcript.entries).unwrap().len()
-        };
-        let window =
-            bytes(&TranscriptSnapshot::from_materialized(&session).browser_transcript(None));
-
-        let appended = frontier + 1;
-        session.transcript.push(fixture_agent_item(appended));
-        session.applied_event_ordinal = appended;
-        let delta =
-            TranscriptSnapshot::from_materialized(&session).browser_transcript(Some(frontier));
-
-        println!("window {window} bytes, delta {} bytes", bytes(&delta));
-        assert!(
-            bytes(&delta) * 4 < window,
-            "one appended message resent {} of {window} bytes",
-            bytes(&delta)
-        );
-    }
-
-    /// The conversation a delta test needs: settled messages the projection
-    /// records an exact update cursor for.
-    fn message_session(items: u64) -> MaterializedSession {
-        let mut session = MaterializedSession::empty("session-delta");
-        session.transcript = (1..=items)
-            .map(|position| match position % 2 {
-                1 => fixture_user_item(position),
-                _ => fixture_agent_item(position),
-            })
-            .collect();
-        session.applied_event_ordinal = items;
-        session
-    }
-
-    fn delta_ids(session: &MaterializedSession, after_seq: u64) -> Vec<u64> {
-        let delta =
-            TranscriptSnapshot::from_materialized(session).browser_transcript(Some(after_seq));
-        assert!(!delta.reset, "the window still covers the viewer's cursor");
-        delta.entries.iter().map(|entry| entry.id).collect()
-    }
-
-    #[test]
-    fn appending_one_message_marks_only_that_entry_changed() {
-        let mut session = message_session(8);
-        let opened = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
-        assert_eq!(opened.entries.len(), 8);
-        let cursor = opened.latest_seq;
-
-        session.transcript.push(fixture_agent_item(9));
-        session.applied_event_ordinal = 9;
-
-        assert_eq!(delta_ids(&session, cursor), [9]);
-    }
-
-    #[test]
-    fn a_growing_agent_message_is_the_only_entry_its_delta_carries() {
-        let mut session = message_session(6);
-        let cursor = TranscriptSnapshot::from_materialized(&session)
-            .browser_transcript(None)
-            .latest_seq;
-
-        let streaming = Arc::make_mut(&mut session.transcript[5]);
-        let TranscriptBody::Agent { chunks, .. } = &mut streaming.body else {
-            panic!("expected an agent message");
-        };
-        chunks.push(serde_json::json!({
-            "content": {"type": "text", "text": " and one more thing"}
-        }));
-        streaming.latest_content_event_ordinal = Some(7);
-        streaming.last_changed_at_ms = FIXTURE_MS + 1;
-        session.applied_event_ordinal = 7;
-
-        assert_eq!(delta_ids(&session, cursor), [6]);
-        let delta =
-            TranscriptSnapshot::from_materialized(&session).browser_transcript(Some(cursor));
-        assert!(delta.entries[0].lines[0].ends_with(" and one more thing"));
-    }
-
-    #[test]
-    fn markdown_list_wrapping_uses_a_hanging_indent() {
-        let entry = ChatEntry::plain(1, ChatRole::Agent, "- alpha beta gamma");
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries.push(entry);
-        let text = transcript_text(&mut chat, 13);
-
-        assert!(text.iter().any(|line| line == "│ • alpha"));
-        assert!(text.iter().any(|line| line == "│   beta"));
-        assert!(text.iter().any(|line| line == "│   gamma"));
-    }
-
-    #[test]
-    fn page_navigation_keeps_end_attached_to_the_latest_message() {
-        let mut chat = numbered_chat(40);
-        let rows = drawn_transcript(&mut chat, 60, 24);
-        assert!(shows(&rows, "message 39"), "opens on the newest message");
-        assert!(!shows(&rows, "End to follow"), "the tail needs no hint");
-
-        chat.handle_key(key(KeyCode::PageUp));
-        let rows = drawn_transcript(&mut chat, 60, 24);
-        assert!(!shows(&rows, "message 39"), "page up leaves the tail");
-        assert!(
-            shows(&rows, "End to follow"),
-            "scrolled back says how to return"
-        );
-
-        chat.handle_key(key(KeyCode::PageDown));
-        let rows = drawn_transcript(&mut chat, 60, 24);
-        assert!(shows(&rows, "message 39"), "page down returns to the tail");
-
-        chat.handle_key(key(KeyCode::PageUp));
-        chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
-        let rows = drawn_transcript(&mut chat, 60, 24);
-        assert!(
-            shows(&rows, "message 39"),
-            "Ctrl-End follows the tail again"
-        );
-        assert!(!shows(&rows, "End to follow"));
-    }
-
-    #[test]
-    fn control_home_and_end_reach_both_ends_of_a_long_transcript() {
-        let mut chat = numbered_chat(200);
-        let _ = drawn_transcript(&mut chat, 40, 24);
-
-        chat.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
-        let rows = drawn_transcript(&mut chat, 40, 24);
-        assert!(shows(&rows, "message 0"), "Ctrl-Home reaches the first row");
-        assert!(!shows(&rows, "message 199"));
-
-        chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
-        let rows = drawn_transcript(&mut chat, 40, 24);
-        assert!(shows(&rows, "message 199"), "Ctrl-End reaches the last row");
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
-        let mut chat = numbered_chat(40);
-        let _ = drawn_transcript(&mut chat, 40, 24);
-        // Away from the conversations pane, so the wheel reaches the transcript.
-        let mouse = |kind| mouse_in(kind, Rect::new(0, 10, 40, 1));
-
-        chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
-        let scrolled = drawn_transcript(&mut chat, 40, 24);
-        assert!(!shows(&scrolled, "message 39"), "wheel up leaves the tail");
-
-        chat.handle_mouse(mouse(MouseEventKind::ScrollDown));
-        let rows = drawn_transcript(&mut chat, 40, 24);
-        assert!(shows(&rows, "message 39"), "wheel down resumes following");
-        assert!(!rows.iter().any(|row| row.contains("End to follow")));
-    }
-
-    #[test]
-    fn the_wheel_over_an_empty_transcript_has_nothing_to_scroll() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        let rows = drawn_transcript(&mut chat, 40, 24);
-
-        chat.handle_mouse(mouse_in(MouseEventKind::ScrollUp, Rect::new(0, 10, 40, 1)));
-        chat.handle_mouse(mouse_in(
-            MouseEventKind::ScrollDown,
-            Rect::new(0, 10, 40, 1),
-        ));
-
-        assert_eq!(drawn_transcript(&mut chat, 40, 24), rows);
-    }
-
-    #[test]
-    fn scrolled_history_stays_put_while_new_messages_stream_in() {
-        let mut chat = numbered_chat(40);
-        let _ = drawn_transcript(&mut chat, 40, 24);
-        chat.handle_key(key(KeyCode::PageUp));
-        let before = drawn_transcript(&mut chat, 40, 24);
-
-        for index in 40..50 {
-            chat.entries.push(ChatEntry::plain(
-                index as u64,
-                ChatRole::User,
-                format!("message {index}"),
-            ));
-        }
-        let after = drawn_transcript(&mut chat, 40, 24);
-
-        assert_eq!(
-            visible_messages(&before),
-            visible_messages(&after),
-            "appending messages must not move a scrolled-back viewport"
-        );
-        assert!(!visible_messages(&after).is_empty());
-    }
-
-    #[test]
-    fn a_transcript_shorter_than_the_viewport_cannot_scroll() {
-        let mut chat = numbered_chat(2);
-        let rows = drawn_transcript(&mut chat, 40, 24);
-
-        chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
-        chat.handle_key(key(KeyCode::PageUp));
-
-        assert_eq!(rows, drawn_transcript(&mut chat, 40, 24));
-    }
-
-    #[test]
-    fn adjacent_thought_messages_coalesce_without_an_extra_separator() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        for (seq, id, text) in [(1, "one", "first thought"), (2, "two", "second thought")] {
-            chat.apply_session_update(
-                seq,
-                &serde_json::json!({
-                    "sessionUpdate": "agent_thought_chunk",
-                    "messageId": id,
-                    "content": {"type": "text", "text": text}
-                }),
-            );
-        }
-
-        assert_eq!(chat.entries.len(), 1);
-        assert_eq!(chat.entries[0].text, "first thought\nsecond thought");
-        let rendered = transcript_text(&mut chat, 80);
-        assert_eq!(
-            rendered
-                .iter()
-                .filter(|line| line.contains("Thinking"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            rendered,
-            ["○ Thinking", "│ first thought", "│ second thought", ""]
-        );
-    }
-
-    #[test]
-    fn materialized_tool_and_plan_conversion_preserves_more_than_eight_details() {
-        let tool_content = (0..12)
-            .map(|index| {
-                serde_json::json!({
-                    "type": "content",
-                    "content": {"type": "text", "text": format!("result-{index}")}
-                })
-            })
-            .collect::<Vec<_>>();
-        let locations = (0..12)
-            .map(|index| {
-                serde_json::json!({
-                    "path": format!("src/file-{index}.rs"),
-                    "line": index + 1
-                })
-            })
-            .collect::<Vec<_>>();
-        let plan = (0..12)
-            .map(|index| {
-                serde_json::json!({
-                    "content": format!("step-{index}"),
-                    "priority": "medium",
-                    "status": "pending"
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut session = MaterializedSession::empty("session-rich-details");
-        session.applied_event_ordinal = 2;
-        session.applied_event_digest = "a".repeat(64);
-        session.transcript = vec![
-            Arc::new(TranscriptItem {
-                stable_id: "tool:inspect".into(),
-                position: 1,
-                latest_content_event_ordinal: None,
-                created_at_ms: 1,
-                last_changed_at_ms: 1,
-                body: TranscriptBody::Tool {
-                    call: serde_json::json!({
-                        "toolCallId": "inspect",
-                        "title": "inspect",
-                        "status": "completed",
-                        "content": tool_content,
-                        "locations": locations
-                    }),
-                    terminal_outputs: Vec::new(),
-                    terminal_refs: Vec::new(),
-                },
-            }),
-            Arc::new(TranscriptItem {
-                stable_id: "plan:current".into(),
-                position: 2,
-                latest_content_event_ordinal: None,
-                created_at_ms: 2,
-                last_changed_at_ms: 2,
-                body: TranscriptBody::Plan {
-                    plan: serde_json::json!({"entries": plan}),
-                },
-            }),
-        ];
-
-        let entries = materialized_chat_entries(&session);
-        assert_eq!(entries[0].tool_content.len(), 12);
-        assert_eq!(entries[0].tool_locations.len(), 12);
-        assert_eq!(entries[1].plan.len(), 12);
-
-        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
-        // The remote viewer mirrors the TUI's Rich feed, so a tool entry is its
-        // title alone: neither the content details nor the locations belong
-        // there, however many the projection kept for Raw mode.
-        assert_eq!(browser.entries[0].lines, ["inspect"]);
-        assert!(
-            browser.entries[1]
-                .lines
-                .iter()
-                .any(|line| line == "○ step-11")
-        );
-    }
-
-    #[test]
-    fn materialized_terminal_content_renders_output_and_exit_summary() {
-        let mut session = MaterializedSession::empty("session-terminal");
-        session.applied_event_ordinal = 1;
-        session.applied_event_digest = "a".repeat(64);
-        session.transcript = vec![Arc::new(TranscriptItem {
-            stable_id: "tool:bash".into(),
-            position: 1,
-            latest_content_event_ordinal: None,
-            created_at_ms: 1,
-            last_changed_at_ms: 1,
-            body: TranscriptBody::Tool {
-                call: serde_json::json!({
-                    "toolCallId": "bash",
-                    "title": "Bash",
-                    "status": "completed",
-                    "content": [{"type": "terminal", "terminalId": "term-1"}]
-                }),
-                terminal_outputs: vec![TerminalOutputRecord {
-                    terminal_id: "term-1".into(),
-                    // Colored output from a real build tool: the escape must
-                    // not survive into the terminal hel is drawing on.
-                    output: "\u{1b}[32mtests passed\u{1b}[0m".into(),
-                    truncated: false,
-                    exit_code: Some(0),
-                    signal: None,
-                }],
-                terminal_refs: vec!["term-1".into()],
-            },
-        })];
-
-        let entries = materialized_chat_entries(&session);
-        assert_eq!(entries[0].tool_content, ["tests passed\nexited 0"]);
-
-        let mut chat = ChatState::from_materialized(&session, &[], &[]);
-        chat.render_mode = TranscriptRenderMode::Raw;
-        let rendered = transcript_text(&mut chat, 80);
-        assert!(
-            rendered.iter().any(|line| line.contains("tests passed")),
-            "raw rows show the captured output: {rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.contains("exited 0")),
-            "raw rows show how the terminal ended: {rendered:?}"
-        );
-        assert!(
-            !rendered.iter().any(|line| line.contains("terminal term-1")),
-            "the id placeholder is replaced once output exists: {rendered:?}"
-        );
-        assert!(
-            !rendered.iter().any(|line| line.contains('\u{1b}')),
-            "escape sequences are sanitized out: {rendered:?}"
-        );
-
-        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
-        assert_eq!(
-            browser.entries[0].lines,
-            ["Bash"],
-            "the remote viewer shows the decluttered title, not the output"
-        );
-    }
-
-    #[test]
-    fn kimi_text_and_captured_terminal_output_render_once_and_only_in_raw_mode() {
-        const OUTPUT: &str = "toolchain inventory";
-        let mut session = MaterializedSession::empty("session-kimi-terminal");
-        session.applied_event_ordinal = 1;
-        session.applied_event_digest = "a".repeat(64);
-        session.transcript = vec![Arc::new(TranscriptItem {
-            stable_id: "tool:kimi-shell".into(),
-            position: 1,
-            latest_content_event_ordinal: None,
-            created_at_ms: 1,
-            last_changed_at_ms: 1,
-            body: TranscriptBody::Tool {
-                call: serde_json::json!({
-                    "toolCallId": "kimi-shell",
-                    "title": "Execute `inspect toolchain`",
-                    "status": "completed",
-                    "content": [{
-                        "type": "content",
-                        "content": {"type": "text", "text": OUTPUT}
-                    }],
-                    "rawOutput": {
-                        "type": "Bash",
-                        "output": OUTPUT.as_bytes(),
-                        "exit_code": 1,
-                        "command": "inspect toolchain"
-                    }
-                }),
-                terminal_outputs: vec![TerminalOutputRecord {
-                    terminal_id: "term-1".into(),
-                    output: OUTPUT.into(),
-                    truncated: false,
-                    exit_code: Some(1),
-                    signal: None,
-                }],
-                terminal_refs: vec!["term-1".into()],
-            },
-        })];
-
-        let entries = materialized_chat_entries(&session);
-        assert_eq!(entries[0].tool_content, [OUTPUT, "exited 1"]);
-
-        let mut chat = ChatState::from_materialized(&session, &[], &[]);
-        let rich = transcript_text(&mut chat, 80);
-        assert!(
-            !rich.iter().any(|line| line.contains(OUTPUT)),
-            "Rich mode shows the tool call, not its duplicate output: {rich:?}"
-        );
-
-        chat.render_mode = TranscriptRenderMode::Raw;
-        let raw = transcript_text(&mut chat, 80);
-        assert_eq!(
-            raw.iter().filter(|line| line.contains(OUTPUT)).count(),
-            1,
-            "Raw mode keeps one copy of the output: {raw:?}"
-        );
-        assert!(raw.iter().any(|line| line.contains("exited 1")));
-
-        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
-        assert!(
-            browser
-                .entries
-                .iter()
-                .flat_map(|entry| &entry.lines)
-                .all(|line| !line.contains(OUTPUT)),
-            "the remote Rich feed suppresses the duplicate output"
-        );
-    }
-
-    #[test]
-    fn legacy_kimi_duplicate_is_suppressed_without_reprojecting_history() {
-        const OUTPUT: &str = "legacy failed output";
-        let mut session = MaterializedSession::empty("session-legacy-kimi-terminal");
-        session.applied_event_ordinal = 2;
-        session.applied_event_digest = "a".repeat(64);
-        session.transcript = vec![
-            Arc::new(TranscriptItem {
-                stable_id: "tool:kimi-shell".into(),
-                position: 1,
-                latest_content_event_ordinal: None,
-                created_at_ms: 1,
-                last_changed_at_ms: 2,
-                body: TranscriptBody::Tool {
-                    call: serde_json::json!({
-                        "toolCallId": "kimi-shell",
-                        "title": "Execute `inspect toolchain`",
-                        "status": "completed",
-                        "content": [{
-                            "type": "content",
-                            "content": {"type": "text", "text": OUTPUT}
-                        }],
-                        "rawOutput": {
-                            "type": "Bash",
-                            "output": OUTPUT.as_bytes(),
-                            "exit_code": 1,
-                            "command": "inspect toolchain"
-                        }
-                    }),
-                    terminal_outputs: Vec::new(),
-                    terminal_refs: Vec::new(),
-                },
-            }),
-            Arc::new(TranscriptItem {
-                stable_id: "terminal:term-1".into(),
-                position: 2,
-                latest_content_event_ordinal: None,
-                created_at_ms: 2,
-                last_changed_at_ms: 2,
-                body: TranscriptBody::TerminalOutput {
-                    record: TerminalOutputRecord {
-                        terminal_id: "term-1".into(),
-                        output: OUTPUT.into(),
-                        truncated: false,
-                        exit_code: Some(1),
-                        signal: None,
-                    },
-                },
-            }),
-        ];
-
-        let entries = materialized_chat_entries(&session);
-        assert!(entries[1].raw_only);
-        let mut chat = ChatState::from_materialized(&session, &[], &[]);
-        let rich = transcript_text(&mut chat, 80);
-        assert!(
-            !rich.iter().any(|line| line.contains(OUTPUT)),
-            "an existing duplicate becomes quiet after upgrading: {rich:?}"
-        );
-        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
-        assert!(
-            browser
-                .entries
-                .iter()
-                .flat_map(|entry| &entry.lines)
-                .all(|line| !line.contains(OUTPUT))
-        );
-    }
-
-    const STANDALONE_OUTPUT: &str = "cargo build finished";
-
-    fn terminal_record(exit_code: Option<u32>, signal: Option<&str>) -> TerminalOutputRecord {
-        TerminalOutputRecord {
-            terminal_id: "term-1".into(),
-            output: STANDALONE_OUTPUT.into(),
-            truncated: false,
-            exit_code,
-            signal: signal.map(str::to_owned),
-        }
-    }
-
-    fn terminal_output_item(position: u64, record: TerminalOutputRecord) -> Arc<TranscriptItem> {
-        Arc::new(TranscriptItem {
-            stable_id: format!("terminal:{}", record.terminal_id),
-            position,
-            latest_content_event_ordinal: None,
-            created_at_ms: position as i64,
-            last_changed_at_ms: position as i64,
-            body: TranscriptBody::TerminalOutput { record },
-        })
-    }
-
-    /// A hel-hosted command whose output no tool call refers to, after an agent
-    /// message so the feed has something else to show.
-    fn standalone_terminal_session(record: TerminalOutputRecord) -> MaterializedSession {
-        let mut session = MaterializedSession::empty("session-standalone-terminal");
-        session.applied_event_ordinal = 2;
-        session.transcript = vec![
-            agent_message_item("agent:1", 1, "running the build"),
-            terminal_output_item(2, record),
-        ];
-        session
-    }
-
-    fn browser_lines(session: &MaterializedSession) -> Vec<String> {
-        TranscriptSnapshot::from_materialized(session)
-            .browser_transcript(None)
-            .entries
-            .into_iter()
-            .flat_map(|entry| entry.lines)
-            .collect()
-    }
-
-    #[test]
-    fn a_cleanly_exited_standalone_terminal_item_renders_only_in_raw_mode() {
-        let session = standalone_terminal_session(terminal_record(Some(0), None));
-
-        let mut chat = ChatState::from_materialized(&session, &[], &[]);
-        let rich = transcript_text(&mut chat, 80);
-        assert!(
-            rich.iter().any(|line| line.contains("running the build")),
-            "the rest of the conversation still renders: {rich:?}"
-        );
-        assert!(
-            !rich.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
-            "a clean command's output is left out of the rich feed: {rich:?}"
-        );
-        assert!(
-            !rich.iter().any(|line| line.contains("exited 0")),
-            "and so is its exit summary: {rich:?}"
-        );
-
-        let browser = browser_lines(&session);
-        assert!(
-            browser
-                .iter()
-                .any(|line| line.contains("running the build")),
-            "the rest of the conversation still reaches the remote viewer: {browser:?}"
-        );
-        assert!(
-            !browser.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
-            "the remote viewer mirrors the rich feed: {browser:?}"
-        );
-
-        chat.render_mode = TranscriptRenderMode::Raw;
-        let raw = transcript_text(&mut chat, 80);
-        assert!(
-            raw.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
-            "raw rows keep the captured output: {raw:?}"
-        );
-        assert!(
-            raw.iter().any(|line| line.contains("exited 0")),
-            "raw rows keep how the terminal ended: {raw:?}"
-        );
-    }
-
-    #[test]
-    fn an_abnormally_ended_standalone_terminal_item_renders_everywhere() {
-        for (record, summary) in [
-            (terminal_record(Some(3), None), "exited 3"),
-            (terminal_record(None, Some("SIGKILL")), "killed by SIGKILL"),
-            (
-                terminal_record(Some(0), Some("SIGKILL")),
-                "killed by SIGKILL",
-            ),
-            (terminal_record(None, None), "released before exit"),
-        ] {
-            let session = standalone_terminal_session(record);
-
-            let mut chat = ChatState::from_materialized(&session, &[], &[]);
-            let rich = transcript_text(&mut chat, 80);
-            assert!(
-                rich.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
-                "{summary}: the rich feed keeps the output: {rich:?}"
-            );
-            assert!(
-                rich.iter().any(|line| line.contains(summary)),
-                "{summary}: the rich feed says how it ended: {rich:?}"
-            );
-
-            let browser = browser_lines(&session);
-            assert!(
-                browser.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
-                "{summary}: the remote viewer keeps the output: {browser:?}"
-            );
-            assert!(
-                browser.iter().any(|line| line.contains(summary)),
-                "{summary}: the remote viewer says how it ended: {browser:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_clean_standalone_terminal_item_between_completed_tools_keeps_one_run() {
-        let mut session = MaterializedSession::empty("session-terminal-between-tools");
-        session.applied_event_ordinal = 3;
-        session.transcript = vec![
-            fixture_tool_item(1),
-            terminal_output_item(2, terminal_record(Some(0), None)),
-            fixture_tool_item(3),
-        ];
-        let mut chat = ChatState::from_materialized(&session, &[], &[]);
-        // Ends the newest result's protection, so both tools can collapse.
-        chat.entries
-            .push(ChatEntry::plain(4, ChatRole::User, "now ship it"));
-
-        let text = transcript_text(&mut chat, 80);
-
-        assert_eq!(
-            text,
-            [
-                "✓ Tool · done",
-                "│ read, read",
-                "",
-                "❯ You",
-                "│ now ship it",
-                "",
-            ],
-            "the omitted entry neither renders nor splits the run"
-        );
-    }
-
-    /// Grok Build's final update replaces `content` with plain text, so the
-    /// output hel captured is attached to the item with nothing in the call
-    /// pointing at it. It is still the only copy of what the command printed.
-    #[test]
-    fn attached_terminal_output_renders_when_the_call_no_longer_refers_to_it() {
-        let mut session = MaterializedSession::empty("session-dropped-terminal");
-        session.applied_event_ordinal = 1;
-        session.applied_event_digest = "a".repeat(64);
-        session.transcript = vec![Arc::new(TranscriptItem {
-            stable_id: "tool:bash".into(),
-            position: 1,
-            latest_content_event_ordinal: None,
-            created_at_ms: 1,
-            last_changed_at_ms: 1,
-            body: TranscriptBody::Tool {
-                call: serde_json::json!({
-                    "toolCallId": "bash",
-                    "title": "Bash",
-                    "status": "completed",
-                    "content": [{
-                        "type": "content",
-                        "content": {"type": "text", "text": "ran the build"}
-                    }]
-                }),
-                terminal_outputs: vec![TerminalOutputRecord {
-                    terminal_id: "term-1".into(),
-                    output: "build finished".into(),
-                    truncated: false,
-                    exit_code: Some(0),
-                    signal: None,
-                }],
-                terminal_refs: vec!["term-1".into()],
-            },
-        })];
-
-        let entries = materialized_chat_entries(&session);
-        assert_eq!(
-            entries[0].tool_content,
-            ["ran the build", "build finished\nexited 0"],
-            "the captured output follows the content the call still carries"
-        );
-    }
-
-    /// Codex runs the command in its own terminal, which hel never opened, and
-    /// reports the text in `rawOutput` beside the reference.
-    #[test]
-    fn codex_raw_output_renders_for_a_terminal_hel_has_no_record_for() {
-        let call = |raw_output: serde_json::Value| {
-            serde_json::json!({
-                "toolCallId": "exec",
-                "title": "Shell",
-                "status": "completed",
-                "content": [{"type": "terminal", "terminalId": "exec-1"}],
-                "rawOutput": raw_output
-            })
-        };
-        let details = |raw_output: serde_json::Value| {
-            let call = ToolCall::deserialize(&call(raw_output)).expect("valid ACP tool call");
-            tool_content_details(&call.content, &[], call.raw_output.as_ref())
-        };
-
-        assert_eq!(
-            details(serde_json::json!({"formatted_output": "tests passed", "exit_code": 0})),
-            ["tests passed\nexited 0"]
-        );
-        assert_eq!(
-            details(serde_json::json!({"formatted_output": "still running"})),
-            ["still running"],
-            "an exit line needs an exit code to report"
-        );
-        assert_eq!(
-            details(serde_json::json!({"exit_code": 0})),
-            ["terminal exec-1"],
-            "without output there is nothing to show but the id"
-        );
-    }
-
-    #[test]
-    fn browser_tool_entries_show_the_title_and_diffstats_only() {
-        let mut session = MaterializedSession::empty("session-browser-tool");
-        session.applied_event_ordinal = 1;
-        session.applied_event_digest = "a".repeat(64);
-        session.transcript = vec![Arc::new(TranscriptItem {
-            stable_id: "tool:edit".into(),
-            position: 1,
-            latest_content_event_ordinal: None,
-            created_at_ms: 1,
-            last_changed_at_ms: 1,
-            body: TranscriptBody::Tool {
-                call: serde_json::json!({
-                    "toolCallId": "edit",
-                    "title": "Edit src/lib.rs",
-                    "status": "completed",
-                    "content": [
-                        {
-                            "type": "content",
-                            "content": {"type": "text", "text": "wrote the file"}
-                        },
-                        {
-                            "type": "diff",
-                            "path": "/workspace/src/lib.rs",
-                            "oldText": "alpha\n",
-                            "newText": "alpha\nbeta\n"
-                        }
-                    ],
-                    "locations": [{"path": "/workspace/src/lib.rs", "line": 2}]
-                }),
-                terminal_outputs: Vec::new(),
-                terminal_refs: Vec::new(),
-            },
-        })];
-
-        let entries = materialized_chat_entries(&session);
-        assert!(entries[0].tool_content.contains(&"wrote the file".into()));
-        assert_eq!(entries[0].tool_locations, ["/workspace/src/lib.rs:2"]);
-
-        let exact_diffstats = BTreeMap::from([(
-            "tool:edit".to_owned(),
-            materialized_tool_diffstats(&session.transcript[0]).unwrap(),
-        )]);
-        let browser =
-            TranscriptSnapshot::from_materialized_with_diffstats(&session, &exact_diffstats)
-                .browser_transcript(None);
-        assert_eq!(
-            browser.entries[0].lines,
-            ["Edit src/lib.rs", "/workspace/src/lib.rs  +1 −0"],
-            "the remote viewer carries the Rich feed's title and diffstat, \
-             not the Raw content or locations"
-        );
-    }
-
-    #[test]
-    fn terminal_exit_summary_names_signal_release_and_truncation() {
-        let record = |exit_code, signal: Option<&str>, truncated| TerminalOutputRecord {
-            terminal_id: "term-1".into(),
-            output: "out".into(),
-            truncated,
-            exit_code,
-            signal: signal.map(str::to_owned),
-        };
-
-        assert_eq!(
-            terminal_exit_summary(&record(Some(0), None, false)),
-            "exited 0"
-        );
-        assert_eq!(
-            terminal_exit_summary(&record(Some(1), None, true)),
-            "exited 1 · output truncated"
-        );
-        assert_eq!(
-            terminal_exit_summary(&record(None, Some("SIGKILL"), false)),
-            "killed by SIGKILL"
-        );
-        assert_eq!(
-            terminal_exit_summary(&record(None, None, false)),
-            "released before exit"
-        );
-
-        // A terminal that produced nothing is still worth a line: the summary
-        // is all a reader has to go on.
-        let mut silent = record(None, Some("SIGTERM"), false);
-        silent.output.clear();
-        assert_eq!(terminal_output_detail(&silent), "killed by SIGTERM");
-    }
-
-    #[test]
-    fn appending_a_chunk_reuses_earlier_entries_by_pointer_identity() {
-        let mut session = MaterializedSession::empty("session-pointer-reuse");
-        session.applied_event_ordinal = 3;
-        session.transcript = vec![
-            user_transcript_item(1, "first"),
-            user_transcript_item(2, "second"),
-            agent_transcript_item("agent:3", 3),
-        ];
-
-        let mut chat = ChatState::from_materialized(&session, &[], &[]);
-        // Nothing about these entries matches their item any more, so only a
-        // pointer comparison can reuse them.
-        for (index, entry) in chat.entries.iter_mut().take(2).enumerate() {
-            entry.text = format!("reused {index}");
-            entry.revision = u64::MAX;
-            entry.recorded_at_ms = None;
-        }
-
-        let tail = Arc::make_mut(&mut session.transcript[2]);
-        let TranscriptBody::Agent { chunks, .. } = &mut tail.body else {
-            panic!("expected an agent message");
-        };
-        chunks.push(serde_json::json!({
-            "content": {"type": "text", "text": " again"}
-        }));
-        tail.last_changed_at_ms = 40;
-        tail.latest_content_event_ordinal = Some(4);
-        session.applied_event_ordinal = 4;
-        chat.apply_materialized(&session, &[], &[]);
-
-        assert_eq!(chat.entries.len(), 3);
-        assert_eq!(chat.entries[0].text, "reused 0");
-        assert_eq!(chat.entries[1].text, "reused 1");
-        assert!(chat.entries[0].source.is(&session.transcript[0]));
-        assert!(chat.entries[1].source.is(&session.transcript[1]));
-        assert_eq!(chat.entries[2].text, "hello again");
-        assert!(chat.entries[2].source.is(&session.transcript[2]));
-    }
-
-    #[test]
-    fn restored_transcript_reuses_entries_through_the_field_fallback() {
-        let mut session = MaterializedSession::empty("session-restored");
-        session.applied_event_ordinal = 2;
-        session.transcript = vec![
-            user_transcript_item(1, "first"),
-            user_transcript_item(2, "second"),
-        ];
-        let mut chat = ChatState::from_materialized(&session, &[], &[]);
-        chat.entries[0].text = "reused".into();
-
-        // A restore rebuilds every item, so nothing is pointer-identical even
-        // though the content is unchanged.
-        let mut restored = MaterializedSession::empty("session-restored");
-        restored.applied_event_ordinal = 3;
-        restored.transcript = vec![
-            user_transcript_item(1, "first"),
-            user_transcript_item(2, "second"),
-            agent_transcript_item("agent:3", 3),
-        ];
-        chat.apply_materialized(&restored, &[], &[]);
-
-        assert_eq!(
-            chat.entries
-                .iter()
-                .map(|entry| entry.text.as_str())
-                .collect::<Vec<_>>(),
-            ["reused", "second", "hello"]
-        );
-        // Reuse re-points the entry at the item it now stands for, so the next
-        // projection can take the pointer path again.
-        for (entry, item) in chat.entries.iter().zip(&restored.transcript) {
-            assert!(entry.source.is(item));
-        }
-    }
-
-    #[test]
-    fn raw_mode_preserves_markdown_markers_and_exposes_tool_details() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.entries
-            .push(ChatEntry::plain(1, ChatRole::Agent, "**bold**"));
-        chat.render_mode = TranscriptRenderMode::Raw;
-        assert!(transcript_text(&mut chat, 30).contains(&"│ **bold**".into()));
-    }
-}
+mod tests;

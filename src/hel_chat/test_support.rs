@@ -95,9 +95,20 @@ pub(super) fn line_text(lines: Vec<Line<'static>>) -> Vec<String> {
 
 /// Draw the chat and return the transcript rows currently on screen.
 pub(super) fn drawn_transcript(chat: &mut ChatState, width: u16, height: u16) -> Vec<String> {
+    drawn_transcript_selecting(chat, width, height, false)
+}
+
+/// Like `drawn_transcript`, but says whether the selection engine still owns a
+/// transcript selection, which is what freezes the transcript's row space.
+pub(super) fn drawn_transcript_selecting(
+    chat: &mut ChatState,
+    width: u16,
+    height: u16,
+    transcript_selected: bool,
+) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     terminal
-        .draw(|frame| render(frame, chat))
+        .draw(|frame| render(frame, chat, transcript_selected))
         .expect("draw chat");
     let buffer = terminal.backend().buffer();
     (buffer.area.y..buffer.area.bottom())
@@ -146,6 +157,12 @@ pub(super) fn grok_chat() -> ChatState {
 pub(super) fn mode_config_option(current: &str, values: &[&str]) -> SessionConfigOption {
     select_config_option("interaction_mode", current, values)
         .category(SessionConfigOptionCategory::Mode)
+}
+
+pub(super) fn fast_mode_option(current: &str) -> SessionConfigOption {
+    let mut option = select_config_option("fast-mode", current, &["off", "on"]);
+    option.name = "Fast mode".into();
+    option
 }
 
 pub(super) fn select_config_option(

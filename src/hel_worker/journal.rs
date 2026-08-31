@@ -3,7 +3,7 @@
 //! `DurableRelay` that make an event or a snapshot durable before it is
 //! acknowledged to a caller.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::ops::ControlFlow;
@@ -19,10 +19,10 @@ use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedPrompt;
 
 use super::snapshot::{
-    RelayCommand, RelayCommandOutcome, RelayDispatchState, RelayEvent, RelayObservation,
-    RelaySnapshot, apply_relay_event, clamp_observation, ensure_byte_budget,
+    RELAY_EVENT_FORMAT_V2, RelayCommand, RelayCommandOutcome, RelayDispatchState, RelayEvent,
+    RelayObservation, RelaySnapshot, apply_relay_event, clamp_observation, ensure_byte_budget,
     ensure_serialized_budget, observation_changes_state, relay_event_digest, validate_relay_digest,
-    validate_relay_event,
+    validate_relay_event, validate_relay_event_self,
 };
 use super::{
     DurableRelay, RELAY_ACTIVE_SEGMENT, RELAY_EVENT_BYTE_BUDGET, RELAY_EVENT_ENVELOPE_RESERVE,
@@ -37,9 +37,12 @@ pub(crate) struct RelayJournalSpan {
     /// Physical first ordinal in `path`; it may precede `after_ordinal` when a
     /// crash left an overlapping active/sealed copy.
     pub(crate) file_first_ordinal: u64,
-    pub(crate) file_first_previous_digest: String,
+    /// Present when this process has read the segment. Sealed segment names
+    /// carry their ordinal range, so startup does not need to decompress old
+    /// transcript history merely to discover its layout.
+    pub(crate) file_first_previous_digest: Option<String>,
     pub(crate) file_last_ordinal: u64,
-    pub(crate) file_last_digest: String,
+    pub(crate) file_last_digest: Option<String>,
     /// This canonical span contributes only ordinals greater than this value.
     pub(crate) after_ordinal: u64,
 }
@@ -78,7 +81,12 @@ pub(crate) fn open_relay_journal(
     let active = journal.join(RELAY_ACTIVE_SEGMENT);
     let mut files = Vec::new();
     for path in paths {
-        if let Some(metadata) = inspect_relay_journal_file(&path, path == active)? {
+        let metadata = if path == active {
+            inspect_relay_journal_file(&path, true)?
+        } else {
+            Some(sealed_relay_journal_metadata(&path)?)
+        };
+        if let Some(metadata) = metadata {
             files.push(metadata);
         }
     }
@@ -112,9 +120,7 @@ pub(crate) fn open_relay_journal(
         .max()
         .unwrap_or(retained_through);
     let mut previous_ordinal = retained_through;
-    let mut previous_digest = retained_digest.to_owned();
     let mut spans = Vec::new();
-    let mut hot_events = VecDeque::new();
 
     while previous_ordinal < journal_latest {
         let next_ordinal = previous_ordinal
@@ -131,57 +137,7 @@ pub(crate) fn open_relay_journal(
             bail!("relay journal has a gap after event {previous_ordinal}");
         };
         let contribution_after = previous_ordinal;
-        let mut overlap_verified = candidate.file_first_ordinal == next_ordinal;
-        visit_relay_journal_file(&candidate.path, false, |event, _| {
-            if event.ordinal < contribution_after {
-                return Ok(ControlFlow::Continue(()));
-            }
-            if event.ordinal == contribution_after {
-                if event.digest != previous_digest {
-                    bail!(
-                        "overlapping relay journal {} conflicts at event {}",
-                        candidate.path.display(),
-                        event.ordinal
-                    );
-                }
-                overlap_verified = true;
-                return Ok(ControlFlow::Continue(()));
-            }
-            if !overlap_verified {
-                bail!(
-                    "overlapping relay journal {} does not contain boundary event {}",
-                    candidate.path.display(),
-                    contribution_after
-                );
-            }
-            validate_relay_event(previous_ordinal, &previous_digest, &event)
-                .context("validate relay journal event chain")?;
-            for (name, ordinal, digest) in &original_frontiers {
-                if event.ordinal == *ordinal && event.digest != *digest {
-                    bail!(
-                        "relay {name} digest conflicts with journal event {}",
-                        event.ordinal
-                    );
-                }
-            }
-            if event.ordinal > snapshot_ordinal {
-                apply_relay_event(snapshot, &event)?;
-            }
-            previous_ordinal = event.ordinal;
-            previous_digest = event.digest.clone();
-            if hot_events.len() == RELAY_HOT_EVENT_CAPACITY {
-                hot_events.pop_front();
-            }
-            hot_events.push_back(event);
-            Ok(ControlFlow::Continue(()))
-        })?;
-        if previous_ordinal != candidate.file_last_ordinal {
-            bail!(
-                "relay journal {} ended at event {previous_ordinal}, expected {}",
-                candidate.path.display(),
-                candidate.file_last_ordinal
-            );
-        }
+        previous_ordinal = candidate.file_last_ordinal;
         spans.push(RelayJournalSpan {
             after_ordinal: contribution_after,
             ..candidate
@@ -200,10 +156,119 @@ pub(crate) fn open_relay_journal(
         }
     }
 
+    // The durable snapshot already contains the current operational state.
+    // Only a crash tail newer than that snapshot must be decompressed and
+    // applied during startup; retained history is validated when a controller
+    // actually requests it. This keeps worker readiness proportional to the
+    // bounded snapshot lag instead of the lifetime transcript size.
+    let mut hot_events = VecDeque::new();
+    let mut recovered_ordinal = snapshot_ordinal;
+    let mut recovered_digest = snapshot.latest_digest.clone();
+    for span in &spans {
+        if span.file_last_ordinal <= recovered_ordinal {
+            continue;
+        }
+        let boundary = recovered_ordinal;
+        let mut boundary_verified = span.file_first_ordinal == boundary.saturating_add(1);
+        visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
+            if event.ordinal < boundary {
+                return Ok(ControlFlow::Continue(()));
+            }
+            if event.ordinal == boundary {
+                if event.digest != recovered_digest {
+                    bail!(
+                        "overlapping relay journal {} conflicts at event {}",
+                        span.path.display(),
+                        event.ordinal
+                    );
+                }
+                boundary_verified = true;
+                return Ok(ControlFlow::Continue(()));
+            }
+            if !boundary_verified {
+                bail!(
+                    "overlapping relay journal {} does not contain boundary event {}",
+                    span.path.display(),
+                    boundary
+                );
+            }
+            validate_relay_event(recovered_ordinal, &recovered_digest, &event)
+                .context("validate relay journal recovery tail")?;
+            apply_relay_event(snapshot, &event)?;
+            recovered_ordinal = event.ordinal;
+            recovered_digest = event.digest.clone();
+            if hot_events.len() == RELAY_HOT_EVENT_CAPACITY {
+                hot_events.pop_front();
+            }
+            hot_events.push_back(event);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        if recovered_ordinal != span.file_last_ordinal {
+            bail!(
+                "relay journal {} ended at event {recovered_ordinal}, expected {}",
+                span.path.display(),
+                span.file_last_ordinal
+            );
+        }
+    }
+    if hot_events.len() < RELAY_HOT_EVENT_CAPACITY {
+        let mut recent = VecDeque::new();
+        for span in spans.iter().rev() {
+            let mut segment_events = Vec::new();
+            let mut previous: Option<RelayEvent> = None;
+            visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
+                // Validate each record by its own digest; between consecutive
+                // records the v1 chain link is also enforced. The first record
+                // read cold has no trusted predecessor, so it is validated on
+                // its own digest alone (a v2 record carries no back-reference).
+                if let Some(previous) = &previous {
+                    validate_relay_event(previous.ordinal, &previous.digest, &event).with_context(
+                        || format!("validate relay journal {}", span.path.display()),
+                    )?;
+                } else {
+                    validate_relay_event_self(&event).with_context(|| {
+                        format!("validate relay journal {}", span.path.display())
+                    })?;
+                }
+                if event.ordinal > span.after_ordinal && event.ordinal <= snapshot.latest_ordinal {
+                    segment_events.push(event.clone());
+                }
+                previous = Some(event);
+                Ok(ControlFlow::Continue(()))
+            })?;
+            for event in segment_events.into_iter().rev() {
+                recent.push_front(event);
+                if recent.len() == RELAY_HOT_EVENT_CAPACITY {
+                    break;
+                }
+            }
+            if recent.len() == RELAY_HOT_EVENT_CAPACITY {
+                break;
+            }
+        }
+        hot_events = recent;
+    }
+    if snapshot.latest_ordinal > retained_through {
+        let Some(latest) = hot_events.back() else {
+            bail!(
+                "relay journal is missing snapshot frontier event {}",
+                snapshot.latest_ordinal
+            );
+        };
+        if latest.ordinal != snapshot.latest_ordinal || latest.digest != snapshot.latest_digest {
+            bail!(
+                "relay snapshot digest conflicts with journal event {}",
+                snapshot.latest_ordinal
+            );
+        }
+    }
+
     // An active copy left behind by a crash may be fully covered by a sealed
     // span. Keep it as a zero-width canonical span when it reaches the current
-    // frontier so future appends remain contiguous. A stale shorter active
-    // copy is safe to truncate because the selected sealed chain covers it.
+    // frontier so future appends remain contiguous. Preserve a stale shorter
+    // copy under an ignored name before replacing it: sealed filenames are
+    // enough to assemble history lazily, but are not proof that deleting the
+    // overlapping active data would be safe.
     if let Some(active_file) = files.iter().find(|file| file.path == active)
         && !spans.iter().any(|span| span.path == active)
     {
@@ -213,29 +278,8 @@ pub(crate) fn open_relay_journal(
                 ..active_file.clone()
             });
         } else if active_file.file_last_ordinal < previous_ordinal {
-            truncate_active_relay_journal(journal, &active)?;
+            archive_stale_active_relay_journal(journal, &active, active_file)?;
         }
-    }
-    let canonical_paths = spans
-        .iter()
-        .map(|span| span.path.clone())
-        .collect::<BTreeSet<_>>();
-    let mut removed_redundant_copy = false;
-    for file in &files {
-        if file
-            .path
-            .extension()
-            .is_some_and(|extension| extension == "gz")
-            && !canonical_paths.contains(&file.path)
-        {
-            fs::remove_file(&file.path).with_context(|| {
-                format!("remove redundant relay segment {}", file.path.display())
-            })?;
-            removed_redundant_copy = true;
-        }
-    }
-    if removed_redundant_copy {
-        sync_directory(journal)?;
     }
     Ok((spans, hot_events))
 }
@@ -254,7 +298,7 @@ fn seal_active_relay_segment(journal: &Path, metadata: &mut RelayJournalSpan) ->
         .write(true)
         .open(&temporary)?;
     let mut encoder = GzEncoder::new(file, Compression::default());
-    visit_relay_journal_file(&active, false, |event, _| {
+    visit_relay_journal_file(&active, JournalReadMode::Strict, |event, _| {
         serde_json::to_writer(&mut encoder, &event)?;
         encoder.write_all(b"\n")?;
         Ok(ControlFlow::Continue(()))
@@ -286,17 +330,18 @@ fn inspect_relay_journal_file(
 ) -> Result<Option<RelayJournalSpan>> {
     let mut first: Option<RelayEvent> = None;
     let mut previous: Option<RelayEvent> = None;
-    visit_relay_journal_file(path, repair_partial_tail, |event, encoded_len| {
+    let mode = if repair_partial_tail {
+        JournalReadMode::RepairTail
+    } else {
+        JournalReadMode::Strict
+    };
+    visit_relay_journal_file(path, mode, |event, encoded_len| {
         ensure_byte_budget(encoded_len, RELAY_EVENT_BYTE_BUDGET, "relay event")?;
         if let Some(previous) = &previous {
             validate_relay_event(previous.ordinal, &previous.digest, &event)
                 .with_context(|| format!("validate relay journal {}", path.display()))?;
         } else {
-            let previous_ordinal = event
-                .ordinal
-                .checked_sub(1)
-                .ok_or_else(|| anyhow!("relay event ordinal zero is invalid"))?;
-            validate_relay_event(previous_ordinal, &event.previous_digest, &event)
+            validate_relay_event_self(&event)
                 .with_context(|| format!("validate relay journal {}", path.display()))?;
             first = Some(event.clone());
         }
@@ -306,33 +351,96 @@ fn inspect_relay_journal_file(
     Ok(first.zip(previous).map(|(first, last)| RelayJournalSpan {
         path: path.to_owned(),
         file_first_ordinal: first.ordinal,
-        file_first_previous_digest: first.previous_digest,
+        // A v1 first event caches the digest before the span in its
+        // `previous_digest`; a v2 first event carries none, so the boundary
+        // digest must be read from the event itself when needed.
+        file_first_previous_digest: (!first.previous_digest.is_empty())
+            .then_some(first.previous_digest),
         file_last_ordinal: last.ordinal,
-        file_last_digest: last.digest,
+        file_last_digest: Some(last.digest),
         after_ordinal: 0,
     }))
 }
 
+fn sealed_relay_journal_metadata(path: &Path) -> Result<RelayJournalSpan> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        bail!("relay segment has a non-UTF-8 name: {}", path.display());
+    };
+    let Some(range) = name
+        .strip_prefix("segment-")
+        .and_then(|name| name.strip_suffix(".jsonl.gz"))
+    else {
+        bail!("invalid sealed relay segment name {}", path.display());
+    };
+    let Some((first, last)) = range.split_once('-') else {
+        bail!("invalid sealed relay segment range {}", path.display());
+    };
+    let first = first
+        .parse::<u64>()
+        .with_context(|| format!("parse first ordinal from {}", path.display()))?;
+    let last = last
+        .parse::<u64>()
+        .with_context(|| format!("parse last ordinal from {}", path.display()))?;
+    if first == 0 || first > last {
+        bail!("invalid sealed relay segment range {first}-{last}");
+    }
+    Ok(RelayJournalSpan {
+        path: path.to_owned(),
+        file_first_ordinal: first,
+        file_first_previous_digest: None,
+        file_last_ordinal: last,
+        file_last_digest: None,
+        after_ordinal: 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override of the seal threshold so tests build multi-segment
+    /// journals from a handful of small records instead of megabytes.
+    static SEAL_BYTE_LIMIT_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear) the active-segment seal threshold for the current test thread.
+#[cfg(test)]
+pub(crate) fn set_seal_byte_limit_override(limit: Option<u64>) {
+    SEAL_BYTE_LIMIT_OVERRIDE.with(|cell| cell.set(limit));
+}
+
+fn relay_segment_byte_limit() -> u64 {
+    #[cfg(test)]
+    if let Some(limit) = SEAL_BYTE_LIMIT_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    RELAY_SEGMENT_BYTE_LIMIT
+}
+
 pub(crate) fn visit_relay_journal_file(
     path: &Path,
-    repair_partial_tail: bool,
+    mode: JournalReadMode,
     mut visitor: impl FnMut(RelayEvent, usize) -> Result<ControlFlow<()>>,
-) -> Result<()> {
+) -> Result<Vec<RelayJournalGap>> {
     if !path.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let compressed = path.extension().is_some_and(|extension| extension == "gz");
     if compressed {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let decoder = GzDecoder::new(file);
         let mut reader = std::io::BufReader::new(decoder);
-        visit_relay_journal_reader(path, &mut reader, false, &mut visitor)?;
-        return Ok(());
+        let scan = visit_relay_journal_reader(
+            path,
+            &mut reader,
+            mode.without_tail_repair(),
+            &mut visitor,
+        )?;
+        return Ok(scan.gaps);
     }
 
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
-    let scan = visit_relay_journal_reader(path, &mut reader, repair_partial_tail, &mut visitor)?;
+    let scan = visit_relay_journal_reader(path, &mut reader, mode, &mut visitor)?;
     drop(reader);
     if let Some(valid_len) = scan.truncate_to {
         let file = OpenOptions::new()
@@ -345,45 +453,143 @@ pub(crate) fn visit_relay_journal_file(
             sync_directory(parent)?;
         }
     }
-    Ok(())
+    Ok(scan.gaps)
+}
+
+/// How a journal file is read when a record does not parse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum JournalReadMode {
+    /// Read-only and strict: an unparseable terminated record aborts the scan.
+    /// A torn tail (no trailing newline) stops cleanly without touching the file.
+    Strict,
+    /// Startup repair of the live active segment: like `Strict`, but a torn tail
+    /// is truncated to the last complete record.
+    RepairTail,
+    /// Recovery: an unparseable terminated record is skipped and recorded as a
+    /// byte gap; the scan recovers every intact record either side of it. A torn
+    /// tail stops cleanly (never truncates — recovery is read-only).
+    Recover,
+}
+
+impl JournalReadMode {
+    /// Tail repair is meaningless for a compressed sealed segment (its bytes are
+    /// gzip-framed and immutable), so drop it there while keeping recovery.
+    fn without_tail_repair(self) -> Self {
+        match self {
+            JournalReadMode::RepairTail => JournalReadMode::Strict,
+            other => other,
+        }
+    }
+}
+
+/// A run of unrecoverable bytes skipped during `Recover` — one or more corrupt
+/// records. The surrounding good records are recovered; the caller correlates
+/// the byte range with ordinals from the events it did receive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RelayJournalGap {
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: usize,
 }
 
 struct RelayJournalScan {
     truncate_to: Option<u64>,
+    gaps: Vec<RelayJournalGap>,
 }
 
 fn visit_relay_journal_reader(
     path: &Path,
     reader: &mut impl BufRead,
-    repair_partial_tail: bool,
+    mode: JournalReadMode,
     visitor: &mut impl FnMut(RelayEvent, usize) -> Result<ControlFlow<()>>,
 ) -> Result<RelayJournalScan> {
     let mut line = Vec::new();
     let mut complete_bytes = 0_u64;
+    let mut gaps = Vec::new();
     loop {
         let (consumed, terminated) = read_bounded_line(reader, &mut line, RELAY_EVENT_BYTE_BUDGET)
             .with_context(|| format!("read relay journal {}", path.display()))?;
         if consumed == 0 {
-            return Ok(RelayJournalScan { truncate_to: None });
-        }
-        if !terminated && repair_partial_tail {
             return Ok(RelayJournalScan {
-                truncate_to: Some(complete_bytes),
+                truncate_to: None,
+                gaps,
             });
         }
+        if !terminated {
+            // A line with no trailing newline is a partial or in-flight append,
+            // never a committed event: `append_relay_event` writes each record
+            // and its newline in a single call. Stop at the last complete
+            // record instead of parsing the torn bytes (which fails with an
+            // "EOF while parsing" error). Repair mode truncates the torn tail;
+            // every other mode leaves the file untouched for the writer to
+            // finish.
+            return Ok(RelayJournalScan {
+                truncate_to: (mode == JournalReadMode::RepairTail).then_some(complete_bytes),
+                gaps,
+            });
+        }
+        let record_offset = complete_bytes;
         complete_bytes = complete_bytes
             .checked_add(u64::try_from(consumed).context("relay journal length overflow")?)
             .ok_or_else(|| anyhow!("relay journal length overflow"))?;
         if line.is_empty() {
             continue;
         }
-        let event = serde_json::from_slice(&line)
-            .with_context(|| format!("parse relay journal {}", path.display()))?;
+        let event = match serde_json::from_slice(&line) {
+            Ok(event) => event,
+            Err(error) => {
+                // A terminated record that will not parse is unrecoverable. In
+                // recovery, skip it so its corruption cannot poison the intact
+                // records around it; otherwise fail as before.
+                if mode == JournalReadMode::Recover {
+                    tracing::warn!(
+                        journal = %path.display(),
+                        byte_offset = record_offset,
+                        bytes = line.len(),
+                        %error,
+                        "skipping unparseable relay journal record during recovery",
+                    );
+                    gaps.push(RelayJournalGap {
+                        byte_offset: record_offset,
+                        byte_len: line.len(),
+                    });
+                    continue;
+                }
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("parse relay journal {}", path.display()));
+            }
+        };
+        // A record that parses but whose bytes were altered fails to recompute
+        // its own digest. In recovery that is corruption too — skip it so a
+        // flipped byte cannot be served as a valid but wrong record, and so it
+        // cannot poison its neighbours. Strict/RepairTail leave this to the
+        // caller's own validation, as before.
+        if mode == JournalReadMode::Recover
+            && let Err(error) = validate_relay_event_self(&event)
+        {
+            tracing::warn!(
+                journal = %path.display(),
+                byte_offset = record_offset,
+                bytes = line.len(),
+                %error,
+                "skipping relay journal record that failed self-validation during recovery",
+            );
+            gaps.push(RelayJournalGap {
+                byte_offset: record_offset,
+                byte_len: line.len(),
+            });
+            continue;
+        }
         if visitor(event, line.len())?.is_break() {
-            return Ok(RelayJournalScan { truncate_to: None });
+            return Ok(RelayJournalScan {
+                truncate_to: None,
+                gaps,
+            });
         }
         if !terminated {
-            return Ok(RelayJournalScan { truncate_to: None });
+            return Ok(RelayJournalScan {
+                truncate_to: None,
+                gaps,
+            });
         }
     }
 }
@@ -419,7 +625,31 @@ pub(crate) fn read_bounded_line(
     }
 }
 
-fn truncate_active_relay_journal(journal: &Path, active: &Path) -> Result<()> {
+fn archive_stale_active_relay_journal(
+    journal: &Path,
+    active: &Path,
+    metadata: &RelayJournalSpan,
+) -> Result<()> {
+    let archived = journal.join(format!(
+        "stale-active-{:020}-{:020}.jsonl",
+        metadata.file_first_ordinal, metadata.file_last_ordinal
+    ));
+    if archived.exists() {
+        bail!(
+            "cannot preserve stale relay journal {} because {} already exists",
+            active.display(),
+            archived.display()
+        );
+    }
+    fs::rename(active, &archived).with_context(|| {
+        format!(
+            "preserve stale relay journal {} as {}",
+            active.display(),
+            archived.display()
+        )
+    })?;
+    sync_directory(journal)?;
+
     let replacement = journal.join("active.jsonl.new");
     let file = OpenOptions::new()
         .create(true)
@@ -513,9 +743,14 @@ impl DurableRelay {
             observation,
             RELAY_EVENT_BYTE_BUDGET - RELAY_EVENT_ENVELOPE_RESERVE,
         )?;
+        // v2: self-describing records carry no chain link, so a corrupt record
+        // can never invalidate the events after it. The frontier is still
+        // tracked by `latest_digest` for cursor validation; it just is not
+        // folded into the next record's digest.
         let event = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V2,
             ordinal,
-            previous_digest: self.snapshot.latest_digest.clone(),
+            previous_digest: String::new(),
             digest: String::new(),
             recorded_at_ms: epoch_millis(),
             command_id: command_id.map(str::to_owned),
@@ -561,6 +796,7 @@ impl DurableRelay {
         if created_active_segment {
             sync_directory(&journal)?;
         }
+        crate::hel_test_hooks::reach_test_hook("journal_append_before_snapshot_publication")?;
 
         match staged {
             Some(next_snapshot) => self.snapshot = next_snapshot,
@@ -612,7 +848,7 @@ impl DurableRelay {
     fn seal_active_segment_if_needed(&mut self) -> Result<()> {
         let journal = self.root.join(RELAY_JOURNAL_DIR);
         let active = journal.join(RELAY_ACTIVE_SEGMENT);
-        if !active.exists() || active.metadata()?.len() < RELAY_SEGMENT_BYTE_LIMIT {
+        if !active.exists() || active.metadata()?.len() < relay_segment_byte_limit() {
             return Ok(());
         }
         let Some(index) = self
@@ -636,15 +872,18 @@ impl DurableRelay {
         {
             debug_assert_eq!(span.file_last_ordinal + 1, event.ordinal);
             span.file_last_ordinal = event.ordinal;
-            span.file_last_digest = event.digest.clone();
+            span.file_last_digest = Some(event.digest.clone());
             return;
         }
         self.journal_spans.push(RelayJournalSpan {
             path: active.to_owned(),
             file_first_ordinal: event.ordinal,
-            file_first_previous_digest: event.previous_digest.clone(),
+            // v2 events carry no `previous_digest`; the boundary digest is read
+            // from the event itself when needed.
+            file_first_previous_digest: (!event.previous_digest.is_empty())
+                .then(|| event.previous_digest.clone()),
             file_last_ordinal: event.ordinal,
-            file_last_digest: event.digest.clone(),
+            file_last_digest: Some(event.digest.clone()),
             after_ordinal: event.ordinal - 1,
         });
     }
@@ -678,7 +917,7 @@ impl DurableRelay {
         let mut last: Option<RelayEvent> = None;
         let mut written_through = retain_after;
         for span in &self.journal_spans {
-            visit_relay_journal_file(&span.path, false, |event, _| {
+            visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
                 if event.ordinal <= span.after_ordinal || event.ordinal <= written_through {
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -711,9 +950,9 @@ impl DurableRelay {
             (Some(first), Some(last)) => vec![RelayJournalSpan {
                 path: active.clone(),
                 file_first_ordinal: first.ordinal,
-                file_first_previous_digest: first.previous_digest,
+                file_first_previous_digest: Some(first.previous_digest),
                 file_last_ordinal: last.ordinal,
-                file_last_digest: last.digest,
+                file_last_digest: Some(last.digest),
                 after_ordinal: retain_after,
             }],
             (None, None) => Vec::new(),
@@ -915,6 +1154,10 @@ impl DurableRelay {
 }
 
 #[cfg(test)]
+#[path = "journal_chaos.rs"]
+mod chaos;
+
+#[cfg(test)]
 mod tests {
     use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate};
     use serde_json::Value;
@@ -922,9 +1165,9 @@ mod tests {
     use super::*;
     use crate::hel_worker::test_support::*;
     use crate::hel_worker::{
-        ClaimedRelayCommand, RELAY_EVENT_GENESIS_DIGEST, RelayCommandKind, RelayCommandOutcome,
-        RelayCursor, RelayErrorCode, RelayErrorDetail, RelayExecutionState, RelayProtocolError,
-        RelayRequest, RelayResponseBody, RelayResponsePayload,
+        ClaimedRelayCommand, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_GENESIS_DIGEST, RelayCommandKind,
+        RelayCommandOutcome, RelayCursor, RelayErrorCode, RelayErrorDetail, RelayExecutionState,
+        RelayProtocolError, RelayRequest, RelayResponseBody, RelayResponsePayload,
     };
 
     /// Streamed chunk cost, measured both ways in one process so a loaded
@@ -1489,6 +1732,7 @@ mod tests {
         let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
         drop(relay);
         let event = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V1,
             ordinal: 1,
             previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
             digest: String::new(),
@@ -1559,6 +1803,246 @@ mod tests {
         let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
         assert_eq!(relay.latest_ordinal(), 2);
         assert_eq!(retained_events(&relay).len(), 2);
+    }
+
+    #[test]
+    fn a_read_only_replay_tolerates_a_torn_active_tail_and_serves_the_newest_record() {
+        // An attach serving the hot segment can read it while the worker is
+        // mid-append, catching a final record with no trailing newline. That
+        // partial write must not fail the replay: every complete record —
+        // including the most recent — has to be delivered, and the live file
+        // must be left untouched for the writer to finish.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(RELAY_ACTIVE_SEGMENT);
+        let mut file = File::create(&path).unwrap();
+        let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
+        for ordinal in 1..=3 {
+            let event = RelayEvent {
+                format: RELAY_EVENT_FORMAT_V1,
+                ordinal,
+                previous_digest: previous_digest.clone(),
+                digest: String::new(),
+                recorded_at_ms: epoch_millis(),
+                command_id: None,
+                observation: RelayObservation::Warning {
+                    message: format!("event {ordinal}"),
+                },
+            };
+            let event = RelayEvent {
+                digest: relay_event_digest(&event).unwrap(),
+                ..event
+            };
+            previous_digest = event.digest.clone();
+            serde_json::to_writer(&mut file, &event).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        // A torn, in-flight fourth record: content began but the closing bytes
+        // and newline are not on disk yet.
+        file.write_all(br#"{"ordinal":4,"previous_digest":"#)
+            .unwrap();
+        file.sync_all().unwrap();
+        let len_before = path.metadata().unwrap().len();
+
+        let mut seen = Vec::new();
+        visit_relay_journal_file(&path, JournalReadMode::Strict, |event, _| {
+            seen.push(event.ordinal);
+            Ok(ControlFlow::Continue(()))
+        })
+        .expect("a read-only replay must tolerate a torn tail");
+
+        assert_eq!(
+            seen,
+            vec![1, 2, 3],
+            "every complete record, including the most recent, must be served"
+        );
+        assert_eq!(
+            path.metadata().unwrap().len(),
+            len_before,
+            "a read-only replay must not truncate the live segment"
+        );
+    }
+
+    #[test]
+    fn recover_mode_skips_a_corrupt_record_and_recovers_its_neighbours() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(RELAY_ACTIVE_SEGMENT);
+        fn write_event(file: &mut File, ordinal: u64, previous_digest: &mut String) {
+            let event = RelayEvent {
+                format: RELAY_EVENT_FORMAT_V1,
+                ordinal,
+                previous_digest: previous_digest.clone(),
+                digest: String::new(),
+                recorded_at_ms: ordinal as i64,
+                command_id: None,
+                observation: RelayObservation::Warning {
+                    message: format!("event {ordinal}"),
+                },
+            };
+            let event = RelayEvent {
+                digest: relay_event_digest(&event).unwrap(),
+                ..event
+            };
+            *previous_digest = event.digest.clone();
+            serde_json::to_writer(&mut *file, &event).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+
+        let mut file = File::create(&path).unwrap();
+        let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
+        write_event(&mut file, 1, &mut previous_digest);
+        // A corrupt interior record: terminated (has its newline) but not valid
+        // JSON, so its bytes are unrecoverable.
+        file.write_all(br#"{"ordinal":2,"observation": BROKEN"#)
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        write_event(&mut file, 3, &mut previous_digest);
+        file.sync_all().unwrap();
+
+        // Strict aborts on the corrupt record.
+        let strict = visit_relay_journal_file(&path, JournalReadMode::Strict, |_, _| {
+            Ok(ControlFlow::Continue(()))
+        });
+        assert!(
+            strict.is_err(),
+            "strict reads must not silently pass a corrupt record"
+        );
+
+        // Recover skips it and delivers both intact neighbours, reporting one gap.
+        let mut seen = Vec::new();
+        let gaps = visit_relay_journal_file(&path, JournalReadMode::Recover, |event, _| {
+            seen.push(event.ordinal);
+            Ok(ControlFlow::Continue(()))
+        })
+        .expect("recovery must not fail on a corrupt record");
+        assert_eq!(
+            seen,
+            vec![1, 3],
+            "records either side of the corruption must be recovered"
+        );
+        assert_eq!(gaps.len(), 1, "the one corrupt record is reported as a gap");
+    }
+
+    #[test]
+    fn recovery_isolates_a_corrupt_record_at_every_position() {
+        // "Recover everything that isn't actively corrupted": whichever single
+        // record is corrupt, all the others come back and exactly one gap is
+        // reported.
+        const COUNT: u64 = 6;
+        for corrupt_index in 1..=COUNT {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(RELAY_ACTIVE_SEGMENT);
+            let mut file = File::create(&path).unwrap();
+            let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
+            for ordinal in 1..=COUNT {
+                if ordinal == corrupt_index {
+                    file.write_all(br#"{"ordinal":0,"observation": BROKEN"#)
+                        .unwrap();
+                    file.write_all(b"\n").unwrap();
+                    continue;
+                }
+                let event = RelayEvent {
+                    format: RELAY_EVENT_FORMAT_V2,
+                    ordinal,
+                    previous_digest: String::new(),
+                    digest: String::new(),
+                    recorded_at_ms: ordinal as i64,
+                    command_id: None,
+                    observation: RelayObservation::Warning {
+                        message: format!("event {ordinal}"),
+                    },
+                };
+                let event = RelayEvent {
+                    digest: relay_event_digest(&event).unwrap(),
+                    ..event
+                };
+                // v2 records self-hash; keep a running frontier only to mimic
+                // the writer, though v2 does not fold it in.
+                previous_digest = event.digest.clone();
+                serde_json::to_writer(&mut file, &event).unwrap();
+                file.write_all(b"\n").unwrap();
+            }
+            file.sync_all().unwrap();
+            let _ = &previous_digest;
+
+            let mut seen = Vec::new();
+            let gaps = visit_relay_journal_file(&path, JournalReadMode::Recover, |event, _| {
+                validate_relay_event_self(&event).unwrap();
+                seen.push(event.ordinal);
+                Ok(ControlFlow::Continue(()))
+            })
+            .expect("recovery must not fail on a corrupt record");
+            let expected: Vec<u64> = (1..=COUNT).filter(|o| *o != corrupt_index).collect();
+            assert_eq!(
+                seen, expected,
+                "every intact record must survive corruption at index {corrupt_index}"
+            );
+            assert_eq!(
+                gaps.len(),
+                1,
+                "one gap for corruption at index {corrupt_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_journal_mixing_v1_and_v2_records_reads_and_validates_across_the_boundary() {
+        // During the lazy migration a journal holds legacy v1 records followed
+        // by new v2 records. Both formats read, each self-validates, and the
+        // v1→v2 boundary validates without a chain link.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(RELAY_ACTIVE_SEGMENT);
+        let mut file = File::create(&path).unwrap();
+
+        let v1 = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V1,
+            ordinal: 1,
+            previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+            digest: String::new(),
+            recorded_at_ms: 1,
+            command_id: None,
+            observation: RelayObservation::Warning {
+                message: "legacy".into(),
+            },
+        };
+        let v1 = RelayEvent {
+            digest: relay_event_digest(&v1).unwrap(),
+            ..v1
+        };
+        serde_json::to_writer(&mut file, &v1).unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let v2 = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V2,
+            ordinal: 2,
+            previous_digest: String::new(),
+            digest: String::new(),
+            recorded_at_ms: 2,
+            command_id: None,
+            observation: RelayObservation::Warning {
+                message: "new".into(),
+            },
+        };
+        let v2 = RelayEvent {
+            digest: relay_event_digest(&v2).unwrap(),
+            ..v2
+        };
+        serde_json::to_writer(&mut file, &v2).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+
+        let mut events = Vec::new();
+        visit_relay_journal_file(&path, JournalReadMode::Strict, |event, _| {
+            events.push(event);
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].format, RELAY_EVENT_FORMAT_V1);
+        assert_eq!(events[1].format, RELAY_EVENT_FORMAT_V2);
+        // The v2 record continues from the v1 record across the format
+        // boundary: ordinal contiguity holds and the v2 record self-validates,
+        // with no chain link required.
+        validate_relay_event(v1.ordinal, &v1.digest, &events[1]).unwrap();
     }
 
     #[test]
@@ -1893,6 +2377,84 @@ mod tests {
     }
 
     #[test]
+    fn reopening_preserves_a_stale_active_copy_before_appending() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join(RELAY_JOURNAL_DIR);
+        let active = journal.join(RELAY_ACTIVE_SEGMENT);
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        for message in ["first", "second"] {
+            relay
+                .record_observation(RelayObservation::Warning {
+                    message: message.into(),
+                })
+                .unwrap();
+        }
+        relay.persist_snapshot().unwrap();
+        drop(relay);
+
+        let active_bytes = fs::read(&active).unwrap();
+        let first_line_end = active_bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let stale_bytes = active_bytes[..first_line_end].to_vec();
+        let mut metadata = inspect_relay_journal_file(&active, false).unwrap().unwrap();
+        seal_active_relay_segment(&journal, &mut metadata).unwrap();
+        fs::write(&active, &stale_bytes).unwrap();
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.latest_ordinal(), 2);
+        assert!(fs::read(&active).unwrap().is_empty());
+        let archived = fs::read_dir(&journal)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("stale-active-"))
+            })
+            .expect("stale active journal was not preserved");
+        assert_eq!(fs::read(archived).unwrap(), stale_bytes);
+
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "third".into(),
+            })
+            .unwrap();
+        assert_eq!(relay.latest_ordinal(), 3);
+    }
+
+    #[test]
+    fn replay_lazily_resolves_an_old_sealed_segment_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join(RELAY_JOURNAL_DIR);
+        let active = journal.join(RELAY_ACTIVE_SEGMENT);
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let mut first_digest = None;
+        for index in 0..=RELAY_HOT_EVENT_CAPACITY {
+            relay
+                .record_observation(RelayObservation::Warning {
+                    message: format!("event {index}"),
+                })
+                .unwrap();
+            if index == 0 {
+                first_digest = Some(relay.latest_digest().to_owned());
+            }
+            let span = relay
+                .journal_spans
+                .iter_mut()
+                .find(|span| span.path == active)
+                .unwrap();
+            seal_active_relay_segment(&journal, span).unwrap();
+        }
+        relay.persist_snapshot().unwrap();
+        drop(relay);
+
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let events = relay
+            .events_after(1, &first_digest.unwrap())
+            .expect("old segment boundary should resolve from the next sealed segment");
+        assert_eq!(events.first().unwrap().ordinal, 2);
+    }
+
+    #[test]
     fn large_relay_history_stays_disk_backed_and_replays_across_segments() {
         const EVENT_COUNT: usize = 80;
         const MESSAGE_BYTES: usize = 64 * 1024;
@@ -1965,6 +2527,69 @@ mod tests {
         assert_eq!(replayed, EVENT_COUNT);
         assert!(pages >= 2, "history unexpectedly fit in one replay page");
         assert_eq!(cursor.digest, expected_digest);
+    }
+
+    #[test]
+    fn reopening_does_not_decompress_historical_sealed_segments() {
+        const EVENT_COUNT: usize = 80;
+        const MESSAGE_BYTES: usize = 64 * 1024;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        for index in 0..EVENT_COUNT {
+            relay
+                .record_observation(RelayObservation::Warning {
+                    message: format!("{index:04}:{}", "x".repeat(MESSAGE_BYTES)),
+                })
+                .unwrap();
+        }
+        drop(relay);
+
+        let mut sealed = fs::read_dir(temp.path().join(RELAY_JOURNAL_DIR))
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "gz"))
+            .collect::<Vec<_>>();
+        sealed.sort();
+        assert!(
+            sealed.len() >= 3,
+            "test history did not seal enough segments"
+        );
+        fs::write(&sealed[0], b"not a gzip stream").unwrap();
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0")
+            .expect("current snapshot should open without reading old transcript segments");
+        let response = relay.handle(relay_request(
+            "attach-corrupt-history",
+            RelayRequest::Attach {
+                after_ordinal: 0,
+                after_digest: RELAY_EVENT_GENESIS_DIGEST.into(),
+            },
+        ));
+        let RelayResponseBody::Error { error } = response.body else {
+            panic!("corrupt history was served: {response:?}");
+        };
+        // Corrupt history is never served as valid data. Because readable
+        // history exists past the corrupt segment, the relay answers with a
+        // recovery cursor so the controller resynchronizes forward instead of
+        // retrying the unreadable bytes forever.
+        assert_eq!(error.code, RelayErrorCode::Desynchronized);
+        let Some(RelayErrorDetail::Desynchronized {
+            earliest_available,
+            latest,
+            ..
+        }) = error.detail
+        else {
+            panic!("expected a desync recovery cursor: {error:?}");
+        };
+        assert!(
+            earliest_available > 0,
+            "recovery cursor must skip the corrupt segment, got {earliest_available}"
+        );
+        assert!(
+            earliest_available < latest,
+            "newer readable history must remain available: {earliest_available} < {latest}"
+        );
     }
 
     #[test]

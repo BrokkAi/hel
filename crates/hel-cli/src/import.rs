@@ -90,9 +90,9 @@ impl ImportCommand {
     }
 }
 
-pub(crate) fn import(args: ImportArgs) -> Result<()> {
+pub(crate) fn import(args: ImportArgs, workspace_id: &str) -> Result<()> {
     let (harness, args) = args.command.split();
-    import_native(harness, args)
+    import_native(harness, args, workspace_id)
 }
 
 /// How the CLI names a harness while it reports what it selected.
@@ -243,7 +243,7 @@ fn locate_for_import(
 /// Adopt one native session from the command line. Every harness takes these
 /// same steps; only the locator and the importer bound in [`LocatedImport`]
 /// differ.
-fn import_native(harness: HarnessKind, args: NativeImportArgs) -> Result<()> {
+fn import_native(harness: HarnessKind, args: NativeImportArgs, workspace_id: &str) -> Result<()> {
     let home = harness_config_home(harness)?;
     let selection = match args.session {
         Some(session) => ClaudeSessionSelection::NativeSessionId(session),
@@ -280,12 +280,12 @@ fn import_native(harness: HarnessKind, args: NativeImportArgs) -> Result<()> {
     // `write_archive_atomic`; persist a synthesized config before the state
     // record that references it.
     config.save()?;
-    persist_imported_session(
-        state
-            .sessions
-            .get(&imported.session_id)
-            .context("import did not add its session to controller state")?,
-    )?;
+    let session = state
+        .sessions
+        .get_mut(&imported.session_id)
+        .context("import did not add its session to controller state")?;
+    session.workspace_id = workspace_id.to_owned();
+    persist_imported_session(session)?;
     println!(
         "Imported {} as Hel session {} (bundle {}, archive {})",
         imported.native_session_id,
@@ -352,11 +352,9 @@ fn confirm_import_safety(
         };
         bail!("pass {flags} to acknowledge import safety warnings");
     }
-    print!("Proceed? [y/N]: ");
-    use std::io::Write as _;
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
+    let answer = hel::hel_readline::LineReader::default()
+        .read_line("Proceed? [y/N]: ")?
+        .unwrap_or_default();
     Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
@@ -402,7 +400,7 @@ pub(crate) struct DashboardImportSuccess {
 
 pub(crate) enum DashboardImportTaskResult {
     NeedsBundle(ImportBundlePrompt),
-    Imported(DashboardImportSuccess),
+    Imported(Box<DashboardImportSuccess>),
     Cancelled,
 }
 
@@ -416,8 +414,16 @@ pub(crate) enum DashboardImportUpdate {
     Finished {
         task_id: u64,
         pending: PendingDashboardImport,
-        result: Result<DashboardImportTaskResult>,
+        result: Box<Result<DashboardImportTaskResult>>,
     },
+}
+
+pub(crate) struct DashboardImportRequest {
+    pub(crate) workspace_id: String,
+    pub(crate) pending: PendingDashboardImport,
+    pub(crate) safety: DashboardImportSafety,
+    pub(crate) task_id: u64,
+    pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 pub(crate) fn discover_import_profile(
@@ -496,13 +502,17 @@ fn display_home_relative(path: &std::path::Path) -> String {
 
 pub(crate) fn spawn_dashboard_import(
     controller: &Controller,
-    pending: PendingDashboardImport,
-    safety: DashboardImportSafety,
-    task_id: u64,
-    cancelled: Arc<AtomicBool>,
+    request: DashboardImportRequest,
     updates: tokio::sync::mpsc::Sender<DashboardImportUpdate>,
     tracker: crate::dashboard::CriticalOperationTracker,
 ) {
+    let DashboardImportRequest {
+        workspace_id,
+        pending,
+        safety,
+        task_id,
+        cancelled,
+    } = request;
     let guard = tracker.begin_cancellable("importing session", cancelled.clone());
     let worker_controller = Controller {
         config: controller.config.clone(),
@@ -515,12 +525,14 @@ pub(crate) fn spawn_dashboard_import(
                 return;
             }
             if force {
-                let _ = updates.blocking_send(DashboardImportUpdate::Progress {
+                if let Err(error) = updates.blocking_send(DashboardImportUpdate::Progress {
                     task_id,
                     step,
                     total,
                     message: message.into(),
-                });
+                }) {
+                    tracing::debug!(task_id, %error, "import progress consumer closed");
+                }
                 return;
             }
             let mut last_update = last_detail_update.lock().expect("import progress lock");
@@ -528,16 +540,17 @@ pub(crate) fn spawn_dashboard_import(
             if now.duration_since(*last_update) < Duration::from_millis(250) {
                 return;
             }
-            if updates
-                .try_send(DashboardImportUpdate::Progress {
-                    task_id,
-                    step,
-                    total,
-                    message: message.into(),
-                })
-                .is_ok()
-            {
-                *last_update = now;
+            match updates.try_send(DashboardImportUpdate::Progress {
+                task_id,
+                step,
+                total,
+                message: message.into(),
+            }) {
+                Ok(()) => *last_update = now,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(task_id, "import progress consumer closed");
+                }
             }
         };
         let mut result = import_session_from_profile(
@@ -549,6 +562,15 @@ pub(crate) fn spawn_dashboard_import(
             &cancelled,
             report,
         );
+        if let Ok(DashboardImportTaskResult::Imported(imported)) = &mut result
+            && let Some(session) = imported
+                .controller
+                .state
+                .sessions
+                .get_mut(&imported.session_id)
+        {
+            session.workspace_id = workspace_id;
+        }
         if cancelled.load(Ordering::Acquire) {
             if let Ok(DashboardImportTaskResult::Imported(imported)) = &result
                 && let Some(path) = imported
@@ -558,16 +580,19 @@ pub(crate) fn spawn_dashboard_import(
                     .get(&imported.session_id)
                     .and_then(|session| session.checkpoint.as_ref())
                     .map(|checkpoint| checkpoint.archive_path.clone())
+                && let Err(error) = std::fs::remove_file(&path)
             {
-                let _ = std::fs::remove_file(path);
+                tracing::warn!(path = %path.display(), %error, "could not remove cancelled import checkpoint");
             }
             result = Ok(DashboardImportTaskResult::Cancelled);
         }
-        let _ = updates.blocking_send(DashboardImportUpdate::Finished {
+        if let Err(error) = updates.blocking_send(DashboardImportUpdate::Finished {
             task_id,
             pending,
-            result,
-        });
+            result: Box::new(result),
+        }) {
+            tracing::debug!(task_id, %error, "import completion consumer closed");
+        }
         drop(guard);
     });
 }
@@ -712,13 +737,13 @@ fn import_session_from_profile(
         &control,
     )?;
     report(4, Some(4), "Finalizing imported session…", true);
-    Ok(DashboardImportTaskResult::Imported(
+    Ok(DashboardImportTaskResult::Imported(Box::new(
         DashboardImportSuccess {
             harness: profile.kind.display_name(),
             session_id: imported.session_id,
             controller,
         },
-    ))
+    )))
 }
 
 #[cfg(test)]

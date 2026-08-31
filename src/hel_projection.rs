@@ -1,10 +1,11 @@
 //! Controller-owned projection of the durable ACP relay stream.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdateFields,
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -32,11 +33,162 @@ pub struct ProjectedRelayEvent {
     pub mutation: MaterializedSessionMutation,
 }
 
+/// Ephemeral lookup state for projecting a relay page. It is deliberately not
+/// part of the serialized session: the durable transcript remains canonical,
+/// while catch-up avoids rediscovering keyed items and open streams with a
+/// full transcript walk for every event.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionIndex {
+    transcript: HashMap<String, Arc<TranscriptItem>>,
+    transcript_positions: HashMap<String, usize>,
+    open_agent_streams: BTreeSet<(u64, String)>,
+    open_thought_streams: BTreeSet<(u64, String)>,
+    terminal_referrers: HashMap<String, BTreeSet<String>>,
+}
+
+impl ProjectionIndex {
+    pub(crate) fn new(current: &MaterializedSession) -> Self {
+        let mut index = Self {
+            transcript: HashMap::with_capacity(current.transcript.len()),
+            transcript_positions: HashMap::with_capacity(current.transcript.len()),
+            open_agent_streams: BTreeSet::new(),
+            open_thought_streams: BTreeSet::new(),
+            terminal_referrers: HashMap::new(),
+        };
+        for (position, item) in current.transcript.iter().enumerate() {
+            index.insert_at(item.clone(), position);
+        }
+        index
+    }
+
+    fn get(&self, stable_id: &str) -> Option<&Arc<TranscriptItem>> {
+        self.transcript.get(stable_id)
+    }
+
+    fn position(&self, stable_id: &str) -> Option<usize> {
+        self.transcript_positions.get(stable_id).copied()
+    }
+
+    fn insert(&mut self, item: Arc<TranscriptItem>) {
+        let position = self
+            .remove(&item.stable_id)
+            .unwrap_or(self.transcript.len());
+        self.insert_at(item, position);
+    }
+
+    fn insert_at(&mut self, item: Arc<TranscriptItem>, position: usize) {
+        let stream = (item.position, item.stable_id.clone());
+        match &item.body {
+            TranscriptBody::Agent {
+                streaming: true, ..
+            } => {
+                self.open_agent_streams.insert(stream);
+            }
+            TranscriptBody::Thought {
+                streaming: true, ..
+            } => {
+                self.open_thought_streams.insert(stream);
+            }
+            TranscriptBody::Tool {
+                call,
+                terminal_refs,
+                ..
+            } => {
+                let mut terminal_ids = tool_call_terminal_ids(call);
+                terminal_ids.extend(terminal_refs.iter().cloned());
+                for terminal_id in terminal_ids {
+                    self.terminal_referrers
+                        .entry(terminal_id)
+                        .or_default()
+                        .insert(item.stable_id.clone());
+                }
+            }
+            _ => {}
+        }
+        self.transcript_positions
+            .insert(item.stable_id.clone(), position);
+        self.transcript.insert(item.stable_id.clone(), item);
+    }
+
+    fn remove(&mut self, stable_id: &str) -> Option<usize> {
+        let item = self.transcript.remove(stable_id)?;
+        let position = self.transcript_positions.remove(stable_id);
+        debug_assert!(position.is_some());
+        let stream = (item.position, item.stable_id.clone());
+        self.open_agent_streams.remove(&stream);
+        self.open_thought_streams.remove(&stream);
+        if let TranscriptBody::Tool {
+            call,
+            terminal_refs,
+            ..
+        } = &item.body
+        {
+            let mut terminal_ids = tool_call_terminal_ids(call);
+            terminal_ids.extend(terminal_refs.iter().cloned());
+            for terminal_id in terminal_ids {
+                if let Some(referrers) = self.terminal_referrers.get_mut(&terminal_id) {
+                    referrers.remove(stable_id);
+                    if referrers.is_empty() {
+                        self.terminal_referrers.remove(&terminal_id);
+                    }
+                }
+            }
+        }
+        position
+    }
+
+    fn reindex_after_removal(&mut self, transcript: &[Arc<TranscriptItem>], removed: usize) {
+        for (position, item) in transcript.iter().enumerate().skip(removed) {
+            self.transcript_positions
+                .insert(item.stable_id.clone(), position);
+        }
+    }
+
+    fn latest_open_stream(&self, agent: bool) -> Option<&Arc<TranscriptItem>> {
+        let streams = if agent {
+            &self.open_agent_streams
+        } else {
+            &self.open_thought_streams
+        };
+        streams
+            .last()
+            .and_then(|(_, stable_id)| self.transcript.get(stable_id))
+    }
+
+    fn open_streams(&self, agent: bool) -> impl Iterator<Item = &Arc<TranscriptItem>> {
+        let streams = if agent {
+            &self.open_agent_streams
+        } else {
+            &self.open_thought_streams
+        };
+        streams
+            .iter()
+            .filter_map(|(_, stable_id)| self.transcript.get(stable_id))
+    }
+
+    fn terminal_referrers(&self, terminal_id: &str) -> impl Iterator<Item = &Arc<TranscriptItem>> {
+        self.terminal_referrers
+            .get(terminal_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|stable_id| self.transcript.get(stable_id))
+    }
+}
+
 /// Derive the minimal mutation for exactly the next relay event. This clones
 /// only logical items touched by the event; the actor-owned transcript is not
 /// copied.
 pub fn project_relay_event(
     current: &MaterializedSession,
+    event: &RelayEvent,
+) -> Result<ProjectedRelayEvent> {
+    let index = ProjectionIndex::new(current);
+    project_relay_event_indexed(current, &index, event)
+}
+
+pub(crate) fn project_relay_event_indexed(
+    current: &MaterializedSession,
+    index: &ProjectionIndex,
     event: &RelayEvent,
 ) -> Result<ProjectedRelayEvent> {
     validate_relay_event(
@@ -49,7 +201,7 @@ pub fn project_relay_event(
         last_activity_at_ms: Some(event.recorded_at_ms),
         ..MaterializedSessionMutation::default()
     };
-    project_observation(current, event, &mut mutation)?;
+    project_observation(current, index, event, &mut mutation)?;
     Ok(ProjectedRelayEvent { mutation })
 }
 
@@ -61,6 +213,24 @@ pub fn apply_committed_projection_event(
     current: &mut MaterializedSession,
     event: &RelayEvent,
     mutation: MaterializedSessionMutation,
+) -> Result<()> {
+    apply_committed_projection_event_inner(current, event, mutation, None)
+}
+
+pub(crate) fn apply_committed_projection_event_indexed(
+    current: &mut MaterializedSession,
+    index: &mut ProjectionIndex,
+    event: &RelayEvent,
+    mutation: MaterializedSessionMutation,
+) -> Result<()> {
+    apply_committed_projection_event_inner(current, event, mutation, Some(index))
+}
+
+fn apply_committed_projection_event_inner(
+    current: &mut MaterializedSession,
+    event: &RelayEvent,
+    mutation: MaterializedSessionMutation,
+    mut index: Option<&mut ProjectionIndex>,
 ) -> Result<()> {
     validate_relay_event(
         current.applied_event_ordinal,
@@ -80,11 +250,32 @@ pub fn apply_committed_projection_event(
         match item_mutation {
             TranscriptMutation::Upsert(item) => {
                 item.validate(event.ordinal)?;
-                if let Some(existing) = current
-                    .transcript
-                    .iter_mut()
-                    .find(|existing| existing.stable_id == item.stable_id)
-                {
+                let existing_position = index
+                    .as_deref()
+                    .and_then(|index| index.position(&item.stable_id));
+                let existing = if let Some(position) = existing_position {
+                    Some(current.transcript.get_mut(position).with_context(|| {
+                        format!(
+                            "transcript index position {position} for {:?} is out of bounds",
+                            item.stable_id
+                        )
+                    })?)
+                } else if index.is_none() {
+                    current
+                        .transcript
+                        .iter_mut()
+                        .find(|existing| existing.stable_id == item.stable_id)
+                } else {
+                    None
+                };
+                if let Some(existing) = existing {
+                    if existing.stable_id != item.stable_id {
+                        return Err(ProjectionIntegrityError(format!(
+                            "transcript index for {:?} points to {:?}",
+                            item.stable_id, existing.stable_id
+                        ))
+                        .into());
+                    }
                     if existing.position != item.position
                         || existing.created_at_ms != item.created_at_ms
                     {
@@ -122,14 +313,35 @@ pub fn apply_committed_projection_event(
                     } else {
                         *existing = Arc::new(item);
                     }
+                    if let Some(index) = index.as_deref_mut() {
+                        index.insert(existing.clone());
+                    }
                 } else {
-                    current.transcript.push(Arc::new(item));
+                    let item = Arc::new(item);
+                    if let Some(index) = index.as_deref_mut() {
+                        index.insert(item.clone());
+                    }
+                    current.transcript.push(item);
                 }
             }
             TranscriptMutation::Remove { stable_id } => {
-                current
-                    .transcript
-                    .retain(|item| item.stable_id != stable_id);
+                if let Some(index) = index.as_deref_mut() {
+                    if let Some(position) = index.remove(&stable_id) {
+                        let removed = current.transcript.remove(position);
+                        if removed.stable_id != stable_id {
+                            return Err(ProjectionIntegrityError(format!(
+                                "transcript index for {stable_id:?} removed {:?}",
+                                removed.stable_id
+                            ))
+                            .into());
+                        }
+                        index.reindex_after_removal(&current.transcript, position);
+                    }
+                } else {
+                    current
+                        .transcript
+                        .retain(|item| item.stable_id != stable_id);
+                }
             }
         }
     }
@@ -153,6 +365,7 @@ pub fn apply_committed_projection_event(
 
 fn project_observation(
     current: &MaterializedSession,
+    index: &ProjectionIndex,
     event: &RelayEvent,
     mutation: &mut MaterializedSessionMutation,
 ) -> Result<()> {
@@ -160,22 +373,16 @@ fn project_observation(
         RelayObservation::AgentInitialized { .. } => {}
         RelayObservation::SessionOpened { resumed, .. } => {
             mutation.pending_elicitations = Some(Vec::new());
-            push_system(
-                mutation,
-                event,
-                if *resumed {
-                    "harness session resumed"
-                } else {
-                    "harness session started"
-                },
-            );
+            if !resumed {
+                push_system(mutation, event, "harness session started");
+            }
         }
         RelayObservation::SessionConfigured { config_options } => {
             mutation.configuration = Some(configuration_values(config_options));
         }
         RelayObservation::SessionModesConfigured { .. } => {}
         RelayObservation::SessionUpdate { update } => {
-            project_session_update(current, event, update, mutation)?;
+            project_session_update(current, index, event, update, mutation)?;
         }
         RelayObservation::PermissionAutoApproved {
             option_id,
@@ -190,6 +397,27 @@ fn project_observation(
             pending.retain(|existing| existing.id != request.id);
             pending.push(request.clone());
             mutation.pending_elicitations = Some(pending);
+            // A plan decision also becomes a durable transcript item at the
+            // point the harness proposed it, so the proposal renders inline
+            // after the conversation that produced it and outlives both the
+            // decision dialog and the session's process.
+            if let Some(plan) = crate::hel_acp::plan_review_proposal(request) {
+                close_streams(index, mutation, event.recorded_at_ms);
+                upsert(
+                    mutation,
+                    TranscriptItem {
+                        stable_id: plan_proposal_item_id(event.ordinal),
+                        position: event.ordinal,
+                        latest_content_event_ordinal: None,
+                        created_at_ms: event.recorded_at_ms,
+                        last_changed_at_ms: event.recorded_at_ms,
+                        body: TranscriptBody::PlanProposal {
+                            proposal_id: request.id.clone(),
+                            plan: plan.to_owned(),
+                        },
+                    },
+                );
+            }
         }
         RelayObservation::ElicitationResolved { elicitation_id, .. } => {
             let mut pending = current.pending_elicitations.clone();
@@ -251,7 +479,7 @@ fn project_observation(
             ),
             RelayCommand::RemoveQueuedPrompt { .. } | RelayCommand::ClearQueuedPrompts => {}
             RelayCommand::Close { .. } => {
-                close_streams(current, mutation, event.recorded_at_ms);
+                close_streams(index, mutation, event.recorded_at_ms);
                 mutation.execution = Some(MaterializedExecutionState::Closing);
             }
             _ => {}
@@ -260,18 +488,18 @@ fn project_observation(
             command_id,
             started_at_ms,
         } => {
-            if let Some(index) = current
+            if let Some(queue_index) = current
                 .queued_prompts
                 .iter()
                 .position(|queued| queued.command_id == *command_id)
             {
                 let mut queue = current.queued_prompts.clone();
-                let entry = queue.remove(index);
+                let entry = queue.remove(queue_index);
                 mutation.queued_prompts = Some(queue);
                 // A configuration change applies between turns: it never
                 // becomes a transcript turn and never starts the turn clock.
                 if entry.kind.is_prompt() {
-                    close_streams(current, mutation, event.recorded_at_ms);
+                    close_streams(index, mutation, event.recorded_at_ms);
                     upsert(
                         mutation,
                         TranscriptItem {
@@ -290,11 +518,7 @@ fn project_observation(
                     });
                 }
             }
-            if let Some(existing) = current
-                .transcript
-                .iter()
-                .find(|item| item.stable_id == user_shell_item_id(command_id))
-            {
+            if let Some(existing) = index.get(&user_shell_item_id(command_id)) {
                 let mut item = TranscriptItem::clone(existing);
                 if let TranscriptBody::System { text } = &mut item.body {
                     *text = text.replacen("Shell · queued", "Shell · running", 1);
@@ -311,15 +535,11 @@ fn project_observation(
             queue.retain(|queued| queued.command_id != *command_id);
             match outcome {
                 crate::hel_worker::RelayCommandOutcome::Prompt { .. } => {
-                    close_streams(current, mutation, event.recorded_at_ms);
+                    close_streams(index, mutation, event.recorded_at_ms);
                     mutation.execution = Some(MaterializedExecutionState::Idle);
                 }
                 crate::hel_worker::RelayCommandOutcome::UserShell { result } => {
-                    if let Some(existing) = current
-                        .transcript
-                        .iter()
-                        .find(|item| item.stable_id == user_shell_item_id(command_id))
-                    {
+                    if let Some(existing) = index.get(&user_shell_item_id(command_id)) {
                         let mut item = TranscriptItem::clone(existing);
                         item.body = TranscriptBody::System {
                             text: user_shell_result_text(result),
@@ -329,7 +549,7 @@ fn project_observation(
                     }
                 }
                 crate::hel_worker::RelayCommandOutcome::Closed => {
-                    close_streams(current, mutation, event.recorded_at_ms);
+                    close_streams(index, mutation, event.recorded_at_ms);
                     mutation.execution = Some(MaterializedExecutionState::Closed);
                 }
                 crate::hel_worker::RelayCommandOutcome::QueueChanged {
@@ -362,17 +582,14 @@ fn project_observation(
             command,
             message,
         } => {
-            let prompt_was_started = current
-                .transcript
-                .iter()
-                .any(|item| item.stable_id == format!("user:{command_id}"));
+            let prompt_was_started = index.get(&format!("user:{command_id}")).is_some();
             let mut queue = current.queued_prompts.clone();
             queue.retain(|queued| queued.command_id != *command_id);
             if queue != current.queued_prompts {
                 mutation.queued_prompts = Some(queue);
             }
             if prompt_was_started {
-                close_streams(current, mutation, event.recorded_at_ms);
+                close_streams(index, mutation, event.recorded_at_ms);
                 mutation.execution = Some(MaterializedExecutionState::Idle);
             }
             if *command == RelayCommandKind::Close
@@ -381,11 +598,7 @@ fn project_observation(
                 mutation.execution = Some(MaterializedExecutionState::Idle);
             }
             if matches!(command, RelayCommandKind::RunUserShell) {
-                if let Some(existing) = current
-                    .transcript
-                    .iter()
-                    .find(|item| item.stable_id == user_shell_item_id(command_id))
-                {
+                if let Some(existing) = index.get(&user_shell_item_id(command_id)) {
                     let mut item = TranscriptItem::clone(existing);
                     if let TranscriptBody::System { text } = &mut item.body {
                         *text = format!(
@@ -415,11 +628,7 @@ fn project_observation(
             stdout_truncated,
             stderr_truncated,
         } => {
-            if let Some(existing) = current
-                .transcript
-                .iter()
-                .find(|item| item.stable_id == user_shell_item_id(command_id))
-            {
+            if let Some(existing) = index.get(&user_shell_item_id(command_id)) {
                 let mut item = TranscriptItem::clone(existing);
                 item.body = TranscriptBody::System {
                     text: user_shell_text(
@@ -453,30 +662,64 @@ fn project_observation(
                 exit_code: *exit_code,
                 signal: signal.clone(),
             };
+            let raw_owner = uniquely_matching_raw_tool(index, &record);
+            let referrers = index
+                .terminal_referrers(terminal_id)
+                .cloned()
+                .collect::<Vec<_>>();
             let mut attached = false;
-            for existing in &current.transcript {
-                if !tool_refers_to_terminal(&existing.body, terminal_id) {
+            for existing in &referrers {
+                if raw_owner.as_ref().is_some_and(|owner| {
+                    owner.stable_id != existing.stable_id
+                        && fallback_tool_item(existing).unwrap_or(false)
+                }) {
+                    mutation.transcript.push(TranscriptMutation::Remove {
+                        stable_id: existing.stable_id.clone(),
+                    });
+                    attached = true;
                     continue;
                 }
                 let mut item = TranscriptItem::clone(existing);
                 let TranscriptBody::Tool {
-                    terminal_outputs, ..
+                    terminal_outputs,
+                    terminal_refs,
+                    ..
                 } = &mut item.body
                 else {
                     unreachable!("matched a tool body above");
                 };
                 replace_or_push_terminal_record(terminal_outputs, record.clone());
+                if !terminal_refs.contains(terminal_id) {
+                    terminal_refs.push(terminal_id.clone());
+                }
+                finalize_fallback_terminal_tool(&mut item)?;
+                item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                upsert(mutation, item);
+                attached = true;
+            }
+            if let Some(existing) = raw_owner
+                && !referrers
+                    .iter()
+                    .any(|referrer| referrer.stable_id == existing.stable_id)
+            {
+                let mut item = TranscriptItem::clone(&existing);
+                let TranscriptBody::Tool {
+                    terminal_outputs,
+                    terminal_refs,
+                    ..
+                } = &mut item.body
+                else {
+                    unreachable!("matched a tool body above");
+                };
+                replace_or_push_terminal_record(terminal_outputs, record.clone());
+                terminal_refs.push(terminal_id.clone());
                 item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
                 upsert(mutation, item);
                 attached = true;
             }
             if !attached {
                 let stable_id = terminal_item_id(terminal_id);
-                match current
-                    .transcript
-                    .iter()
-                    .find(|item| item.stable_id == stable_id)
-                {
+                match index.get(&stable_id) {
                     Some(existing) => {
                         let mut item = TranscriptItem::clone(existing);
                         item.body = TranscriptBody::TerminalOutput { record };
@@ -500,6 +743,16 @@ fn project_observation(
         RelayObservation::Warning { message } => {
             push_system(mutation, event, format!("warning: {message}"));
         }
+        RelayObservation::SessionRestarted => push_system_with_id(
+            mutation,
+            event,
+            format!(
+                "{}{}",
+                crate::hel_transcript::SESSION_RESTART_ITEM_PREFIX,
+                event.ordinal
+            ),
+            crate::hel_transcript::SESSION_RESTART_TEXT,
+        ),
         // Keyed on the command rather than the event ordinal, and skipped once
         // the line exists: a relay that re-records the same notice after a
         // persistence retry leaves exactly one line in the conversation.
@@ -508,20 +761,16 @@ fn project_observation(
                 Some(command_id) => format!("system:notice:{command_id}"),
                 None => format!("system:{}", event.ordinal),
             };
-            if !current
-                .transcript
-                .iter()
-                .any(|item| item.stable_id == stable_id)
-            {
+            if index.get(&stable_id).is_none() {
                 push_system_with_id(mutation, event, stable_id, message.clone());
             }
         }
         RelayObservation::Closing => {
-            close_streams(current, mutation, event.recorded_at_ms);
+            close_streams(index, mutation, event.recorded_at_ms);
             mutation.execution = Some(MaterializedExecutionState::Closing);
         }
         RelayObservation::Closed => {
-            close_streams(current, mutation, event.recorded_at_ms);
+            close_streams(index, mutation, event.recorded_at_ms);
             mutation.execution = Some(MaterializedExecutionState::Closed);
         }
     }
@@ -530,6 +779,13 @@ fn project_observation(
 
 fn user_shell_item_id(command_id: &str) -> String {
     format!("shell:{command_id}")
+}
+
+/// Stable id of the captured plan proposal created by the relay event at
+/// `ordinal`. The ordinal keys it because the harness-side review id restarts
+/// with every harness process, while the ordinal is durable and replay-stable.
+pub fn plan_proposal_item_id(ordinal: u64) -> String {
+    format!("plan-proposal:{ordinal}")
 }
 
 fn user_shell_text(
@@ -591,6 +847,7 @@ fn user_shell_result_text(result: &crate::hel_worker::UserShellResult) -> String
 
 fn project_session_update(
     current: &MaterializedSession,
+    index: &ProjectionIndex,
     event: &RelayEvent,
     update: &SessionUpdate,
     mutation: &mut MaterializedSessionMutation,
@@ -601,26 +858,27 @@ fn project_session_update(
     );
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
-            close_stream_kind(current, mutation, false, event.recorded_at_ms);
-            push_stream_chunk(current, mutation, event, true, running, chunk)?;
+            close_stream_kind(index, mutation, false, event.recorded_at_ms);
+            push_stream_chunk(current, index, mutation, event, true, running, chunk)?;
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
-            close_stream_kind(current, mutation, true, event.recorded_at_ms);
-            push_stream_chunk(current, mutation, event, false, running, chunk)?;
+            close_stream_kind(index, mutation, true, event.recorded_at_ms);
+            push_stream_chunk(current, index, mutation, event, false, running, chunk)?;
         }
         // CommandStarted is the controller's canonical local user message.
         SessionUpdate::UserMessageChunk(_) => {}
         SessionUpdate::ToolCall(call) => {
-            close_streams(current, mutation, event.recorded_at_ms);
+            close_streams(index, mutation, event.recorded_at_ms);
+            if fallback_terminal_already_claimed(index, call)? {
+                return Ok(());
+            }
             let stable_id = format!("tool:{}", call.tool_call_id);
             // Agents re-send a whole `tool_call` for an id they already
             // reported, both when they revise a call and when a resumed
             // session replays its history. Merge into the existing item so the
             // immutable identity fields survive.
-            if let Some(mut item) = current
-                .transcript
-                .iter()
-                .find(|item| item.stable_id == stable_id)
+            if let Some(mut item) = index
+                .get(&stable_id)
                 .map(|item| TranscriptItem::clone(item))
             {
                 let TranscriptBody::Tool { call: existing, .. } = &mut item.body else {
@@ -631,7 +889,9 @@ fn project_session_update(
                 };
                 *existing = serde_json::to_value(call)?;
                 item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
-                attach_terminal_outputs(current, mutation, &mut item);
+                attach_terminal_outputs(current, index, mutation, &mut item);
+                consume_fallback_terminal_tools(index, mutation, &mut item, false)?;
+                finalize_fallback_terminal_tool(&mut item)?;
                 upsert(mutation, item);
             } else {
                 let mut item = TranscriptItem {
@@ -646,24 +906,33 @@ fn project_session_update(
                         terminal_refs: Vec::new(),
                     },
                 };
-                attach_terminal_outputs(current, mutation, &mut item);
+                attach_terminal_outputs(current, index, mutation, &mut item);
+                consume_fallback_terminal_tools(index, mutation, &mut item, true)?;
+                finalize_fallback_terminal_tool(&mut item)?;
                 upsert(mutation, item);
             }
         }
         SessionUpdate::ToolCallUpdate(update) => {
-            close_streams(current, mutation, event.recorded_at_ms);
             let stable_id = format!("tool:{}", update.tool_call_id);
-            let mut item = current
-                .transcript
-                .iter()
-                .find(|item| item.stable_id == stable_id)
-                .map(|item| TranscriptItem::clone(item))
-                .with_context(|| {
-                    format!(
-                        "ACP updated tool call {} before creating it",
-                        update.tool_call_id
-                    )
-                })?;
+            let item = index
+                .get(&stable_id)
+                .map(|item| TranscriptItem::clone(item));
+            let Some(mut item) = item else {
+                // Codex may finish dispatching a historical tool update after
+                // `session/load` returns even though Hel intentionally did not
+                // replay that tool's creation. The update has no target in the
+                // canonical transcript, so it is an observable no-op. Log it
+                // and advance the relay frontier instead of pinning every
+                // later live event behind provider-local resume noise.
+                tracing::warn!(
+                    session_id = %current.session_id,
+                    tool_call_id = %update.tool_call_id,
+                    has_public_fields = update.fields != ToolCallUpdateFields::default(),
+                    "ignored ACP update for a tool call absent from the durable transcript"
+                );
+                return Ok(());
+            };
+            close_streams(index, mutation, event.recorded_at_ms);
             let TranscriptBody::Tool { call, .. } = &mut item.body else {
                 bail!(
                     "ACP tool call {} conflicts with transcript item {stable_id}",
@@ -677,11 +946,13 @@ fn project_session_update(
             materialized_call.update(update.fields.clone());
             *call = serde_json::to_value(materialized_call)?;
             item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
-            attach_terminal_outputs(current, mutation, &mut item);
+            attach_terminal_outputs(current, index, mutation, &mut item);
+            consume_fallback_terminal_tools(index, mutation, &mut item, false)?;
+            finalize_fallback_terminal_tool(&mut item)?;
             upsert(mutation, item);
         }
         SessionUpdate::Plan(plan) => {
-            close_streams(current, mutation, event.recorded_at_ms);
+            close_streams(index, mutation, event.recorded_at_ms);
             let plan = serde_json::to_value(plan)?;
             let latest_user_position = current
                 .transcript
@@ -741,6 +1012,7 @@ fn project_session_update(
 
 fn push_stream_chunk(
     current: &MaterializedSession,
+    index: &ProjectionIndex,
     mutation: &mut MaterializedSessionMutation,
     event: &RelayEvent,
     agent: bool,
@@ -767,28 +1039,16 @@ fn push_stream_chunk(
     });
     let existing = explicit_id
         .as_ref()
-        .and_then(|id| {
-            current
-                .transcript
-                .iter()
-                .position(|item| item.stable_id == *id)
-        })
+        .and_then(|id| index.get(id))
         .or_else(|| {
             if explicit_id.is_none() {
-                current
-                    .transcript
-                    .iter()
-                    .rposition(|item| match &item.body {
-                        TranscriptBody::Agent { streaming, .. } if agent => *streaming,
-                        TranscriptBody::Thought { streaming, .. } if !agent => *streaming,
-                        _ => false,
-                    })
+                index.latest_open_stream(agent)
             } else {
                 None
             }
         });
-    if let Some(index) = existing {
-        let mut item = TranscriptItem::clone(&current.transcript[index]);
+    if let Some(existing) = existing {
+        let mut item = TranscriptItem::clone(existing);
         match &mut item.body {
             TranscriptBody::Agent { chunks, streaming } if agent => {
                 chunks.push(serde_json::to_value(chunk)?);
@@ -889,43 +1149,33 @@ fn tool_call_terminal_ids(call: &Value) -> Vec<String> {
     };
     content
         .iter()
-        .filter_map(|value| match ToolCallContent::deserialize(value).ok()? {
-            ToolCallContent::Terminal(terminal) => Some(terminal.terminal_id.0.to_string()),
-            _ => None,
+        .filter_map(|value| match ToolCallContent::deserialize(value) {
+            Ok(ToolCallContent::Terminal(terminal)) => Some(terminal.terminal_id.0.to_string()),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "ignoring malformed tool-call content while locating terminal output"
+                );
+                None
+            }
         })
         .collect()
 }
 
-/// Whether one transcript item is a tool call that refers to `terminal_id`,
-/// now or at any earlier point in its life. The current call is still consulted
-/// because items restored from an archive written before terminal references
-/// were remembered carry none.
-fn tool_refers_to_terminal(body: &TranscriptBody, terminal_id: &str) -> bool {
-    let TranscriptBody::Tool {
-        call,
-        terminal_refs,
-        ..
-    } = body
-    else {
-        return false;
-    };
-    terminal_refs.iter().any(|id| id == terminal_id)
-        || tool_call_terminal_ids(call)
-            .iter()
-            .any(|id| id == terminal_id)
-}
-
 /// The output already recorded for `terminal_id`, wherever it is parked.
 fn find_terminal_record(
-    current: &MaterializedSession,
+    index: &ProjectionIndex,
     terminal_id: &str,
 ) -> Option<TerminalOutputRecord> {
-    current.transcript.iter().find_map(|item| match &item.body {
-        TranscriptBody::TerminalOutput { record } if record.terminal_id == terminal_id => {
-            Some(record.clone())
-        }
-        _ => None,
-    })
+    index
+        .get(&terminal_item_id(terminal_id))
+        .and_then(|item| match &item.body {
+            TranscriptBody::TerminalOutput { record } if record.terminal_id == terminal_id => {
+                Some(record.clone())
+            }
+            _ => None,
+        })
 }
 
 fn replace_or_push_terminal_record(
@@ -941,13 +1191,175 @@ fn replace_or_push_terminal_record(
     }
 }
 
+fn fallback_terminal_tool_item_id(terminal_id: &str) -> String {
+    format!(
+        "tool:{}",
+        crate::hel_acp::fallback_terminal_tool_call_id(terminal_id)
+    )
+}
+
+fn fallback_tool_item(item: &TranscriptItem) -> Result<bool> {
+    let TranscriptBody::Tool { call, .. } = &item.body else {
+        return Ok(false);
+    };
+    let call = serde_json::from_value(call.clone()).context("parse fallback terminal tool call")?;
+    Ok(crate::hel_acp::is_fallback_terminal_tool_call(&call))
+}
+
+/// The one provider tool demonstrably owning a result through its raw value.
+/// Identical concurrent results are deliberately left with the fallback tool.
+fn uniquely_matching_raw_tool(
+    index: &ProjectionIndex,
+    record: &TerminalOutputRecord,
+) -> Option<Arc<TranscriptItem>> {
+    let mut matching = index.transcript.values().filter_map(|item| {
+        let TranscriptBody::Tool { call, .. } = &item.body else {
+            return None;
+        };
+        if fallback_tool_item(item).ok()? {
+            return None;
+        }
+        record
+            .matches_tool_raw_result(call)
+            .then(|| Arc::clone(item))
+    });
+    let item = matching.next()?;
+    matching.next().is_none().then_some(item)
+}
+
+/// A provider may publish its real tool before it asks the client to create
+/// the terminal. In that ordering the existing call already provides the
+/// durable start item, so the compatibility call would only duplicate it.
+fn fallback_terminal_already_claimed(index: &ProjectionIndex, call: &ToolCall) -> Result<bool> {
+    if !crate::hel_acp::is_fallback_terminal_tool_call(call) {
+        return Ok(false);
+    }
+    let value = serde_json::to_value(call)?;
+    Ok(tool_call_terminal_ids(&value)
+        .into_iter()
+        .any(|terminal_id| {
+            index.terminal_referrers(&terminal_id).any(|item| {
+                let TranscriptBody::Tool { call, .. } = &item.body else {
+                    return false;
+                };
+                serde_json::from_value::<ToolCall>(call.clone())
+                    .is_ok_and(|call| !crate::hel_acp::is_fallback_terminal_tool_call(&call))
+            })
+        }))
+}
+
+/// Replace Hel's interim terminal tool with the real ACP tool once the agent
+/// supplies one. Output may already have landed on the interim item, so move
+/// it along. A newly created real item can also adopt the interim item's start
+/// identity; an existing tool keeps its immutable position and timestamp.
+fn consume_fallback_terminal_tools(
+    index: &ProjectionIndex,
+    mutation: &mut MaterializedSessionMutation,
+    item: &mut TranscriptItem,
+    may_adopt_identity: bool,
+) -> Result<()> {
+    let TranscriptBody::Tool {
+        call,
+        terminal_outputs,
+        terminal_refs,
+    } = &mut item.body
+    else {
+        return Ok(());
+    };
+    let materialized: ToolCall = serde_json::from_value(call.clone())
+        .context("parse ACP tool call while claiming fallback terminal tools")?;
+    if crate::hel_acp::is_fallback_terminal_tool_call(&materialized) {
+        return Ok(());
+    }
+
+    let mut terminal_ids = tool_call_terminal_ids(call);
+    terminal_ids.extend(terminal_refs.iter().cloned());
+    for terminal_id in terminal_ids {
+        let stable_id = fallback_terminal_tool_item_id(&terminal_id);
+        if stable_id == item.stable_id {
+            continue;
+        }
+        let Some(fallback) = index.get(&stable_id) else {
+            continue;
+        };
+        let TranscriptBody::Tool {
+            call: fallback_call,
+            terminal_outputs: fallback_outputs,
+            terminal_refs: fallback_refs,
+        } = &fallback.body
+        else {
+            continue;
+        };
+        let fallback_call: ToolCall = serde_json::from_value(fallback_call.clone())
+            .context("parse fallback terminal tool call")?;
+        if !crate::hel_acp::is_fallback_terminal_tool_call(&fallback_call) {
+            continue;
+        }
+        for record in fallback_outputs {
+            replace_or_push_terminal_record(terminal_outputs, record.clone());
+        }
+        for terminal_ref in fallback_refs {
+            if !terminal_refs.contains(terminal_ref) {
+                terminal_refs.push(terminal_ref.clone());
+            }
+        }
+        if !terminal_refs.contains(&terminal_id) {
+            terminal_refs.push(terminal_id);
+        }
+        if may_adopt_identity {
+            item.position = item.position.min(fallback.position);
+            item.created_at_ms = item.created_at_ms.min(fallback.created_at_ms);
+        }
+        item.last_changed_at_ms = item.last_changed_at_ms.max(fallback.last_changed_at_ms);
+        mutation
+            .transcript
+            .push(TranscriptMutation::Remove { stable_id });
+    }
+    Ok(())
+}
+
+/// Terminal close is a Hel event rather than an ACP tool update. Complete only
+/// the interim call Hel created; a provider-owned call keeps its own status.
+fn finalize_fallback_terminal_tool(item: &mut TranscriptItem) -> Result<()> {
+    let TranscriptBody::Tool {
+        call,
+        terminal_outputs,
+        ..
+    } = &mut item.body
+    else {
+        return Ok(());
+    };
+    if terminal_outputs.is_empty() {
+        return Ok(());
+    }
+    let mut materialized: ToolCall = serde_json::from_value(call.clone())
+        .context("parse ACP tool call while finalizing fallback terminal tool")?;
+    if !crate::hel_acp::is_fallback_terminal_tool_call(&materialized) {
+        return Ok(());
+    }
+    materialized.status = if terminal_outputs
+        .iter()
+        .all(TerminalOutputRecord::exited_cleanly)
+    {
+        ToolCallStatus::Completed
+    } else {
+        ToolCallStatus::Failed
+    };
+    *call = serde_json::to_value(materialized)?;
+    Ok(())
+}
+
 /// The one parked terminal result an ACP tool demonstrably owns through its
 /// raw result. Ambiguous identical results stay standalone rather than being
 /// assigned to an arbitrary concurrent tool.
 fn uniquely_matching_raw_terminal(current: &MaterializedSession, call: &Value) -> Option<String> {
     let mut matching = current.transcript.iter().filter_map(|item| {
-        let TranscriptBody::TerminalOutput { record } = &item.body else {
-            return None;
+        let record = match &item.body {
+            TranscriptBody::TerminalOutput { record } => record,
+            TranscriptBody::Tool {
+                terminal_outputs, ..
+            } if fallback_tool_item(item).ok()? => terminal_outputs.first()?,
+            _ => return None,
         };
         record
             .matches_tool_raw_result(call)
@@ -967,6 +1379,7 @@ fn uniquely_matching_raw_terminal(current: &MaterializedSession, call: &Value) -
 /// started.
 fn attach_terminal_outputs(
     current: &MaterializedSession,
+    index: &ProjectionIndex,
     mutation: &mut MaterializedSessionMutation,
     item: &mut TranscriptItem,
 ) {
@@ -991,7 +1404,7 @@ fn attach_terminal_outputs(
     }
     let mut consumed = Vec::new();
     for terminal_id in terminal_refs.iter() {
-        let Some(record) = find_terminal_record(current, terminal_id) else {
+        let Some(record) = find_terminal_record(index, terminal_id) else {
             continue;
         };
         replace_or_push_terminal_record(terminal_outputs, record);
@@ -1005,37 +1418,31 @@ fn attach_terminal_outputs(
 }
 
 fn close_stream_kind(
-    current: &MaterializedSession,
+    index: &ProjectionIndex,
     mutation: &mut MaterializedSessionMutation,
     agent: bool,
     changed_at_ms: i64,
 ) {
-    for item in &current.transcript {
-        let streaming = match &item.body {
-            TranscriptBody::Agent { streaming, .. } if agent => *streaming,
-            TranscriptBody::Thought { streaming, .. } if !agent => *streaming,
-            _ => continue,
-        };
-        if streaming {
-            let mut closed = TranscriptItem::clone(item);
-            match &mut closed.body {
-                TranscriptBody::Agent { streaming, .. }
-                | TranscriptBody::Thought { streaming, .. } => *streaming = false,
-                _ => unreachable!(),
+    for item in index.open_streams(agent) {
+        let mut closed = TranscriptItem::clone(item);
+        match &mut closed.body {
+            TranscriptBody::Agent { streaming, .. } | TranscriptBody::Thought { streaming, .. } => {
+                *streaming = false
             }
-            closed.last_changed_at_ms = closed.last_changed_at_ms.max(changed_at_ms);
-            upsert(mutation, closed);
+            _ => unreachable!(),
         }
+        closed.last_changed_at_ms = closed.last_changed_at_ms.max(changed_at_ms);
+        upsert(mutation, closed);
     }
 }
 
 fn close_streams(
-    current: &MaterializedSession,
+    index: &ProjectionIndex,
     mutation: &mut MaterializedSessionMutation,
     changed_at_ms: i64,
 ) {
-    close_stream_kind(current, mutation, true, changed_at_ms);
-    close_stream_kind(current, mutation, false, changed_at_ms);
+    close_stream_kind(index, mutation, true, changed_at_ms);
+    close_stream_kind(index, mutation, false, changed_at_ms);
 }
 
 fn push_system(
@@ -1081,13 +1488,25 @@ fn configuration_values(
     options
         .iter()
         .filter_map(|option| {
-            let value = serde_json::to_value(option).ok()?;
-            let id = value.get("id")?.as_str()?.to_owned();
+            let value = match serde_json::to_value(option) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, "could not serialize a session configuration option");
+                    return None;
+                }
+            };
+            let Some(id) = value.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                tracing::warn!("session configuration option omitted a string id");
+                return None;
+            };
             let current = value
                 .get("currentValue")
-                .or_else(|| value.get("current_value"))?
-                .clone();
-            Some((id, current))
+                .or_else(|| value.get("current_value"));
+            let Some(current) = current else {
+                tracing::warn!(option_id = %id, "session configuration option omitted its current value");
+                return None;
+            };
+            Some((id, current.clone()))
         })
         .collect()
 }
@@ -1150,6 +1569,12 @@ pub fn canonical_session_from_materialized(
                 }
                 TranscriptBody::Plan { plan } => {
                     CanonicalTranscriptBody::Plan { plan: plan.clone() }
+                }
+                TranscriptBody::PlanProposal { proposal_id, plan } => {
+                    CanonicalTranscriptBody::PlanProposal {
+                        proposal_id: proposal_id.clone(),
+                        plan: plan.clone(),
+                    }
                 }
                 TranscriptBody::System { text } => {
                     CanonicalTranscriptBody::System { text: text.clone() }
@@ -1243,6 +1668,12 @@ pub fn materialized_session_from_canonical(
                 CanonicalTranscriptBody::Plan { plan } => {
                     TranscriptBody::Plan { plan: plan.clone() }
                 }
+                CanonicalTranscriptBody::PlanProposal { proposal_id, plan } => {
+                    TranscriptBody::PlanProposal {
+                        proposal_id: proposal_id.clone(),
+                        plan: plan.clone(),
+                    }
+                }
                 CanonicalTranscriptBody::System { text } => {
                     TranscriptBody::System { text: text.clone() }
                 }
@@ -1318,6 +1749,7 @@ mod tests {
 
     fn event(previous: &MaterializedSession, observation: RelayObservation) -> RelayEvent {
         let mut event = RelayEvent {
+            format: crate::hel_worker::RELAY_EVENT_FORMAT_V1,
             ordinal: previous.applied_event_ordinal + 1,
             previous_digest: previous.applied_event_digest.clone(),
             digest: String::new(),
@@ -1338,6 +1770,83 @@ mod tests {
     fn apply_observation(session: &mut MaterializedSession, observation: RelayObservation) {
         let next = event(session, observation);
         apply(session, next);
+    }
+
+    fn apply_indexed_observation(
+        session: &mut MaterializedSession,
+        index: &mut ProjectionIndex,
+        observation: RelayObservation,
+    ) {
+        let next = event(session, observation);
+        let projected = project_relay_event_indexed(session, index, &next).unwrap();
+        apply_committed_projection_event_indexed(session, index, &next, projected.mutation)
+            .unwrap();
+    }
+
+    #[test]
+    fn resume_open_updates_operational_state_without_adding_transcript_noise() {
+        let session = MaterializedSession::empty("session");
+        let resumed = event(
+            &session,
+            RelayObservation::SessionOpened {
+                native_session_id: "native".into(),
+                resumed: true,
+            },
+        );
+        let mutation = project_relay_event(&session, &resumed).unwrap().mutation;
+        assert!(mutation.transcript.is_empty());
+        assert_eq!(mutation.pending_elicitations, Some(Vec::new()));
+
+        let started = event(
+            &session,
+            RelayObservation::SessionOpened {
+                native_session_id: "native".into(),
+                resumed: false,
+            },
+        );
+        assert_eq!(
+            project_relay_event(&session, &started)
+                .unwrap()
+                .mutation
+                .transcript
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_restarts_project_as_distinct_durable_system_lines() {
+        let mut session = MaterializedSession::empty("session");
+        apply_observation(&mut session, RelayObservation::SessionRestarted);
+        apply_observation(&mut session, RelayObservation::SessionRestarted);
+
+        assert_eq!(session.transcript.len(), 2);
+        assert!(
+            session
+                .transcript
+                .iter()
+                .all(|item| item.is_session_restart())
+        );
+        assert_eq!(session.unread_session_restarts_after(0), 2);
+        assert!(session.transcript.iter().all(|item| matches!(
+            &item.body,
+            TranscriptBody::System { text }
+                if text == crate::hel_transcript::SESSION_RESTART_TEXT
+        )));
+        assert_ne!(
+            session.transcript[0].stable_id,
+            session.transcript[1].stable_id
+        );
+
+        let canonical = canonical_session_from_materialized(&session).unwrap();
+        let restored = materialized_session_from_canonical("session", &canonical).unwrap();
+        assert_eq!(restored.unread_session_restarts_after(0), 2);
+        assert!(
+            restored
+                .transcript
+                .iter()
+                .all(|item| item.is_session_restart())
+        );
     }
 
     #[test]
@@ -1433,6 +1942,74 @@ mod tests {
             },
         );
         assert!(session.pending_elicitations.is_empty());
+        assert!(session.transcript.is_empty());
+    }
+
+    #[test]
+    fn a_plan_decision_also_becomes_a_durable_proposal_item() {
+        let mut session = MaterializedSession::empty("session-1");
+        let plan = "1. Read the code\n2. Change it";
+        let request = crate::hel_acp::normalized_plan_review(
+            "plan-review-3".into(),
+            &serde_json::json!({ "plan": plan }),
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::ElicitationRequested {
+                request: request.clone(),
+            },
+        );
+
+        assert_eq!(session.pending_elicitations, vec![request]);
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert_eq!(item.stable_id, plan_proposal_item_id(1));
+        assert_eq!(item.position, 1);
+        assert_eq!(
+            item.body,
+            TranscriptBody::PlanProposal {
+                proposal_id: "plan-review-3".into(),
+                plan: plan.into(),
+            }
+        );
+
+        // Answering the decision retires the dialog, not the record of it.
+        apply_observation(
+            &mut session,
+            RelayObservation::ElicitationResolved {
+                elicitation_id: "plan-review-3".into(),
+                action: "accept".into(),
+            },
+        );
+        assert!(session.pending_elicitations.is_empty());
+        assert_eq!(session.transcript.len(), 1);
+    }
+
+    #[test]
+    fn a_captured_proposal_keeps_its_place_after_the_conversation_that_produced_it() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, untagged_agent_chunk("here is my plan"));
+        apply_observation(
+            &mut session,
+            RelayObservation::ElicitationRequested {
+                request: crate::hel_acp::normalized_plan_review(
+                    "plan-review-1".into(),
+                    &serde_json::json!({ "plan": "do the work" }),
+                ),
+            },
+        );
+        apply_observation(&mut session, untagged_agent_chunk("starting now"));
+
+        let bodies = session
+            .transcript
+            .iter()
+            .map(|item| match &item.body {
+                TranscriptBody::Agent { .. } => "agent",
+                TranscriptBody::PlanProposal { .. } => "proposal",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, vec!["agent", "proposal", "agent"]);
     }
 
     /// An agent message chunk with no `message_id`, as Grok Build's goal mode streams them.
@@ -1761,24 +2338,53 @@ mod tests {
     }
 
     #[test]
-    fn tool_update_without_an_initial_call_is_rejected() {
-        let session = MaterializedSession::empty("session-1");
+    fn tool_update_without_an_initial_call_is_ignored_and_advances_the_frontier() {
+        let mut session = MaterializedSession::empty("session-1");
         let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "missing-tool",
             ToolCallUpdateFields::new().title("updated"),
         ));
-
-        let error = project_relay_event(
+        let relay_event = event(
             &session,
-            &event(
-                &session,
-                RelayObservation::SessionUpdate {
-                    update: Box::new(update),
-                },
+            RelayObservation::SessionUpdate {
+                update: Box::new(update),
+            },
+        );
+
+        let projected = project_relay_event(&session, &relay_event)
+            .expect("a delayed pre-resume tool update is an observable no-op");
+        apply_committed_projection_event(&mut session, &relay_event, projected.mutation)
+            .expect("the no-op still advances the committed relay frontier");
+
+        assert!(session.transcript.is_empty());
+        assert_eq!(session.applied_event_ordinal, 1);
+    }
+
+    #[test]
+    fn metadata_only_tool_update_without_an_initial_call_is_ignored() {
+        let mut session = MaterializedSession::empty("session-1");
+        let update = SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new("pre-resume-tool", ToolCallUpdateFields::new()).meta(
+                serde_json::Map::from_iter([(
+                    "terminal_output_delta".into(),
+                    json!({"data": "late output"}),
+                )]),
             ),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("before creating it"));
+        );
+        let relay_event = event(
+            &session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(update),
+            },
+        );
+
+        let projected = project_relay_event(&session, &relay_event)
+            .expect("private metadata cannot change the transcript projection");
+        apply_committed_projection_event(&mut session, &relay_event, projected.mutation)
+            .expect("the no-op still advances the committed relay frontier");
+
+        assert!(session.transcript.is_empty());
+        assert_eq!(session.applied_event_ordinal, 1);
     }
 
     #[test]
@@ -1899,6 +2505,14 @@ mod tests {
         }
     }
 
+    fn fallback_terminal_tool(terminal_id: &str, command: &str) -> RelayObservation {
+        RelayObservation::SessionUpdate {
+            update: Box::new(SessionUpdate::ToolCall(
+                crate::hel_acp::fallback_terminal_tool_call(terminal_id, command.into()),
+            )),
+        }
+    }
+
     fn attached_terminal_outputs(item: &TranscriptItem) -> &[TerminalOutputRecord] {
         let TranscriptBody::Tool {
             terminal_outputs, ..
@@ -1907,6 +2521,131 @@ mod tests {
             panic!("expected a tool item, got {:?}", item.body);
         };
         terminal_outputs
+    }
+
+    #[test]
+    fn fallback_terminal_tool_completes_in_place_instead_of_parking_output() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert_eq!(item.stable_id, "tool:hel-terminal:term-1");
+        assert_eq!(item.position, 1, "the terminal retains its start order");
+        assert_eq!(attached_terminal_outputs(item).len(), 1);
+        let TranscriptBody::Tool { call, .. } = &item.body else {
+            panic!("the fallback stays a tool");
+        };
+        let call: ToolCall = serde_json::from_value(call.clone()).unwrap();
+        assert_eq!(call.status, ToolCallStatus::Completed);
+    }
+
+    #[test]
+    fn real_tool_call_replaces_fallback_and_keeps_its_start_order() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(&mut session, terminal_tool_call("call-1", "term-1"));
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1, "the fallback was consumed");
+        let item = &session.transcript[0];
+        assert_eq!(item.stable_id, "tool:call-1");
+        assert_eq!(item.position, 1);
+        assert_eq!(attached_terminal_outputs(item).len(), 1);
+    }
+
+    #[test]
+    fn fallback_is_suppressed_when_real_tool_already_claims_terminal() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, terminal_tool_call("call-1", "term-1"));
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        assert_eq!(attached_terminal_outputs(&session.transcript[0]).len(), 1);
+    }
+
+    fn kimi_raw_tool_update(call_id: &'static str, output: &'static str) -> RelayObservation {
+        RelayObservation::SessionUpdate {
+            update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .raw_output(json!({
+                        "type": "Bash",
+                        "output": output.as_bytes(),
+                        "exit_code": 0,
+                        "command": "cargo test"
+                    })),
+            ))),
+        }
+    }
+
+    #[test]
+    fn raw_result_before_terminal_close_claims_the_fallback() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "Execute `cargo test`",
+                ))),
+            },
+        );
+        apply_observation(
+            &mut session,
+            kimi_raw_tool_update("call-1", "build finished\n"),
+        );
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        assert_eq!(session.transcript[0].position, 2);
+        assert_eq!(attached_terminal_outputs(&session.transcript[0]).len(), 1);
+    }
+
+    #[test]
+    fn raw_result_after_terminal_close_claims_the_fallback() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "cargo test"));
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "Execute `cargo test`",
+                ))),
+            },
+        );
+        apply_observation(&mut session, terminal_output("term-1"));
+        apply_observation(
+            &mut session,
+            kimi_raw_tool_update("call-1", "build finished\n"),
+        );
+
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        assert_eq!(session.transcript[0].position, 2);
+        assert_eq!(attached_terminal_outputs(&session.transcript[0]).len(), 1);
+    }
+
+    #[test]
+    fn late_fallback_claims_output_from_a_fast_terminal() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, terminal_output("term-1"));
+        apply_observation(&mut session, fallback_terminal_tool("term-1", "true"));
+
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "tool:hel-terminal:term-1");
+        let TranscriptBody::Tool { call, .. } = &session.transcript[0].body else {
+            panic!("the parked output became a fallback tool");
+        };
+        let call: ToolCall = serde_json::from_value(call.clone()).unwrap();
+        assert_eq!(call.status, ToolCallStatus::Completed);
     }
 
     #[test]
@@ -1922,6 +2661,25 @@ mod tests {
         assert_eq!(outputs[0].output, "build finished\n");
         assert_eq!(outputs[0].exit_code, Some(0));
         assert_eq!(session.transcript[0].last_changed_at_ms, 200);
+    }
+
+    #[test]
+    fn indexed_page_projection_tracks_terminal_and_tool_replacements() {
+        let mut session = MaterializedSession::empty("session-1");
+        let mut index = ProjectionIndex::new(&session);
+        apply_indexed_observation(&mut session, &mut index, terminal_output("term-1"));
+        apply_indexed_observation(
+            &mut session,
+            &mut index,
+            terminal_tool_call("call-1", "term-1"),
+        );
+        apply_indexed_observation(&mut session, &mut index, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1, "parked output was consumed");
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        let outputs = attached_terminal_outputs(&session.transcript[0]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].terminal_id, "term-1");
     }
 
     #[test]
@@ -2545,6 +3303,17 @@ mod tests {
                     }],
                     "_meta": {"planProvider": "test"}
                 }),
+            },
+        }));
+        session.transcript.push(Arc::new(TranscriptItem {
+            stable_id: plan_proposal_item_id(4),
+            position: 4,
+            latest_content_event_ordinal: None,
+            created_at_ms: 40,
+            last_changed_at_ms: 40,
+            body: TranscriptBody::PlanProposal {
+                proposal_id: "plan-review-1".into(),
+                plan: "1. Read the code\n2. Change it".into(),
             },
         }));
         session.queued_prompts.push(MaterializedQueuedPrompt {

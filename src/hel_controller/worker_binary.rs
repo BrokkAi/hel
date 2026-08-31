@@ -7,18 +7,22 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use crate::hel_config::{ProjectBundle, ProjectRepository, atomic_write, data_dir};
+use crate::hel_config::{
+    ExecutionPolicy, ProjectBundle, ProjectRepository, atomic_write, data_dir,
+};
 use crate::hel_project_memory::{ProjectMemoryIdentity, RepositoryMemoryIdentity};
-use crate::hel_session_manager::{ProjectMemorySyncTarget, WorkerRecoveryPlan};
+use crate::hel_session_manager::{
+    ProjectMemorySyncTarget, WorkerBinaryRefreshPlan, WorkerLaunchRefreshPlan, WorkerRecoveryPlan,
+};
 use crate::hel_targets::{
     self, CommandExecutor, CommandPlan, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
 };
 use crate::hel_worker_runtime::{
-    ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery, WorkerLaunchConfig, WorkerOwnership,
+    DISCOVER_LOGIN_PATH_ENV, ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery,
+    WorkerLaunchConfig, WorkerOwnership,
 };
 
 use super::backend::backend_locator;
-use super::provisioning::{execution_policy, install_inherited_git_settings};
 use super::readiness::WORKER_EXIT_RECORD_MARKER;
 use super::{Controller, execute_checked, scp_command_spec, ssh_command_spec, target_profile_home};
 
@@ -66,62 +70,19 @@ impl Controller {
             .is_none()
             .then(|| self.config.bundles.get(&session.bundle_id))
             .flatten();
-        let target_profile_home = target_profile_home(backend, session_id, profile);
-        let workspace = if let Some(project_directory) = &session.project_directory {
-            (project_directory.to_string_lossy().into_owned(), Vec::new())
-        } else {
-            workspace_paths(
-                backend,
-                bundle.context("session bundle is missing")?,
-                session_id,
-            )?
-        };
-        let mut additional_directories = workspace.1.iter().map(PathBuf::from).collect::<Vec<_>>();
-        additional_directories.extend(
-            session
-                .additional_mounts
-                .iter()
-                .map(|resource| resource.destination.clone()),
-        );
-        if profile.kind == crate::hel_config::HarnessKind::Deepseek
-            && !additional_directories.is_empty()
-        {
-            bail!(
-                "DeepSeek Harness ACP does not support multiple workspace roots; use a single-repository bundle"
-            );
-        }
-        // Some harnesses need the policy on their command line or in their
-        // environment, so resolve it before constructing the launch config.
-        let execution_policy = execution_policy(backend);
-        let (bridge_command, bridge_args) = bridge_launch(
-            profile.kind,
-            profile.executable.as_deref(),
-            execution_policy,
-        );
-        let mut environment = profile.environment.clone();
-        environment.insert(profile.home_env().into(), target_profile_home.clone());
-        configure_execution_environment(profile.kind, execution_policy, &mut environment);
-        let mut project_memory =
-            project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
-        project_memory.mcp_delivery = project_memory_mcp_delivery(profile.kind, backend);
-        if profile.kind == crate::hel_config::HarnessKind::Claude {
-            environment.insert(
-                "CLAUDE_CODE_PROJECT_DIR_NAME".into(),
-                project_memory_replica_slug(&project_memory.project_key, session_id),
-            );
-        }
-        let launch = WorkerLaunchConfig {
-            session_id: session_id.to_string(),
-            harness: profile.kind,
-            bridge_command: PathBuf::from(bridge_command),
-            bridge_args,
-            environment,
-            cwd: PathBuf::from(&workspace.0),
-            additional_directories,
-            native_session_id: session.native_session_id.clone(),
-            project_memory: Some(project_memory.clone()),
-            execution_policy,
-        };
+        let target = self
+            .config
+            .targets
+            .get(&session.target_template_id)
+            .context("session target template is missing")?;
+        let (launch, project_memory, target_profile_home) = worker_launch_config(
+            session,
+            profile,
+            bundle,
+            backend,
+            session_id,
+            target.execution_policy(),
+        )?;
 
         let staging = tempfile::tempdir().context("create worker staging directory")?;
         let launch_path = staging.path().join("launch.json");
@@ -129,6 +90,7 @@ impl Controller {
         let ownership_path = staging.path().join("ownership.json");
         WorkerOwnership {
             version: WorkerOwnership::VERSION,
+            workspace_id: session.workspace_id.clone(),
             session_id: session_id.to_string(),
             profile_id: session.last_profile.clone(),
             bundle_id: session.bundle_id.clone(),
@@ -145,6 +107,7 @@ impl Controller {
                 "profile staging completed"
             );
             result?;
+            append_hel_target_environment(profile.kind, &profile_stage, backend)?;
             stage_memory_replica(
                 &project_memory,
                 Path::new(&target_profile_home),
@@ -168,8 +131,7 @@ impl Controller {
             &launch_path,
             &ownership_path,
             &profile_stage,
-        )?;
-        install_inherited_git_settings(executor, backend, session_id)
+        )
     }
 
     /// Collect the dead worker's exit record and log tail for a session whose
@@ -186,8 +148,28 @@ impl Controller {
     ) -> Option<String> {
         let session = self.state.sessions.get(session_id)?;
         let locator = session.target.as_ref()?;
-        let backend = backend_locator(locator, session, &self.config).ok()?;
-        let worker_root = hel_targets::worker_root(&backend, session_id).ok()?;
+        let backend = match backend_locator(locator, session, &self.config) {
+            Ok(backend) => backend,
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "could not construct a worker diagnostic probe"
+                );
+                return None;
+            }
+        };
+        let worker_root = match hel_targets::worker_root(&backend, session_id) {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "could not derive the worker diagnostic root"
+                );
+                return None;
+            }
+        };
         worker_last_words(executor, &backend, &worker_root)
     }
 
@@ -196,9 +178,39 @@ impl Controller {
     /// session manager runs both off its async actor.
     pub fn worker_recovery_plan(&self, session_id: &str) -> Result<WorkerRecoveryPlan> {
         let (backend, worker_root) = self.worker_placement(session_id)?;
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let profile = self
+            .config
+            .profiles
+            .get(&session.last_profile)
+            .context("session profile is missing")?;
+        let bundle = session
+            .project_directory
+            .is_none()
+            .then(|| self.config.bundles.get(&session.bundle_id))
+            .flatten();
+        let target = self
+            .config
+            .targets
+            .get(&session.target_template_id)
+            .context("session target template is missing")?;
+        let (launch, _, _) = worker_launch_config(
+            session,
+            profile,
+            bundle,
+            &backend,
+            session_id,
+            target.execution_policy(),
+        )?;
         Ok(WorkerRecoveryPlan {
             target: hel_targets::target_recovery_plan(&backend, session_id)?,
             liveness_probe: worker_liveness_command(&backend, &worker_root),
+            binary_refresh: worker_binary_refresh_plan(&backend, session_id)?,
+            launch_refresh: Some(worker_launch_refresh_plan(&backend, session_id, &launch)?),
             restart: CommandPlan {
                 description: format!("restart Hel worker for session {session_id}"),
                 commands: vec![
@@ -244,6 +256,93 @@ impl Controller {
         Ok(ProjectMemorySyncTarget {
             canonical_root: canonical_memory_root(&launch.project_key),
         })
+    }
+}
+
+fn worker_launch_config(
+    session: &crate::hel_state::SessionRecord,
+    profile: &crate::hel_config::HarnessProfile,
+    bundle: Option<&ProjectBundle>,
+    backend: &hel_targets::TargetLocator,
+    session_id: &str,
+    execution_policy: ExecutionPolicy,
+) -> Result<(WorkerLaunchConfig, ProjectMemoryLaunchConfig, String)> {
+    let target_profile_home = target_profile_home(backend, session_id, profile);
+    let workspace = if let Some(project_directory) = &session.project_directory {
+        (project_directory.to_string_lossy().into_owned(), Vec::new())
+    } else {
+        workspace_paths(
+            backend,
+            bundle.context("session bundle is missing")?,
+            session_id,
+        )?
+    };
+    let mut additional_directories = workspace.1.iter().map(PathBuf::from).collect::<Vec<_>>();
+    additional_directories.extend(
+        session
+            .additional_mounts
+            .iter()
+            .map(|resource| resource.destination.clone()),
+    );
+    if profile.kind == crate::hel_config::HarnessKind::Deepseek
+        && !additional_directories.is_empty()
+    {
+        bail!(
+            "DeepSeek Harness ACP does not support multiple workspace roots; use a single-repository bundle"
+        );
+    }
+    let (bridge_command, bridge_args) = bridge_launch(
+        profile.kind,
+        profile.executable.as_deref(),
+        execution_policy,
+    );
+    let mut environment = profile.environment.clone();
+    environment.insert(profile.home_env().into(), target_profile_home.clone());
+    profile
+        .kind
+        .configure_execution_environment(execution_policy, &mut environment);
+    configure_login_path_discovery(&mut environment, backend);
+    let mut project_memory =
+        project_memory_launch(session, bundle, &workspace, &target_profile_home)?;
+    project_memory.mcp_delivery = project_memory_mcp_delivery(profile.kind, backend);
+    if profile.kind == crate::hel_config::HarnessKind::Claude {
+        environment.insert(
+            "CLAUDE_CODE_PROJECT_DIR_NAME".into(),
+            project_memory_replica_slug(&project_memory.project_key, session_id),
+        );
+    }
+    Ok((
+        WorkerLaunchConfig {
+            session_id: session_id.to_string(),
+            harness: profile.kind,
+            bridge_command: PathBuf::from(bridge_command),
+            bridge_args,
+            environment,
+            cwd: PathBuf::from(&workspace.0),
+            additional_directories,
+            native_session_id: session.native_session_id.clone(),
+            project_memory: Some(project_memory.clone()),
+            execution_policy,
+        },
+        project_memory,
+        target_profile_home,
+    ))
+}
+
+fn configure_login_path_discovery(
+    environment: &mut std::collections::BTreeMap<String, String>,
+    backend: &hel_targets::TargetLocator,
+) {
+    environment.remove(DISCOVER_LOGIN_PATH_ENV);
+    if !environment.contains_key("PATH")
+        && matches!(
+            backend,
+            hel_targets::TargetLocator::LocalBare { .. }
+                | hel_targets::TargetLocator::AwsEc2 { .. }
+                | hel_targets::TargetLocator::SshBare { .. }
+        )
+    {
+        environment.insert(DISCOVER_LOGIN_PATH_ENV.into(), "1".into());
     }
 }
 
@@ -515,6 +614,22 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
         ));
         candidates.push((directory.join(&triple).join("hel"), "HEL_WORKER_DIR"));
     }
+    if let Some((path, source)) = candidates.into_iter().find(|(path, _)| path.is_file()) {
+        return Ok(WorkerBinaryAvailability::Local {
+            path,
+            source: source.into(),
+        });
+    }
+    if cfg!(all(target_os = "linux", target_env = "musl"))
+        && ((arch == "x86_64" && cfg!(target_arch = "x86_64"))
+            || (arch == "aarch64" && cfg!(target_arch = "aarch64")))
+    {
+        return Ok(WorkerBinaryAvailability::Local {
+            path: stable_running_executable(&current)?,
+            source: "native musl Hel binary".into(),
+        });
+    }
+    let mut candidates = Vec::new();
     if let Some(directory) = current.parent() {
         candidates.push((
             packaged_worker_binary_path(directory, &triple),
@@ -738,7 +853,11 @@ fn workspace_paths(
 // Package versions for ACP bridges. Keep these in lockstep with the global npm installs in
 // containers/Containerfile.agent-dev; bridge_pins_match_containerfile() below
 // fails the build when they drift.
-const CODEX_ACP_FALLBACK_VERSION: &str = "1.1.14";
+// Codex 0.148 reuses pending MCP startups during runtime reconciliation. Older
+// releases could cancel the first project-memory startup while immediately
+// replacing it with an equivalent connection, leaving a false failed-tool
+// event at the beginning of every session.
+const CODEX_ACP_FALLBACK_VERSION: &str = "1.6.2";
 
 const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
 
@@ -746,20 +865,7 @@ const DEEPSEEK_HARNESS_FALLBACK_VERSION: &str = "0.1.1-rc.2";
 
 const DEEPSEEK_ACP_FALLBACK_VERSION: &str = "0.10.0";
 
-fn configure_execution_environment(
-    harness: crate::hel_config::HarnessKind,
-    policy: crate::hel_config::ExecutionPolicy,
-    environment: &mut std::collections::BTreeMap<String, String>,
-) {
-    if let Some((key, value)) = harness
-        .execution_enforcement(policy)
-        .and_then(crate::hel_config::ExecutionEnforcement::launch_environment)
-    {
-        environment.insert(key.to_owned(), value.to_owned());
-    }
-}
-
-fn bridge_launch(
+pub(super) fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
     executable: Option<&Path>,
     policy: crate::hel_config::ExecutionPolicy,
@@ -776,22 +882,22 @@ fn bridge_launch(
         crate::hel_config::HarnessKind::Codex => (
             "sh".into(),
             vec![
-                "-lc".into(),
-                format!("if command -v codex-acp >/dev/null 2>&1; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@{CODEX_ACP_FALLBACK_VERSION}", ensure_node_script()),
+                "-c".into(),
+                format!("if command -v codex-acp >/dev/null 2>&1 && [ \"$(codex-acp --version 2>/dev/null)\" = \"@agentclientprotocol/codex-acp {CODEX_ACP_FALLBACK_VERSION}\" ]; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@{CODEX_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Claude => (
             "sh".into(),
             vec![
-                "-lc".into(),
+                "-c".into(),
                 format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Kimi => (
             "sh".into(),
             vec![
-                "-lc".into(),
-                "if command -v kimi >/dev/null 2>&1; then exec kimi acp; elif [ -x \"$HOME/.kimi-code/bin/kimi\" ]; then exec \"$HOME/.kimi-code/bin/kimi\" acp; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash && exec \"$HOME/.kimi-code/bin/kimi\" acp; else echo 'Hel needs compatible Kimi Code or curl for its official installer' >&2; exit 127; fi".into(),
+                "-c".into(),
+                "if command -v kimi >/dev/null 2>&1; then exec kimi acp; elif [ -x \"$HOME/.kimi-code/bin/kimi\" ]; then exec \"$HOME/.kimi-code/bin/kimi\" acp; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash && exec \"$HOME/.kimi-code/bin/kimi\" acp; else echo 'Hel needs compatible Kimi Code or curl for its official installer; configure the profile executable or environment PATH when the tool is installed elsewhere' >&2; exit 127; fi".into(),
             ],
         ),
         crate::hel_config::HarnessKind::Grok => {
@@ -801,9 +907,9 @@ fn bridge_launch(
             (
                 "sh".into(),
                 vec![
-                    "-lc".into(),
+                    "-c".into(),
                     format!(
-                        "if command -v grok >/dev/null 2>&1; then exec grok {acp}; elif [ -x \"$GROK_HOME/bin/grok\" ]; then exec \"$GROK_HOME/bin/grok\" {acp}; elif [ -x \"$HOME/.grok/bin/grok\" ]; then exec \"$HOME/.grok/bin/grok\" {acp}; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://x.ai/cli/install.sh | bash && exec \"$HOME/.grok/bin/grok\" {acp}; else echo 'Hel needs compatible Grok Build or curl for its official installer' >&2; exit 127; fi"
+                        "if command -v grok >/dev/null 2>&1; then exec grok {acp}; elif [ -x \"$GROK_HOME/bin/grok\" ]; then exec \"$GROK_HOME/bin/grok\" {acp}; elif [ -x \"$HOME/.grok/bin/grok\" ]; then exec \"$HOME/.grok/bin/grok\" {acp}; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://x.ai/cli/install.sh | bash && exec \"$HOME/.grok/bin/grok\" {acp}; else echo 'Hel needs compatible Grok Build or curl for its official installer; configure the profile executable or environment PATH when the tool is installed elsewhere' >&2; exit 127; fi"
                     ),
                 ],
             )
@@ -811,9 +917,9 @@ fn bridge_launch(
         crate::hel_config::HarnessKind::Deepseek => (
             "sh".into(),
             vec![
-                "-lc".into(),
+                "-c".into(),
                 format!(
-                    "{}; if command -v dsh >/dev/null 2>&1 && command -v dsh-acp-server >/dev/null 2>&1; then exec dsh-acp-server; fi; echo 'Hel needs @deepseek-ai/dsh@{DEEPSEEK_HARNESS_FALLBACK_VERSION} and dsh-acp-server@{DEEPSEEK_ACP_FALLBACK_VERSION} installed on PATH' >&2; exit 127",
+                    "{}; if command -v dsh >/dev/null 2>&1 && command -v dsh-acp-server >/dev/null 2>&1; then exec dsh-acp-server; fi; echo 'Hel needs @deepseek-ai/dsh@{DEEPSEEK_HARNESS_FALLBACK_VERSION} and dsh-acp-server@{DEEPSEEK_ACP_FALLBACK_VERSION} installed on PATH; configure the profile executable or environment PATH when they are installed elsewhere' >&2; exit 127",
                     ensure_node_22_script(),
                 ),
             ],
@@ -822,7 +928,7 @@ fn bridge_launch(
 }
 
 fn ensure_node_script() -> &'static str {
-    "if ! command -v npx >/dev/null 2>&1; then if [ \"$(id -u)\" = 0 ]; then SUDO=''; elif command -v sudo >/dev/null 2>&1 && sudo -n true; then SUDO='sudo'; else echo 'Hel needs Node/npx or passwordless sudo to install it' >&2; exit 127; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y nodejs npm; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y nodejs npm; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y nodejs npm; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache nodejs npm; else echo 'Hel cannot install Node on this image; bake npx or a compatible ACP bridge into it' >&2; exit 127; fi; fi"
+    "if ! command -v npx >/dev/null 2>&1; then if [ \"$(id -u)\" = 0 ]; then SUDO=''; elif command -v sudo >/dev/null 2>&1 && sudo -n true; then SUDO='sudo'; else echo 'Hel needs Node/npx or passwordless sudo to install it; configure the profile executable or environment PATH when the tool is installed elsewhere' >&2; exit 127; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y nodejs npm; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y nodejs npm; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y nodejs npm; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache nodejs npm; else echo 'Hel cannot install Node on this image; bake npx or a compatible ACP bridge into it, or configure the profile executable or environment PATH' >&2; exit 127; fi; fi"
 }
 
 fn ensure_node_22_script() -> String {
@@ -832,9 +938,12 @@ fn ensure_node_22_script() -> String {
     )
 }
 
-const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel container environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories (`/workspace/...`), including committed work, staged and unstaged changes, and untracked files.\n\nEverything outside the workspace, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost when the session ends. Keep durable results in the workspace or push them to a remote.\n";
+const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel disposable environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories under `/workspace`, including committed work, staged and unstaged changes, and untracked files. Hel then removes the container.\n\nEverything outside `/workspace`, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n";
 
-fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path) -> Result<()> {
+pub(super) fn stage_profile(
+    profile: &crate::hel_config::HarnessProfile,
+    destination: &Path,
+) -> Result<()> {
     let harness = profile.kind;
     let source = profile.home.as_path();
     std::fs::create_dir_all(destination)?;
@@ -892,18 +1001,29 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
         }
         Ok(())
     })?;
-    append_hel_container_environment(profile.kind, destination)
+    Ok(())
 }
 
-/// Add the Hel lifecycle guidance only to the staged per-session profile.
-fn append_hel_container_environment(
+/// Add lifecycle guidance only for targets that Hel destroys as a whole.
+fn append_hel_target_environment(
     harness: crate::hel_config::HarnessKind,
     destination: &Path,
+    target: &hel_targets::TargetLocator,
 ) -> Result<()> {
+    let environment = match target {
+        hel_targets::TargetLocator::LocalPodman { .. }
+        | hel_targets::TargetLocator::AppleContainer { .. }
+        | hel_targets::TargetLocator::SshPodman { .. } => HEL_CONTAINER_ENVIRONMENT.to_owned(),
+        hel_targets::TargetLocator::AwsEc2 { workspace, .. } => format!(
+            "## Hel disposable environment\n\nThis session runs on a disposable Hel EC2 instance. When the session closes, Hel checkpoints everything in project workspace directories under `$HOME/{workspace}`, including committed work, staged and unstaged changes, and untracked files. Hel then terminates the instance.\n\nEverything outside `$HOME/{workspace}`, including installed packages, the rest of `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n"
+        ),
+        hel_targets::TargetLocator::LocalBare { .. }
+        | hel_targets::TargetLocator::SshBare { .. } => return Ok(()),
+    };
     let instructions = match harness {
         crate::hel_config::HarnessKind::Codex => "AGENTS.md",
         crate::hel_config::HarnessKind::Claude => "CLAUDE.md",
-        crate::hel_config::HarnessKind::Kimi => "SYSTEM.md",
+        crate::hel_config::HarnessKind::Kimi => "AGENTS.md",
         crate::hel_config::HarnessKind::Grok => "AGENTS.md",
         crate::hel_config::HarnessKind::Deepseek => "AGENTS.md",
     };
@@ -923,7 +1043,7 @@ fn append_hel_container_environment(
         .open(&path)
         .with_context(|| format!("open staged harness instructions {}", path.display()))?;
     file.write_all(separator.as_bytes())?;
-    file.write_all(HEL_CONTAINER_ENVIRONMENT.as_bytes())?;
+    file.write_all(environment.as_bytes())?;
     Ok(())
 }
 
@@ -1323,30 +1443,33 @@ pub(super) fn replace_installed_worker_binary(
     session_id: &str,
     worker_binary: &Path,
 ) -> Result<()> {
+    let plan = installed_worker_binary_replacement_plan(locator, session_id, worker_binary)?;
+    for command in plan.commands {
+        execute_checked(executor, command)?;
+    }
+    Ok(())
+}
+
+fn installed_worker_binary_replacement_plan(
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    worker_binary: &Path,
+) -> Result<CommandPlan> {
     let worker_root = hel_targets::worker_root(locator, session_id)?;
     let installed = format!("{worker_root}/hel");
     let staged = format!("{worker_root}/hel.next");
-    match locator {
-        hel_targets::TargetLocator::LocalBare { .. } => {
-            execute_checked(
-                executor,
-                CommandSpec::new(
-                    "cp",
-                    [worker_binary.to_string_lossy().into_owned(), staged.clone()],
-                )
-                .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
-                CommandSpec::new("mv", ["-f", &staged, &installed])
-                    .purpose("replace installed Hel worker"),
-            )?;
-            execute_checked(
-                executor,
-                CommandSpec::new("chmod", ["700", &installed])
-                    .purpose("make replaced Hel worker executable"),
-            )?;
-        }
+    let commands = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => vec![
+            CommandSpec::new(
+                "cp",
+                [worker_binary.to_string_lossy().into_owned(), staged.clone()],
+            )
+            .purpose("stage replacement Hel worker"),
+            CommandSpec::new("mv", ["-f", &staged, &installed])
+                .purpose("replace installed Hel worker"),
+            CommandSpec::new("chmod", ["700", &installed])
+                .purpose("make replaced Hel worker executable"),
+        ],
         hel_targets::TargetLocator::LocalPodman { container_id }
         | hel_targets::TargetLocator::AppleContainer { container_id } => {
             let engine = if matches!(locator, hel_targets::TargetLocator::LocalPodman { .. }) {
@@ -1354,8 +1477,7 @@ pub(super) fn replace_installed_worker_binary(
             } else {
                 "container"
             };
-            execute_checked(
-                executor,
+            vec![
                 CommandSpec::new(
                     engine,
                     [
@@ -1365,9 +1487,6 @@ pub(super) fn replace_installed_worker_binary(
                     ],
                 )
                 .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 CommandSpec::new(
                     engine,
                     [
@@ -1380,9 +1499,6 @@ pub(super) fn replace_installed_worker_binary(
                     ],
                 )
                 .purpose("replace installed Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 CommandSpec::new(
                     engine,
                     [
@@ -1394,48 +1510,29 @@ pub(super) fn replace_installed_worker_binary(
                     ],
                 )
                 .purpose("make replaced Hel worker executable"),
-            )?;
+            ]
         }
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
-        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            execute_checked(
-                executor,
-                scp_command_spec(ssh, worker_binary, &staged, false)
-                    .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
-                ssh_command_spec(ssh, ["mv", "-f", "--", &staged, &installed])
-                    .purpose("replace installed Hel worker"),
-            )?;
-            execute_checked(
-                executor,
-                ssh_command_spec(ssh, ["chmod", "700", &installed])
-                    .purpose("make replaced Hel worker executable"),
-            )?;
-        }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => vec![
+            scp_command_spec(ssh, worker_binary, &staged, false)
+                .purpose("stage replacement Hel worker"),
+            ssh_command_spec(ssh, ["mv", "-f", "--", &staged, &installed])
+                .purpose("replace installed Hel worker"),
+            ssh_command_spec(ssh, ["chmod", "700", &installed])
+                .purpose("make replaced Hel worker executable"),
+        ],
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             let upload = format!(".cache/hel/uploads/{session_id}-hel.next");
-            execute_checked(
-                executor,
+            vec![
                 ssh_command_spec(ssh, ["mkdir", "-p", ".cache/hel/uploads"])
                     .purpose("create remote replacement worker staging"),
-            )?;
-            execute_checked(
-                executor,
                 scp_command_spec(ssh, worker_binary, &upload, false)
                     .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 ssh_command_spec(
                     ssh,
                     ["podman", "cp", &upload, &format!("{container_id}:{staged}")],
                 )
                 .purpose("stage replacement Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 ssh_command_spec(
                     ssh,
                     [
@@ -1450,23 +1547,129 @@ pub(super) fn replace_installed_worker_binary(
                     ],
                 )
                 .purpose("replace installed Hel worker"),
-            )?;
-            execute_checked(
-                executor,
                 ssh_command_spec(
                     ssh,
                     ["podman", "exec", container_id, "chmod", "700", &installed],
                 )
                 .purpose("make replaced Hel worker executable"),
-            )?;
-            execute_checked(
-                executor,
                 ssh_command_spec(ssh, ["rm", "-f", "--", &upload])
                     .purpose("remove remote replacement worker staging"),
-            )?;
+            ]
+        }
+    };
+    Ok(CommandPlan {
+        description: format!("replace stale Hel worker for session {session_id}"),
+        commands,
+    })
+}
+
+fn installed_file_digest_command(
+    locator: &hel_targets::TargetLocator,
+    path: &str,
+    purpose: &str,
+) -> CommandSpec {
+    match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sha256sum", [path]),
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", container_id, "sha256sum", path])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => {
+            CommandSpec::new("container", ["exec", container_id, "sha256sum", path])
+        }
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_spec(ssh, ["sha256sum", path])
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
+            ssh_command_spec(ssh, ["podman", "exec", container_id, "sha256sum", path])
         }
     }
-    Ok(())
+    .purpose(purpose)
+}
+
+fn worker_launch_refresh_plan(
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    launch: &WorkerLaunchConfig,
+) -> Result<WorkerLaunchRefreshPlan> {
+    let worker_root = hel_targets::worker_root(locator, session_id)?;
+    let installed = format!("{worker_root}/launch.json");
+    let staged = format!("{installed}.next");
+    let staged_arg = hel_targets::join_remote_command(std::slice::from_ref(&staged));
+    let installed_arg = hel_targets::join_remote_command(std::slice::from_ref(&installed));
+    let script = format!("umask 077; cat > {staged_arg} && mv -f -- {staged_arg} {installed_arg}");
+    let body = serde_json::to_vec_pretty(launch).context("serialize worker launch config")?;
+    let expected_sha256 = format!("{:x}", Sha256::digest(&body));
+    let replace = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", "-i", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => CommandSpec::new(
+            "container",
+            ["exec", "-i", container_id, "sh", "-c", &script],
+        ),
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_spec(ssh, ["sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => ssh_command_spec(
+            ssh,
+            ["podman", "exec", "-i", container_id, "sh", "-c", &script],
+        ),
+    }
+    .purpose("replace stale Hel worker launch config")
+    .with_sensitive_stdin(body);
+    Ok(WorkerLaunchRefreshPlan {
+        expected_sha256,
+        installed_digest: installed_file_digest_command(
+            locator,
+            &installed,
+            "identify installed Hel worker launch config",
+        ),
+        replace: CommandPlan {
+            description: format!("replace stale Hel launch config for session {session_id}"),
+            commands: vec![replace],
+        },
+    })
+}
+
+/// Prepare a local refresh without hashing the controller binary. Digesting
+/// happens only after recovery has proved that the worker needs a restart.
+fn worker_binary_refresh_plan(
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+) -> Result<Option<WorkerBinaryRefreshPlan>> {
+    if matches!(
+        locator,
+        hel_targets::TargetLocator::AwsEc2 { .. }
+            | hel_targets::TargetLocator::SshBare { .. }
+            | hel_targets::TargetLocator::SshPodman { .. }
+    ) {
+        return Ok(None);
+    }
+    // Resolving a deleted running executable materializes /proc/self/exe and
+    // can copy hundreds of megabytes. Target lists are assembled on UI/event
+    // loops, so leave refresh disabled until the next controller start rather
+    // than doing that work here.
+    if !std::env::current_exe().is_ok_and(|path| path.is_file()) {
+        return Ok(None);
+    }
+    let source = match worker_binary_prerequisite_for_arch(std::env::consts::ARCH) {
+        Ok(WorkerBinaryAvailability::Local { path, .. }) => path,
+        Ok(WorkerBinaryAvailability::Remote { .. }) | Err(_) => return Ok(None),
+    };
+    let worker_root = hel_targets::worker_root(locator, session_id)?;
+    let installed = format!("{worker_root}/hel");
+    Ok(Some(WorkerBinaryRefreshPlan {
+        replace: installed_worker_binary_replacement_plan(locator, session_id, &source)?,
+        source,
+        installed_digest: installed_file_digest_command(
+            locator,
+            &installed,
+            "identify installed Hel worker binary",
+        ),
+    }))
 }
 
 /// Stop the detached worker daemon at `worker_root` without deleting its files.
@@ -1508,7 +1711,7 @@ fn stop_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) 
         }
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &script])
+            ssh_command_spec(ssh, ["sh", "-c", &script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
@@ -1529,7 +1732,7 @@ fn worker_liveness_command(locator: &hel_targets::TargetLocator, worker_root: &s
         }
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &script])
+            ssh_command_spec(ssh, ["sh", "-c", &script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
@@ -1550,16 +1753,17 @@ pub(super) fn start_worker(
 fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) -> CommandSpec {
     let binary = format!("{worker_root}/hel");
     let config = format!("{worker_root}/launch.json");
-    // The exit record describes the worker's previous life. Clear it as part
-    // of the launch, before the new daemon can be probed: the startup connect
-    // loop treats that file as proof the worker it just started has died, so
-    // a stale record would abort every restart.
-    let clear_exit_record = format!(
-        "rm -f {}; ",
+    // These files describe the worker's previous life. Clear them as part of
+    // the launch, before the new daemon can be probed: a stale exit record
+    // aborts startup, while a stale socket makes a recovering daemon look
+    // ready and invites the reconnect actor to kill it as unresponsive.
+    let clear_stale_runtime = format!(
+        "rm -f {} {}; ",
         hel_targets::join_remote_command(&[format!("{worker_root}/worker-exit.json")]),
+        hel_targets::join_remote_command(&[format!("{worker_root}/control.sock")]),
     );
     let detached_script = format!(
-        "{clear_exit_record}nohup {} >{} 2>&1 </dev/null &",
+        "{clear_stale_runtime}nohup {} >{} 2>&1 </dev/null &",
         hel_targets::join_remote_command(&[
             binary.clone(),
             "worker".into(),
@@ -1574,7 +1778,7 @@ fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str)
     // Redirect daemon output to worker.log in every launch mode; an
     // unexplained dead worker is undebuggable without it.
     let exec_script = format!(
-        "{clear_exit_record}exec {} >{} 2>&1",
+        "{clear_stale_runtime}exec {} >{} 2>&1",
         hel_targets::join_remote_command(&[
             binary.clone(),
             "worker".into(),
@@ -1600,7 +1804,7 @@ fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str)
         ),
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &detached_script])
+            ssh_command_spec(ssh, ["sh", "-c", &detached_script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => ssh_command_spec(
             ssh,
@@ -1693,14 +1897,32 @@ pub(super) fn worker_last_words(
         }
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
-            ssh_command_spec(ssh, ["sh", "-lc", &script])
+            ssh_command_spec(ssh, ["sh", "-c", &script])
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
         }
     }
     .purpose("collect worker last words");
-    let output = executor.execute(&command).ok()?;
+    let output = match executor.execute(&command) {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(
+                worker_root,
+                %error,
+                "could not collect worker diagnostics"
+            );
+            return None;
+        }
+    };
+    if output.status != 0 {
+        tracing::debug!(
+            worker_root,
+            status = output.status,
+            "worker diagnostic probe returned a failure"
+        );
+        return None;
+    }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!text.is_empty()).then(|| format!("worker diagnostics:\n{text}"))
 }
@@ -1757,7 +1979,7 @@ mod tests {
     /// must clear it first, or the startup connect loop reads the previous
     /// death as this worker's and gives up on a healthy daemon.
     #[test]
-    fn starting_a_worker_clears_the_previous_exit_record_before_launching() {
+    fn starting_a_worker_clears_stale_runtime_files_before_launching() {
         struct RecordingExecutor {
             commands: RefCell<Vec<CommandSpec>>,
         }
@@ -1797,8 +2019,12 @@ mod tests {
             let cleared = script.find("rm -f").expect("the exit record is removed");
             let launched = script.find("worker").expect("the daemon is launched");
             assert!(
+                script.contains("control.sock"),
+                "the stale relay endpoint must be cleared before startup: {script}"
+            );
+            assert!(
                 cleared < launched,
-                "the exit record must be cleared before the daemon starts: {script}"
+                "stale runtime files must be cleared before the daemon starts: {script}"
             );
         }
     }
@@ -1834,6 +2060,13 @@ mod tests {
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].purpose, "stop Hel worker daemon");
+        assert!(
+            commands[0]
+                .args
+                .last()
+                .is_some_and(|remote| remote.starts_with("'sh' '-c' ")),
+            "raw SSH worker management must not source login profiles: {commands:?}"
+        );
         let script = commands[0]
             .args
             .iter()
@@ -2136,25 +2369,32 @@ mod tests {
     }
     #[test]
     fn default_bridges_pin_command_capable_adapter_versions() {
-        let (_, codex_arguments) = bridge_launch(
+        let (codex_command, codex_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Codex,
             None,
             ExecutionPolicy::Unconstrained,
         );
-        assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.1.14"));
+        assert_eq!(codex_command, "sh");
+        assert_eq!(codex_arguments[0], "-c");
+        assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.6.2"));
+        assert!(codex_arguments[1].contains("codex-acp --version"));
 
-        let (_, claude_arguments) = bridge_launch(
+        let (claude_command, claude_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Claude,
             None,
             ExecutionPolicy::Unconstrained,
         );
+        assert_eq!(claude_command, "sh");
+        assert_eq!(claude_arguments[0], "-c");
         assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.68.0"));
 
-        let (_, deepseek_arguments) = bridge_launch(
+        let (deepseek_command, deepseek_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Deepseek,
             None,
             ExecutionPolicy::Unconstrained,
         );
+        assert_eq!(deepseek_command, "sh");
+        assert_eq!(deepseek_arguments[0], "-c");
         assert!(deepseek_arguments[1].contains("@deepseek-ai/dsh@0.1.1-rc.2"));
         assert!(deepseek_arguments[1].contains("dsh-acp-server@0.10.0"));
         assert!(!deepseek_arguments[1].contains("npx -y -p @deepseek-ai/dsh"));
@@ -2164,8 +2404,7 @@ mod tests {
     fn codex_execution_environment_follows_the_target_policy() {
         let mut podman_environment =
             BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Codex,
+        crate::hel_config::HarnessKind::Codex.configure_execution_environment(
             ExecutionPolicy::Unconstrained,
             &mut podman_environment,
         );
@@ -2178,8 +2417,7 @@ mod tests {
 
         let mut bare_environment =
             BTreeMap::from([("INITIAL_AGENT_MODE".to_owned(), "read-only".to_owned())]);
-        configure_execution_environment(
-            crate::hel_config::HarnessKind::Codex,
+        crate::hel_config::HarnessKind::Codex.configure_execution_environment(
             ExecutionPolicy::ConfiguredApprovals,
             &mut bare_environment,
         );
@@ -2189,6 +2427,57 @@ mod tests {
                 .map(String::as_str),
             Some("read-only"),
             "raw localhost must preserve the profile's configured mode"
+        );
+    }
+    #[test]
+    fn only_raw_targets_without_an_explicit_path_request_login_path_discovery() {
+        let raw = hel_targets::TargetLocator::LocalBare {
+            worker_root: "/worker".into(),
+        };
+        let managed = hel_targets::TargetLocator::LocalPodman {
+            container_id: "container".into(),
+        };
+
+        let mut environment = BTreeMap::new();
+        configure_login_path_discovery(&mut environment, &raw);
+        assert_eq!(
+            environment.get(DISCOVER_LOGIN_PATH_ENV).map(String::as_str),
+            Some("1")
+        );
+
+        let mut explicit = BTreeMap::from([
+            ("PATH".into(), "/configured/bin".into()),
+            (DISCOVER_LOGIN_PATH_ENV.into(), "stale".into()),
+        ]);
+        configure_login_path_discovery(&mut explicit, &raw);
+        assert_eq!(
+            explicit.get("PATH").map(String::as_str),
+            Some("/configured/bin")
+        );
+        assert!(!explicit.contains_key(DISCOVER_LOGIN_PATH_ENV));
+
+        let mut managed_environment =
+            BTreeMap::from([(DISCOVER_LOGIN_PATH_ENV.into(), "stale".into())]);
+        configure_login_path_discovery(&mut managed_environment, &managed);
+        assert!(!managed_environment.contains_key(DISCOVER_LOGIN_PATH_ENV));
+    }
+    #[test]
+    fn grok_sandbox_environment_follows_the_target_policy() {
+        let mut isolated = BTreeMap::from([("GROK_SANDBOX".to_owned(), "strict".to_owned())]);
+        crate::hel_config::HarnessKind::Grok
+            .configure_execution_environment(ExecutionPolicy::Unconstrained, &mut isolated);
+        assert_eq!(
+            isolated.get("GROK_SANDBOX").map(String::as_str),
+            Some("off")
+        );
+
+        let mut local = BTreeMap::from([("GROK_SANDBOX".to_owned(), "strict".to_owned())]);
+        crate::hel_config::HarnessKind::Grok
+            .configure_execution_environment(ExecutionPolicy::ConfiguredApprovals, &mut local);
+        assert_eq!(
+            local.get("GROK_SANDBOX").map(String::as_str),
+            Some("strict"),
+            "raw localhost must preserve the profile's configured sandbox"
         );
     }
     #[test]
@@ -2222,26 +2511,26 @@ mod tests {
         }
     }
     #[test]
-    fn kimi_default_bridge_uses_bash_for_the_official_installer() {
+    fn kimi_default_bridge_is_non_login_and_uses_bash_for_the_official_installer() {
         let (command, arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Kimi,
             None,
             ExecutionPolicy::Unconstrained,
         );
         assert_eq!(command, "sh");
-        assert_eq!(arguments[0], "-lc");
+        assert_eq!(arguments[0], "-c");
         assert!(arguments[1].contains("install.sh | bash &&"));
         assert!(arguments[1].contains("$HOME/.kimi-code/bin/kimi"));
     }
     #[test]
-    fn grok_default_bridge_uses_bash_for_the_official_installer() {
+    fn grok_default_bridge_is_non_login_and_uses_bash_for_the_official_installer() {
         let (command, arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Grok,
             None,
             ExecutionPolicy::ConfiguredApprovals,
         );
         assert_eq!(command, "sh");
-        assert_eq!(arguments[0], "-lc");
+        assert_eq!(arguments[0], "-c");
         let script = &arguments[1];
         assert!(script.contains("https://x.ai/cli/install.sh | bash &&"));
         assert!(script.contains("command -v grok"));
@@ -2524,18 +2813,16 @@ mod tests {
         assert!(staged.path().join("settings.yaml").is_file());
         assert!(!staged.path().join("sessions").exists());
         assert!(!staged.path().join("profiles").exists());
-        assert!(
-            std::fs::read_to_string(staged.path().join("AGENTS.md"))
-                .unwrap()
-                .contains("Hel container environment")
-        );
     }
     #[test]
-    fn stage_profile_appends_container_environment_for_each_harness_without_touching_home() {
+    fn disposable_container_guidance_reaches_each_harness_without_touching_home() {
+        let target = hel_targets::TargetLocator::LocalPodman {
+            container_id: "container".into(),
+        };
         for (kind, instructions) in [
             (crate::hel_config::HarnessKind::Codex, "AGENTS.md"),
             (crate::hel_config::HarnessKind::Claude, "CLAUDE.md"),
-            (crate::hel_config::HarnessKind::Kimi, "SYSTEM.md"),
+            (crate::hel_config::HarnessKind::Kimi, "AGENTS.md"),
             (crate::hel_config::HarnessKind::Grok, "AGENTS.md"),
             (crate::hel_config::HarnessKind::Deepseek, "AGENTS.md"),
         ] {
@@ -2553,6 +2840,7 @@ mod tests {
             };
 
             stage_profile(&profile, staged.path()).unwrap();
+            append_hel_target_environment(kind, staged.path(), &target).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(staged.path().join(instructions)).unwrap(),
@@ -2567,8 +2855,10 @@ mod tests {
         }
     }
     #[test]
-    fn stage_profile_creates_missing_staged_container_instructions() {
+    fn kimi_guidance_uses_agents_md_without_mutating_the_system_override() {
         let home = tempfile::tempdir().unwrap();
+        let system_override = "# Custom Kimi system prompt\n";
+        std::fs::write(home.path().join("SYSTEM.md"), system_override).unwrap();
         let staged = tempfile::tempdir().unwrap();
         let profile = crate::hel_config::HarnessProfile {
             kind: crate::hel_config::HarnessKind::Kimi,
@@ -2579,12 +2869,68 @@ mod tests {
         };
 
         stage_profile(&profile, staged.path()).unwrap();
+        append_hel_target_environment(
+            profile.kind,
+            staged.path(),
+            &hel_targets::TargetLocator::LocalPodman {
+                container_id: "container".into(),
+            },
+        )
+        .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(staged.path().join("SYSTEM.md")).unwrap(),
+            std::fs::read_to_string(staged.path().join("AGENTS.md")).unwrap(),
             HEL_CONTAINER_ENVIRONMENT
         );
-        assert!(!home.path().join("SYSTEM.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(staged.path().join("SYSTEM.md")).unwrap(),
+            system_override
+        );
+        assert!(!home.path().join("AGENTS.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("SYSTEM.md")).unwrap(),
+            system_override
+        );
+    }
+
+    #[test]
+    fn ec2_guidance_names_its_real_workspace_and_ssh_bare_gets_none() {
+        let ec2 = tempfile::tempdir().unwrap();
+        append_hel_target_environment(
+            crate::hel_config::HarnessKind::Codex,
+            ec2.path(),
+            &hel_targets::TargetLocator::AwsEc2 {
+                profile: "profile".into(),
+                region: "region".into(),
+                instance_id: "instance".into(),
+                ssh: hel_targets::SshTarget {
+                    destination: "host".into(),
+                    ssh_args: Vec::new(),
+                },
+                workspace: ".local/share/hel/workspaces/session".into(),
+            },
+        )
+        .unwrap();
+        let guidance = std::fs::read_to_string(ec2.path().join("AGENTS.md")).unwrap();
+        assert!(guidance.contains("disposable Hel EC2 instance"));
+        assert!(guidance.contains("`$HOME/.local/share/hel/workspaces/session`"));
+        assert!(!guidance.contains("disposable Hel container"));
+        assert!(!guidance.contains("`/workspace`"));
+
+        let ssh_bare = tempfile::tempdir().unwrap();
+        append_hel_target_environment(
+            crate::hel_config::HarnessKind::Codex,
+            ssh_bare.path(),
+            &hel_targets::TargetLocator::SshBare {
+                ssh: hel_targets::SshTarget {
+                    destination: "host".into(),
+                    ssh_args: Vec::new(),
+                },
+                workspace: ".local/share/hel/workspaces/session".into(),
+            },
+        )
+        .unwrap();
+        assert!(!ssh_bare.path().join("AGENTS.md").exists());
     }
 
     #[test]

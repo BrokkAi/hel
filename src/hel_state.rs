@@ -78,7 +78,11 @@ impl QueuedCommandKind {
 /// The composer form of a configuration change, used both as the queue entry's
 /// display text and as the text peeled back into the composer for editing.
 pub fn config_command_text(key: &str, value: &str) -> String {
-    format!("/{key} {value}")
+    if key == "fast-mode" {
+        "/fast".to_owned()
+    } else {
+        format!("/{key} {value}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +137,7 @@ pub struct MaterializedSessionSummary {
     /// nonempty user message in transcript order.
     pub last_agent_message_follows_last_user: bool,
     pub agent_message_latest_content_ordinals: Vec<u64>,
+    pub session_restart_event_ordinals: Vec<u64>,
 }
 
 impl MaterializedSession {
@@ -162,6 +167,15 @@ impl MaterializedSession {
                 item.latest_content_event_ordinal
                     .is_some_and(|ordinal| ordinal > viewed_through_event_ordinal)
                     && item.is_nonempty_agent_message()
+            })
+            .count() as u64
+    }
+
+    pub fn unread_session_restarts_after(&self, viewed_through_event_ordinal: u64) -> u64 {
+        self.transcript
+            .iter()
+            .filter(|item| {
+                item.position > viewed_through_event_ordinal && item.is_session_restart()
             })
             .count() as u64
     }
@@ -269,6 +283,13 @@ pub struct RecoveryObserver {
     pub(crate) gate: Arc<RecoveryGate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryCheckpointPhase {
+    Prestaging,
+    Snapshotting,
+    Saving,
+}
+
 /// A per-session reservation held by a foreground lifecycle operation. The
 /// coordinator cannot start another recovery copy until this value is dropped.
 pub struct RecoveryReservation {
@@ -292,6 +313,7 @@ struct RecoveryGateState {
     /// In-flight copies, each with the cancel flag its executor watches, so a
     /// foreground lifecycle operation can preempt one instead of waiting.
     busy: BTreeMap<String, Arc<AtomicBool>>,
+    phases: BTreeMap<String, RecoveryCheckpointPhase>,
     reservations: BTreeMap<String, usize>,
 }
 
@@ -325,15 +347,32 @@ impl RecoveryGate {
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         state.busy.insert(session_id.to_owned(), cancelled.clone());
+        state
+            .phases
+            .insert(session_id.to_owned(), RecoveryCheckpointPhase::Prestaging);
         Some(cancelled)
     }
 
-    pub(crate) fn finish(&self, session_id: &str) {
+    pub(crate) fn set_phase(&self, session_id: &str, phase: RecoveryCheckpointPhase) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.busy.contains_key(session_id) {
+            state.phases.insert(session_id.to_owned(), phase);
+        }
+    }
+
+    pub(crate) fn phase(&self, session_id: &str) -> Option<RecoveryCheckpointPhase> {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .busy
-            .remove(session_id);
+            .phases
+            .get(session_id)
+            .copied()
+    }
+
+    pub(crate) fn finish(&self, session_id: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.busy.remove(session_id);
+        state.phases.remove(session_id);
     }
 
     pub(crate) fn is_busy(&self, session_id: &str) -> bool {
@@ -403,17 +442,32 @@ impl RecoveryContext {
     pub fn is_busy(&self) -> bool {
         self.observer.is_busy(&self.session.id)
     }
+
+    pub fn phase(&self) -> Option<RecoveryCheckpointPhase> {
+        self.observer.phase(&self.session.id)
+    }
 }
 
 impl RecoveryObserver {
     /// Queues one observation for the coordinator. Returns as soon as the
     /// observation is queued; a stopped coordinator makes this a no-op.
     pub fn observe(&self, observation: RecoveryObservation) {
-        let _ = self.observations.send(observation);
+        let session_id = observation.session.id.clone();
+        if let Err(error) = self.observations.send(observation) {
+            tracing::debug!(
+                %session_id,
+                %error,
+                "recovery observation dropped because the coordinator stopped"
+            );
+        }
     }
 
     pub fn is_busy(&self, session_id: &str) -> bool {
         self.gate.is_busy(session_id)
+    }
+
+    pub fn phase(&self, session_id: &str) -> Option<RecoveryCheckpointPhase> {
+        self.gate.phase(session_id)
     }
 
     /// Holds off any recovery copy for this session until the returned
@@ -710,6 +764,8 @@ impl CheckpointMetadata {
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {
     pub id: String,
+    #[serde(default = "default_session_workspace_id")]
+    pub workspace_id: String,
     pub title: String,
     pub harness_kind: HarnessKind,
     pub last_profile: String,
@@ -761,6 +817,17 @@ pub struct SessionRecord {
     pub last_checkpoint_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CheckpointMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostContainerSize {
+    pub cpus: u64,
+    pub memory_bytes: u64,
+}
+
+fn default_session_workspace_id() -> String {
+    crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned()
 }
 
 impl SessionRecord {
@@ -878,6 +945,7 @@ impl SessionRecord {
                 self.id
             );
         }
+        validate_id("workspace", &self.workspace_id)?;
         validate_id("profile", &self.last_profile)?;
         validate_id("bundle", &self.bundle_id)?;
         if let Some(project_directory) = &self.project_directory
@@ -1019,6 +1087,9 @@ pub struct HelState {
     /// Recently used source directories, keyed by `local` or SSH host name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mount_history: BTreeMap<String, Vec<PathBuf>>,
+    /// Most recently launched container size on each physical target host.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub container_sizes: BTreeMap<String, HostContainerSize>,
 }
 
 impl Default for HelState {
@@ -1027,6 +1098,7 @@ impl Default for HelState {
             version: STATE_VERSION,
             sessions: BTreeMap::new(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         }
     }
 }
@@ -1050,6 +1122,17 @@ impl HelState {
                 bail!("mount history for {host:?} contains a non-absolute source path");
             }
         }
+        for (host, size) in &self.container_sizes {
+            if host.trim().is_empty() {
+                bail!("container size history contains an empty host key");
+            }
+            if size.cpus == 0 || size.memory_bytes == 0 {
+                bail!("container size history for {host:?} contains a zero value");
+            }
+            if size.cpus > i64::MAX as u64 || size.memory_bytes > i64::MAX as u64 {
+                bail!("container size history for {host:?} exceeds SQLite integer range");
+            }
+        }
         Ok(())
     }
 
@@ -1063,6 +1146,10 @@ impl HelState {
             sources.insert(0, mount.source.clone());
         }
         sources.truncate(20);
+    }
+
+    pub fn remember_container_size(&mut self, host: &str, size: HostContainerSize) {
+        self.container_sizes.insert(host.to_owned(), size);
     }
 
     pub fn project_directories(&self, host: &str) -> &[PathBuf] {
@@ -1080,13 +1167,13 @@ impl HelState {
         directories.truncate(20);
     }
 
-    pub fn remove_stopped_session(&mut self, session_id: &str) -> Result<SessionRecord> {
+    pub fn destroy_stopped_session(&mut self, session_id: &str) -> Result<SessionRecord> {
         let session = self
             .sessions
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?;
         if session.state.is_active() {
-            bail!("refusing to delete active session {session_id}");
+            bail!("refusing to destroy active session {session_id}");
         }
         Ok(self
             .sessions
@@ -1232,8 +1319,16 @@ mod tests {
         TargetTemplate,
     };
 
+    #[test]
+    fn fast_mode_configuration_uses_its_user_facing_toggle_command() {
+        assert_eq!(config_command_text("fast-mode", "on"), "/fast");
+        assert_eq!(config_command_text("fast-mode", "off"), "/fast");
+        assert_eq!(config_command_text("model", "sol"), "/model sol");
+    }
+
     fn sample_state() -> HelState {
         let session = SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -1278,12 +1373,14 @@ mod tests {
                 "local".into(),
                 vec![PathBuf::from("/home/test/cache")],
             )]),
+            container_sizes: BTreeMap::new(),
         }
     }
 
     fn sample_config() -> HelConfig {
         HelConfig {
             version: CONFIG_VERSION,
+            phone: Default::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
@@ -1350,6 +1447,34 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&edited).expect("serialize"))
                 .expect("reload edited session");
         assert_eq!(round_tripped, edited);
+    }
+
+    #[test]
+    fn container_size_history_rejects_invalid_keys_and_values() {
+        let mut state = HelState::default();
+        state.container_sizes.insert(
+            String::new(),
+            HostContainerSize {
+                cpus: 8,
+                memory_bytes: 32,
+            },
+        );
+        assert!(
+            state
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("empty host")
+        );
+
+        state.container_sizes = BTreeMap::from([(
+            "local".into(),
+            HostContainerSize {
+                cpus: 0,
+                memory_bytes: 32,
+            },
+        )]);
+        assert!(state.validate().unwrap_err().to_string().contains("zero"));
     }
 
     #[test]
@@ -1742,7 +1867,7 @@ mod tests {
         let mut state = sample_state();
         assert!(
             state
-                .remove_stopped_session("0123456789abcdef")
+                .destroy_stopped_session("0123456789abcdef")
                 .unwrap_err()
                 .to_string()
                 .contains("active session")
@@ -1750,7 +1875,7 @@ mod tests {
         assert!(state.sessions.contains_key("0123456789abcdef"));
 
         state.sessions.values_mut().next().unwrap().state = SessionState::Stopped;
-        let removed = state.remove_stopped_session("0123456789abcdef").unwrap();
+        let removed = state.destroy_stopped_session("0123456789abcdef").unwrap();
         assert_eq!(removed.id, "0123456789abcdef");
         assert!(state.sessions.is_empty());
     }

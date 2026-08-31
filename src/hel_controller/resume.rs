@@ -7,6 +7,7 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1::ContentBlock;
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::hel_archive::{
     CanonicalQueuedCommandKind, CanonicalSessionSnapshot, CheckpointRepositoryBundle, SystemGit,
@@ -21,24 +22,28 @@ use crate::hel_state::{
 };
 use crate::hel_targets::{
     self, AdditionalMount, CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec,
-    ProcessExecutor, ProvisionStage,
+    ProcessExecutor, ProvisionStage, ProvisionStageGuard,
 };
 use crate::hel_worker::RelayCommand;
 
 use super::backend::{backend_locator, controller_github_token, validate_resource_allocation};
 use super::checkpoint::upload_checkpoint_spec;
 use super::provisioning::{
-    LocalBootstrap, ProvisioningFailureDisposition, StagedExecutor, install_attached_resources,
+    LocalBootstrap, ProvisioningFailureDisposition, StagedExecutor, execute_concurrent_lanes,
+    install_attached_resources,
 };
 use super::readiness::{connect_started_worker, wait_for_native_session};
 use super::worker_binary::{start_worker, worker_probe_diagnosis};
 use super::worktree::{
     PrimaryCheckoutRequirement, ResumeConversion, ResumePlan, apply_raw_to_workspace,
     apply_workspace_to_raw, cleanup_managed_worktree, create_managed_worktree,
-    plan_raw_to_workspace, raw_checkout_divergence_notice, raw_checkout_position,
-    resume_compatibility, retire_managed_worktree,
+    managed_worktree_checkout_exists, plan_raw_to_workspace, raw_checkout_divergence_notice,
+    raw_checkout_position, restore_managed_worktree, resume_compatibility, retire_managed_worktree,
 };
-use super::{Controller, SessionResumeOptions, execute_checked, now, target_profile_home};
+use super::{
+    Controller, SessionResumeOptions, execute_checked, now, selected_host_container_size,
+    target_profile_home,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeRepositorySourceMismatch {
@@ -50,7 +55,8 @@ pub struct ResumeRepositorySourceMismatch {
     pub configured_origin: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResumeRepositorySourceReceipt {
     session_id: String,
     bundle_id: String,
@@ -649,6 +655,7 @@ impl Controller {
         let plan = resume_compatibility(&previous, &self.config, target_id)
             .map_err(|reason| anyhow::anyhow!("{reason}"))?;
         if plan == ResumePlan::InPlace
+            && previous.managed_worktree.is_none()
             && let Some(project_directory) = &previous.project_directory
         {
             self.validate_project_directory(target_id, project_directory, executor)
@@ -670,6 +677,8 @@ impl Controller {
         let additional_mounts =
             additional_mounts.unwrap_or_else(|| previous.additional_mounts.clone());
         validate_resource_allocation(target_template, resource_allocation.as_ref())?;
+        let selected_container_size =
+            selected_host_container_size(target_template, resource_allocation.as_ref());
         if !additional_mounts.is_empty() && mount_history_host(target_template).is_none() {
             bail!("attached resources are unsupported for this target");
         }
@@ -719,9 +728,15 @@ impl Controller {
                 conversion.worktree.branch,
             ));
         }
-        // The live checkout, not the archive, is the truth for a raw session.
-        // Say so in the conversation when the two disagree; never reconcile.
-        if let Some(project_directory) = &previous.project_directory {
+        let managed_checkout_present = previous
+            .managed_worktree
+            .as_ref()
+            .map(|worktree| managed_worktree_checkout_exists(executor, worktree))
+            .transpose()?
+            .unwrap_or(true);
+        // A checkout Hel did not retire remains the truth for a raw session.
+        // A retired checkout is recreated from the branch and archive below.
+        if managed_checkout_present && let Some(project_directory) = &previous.project_directory {
             match raw_checkout_position(&previous, &self.config, project_directory, executor) {
                 Ok(live) => resume_notices.extend(raw_checkout_divergence_notice(
                     project_directory,
@@ -833,9 +848,33 @@ impl Controller {
         }
         // Resume rewrites the record it resumes, including the attached
         // directories and the harness session id, so it writes the whole row.
-        crate::hel_database::save_session(&self.state.sessions[session_id])?;
+        if let Some((host, size)) = selected_container_size.as_ref() {
+            crate::hel_database::save_session_with_container_size(
+                &self.state.sessions[session_id],
+                host,
+                *size,
+            )?;
+        } else {
+            crate::hel_database::save_session(&self.state.sessions[session_id])?;
+        }
+        if let Some((host, size)) = selected_container_size {
+            self.state.remember_container_size(&host, size);
+        }
 
+        let mut recreated_managed_worktree = false;
         let result = async {
+            if let Some(worktree) = previous.managed_worktree.as_ref() {
+                recreated_managed_worktree = restore_managed_worktree(executor, worktree)?;
+                if recreated_managed_worktree && plan == ResumePlan::RawToWorkspace {
+                    crate::hel_checkpoint::restore_single_repository_onto_branch(
+                        &checkpoint.archive_path,
+                        &worktree.worktree_root,
+                        &worktree.branch,
+                        &SystemGit,
+                    )
+                    .context("restore the retired checkout before moving it into a target")?;
+                }
+            }
             // The record already names the worktree, so a failure here rolls
             // back through the same path that cleans up a new session's.
             if let Some(conversion) =
@@ -862,9 +901,6 @@ impl Controller {
                 ProvisioningFailureDisposition::Preserve,
             )
             .await?;
-            // Everything from here to the daemon launch moves data into the
-            // target, so it reports as Sync. Start begins at start_worker.
-            let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
             let (backend, worker_root) = self.worker_placement(session_id)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &resumed_project_directory {
@@ -900,8 +936,11 @@ impl Controller {
                 relay_root: target_path(&worker_root),
                 harness_home: target_path(&harness_home),
                 // A converted session's repository arrives as a seed from its
-                // own checkout, not from the archive's metadata-only capture.
-                restore_repositories: resumed_project_directory.is_none() && conversion.is_none(),
+                // own checkout. An in-place managed checkout recreated from
+                // its retained branch still needs the archive's dirty state.
+                restore_repositories: (resumed_project_directory.is_none()
+                    && conversion.is_none())
+                    || (recreated_managed_worktree && plan == ResumePlan::InPlace),
                 restore_native: same_harness,
                 // A conversion puts the checkout somewhere the archive could
                 // not have named, so the restored harness session is pointed at
@@ -919,19 +958,22 @@ impl Controller {
             // frontier no journal can support. This runs before the worker
             // binary is installed: a surviving daemon still holds the old one
             // open, and the install would land on a running executable.
-            if let Some(command) = hel_targets::clear_relay_state_plan(&backend, session_id)? {
-                execute_checked(syncing, command)?;
+            {
+                let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
+                if let Some(command) = hel_targets::clear_relay_state_plan(&backend, session_id)? {
+                    execute_checked(syncing, command)?;
+                }
+                // Both lanes below write into the worker root, so it exists first.
+                execute_checked(
+                    syncing,
+                    hel_targets::command_on_locator(
+                        &backend,
+                        session_id,
+                        vec!["mkdir".into(), "-p".into(), worker_root.clone()],
+                        "create the session worker root",
+                    )?,
+                )?;
             }
-            // Both lanes below write into the worker root, so it exists first.
-            execute_checked(
-                syncing,
-                hel_targets::command_on_locator(
-                    &backend,
-                    session_id,
-                    vec!["mkdir".into(), "-p".into(), worker_root.clone()],
-                    "create the session worker root",
-                )?,
-            )?;
             let staging = tempfile::tempdir().context("create restore staging")?;
             let local_spec = staging.path().join("restore-spec.json");
             std::fs::write(&local_spec, serde_json::to_vec_pretty(&restore)?)?;
@@ -949,11 +991,18 @@ impl Controller {
             let local_spec_ref = local_spec.as_path();
             execute_concurrent_lanes(
                 || {
+                    let syncing =
+                        &StagedExecutor::new(executor, ProvisionStage::Syncing);
                     controller.prepare_worker_files(
                         session_id,
                         backend_ref,
                         worker_root_ref,
                         syncing,
+                    )?;
+                    super::provisioning::install_inherited_git_settings(
+                        syncing,
+                        backend_ref,
+                        session_id,
                     )?;
                     // The restore needs the fetched objects: a committed delta
                     // bundle cannot be applied without its prerequisites, and a
@@ -969,15 +1018,17 @@ impl Controller {
                     )
                 },
                 || {
+                    let restoring =
+                        &StagedExecutor::new(executor, ProvisionStage::Restoring);
                     upload_checkpoint_spec(
-                        syncing,
+                        restoring,
                         backend_ref,
                         session_id,
                         &checkpoint.archive_path,
                         &remote_archive,
                     )?;
                     upload_checkpoint_spec(
-                        syncing,
+                        restoring,
                         backend_ref,
                         session_id,
                         local_spec_ref,
@@ -985,21 +1036,33 @@ impl Controller {
                     )
                 },
             )?;
-            execute_checked(
-                syncing,
-                restore_command(&backend, session_id, &remote_spec)?,
-            )?;
-            install_attached_resources(&self.state, session_id, &backend, &worker_root, syncing)?;
-            self.connect_local_repositories(
-                session_id,
-                &backend,
-                &worker_root,
-                syncing,
-                match conversion.as_ref().and_then(ResumeConversion::raw_to_workspace) {
-                    Some(conversion) => LocalBootstrap::SeedFrom(conversion.checkout.clone()),
-                    None => LocalBootstrap::Seed,
-                },
-            )?;
+            {
+                let restoring = &StagedExecutor::new(executor, ProvisionStage::Restoring);
+                execute_checked(
+                    restoring,
+                    restore_command(&backend, session_id, &remote_spec)?,
+                )?;
+            }
+            {
+                let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
+                install_attached_resources(
+                    &self.state,
+                    session_id,
+                    &backend,
+                    &worker_root,
+                    syncing,
+                )?;
+                self.connect_local_repositories(
+                    session_id,
+                    &backend,
+                    &worker_root,
+                    syncing,
+                    match conversion.as_ref().and_then(ResumeConversion::raw_to_workspace) {
+                        Some(conversion) => LocalBootstrap::SeedFrom(conversion.checkout.clone()),
+                        None => LocalBootstrap::Seed,
+                    },
+                )?;
+            }
             match projection_build {
                 Some(build) => {
                     let mut restored_projection = build
@@ -1041,7 +1104,8 @@ impl Controller {
             } else {
                 // The new harness compacts the prior transcript itself, in a
                 // scratch session on this relay, before its first real prompt.
-                executor.notify_stage(ProvisionStage::Compacting);
+                let _compacting =
+                    ProvisionStageGuard::new(executor, ProvisionStage::Compacting);
                 let context = compact_while_cancellable(
                     &canonical_session,
                     context_bytes,
@@ -1085,6 +1149,12 @@ impl Controller {
                 .and_then(|plan| plan.retire.as_ref())
                 && let Err(error) = retire_managed_worktree(executor, worktree)
             {
+                tracing::warn!(
+                    session_id,
+                    worktree = %worktree.worktree_root.display(),
+                    error = format!("{error:#}"),
+                    "could not retire the old managed worktree after resume"
+                );
                 resume_notices.push(format!(
                     "Hel could not remove the worktree at {}: {error:#}. Remove it with `git worktree remove --force {}`.",
                     worktree.worktree_root.display(),
@@ -1126,21 +1196,48 @@ impl Controller {
                 // so they are correct whether or not the write had happened
                 // when the resume failed.
                 if rebuild_projection {
-                    if let Ok(previous_projection) =
-                        materialized_session_from_canonical(session_id, &canonical_session)
-                    {
-                        let _ =
-                            crate::hel_database::save_materialized_session(&previous_projection);
+                    match materialized_session_from_canonical(session_id, &canonical_session) {
+                        Ok(previous_projection) => {
+                            if let Err(restore_error) =
+                                crate::hel_database::save_materialized_session(&previous_projection)
+                            {
+                                tracing::error!(
+                                    session_id,
+                                    error = format!("{restore_error:#}"),
+                                    "could not restore the durable projection after resume failed"
+                                );
+                            }
+                        }
+                        Err(restore_error) => {
+                            tracing::error!(
+                                session_id,
+                                error = format!("{restore_error:#}"),
+                                "could not rebuild the durable projection after resume failed"
+                            );
+                        }
                     }
-                } else if discard_queued_prompts {
-                    let _ = crate::hel_database::replace_materialized_queued_prompts(
+                } else if discard_queued_prompts
+                    && let Err(restore_error) =
+                        crate::hel_database::replace_materialized_queued_prompts(
+                            session_id,
+                            &crate::hel_projection::materialized_queued_prompts_from_canonical(
+                                &canonical_session.queued_prompts,
+                            ),
+                        )
+                {
+                    tracing::error!(
                         session_id,
-                        &crate::hel_projection::materialized_queued_prompts_from_canonical(
-                            &canonical_session.queued_prompts,
-                        ),
+                        error = format!("{restore_error:#}"),
+                        "could not restore queued prompts after resume failed"
                     );
                 }
-                Err(self.rollback_failed_resume(session_id, &previous, error, executor)?)
+                Err(self.rollback_failed_resume(
+                    session_id,
+                    &previous,
+                    recreated_managed_worktree,
+                    error,
+                    executor,
+                )?)
             }
         }
     }
@@ -1149,6 +1246,7 @@ impl Controller {
         &mut self,
         session_id: &str,
         previous: &SessionRecord,
+        recreated_managed_worktree: bool,
         error: anyhow::Error,
         _executor: &impl CommandExecutor,
     ) -> Result<anyhow::Error> {
@@ -1175,6 +1273,10 @@ impl Controller {
             current.managed_worktree.as_ref(),
             previous.managed_worktree.as_ref(),
         ) {
+            (_, Some(previous)) if recreated_managed_worktree => retire_managed_worktree(
+                &CancellableProcessExecutor::with_timeout(Duration::from_secs(15)),
+                previous,
+            ),
             (Some(current), Some(previous)) if current == previous => Ok(()),
             (Some(worktree), _) => cleanup_managed_worktree(
                 &CancellableProcessExecutor::with_timeout(Duration::from_secs(15)),
@@ -1188,6 +1290,13 @@ impl Controller {
             .map(|cleanup_error| format!("{cleanup_error:#}"))
             .collect::<Vec<_>>()
             .join("; ");
+        if !cleanup_error.is_empty() {
+            tracing::warn!(
+                session_id,
+                error = %cleanup_error,
+                "resume rollback cleanup reported failures"
+            );
+        }
         let original = format!("{error:#}");
         let record = self.state.sessions.get_mut(session_id).unwrap();
         let failure = apply_failed_resume_rollback(
@@ -1244,38 +1353,6 @@ pub(super) fn apply_failed_resume_rollback(
             anyhow::anyhow!(failure)
         }
     }
-}
-
-/// Run two independent sequences of target work at the same time.
-///
-/// [`hel_targets::CommandPlan::execute_concurrent`] overlaps commands inside
-/// one plan. This overlaps two lanes that each interleave target commands with
-/// controller-side work, which a flat plan cannot express. Both lanes share the
-/// caller's executor, so every command keeps the executor's cancellation and
-/// stage reporting.
-///
-/// A failure in the first lane is reported ahead of a failure in the second, so
-/// the error a caller sees never depends on which lane lost the race. Both
-/// lanes always run to completion: neither can be interrupted mid-transfer, and
-/// leaving one running past the return would race the recovery that follows.
-fn execute_concurrent_lanes(
-    first: impl FnOnce() -> Result<()> + Send,
-    second: impl FnOnce() -> Result<()> + Send,
-) -> Result<()> {
-    std::thread::scope(|scope| {
-        // The second lane gets the new thread and the first runs here, so a
-        // panic in the first propagates exactly as it would without the
-        // overlap.
-        let second = scope.spawn(second);
-        let first = first();
-        let second = second.join().unwrap_or_else(|panic| {
-            Err(anyhow::anyhow!(
-                "concurrent target lane panicked: {}",
-                hel_targets::command_thread_panic_message(panic.as_ref())
-            ))
-        });
-        first.and(second)
-    })
 }
 
 /// Whether a resume has to rebuild the durable projection from its archive.
@@ -1347,6 +1424,7 @@ mod tests {
     use super::*;
 
     const RESUME_ROLLBACK_TEST_CHILD: &str = "HEL_RESUME_ROLLBACK_TEST_CHILD";
+    const RETIRED_WORKTREE_RESUME_TEST_CHILD: &str = "HEL_RETIRED_WORKTREE_RESUME_TEST_CHILD";
 
     #[test]
     fn raw_in_place_preflight_does_not_require_its_synthetic_bundle() {
@@ -1892,11 +1970,11 @@ mod tests {
         // The first lane fails slowly and the second immediately, so a
         // completion-order report could only pick the second.
         let error = execute_concurrent_lanes(
-            || {
+            || -> Result<()> {
                 std::thread::sleep(Duration::from_millis(50));
                 bail!("worker install failed")
             },
-            || {
+            || -> Result<()> {
                 reached.lock().unwrap().push("second");
                 bail!("checkpoint upload failed")
             },
@@ -1910,8 +1988,11 @@ mod tests {
             "a failing first lane must not cut the second one short"
         );
 
-        let error =
-            execute_concurrent_lanes(|| Ok(()), || bail!("checkpoint upload failed")).unwrap_err();
+        let error = execute_concurrent_lanes(
+            || Ok(()),
+            || -> Result<()> { bail!("checkpoint upload failed") },
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), "checkpoint upload failed");
     }
     #[test]
@@ -1943,6 +2024,7 @@ mod tests {
     #[test]
     fn failed_resume_rolls_back_only_after_target_cleanup() {
         let previous = SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -2190,6 +2272,119 @@ mod tests {
             crate::hel_database::load_materialized_session(session_id).unwrap(),
             Some(expected_projection)
         );
+    }
+    #[test]
+    fn failed_resume_retires_a_checkout_it_recreated() {
+        if std::env::var_os(RETIRED_WORKTREE_RESUME_TEST_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let test_name = format!(
+                "{}::failed_resume_retires_a_checkout_it_recreated",
+                module_path!()
+                    .strip_prefix("hel::")
+                    .unwrap_or(module_path!())
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(RETIRED_WORKTREE_RESUME_TEST_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path().join("data"))
+                .env("HEL_CONFIG_DIR", directory.path().join("config"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated retired-worktree resume test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct FailAfterWorktreeRestore;
+
+        impl CommandExecutor for FailAfterWorktreeRestore {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                if matches!(command.program.as_str(), "git" | "mkdir") {
+                    return ProcessExecutor.execute(command);
+                }
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: Vec::new(),
+                    stderr: b"stop after recreating the checkout".to_vec(),
+                })
+            }
+        }
+
+        let data_directory = PathBuf::from(std::env::var_os("HEL_DATA_DIR").unwrap());
+        let archive_directory = data_directory.join("archives");
+        std::fs::create_dir_all(&archive_directory).unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(&archive_directory, session_id, 7);
+        let repository = committed_repository();
+        let mut session = managed_worktree_session(repository.path(), session_id);
+        session.checkpoint = Some(checkpoint);
+        let worktree = session.managed_worktree.clone().unwrap();
+        retire_managed_worktree(&ProcessExecutor, &worktree).unwrap();
+        assert!(!worktree.worktree_root.exists());
+
+        let profile_home = data_directory.join("profile");
+        std::fs::create_dir_all(&profile_home).unwrap();
+        let mut config = resume_compatibility_config();
+        config.profiles.insert(
+            "codex".into(),
+            HarnessProfile {
+                kind: crate::hel_config::HarnessKind::Codex,
+                home: profile_home,
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        );
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+        crate::hel_database::save_state(&controller.state).unwrap();
+
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(controller.resume_session_controlled(
+                session_id,
+                "codex",
+                "local-bare",
+                SessionResumeOptions {
+                    additional_mounts: None,
+                    resource_allocation: None,
+                    discard_queue: false,
+                },
+                &FailAfterWorktreeRestore,
+            ))
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("stop after recreating the checkout"),
+            "{error:#}"
+        );
+        assert!(!worktree.worktree_root.exists());
+        assert_eq!(
+            controller.state.sessions[session_id].state,
+            SessionState::Stopped
+        );
+        let branch = Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args([
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", worktree.branch),
+            ])
+            .status()
+            .unwrap();
+        assert!(branch.success(), "resume rollback must retain the branch");
     }
     const RAW_CONVERSION_TEST_CHILD: &str = "HEL_RAW_CONVERSION_TEST_CHILD";
     #[test]

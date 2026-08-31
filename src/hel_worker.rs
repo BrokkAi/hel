@@ -22,16 +22,17 @@ pub use journal::{RestoredRelaySeed, restored_relay_seed_path};
 pub use protocol::{
     RelayErrorCode, RelayErrorDetail, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
     RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload, RelayVersionRange,
-    incompatible_request_protocol_response, invalid_relay_request_response, read_relay_frame,
-    serve_relay_json_lines, unsupported_relay_method_response, write_relay_frame,
+    ReviewerRequest, incompatible_request_protocol_response, invalid_relay_request_response,
+    read_relay_frame, serve_relay_json_lines, unsupported_relay_method_response, write_relay_frame,
 };
 #[cfg(unix)]
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
     ActiveAgentTerminal, ActiveRelayPrompt, ActiveUserShell, ClaimedRelayCommand,
-    QueuedRelayPrompt, RelayCommand, RelayCommandKind, RelayCommandOutcome, RelayCursor,
-    RelayEvent, RelayExecutionState, RelayObservation, RelayOperationalState, UserShellResult,
-    UserShellStatus, relay_event_digest, validate_relay_event,
+    QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_FORMAT_V2, RelayCommand,
+    RelayCommandKind, RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState,
+    RelayObservation, RelayOperationalState, UserShellResult, UserShellStatus, relay_event_digest,
+    validate_relay_event, validate_relay_event_self,
 };
 pub use types::{
     ActivePrompt, Attachment, QueuedPrompt, SequencedEvent, WorkerEvent, WorkerPhase,
@@ -53,7 +54,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedCommandKind;
 use journal::{
-    RelayJournalSpan, open_relay_journal, read_restored_relay_seed, visit_relay_journal_file,
+    JournalReadMode, RelayJournalSpan, open_relay_journal, read_restored_relay_seed,
+    visit_relay_journal_file,
 };
 use protocol::{incompatible_request_protocol, relay_error, relay_protocol_error};
 use snapshot::{
@@ -92,12 +94,22 @@ const RELAY_SNAPSHOT_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 /// Current durable ACP relay protocol. Peers that only speak an older
 /// version in [`RELAY_MIN_PROTOCOL_VERSION`]..=this range still connect.
 /// Protocol 0 is the retired pre-relay worker protocol and is rejected.
-pub const RELAY_PROTOCOL_VERSION: u32 = 5;
+pub const RELAY_PROTOCOL_VERSION: u32 = 6;
 pub const RELAY_MIN_PROTOCOL_VERSION: u32 = 1;
 /// Digest for the empty relay event prefix (ordinal zero).
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
-const RELAY_EVENT_DIGEST_DOMAIN: &[u8] = b"hel-relay-event-v1\0";
-const RELAY_STATE_VERSION: u32 = 1;
+/// Domain separator for a v1 (chained) relay event digest. v1 records fold
+/// `previous_digest` into the hash, forming a linked chain.
+pub(crate) const RELAY_EVENT_DIGEST_DOMAIN: &[u8] = b"hel-relay-event-v1\0";
+/// Domain separator for a v2 (self-describing) relay event digest. v2 records
+/// carry no `previous_digest`; the digest depends only on the record's own
+/// content, so a corrupt record can never invalidate its neighbours.
+pub(crate) const RELAY_EVENT_DIGEST_DOMAIN_V2: &[u8] = b"hel-relay-event-v2\0";
+/// Snapshots at or below this schema are readable; a newer schema is rejected.
+/// A v1 snapshot is upgraded in place to the current schema on open (its stored
+/// frontier digests stay valid, since each is recomputed with the formula that
+/// matches the record's format).
+const RELAY_STATE_VERSION: u32 = 2;
 /// The relay snapshot inside a worker root. Teardown and restore name it from
 /// here rather than repeating the literal.
 pub const RELAY_STATE_FILE: &str = "relay-state.json";
@@ -117,6 +129,7 @@ const RELAY_SEGMENT_BYTE_LIMIT: u64 = 1024 * 1024;
 /// journaled without their own snapshot write until this much has accumulated.
 const RELAY_SNAPSHOT_LAG_BYTE_LIMIT: usize = 1024 * 1024;
 const RELAY_HOT_EVENT_CAPACITY: usize = 32;
+const RELAY_REPLAY_CURSOR_CAPACITY: usize = 32;
 const NATIVE_SESSION_IDENTITY_FILE: &str = "native-session.json";
 
 /// Remove controller-only context that an ACP harness copied into a user-facing
@@ -177,6 +190,11 @@ pub struct DurableRelay {
     /// A small optimization for recent cursor validation. This is never the
     /// source of truth and is deliberately fixed-size.
     hot_events: VecDeque<RelayEvent>,
+    /// Digests proven while serving older replay pages. Controllers normally
+    /// return the previous page's frontier, so retaining those sparse cursors
+    /// avoids decompressing that segment again merely to validate the next
+    /// request. Event bodies remain on disk and authoritative.
+    replay_cursors: VecDeque<(u64, String)>,
     /// Journal bytes appended since `relay-state.json` last matched this
     /// snapshot. Zero means the durable file is exactly this state.
     unpersisted_journal_bytes: usize,
@@ -218,14 +236,19 @@ impl DurableRelay {
             let bytes =
                 fs::read(&state_path).with_context(|| format!("read {}", state_path.display()))?;
             ensure_byte_budget(bytes.len(), RELAY_SNAPSHOT_BYTE_BUDGET, "relay snapshot")?;
-            let snapshot: RelaySnapshot = serde_json::from_slice(&bytes)
+            let mut snapshot: RelaySnapshot = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse {}", state_path.display()))?;
-            if snapshot.format_version != RELAY_STATE_VERSION {
+            if snapshot.format_version > RELAY_STATE_VERSION {
                 bail!(
-                    "relay state schema {} is incompatible with schema {RELAY_STATE_VERSION}",
+                    "relay state schema {} is newer than supported schema {RELAY_STATE_VERSION}",
                     snapshot.format_version
                 );
             }
+            // Upgrade an older snapshot in place. The stored frontier digests
+            // stay valid — each is recomputed with the formula matching the
+            // record's format — so only the schema marker advances; the next
+            // persist writes it back at the current version.
+            snapshot.format_version = RELAY_STATE_VERSION;
             if snapshot.session_id != session_id {
                 bail!(
                     "relay state belongs to session {}, not {session_id}",
@@ -330,6 +353,7 @@ impl DurableRelay {
             snapshot,
             journal_spans,
             hot_events,
+            replay_cursors: VecDeque::new(),
             unpersisted_journal_bytes: 0,
             journal_generation: 0,
             acp_activity: AcpActivityClock::default(),
@@ -460,7 +484,7 @@ impl DurableRelay {
     pub fn events_after(&self, after_ordinal: u64, after_digest: &str) -> Result<Vec<RelayEvent>> {
         let plan = self.replay_plan();
         plan.validate_cursor(after_ordinal, after_digest)?;
-        plan.read_events_after(after_ordinal, usize::MAX)
+        plan.read_events_after(after_ordinal, after_digest, usize::MAX)
             .map(|page| page.events)
     }
 
@@ -480,6 +504,7 @@ impl DurableRelay {
                 .hot_events
                 .iter()
                 .map(|event| (event.ordinal, event.digest.clone()))
+                .chain(self.replay_cursors.iter().cloned())
                 .collect(),
             latest_ordinal: self.snapshot.latest_ordinal,
             latest_digest: self.snapshot.latest_digest.clone(),
@@ -491,6 +516,37 @@ impl DurableRelay {
             retained_digest: self.snapshot.retained_digest().to_owned(),
             generation: self.journal_generation,
         }
+    }
+
+    /// Retain a cursor this worker just proved while reading a replay page.
+    /// This is an optimization only: losing the cache causes another journal
+    /// validation scan, never a loss of durable history.
+    pub fn remember_replay_cursor(&mut self, response: &RelayResponseEnvelope) {
+        let RelayResponseBody::Ok {
+            payload:
+                RelayResponsePayload::Attached {
+                    through_ordinal,
+                    through_digest,
+                    ..
+                },
+        } = &response.body
+        else {
+            return;
+        };
+        if self
+            .replay_cursors
+            .back()
+            .is_some_and(|(ordinal, digest)| ordinal == through_ordinal && digest == through_digest)
+        {
+            return;
+        }
+        self.replay_cursors
+            .retain(|(ordinal, _)| ordinal != through_ordinal);
+        if self.replay_cursors.len() == RELAY_REPLAY_CURSOR_CAPACITY {
+            self.replay_cursors.pop_front();
+        }
+        self.replay_cursors
+            .push_back((*through_ordinal, through_digest.clone()));
     }
 
     /// Split an attach into the cheap part that needs the relay lock and the
@@ -641,6 +697,9 @@ impl DurableRelay {
             | RelayRequest::InstallCredentials { .. }
             | RelayRequest::SkillsState
             | RelayRequest::InstallSkills { .. }
+            | RelayRequest::GithubTokenState
+            | RelayRequest::InstallGithubToken { .. }
+            | RelayRequest::RemoveGithubToken
             | RelayRequest::ProjectMemorySnapshot
             | RelayRequest::InstallProjectMemorySnapshot { .. } => {
                 return Ok(relay_error(
@@ -662,6 +721,17 @@ impl DurableRelay {
                 return Ok(relay_error(
                     RelayErrorCode::InvalidState,
                     "elicitation responses must be handled by the live relay transport",
+                    false,
+                    None,
+                ));
+            }
+            RelayRequest::Reviewer { .. } => {
+                // The reviewer has its own relay and its own harness process.
+                // Only the live worker transport owns both, so this relay
+                // never answers for it.
+                return Ok(relay_error(
+                    RelayErrorCode::InvalidState,
+                    "reviewer requests must be handled by the live relay transport",
                     false,
                     None,
                 ));
@@ -1659,8 +1729,8 @@ struct RelayEventPage {
 /// of a real desynchronization.
 pub struct RelayReplayPlan {
     spans: Vec<RelayJournalSpan>,
-    /// Digests of the newest events, so a controller cursor near the frontier
-    /// validates without touching the disk at all.
+    /// Digests of recent live events and proven replay-page cursors, so the
+    /// next sequential attachment validates without touching old segments.
     hot_digests: Vec<(u64, String)>,
     latest_ordinal: u64,
     latest_digest: String,
@@ -1672,6 +1742,27 @@ pub struct RelayReplayPlan {
     retained_digest: String,
     generation: u64,
 }
+
+/// A journal span could not be parsed during a replay. When newer readable
+/// history exists past it, `read_events_after` attaches this to the error so
+/// `attach` can answer with a `Desynchronized` recovery cursor rather than a
+/// retryable failure that the controller would loop on forever.
+#[derive(Debug)]
+struct UnreadableRelaySpan {
+    recover_after: u64,
+}
+
+impl std::fmt::Display for UnreadableRelaySpan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "relay history is unreadable; readable events resume after event {}",
+            self.recover_after
+        )
+    }
+}
+
+impl std::error::Error for UnreadableRelaySpan {}
 
 impl RelayReplayPlan {
     fn attach(
@@ -1688,7 +1779,34 @@ impl RelayReplayPlan {
                 Some(self.desynchronized_detail(after_ordinal, after_digest)),
             )));
         }
-        let page = self.read_events_after(after_ordinal, RELAY_REPLAY_BYTE_BUDGET)?;
+        let page =
+            match self.read_events_after(after_ordinal, after_digest, RELAY_REPLAY_BYTE_BUDGET) {
+                Ok(page) => page,
+                Err(error) => {
+                    // An unreadable old span cannot be served, but newer history
+                    // still can. Answer with a desynchronization cursor past the
+                    // corruption so the controller resynchronizes from there
+                    // instead of retrying the same unparseable bytes forever.
+                    if let Some(gap) = error.downcast_ref::<UnreadableRelaySpan>() {
+                        let (earliest_available, earliest_digest) =
+                            self.recovery_cursor_after(gap.recover_after);
+                        return Ok(Err(relay_protocol_error(
+                            RelayErrorCode::Desynchronized,
+                            error.to_string(),
+                            false,
+                            Some(RelayErrorDetail::Desynchronized {
+                                requested_after: after_ordinal,
+                                requested_digest: after_digest.to_owned(),
+                                earliest_available,
+                                earliest_digest,
+                                latest: self.latest_ordinal,
+                                latest_digest: self.latest_digest.clone(),
+                            }),
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
         ensure_serialized_budget(&state, RELAY_STATE_BYTE_BUDGET, "relay operational state")?;
         Ok(Ok(RelayResponsePayload::Attached {
             state,
@@ -1696,6 +1814,34 @@ impl RelayReplayPlan {
             through_ordinal: page.through_ordinal,
             through_digest: page.through_digest,
         }))
+    }
+
+    /// A resync cursor the controller can attach at to recover history past an
+    /// unreadable span. It must name an ordinal whose digest is resolvable
+    /// *without* the corrupt span, so it points at the first readable, self-
+    /// valid event strictly after the corruption. The controller re-attaches
+    /// after it and recovers every later event; at most the corrupt span and
+    /// that one boundary event are lost. When nothing readable remains, it
+    /// resumes live at the frontier.
+    fn recovery_cursor_after(&self, corrupt_last_ordinal: u64) -> (u64, String) {
+        for span in &self.spans {
+            if span.file_last_ordinal <= corrupt_last_ordinal {
+                continue;
+            }
+            let mut found = None;
+            let _ = visit_relay_journal_file(&span.path, JournalReadMode::Recover, |event, _| {
+                if event.ordinal > corrupt_last_ordinal && validate_relay_event_self(&event).is_ok()
+                {
+                    found = Some((event.ordinal, event.digest));
+                    return Ok(ControlFlow::Break(()));
+                }
+                Ok(ControlFlow::Continue(()))
+            });
+            if let Some(cursor) = found {
+                return cursor;
+            }
+        }
+        (self.latest_ordinal, self.latest_digest.clone())
     }
 
     fn validate_cursor(&self, after_ordinal: u64, after_digest: &str) -> Result<()> {
@@ -1734,13 +1880,33 @@ impl RelayReplayPlan {
         if ordinal == self.recovery_floor_ordinal {
             return Ok(Some(self.recovery_floor_digest.clone()));
         }
+        if let Some((_, digest)) = self.hot_digests.iter().find(|(hot, _)| *hot == ordinal) {
+            return Ok(Some(digest.clone()));
+        }
+        // A v1 span caches the digest at its boundary in the first event's
+        // `previous_digest`, so the digest before the span can be read without
+        // touching the segment. v2 records carry no such back-reference
+        // (`file_first_previous_digest` is None), so fall through to read the
+        // event at `ordinal` directly.
         if let Some(span) = self.spans.iter().find(|span| {
             span.file_first_ordinal.checked_sub(1) == Some(ordinal) && ordinal >= span.after_ordinal
         }) {
-            return Ok(Some(span.file_first_previous_digest.clone()));
-        }
-        if let Some((_, digest)) = self.hot_digests.iter().find(|(hot, _)| *hot == ordinal) {
-            return Ok(Some(digest.clone()));
+            if let Some(digest) = &span.file_first_previous_digest {
+                return Ok(Some(digest.clone()));
+            }
+            let mut digest = None;
+            visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
+                validate_relay_event_self(&event)
+                    .with_context(|| format!("validate relay journal {}", span.path.display()))?;
+                if event.format == RELAY_EVENT_FORMAT_V1 && !event.previous_digest.is_empty() {
+                    digest = Some(event.previous_digest);
+                }
+                Ok(ControlFlow::Break(()))
+            })?;
+            if digest.is_some() {
+                return Ok(digest);
+            }
+            // v2 first event: no cached boundary digest; read the target itself.
         }
         let Some(span) = self
             .spans
@@ -1750,68 +1916,116 @@ impl RelayReplayPlan {
             return Ok(None);
         };
         let mut digest = None;
-        visit_relay_journal_file(&span.path, false, |event, _| {
+        let mut previous: Option<RelayEvent> = None;
+        visit_relay_journal_file(&span.path, JournalReadMode::Strict, |event, _| {
+            // Each record is validated by its own digest (the corruption check).
+            // Between consecutive records the v1 chain link is also enforced;
+            // v2 records have no link and are trusted on their own digest.
+            validate_relay_event_self(&event)
+                .with_context(|| format!("validate relay journal {}", span.path.display()))?;
+            if let Some(previous) = &previous
+                && event.format == RELAY_EVENT_FORMAT_V1
+                && event.previous_digest != previous.digest
+            {
+                bail!(
+                    "relay journal {} event {} does not chain from event {}",
+                    span.path.display(),
+                    event.ordinal,
+                    previous.ordinal
+                );
+            }
             if event.ordinal == ordinal {
                 digest = Some(event.digest.clone());
                 return Ok(ControlFlow::Break(()));
             }
+            previous = Some(event);
             Ok(ControlFlow::Continue(()))
         })?;
         Ok(digest)
     }
 
-    fn read_events_after(&self, after_ordinal: u64, byte_budget: usize) -> Result<RelayEventPage> {
+    fn read_events_after(
+        &self,
+        after_ordinal: u64,
+        after_digest: &str,
+        byte_budget: usize,
+    ) -> Result<RelayEventPage> {
         let mut events = Vec::new();
         let mut used = 0_usize;
         let mut through_ordinal = after_ordinal;
-        let mut through_digest = self
-            .digest_at(after_ordinal)?
-            .ok_or_else(|| anyhow!("relay digest missing at event {after_ordinal}"))?;
+        // `attach` validated this exact cursor immediately before entering the
+        // reader. Reusing it avoids a second decompression pass over the
+        // cursor's sealed segment.
+        let mut through_digest = after_digest.to_owned();
         let mut page_full = false;
 
         for span in &self.spans {
             if page_full || span.file_last_ordinal <= through_ordinal {
                 continue;
             }
-            visit_relay_journal_file(&span.path, false, |event, encoded_len| {
-                if event.ordinal <= span.after_ordinal || event.ordinal <= through_ordinal {
-                    return Ok(ControlFlow::Continue(()));
+            let read = visit_relay_journal_file(
+                &span.path,
+                JournalReadMode::Strict,
+                |event, encoded_len| {
+                    if event.ordinal <= span.after_ordinal || event.ordinal <= through_ordinal {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    if event.ordinal > self.latest_ordinal {
+                        // The active segment kept growing after this plan was
+                        // captured. Those events are real, but the reply's
+                        // operational state describes the frontier the plan saw,
+                        // so the page stops there and the caller asks again.
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    let expected = through_ordinal
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
+                    if event.ordinal != expected {
+                        bail!(
+                            "relay journal page has a gap after event {through_ordinal}: found {}",
+                            event.ordinal
+                        );
+                    }
+                    // The page is assembled off the relay lock, so it carries its
+                    // own proof that it is one unbroken run the cursor named rather
+                    // than fragments of a journal that moved. For v1 the in-record
+                    // chain link proves this; a v2 page relies instead on both
+                    // endpoints being digest anchors (the cursor and the frontier)
+                    // plus each interior record self-validating and the ordinals
+                    // being contiguous.
+                    if event.format == RELAY_EVENT_FORMAT_V1
+                        && event.previous_digest != through_digest
+                    {
+                        bail!(
+                            "relay journal event {} does not chain from event {through_ordinal}",
+                            event.ordinal
+                        );
+                    }
+                    validate_relay_event(through_ordinal, &through_digest, &event)
+                        .context("validate relay journal page event")?;
+                    if !events.is_empty() && used.saturating_add(encoded_len) > byte_budget {
+                        page_full = true;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    used = used.saturating_add(encoded_len);
+                    through_ordinal = event.ordinal;
+                    through_digest.clone_from(&event.digest);
+                    events.push(event);
+                    Ok(ControlFlow::Continue(()))
+                },
+            );
+            if let Err(error) = read {
+                // This span will not parse. If newer, readable history exists
+                // past it, mark the error so `attach` can send the controller a
+                // recovery cursor after this span instead of a retryable failure
+                // it would loop on. The corrupt bytes are never served as valid.
+                if span.file_last_ordinal < self.latest_ordinal {
+                    return Err(error.context(UnreadableRelaySpan {
+                        recover_after: span.file_last_ordinal,
+                    }));
                 }
-                if event.ordinal > self.latest_ordinal {
-                    // The active segment kept growing after this plan was
-                    // captured. Those events are real, but the reply's
-                    // operational state describes the frontier the plan saw,
-                    // so the page stops there and the caller asks again.
-                    return Ok(ControlFlow::Break(()));
-                }
-                let expected = through_ordinal
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
-                if event.ordinal != expected {
-                    bail!(
-                        "relay journal page has a gap after event {through_ordinal}: found {}",
-                        event.ordinal
-                    );
-                }
-                // The page is assembled off the relay lock, so it carries its
-                // own proof that it is one unbroken run of the chain the cursor
-                // named rather than fragments of a journal that moved.
-                if event.previous_digest != through_digest {
-                    bail!(
-                        "relay journal event {} does not chain from event {through_ordinal}",
-                        event.ordinal
-                    );
-                }
-                if !events.is_empty() && used.saturating_add(encoded_len) > byte_budget {
-                    page_full = true;
-                    return Ok(ControlFlow::Break(()));
-                }
-                used = used.saturating_add(encoded_len);
-                through_ordinal = event.ordinal;
-                through_digest.clone_from(&event.digest);
-                events.push(event);
-                Ok(ControlFlow::Continue(()))
-            })?;
+                return Err(error);
+            }
             // A canonical span contributes every ordinal through its last one.
             // Stopping short means the file no longer holds what this plan
             // captured: it was sealed, rewritten, or pruned under the reader.
@@ -2300,6 +2514,45 @@ mod tests {
         assert_eq!(cursor.ordinal, through_ordinal);
         assert_eq!(cursor.digest, through_digest);
         assert_eq!(state.latest_ordinal, planned_frontier);
+    }
+
+    #[test]
+    fn a_proven_replay_cursor_does_not_reread_its_old_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        record_paged_history(&mut relay, 80);
+        let first_request = attach_envelope(&relay, "first", 0);
+        let first = relay.handle(first_request);
+        let RelayResponseBody::Ok {
+            payload:
+                RelayResponsePayload::Attached {
+                    through_ordinal,
+                    through_digest,
+                    ..
+                },
+        } = &first.body
+        else {
+            panic!("first replay page failed: {:?}", first.body);
+        };
+        assert!(*through_ordinal < relay.latest_ordinal());
+        relay.remember_replay_cursor(&first);
+
+        let old_segment = relay
+            .journal_spans
+            .iter()
+            .find(|span| {
+                *through_ordinal > span.after_ordinal && *through_ordinal <= span.file_last_ordinal
+            })
+            .expect("the replay cursor belongs to a journal segment")
+            .path
+            .clone();
+        std::fs::rename(&old_segment, old_segment.with_extension("moved")).unwrap();
+
+        assert_eq!(
+            relay.digest_at(*through_ordinal).unwrap().as_deref(),
+            Some(through_digest.as_str()),
+            "validating the returned cursor must not reopen its old segment"
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::hel_projection::canonical_session_from_materialized;
 use crate::hel_state::{HelState, SessionRecord, SessionState, TargetLocator};
 use crate::hel_targets::{
     self, CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec, ProvisionStage,
+    ProvisionStageGuard,
 };
 
 use super::backend::{
@@ -27,6 +28,7 @@ use super::backend::{
     preflight_target, use_github_https_urls,
 };
 use super::checkpoint::upload_checkpoint_spec;
+use super::git_cache;
 use super::readiness::{connect_started_worker, wait_for_native_session};
 use super::worker_binary::{start_worker, worker_probe_diagnosis};
 use super::{Controller, execute_checked, now, target_kind};
@@ -89,9 +91,26 @@ impl Controller {
         grant_commit: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let github_token = controller_github_token();
-        self.provision_session_with_github_token(session_id, executor, github_token.as_deref())
+        let repositories = self
+            .provision_session_target_with_failure_disposition(
+                session_id,
+                executor,
+                github_token.as_deref(),
+                ProvisioningFailureDisposition::Discard,
+            )
             .await?;
-        match self.install_and_connect_worker(session_id, executor).await {
+        let setup = execute_concurrent_lanes(
+            || execute_repository_setup(&repositories, executor),
+            || self.install_worker_payload(session_id, executor),
+        );
+        let result = match setup {
+            Ok(((), (backend, worker_root))) => {
+                self.connect_and_start_worker(session_id, executor, &backend, &worker_root)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(native_session_id) => {
                 if let Err(error) = grant_commit() {
                     return Err(self.rollback_failed_new_session(session_id, error, executor)?);
@@ -139,6 +158,13 @@ impl Controller {
             .map(|error| format!("{error:#}"))
             .collect::<Vec<_>>()
             .join("; ");
+        if !cleanup_error.is_empty() {
+            tracing::warn!(
+                session_id,
+                error = %cleanup_error,
+                "new-session rollback cleanup reported failures"
+            );
+        }
         let original = format!("{error:#}");
         let original = match persist_launch_failure(session_id, &original) {
             Ok(path) => format!("{original}; full diagnostic saved to {}", path.display()),
@@ -187,6 +213,30 @@ impl Controller {
         github_token: Option<&str>,
         failure_disposition: ProvisioningFailureDisposition,
     ) -> Result<()> {
+        let repositories = self
+            .provision_session_target_with_failure_disposition(
+                session_id,
+                executor,
+                github_token,
+                failure_disposition,
+            )
+            .await?;
+        match execute_repository_setup(&repositories, executor) {
+            Ok(()) => Ok(()),
+            Err(error) if failure_disposition == ProvisioningFailureDisposition::Discard => {
+                Err(self.rollback_failed_new_session(session_id, error, executor)?)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn provision_session_target_with_failure_disposition(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        github_token: Option<&str>,
+        failure_disposition: ProvisioningFailureDisposition,
+    ) -> Result<hel_targets::CommandPlan> {
         let session = self
             .state
             .sessions
@@ -257,38 +307,72 @@ impl Controller {
             {
                 use_github_https_urls(bundle);
             }
-            let mut provision = if let Some(project_directory) = &session.project_directory {
+            preflight_target(template, executor)?;
+            let prepared_cache = bundle.as_mut().and_then(|bundle| {
+                git_cache::prepare(
+                    &target,
+                    session_id,
+                    bundle,
+                    &mut runtime_mounts,
+                    container_github_token,
+                    executor,
+                )
+            });
+            let provision = if let Some(project_directory) = &session.project_directory {
                 hel_targets::provision_bare_project_plan(
                     &target,
                     session_id,
                     &project_directory.to_string_lossy(),
-                )?
+                )
             } else {
-                hel_targets::provision_plan(
-                    &target,
-                    session_id,
-                    bundle
-                        .as_ref()
-                        .context("project bundle disappeared during provisioning")?,
-                    &runtime_mounts,
-                )?
+                bundle
+                    .as_ref()
+                    .context("project bundle disappeared during provisioning")
+                    .and_then(|bundle| {
+                        hel_targets::provision_plan(&target, session_id, bundle, &runtime_mounts)
+                    })
             };
-            if let Some(token) = container_github_token {
-                provision.provide_target_environment_secret(&target, "GH_TOKEN", token)?;
+            let mut provision = match provision {
+                Ok(provision) => provision,
+                Err(error) => {
+                    if let Some(cache) = &prepared_cache {
+                        let _ = cache.cleanup(executor);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(token) = container_github_token
+                && let Err(error) =
+                    provision.provide_target_environment_secret(&target, "GH_TOKEN", token)
+            {
+                if let Some(cache) = &prepared_cache {
+                    let _ = cache.cleanup(executor);
+                }
+                return Err(error);
             }
 
-            preflight_target(template, executor)?;
             let started = Instant::now();
-            let result = provision_target(&provision, &target, session_id, executor, |outputs| {
-                locator_after_provision(
-                    template,
-                    &target,
-                    session_id,
-                    outputs.first(),
-                    executor,
-                    bundle.as_ref(),
-                )
-            });
+            let result =
+                provision_target_creation(&provision, &target, session_id, executor, |outputs| {
+                    locator_after_provision(
+                        template,
+                        &target,
+                        session_id,
+                        outputs.first(),
+                        executor,
+                    )
+                })
+                .map(|(locator, remainder)| (locator, remainder, bundle));
+            if result.is_err()
+                && let Some(cache) = &prepared_cache
+            {
+                if let Some(locator) = provisioned_locator(&target, session_id, None) {
+                    let _ = hel_targets::close_plan(&locator, session_id)
+                        .and_then(|plan| plan.execute(executor).map(|_| ()));
+                } else {
+                    let _ = cache.cleanup(executor);
+                }
+            }
             tracing::debug!(
                 session_id,
                 elapsed_ms = started.elapsed().as_millis(),
@@ -306,7 +390,39 @@ impl Controller {
             Err(error) if failure_disposition == ProvisioningFailureDisposition::Preserve => {
                 Err(error)
             }
-            result => apply_new_session_provisioning_result(&mut self.state, session_id, result),
+            Err(error) => {
+                apply_new_session_provisioning_result(&mut self.state, session_id, Err(error))?;
+                unreachable!("an unsuccessful provisioning result returned Ok")
+            }
+            Ok((locator, remainder, bundle)) => {
+                apply_new_session_provisioning_result(&mut self.state, session_id, Ok(locator))?;
+                let session = &self.state.sessions[session_id];
+                let backend = backend_locator(
+                    session
+                        .target
+                        .as_ref()
+                        .context("provisioned target disappeared")?,
+                    session,
+                    &self.config,
+                )?;
+                if matches!(backend, hel_targets::TargetLocator::AwsEc2 { .. }) {
+                    hel_targets::provision_on_locator_plan(
+                        &backend,
+                        session_id,
+                        bundle
+                            .as_ref()
+                            .context("AWS provisioning requires a project bundle")?,
+                    )
+                } else {
+                    Ok(remainder)
+                }
+            }
+        };
+        let result = match result {
+            Err(error) if failure_disposition == ProvisioningFailureDisposition::Discard => {
+                return Err(self.rollback_failed_new_session(session_id, error, executor)?);
+            }
+            result => result,
         };
         if result.is_ok()
             && let Some(session) = self.state.sessions.get(session_id)
@@ -364,30 +480,45 @@ impl Controller {
         Ok(())
     }
 
-    async fn install_and_connect_worker(
+    fn install_worker_payload(
         &self,
         session_id: &str,
         executor: &impl CommandExecutor,
-    ) -> Result<Option<String>> {
-        // Installing the worker and connecting its repositories moves data into
-        // the target, so it reports as Sync. Start begins at the daemon launch.
+    ) -> Result<(hel_targets::TargetLocator, String)> {
+        // Worker/profile installation is independent of repository cloning.
         let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
         let (backend, worker_root) = self.worker_placement(session_id)?;
         self.prepare_worker_files(session_id, &backend, &worker_root, syncing)?;
         install_attached_resources(&self.state, session_id, &backend, &worker_root, syncing)?;
-        self.connect_local_repositories(
-            session_id,
-            &backend,
-            &worker_root,
-            syncing,
-            LocalBootstrap::Seed,
-        )?;
+        Ok((backend, worker_root))
+    }
+
+    async fn connect_and_start_worker(
+        &self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+        backend: &hel_targets::TargetLocator,
+        worker_root: &str,
+    ) -> Result<Option<String>> {
+        // A local-origin fetch needs both the checkout from the clone lane and
+        // the worker binary from the sync lane, so it joins them here.
+        {
+            let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
+            install_inherited_git_settings(executor, backend, session_id)?;
+            self.connect_local_repositories(
+                session_id,
+                backend,
+                worker_root,
+                syncing,
+                LocalBootstrap::Seed,
+            )?;
+        }
         let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
-        start_worker(executor, &backend, &worker_root)?;
-        let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
+        start_worker(executor, backend, worker_root)?;
+        let reconnect = &hel_targets::reconnect_plan(backend, session_id)?.commands[0];
         let readiness = async {
             let mut relay =
-                connect_started_worker(reconnect, session_id, executor, &backend, &worker_root)
+                connect_started_worker(reconnect, session_id, executor, backend, worker_root)
                     .await?;
             let native_session_id = wait_for_native_session(&mut relay, executor).await?;
             Ok(Some(native_session_id))
@@ -397,8 +528,8 @@ impl Controller {
             Ok(native_session_id) => Ok(native_session_id),
             Err(error) => Err(worker_probe_diagnosis(
                 executor,
-                &backend,
-                &worker_root,
+                backend,
+                worker_root,
                 error,
             )),
         }
@@ -719,12 +850,48 @@ pub(super) fn install_attached_resources(
     Ok(())
 }
 
+/// Run two independent target setup lanes at the same time and wait for both.
+/// The first lane's failure wins deterministically when both fail, and neither
+/// lane is abandoned while it may still own a transfer or subprocess.
+pub(super) fn execute_concurrent_lanes<A: Send, B: Send>(
+    first: impl FnOnce() -> Result<A> + Send,
+    second: impl FnOnce() -> Result<B> + Send,
+) -> Result<(A, B)> {
+    std::thread::scope(|scope| {
+        let second = scope.spawn(second);
+        let first = first();
+        let second = second.join().unwrap_or_else(|panic| {
+            Err(anyhow::anyhow!(
+                "concurrent target lane panicked: {}",
+                hel_targets::command_thread_panic_message(panic.as_ref())
+            ))
+        });
+        match (first, second) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(first), Ok(second)) => Ok((first, second)),
+        }
+    })
+}
+
+fn execute_repository_setup(
+    plan: &hel_targets::CommandPlan,
+    executor: &(impl CommandExecutor + Sync),
+) -> Result<()> {
+    if plan.commands.is_empty() {
+        return Ok(());
+    }
+    let _cloning = ProvisionStageGuard::new(executor, ProvisionStage::Cloning);
+    plan.execute_concurrent(executor).map(|_| ())
+}
+
 /// Run a provisioning plan and discover the locator it produced, tearing the
 /// target down again if anything after its creation fails.
 ///
 /// Creation is the boundary that matters. A step that fails before the target
 /// exists has left nothing behind; every failure after it — a later plan step
 /// or locator discovery — owns a target no session record will point at.
+#[cfg(test)]
 fn provision_target(
     plan: &hel_targets::CommandPlan,
     target: &hel_targets::TargetTemplate,
@@ -752,6 +919,41 @@ fn provision_target(
     })
 }
 
+/// Bring the target into existence and return the commands that populate its
+/// repositories. The caller may overlap that remainder with worker/profile
+/// installation once it has persisted the discovered locator.
+fn provision_target_creation(
+    plan: &hel_targets::CommandPlan,
+    target: &hel_targets::TargetTemplate,
+    session_id: &str,
+    executor: &(impl CommandExecutor + Sync),
+    discover: impl FnOnce(&[CommandOutput]) -> Result<TargetLocator>,
+) -> Result<(TargetLocator, hel_targets::CommandPlan)> {
+    let Some((creation, remainder)) = plan.split_at_target_creation() else {
+        // Nothing this plan runs can leave a target behind, so its commands
+        // must still finish before the locator is usable.
+        let outputs = plan.execute_concurrent(executor)?;
+        return discover(&outputs).map(|locator| {
+            (
+                locator,
+                hel_targets::CommandPlan {
+                    description: plan.description.clone(),
+                    commands: Vec::new(),
+                },
+            )
+        });
+    };
+    let outputs = creation.execute_concurrent(executor)?;
+    discover(&outputs)
+        .map(|locator| (locator, remainder))
+        .map_err(|error| {
+            match cleanup_failed_provision(target, session_id, outputs.first(), executor) {
+                Some(note) => error.context(note),
+                None => error,
+            }
+        })
+}
+
 /// Best-effort teardown of a target whose creation succeeded but whose
 /// provisioning failed before a locator was recorded. Returns a note
 /// describing what happened for inclusion in the session error.
@@ -770,7 +972,14 @@ fn cleanup_failed_provision(
     );
     let plan = match hel_targets::close_plan(&locator, session_id) {
         Ok(plan) => plan,
-        Err(error) => return Some(format!("cleanup FAILED: {error:#}; {leak}")),
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                error = format!("{error:#}"),
+                "could not build provisioning cleanup plan"
+            );
+            return Some(format!("cleanup FAILED: {error:#}; {leak}"));
+        }
     };
     let purpose = plan
         .commands
@@ -783,7 +992,24 @@ fn cleanup_failed_provision(
     };
     match hel_targets::cleanup_target_is_confirmed_absent(&locator, session_id, executor) {
         Ok(true) => Some(format!("cleanup succeeded: {purpose}")),
-        _ => Some(format!("cleanup FAILED ({purpose}): {error:#}; {leak}")),
+        Ok(false) => {
+            tracing::warn!(
+                session_id,
+                error = format!("{error:#}"),
+                "provisioning cleanup failed and the target may still exist"
+            );
+            Some(format!("cleanup FAILED ({purpose}): {error:#}; {leak}"))
+        }
+        Err(confirm_error) => {
+            tracing::warn!(
+                session_id,
+                error = format!("{confirm_error:#}"),
+                "could not confirm whether the failed provisioning target was removed"
+            );
+            Some(format!(
+                "cleanup FAILED ({purpose}): {error:#}; checking whether it was removed also failed: {confirm_error:#}; {leak}"
+            ))
+        }
     }
 }
 
@@ -1088,8 +1314,15 @@ fn start_git_broker(files: &BrokerFiles) -> Result<std::process::Child> {
     // A broker killed outright leaves its marker behind, and the new one has
     // to publish its own before it counts as ready. A marker a live broker
     // owns is never touched.
-    if !broker_is_alive(&files.pid) {
-        let _ = std::fs::remove_file(&files.ready);
+    if !broker_is_alive(&files.pid)
+        && let Err(error) = std::fs::remove_file(&files.ready)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %files.ready.display(),
+            %error,
+            "could not remove stale Git broker ready marker"
+        );
     }
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -1124,8 +1357,12 @@ fn start_git_broker(files: &BrokerFiles) -> Result<std::process::Child> {
         }
         if Instant::now() >= deadline {
             // Leave no half-started broker behind holding the session slot.
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(error) = child.kill() {
+                tracing::warn!(%error, "could not terminate timed-out Git broker");
+            }
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "could not reap timed-out Git broker");
+            }
             bail!(
                 "timed out starting local Git broker; see {}",
                 files.log.display()
@@ -1331,6 +1568,10 @@ pub(super) fn enforce_overlay_capable_mounts(
     let filesystems = match hel_targets::probe_filesystem_types(ssh, &overlaid, executor) {
         Ok(filesystems) => filesystems,
         Err(error) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "could not probe attached-directory filesystems; preserving overlay mounts"
+            );
             return vec![format!(
                 "Could not read the filesystem under the attached directories, so they keep the \
                  copy-on-write overlay: {error:#}"
@@ -1361,11 +1602,16 @@ pub(super) fn enforce_overlay_capable_mounts(
 pub(super) struct StagedExecutor<'a, E: CommandExecutor> {
     inner: &'a E,
     stage: ProvisionStage,
+    _guard: ProvisionStageGuard<'a, E>,
 }
 
 impl<'a, E: CommandExecutor> StagedExecutor<'a, E> {
     pub(super) fn new(inner: &'a E, stage: ProvisionStage) -> Self {
-        Self { inner, stage }
+        Self {
+            inner,
+            stage,
+            _guard: ProvisionStageGuard::new(inner, stage),
+        }
     }
 
     fn staged(&self, command: &CommandSpec) -> CommandSpec {
@@ -1385,8 +1631,12 @@ impl<E: CommandExecutor> CommandExecutor for StagedExecutor<'_, E> {
         self.inner.cancellation_requested()
     }
 
-    fn notify_stage(&self, stage: ProvisionStage) {
-        self.inner.notify_stage(stage);
+    fn stage_started(&self, stage: ProvisionStage) {
+        self.inner.stage_started(stage);
+    }
+
+    fn stage_finished(&self, stage: ProvisionStage) {
+        self.inner.stage_finished(stage);
     }
 
     fn notify_notice(&self, notice: &str) {
@@ -1440,16 +1690,6 @@ fn inherits_controller_git_settings(locator: &hel_targets::TargetLocator) -> boo
         locator,
         hel_targets::TargetLocator::LocalBare { .. } | hel_targets::TargetLocator::SshBare { .. }
     )
-}
-
-pub(super) fn execution_policy(
-    locator: &hel_targets::TargetLocator,
-) -> crate::hel_config::ExecutionPolicy {
-    if matches!(locator, hel_targets::TargetLocator::LocalBare { .. }) {
-        crate::hel_config::ExecutionPolicy::ConfiguredApprovals
-    } else {
-        crate::hel_config::ExecutionPolicy::Unconstrained
-    }
 }
 
 fn inherited_git_setting_commands(
@@ -1593,6 +1833,7 @@ mod tests {
                 url: Some("https://github.com/example/app.git".into()),
                 destination: "app".into(),
                 git_ref: None,
+                reference: None,
             }],
         }
     }
@@ -1735,6 +1976,7 @@ mod tests {
     fn failed_new_session_provisioning_discards_provisional_record() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let record = SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -1777,6 +2019,7 @@ mod tests {
     fn failed_new_worker_start_discards_session_only_after_target_cleanup() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let mut session = SessionRecord {
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
             archived: false,
             container_cpus: None,
             container_memory: None,
@@ -1941,17 +2184,6 @@ mod tests {
         };
         assert!(!inherits_controller_git_settings(&persistent));
         assert!(!inherits_controller_git_settings(&local));
-        assert_eq!(
-            execution_policy(&local),
-            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
-        );
-        for locator in ephemeral.iter().chain(std::iter::once(&persistent)) {
-            assert_eq!(
-                execution_policy(locator),
-                crate::hel_config::ExecutionPolicy::Unconstrained,
-                "isolated and remote targets run unconstrained: {locator:?}"
-            );
-        }
         assert!(
             inherited_git_setting_commands(
                 &persistent,
@@ -1960,6 +2192,54 @@ mod tests {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn raw_ssh_targets_select_permissions_and_ssh_podman_is_unconstrained() {
+        let ssh = crate::hel_config::SshConnection {
+            host: "builder".into(),
+            user: None,
+            identity_file: None,
+            extra_args: Vec::new(),
+        };
+        let guardian = TargetTemplate::SshBare {
+            ssh: ssh.clone(),
+            permissions: crate::hel_config::PermissionMode::Guardian,
+            workspace_prefix: ".local/share/hel/workspaces".into(),
+        };
+        let podman = TargetTemplate::SshPodman {
+            ssh: ssh.clone(),
+            container: crate::hel_config::ContainerTemplate {
+                image: "example.invalid/agent:latest".into(),
+                pull_policy: Default::default(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: BTreeMap::new(),
+            },
+        };
+        let yolo = TargetTemplate::SshBare {
+            ssh,
+            permissions: crate::hel_config::PermissionMode::Yolo,
+            workspace_prefix: ".local/share/hel/workspaces".into(),
+        };
+
+        assert_eq!(
+            TargetTemplate::LocalBare.execution_policy(),
+            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
+        );
+        assert_eq!(
+            guardian.execution_policy(),
+            crate::hel_config::ExecutionPolicy::ConfiguredApprovals
+        );
+        assert_eq!(
+            podman.execution_policy(),
+            crate::hel_config::ExecutionPolicy::Unconstrained
+        );
+        assert_eq!(
+            yolo.execution_policy(),
+            crate::hel_config::ExecutionPolicy::Unconstrained
         );
     }
     const PROVISIONED_SESSION: &str = "0123456789abcdef0123456789abcdef";
@@ -2047,6 +2327,30 @@ mod tests {
             assert!(removal.contains("rm --force"), "{removal}");
             assert!(removal.contains(&name), "{removal}");
         }
+    }
+
+    #[test]
+    fn target_creation_returns_repository_setup_without_running_it() {
+        let target = podman_target();
+        let plan = hel_targets::provision_plan(&target, PROVISIONED_SESSION, &probe_bundle(), &[])
+            .unwrap();
+        let executor = RecordingExecutor::succeeding();
+
+        let (_, repositories) =
+            provision_target_creation(&plan, &target, PROVISIONED_SESSION, &executor, |_| {
+                Ok(TargetLocator::LocalPodman {
+                    container_id: hel_targets::resource_name(PROVISIONED_SESSION)?,
+                })
+            })
+            .unwrap();
+
+        assert_eq!(executor.commands().len(), 1, "only podman run may execute");
+        assert!(
+            repositories
+                .commands
+                .iter()
+                .any(|command| command.purpose == "clone app")
+        );
     }
 
     #[test]

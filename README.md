@@ -25,7 +25,7 @@ Hel exists for the second case.
   rotating OAuth tokens across every live session within about a minute, and
   structurally excludes credentials from event streams and recovery archives.
 - **One view of capacity.** Sessions, per-profile quota and usage, and host
-  capacity in one dashboard — and on your phone through `hel server`.
+  capacity in one dashboard — and on your phone through the persistent Hel daemon.
 - **Agents can operate it.** `hel doctor --json` and `hel setup instructions`
   are designed so your coding agent can converge a host to session-ready by
   looping on machine-readable checks.
@@ -86,7 +86,7 @@ Issues and pull requests for new harnesses are welcome.
 | Local Git worktree | `local-bare` | your machine | your configured approvals |
 | Podman container | `local-podman` | Linux, WSL2 | unrestricted |
 | Apple container | `apple-container` | macOS 26+, Apple silicon | unrestricted |
-| SSH machine | `ssh-bare` | a Linux host you name | unrestricted |
+| SSH machine | `ssh-bare` | a Linux host you name | guardian or unrestricted |
 | Podman over SSH | `ssh-podman` | a Linux host you name | unrestricted |
 | EC2 instance | `aws-ec2` | your AWS account | unrestricted |
 
@@ -100,15 +100,18 @@ curl -fsSL https://raw.githubusercontent.com/BrokkAi/hel/master/install.sh | sh
 ```
 
 This downloads a verified release into `~/.local/bin` — no Rust toolchain
-needed. Run `hel doctor` next. The installer also supports `--prefix` and
-`--version`; see `--help`.
+needed. Linux releases are static musl binaries. Run `hel doctor` next. The
+installer also supports `--prefix` and `--version`; see `--help`.
 
 Building from source works too:
 
 ```console
 cargo build --release
-./target/release/hel
+./target/x86_64-unknown-linux-musl/release/hel
 ```
+
+On Apple silicon, pass `--target aarch64-apple-darwin` and run the binary from
+that target's release directory.
 
 For container targets, pull the published multi-arch agent image (public, no
 authentication):
@@ -125,7 +128,7 @@ to build your own.
 
 ## Quickstart
 
-1. Run `hel`. The first run opens a plain-terminal setup dialog: it finds your
+1. Run `hel`. The first run creates a named workspace and opens a plain-terminal setup dialog: it finds your
    local harness homes, checks that credentials look present, detects the
    current GitHub repository, recommends a container runtime, and writes
    `config.toml` after you confirm.
@@ -135,8 +138,8 @@ to build your own.
 3. In the dashboard, create a session: pick a profile, a repository bundle,
    and a target, then send your first prompt.
 4. Detach whenever you like (`Ctrl+Q`). The session keeps running and your
-   queued prompts keep executing. Reattach from the dashboard, or run
-   `hel server` and drive it from your phone.
+   queued prompts keep executing. Reattach from the dashboard, or open the
+   daemon-owned web viewer shown by `hel daemon status`.
 
 In an attached TUI or the phone viewer, start a message with `!` to run the
 rest as `bash -lc` inside that session's target. Shell commands run in the
@@ -179,18 +182,57 @@ image = "ghcr.io/brokkai/hel/agent-dev:latest"
 Profiles point at harness home directories on your machine — run as many
 profiles per harness as you have accounts. Bundles describe the repositories a
 session checks out (multi-repository bundles give agents a virtual monorepo).
+Hel-owned worker and bridge commands use non-login shells. On raw local, SSH,
+and EC2 targets, Hel makes one bounded login-shell probe when each worker starts
+and carries only its discovered `PATH` into the non-login runtime; an explicit
+`environment.PATH` in the profile takes precedence. Later profile changes take
+effect after the worker restarts or the session resumes. Agent-requested shell
+commands still run as `bash -lc` and intentionally use the session user's login
+environment. If automatic discovery is insufficient, set a target-side ACP
+bridge path with the profile's `executable` key or set an explicit search path
+under `[profiles.<id>.environment]` with `PATH = "..."`.
 Target prerequisites and full option lists are covered in
 [docs/PODMAN.md](docs/PODMAN.md), [docs/SSH.md](docs/SSH.md), and
 [docs/AWS.md](docs/AWS.md).
 
+### Web viewer and Tailscale
+
+The daemon starts the authenticated web viewer by default. Run
+`hel daemon status` for its URL and six-digit login code. Without Tailscale it
+serves HTTP only on `127.0.0.1:3765`.
+
+When the local Tailscale node has MagicDNS and HTTPS Certificates enabled, Hel
+automatically requests the node's trusted `ts.net` certificate and serves HTTPS
+on all interfaces at the same port. Certificate issuance runs in the background
+and may take about 30 seconds the first time; certificates renew daily without a
+daemon restart. If HTTPS Certificates are unavailable, the status output keeps
+the viewer loopback-only and explains how to enable them. After changing the
+tailnet setting, run `hel daemon restart`.
+
+The historical configuration section remains `[phone]`. Explicit certificate
+configuration takes precedence over automatic Tailscale detection:
+
+```toml
+[phone]
+# Set false to disable the web viewer entirely.
+enabled = true
+bind = "127.0.0.1:3765"
+# Set false to keep the viewer loopback-only without probing Tailscale.
+tailscale_detect = true
+# tls_cert = "/path/to/cert.pem"
+# tls_key = "/path/to/key.pem"
+```
+
 ## Security and isolation model
 
 - Execution policy is selected by target, then translated into each harness's
-  own controls. Isolated and remote targets run unconstrained. On a local
-  worktree (`local-bare`), Hel preserves the profile and harness's configured
-  approval behavior. Codex, Claude Code, and Grok Build expose guardian modes;
-  Kimi Code and DeepSeek Harness do not, so Hel shows a prominent warning not
-  to use them on a raw, unsandboxed target.
+  own controls. Containers and EC2 targets run unconstrained. Named raw SSH
+  targets (`ssh-bare`) explicitly select `permissions = "guardian"` to preserve
+  configured approvals or `permissions = "yolo"` for unconstrained execution.
+  A local worktree (`local-bare`) also preserves the profile and harness's
+  configured approval behavior. Codex, Claude Code, and Grok Build expose
+  guardian modes; Kimi Code and DeepSeek Harness do not, so Hel shows a
+  prominent warning when guardian permissions cannot be enforced on a target.
 - Harness homes are copied by allowlist, not wholesale. For Claude Code, for
   example: credentials, settings, `CLAUDE.md`, `skills/`, and `plugins/` — no
   transcripts, history, or caches. Hel sets `CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
@@ -198,8 +240,9 @@ Target prerequisites and full option lists are covered in
   propagate to live sessions within about a minute.
 - Credentials travel only between the controller and a session's worker. They
   are never written to the event journal or recovery archives. When the
-  controller's `gh` is authenticated, fresh containers receive its GitHub
-  token as `GH_TOKEN`; the token is not stored in archives.
+  controller's `gh` is authenticated, Hel continuously pushes its active
+  GitHub token to every live non-local session, including raw SSH targets.
+  The token is not stored in archives.
 - A repository configured with `local` is served to workers through a
   per-session Git protocol bridge over the session's own transport: `git
   fetch` and fast-forward `git push origin` operate on your checkout with no
@@ -208,9 +251,9 @@ Target prerequisites and full option lists are covered in
   LFS is not supported through the bridge.
 - Attached directories reject symbolic links, so an attachment cannot escape
   its source or destination tree.
-- `hel server` binds only to loopback unless you configure TLS directly. The
-  phone viewer authenticates with a code shown at server start, exchanged for
-  a signed session cookie.
+- The daemon's web viewer requires a six-digit code exchanged for a signed
+  session cookie. It binds only to loopback unless explicit TLS is configured
+  or automatic Tailscale detection obtains a trusted `ts.net` certificate.
 
 ## Durability
 

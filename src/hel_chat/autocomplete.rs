@@ -1,15 +1,13 @@
 //! Slash commands: what they parse to, what the popup offers, and how a
 //! chosen completion lands back in the composer.
 
-use agent_client_protocol::schema::v1::{
-    AvailableCommandInput, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
-};
+use agent_client_protocol::schema::v1::{AvailableCommandInput, SessionConfigOption};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem};
 
-use crate::hel_acp::find_session_config_option;
+use crate::hel_acp::{SessionConfigChoice, session_config_choices};
 use crate::hel_transcript::{ChatEntry, ChatRole};
 
 use super::ChatState;
@@ -21,6 +19,7 @@ pub(super) enum LocalCommand {
     Detach,
     Model,
     Effort,
+    Fast,
     Plan,
     Implement,
 }
@@ -37,13 +36,6 @@ pub(super) struct CommandChoice {
     description: String,
     input_hint: Option<String>,
     source: CommandSource,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ConfigValueChoice {
-    value: String,
-    name: String,
-    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +146,14 @@ impl ChatState {
 
     pub(super) fn rebuild_command_choices(&mut self) {
         let mut commands = builtin_command_choices();
+        if self.supports_fast_mode() {
+            commands.push(CommandChoice {
+                name: "fast".to_owned(),
+                description: "toggle Codex Fast mode".to_owned(),
+                input_hint: None,
+                source: CommandSource::Hel,
+            });
+        }
         if self.supports_plan_mode() {
             commands.push(CommandChoice {
                 name: "plan".to_owned(),
@@ -168,10 +168,13 @@ impl ChatState {
                 source: CommandSource::Hel,
             });
         }
-        for command in &self.agent_commands {
+        for command in self.acp_surface.agent_commands() {
             let name = command.name.trim();
             if name.is_empty()
-                || matches!(name.to_ascii_lowercase().as_str(), "plan" | "implement")
+                || matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "fast" | "plan" | "implement"
+                )
                 || commands
                     .iter()
                     .any(|existing| existing.name.eq_ignore_ascii_case(name))
@@ -194,15 +197,9 @@ impl ChatState {
     }
 
     pub(super) fn set_config_options(&mut self, options: &[SessionConfigOption]) {
-        let changed = self.config_options != options;
-        self.config_options = options.to_vec();
-        self.current_model = config_current_value(options, "model");
-        self.current_effort = config_current_value(options, "effort");
-        if changed || self.current_mode.is_none() {
-            self.set_plan_mode_from_surfaces();
-        }
-        self.model_values = config_values(options, "model");
-        self.effort_values = config_values(options, "effort");
+        self.acp_surface.set_config_options(options);
+        self.model_values = session_config_choices(options, "model");
+        self.effort_values = session_config_choices(options, "effort");
         self.rebuild_command_choices();
     }
 
@@ -298,15 +295,13 @@ pub(super) fn builtin_command_choices() -> Vec<CommandChoice> {
 }
 
 pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
-    let command = prompt.strip_prefix('/')?;
-    let (name, args) = command
-        .split_once(char::is_whitespace)
-        .map_or((command, ""), |(name, args)| (name, args.trim()));
+    let (name, args) = parse_slash_command(prompt)?;
     let command = match name {
         "help" => LocalCommand::Help,
         "detach" => LocalCommand::Detach,
         "model" => LocalCommand::Model,
         "effort" => LocalCommand::Effort,
+        "fast" => LocalCommand::Fast,
         "plan" => LocalCommand::Plan,
         "implement" => LocalCommand::Implement,
         _ => return None,
@@ -314,59 +309,30 @@ pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> 
     Some((command, args))
 }
 
-pub(super) fn is_goal_prompt(prompt: &str) -> bool {
-    prompt
-        .strip_prefix("/goal")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+pub(super) fn prompt_invokes_command(prompt: &str, expected: &str) -> bool {
+    parse_slash_command(prompt).is_some_and(|(name, _)| name == expected)
 }
 
-fn find_config_option<'a>(
-    options: &'a [SessionConfigOption],
-    key: &str,
-) -> Option<&'a SessionConfigOption> {
-    find_session_config_option(options, key)
+fn parse_slash_command(prompt: &str) -> Option<(&str, &str)> {
+    let command = prompt.strip_prefix('/')?;
+    Some(
+        command
+            .split_once(char::is_whitespace)
+            .map_or((command, ""), |(name, args)| (name, args.trim())),
+    )
 }
 
-pub(super) fn config_current_value(options: &[SessionConfigOption], key: &str) -> Option<String> {
-    let option = find_config_option(options, key)?;
-    let SessionConfigKind::Select(select) = &option.kind else {
-        return None;
-    };
-    Some(select.current_value.to_string())
-}
-
-fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueChoice> {
-    let option = find_config_option(options, key);
-    let Some(option) = option else {
-        return Vec::new();
-    };
-    let SessionConfigKind::Select(select) = &option.kind else {
-        return Vec::new();
-    };
-    let choices = match &select.options {
-        SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect::<Vec<_>>(),
-        SessionConfigSelectOptions::Grouped(groups) => {
-            groups.iter().flat_map(|group| &group.options).collect()
-        }
-        _ => Vec::new(),
-    };
-    choices
-        .into_iter()
-        .map(|choice| ConfigValueChoice {
-            value: choice.value.to_string(),
-            name: choice.name.clone(),
-            description: choice.description.clone(),
-        })
-        .collect()
-}
-
-pub(super) fn render_autocomplete(frame: &mut Frame, prompt_area: Rect, chat: &ChatState) {
-    let Some(autocomplete) = chat.autocomplete.as_ref() else {
-        return;
-    };
+/// Draws the popup over the prompt and reports the rows it covers, so the
+/// caller can register them as a selectable surface.
+pub(super) fn render_autocomplete(
+    frame: &mut Frame,
+    prompt_area: Rect,
+    chat: &ChatState,
+) -> Option<Rect> {
+    let autocomplete = chat.autocomplete.as_ref()?;
     let visible = autocomplete.matches.len().min(8);
     if visible == 0 {
-        return;
+        return None;
     }
     let height = (visible as u16).saturating_add(2);
     let area = Rect::new(
@@ -407,6 +373,7 @@ pub(super) fn render_autocomplete(frame: &mut Frame, prompt_area: Rect, chat: &C
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items), inner);
+    Some(inner)
 }
 
 fn autocomplete_row(chat: &ChatState, kind: AutocompleteKind, index: usize) -> Option<String> {
@@ -437,7 +404,7 @@ fn autocomplete_row(chat: &ChatState, kind: AutocompleteKind, index: usize) -> O
     }
 }
 
-fn config_value_row(choice: &ConfigValueChoice) -> Option<String> {
+fn config_value_row(choice: &SessionConfigChoice) -> Option<String> {
     let description = choice
         .description
         .as_deref()
@@ -451,7 +418,9 @@ fn config_value_row(choice: &ConfigValueChoice) -> Option<String> {
 mod tests {
     use super::*;
     use crate::hel_chat::ChatAction;
-    use crate::hel_chat::test_support::{advertise, grok_chat, key, mode_config_option, snapshot};
+    use crate::hel_chat::test_support::{
+        advertise, fast_mode_option, grok_chat, key, mode_config_option, snapshot,
+    };
     use crossterm::event::KeyCode;
 
     #[test]
@@ -459,6 +428,9 @@ mod tests {
         assert_eq!(parse_local_command("/checkpoint before refactor"), None);
         assert_eq!(parse_local_command("/checkpointing"), None);
         assert_eq!(parse_local_command("explain /checkpoint"), None);
+        assert!(prompt_invokes_command("/goal finish it", "goal"));
+        assert!(!prompt_invokes_command("/Goal finish it", "goal"));
+        assert!(!prompt_invokes_command("/goalkeeper", "goal"));
     }
 
     #[test]
@@ -626,6 +598,33 @@ mod tests {
                 key: "effort".into(),
                 value: "max".into(),
             }
+        );
+    }
+
+    #[test]
+    fn fast_is_a_hel_command_only_while_the_codex_selector_is_available() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        advertise(&mut chat, 1, &["fast"]);
+        assert!(
+            !chat
+                .command_choices
+                .iter()
+                .any(|command| command.name == "fast")
+        );
+
+        chat.set_config_options(&[fast_mode_option("off")]);
+        assert!(
+            chat.command_choices
+                .iter()
+                .any(|command| { command.name == "fast" && command.source == CommandSource::Hel })
+        );
+
+        chat.set_config_options(&[]);
+        assert!(
+            !chat
+                .command_choices
+                .iter()
+                .any(|command| command.name == "fast")
         );
     }
 

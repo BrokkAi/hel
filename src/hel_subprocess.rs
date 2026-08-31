@@ -19,9 +19,40 @@
 )]
 
 use std::io::{ErrorKind, Write};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, anyhow};
+
+/// Launch a long-lived background process with no inherited terminal streams.
+/// The child is deliberately not waited here: it owns a singleton lock and
+/// publishes its own endpoint, while callers confirm readiness over IPC.
+pub fn spawn_detached(command: &mut Command, log_path: &Path) -> Result<u32> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("create detached process log directory {}", parent.display())
+        })?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let log = options
+        .open(log_path)
+        .with_context(|| format!("open detached process log {}", log_path.display()))?;
+    let stderr = log.try_clone().context("clone detached process log")?;
+    command.stdin(Stdio::null()).stdout(log).stderr(stderr);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command.spawn().context("spawn detached child process")?;
+    Ok(child.id())
+}
 
 /// Run `command` with `input` written to its stdin, returning the captured
 /// output.

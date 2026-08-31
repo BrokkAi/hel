@@ -14,14 +14,16 @@ use ratatui::layout::Rect;
 use hel::hel_chat::Notices;
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate as HelTargetTemplate};
 use hel::hel_quota::ProfileQuota;
+use hel::hel_selection::FrameSurfaces;
 use hel::hel_state::{
     HelState, ProjectSourceIdentity, SessionRecord, SessionResourceAllocation, SessionState,
 };
 use hel::hel_targets::AdditionalMount;
 
 use crate::dialogs::{
-    ConfirmDialog, Confirmation, ContainerEditor, FORCE_CONFIRMATION, ImportBundleConfirmation,
-    ImportProgress, RenameEditor, RenameFocus, RepositoryOriginDialog,
+    ConfigIdEditor, ConfirmDialog, Confirmation, ContainerEditor, FORCE_STOP_CONFIRMATION,
+    ImportBundleConfirmation, ImportProgress, RenameEditor, RenameFocus, RepositoryOriginDialog,
+    SessionEditDialog, TargetActionsDialog, WebDialog,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::ResumeDialog;
@@ -107,6 +109,7 @@ pub enum DashboardAction {
     },
     CancelOperation {
         session_id: String,
+        kind: SessionOperationKind,
     },
     ResolveAwsResourceOptions {
         target_template_ids: Vec<String>,
@@ -117,13 +120,10 @@ pub enum DashboardAction {
     Close {
         session_id: String,
     },
-    ForceDestroy {
+    ForceStop {
         session_id: String,
     },
-    DeleteActive {
-        session_id: String,
-    },
-    DeleteStopped {
+    DestroyStopped {
         session_id: String,
     },
     RenameSession {
@@ -131,6 +131,23 @@ pub enum DashboardAction {
         title: String,
     },
     RefreshQuotas,
+    RefreshCapacity,
+    RenameProfile {
+        old_id: String,
+        new_id: String,
+    },
+    RenameTarget {
+        old_id: String,
+        new_id: String,
+    },
+    TestTarget {
+        target_id: String,
+    },
+    CancelTargetTest,
+    LoadWebAccess,
+    /// Read the system clipboard on a worker before applying its contents.
+    /// Clipboard providers may perform IPC and must never run on the TUI loop.
+    PasteFromClipboard,
     MarkAllRead {
         receipts: Vec<(String, u64)>,
     },
@@ -167,7 +184,19 @@ pub enum DashboardAction {
         additional_mounts: Vec<AdditionalMount>,
         mount_history: Vec<std::path::PathBuf>,
     },
+    OpenWorkspacePicker,
     QuitDetach,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebViewerAccess {
+    Ready {
+        viewer_url: String,
+        viewer_code: String,
+        qr_login_url: Option<String>,
+        fallback_reason: Option<String>,
+    },
+    Unavailable(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +205,6 @@ pub enum SessionOperationKind {
     Resuming,
     Stopping,
     Destroying,
-    Deleting,
     Connecting,
     Importing,
 }
@@ -188,7 +216,6 @@ impl SessionOperationKind {
             Self::Resuming => "Resuming",
             Self::Stopping => "Stopping",
             Self::Destroying => "Destroying",
-            Self::Deleting => "Deleting",
             Self::Connecting => "Connecting",
             Self::Importing => "Importing",
         }
@@ -210,6 +237,10 @@ pub(crate) enum Mode {
     /// The unified picker for every session that is not live.
     ResumeDialog(ResumeDialog),
     RepositoryOrigin(RepositoryOriginDialog),
+    SessionEdit(SessionEditDialog),
+    ConfigId(ConfigIdEditor),
+    TargetActions(TargetActionsDialog),
+    Web(WebDialog),
     Rename(RenameEditor),
     EditContainer(ContainerEditor),
     Importing(ImportProgress),
@@ -269,6 +300,13 @@ pub struct DashboardState {
     pub(crate) quotas: BTreeMap<String, ProfileQuota>,
     pub(crate) quota_refreshing: BTreeSet<String>,
     pub(crate) session_details: BTreeMap<String, SessionDetail>,
+    /// Sessions whose relay worker the controller currently cannot reach. Their
+    /// summary band renders red so an unreachable target is obvious at a glance.
+    pub(crate) unreachable_sessions: BTreeSet<String>,
+    /// Sessions with a second opinion in progress. Stopping one destroys its
+    /// target, and the reviewer's conversation goes with it, so the stop
+    /// confirmation says so first.
+    pub(crate) sessions_with_review: BTreeSet<String>,
     pub(crate) project_sources: BTreeMap<String, ProjectSourceIdentity>,
     pub(crate) checkpoint_archive_sizes: BTreeMap<String, Option<u64>>,
     pub(crate) session_operations: BTreeMap<String, SessionOperationDisplay>,
@@ -279,6 +317,9 @@ pub struct DashboardState {
     pub(crate) focus: Focus,
     pub(crate) pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
     pub(crate) resume_sessions_area: Option<Rect>,
+    /// Selectable surfaces, rebuilt by every frame in render order so the
+    /// selection engine can hit-test the screen the user is looking at.
+    pub(crate) frame_surfaces: FrameSurfaces,
     /// Native sessions the resume dialog hides, loaded from Hel's database.
     pub(crate) hidden_native_sessions: BTreeSet<(HarnessKind, String)>,
     /// The rows the open resume dialog shows, derived from the records, the
@@ -308,6 +349,8 @@ impl DashboardState {
             quotas,
             quota_refreshing: BTreeSet::new(),
             session_details: BTreeMap::new(),
+            unreachable_sessions: BTreeSet::new(),
+            sessions_with_review: BTreeSet::new(),
             project_sources: BTreeMap::new(),
             checkpoint_archive_sizes: BTreeMap::new(),
             session_operations: BTreeMap::new(),
@@ -318,6 +361,7 @@ impl DashboardState {
             focus: Focus::Active,
             pane_areas: None,
             resume_sessions_area: None,
+            frame_surfaces: FrameSurfaces::new(),
             hidden_native_sessions: BTreeSet::new(),
             resume_rows: Vec::new(),
             active_row_areas: Vec::new(),
@@ -358,16 +402,24 @@ impl DashboardState {
             return DashboardAction::None;
         }
         if is_paste_shortcut(key) {
-            match hel::hel_clipboard::read_text() {
-                Ok(text) => self.handle_paste(&text),
-                Err(error) => self.notices.set(format!("Paste failed: {error:#}")),
-            }
+            return DashboardAction::PasteFromClipboard;
+        }
+        let text_focused = self.text_input_focused();
+        if text_focused
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
+            self.cancel_modal();
             return DashboardAction::None;
         }
-        if dashboard_accelerator(key.modifiers)
-            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
-        {
+        if dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('q') {
             return DashboardAction::QuitDetach;
+        }
+        if !text_focused && dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('c') {
+            return DashboardAction::QuitDetach;
+        }
+        if !text_focused && dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('w') {
+            return DashboardAction::OpenWorkspacePicker;
         }
 
         // Retire the notice this key press is stepping past, but only once it
@@ -381,12 +433,22 @@ impl DashboardState {
         }
         match self.mode.clone() {
             Mode::Dashboard => self.handle_dashboard_key(key),
-            Mode::New(wizard) => self.handle_new_key(key.code, wizard),
-            Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
+            Mode::New(wizard) => self.handle_new_key(key, wizard),
+            Mode::Resume(wizard) => self.handle_resume_key(key, wizard),
             Mode::ResumeDialog(_) => unreachable!("the resume dialog is handled in place"),
-            Mode::RepositoryOrigin(dialog) => self.handle_repository_origin_key(key.code, dialog),
-            Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
-            Mode::EditContainer(editor) => self.handle_container_edit_key(key.code, editor),
+            Mode::RepositoryOrigin(dialog) => self.handle_repository_origin_key(key, dialog),
+            Mode::SessionEdit(dialog) => self.handle_session_edit_key(key, dialog),
+            Mode::ConfigId(editor) => self.handle_config_id_key(key, editor),
+            Mode::TargetActions(dialog) => self.handle_target_actions_key(key, dialog),
+            Mode::Web(_) => match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                _ => DashboardAction::None,
+            },
+            Mode::Rename(editor) => self.handle_rename_key(key, editor),
+            Mode::EditContainer(editor) => self.handle_container_edit_key(key, editor),
             // The only control is the Cancel button, so Enter presses it too.
             Mode::Importing(_) => match key.code {
                 KeyCode::Esc | KeyCode::Enter => DashboardAction::CancelImport,
@@ -395,7 +457,23 @@ impl DashboardState {
             Mode::ConfirmImportBundle(confirmation) => {
                 self.handle_import_bundle_key(key.code, confirmation)
             }
-            Mode::Confirm(dialog) => self.handle_confirmation_key(key.code, dialog),
+            Mode::Confirm(dialog) => self.handle_confirmation_key(key, dialog),
+        }
+    }
+
+    fn text_input_focused(&self) -> bool {
+        match &self.mode {
+            Mode::Rename(editor) => editor.focus == RenameFocus::Field,
+            Mode::RepositoryOrigin(dialog) => dialog.focus == dialogs::RepositoryOriginFocus::Field,
+            Mode::EditContainer(editor) => editor.field().is_some(),
+            Mode::ResumeDialog(dialog) => dialog.focus == crate::resume::ResumeFocus::Search,
+            Mode::New(wizard) => wizard.text_input_focused(),
+            Mode::Resume(wizard) => wizard.text_input_focused(),
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::ForceStop { .. },
+                ..
+            }) => true,
+            _ => false,
         }
     }
 
@@ -430,11 +508,10 @@ impl DashboardState {
                 }
             }
             Mode::Confirm(ConfirmDialog {
-                confirmation:
-                    Confirmation::ForceDestroy { typed, .. } | Confirmation::DeleteActive { typed, .. },
+                confirmation: Confirmation::ForceStop { typed, .. },
                 ..
             }) => {
-                let remaining = FORCE_CONFIRMATION.len().saturating_sub(typed.len());
+                let remaining = FORCE_STOP_CONFIRMATION.len().saturating_sub(typed.len());
                 typed.extend(
                     pasted
                         .chars()
@@ -451,6 +528,11 @@ impl DashboardState {
             }
             _ => {}
         }
+    }
+
+    /// The surfaces the last frame registered, for the selection engine.
+    pub fn frame_surfaces(&self) -> &FrameSurfaces {
+        &self.frame_surfaces
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> DashboardAction {
@@ -557,6 +639,10 @@ impl DashboardState {
                 self.cycle_focus(true);
                 DashboardAction::None
             }
+            (KeyCode::Char('b'), true) => {
+                self.mode = Mode::Web(WebDialog::loading());
+                DashboardAction::LoadWebAccess
+            }
             (KeyCode::Up | KeyCode::Char('k'), false) => {
                 self.move_selection(-1);
                 DashboardAction::None
@@ -574,7 +660,7 @@ impl DashboardState {
                 self.set_selection(len.saturating_sub(1));
                 DashboardAction::None
             }
-            (KeyCode::Char('a'), true) => self.mark_all_read(),
+            (KeyCode::Char('a'), true) if self.focus == Focus::Active => self.mark_all_read(),
             (KeyCode::Char(digit @ '1'..='9'), false) if self.focus == Focus::Active => {
                 self.expand_project_number(digit.to_digit(10).unwrap_or(0) as usize);
                 DashboardAction::None
@@ -583,51 +669,45 @@ impl DashboardState {
                 self.expand_selected_project();
                 DashboardAction::None
             }
-            (KeyCode::Char('n'), true) => self.begin_new(),
-            (KeyCode::Char('x'), true) => {
-                let session_id = self.selected_session().and_then(|session| {
+            (KeyCode::Char('n'), true) if self.focus == Focus::Active => self.begin_new(),
+            (KeyCode::Char('x'), true) if self.focus == Focus::Active => {
+                let operation = self.selected_session().and_then(|session| {
                     self.session_operations
-                        .contains_key(&session.id)
-                        .then(|| session.id.clone())
+                        .get(&session.id)
+                        .map(|operation| (session.id.clone(), operation.kind))
                 });
-                session_id.map_or(DashboardAction::None, |session_id| {
-                    DashboardAction::CancelOperation { session_id }
+                operation.map_or(DashboardAction::None, |(session_id, kind)| {
+                    DashboardAction::CancelOperation { session_id, kind }
                 })
             }
-            (KeyCode::Char('t'), true) => DashboardAction::OpenResumeDialog,
-            (KeyCode::Char('r'), true) => {
-                if self.focus == Focus::Quotas {
-                    DashboardAction::RefreshQuotas
-                } else if self.focus == Focus::Active {
-                    if !self.reject_selected_operation() {
-                        self.begin_rename();
-                    }
-                    DashboardAction::None
-                } else {
-                    DashboardAction::None
-                }
+            (KeyCode::Char('s'), true) if self.focus == Focus::Active => {
+                DashboardAction::OpenResumeDialog
             }
-            (KeyCode::Char('u'), true) => DashboardAction::RefreshQuotas,
+            (KeyCode::Char('r'), true) if self.focus == Focus::Capacity => {
+                DashboardAction::RefreshCapacity
+            }
+            (KeyCode::Char('r'), true) if self.focus == Focus::Quotas => {
+                DashboardAction::RefreshQuotas
+            }
             // Setup and the container editor never both apply: setup only
             // opens while the config is empty, and an empty config has no
             // sessions to select.
             (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
             (KeyCode::Char('e'), true) if self.focus == Focus::Active => {
-                self.begin_container_edit();
+                self.begin_session_edit();
                 DashboardAction::None
             }
-            (KeyCode::Char('p'), true) if self.focus == Focus::Active => {
-                if self.reject_selected_operation() {
-                    return DashboardAction::None;
-                }
-                if let Some(session) = self.selected_session() {
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
-                        session_id: session.id.clone(),
-                    }));
-                }
+            (KeyCode::Char('e'), true) if self.focus == Focus::Capacity => {
+                self.begin_target_actions();
                 DashboardAction::None
             }
-            (KeyCode::Enter, _) | (KeyCode::Char('o'), true) => self.open_or_resume(),
+            (KeyCode::Char('e'), true) if self.focus == Focus::Quotas => {
+                self.begin_profile_rename();
+                DashboardAction::None
+            }
+            (KeyCode::Enter, _) | (KeyCode::Char('o'), true) if self.focus == Focus::Active => {
+                self.open_or_resume()
+            }
             _ => DashboardAction::None,
         }
     }
@@ -781,7 +861,7 @@ impl DashboardState {
     fn mark_all_read(&mut self) -> DashboardAction {
         let mut receipts = Vec::new();
         for (session_id, detail) in &mut self.session_details {
-            if detail.unread_agent_messages == 0 {
+            if !detail.has_unread() {
                 continue;
             }
             let Some(through) = detail.materialized_applied_event_ordinal else {
@@ -792,7 +872,7 @@ impl DashboardState {
             };
             if through > session.viewed_through_event_ordinal {
                 session.viewed_through_event_ordinal = through;
-                detail.unread_agent_messages = 0;
+                detail.clear_unread();
                 receipts.push((session_id.clone(), through));
             }
         }
@@ -1055,15 +1135,21 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(dashboard.handle_key(ctrl_key('k')), DashboardAction::None);
+        assert_eq!(dashboard.handle_key(ctrl_key('u')), DashboardAction::None);
         assert_eq!(
-            dashboard.handle_key(ctrl_key('u')),
-            DashboardAction::RefreshQuotas
-        );
-        assert_eq!(
-            dashboard.handle_key(ctrl_key('t')),
+            dashboard.handle_key(ctrl_key('s')),
             DashboardAction::OpenResumeDialog
         );
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('w')),
+            DashboardAction::OpenWorkspacePicker
+        );
+        assert_eq!(dashboard.handle_key(ctrl_key('t')), DashboardAction::None);
         assert_eq!(dashboard.handle_key(ctrl_key('i')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('v')),
+            DashboardAction::PasteFromClipboard
+        );
         assert_eq!(
             dashboard.handle_key(ctrl_key('q')),
             DashboardAction::QuitDetach
@@ -1074,6 +1160,62 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(dashboard.focus, Focus::Capacity);
+    }
+
+    #[test]
+    fn dashboard_action_hotkeys_follow_the_focused_pane() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        assert_eq!(dashboard.handle_key(ctrl_key('r')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('b')),
+            DashboardAction::LoadWebAccess
+        );
+        dashboard.cancel_modal();
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Capacity);
+        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('r')),
+            DashboardAction::RefreshCapacity
+        );
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('w')),
+            DashboardAction::OpenWorkspacePicker
+        );
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Quotas);
+        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('r')),
+            DashboardAction::RefreshQuotas
+        );
+        assert_eq!(dashboard.handle_key(ctrl_key('u')), DashboardAction::None);
+    }
+
+    #[test]
+    fn remote_operation_cancel_action_carries_the_operation_kind() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let session_id = session.id.clone();
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.begin_session_operation(
+            session_id.clone(),
+            SessionOperationKind::Launching,
+            None,
+        );
+
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('x')),
+            DashboardAction::CancelOperation {
+                session_id,
+                kind: SessionOperationKind::Launching,
+            }
+        );
     }
 
     /// The notice bar is the only report a background failure gets, so a key
@@ -1137,7 +1279,11 @@ mod tests {
         running.state = SessionState::Running;
         running.checkpoint = None;
         let mut rename = dashboard_with_session(running);
-        assert_eq!(rename.handle_key(ctrl_key('r')), DashboardAction::None);
+        assert_eq!(rename.handle_key(ctrl_key('e')), DashboardAction::None);
+        assert_eq!(
+            rename.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
 
         let mut importing = dashboard_with_session(stopped_session());
         importing.show_import_progress("Chosen session".into());
@@ -1189,6 +1335,7 @@ mod tests {
                 (lost.id.clone(), lost),
             ]),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let (active, terminal) = partition_sessions(state.sessions.values());
         assert_eq!(
@@ -1261,6 +1408,7 @@ mod tests {
                 .map(|session| (session.id.clone(), session))
                 .collect(),
             mount_history: BTreeMap::new(),
+            container_sizes: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         let source =
@@ -1304,12 +1452,33 @@ mod tests {
     }
 
     #[test]
+    fn mark_all_read_includes_a_restart_only_session() {
+        let mut dashboard = dashboard_with_session(running_session());
+        apply_materialized_transcript(&mut dashboard, vec![session_restart(3)]);
+        assert_eq!(
+            dashboard.session_details["session-1"].unread_session_restarts,
+            1
+        );
+
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('a')),
+            DashboardAction::MarkAllRead {
+                receipts: vec![("session-1".into(), 3)]
+            }
+        );
+        let detail = &dashboard.session_details["session-1"];
+        assert_eq!(detail.unread_session_restarts, 0);
+        assert!(!detail.has_unread());
+    }
+
+    #[test]
     fn bracketed_paste_populates_dashboard_text_editors() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
-        dashboard.handle_key(ctrl_key('r'));
+        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Enter));
         let Mode::Rename(editor) = &mut dashboard.mode else {
             panic!("expected rename editor")
         };
@@ -1337,6 +1506,7 @@ mod tests {
                     (archived.id.clone(), archived),
                 ]),
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1380,6 +1550,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1417,6 +1588,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1458,6 +1630,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1621,6 +1794,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions,
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -1649,6 +1823,7 @@ mod tests {
                 version: STATE_VERSION,
                 sessions: BTreeMap::from([(other.id.clone(), other)]),
                 mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );

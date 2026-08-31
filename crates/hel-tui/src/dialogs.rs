@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
+use qrcode::QrCode;
+use qrcode::types::{Color as QrColor, EcLevel};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -11,19 +13,21 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use std::path::PathBuf;
 
-use hel::hel_chat::TranscriptSnapshot;
 use hel::hel_config::{HarnessKind, mount_history_host};
+use hel::hel_selection::FrameSurfaces;
 use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_additional_mounts};
+use hel::hel_text_input::TextInput;
 
-use crate::ingest::TranscriptHydration;
-use crate::widgets::{action_buttons, centered_rect, focused_buttons, popup_height, truncate_text};
+use crate::widgets::{
+    action_buttons, centered_modal, focused_buttons, popup_height, truncate_text,
+};
 use crate::wizards::read_only_marker;
 use crate::{
-    ButtonKey, DashboardAction, DashboardState, Mode, button_row_key, cycle_button_focus,
-    cycle_control, move_index,
+    ButtonKey, DashboardAction, DashboardState, Mode, WebViewerAccess, button_row_key,
+    cycle_button_focus, cycle_control, move_index,
 };
 
-pub(crate) const FORCE_CONFIRMATION: &str = "DESTROY";
+pub(crate) const FORCE_STOP_CONFIRMATION: &str = "STOP";
 
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
@@ -56,8 +60,87 @@ pub struct ImportProfileOption {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenameEditor {
     pub(crate) session_id: String,
-    pub(crate) title: String,
+    pub(crate) title: TextInput,
     pub(crate) focus: RenameFocus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionEditDialog {
+    pub(crate) session_id: String,
+    pub(crate) container_backed: bool,
+    pub(crate) focus: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigEntryKind {
+    Profile,
+    Target,
+}
+
+impl ConfigEntryKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::Target => "target",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigIdEditor {
+    pub(crate) kind: ConfigEntryKind,
+    pub(crate) old_id: String,
+    pub(crate) value: TextInput,
+    pub(crate) focus: RenameFocus,
+    pub(crate) return_to_targets: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetActionsDialog {
+    pub(crate) target_ids: Vec<String>,
+    pub(crate) target_index: usize,
+    pub(crate) focus: usize,
+    pub(crate) testing: Option<String>,
+    pub(crate) result: Option<(String, Result<(), String>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebDialog {
+    pub(crate) loading: bool,
+    pub(crate) viewer_url: Option<String>,
+    pub(crate) viewer_code: Option<String>,
+    pub(crate) fallback_reason: Option<String>,
+    pub(crate) message: Option<String>,
+    pub(crate) qr: Option<String>,
+}
+
+impl WebDialog {
+    pub(crate) fn loading() -> Self {
+        Self {
+            loading: true,
+            viewer_url: None,
+            viewer_code: None,
+            fallback_reason: None,
+            message: None,
+            qr: None,
+        }
+    }
+}
+
+const TARGET_ACTION_BUTTONS: &[&str] = &["Rename", "Test", "Close"];
+
+impl SessionEditDialog {
+    fn actions(&self) -> &'static [&'static str] {
+        if self.container_backed {
+            &["Rename", "Container settings", "Stop", "Cancel"]
+        } else {
+            &["Rename", "Stop", "Cancel"]
+        }
+    }
+
+    fn stop_index(&self) -> usize {
+        usize::from(self.container_backed) + 1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +150,7 @@ pub(crate) struct RepositoryOriginDialog {
     pub(crate) missing_commit: String,
     pub(crate) archived_origin: String,
     pub(crate) configured_origin: String,
-    pub(crate) replacement: String,
+    pub(crate) replacement: TextInput,
     pub(crate) error: Option<String>,
     pub(crate) focus: RepositoryOriginFocus,
     pub(crate) launch: Box<DashboardAction>,
@@ -119,23 +202,22 @@ pub(crate) enum Confirmation {
     },
     Close {
         session_id: String,
+        /// Whether a second opinion is open on this session. Stopping tears
+        /// the target down, and the reviewer's conversation goes with it.
+        reviewer_conversation: bool,
     },
     CloseFailed {
         session_id: String,
         error: String,
     },
-    ForceDestroy {
+    ForceStop {
         session_id: String,
-        typed: String,
+        typed: TextInput,
     },
-    DeleteActive {
-        session_id: String,
-        typed: String,
-    },
-    DeleteStopped {
+    DestroyStopped {
         session_id: String,
         /// The resume dialog to restore afterwards, so confirming or
-        /// cancelling a delete leaves the user where they were.
+        /// cancelling destruction leaves the user where they were.
         reopen: Option<Box<crate::resume::ResumeDialog>>,
     },
 }
@@ -186,10 +268,10 @@ const IMPORT_PROGRESS_BUTTONS: &[&str] = &["Cancel"];
 fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] {
     match confirmation {
         Confirmation::DirtyLocal { .. } => &["Cancel", "Continue"],
-        Confirmation::Close { .. } => &["Cancel", "Delete", "Stop"],
-        Confirmation::DeleteStopped { .. } => &["Cancel", "Delete"],
-        Confirmation::CloseFailed { .. } => &["Cancel", "Force destroy", "Retry stop"],
-        Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => &[],
+        Confirmation::Close { .. } => &["Cancel", "Stop"],
+        Confirmation::DestroyStopped { .. } => &["Cancel", "Destroy"],
+        Confirmation::CloseFailed { .. } => &["Cancel", "Force stop", "Retry stop"],
+        Confirmation::ForceStop { .. } => &[],
     }
 }
 
@@ -198,7 +280,12 @@ fn primary_button(labels: &[&str]) -> usize {
     labels.len().saturating_sub(1)
 }
 
-pub(crate) fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
+pub(crate) fn render_import_progress(
+    frame: &mut Frame,
+    area: Rect,
+    progress: &ImportProgress,
+    surfaces: &mut FrameSurfaces,
+) {
     let total = progress
         .total
         .map_or_else(|| "?".into(), |total| total.to_string());
@@ -234,7 +321,7 @@ pub(crate) fn render_import_progress(frame: &mut Frame, area: Rect, progress: &I
     )))
     // `trim: false` keeps the padding inside the leftmost button background.
     .wrap(Wrap { trim: false });
-    let popup = centered_rect(76, popup_height(&paragraph, 76, 10, area), area);
+    let popup = centered_modal(surfaces, 76, popup_height(&paragraph, 76, 10, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
@@ -243,6 +330,7 @@ pub(crate) fn render_import_bundle_confirmation(
     frame: &mut Frame,
     area: Rect,
     confirmation: &ImportBundleConfirmation,
+    surfaces: &mut FrameSurfaces,
 ) {
     let mut lines = Vec::new();
     if !confirmation.dirty_git_roots.is_empty() {
@@ -311,7 +399,7 @@ pub(crate) fn render_import_bundle_confirmation(
         )
         // `trim: false` keeps the padding inside the leftmost button background.
         .wrap(Wrap { trim: false });
-    let popup = centered_rect(76, popup_height(&paragraph, 76, 12, area), area);
+    let popup = centered_modal(surfaces, 76, popup_height(&paragraph, 76, 12, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
@@ -321,14 +409,14 @@ pub(crate) fn render_import_bundle_confirmation(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContainerEditor {
     pub(crate) session_id: String,
-    pub(crate) cpus: String,
-    pub(crate) memory: String,
+    pub(crate) cpus: TextInput,
+    pub(crate) memory: TextInput,
     pub(crate) mounts: Vec<AdditionalMount>,
     /// Remembered mount sources for this session's host, offered as
     /// suggestions and editable so a stale directory can be forgotten.
     pub(crate) suggestions: Vec<PathBuf>,
-    pub(crate) source: String,
-    pub(crate) destination: String,
+    pub(crate) source: TextInput,
+    pub(crate) destination: TextInput,
     /// Read-only setting for the directory being typed, carried into the list
     /// when it is attached.
     pub(crate) read_only: bool,
@@ -376,7 +464,7 @@ impl ContainerEditor {
         order
     }
 
-    fn field_mut(&mut self) -> Option<&mut String> {
+    fn field_mut(&mut self) -> Option<&mut TextInput> {
         match self.focus {
             ContainerEditFocus::Cpus => Some(&mut self.cpus),
             ContainerEditFocus::Memory => Some(&mut self.memory),
@@ -387,6 +475,16 @@ impl ContainerEditor {
             | ContainerEditFocus::Suggestions
             | ContainerEditFocus::Cancel
             | ContainerEditFocus::Save => None,
+        }
+    }
+
+    pub(crate) fn field(&self) -> Option<&TextInput> {
+        match self.focus {
+            ContainerEditFocus::Cpus => Some(&self.cpus),
+            ContainerEditFocus::Memory => Some(&self.memory),
+            ContainerEditFocus::Source => Some(&self.source),
+            ContainerEditFocus::Destination => Some(&self.destination),
+            _ => None,
         }
     }
 
@@ -444,10 +542,11 @@ impl ContainerEditor {
         let Some(source) = self.suggestions.get(self.suggestion_index) else {
             return;
         };
-        self.source = source.to_string_lossy().into_owned();
+        self.source = source.to_string_lossy().into_owned().into();
         self.destination = default_mount_destination(source, &self.mounts)
             .to_string_lossy()
-            .into_owned();
+            .into_owned()
+            .into();
         self.focus = ContainerEditFocus::Source;
     }
 
@@ -489,8 +588,13 @@ impl ContainerEditor {
     }
 }
 
-pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &ContainerEditor) {
-    let field = |label: &str, value: &str, focused: bool| {
+pub(crate) fn render_container_editor(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &ContainerEditor,
+    surfaces: &mut FrameSurfaces,
+) {
+    let field = |label: &str, value: &TextInput, focused: bool| {
         let style = if focused {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else {
@@ -498,7 +602,17 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
         };
         Line::from(vec![
             ratatui::text::Span::raw(format!("{label}: ")),
-            ratatui::text::Span::styled(format!("{value} "), style),
+            ratatui::text::Span::styled(
+                format!(
+                    "{} ",
+                    if focused {
+                        value.with_cursor_marker("▏")
+                    } else {
+                        value.to_string()
+                    }
+                ),
+                style,
+            ),
         ])
     };
     let mut lines = vec![
@@ -556,7 +670,7 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
         ),
         field(
             "Read-only",
-            if editor.read_only { "[x]" } else { "[ ]" },
+            &TextInput::from(if editor.read_only { "[x]" } else { "[ ]" }),
             editor.focus == ContainerEditFocus::ReadOnly,
         ),
     ]);
@@ -596,16 +710,28 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
             .borders(Borders::ALL)
             .title(" Edit container size and mounts "),
     );
-    let popup = centered_rect(70, popup_height(&paragraph, 70, 18, area), area);
+    let popup = centered_modal(surfaces, 70, popup_height(&paragraph, 70, 18, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
 
-pub(crate) fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &RenameEditor) {
+pub(crate) fn render_rename_editor(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &RenameEditor,
+    surfaces: &mut FrameSurfaces,
+) {
     let paragraph = Paragraph::new(vec![
         Line::raw(format!("Session: {}", editor.session_id)),
         Line::raw(""),
-        Line::styled(editor.title.clone(), Style::default().fg(Color::Cyan)),
+        Line::styled(
+            if editor.focus == RenameFocus::Field {
+                editor.title.with_cursor_marker("▏")
+            } else {
+                editor.title.to_string()
+            },
+            Style::default().fg(Color::Cyan),
+        ),
         Line::raw(""),
         focused_buttons(RENAME_BUTTONS, editor.focus.button_index()),
     ])
@@ -614,18 +740,270 @@ pub(crate) fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &Renam
             .borders(Borders::ALL)
             .title(" Rename session "),
     );
-    let popup = centered_rect(60, popup_height(&paragraph, 60, 8, area), area);
+    let popup = centered_modal(surfaces, 60, popup_height(&paragraph, 60, 8, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
+}
+
+pub(crate) fn render_session_edit(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &SessionEditDialog,
+    surfaces: &mut FrameSurfaces,
+) {
+    let actions = dialog.actions();
+    let paragraph = Paragraph::new(vec![
+        Line::raw(format!("Session: {}", dialog.session_id)),
+        Line::raw(""),
+        focused_buttons(actions, dialog.focus),
+        Line::raw(""),
+        Line::styled(
+            "Left/Right or Tab selects · Enter opens · Esc closes",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Edit session "),
+    );
+    let popup = centered_modal(surfaces, 72, popup_height(&paragraph, 72, 8, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+pub(crate) fn render_config_id_editor(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &ConfigIdEditor,
+    surfaces: &mut FrameSurfaces,
+) {
+    let paragraph = Paragraph::new(vec![
+        Line::raw(format!(
+            "Current {} ID: {}",
+            editor.kind.label(),
+            editor.old_id
+        )),
+        Line::raw(""),
+        Line::styled(
+            if editor.focus == RenameFocus::Field {
+                editor.value.with_cursor_marker("▏")
+            } else {
+                editor.value.to_string()
+            },
+            Style::default().fg(Color::Cyan),
+        ),
+        Line::raw(""),
+        focused_buttons(RENAME_BUTTONS, editor.focus.button_index()),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Rename {} ID ", editor.kind.label())),
+    );
+    let popup = centered_modal(surfaces, 60, popup_height(&paragraph, 60, 8, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+pub(crate) fn render_target_actions(
+    frame: &mut Frame,
+    area: Rect,
+    dashboard: &DashboardState,
+    dialog: &TargetActionsDialog,
+    surfaces: &mut FrameSurfaces,
+) {
+    let mut lines = dialog
+        .target_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let kind = dashboard
+                .config
+                .targets
+                .get(id)
+                .map(target_kind_label)
+                .unwrap_or("missing");
+            Line::styled(
+                format!(
+                    "{} {id:<24} {kind}",
+                    if index == dialog.target_index {
+                        '›'
+                    } else {
+                        ' '
+                    }
+                ),
+                if index == dialog.target_index {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::raw("No targets configured."));
+    }
+    lines.push(Line::raw(""));
+    if let Some(target_id) = &dialog.testing {
+        lines.push(Line::styled(
+            format!("Testing {target_id}…"),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if let Some((target_id, result)) = &dialog.result {
+        lines.push(Line::styled(
+            match result {
+                Ok(()) => format!("{target_id}: ready"),
+                Err(error) => format!("{target_id}: {error}"),
+            },
+            Style::default().fg(if result.is_ok() {
+                Color::Green
+            } else {
+                Color::Yellow
+            }),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(focused_buttons(TARGET_ACTION_BUTTONS, dialog.focus));
+    lines.push(Line::styled(
+        "Up/Down selects target · Tab selects action · Esc closes",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Target actions "),
+        )
+        .wrap(Wrap { trim: false });
+    let popup = centered_modal(surfaces, 72, popup_height(&paragraph, 72, 12, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+fn target_kind_label(target: &hel::hel_config::TargetTemplate) -> &'static str {
+    match target {
+        hel::hel_config::TargetTemplate::LocalBare => "local bare",
+        hel::hel_config::TargetTemplate::LocalPodman { .. } => "local Podman",
+        hel::hel_config::TargetTemplate::AppleContainer { .. } => "Apple container",
+        hel::hel_config::TargetTemplate::AwsEc2 { .. } => "AWS EC2",
+        hel::hel_config::TargetTemplate::SshBare { .. } => "SSH bare",
+        hel::hel_config::TargetTemplate::SshPodman { .. } => "SSH Podman",
+    }
+}
+
+pub(crate) fn render_web_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &WebDialog,
+    surfaces: &mut FrameSurfaces,
+) {
+    let mut lines = Vec::new();
+    if dialog.loading {
+        lines.push(Line::styled(
+            "Loading web viewer access…",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if let Some(message) = &dialog.message {
+        lines.push(Line::styled(
+            message.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else {
+        if let Some(qr) = &dialog.qr {
+            let qr_width = qr
+                .lines()
+                .map(str::chars)
+                .map(Iterator::count)
+                .max()
+                .unwrap_or(0);
+            let qr_height = qr.lines().count();
+            if usize::from(area.width) >= qr_width + 6 && usize::from(area.height) >= qr_height + 10
+            {
+                lines.extend(qr.lines().map(|line| Line::raw(line.to_owned())));
+                lines.push(Line::raw(""));
+            } else {
+                lines.push(Line::styled(
+                    "Terminal is too small for a scannable QR code.",
+                    Style::default().fg(Color::Yellow),
+                ));
+                lines.push(Line::raw(""));
+            }
+        }
+        if let Some(url) = &dialog.viewer_url {
+            lines.push(Line::raw(format!("Web: {url}")));
+        }
+        if let Some(code) = &dialog.viewer_code {
+            lines.push(Line::raw(format!("Viewer code: {code}")));
+        }
+        if let Some(reason) = &dialog.fallback_reason {
+            lines.push(Line::styled(
+                format!("Local fallback: {reason}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Enter or Esc closes",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" Web viewer "))
+        .wrap(Wrap { trim: false });
+    let width = dialog
+        .qr
+        .as_deref()
+        .and_then(|qr| qr.lines().map(str::chars).map(Iterator::count).max())
+        .and_then(|width| u16::try_from(width + 4).ok())
+        .unwrap_or(72)
+        .max(52);
+    let popup = centered_modal(
+        surfaces,
+        width,
+        popup_height(&paragraph, width, 10, area),
+        area,
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_qr(data: &str) -> Result<String, String> {
+    const QUIET_ZONE: usize = 4;
+    let qr = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)
+        .map_err(|error| format!("encode web login QR: {error}"))?;
+    let total = qr.width() + QUIET_ZONE * 2;
+    let mut output = String::new();
+    for y in (0..total).step_by(2) {
+        for x in 0..total {
+            let module = |x: usize, y: usize| {
+                let Some(x) = x.checked_sub(QUIET_ZONE) else {
+                    return false;
+                };
+                let Some(y) = y.checked_sub(QUIET_ZONE) else {
+                    return false;
+                };
+                x < qr.width() && y < qr.width() && qr[(x, y)] == QrColor::Dark
+            };
+            output.push(match (module(x, y), module(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 pub(crate) fn render_repository_origin(
     frame: &mut Frame,
     area: Rect,
     dialog: &RepositoryOriginDialog,
+    surfaces: &mut FrameSurfaces,
 ) {
     let field_focused = dialog.focus == RepositoryOriginFocus::Field;
-    let field_cursor = if field_focused { "▏" } else { "" };
     let field_style = if field_focused {
         Style::default().fg(Color::Black).bg(Color::Cyan)
     } else {
@@ -648,7 +1026,14 @@ pub(crate) fn render_repository_origin(
         Line::from(vec![
             Span::raw("Source: "),
             Span::styled(
-                format!(" {}{field_cursor} ", dialog.replacement),
+                format!(
+                    " {} ",
+                    if field_focused {
+                        dialog.replacement.with_cursor_marker("▏")
+                    } else {
+                        dialog.replacement.to_string()
+                    }
+                ),
                 field_style,
             ),
         ]),
@@ -680,21 +1065,17 @@ pub(crate) fn render_repository_origin(
                 .title(" Repository history is missing "),
         )
         .wrap(Wrap { trim: false });
-    let popup = centered_rect(76, popup_height(&paragraph, 76, 14, area), area);
+    let popup = centered_modal(surfaces, 76, popup_height(&paragraph, 76, 14, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
 
-pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &ConfirmDialog) {
-    let confirmation = &dialog.confirmation;
-    // Minimum height per dialog; `popup_height` grows it to fit wrapped content.
-    let nominal = match confirmation {
-        Confirmation::DirtyLocal { .. } => 11,
-        Confirmation::CloseFailed { .. } => 12,
-        Confirmation::Close { .. } | Confirmation::DeleteStopped { .. } => 10,
-        Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => 9,
-    };
-    let (title, mut lines) = match confirmation {
+/// Title and body of one confirmation, without its buttons.
+///
+/// Split out so the wording a dialog shows can be asserted without
+/// rendering a frame and reading cells back.
+fn confirmation_body(confirmation: &Confirmation) -> (&'static str, Vec<Line<'static>>) {
+    match confirmation {
         Confirmation::DirtyLocal { repositories, .. } => {
             let mut lines = vec![
                 Line::raw("The initial worker will include these uncommitted changes:"),
@@ -709,22 +1090,37 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
             ]);
             (" Local repository has uncommitted changes ", lines)
         }
-        Confirmation::Close { session_id } => (
-            " Stop session? ",
-            vec![
+        Confirmation::Close {
+            session_id,
+            reviewer_conversation,
+        } => {
+            let mut lines = vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify a recovery copy before destroying the target."),
-                Line::raw("Delete permanently removes it without creating a recovery copy."),
-            ],
-        ),
-        Confirmation::DeleteStopped { session_id, .. } => (
-            " Permanently delete stopped session? ",
+            ];
+            if *reviewer_conversation {
+                // The reviewer's native session lives on the target, and a v1
+                // checkpoint is single session, so resuming cannot bring it
+                // back. Saying so before the stop is the only warning there is.
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "The second opinion in progress cannot be continued after resume.",
+                    Style::default().fg(Color::Yellow),
+                ));
+                lines.push(Line::raw(
+                    "Its review is kept for reference; a later one starts a new conversation.",
+                ));
+            }
+            (" Stop session? ", lines)
+        }
+        Confirmation::DestroyStopped { session_id, .. } => (
+            " Permanently destroy stopped session? ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Hel will permanently delete the recovery archive and session record."),
-                Line::raw("Any Hel-managed worktree and generated branch will also be deleted."),
+                Line::raw("Hel will permanently destroy the recovery archive and session record."),
+                Line::raw("Any Hel-managed worktree and generated branch will also be removed."),
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
@@ -738,26 +1134,42 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
                 ),
             ],
         ),
-        Confirmation::ForceDestroy { session_id, typed } => (
-            " FORCE DESTROY · DATA MAY BE LOST ",
+        Confirmation::ForceStop { session_id, typed } => (
+            " FORCE STOP · RECENT WORK MAY BE LOST ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("The Hel-managed worktree and generated branch will be deleted."),
-                Line::raw(format!("Type {FORCE_CONFIRMATION}, then press Enter:")),
-                Line::styled(typed.clone(), Style::default().fg(Color::Red)),
+                Line::raw("The current target will be removed without a new checkpoint."),
+                Line::raw("You can resume from the latest verified recovery archive."),
+                Line::raw(format!("Type {FORCE_STOP_CONFIRMATION}, then press Enter:")),
+                Line::styled(
+                    typed.with_cursor_marker("▏"),
+                    Style::default().fg(Color::Red),
+                ),
             ],
         ),
-        Confirmation::DeleteActive { session_id, typed } => (
-            " DELETE ACTIVE SESSION · NO CHECKPOINT ",
-            vec![
-                Line::raw(format!("Session: {session_id}")),
-                Line::raw(""),
-                Line::raw(format!("Type {FORCE_CONFIRMATION}, then press Enter:")),
-                Line::styled(typed.clone(), Style::default().fg(Color::Red)),
-            ],
-        ),
+    }
+}
+
+pub(crate) fn render_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &ConfirmDialog,
+    surfaces: &mut FrameSurfaces,
+) {
+    let confirmation = &dialog.confirmation;
+    // Minimum height per dialog; `popup_height` grows it to fit wrapped content.
+    let nominal = match confirmation {
+        Confirmation::DirtyLocal { .. } => 11,
+        Confirmation::CloseFailed { .. } => 12,
+        Confirmation::Close {
+            reviewer_conversation: true,
+            ..
+        } => 13,
+        Confirmation::Close { .. } | Confirmation::DestroyStopped { .. } => 10,
+        Confirmation::ForceStop { .. } => 10,
     };
+    let (title, mut lines) = confirmation_body(confirmation);
     let buttons = confirmation_buttons(confirmation);
     if !buttons.is_empty() {
         lines.push(Line::raw(""));
@@ -772,12 +1184,287 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
         )
         // `trim: false` keeps the padding inside the leftmost button background.
         .wrap(Wrap { trim: false });
-    let popup = centered_rect(72, popup_height(&paragraph, 72, nominal, area), area);
+    let popup = centered_modal(
+        surfaces,
+        72,
+        popup_height(&paragraph, 72, nominal, area),
+        area,
+    );
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
 
 impl DashboardState {
+    pub fn apply_web_access(&mut self, access: WebViewerAccess) {
+        let dialog = match access {
+            WebViewerAccess::Ready {
+                viewer_url,
+                viewer_code,
+                qr_login_url,
+                fallback_reason,
+            } => {
+                let (qr, message) = match qr_login_url {
+                    Some(url) => match render_qr(&url) {
+                        Ok(qr) => (Some(qr), None),
+                        Err(error) => (None, Some(error)),
+                    },
+                    None => (None, None),
+                };
+                WebDialog {
+                    loading: false,
+                    viewer_url: Some(viewer_url),
+                    viewer_code: Some(viewer_code),
+                    fallback_reason,
+                    message,
+                    qr,
+                }
+            }
+            WebViewerAccess::Unavailable(message) => WebDialog {
+                loading: false,
+                viewer_url: None,
+                viewer_code: None,
+                fallback_reason: None,
+                message: Some(message),
+                qr: None,
+            },
+        };
+        if matches!(self.mode, Mode::Web(_)) {
+            self.mode = Mode::Web(dialog);
+        }
+    }
+
+    pub(crate) fn begin_profile_rename(&mut self) {
+        let Some(old_id) = self.config.profiles.keys().nth(self.quota_index).cloned() else {
+            self.notices.set("No profile is selected.");
+            return;
+        };
+        self.mode = Mode::ConfigId(ConfigIdEditor {
+            kind: ConfigEntryKind::Profile,
+            value: TextInput::from_value(old_id.clone()).with_max_chars(64),
+            old_id,
+            focus: RenameFocus::Field,
+            return_to_targets: false,
+        });
+    }
+
+    pub(crate) fn begin_target_actions(&mut self) {
+        let preferred = self
+            .capacity_details
+            .values()
+            .nth(self.capacity_index)
+            .and_then(|detail| detail.target.target_ids.first())
+            .cloned();
+        let target_ids = self.config.targets.keys().cloned().collect::<Vec<_>>();
+        let target_index = preferred
+            .as_ref()
+            .and_then(|id| target_ids.iter().position(|candidate| candidate == id))
+            .unwrap_or(0);
+        self.mode = Mode::TargetActions(TargetActionsDialog {
+            target_ids,
+            target_index,
+            focus: 0,
+            testing: None,
+            result: None,
+        });
+    }
+
+    pub(crate) fn handle_target_actions_key(
+        &mut self,
+        key: KeyEvent,
+        mut dialog: TargetActionsDialog,
+    ) -> DashboardAction {
+        if dialog.testing.is_some()
+            && crate::dashboard_accelerator(key.modifiers)
+            && key.code == KeyCode::Char('x')
+        {
+            dialog.testing = None;
+            dialog.result = Some(("Target test".into(), Err("cancelled".into())));
+            self.mode = Mode::TargetActions(dialog);
+            return DashboardAction::CancelTargetTest;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_index(&mut dialog.target_index, dialog.target_ids.len(), -1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_index(&mut dialog.target_index, dialog.target_ids.len(), 1);
+            }
+            KeyCode::Tab | KeyCode::Right => {
+                dialog.focus = cycle_button_focus(dialog.focus, TARGET_ACTION_BUTTONS.len(), false);
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                dialog.focus = cycle_button_focus(dialog.focus, TARGET_ACTION_BUTTONS.len(), true);
+            }
+            KeyCode::Enter => {
+                let Some(target_id) = dialog.target_ids.get(dialog.target_index).cloned() else {
+                    self.cancel_modal();
+                    return DashboardAction::None;
+                };
+                match dialog.focus {
+                    0 => {
+                        self.mode = Mode::ConfigId(ConfigIdEditor {
+                            kind: ConfigEntryKind::Target,
+                            value: TextInput::from_value(target_id.clone()).with_max_chars(64),
+                            old_id: target_id,
+                            focus: RenameFocus::Field,
+                            return_to_targets: true,
+                        });
+                        return DashboardAction::None;
+                    }
+                    1 if dialog.testing.is_none() => {
+                        dialog.testing = Some(target_id.clone());
+                        dialog.result = None;
+                        self.mode = Mode::TargetActions(dialog);
+                        return DashboardAction::TestTarget { target_id };
+                    }
+                    2 => {
+                        self.cancel_modal();
+                        return DashboardAction::None;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::TargetActions(dialog);
+        DashboardAction::None
+    }
+
+    pub(crate) fn handle_config_id_key(
+        &mut self,
+        key: KeyEvent,
+        mut editor: ConfigIdEditor,
+    ) -> DashboardAction {
+        match key.code {
+            KeyCode::Esc => {
+                if editor.return_to_targets {
+                    self.begin_target_actions();
+                } else {
+                    self.cancel_modal();
+                }
+                DashboardAction::None
+            }
+            KeyCode::Enter if editor.focus == RenameFocus::Cancel => {
+                if editor.return_to_targets {
+                    self.begin_target_actions();
+                } else {
+                    self.cancel_modal();
+                }
+                DashboardAction::None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                editor.focus = cycle_control(
+                    editor.focus,
+                    &RENAME_FOCUS_ORDER,
+                    key.code == KeyCode::BackTab,
+                );
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+            KeyCode::Left | KeyCode::Right if editor.focus != RenameFocus::Field => {
+                editor.focus = RenameFocus::from_button_index(cycle_button_focus(
+                    editor.focus.button_index(),
+                    RENAME_BUTTONS.len(),
+                    key.code == KeyCode::Left,
+                ));
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+            KeyCode::Enter if editor.value.trim().is_empty() => {
+                self.notices.set("Configuration ID cannot be empty.");
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+            KeyCode::Enter => {
+                self.cancel_modal();
+                match editor.kind {
+                    ConfigEntryKind::Profile => DashboardAction::RenameProfile {
+                        old_id: editor.old_id,
+                        new_id: editor.value.into_value(),
+                    },
+                    ConfigEntryKind::Target => DashboardAction::RenameTarget {
+                        old_id: editor.old_id,
+                        new_id: editor.value.into_value(),
+                    },
+                }
+            }
+            _ if editor.focus == RenameFocus::Field => {
+                editor.value.handle_key(key);
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+            _ => {
+                self.mode = Mode::ConfigId(editor);
+                DashboardAction::None
+            }
+        }
+    }
+
+    pub fn apply_target_test(&mut self, target_id: String, result: Result<(), String>) {
+        if let Mode::TargetActions(dialog) = &mut self.mode
+            && dialog.testing.as_deref() == Some(&target_id)
+        {
+            dialog.testing = None;
+            dialog.result = Some((target_id, result));
+        }
+    }
+
+    pub(crate) fn begin_session_edit(&mut self) {
+        if self.reject_selected_operation() {
+            return;
+        }
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        self.mode = Mode::SessionEdit(SessionEditDialog {
+            session_id: session.id.clone(),
+            container_backed: self.selected_container_session().is_some(),
+            focus: 0,
+        });
+    }
+
+    pub(crate) fn handle_session_edit_key(
+        &mut self,
+        key: KeyEvent,
+        mut dialog: SessionEditDialog,
+    ) -> DashboardAction {
+        let actions = dialog.actions();
+        match button_row_key(key.code, dialog.focus, actions.len()) {
+            ButtonKey::Focus(focus) => dialog.focus = focus,
+            ButtonKey::Cancel => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            ButtonKey::Activate(0) => {
+                self.begin_rename();
+                return DashboardAction::None;
+            }
+            ButtonKey::Activate(index) if dialog.container_backed && index == 1 => {
+                self.begin_container_edit();
+                return DashboardAction::None;
+            }
+            ButtonKey::Activate(index) if index == dialog.stop_index() => {
+                let reviewer_conversation = self.sessions_with_review.contains(&dialog.session_id);
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
+                    session_id: dialog.session_id,
+                    reviewer_conversation,
+                }));
+                return DashboardAction::None;
+            }
+            ButtonKey::Activate(_) => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            ButtonKey::Ignored => {}
+        }
+        self.mode = Mode::SessionEdit(dialog);
+        DashboardAction::None
+    }
+
     pub fn show_repository_origin_dialog(
         &mut self,
         session_id: String,
@@ -792,7 +1479,7 @@ impl DashboardState {
             repository_id,
             missing_commit,
             archived_origin,
-            replacement: String::new(),
+            replacement: TextInput::new(),
             configured_origin,
             error: None,
             focus: RepositoryOriginFocus::Field,
@@ -815,9 +1502,10 @@ impl DashboardState {
 
     pub(crate) fn handle_repository_origin_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut dialog: RepositoryOriginDialog,
     ) -> DashboardAction {
+        let code = key.code;
         match code {
             KeyCode::Esc => {
                 self.cancel_modal();
@@ -833,14 +1521,6 @@ impl DashboardState {
                     ],
                     code == KeyCode::BackTab,
                 );
-            }
-            KeyCode::Backspace if dialog.focus == RepositoryOriginFocus::Field => {
-                dialog.replacement.pop();
-                dialog.error = None;
-            }
-            KeyCode::Char(character) if dialog.focus == RepositoryOriginFocus::Field => {
-                dialog.replacement.push(character);
-                dialog.error = None;
             }
             KeyCode::Enter if dialog.focus == RepositoryOriginFocus::Cancel => {
                 self.cancel_modal();
@@ -859,12 +1539,17 @@ impl DashboardState {
                     let action = DashboardAction::ReplaceResumeRepositoryOrigin {
                         session_id: dialog.session_id.clone(),
                         repository_id: dialog.repository_id.clone(),
-                        replacement: dialog.replacement.clone(),
+                        replacement: dialog.replacement.to_string(),
                         launch: dialog.launch.clone(),
                     };
                     self.mode = Mode::RepositoryOrigin(dialog);
                     return action;
                 }
+            }
+            _ if dialog.focus == RepositoryOriginFocus::Field
+                && dialog.replacement.handle_key(key).changed() =>
+            {
+                dialog.error = None;
             }
             _ => {}
         }
@@ -890,12 +1575,12 @@ impl DashboardState {
             .unwrap_or_default();
         self.mode = Mode::EditContainer(ContainerEditor {
             session_id: session.id.clone(),
-            cpus: session.container_cpus.clone().unwrap_or_default(),
-            memory: session.container_memory.clone().unwrap_or_default(),
+            cpus: session.container_cpus.clone().unwrap_or_default().into(),
+            memory: session.container_memory.clone().unwrap_or_default().into(),
             mounts: session.additional_mounts.clone(),
             suggestions,
-            source: String::new(),
-            destination: String::new(),
+            source: TextInput::new(),
+            destination: TextInput::new(),
             read_only: false,
             focus: ContainerEditFocus::Cpus,
             mount_index: 0,
@@ -906,9 +1591,10 @@ impl DashboardState {
 
     pub(crate) fn handle_container_edit_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut editor: ContainerEditor,
     ) -> DashboardAction {
+        let code = key.code;
         let action = match code {
             KeyCode::Esc => {
                 self.cancel_modal();
@@ -1006,15 +1692,11 @@ impl DashboardState {
                 editor.remove_selected();
                 DashboardAction::None
             }
-            KeyCode::Backspace => {
-                if let Some(field) = editor.field_mut() {
-                    field.pop();
-                }
-                DashboardAction::None
-            }
-            KeyCode::Char(character) => {
-                if let Some(field) = editor.field_mut() {
-                    field.push(character);
+            _ if editor.field().is_some() => {
+                if editor
+                    .field_mut()
+                    .is_some_and(|field| field.handle_key(key).changed())
+                {
                     editor.error = None;
                 }
                 DashboardAction::None
@@ -1091,21 +1773,25 @@ impl DashboardState {
         };
         self.mode = Mode::Rename(RenameEditor {
             session_id: session.id.clone(),
-            title: session
-                .session_title_override
-                .as_ref()
-                .or(session.acp_session_title.as_ref())
-                .cloned()
-                .unwrap_or_default(),
+            title: TextInput::from_value(
+                session
+                    .session_title_override
+                    .as_ref()
+                    .or(session.acp_session_title.as_ref())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .with_max_chars(64),
             focus: RenameFocus::Field,
         });
     }
 
     pub(crate) fn handle_rename_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         mut editor: RenameEditor,
     ) -> DashboardAction {
+        let code = key.code;
         match code {
             KeyCode::Esc => {
                 self.cancel_modal();
@@ -1117,7 +1803,6 @@ impl DashboardState {
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
-            // The field has no cursor, so horizontal keys only move between buttons.
             KeyCode::Left | KeyCode::Right if editor.focus != RenameFocus::Field => {
                 editor.focus = RenameFocus::from_button_index(cycle_button_focus(
                     editor.focus.button_index(),
@@ -1140,18 +1825,11 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::RenameSession {
                     session_id: editor.session_id,
-                    title: editor.title,
+                    title: editor.title.into_value(),
                 }
             }
-            KeyCode::Backspace if editor.focus == RenameFocus::Field => {
-                editor.title.pop();
-                self.mode = Mode::Rename(editor);
-                DashboardAction::None
-            }
-            KeyCode::Char(character)
-                if editor.focus == RenameFocus::Field && editor.title.chars().count() < 64 =>
-            {
-                editor.title.push(character);
+            _ if editor.focus == RenameFocus::Field => {
+                editor.title.handle_key(key);
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
@@ -1195,23 +1873,24 @@ impl DashboardState {
 
     pub(crate) fn handle_confirmation_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         dialog: ConfirmDialog,
     ) -> DashboardAction {
+        let code = key.code;
         let ConfirmDialog {
             confirmation,
             focus,
         } = dialog;
         let buttons = confirmation_buttons(&confirmation);
         if buttons.is_empty() {
-            return self.handle_typed_confirmation_key(code, confirmation);
+            return self.handle_typed_confirmation_key(key, confirmation);
         }
         let focus = match button_row_key(code, focus, buttons.len()) {
             ButtonKey::Activate(index) => {
                 return self.activate_confirmation_button(confirmation, index);
             }
             ButtonKey::Cancel => {
-                if let Confirmation::DeleteStopped { reopen, .. } = confirmation {
+                if let Confirmation::DestroyStopped { reopen, .. } = confirmation {
                     self.restore_after_confirmation(reopen);
                 } else {
                     self.cancel_modal();
@@ -1245,19 +1924,20 @@ impl DashboardState {
                 self.cancel_modal();
                 action
             }
-            (Confirmation::Close { session_id }, 1) => self.begin_delete_active(session_id),
-            (Confirmation::Close { session_id }, 2) => {
+            (Confirmation::Close { session_id, .. }, 1) => {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
             }
-            (Confirmation::DeleteStopped { session_id, reopen }, 1) => {
+            (Confirmation::DestroyStopped { session_id, reopen }, 1) => {
                 self.restore_after_confirmation(reopen);
-                DashboardAction::DeleteStopped { session_id }
+                DashboardAction::DestroyStopped { session_id }
             }
             (Confirmation::CloseFailed { session_id, .. }, 1) => {
-                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
                     session_id,
-                    typed: String::new(),
+                    typed: TextInput::new()
+                        .with_max_chars(FORCE_STOP_CONFIRMATION.len())
+                        .with_filter(hel::hel_text_input::InputFilter::AsciiAlphabeticUppercase),
                 }));
                 DashboardAction::None
             }
@@ -1265,7 +1945,7 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
             }
-            (Confirmation::DeleteStopped { reopen, .. }, _) => {
+            (Confirmation::DestroyStopped { reopen, .. }, _) => {
                 self.restore_after_confirmation(reopen);
                 DashboardAction::None
             }
@@ -1273,30 +1953,6 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::None
             }
-        }
-    }
-
-    fn begin_delete_active(&mut self, session_id: String) -> DashboardAction {
-        // Deleting without the typed confirmation needs Hel to know there is
-        // no agent work to lose. An unhydrated transcript can look empty.
-        let known_to_have_no_assistant_messages =
-            self.session_details.get(&session_id).is_some_and(|detail| {
-                detail.transcript_hydration == TranscriptHydration::Ready
-                    && detail.last_agent_message.is_none()
-                    && !detail
-                        .transcript
-                        .as_ref()
-                        .is_some_and(TranscriptSnapshot::has_assistant_messages)
-            });
-        if known_to_have_no_assistant_messages {
-            self.cancel_modal();
-            DashboardAction::DeleteActive { session_id }
-        } else {
-            self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
-                session_id,
-                typed: String::new(),
-            }));
-            DashboardAction::None
         }
     }
 
@@ -1314,11 +1970,12 @@ impl DashboardState {
 
     fn handle_typed_confirmation_key(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         confirmation: Confirmation,
     ) -> DashboardAction {
+        let code = key.code;
         match confirmation {
-            Confirmation::ForceDestroy {
+            Confirmation::ForceStop {
                 session_id,
                 mut typed,
             } => match code {
@@ -1326,68 +1983,13 @@ impl DashboardState {
                     self.cancel_modal();
                     DashboardAction::None
                 }
-                KeyCode::Backspace => {
-                    typed.pop();
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-                KeyCode::Char(c) => {
-                    if typed.len() < FORCE_CONFIRMATION.len() {
-                        typed.push(c.to_ascii_uppercase());
-                    }
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-                KeyCode::Enter if typed == FORCE_CONFIRMATION => {
+                KeyCode::Enter if typed == FORCE_STOP_CONFIRMATION => {
                     self.cancel_modal();
-                    DashboardAction::ForceDestroy { session_id }
+                    DashboardAction::ForceStop { session_id }
                 }
                 _ => {
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-            },
-            Confirmation::DeleteActive {
-                session_id,
-                mut typed,
-            } => match code {
-                KeyCode::Esc => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                KeyCode::Backspace => {
-                    typed.pop();
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-                KeyCode::Char(c) => {
-                    if typed.len() < FORCE_CONFIRMATION.len() {
-                        typed.push(c.to_ascii_uppercase());
-                    }
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
-                        session_id,
-                        typed,
-                    }));
-                    DashboardAction::None
-                }
-                KeyCode::Enter if typed == FORCE_CONFIRMATION => {
-                    self.cancel_modal();
-                    DashboardAction::DeleteActive { session_id }
-                }
-                _ => {
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
+                    typed.handle_key(key);
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceStop {
                         session_id,
                         typed,
                     }));
@@ -1407,7 +2009,7 @@ impl DashboardState {
 mod tests {
     use std::time::Instant;
 
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -1420,72 +2022,15 @@ mod tests {
     use crate::render::render;
     use crate::{DashboardAction, DashboardState, Mode};
 
-    fn asks_to_type_destroy(dashboard: &DashboardState) -> bool {
-        matches!(
-            dashboard.mode,
-            Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::DeleteActive { .. },
-                ..
-            })
-        )
-    }
-
     #[test]
-    fn delete_active_is_immediate_only_once_a_hydrated_transcript_shows_no_assistant_messages() {
-        let mut session = stopped_session();
-        session.state = SessionState::Running;
-        session.checkpoint = None;
-        let mut dashboard = dashboard_with_session(session);
-
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Delete)),
-            DashboardAction::None
-        );
-        assert!(matches!(dashboard.mode, Mode::Dashboard));
-        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
-        assert!(matches!(dashboard.mode, Mode::Dashboard));
-
-        // Nothing has hydrated yet, so a session that looks empty may simply
-        // be one Hel has not read.
-        dashboard.handle_key(ctrl_key('p'));
-        dashboard.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert!(asks_to_type_destroy(&dashboard));
-        dashboard.handle_key(key(KeyCode::Esc));
-
-        // A transcript that could not be read is no better evidence.
-        dashboard.mark_transcript_unavailable("session-1");
-        dashboard.handle_key(ctrl_key('p'));
-        dashboard.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert!(asks_to_type_destroy(&dashboard));
-        dashboard.handle_key(key(KeyCode::Esc));
-
-        // Hydrated and empty: there is no agent work to lose.
-        apply_materialized_transcript(&mut dashboard, Vec::new());
-        dashboard.handle_key(ctrl_key('p'));
-        dashboard.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::DeleteActive {
-                session_id: "session-1".into()
-            }
-        );
-
-        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "hello")]);
-        dashboard.handle_key(ctrl_key('p'));
-        dashboard.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert!(asks_to_type_destroy(&dashboard));
+    fn web_qr_has_a_four_module_quiet_zone() {
+        let qr = render_qr("https://example.test/auth/login?token=secret").unwrap();
+        let lines = qr.lines().collect::<Vec<_>>();
+        assert!(lines.len() > 4);
+        assert!(lines[0].chars().all(|character| character == ' '));
+        assert!(lines[1].chars().all(|character| character == ' '));
+        assert!(lines.iter().all(|line| line.starts_with("    ")));
+        assert!(lines.iter().all(|line| line.ends_with("    ")));
     }
 
     fn dashboard_with_container_session() -> DashboardState {
@@ -1510,11 +2055,44 @@ mod tests {
         editor
     }
 
+    fn open_container_editor(dashboard: &mut DashboardState) {
+        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Right));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(dashboard.mode, Mode::EditContainer(_)));
+    }
+
+    fn open_rename_editor(dashboard: &mut DashboardState) {
+        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(dashboard.mode, Mode::Rename(_)));
+    }
+
+    fn open_stop_dialog(dashboard: &mut DashboardState) {
+        dashboard.handle_key(ctrl_key('e'));
+        let stop_index = match &dashboard.mode {
+            Mode::SessionEdit(dialog) => dialog.stop_index(),
+            _ => panic!("expected session edit dialog"),
+        };
+        for _ in 0..stop_index {
+            dashboard.handle_key(key(KeyCode::Right));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            dashboard.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::Close { .. },
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn ctrl_e_opens_the_container_editor_only_once_setup_is_done() {
         let mut empty = DashboardState::new(
             hel::hel_config::HelConfig {
                 version: hel::hel_config::CONFIG_VERSION,
+                phone: Default::default(),
                 profiles: Default::default(),
                 bundles: Default::default(),
                 targets: Default::default(),
@@ -1526,7 +2104,7 @@ mod tests {
         assert!(matches!(empty.mode, Mode::Dashboard));
 
         let mut dashboard = dashboard_with_container_session();
-        assert_eq!(dashboard.handle_key(ctrl_key('e')), DashboardAction::None);
+        open_container_editor(&mut dashboard);
         let editor = container_editor(&dashboard);
         assert_eq!(editor.session_id, "session-1");
         assert_eq!(editor.mounts.len(), 1);
@@ -1536,7 +2114,7 @@ mod tests {
     #[test]
     fn container_editor_saves_edited_size_mounts_and_remembered_sources() {
         let mut dashboard = dashboard_with_container_session();
-        dashboard.handle_key(ctrl_key('e'));
+        open_container_editor(&mut dashboard);
         for character in "4".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
@@ -1608,7 +2186,7 @@ mod tests {
     #[test]
     fn container_editor_marks_new_and_existing_mounts_read_only() {
         let mut dashboard = dashboard_with_container_session();
-        dashboard.handle_key(ctrl_key('e'));
+        open_container_editor(&mut dashboard);
 
         // Space on the checkbox attaches the next directory read-only.
         while container_editor(&dashboard).focus != ContainerEditFocus::Source {
@@ -1667,7 +2245,7 @@ mod tests {
     #[test]
     fn container_editor_says_when_the_change_takes_effect() {
         let mut dashboard = dashboard_with_container_session();
-        dashboard.handle_key(ctrl_key('e'));
+        open_container_editor(&mut dashboard);
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
         terminal
             .draw(|frame| crate::render::render(frame, &mut dashboard))
@@ -1680,7 +2258,7 @@ mod tests {
     #[test]
     fn rename_uses_acp_title_as_the_initial_value() {
         let mut dashboard = dashboard_with_session(running_session());
-        dashboard.handle_key(ctrl_key('r'));
+        open_rename_editor(&mut dashboard);
         let Mode::Rename(editor) = &dashboard.mode else {
             panic!("expected rename editor");
         };
@@ -1698,10 +2276,35 @@ mod tests {
         assert!(matches!(dashboard.mode, Mode::Dashboard));
     }
 
+    #[test]
+    fn focused_text_fields_own_readline_keys_and_control_c_cancels() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.begin_rename();
+        for character in " alpha beta".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+
+        let control_key =
+            |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+        assert_eq!(
+            dashboard.handle_key(control_key('w')),
+            DashboardAction::None
+        );
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor");
+        };
+        assert!(editor.title.ends_with("alpha "));
+
+        assert_eq!(
+            dashboard.handle_key(control_key('c')),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
     fn dashboard_with_rename_editor() -> DashboardState {
         let mut dashboard = dashboard_with_session(running_session());
-        dashboard.handle_key(ctrl_key('r'));
-        assert!(matches!(dashboard.mode, Mode::Rename(_)));
+        open_rename_editor(&mut dashboard);
         dashboard
     }
 
@@ -2095,11 +2698,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_archive_dialog_offers_retry_or_explicit_force_destroy() {
+    fn failed_archive_dialog_offers_retry_or_explicit_force_stop() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(ctrl_key('p'));
+        open_stop_dialog(&mut dashboard);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
@@ -2121,7 +2724,7 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Char('x'))),
             DashboardAction::None
         );
-        // "Force destroy" sits between Cancel and Retry stop.
+        // "Force stop" sits between Cancel and Retry stop.
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Left)),
             DashboardAction::None
@@ -2133,11 +2736,18 @@ mod tests {
         assert!(matches!(
             dashboard.mode,
             Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::ForceDestroy { .. },
+                confirmation: Confirmation::ForceStop { .. },
                 ..
             })
         ));
-        for character in FORCE_CONFIRMATION.chars() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .unwrap();
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("FORCE STOP · RECENT WORK MAY BE LOST"));
+        assert!(rendered.contains("resume from the latest verified recovery archive"));
+        for character in FORCE_STOP_CONFIRMATION.chars() {
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Char(character))),
                 DashboardAction::None
@@ -2145,7 +2755,7 @@ mod tests {
         }
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::ForceDestroy {
+            DashboardAction::ForceStop {
                 session_id: "session-1".into()
             }
         );
@@ -2178,14 +2788,7 @@ mod tests {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(ctrl_key('p'));
-        assert!(matches!(
-            dashboard.mode,
-            Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::Close { .. },
-                ..
-            })
-        ));
+        open_stop_dialog(&mut dashboard);
         dashboard
     }
 
@@ -2197,9 +2800,9 @@ mod tests {
         };
         assert_eq!(
             confirmation_buttons(&dialog.confirmation),
-            &["Cancel", "Delete", "Stop"]
+            &["Cancel", "Stop"]
         );
-        assert_eq!(dialog.focus, 2);
+        assert_eq!(dialog.focus, 1);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
@@ -2214,8 +2817,8 @@ mod tests {
         for cycle_keys in [
             vec![KeyCode::Tab],
             vec![KeyCode::Right],
-            vec![KeyCode::Left, KeyCode::Left],
-            vec![KeyCode::BackTab, KeyCode::BackTab],
+            vec![KeyCode::Left],
+            vec![KeyCode::BackTab],
         ] {
             let mut dashboard = running_dashboard_with_stop_dialog();
             for cycle_key in &cycle_keys {
@@ -2246,10 +2849,6 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Tab)),
-            DashboardAction::None
-        );
-        assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
                 session_id: "session-1".into()
@@ -2259,7 +2858,7 @@ mod tests {
 
     #[test]
     fn stop_confirmation_escape_cancels_from_any_button() {
-        for presses in 0..3 {
+        for presses in 0..2 {
             let mut dashboard = running_dashboard_with_stop_dialog();
             for _ in 0..presses {
                 dashboard.handle_key(key(KeyCode::Tab));
@@ -2296,7 +2895,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_confirmation_renders_cancel_delete_and_stop_with_stop_focused() {
+    fn stop_confirmation_renders_only_cancel_and_stop_with_stop_focused() {
         let mut dashboard = running_dashboard_with_stop_dialog();
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
         terminal
@@ -2306,17 +2905,13 @@ mod tests {
         let lines = buffer_lines(buffer);
         let row = lines
             .iter()
-            .position(|line| {
-                line.contains(" Cancel ") && line.contains(" Delete ") && line.contains(" Stop ")
-            })
+            .position(|line| line.contains(" Cancel ") && line.contains(" Stop "))
             .expect("button row");
         let button_y = buffer.area.y + row as u16;
         let cancel_x = buffer.area.x + cell_column(&lines[row], "Cancel");
-        let delete_x = buffer.area.x + cell_column(&lines[row], "Delete");
         let stop_x = buffer.area.x + cell_column(&lines[row], "Stop");
         assert_eq!(buffer[(stop_x, button_y)].bg, Color::Cyan);
         assert_eq!(buffer[(cancel_x, button_y)].bg, Color::DarkGray);
-        assert_eq!(buffer[(delete_x, button_y)].bg, Color::DarkGray);
         // Each label keeps its one-cell padding inside the button background.
         assert_eq!(buffer[(cancel_x - 1, button_y)].bg, Color::DarkGray);
         assert_eq!(buffer[(stop_x - 1, button_y)].bg, Color::Cyan);
@@ -2324,12 +2919,64 @@ mod tests {
     }
 
     #[test]
+    fn stopping_a_session_warns_about_a_review_it_would_end() {
+        let quiet = confirmation_lines(&Confirmation::Close {
+            session_id: "session-1".into(),
+            reviewer_conversation: false,
+        });
+        assert!(
+            !quiet.iter().any(|line| line.contains("second opinion")),
+            "a session with no review says nothing about one: {quiet:?}"
+        );
+
+        let warned = confirmation_lines(&Confirmation::Close {
+            session_id: "session-1".into(),
+            reviewer_conversation: true,
+        });
+        assert!(
+            warned
+                .iter()
+                .any(|line| line.contains("cannot be continued after resume")),
+            "stopping must warn that the review ends with the target: {warned:?}"
+        );
+        // The choice is still the ordinary one: stop anyway, or cancel.
+        assert_eq!(
+            confirmation_buttons(&Confirmation::Close {
+                session_id: "session-1".into(),
+                reviewer_conversation: true,
+            }),
+            &["Cancel", "Stop"]
+        );
+    }
+
+    /// The rendered body of one confirmation, as plain strings.
+    fn confirmation_lines(confirmation: &Confirmation) -> Vec<String> {
+        confirmation_body(confirmation)
+            .1
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
     fn button_confirmations_keep_their_button_row_visible() {
         let confirmations = [
             Confirmation::Close {
                 session_id: "session-1".into(),
+                reviewer_conversation: false,
             },
-            Confirmation::DeleteStopped {
+            // The warning adds rows, so the taller variant has to keep its
+            // buttons on screen too.
+            Confirmation::Close {
+                session_id: "session-1".into(),
+                reviewer_conversation: true,
+            },
+            Confirmation::DestroyStopped {
                 session_id: "session-1".into(),
                 reopen: None,
             },
@@ -2363,24 +3010,24 @@ mod tests {
     }
 
     #[test]
-    fn delete_stopped_confirmation_deletes_from_its_primary_button() {
+    fn destroy_stopped_confirmation_destroys_from_its_primary_button() {
         let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_resume_dialog(1, Vec::new());
         dashboard.handle_key(key(KeyCode::Delete));
         let Mode::Confirm(dialog) = &dashboard.mode else {
-            panic!("expected delete confirmation");
+            panic!("expected destroy confirmation");
         };
         assert_eq!(
             confirmation_buttons(&dialog.confirmation),
-            &["Cancel", "Delete"]
+            &["Cancel", "Destroy"]
         );
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::DeleteStopped {
+            DashboardAction::DestroyStopped {
                 session_id: "session-1".into()
             }
         );
-        // Deleting from the dialog leaves the user in the dialog.
+        // Destroying from the dialog leaves the user in the dialog.
         assert!(matches!(dashboard.mode, Mode::ResumeDialog(_)));
     }
 

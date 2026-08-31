@@ -4,13 +4,14 @@
 use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
 
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
-use crate::hel_session_manager::ManagedSessionHandle;
+use crate::hel_session_manager::{ManagedSessionHandle, SessionManagerControl};
 use crate::hel_state::{QueuedCommandKind, config_command_text};
 use crate::hel_worker::RelayCommand;
 
-use super::{ChatState, PlanControl, PlanReviewFollowup, QueuedPrompt, queued_prompt_preview};
+use super::{ChatState, PlanControl, PlanReviewFollowup, queued_prompt_preview};
 
 const CHAT_REMOTE_QUEUE_CAPACITY: usize = 32;
+const SESSION_ACTOR_REPLACEMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 pub(super) enum ChatRemoteOperation {
@@ -35,10 +36,6 @@ pub(super) enum ChatRemoteOperation {
         command_id: String,
         key: String,
         value: String,
-    },
-    SetSessionMode {
-        command_id: String,
-        mode_id: String,
     },
     PlanCommand {
         command_id: String,
@@ -86,10 +83,6 @@ pub(super) enum ChatRemoteResult {
         value: String,
         result: std::result::Result<(), String>,
     },
-    SetSessionMode {
-        mode_id: String,
-        result: std::result::Result<(), String>,
-    },
     PlanCommand {
         original: String,
         requested_active: bool,
@@ -120,9 +113,6 @@ impl ChatRemoteResult {
                 result: Err(error), ..
             }
             | Self::SetConfig {
-                result: Err(error), ..
-            }
-            | Self::SetSessionMode {
                 result: Err(error), ..
             }
             | Self::PlanCommand {
@@ -165,13 +155,17 @@ pub(super) struct ChatRemoteSupervisor {
 }
 
 impl ChatRemoteSupervisor {
-    pub(super) fn spawn(session: ManagedSessionHandle) -> Self {
+    pub(super) fn spawn(
+        session: ManagedSessionHandle,
+        session_manager: SessionManagerControl,
+    ) -> Self {
         let (operations_tx, operations_rx) = tokio::sync::mpsc::channel(CHAT_REMOTE_QUEUE_CAPACITY);
         let (results_tx, results_rx) = tokio::sync::mpsc::unbounded_channel();
         let attached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let worker_attached = attached.clone();
         let worker = tokio::spawn(run_chat_remote_worker(
             session,
+            session_manager,
             operations_rx,
             results_tx,
             worker_attached,
@@ -253,7 +247,8 @@ impl Drop for ChatRemoteSupervisor {
 }
 
 async fn run_chat_remote_worker(
-    session: ManagedSessionHandle,
+    mut session: ManagedSessionHandle,
+    session_manager: SessionManagerControl,
     mut operations: tokio::sync::mpsc::Receiver<ChatRemoteOperation>,
     results: tokio::sync::mpsc::UnboundedSender<ChatRemoteResult>,
     attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -270,6 +265,20 @@ async fn run_chat_remote_worker(
                     accepting = false;
                     continue;
                 };
+                if session.is_stopped() {
+                    let session_id = session.session_id().to_owned();
+                    match session_manager
+                        .wait_for_session(&session_id, SESSION_ACTOR_REPLACEMENT_WAIT)
+                        .await
+                    {
+                        Ok(replacement) => session = replacement,
+                        Err(error) => tracing::warn!(
+                            %session_id,
+                            error = format!("{error:#}"),
+                            "could not reacquire replacement session actor before dispatch"
+                        ),
+                    }
+                }
                 enqueue_chat_remote_operation(
                     &session,
                     operation,
@@ -525,47 +534,6 @@ async fn enqueue_chat_remote_operation(
                 }
             }
         }
-        ChatRemoteOperation::SetSessionMode {
-            command_id,
-            mode_id,
-        } => {
-            let response = session
-                .enqueue_submit(
-                    command_id,
-                    RelayCommand::SetSessionMode {
-                        mode_id: mode_id.clone(),
-                    },
-                )
-                .await;
-            match response {
-                Ok(response) => {
-                    let results = results.clone();
-                    let attached = attached.clone();
-                    pending.spawn(async move {
-                        let result = response
-                            .wait()
-                            .await
-                            .map(|_| ())
-                            .map_err(|error| format!("{error:#}"));
-                        publish_chat_remote_result(
-                            &results,
-                            &attached,
-                            ChatRemoteResult::SetSessionMode { mode_id, result },
-                        );
-                    });
-                }
-                Err(error) => {
-                    publish_chat_remote_result(
-                        results,
-                        attached,
-                        ChatRemoteResult::SetSessionMode {
-                            mode_id,
-                            result: Err(format!("{error:#}")),
-                        },
-                    );
-                }
-            }
-        }
         ChatRemoteOperation::PlanCommand {
             command_id,
             original,
@@ -790,9 +758,24 @@ pub(super) fn restore_unsent_input(chat: &mut ChatState, input: &str) {
 }
 
 pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteResult) {
+    // Most failures are intentionally converted into a notice so the user can
+    // keep reading and editing the chat. Keep the diagnostic in the process
+    // log as well; notices are transient and can be overwritten by the next
+    // event.
+    if let Some(error) = result.failure_message() {
+        tracing::warn!(
+            session_id = %chat.session_id,
+            %error,
+            "chat operation failed and was shown in the UI"
+        );
+    }
     match result {
-        ChatRemoteResult::Sync(Ok(())) => chat.set_notice("Connected to session relay"),
+        ChatRemoteResult::Sync(Ok(())) => {
+            chat.set_transcript_loading(false);
+            chat.set_notice("Connected to session relay");
+        }
         ChatRemoteResult::Sync(Err(error)) => {
+            chat.set_transcript_loading(false);
             chat.set_notice(format!("Connection failed: {error}"))
         }
         ChatRemoteResult::Prompt {
@@ -835,10 +818,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             kind,
             result: Err(error),
         } => {
-            if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
-                chat.queued_prompts
-                    .push_back(QueuedPrompt { id, text, kind });
-            }
+            chat.fail_queued_prompt_removal(id, text, kind);
             chat.set_notice(format!("Queued prompt was not removed: {error}"));
         }
         ChatRemoteResult::SetConfig { result: Ok(()), .. } => {
@@ -852,27 +832,13 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             restore_unsent_input(chat, &config_command_text(&key, &value));
             chat.set_notice(format!("Configuration was not changed: {error}"));
         }
-        ChatRemoteResult::SetSessionMode { result: Ok(()), .. } => {
-            chat.set_notice("Session mode update accepted")
-        }
-        ChatRemoteResult::SetSessionMode {
-            mode_id,
-            result: Err(error),
-        } => {
-            // The optimistic toggle never happened, so drop it rather than
-            // leave the status line claiming a mode the agent is not in.
-            chat.current_mode = None;
-            chat.set_notice(format!(
-                "Session mode was not changed to {mode_id}: {error}"
-            ));
-        }
         ChatRemoteResult::PlanCommand {
             requested_active,
             result: Ok(ordinal),
             ..
         } => {
             chat.plan_command_pending = false;
-            chat.current_mode = Some(if requested_active { "plan" } else { "default" }.into());
+            chat.finish_plan_mode_change(requested_active);
             chat.set_notice(match ordinal {
                 Some(ordinal) => format!("Prompt accepted by relay at {ordinal}"),
                 None if requested_active => "Plan mode on".to_owned(),
@@ -886,14 +852,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             result: Err(error),
         } => {
             chat.plan_command_pending = false;
-            chat.current_mode = Some(
-                if control_applied == requested_active {
-                    "plan"
-                } else {
-                    "default"
-                }
-                .into(),
-            );
+            chat.finish_plan_mode_change(control_applied == requested_active);
             restore_unsent_input(chat, &original);
             chat.set_notice(format!("Plan command was not completed: {error}"));
         }
@@ -907,7 +866,7 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
             ..
         } => {
             if let Some(active) = desired_plan_active {
-                chat.current_mode = Some(if active { "plan" } else { "default" }.into());
+                chat.finish_plan_mode_change(active);
             }
             chat.set_notice("Answer sent")
         }
@@ -939,22 +898,18 @@ pub(super) fn queue_chat_remote_operation(
                 restore_unsent_input(chat, &format!("!{command}"));
             }
             ChatRemoteOperation::RemoveQueuedPrompt { id, text, kind, .. } => {
-                if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
-                    chat.queued_prompts
-                        .push_back(QueuedPrompt { id, text, kind });
-                }
+                chat.fail_queued_prompt_removal(id, text, kind);
             }
             ChatRemoteOperation::SetConfig { key, value, .. } => {
                 restore_unsent_input(chat, &config_command_text(&key, &value));
             }
-            ChatRemoteOperation::SetSessionMode { .. } => chat.current_mode = None,
             ChatRemoteOperation::PlanCommand {
                 original,
                 requested_active,
                 ..
             } => {
                 chat.plan_command_pending = false;
-                chat.current_mode = Some(if requested_active { "default" } else { "plan" }.into());
+                chat.finish_plan_mode_change(!requested_active);
                 restore_unsent_input(chat, &original);
             }
             ChatRemoteOperation::RespondElicitation { request, .. } => {
@@ -970,6 +925,36 @@ pub(super) fn queue_chat_remote_operation(
 mod tests {
     use super::*;
     use crate::hel_chat::test_support::snapshot;
+
+    #[tokio::test]
+    async fn prompt_reacquires_replacement_actor_before_dispatch() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-replaced", 73);
+        let mut remote = ChatRemoteSupervisor::spawn(fixture.stopped, fixture.control);
+
+        remote
+            .operations()
+            .send(ChatRemoteOperation::Prompt {
+                command_id: "prompt-1".into(),
+                text: "keep going".into(),
+                session_id: "session-replaced".into(),
+                bundle_id: "bundle-1".into(),
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), remote.recv())
+            .await
+            .expect("replacement dispatch completed")
+            .expect("remote worker stayed open");
+        assert!(matches!(
+            result,
+            ChatRemoteResult::Prompt {
+                text,
+                result: Ok(73)
+            } if text == "keep going"
+        ));
+    }
 
     #[test]
     fn full_remote_queue_restores_unsent_input_without_blocking() {
@@ -1000,7 +985,7 @@ mod tests {
     #[test]
     fn failed_plan_control_restores_the_full_command_and_rolls_back_mode() {
         let mut chat = crate::hel_chat::test_support::grok_chat();
-        chat.current_mode = Some("plan".into());
+        chat.finish_plan_mode_change(true);
         chat.plan_command_pending = true;
 
         apply_chat_remote_result(
@@ -1013,7 +998,7 @@ mod tests {
             },
         );
 
-        assert_eq!(chat.current_mode.as_deref(), Some("default"));
+        assert_eq!(chat.current_mode(), Some("default"));
         assert_eq!(chat.input, "/plan inspect this");
         assert!(!chat.plan_command_pending);
     }
@@ -1033,7 +1018,7 @@ mod tests {
             },
         );
 
-        assert_eq!(chat.current_mode.as_deref(), Some("plan"));
+        assert_eq!(chat.current_mode(), Some("plan"));
         assert_eq!(chat.input, "/plan inspect this");
     }
 
@@ -1080,5 +1065,25 @@ mod tests {
         );
 
         assert_eq!(chat.input, "!cargo test");
+    }
+
+    #[test]
+    fn failed_fast_update_restores_the_user_facing_toggle_command() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        apply_chat_remote_result(
+            &mut chat,
+            ChatRemoteResult::SetConfig {
+                key: "fast-mode".into(),
+                value: "on".into(),
+                result: Err("rejected".into()),
+            },
+        );
+
+        assert_eq!(chat.input, "/fast");
+        assert_eq!(
+            chat.notice().as_deref(),
+            Some("Configuration was not changed: rejected")
+        );
     }
 }

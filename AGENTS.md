@@ -1,3 +1,17 @@
+# ExecPlans
+
+Use an ExecPlan for a complex feature or a significant refactor. Follow `.agents/PLANS.md` from design through implementation.
+
+Use `.agents/` as the only repository namespace for planning and design artifacts that agents own. Do not create `.agent/`.
+
+Store each ExecPlan in `.agents/plans/`.
+
+Keep `.agents/PLANS.md` as the standard for ExecPlans. Do not store individual ExecPlans next to `.agents/PLANS.md`.
+
+Store design notes for LLMs or agents in `.agents/docs/`. These notes can include agent context, publication runbooks, parity notes, and similar internal information. Do not publish these notes as product documentation.
+
+Reserve `docs/` for future documentation for human readers. Do not store ExecPlans, agent runbooks, or LLM-only context in `docs/`.
+
 # Repository Guidelines
 
 # Git / version control
@@ -86,6 +100,8 @@ Use idiomatic Rust formatted by rustfmt. Prefer clear module boundaries that mat
 ## Testing Guidelines
 
 `.cargo/config.toml` defaults the build target to `x86_64-unknown-linux-musl` so the built controller doubles as the container worker. On non-x86_64-Linux hosts (for example macOS), pass your host triple explicitly: `cargo build --target aarch64-apple-darwin`.
+
+Run every `cargo test` invocation outside the restricted sandbox with elevated permissions. The suite exercises loopback TCP and Unix sockets; sandboxed runs can fail with `EPERM` or hang and do not provide a valid test result.
 
 Add focused unit tests near the code under test using `#[cfg(test)] mod tests`. Follow the existing descriptive test naming style, e.g. `autocomplete_updates_matches_for_prefix`. For state-machine changes, test the event transition or input handling directly rather than relying only on manual TUI checks. Run `cargo test` and `cargo clippy --all-targets -- -D warnings` before submitting changes.
 

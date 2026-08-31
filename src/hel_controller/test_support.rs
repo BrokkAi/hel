@@ -22,6 +22,7 @@ use super::worktree::{
 
 pub(super) fn checkpoint_test_session(session_id: &str) -> SessionRecord {
     SessionRecord {
+        workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
         archived: false,
         container_cpus: None,
         container_memory: None,
@@ -138,6 +139,7 @@ pub(super) fn resume_compatibility_config() -> HelConfig {
                 identity_file: None,
                 extra_args: Vec::new(),
             },
+            permissions: crate::hel_config::PermissionMode::Yolo,
             workspace_prefix: ".local/share/hel/workspaces".into(),
         },
     );

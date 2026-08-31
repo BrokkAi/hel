@@ -7,19 +7,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
-use hel::hel_controller::{Controller, ResumeRepositorySourceReceipt, SessionResumeOptions};
+use hel::hel_controller::{Controller, ResumeRepositorySourceReceipt};
 use hel::hel_setup::SetupOutcome;
 use hel::hel_targets::CancellableProcessExecutor;
+use hel_tui::WebViewerAccess;
 use hel_tui::{DashboardAction, SessionOperationKind};
 
+use crate::daemon;
 use crate::dashboard::io::{
-    ArchiveWriteTarget, ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest,
-    ResumeRepositoryPreflightApply, StageReportingExecutor, config_only_controller,
-    spawn_archive_write, spawn_cancellable_io, spawn_create_bundle,
+    ArchiveWriteTarget, ConfigRenameRequest, ContainerSettingsRequest, DashboardIoUpdate,
+    LifecycleOperationRequest, ResumeRepositoryPreflightApply, config_only_controller,
+    spawn_archive_write, spawn_cancellable_io, spawn_cancellable_io_with_token,
+    spawn_clipboard_read, spawn_config_rename, spawn_create_bundle,
     spawn_dashboard_container_settings, spawn_dashboard_create_session, spawn_dashboard_rename,
-    spawn_lifecycle_operation,
+    spawn_io, spawn_lifecycle_operation,
 };
-use crate::dashboard::{DashboardContext, QUOTA_REFRESH_NOTICE, View, resume_progress_notice};
+use crate::dashboard::{DashboardContext, QUOTA_REFRESH_NOTICE, resume_progress_notice};
 use crate::import::{DashboardImportSafety, PendingDashboardImport};
 use crate::pollers::{LifecycleSuccess, spawn_aws_resource_options_resolution};
 use crate::short_id;
@@ -34,26 +37,131 @@ pub(crate) async fn apply_dashboard_action(
         DashboardAction::QuitDetach => {
             context.request_shutdown();
         }
+        DashboardAction::OpenWorkspacePicker => {
+            context.request_workspace_switch();
+        }
         DashboardAction::OpenConfig => match context.run_setup_dialog()? {
             SetupOutcome::Written => {
-                context.controller.reload()?;
-                context
-                    .dashboard
-                    .set_config(context.controller.config.clone());
-                context
-                    .dashboard
-                    .set_state(context.controller.state.clone());
-                context.request_quota_refresh();
-                context.refresh_poll_targets();
-                context
-                    .dashboard
-                    .set_notice("Setup complete. Press Ctrl+N to start your first session.");
+                context.dashboard.set_notice("Saving setup changes…");
+                let workspace_id = context.workspace_id.clone();
+                let client_id = context.client_id.clone();
+                spawn_io(
+                    "reload setup state",
+                    context.dashboard_io_tx.clone(),
+                    move || {
+                        let mut controller = Controller::load()?;
+                        super::retain_workspace_sessions(
+                            &mut controller,
+                            &workspace_id,
+                            &client_id,
+                        )?;
+                        Ok(controller)
+                    },
+                    DashboardIoUpdate::SetupReloaded,
+                );
             }
             SetupOutcome::Cancelled => context.dashboard.set_notice("Setup cancelled."),
         },
         DashboardAction::RefreshQuotas => {
             context.manual_quota_refresh_generation = Some(context.request_quota_refresh());
             context.dashboard.set_notice(QUOTA_REFRESH_NOTICE);
+        }
+        DashboardAction::RefreshCapacity => context.request_capacity_refresh(),
+        DashboardAction::LoadWebAccess => {
+            let updates = context.dashboard_io_tx.clone();
+            tokio::spawn(async move {
+                let access = match async {
+                    let mut daemon = daemon::connect_existing().await?;
+                    daemon.status().await
+                }
+                .await
+                {
+                    Ok(status) => match status.phone_status {
+                        daemon::WebViewerStatus::Ready {
+                            viewer_url,
+                            viewer_code,
+                            qr_login_url,
+                            fallback_reason,
+                        } => WebViewerAccess::Ready {
+                            viewer_url,
+                            viewer_code,
+                            qr_login_url,
+                            fallback_reason,
+                        },
+                        other => WebViewerAccess::Unavailable(other.to_string()),
+                    },
+                    Err(error) => WebViewerAccess::Unavailable(format!(
+                        "Could not load web viewer access: {error:#}"
+                    )),
+                };
+                if let Err(error) = updates.send(DashboardIoUpdate::WebAccess(access)) {
+                    tracing::debug!(%error, "web viewer access result dropped after dashboard shutdown");
+                }
+            });
+        }
+        DashboardAction::TestTarget { target_id } => {
+            let config = context.controller.config.clone();
+            let reported_id = target_id.clone();
+            let (cancelled, _) = spawn_cancellable_io_with_token(
+                context.critical_operations.clone(),
+                format!("testing target {target_id}"),
+                context.dashboard_io_tx.clone(),
+                move |cancelled| {
+                    if cancelled.load(Ordering::Acquire) {
+                        anyhow::bail!("target test cancelled");
+                    }
+                    let executor = CancellableProcessExecutor::new(cancelled)
+                        .with_deadline(std::time::Duration::from_secs(15));
+                    config_only_controller(config).test_target(&target_id, &executor)
+                },
+                move |result| DashboardIoUpdate::TargetTest {
+                    target_id: reported_id,
+                    result,
+                },
+            );
+            context.target_test_cancel = Some(cancelled);
+        }
+        DashboardAction::CancelTargetTest => {
+            if let Some(cancelled) = context.target_test_cancel.take() {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
+        DashboardAction::RenameProfile { old_id, new_id } => {
+            let what = format!("profile {old_id} to {new_id}");
+            spawn_config_rename(
+                ConfigRenameRequest {
+                    what,
+                    old_id,
+                    new_id,
+                    profile: true,
+                    workspace_id: context.workspace_id.clone(),
+                    client_id: context.client_id.clone(),
+                },
+                context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
+            );
+        }
+        DashboardAction::RenameTarget { old_id, new_id } => {
+            let what = format!("target {old_id} to {new_id}");
+            spawn_config_rename(
+                ConfigRenameRequest {
+                    what,
+                    old_id,
+                    new_id,
+                    profile: false,
+                    workspace_id: context.workspace_id.clone(),
+                    client_id: context.client_id.clone(),
+                },
+                context.dashboard_io_tx.clone(),
+                context.critical_operations.clone(),
+            );
+        }
+        DashboardAction::PasteFromClipboard => {
+            if !context.clipboard_read_in_flight {
+                context.clipboard_read_in_flight = true;
+                context.dashboard.set_notice("Reading clipboard…");
+                spawn_clipboard_read(context.dashboard_io_tx.clone());
+            }
         }
         DashboardAction::MarkAllRead { receipts } => {
             context.acknowledge_dashboard_sessions(receipts);
@@ -314,34 +422,26 @@ pub(crate) async fn apply_dashboard_action(
         }
         action @ DashboardAction::CreateSession { .. } => start_session_launch(context, action),
         DashboardAction::Open { session_id } => {
-            if context.hold_chat_session(&session_id).await.is_ok() {
-                context.view = View::Chat;
-                context.acknowledge_visible_chat();
-            }
-            context.dirty = true;
+            context.open_chat_session(&session_id);
         }
         action @ DashboardAction::ResumeSession { .. } => start_session_launch(context, action),
         DashboardAction::Close { session_id } => {
             context
                 .dashboard
                 .set_notice(format!("Stopping {}…", short_id(&session_id)));
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Stopping,
-                true,
-            );
-            let session_manager = context.worker_commands_tx.clone();
+            let request =
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Stopping);
             let runtime = tokio::runtime::Handle::current();
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    runtime.block_on(controller.close_session_managed_controlled(
-                        &session_id,
-                        &executor,
-                        &session_manager,
-                    ))?;
+                move |_controller, _cancelled| {
+                    runtime.block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .close_session(session_id)
+                            .await
+                    })?;
                     Ok(LifecycleSuccess::Closed)
                 },
             );
@@ -357,69 +457,70 @@ pub(crate) async fn apply_dashboard_action(
                 context.critical_operations.clone(),
             );
         }
-        DashboardAction::ForceDestroy { session_id } => {
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Destroying,
-                true,
-            );
+        DashboardAction::ForceStop { session_id } => {
+            let request =
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Stopping);
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.force_destroy(&session_id, &executor)?;
-                    Ok(LifecycleSuccess::Destroyed)
+                move |_controller, _cancelled| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .force_stop_session(session_id)
+                            .await
+                    })?;
+                    Ok(LifecycleSuccess::ForceStopped)
                 },
             );
         }
-        DashboardAction::DeleteActive { session_id } => {
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Deleting,
-                true,
-            );
+        DashboardAction::DestroyStopped { session_id } => {
+            let request =
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Destroying);
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.force_destroy(&session_id, &executor)?;
-                    controller.delete_session_controlled(&session_id, &executor)?;
-                    Ok(LifecycleSuccess::DeletedActive)
+                move |_controller, _cancelled| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .destroy_stopped_session(session_id)
+                            .await
+                    })?;
+                    Ok(LifecycleSuccess::DestroyedStopped)
                 },
             );
         }
-        DashboardAction::DeleteStopped { session_id } => {
-            // A stopped session has no worker, so nothing is copying it and
-            // no recovery reservation is needed.
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Deleting,
-                false,
-            );
-            spawn_lifecycle_operation(
-                request,
-                context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    if cancelled.load(Ordering::Acquire) {
-                        bail!("operation cancelled");
-                    }
-                    let executor = CancellableProcessExecutor::new(cancelled);
-                    controller.delete_session_controlled(&session_id, &executor)?;
-                    Ok(LifecycleSuccess::DeletedStopped)
-                },
-            );
-        }
-        DashboardAction::CancelOperation { session_id } => {
+        DashboardAction::CancelOperation { session_id, kind } => {
             if let Some(operation) = context.lifecycle_operations.get(&session_id) {
                 operation.cancelled.store(true, Ordering::Release);
-                context.dashboard.set_notice(format!(
-                    "Cancelling {} for {}…",
-                    operation.kind.label().to_ascii_lowercase(),
-                    short_id(&session_id)
-                ));
             }
+            let daemon_session_id = session_id.clone();
+            let updates = context.dashboard_io_tx.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    daemon::connect_or_start()
+                        .await?
+                        .cancel_lifecycle(daemon_session_id.clone())
+                        .await
+                }
+                .await
+                .map_err(|error: anyhow::Error| format!("{error:#}"));
+                if updates
+                    .send(DashboardIoUpdate::LifecycleCancellation {
+                        session_id: daemon_session_id,
+                        result,
+                    })
+                    .is_err()
+                {
+                    tracing::debug!("dashboard closed before lifecycle cancellation completed");
+                }
+            });
+            context.dashboard.set_notice(format!(
+                "Cancelling {} for {}…",
+                kind.label().to_ascii_lowercase(),
+                short_id(&session_id)
+            ));
         }
     }
     Ok(())
@@ -494,6 +595,7 @@ fn start_session_launch_with_repository_preflight(
             context.dashboard.set_notice("Preparing session launch…");
             spawn_dashboard_create_session(
                 action,
+                context.workspace_id.clone(),
                 context.dashboard_io_tx.clone(),
                 context.lifecycle_updates_tx.clone(),
                 tokio::runtime::Handle::current(),
@@ -513,41 +615,32 @@ fn start_session_launch_with_repository_preflight(
                 &profile_id,
                 &target_template_id,
             ));
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Resuming,
-                true,
-            );
+            let request =
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Resuming);
             context.dashboard.set_resume_destination(
                 &session_id,
                 profile_id.clone(),
                 target_template_id.clone(),
             );
-            let stage_updates = context.dashboard_io_tx.clone();
             let runtime = tokio::runtime::Handle::current();
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
-                move |controller, cancelled| {
-                    let executor = StageReportingExecutor::new(
-                        CancellableProcessExecutor::new(cancelled),
-                        session_id.clone(),
-                        stage_updates,
-                    );
-                    let materialized = runtime.block_on(
-                        controller.resume_session_controlled_with_repository_preflight(
-                            &session_id,
-                            &profile_id,
-                            &target_template_id,
-                            SessionResumeOptions {
+                move |_controller, _cancelled| {
+                    let materialized = runtime.block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .resume_session(daemon::ResumeSessionRequest {
+                                session_id: session_id.clone(),
+                                profile_id: profile_id.clone(),
+                                target_template_id: target_template_id.clone(),
                                 additional_mounts: Some(additional_mounts),
                                 resource_allocation,
                                 discard_queue,
-                            },
-                            repository_preflight,
-                            &executor,
-                        ),
-                    )?;
+                                repository_preflight,
+                            })
+                            .await
+                    })?;
                     Ok(LifecycleSuccess::Resumed {
                         profile_id,
                         target_id: target_template_id,
@@ -562,13 +655,11 @@ fn start_session_launch_with_repository_preflight(
 
 impl DashboardContext {
     /// Marks a session busy in the UI and hands back what runs its operation
-    /// off the loop. `reserve_recovery` is for operations that must preempt a
-    /// recovery copy already running for the session.
+    /// off the loop. The daemon owns lifecycle/recovery serialization.
     fn begin_lifecycle_operation(
         &mut self,
         session_id: &str,
         kind: SessionOperationKind,
-        reserve_recovery: bool,
     ) -> LifecycleOperationRequest {
         self.dashboard
             .begin_session_operation(session_id.to_owned(), kind, None);
@@ -584,7 +675,6 @@ impl DashboardContext {
             session_id: session_id.to_owned(),
             kind,
             cancelled,
-            recovery: reserve_recovery.then(|| self.recovery_observer.clone()),
             updates: self.lifecycle_updates_tx.clone(),
         }
     }

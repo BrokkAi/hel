@@ -1,21 +1,21 @@
 //! Prompt history: reverse-i-search over the stored prompts and the up/down
 //! walk through this session's and this project's earlier prompts.
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
+use crate::hel_text_input::TextInput;
 
 use super::ChatState;
-use super::input::previous_grapheme_boundary;
 
 #[derive(Debug, Clone)]
 pub(super) struct HistorySearch {
     original_input: String,
     original_cursor: usize,
     generation: u64,
-    pub(super) query: String,
+    pub(super) query: TextInput,
     pub(super) scope: HistoryScope,
     matches: Vec<PromptHistoryEntry>,
     selected: Option<usize>,
@@ -60,7 +60,7 @@ impl ChatState {
             original_input: self.input.clone(),
             original_cursor: self.input_cursor,
             generation: self.next_history_search_generation,
-            query: String::new(),
+            query: TextInput::new(),
             scope: HistoryScope::Project,
             matches: Vec::new(),
             selected: None,
@@ -75,7 +75,7 @@ impl ChatState {
         };
         let generation = self.next_history_search_generation.wrapping_add(1);
         self.next_history_search_generation = generation;
-        let query = search.query.clone();
+        let query = search.query.to_string();
         let scope = search.scope;
         if let Some(search) = self.history_search.as_mut() {
             search.generation = generation;
@@ -252,31 +252,13 @@ impl ChatState {
             self.accept_history_search();
             return;
         }
-        if code == KeyCode::Backspace
-            || modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('h')
-        {
-            if let Some(search) = self.history_search.as_mut() {
-                let end = search.query.len();
-                let start = previous_grapheme_boundary(&search.query, end);
-                search.query.replace_range(start..end, "");
-            }
-            self.refresh_history_search();
-            return;
-        }
-        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('u') {
-            if let Some(search) = self.history_search.as_mut() {
-                search.query.clear();
-            }
-            self.refresh_history_search();
-            return;
-        }
-        if let KeyCode::Char(character) = code
-            && !character.is_ascii_control()
-            && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            if let Some(search) = self.history_search.as_mut() {
-                search.query.push(character);
-            }
+        let changed = self.history_search.as_mut().is_some_and(|search| {
+            search
+                .query
+                .handle_key(KeyEvent::new(code, modifiers))
+                .changed()
+        });
+        if changed {
             self.refresh_history_search();
         }
     }

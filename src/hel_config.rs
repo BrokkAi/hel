@@ -11,6 +11,61 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+fn default_phone_bind() -> String {
+    "127.0.0.1:3765".to_owned()
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhoneConfig {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default = "default_phone_bind")]
+    pub bind: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub tailscale_detect: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
+}
+
+impl Default for PhoneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: default_phone_bind(),
+            tailscale_detect: true,
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+impl PhoneConfig {
+    fn validate(&self) -> Result<()> {
+        let bind: std::net::SocketAddr = self
+            .bind
+            .parse()
+            .with_context(|| format!("parse phone bind address {:?}", self.bind))?;
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            bail!("phone TLS requires both `tls_cert` and `tls_key`");
+        }
+        if !bind.ip().is_loopback() && self.tls_cert.is_none() {
+            bail!("a non-loopback phone bind requires TLS");
+        }
+        Ok(())
+    }
+}
+
 pub const CONFIG_VERSION: u32 = 1;
 pub const PRODUCT_DIR: &str = "hel";
 
@@ -25,8 +80,8 @@ pub enum HarnessKind {
 }
 
 /// The target-level execution policy Hel applies independently of the selected
-/// harness. Raw localhost preserves the profile; other targets force full
-/// access because their isolation boundary contains the blast radius.
+/// harness. Raw targets may preserve configured approvals; isolated targets
+/// force full access because their boundary contains the blast radius.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPolicy {
@@ -36,74 +91,60 @@ pub enum ExecutionPolicy {
     Unconstrained,
 }
 
+/// Approval behavior selected for a named raw SSH target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionMode {
+    /// Preserve the selected harness profile's approval behavior.
+    Guardian,
+    /// Run every action without sandboxing or approval checks.
+    Yolo,
+}
+
+impl PermissionMode {
+    pub const fn execution_policy(self) -> ExecutionPolicy {
+        match self {
+            Self::Guardian => ExecutionPolicy::ConfiguredApprovals,
+            Self::Yolo => ExecutionPolicy::Unconstrained,
+        }
+    }
+}
+
 impl ExecutionPolicy {
     pub const fn is_unconstrained(self) -> bool {
         matches!(self, Self::Unconstrained)
     }
 }
 
-/// Harness-specific controls that realize a target-level execution policy.
+/// Harness-specific controls that collectively realize a target-level
+/// execution policy. A harness may need more than one launch-time mechanism
+/// in addition to an ACP mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionEnforcement {
-    /// Selected over ACP once the session exists.
-    AcpMode(&'static str),
-    /// Selected at bridge launch and enforced again over ACP once the session
-    /// exists. Initializing the bridge in the desired mode prevents it from
-    /// creating or restoring a session with a transient restrictive policy.
-    AcpModeWithLaunchEnvironment {
-        mode: &'static str,
-        key: &'static str,
-        value: &'static str,
-    },
-    /// Applied to the bridge command line at launch. The harness exposes no
-    /// ACP equivalent, so there is nothing to enforce after the session opens.
-    LaunchFlag {
-        flag: &'static str,
-        label: &'static str,
-    },
-    /// Applied through the child environment at launch.
-    LaunchEnvironment {
-        key: &'static str,
-        value: &'static str,
-        label: &'static str,
-    },
+pub struct ExecutionEnforcement {
+    label: &'static str,
+    acp_mode: Option<&'static str>,
+    launch_flag: Option<&'static str>,
+    launch_environment: Option<(&'static str, &'static str)>,
 }
 
 impl ExecutionEnforcement {
     /// Name reported to the UI for the mode this session runs in.
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::AcpMode(mode) => mode,
-            Self::AcpModeWithLaunchEnvironment { mode, .. } => mode,
-            Self::LaunchFlag { label, .. } => label,
-            Self::LaunchEnvironment { label, .. } => label,
-        }
+        self.label
     }
 
     /// The ACP mode to select after the session opens, when there is one.
     pub const fn acp_mode(self) -> Option<&'static str> {
-        match self {
-            Self::AcpMode(mode) => Some(mode),
-            Self::AcpModeWithLaunchEnvironment { mode, .. } => Some(mode),
-            Self::LaunchFlag { .. } | Self::LaunchEnvironment { .. } => None,
-        }
+        self.acp_mode
     }
 
     /// The launch flag to add to the bridge command line, when there is one.
     pub const fn launch_flag(self) -> Option<&'static str> {
-        match self {
-            Self::AcpMode(_) | Self::AcpModeWithLaunchEnvironment { .. } => None,
-            Self::LaunchFlag { flag, .. } => Some(flag),
-            Self::LaunchEnvironment { .. } => None,
-        }
+        self.launch_flag
     }
 
     pub const fn launch_environment(self) -> Option<(&'static str, &'static str)> {
-        match self {
-            Self::LaunchEnvironment { key, value, .. } => Some((key, value)),
-            Self::AcpModeWithLaunchEnvironment { key, value, .. } => Some((key, value)),
-            Self::AcpMode(_) | Self::LaunchFlag { .. } => None,
-        }
+        self.launch_environment
     }
 }
 
@@ -170,32 +211,53 @@ impl HarnessKind {
     ) -> Option<ExecutionEnforcement> {
         match (self, policy) {
             (_, ExecutionPolicy::ConfiguredApprovals) => None,
-            (Self::Codex, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::AcpModeWithLaunchEnvironment {
-                    mode: "agent-full-access",
-                    key: "INITIAL_AGENT_MODE",
-                    value: "agent-full-access",
-                })
-            }
-            (Self::Claude, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::AcpMode("bypassPermissions"))
-            }
-            (Self::Kimi, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::AcpMode("auto"))
-            }
-            (Self::Grok, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::LaunchFlag {
-                    flag: "--always-approve",
-                    label: "always-approve",
-                })
-            }
-            (Self::Deepseek, ExecutionPolicy::Unconstrained) => {
-                Some(ExecutionEnforcement::LaunchEnvironment {
-                    key: "DSH_PERMISSION_MODE",
-                    value: "danger-full-access",
-                    label: "danger-full-access",
-                })
-            }
+            (Self::Codex, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "agent-full-access",
+                acp_mode: Some("agent-full-access"),
+                launch_flag: None,
+                launch_environment: Some(("INITIAL_AGENT_MODE", "agent-full-access")),
+            }),
+            (Self::Claude, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "bypassPermissions / sandbox-off",
+                acp_mode: Some("bypassPermissions"),
+                launch_flag: None,
+                launch_environment: None,
+            }),
+            (Self::Kimi, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "auto",
+                acp_mode: Some("auto"),
+                launch_flag: None,
+                launch_environment: None,
+            }),
+            (Self::Grok, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "always-approve / sandbox-off",
+                acp_mode: None,
+                launch_flag: Some("--always-approve"),
+                launch_environment: Some(("GROK_SANDBOX", "off")),
+            }),
+            (Self::Deepseek, ExecutionPolicy::Unconstrained) => Some(ExecutionEnforcement {
+                label: "danger-full-access",
+                acp_mode: None,
+                launch_flag: None,
+                launch_environment: Some(("DSH_PERMISSION_MODE", "danger-full-access")),
+            }),
+        }
+    }
+
+    /// Apply the launch environment required to realize `policy`. The
+    /// controller writes this into new launch configs, and the worker repeats
+    /// it so persisted configs from older Hel versions acquire the same
+    /// enforcement after an upgrade.
+    pub fn configure_execution_environment(
+        self,
+        policy: ExecutionPolicy,
+        environment: &mut BTreeMap<String, String>,
+    ) {
+        if let Some((key, value)) = self
+            .execution_enforcement(policy)
+            .and_then(ExecutionEnforcement::launch_environment)
+        {
+            environment.insert(key.to_owned(), value.to_owned());
         }
     }
 
@@ -546,6 +608,7 @@ pub enum TargetTemplate {
     SshBare {
         #[serde(flatten)]
         ssh: SshConnection,
+        permissions: PermissionMode,
         #[serde(default = "default_named_machine_prefix")]
         workspace_prefix: PathBuf,
     },
@@ -558,6 +621,21 @@ pub enum TargetTemplate {
 }
 
 impl TargetTemplate {
+    pub const fn execution_policy(&self) -> ExecutionPolicy {
+        match self {
+            Self::LocalBare => ExecutionPolicy::ConfiguredApprovals,
+            Self::SshBare { permissions, .. } => permissions.execution_policy(),
+            _ => ExecutionPolicy::Unconstrained,
+        }
+    }
+
+    pub const fn permission_mode(&self) -> Option<PermissionMode> {
+        match self {
+            Self::SshBare { permissions, .. } => Some(*permissions),
+            _ => None,
+        }
+    }
+
     fn validate(&self, id: &str) -> Result<()> {
         validate_id("target template", id)?;
         match self {
@@ -593,6 +671,7 @@ impl TargetTemplate {
             Self::SshBare {
                 ssh,
                 workspace_prefix,
+                ..
             } => {
                 ssh.validate(id)?;
                 if workspace_prefix.as_os_str().is_empty()
@@ -605,7 +684,7 @@ impl TargetTemplate {
                 }
                 Ok(())
             }
-            Self::SshPodman { ssh, container } => {
+            Self::SshPodman { ssh, container, .. } => {
                 ssh.validate(id)?;
                 container.validate(id)
             }
@@ -635,6 +714,17 @@ pub fn mount_history_host(template: &TargetTemplate) -> Option<&str> {
     }
 }
 
+/// Stable physical-host key for reusable container CPU and memory defaults.
+pub fn container_size_host(template: &TargetTemplate) -> Option<&str> {
+    match template {
+        TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => Some("local"),
+        TargetTemplate::SshPodman { ssh, .. } => Some(&ssh.host),
+        TargetTemplate::LocalBare
+        | TargetTemplate::SshBare { .. }
+        | TargetTemplate::AwsEc2 { .. } => None,
+    }
+}
+
 fn validate_environment(owner: &str, environment: &BTreeMap<String, String>) -> Result<()> {
     if environment
         .keys()
@@ -649,6 +739,8 @@ fn validate_environment(owner: &str, environment: &BTreeMap<String, String>) -> 
 #[serde(deny_unknown_fields)]
 pub struct HelConfig {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "PhoneConfig::is_default")]
+    pub phone: PhoneConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, HarnessProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -661,6 +753,7 @@ impl Default for HelConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            phone: PhoneConfig::default(),
             profiles: BTreeMap::new(),
             bundles: BTreeMap::new(),
             targets: BTreeMap::new(),
@@ -676,6 +769,7 @@ impl HelConfig {
                 self.version
             );
         }
+        self.phone.validate()?;
         for (id, profile) in &self.profiles {
             profile.validate(id)?;
         }
@@ -702,6 +796,7 @@ impl HelConfig {
             return Ok(Self::default());
         }
         reject_removed_profile_overrides(&contents)?;
+        reject_non_bare_permissions(&contents)?;
         let config: Self = toml::from_str(&contents)
             .with_context(|| format!("parse Hel config {}", path.display()))?;
         config.validate()?;
@@ -746,6 +841,30 @@ impl HelConfig {
         config.save_to(path)?;
         Ok(true)
     }
+}
+
+impl PhoneConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+fn reject_non_bare_permissions(contents: &str) -> Result<()> {
+    let value: toml::Value = contents.parse().context("parse Hel config TOML")?;
+    let Some(targets) = value.get("targets").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (id, target) in targets {
+        let Some(target) = target.as_table() else {
+            continue;
+        };
+        if target.contains_key("permissions")
+            && target.get("kind").and_then(toml::Value::as_str) != Some("ssh-bare")
+        {
+            bail!("target {id:?} sets `permissions`, which is only valid for ssh-bare targets");
+        }
+    }
+    Ok(())
 }
 
 fn reject_removed_profile_overrides(contents: &str) -> Result<()> {
@@ -931,6 +1050,7 @@ mod tests {
     fn sample_config() -> HelConfig {
         HelConfig {
             version: CONFIG_VERSION,
+            phone: PhoneConfig::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
@@ -1025,34 +1145,24 @@ mod tests {
         assert_eq!(HarnessKind::Claude.home_env(), "CLAUDE_CONFIG_DIR");
         assert_eq!(HarnessKind::Kimi.home_env(), "KIMI_CODE_HOME");
         assert_eq!(HarnessKind::Grok.home_env(), "GROK_HOME");
-        assert_eq!(
-            HarnessKind::Codex.execution_enforcement(ExecutionPolicy::Unconstrained),
-            Some(ExecutionEnforcement::AcpModeWithLaunchEnvironment {
-                mode: "agent-full-access",
-                key: "INITIAL_AGENT_MODE",
-                value: "agent-full-access",
-            })
-        );
-        assert_eq!(
-            HarnessKind::Claude.execution_enforcement(ExecutionPolicy::Unconstrained),
-            Some(ExecutionEnforcement::AcpMode("bypassPermissions"))
-        );
-        assert_eq!(
-            HarnessKind::Kimi.execution_enforcement(ExecutionPolicy::Unconstrained),
-            Some(ExecutionEnforcement::AcpMode("auto"))
-        );
-        assert_eq!(
-            HarnessKind::Grok.execution_enforcement(ExecutionPolicy::Unconstrained),
-            Some(ExecutionEnforcement::LaunchFlag {
-                flag: "--always-approve",
-                label: "always-approve",
-            })
-        );
+        let codex = HarnessKind::Codex
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
+        assert_eq!(codex.acp_mode(), Some("agent-full-access"));
+        assert_eq!(codex.label(), "agent-full-access");
+        let claude = HarnessKind::Claude
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
+        assert_eq!(claude.acp_mode(), Some("bypassPermissions"));
+        let kimi = HarnessKind::Kimi
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
+        assert_eq!(kimi.acp_mode(), Some("auto"));
     }
 
     #[test]
     fn unconstrained_enforcement_splits_acp_modes_from_launch_controls() {
-        for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
+        for kind in [HarnessKind::Codex, HarnessKind::Kimi] {
             let enforcement = kind
                 .execution_enforcement(ExecutionPolicy::Unconstrained)
                 .unwrap();
@@ -1071,7 +1181,13 @@ mod tests {
             .unwrap();
         assert_eq!(grok.acp_mode(), None);
         assert_eq!(grok.launch_flag(), Some("--always-approve"));
-        assert_eq!(grok.label(), "always-approve");
+        assert_eq!(grok.label(), "always-approve / sandbox-off");
+        assert_eq!(grok.launch_environment(), Some(("GROK_SANDBOX", "off")));
+        let claude = HarnessKind::Claude
+            .execution_enforcement(ExecutionPolicy::Unconstrained)
+            .unwrap();
+        assert_eq!(claude.acp_mode(), Some("bypassPermissions"));
+        assert_eq!(claude.label(), "bypassPermissions / sandbox-off");
         let deepseek = HarnessKind::Deepseek
             .execution_enforcement(ExecutionPolicy::Unconstrained)
             .unwrap();
@@ -1312,12 +1428,117 @@ mod tests {
     }
 
     #[test]
+    fn raw_ssh_permissions_are_required_and_podman_rejects_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = sample_config();
+        let container = match config.targets.remove("podman-default").unwrap() {
+            TargetTemplate::LocalPodman { container } => container,
+            _ => unreachable!(),
+        };
+        let ssh = SshConnection {
+            host: "builder".into(),
+            user: None,
+            identity_file: None,
+            extra_args: Vec::new(),
+        };
+        config.targets = BTreeMap::from([
+            (
+                "builder-guardian".into(),
+                TargetTemplate::SshBare {
+                    ssh: ssh.clone(),
+                    permissions: PermissionMode::Guardian,
+                    workspace_prefix: default_named_machine_prefix(),
+                },
+            ),
+            (
+                "builder-yolo".into(),
+                TargetTemplate::SshBare {
+                    ssh: ssh.clone(),
+                    permissions: PermissionMode::Yolo,
+                    workspace_prefix: default_named_machine_prefix(),
+                },
+            ),
+            (
+                "builder-podman".into(),
+                TargetTemplate::SshPodman { ssh, container },
+            ),
+        ]);
+
+        config.save_to(&path).unwrap();
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("permissions = \"guardian\""), "{body}");
+        assert!(body.contains("permissions = \"yolo\""), "{body}");
+        assert_eq!(body.matches("permissions = ").count(), 2, "{body}");
+        assert_eq!(HelConfig::load_from(&path).unwrap(), config);
+
+        fs::write(
+            &path,
+            "version = 1\n[targets.builder]\nkind = \"ssh-bare\"\nhost = \"builder\"\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", HelConfig::load_from(&path).unwrap_err());
+        assert!(error.contains("permissions"), "{error}");
+
+        fs::write(
+            &path,
+            "version = 1\n[targets.builder]\nkind = \"ssh-podman\"\nhost = \"builder\"\npermissions = \"guardian\"\nimage = \"example.invalid/agent:latest\"\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", HelConfig::load_from(&path).unwrap_err());
+        assert!(error.contains("only valid for ssh-bare"), "{error}");
+    }
+
+    #[test]
     fn missing_config_uses_clean_v1_defaults() {
         let directory = tempfile::tempdir().unwrap();
-        assert_eq!(
-            HelConfig::load_from(&directory.path().join("missing.toml")).unwrap(),
-            HelConfig::default()
-        );
+        let config = HelConfig::load_from(&directory.path().join("missing.toml")).unwrap();
+        assert_eq!(config, HelConfig::default());
+        assert!(config.phone.enabled);
+        assert!(config.phone.tailscale_detect);
+    }
+
+    #[test]
+    fn omitted_phone_fields_enable_the_web_viewer_and_tailscale_detection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "version = 1\n[phone]\nbind = \"127.0.0.1:4765\"\n").unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+
+        assert!(config.phone.enabled);
+        assert!(config.phone.tailscale_detect);
+        assert_eq!(config.phone.bind, "127.0.0.1:4765");
+    }
+
+    #[test]
+    fn explicit_web_viewer_opt_out_survives_serialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = HelConfig::default();
+        config.phone.enabled = false;
+        config.phone.tailscale_detect = false;
+
+        config.save_to(&path).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+
+        assert!(body.contains("enabled = false"), "{body}");
+        assert!(body.contains("tailscale_detect = false"), "{body}");
+        assert_eq!(HelConfig::load_from(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn phone_config_requires_tls_off_loopback_and_complete_key_pairs() {
+        let mut config = HelConfig::default();
+        config.phone.enabled = true;
+        config.phone.bind = "0.0.0.0:3765".into();
+        assert!(config.validate().unwrap_err().to_string().contains("TLS"));
+
+        config.phone.tls_cert = Some(PathBuf::from("certificate.pem"));
+        assert!(config.validate().unwrap_err().to_string().contains("both"));
+        config.phone.tls_key = Some(PathBuf::from("private-key.pem"));
+        config.validate().unwrap();
     }
 
     #[test]
@@ -1358,5 +1579,37 @@ mod tests {
                 .to_string()
                 .contains("must use `home`")
         );
+    }
+
+    #[test]
+    fn container_size_hosts_group_local_runtimes_and_exact_ssh_hosts() {
+        let container = ContainerTemplate {
+            image: "agent:latest".into(),
+            pull_policy: Default::default(),
+            platform: None,
+            cpus: None,
+            memory: None,
+            environment: BTreeMap::new(),
+        };
+        let podman = TargetTemplate::LocalPodman {
+            container: container.clone(),
+        };
+        let apple = TargetTemplate::AppleContainer {
+            container: container.clone(),
+        };
+        let ssh = TargetTemplate::SshPodman {
+            ssh: SshConnection {
+                host: "builder.example.test".into(),
+                user: Some("dev".into()),
+                identity_file: None,
+                extra_args: Vec::new(),
+            },
+            container,
+        };
+
+        assert_eq!(container_size_host(&podman), Some("local"));
+        assert_eq!(container_size_host(&apple), Some("local"));
+        assert_eq!(container_size_host(&ssh), Some("builder.example.test"));
+        assert_eq!(container_size_host(&TargetTemplate::LocalBare), None);
     }
 }

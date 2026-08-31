@@ -1,12 +1,23 @@
-//! Minimal ACP runtime used by a Hel session worker.
+//! ACP runtime and normalized session controls used by a Hel session worker.
 //!
 //! The worker owns exactly one harness process and one foreground session.  It
-//! deliberately does not know about orchestration, review lanes, or subagents.
+//! deliberately does not know about orchestration, review lanes, or subagents;
+//! [`surface`] projects protocol capabilities for the chat control surface.
 
-use std::collections::BTreeMap;
+mod dialect;
+pub(crate) mod surface;
+mod terminal_compat;
+pub use surface::PlanControl;
+#[cfg(any(unix, test))]
+pub(crate) use terminal_compat::fallback_terminal_tool_call;
+pub(crate) use terminal_compat::{fallback_terminal_tool_call_id, is_fallback_terminal_tool_call};
+
+use dialect::grok;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,11 +29,11 @@ use agent_client_protocol::schema::v1::{
     KillTerminalResponse, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
     PermissionOptionKind, PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigValueId, SessionId, SessionModeState,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionModeState,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
     StopReason, TerminalExitStatus, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
-    TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    TextContent, ToolCallUpdateFields, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -42,6 +53,119 @@ use crate::hel_terminal::{
 };
 use crate::hel_worker::AcpActivityClock;
 use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery};
+
+pub(crate) fn plan_review_carries_native_feedback(id: &str) -> bool {
+    grok::is_plan_review_id(id)
+}
+
+/// Identity prefix every normalized plan decision shares, whatever harness
+/// dialect produced it.
+pub const PLAN_REVIEW_ID_PREFIX: &str = "plan-review-";
+
+/// Header [`normalized_plan_review`] puts in front of the harness's proposal
+/// text. Reading the proposal back out is the inverse, so both live here.
+const PLAN_REVIEW_MESSAGE_PREFIX: &str = "Review the agent's plan:\n\n";
+
+/// Whether this elicitation id belongs to one of Hel's normalized plan
+/// decisions.
+#[must_use]
+pub fn is_plan_review_id(id: &str) -> bool {
+    id.starts_with(PLAN_REVIEW_ID_PREFIX)
+}
+
+/// The exact proposal text a normalized plan decision carries.
+///
+/// Returns `None` for any other elicitation, and for a plan decision whose
+/// message was not built by [`normalized_plan_review`].
+#[must_use]
+pub fn plan_review_proposal(request: &ElicitationRequest) -> Option<&str> {
+    if !is_plan_review_id(&request.id) {
+        return None;
+    }
+    request.message.strip_prefix(PLAN_REVIEW_MESSAGE_PREFIX)
+}
+
+/// The plan decision Hel answers itself instead of forwarding to the harness.
+/// Every other decision maps to a native option through the dialect bridge.
+pub const PLAN_REVIEW_SECOND_OPINION: &str = "second_opinion";
+
+/// The proposal to review when this answer asked for a second opinion.
+///
+/// A second opinion is local: the harness's decision stays pending while Hel
+/// sets the reviewer up, so this answer must never reach ACP. Callers use the
+/// returned proposal as the captured text they hand to the reviewer.
+#[must_use]
+pub fn plan_review_second_opinion<'a>(
+    request: &'a ElicitationRequest,
+    response: &ElicitationResponse,
+) -> Option<&'a str> {
+    let proposal = plan_review_proposal(request)?;
+    let ElicitationResponse::Accept { content } = response else {
+        return None;
+    };
+    match content.get(PLAN_REVIEW_ACTION) {
+        Some(ElicitationValue::String(action)) if action == PLAN_REVIEW_SECOND_OPINION => {
+            Some(proposal)
+        }
+        _ => None,
+    }
+}
+
+/// The answer Hel gives the harness once a second opinion has been set up.
+///
+/// Gathering context needs an idle planning session, so the pending decision
+/// has to be resolved first. Declining keeps plan mode active, which is why
+/// the captured proposal is the only copy of the plan that survives and why
+/// cancelling a review owes the user a Hel-owned decision in its place.
+#[must_use]
+pub fn plan_review_keep_planning() -> ElicitationResponse {
+    ElicitationResponse::Accept {
+        content: std::collections::BTreeMap::from([(
+            PLAN_REVIEW_ACTION.to_owned(),
+            ElicitationValue::String("keep_planning".to_owned()),
+        )]),
+    }
+}
+
+/// Private ACP metadata is provider-local and has no Hel projection. In
+/// particular, Codex can replay terminal-output metadata for old tool calls on
+/// every `session/load`; journaling those invisible deltas grows the relay and
+/// makes every later recovery replay them again.
+fn session_update_is_relay_visible(
+    update: &SessionUpdate,
+    live_tool_calls: &Mutex<BTreeSet<String>>,
+    session_id: &str,
+) -> bool {
+    match update {
+        SessionUpdate::ToolCall(call) => {
+            live_tool_calls
+                .lock()
+                .expect("live ACP tool-call set lock poisoned")
+                .insert(call.tool_call_id.to_string());
+            true
+        }
+        SessionUpdate::ToolCallUpdate(update)
+            if update.fields == ToolCallUpdateFields::default() =>
+        {
+            false
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let created_live = live_tool_calls
+                .lock()
+                .expect("live ACP tool-call set lock poisoned")
+                .contains(&update.tool_call_id.to_string());
+            if !created_live {
+                tracing::warn!(
+                    %session_id,
+                    tool_call_id = %update.tool_call_id,
+                    "ignored delayed ACP update for a tool call not created on this live connection"
+                );
+            }
+            created_live
+        }
+        _ => true,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
@@ -77,6 +201,45 @@ fn project_memory_mcp(spec: &LaunchSpec) -> Vec<McpServer> {
             memory.root.to_string_lossy().into_owned(),
         ]),
     )]
+}
+
+fn session_request_meta(spec: &LaunchSpec) -> Option<serde_json::Map<String, serde_json::Value>> {
+    (spec.harness == HarnessKind::Claude && spec.execution_policy.is_unconstrained()).then(|| {
+        let serde_json::Value::Object(meta) = serde_json::json!({
+            "claudeCode": {
+                "options": {
+                    "sandbox": {
+                        "enabled": false
+                    }
+                }
+            }
+        }) else {
+            unreachable!("Claude session metadata is an object")
+        };
+        meta
+    })
+}
+
+fn new_session_request(spec: &LaunchSpec, include_project_memory: bool) -> NewSessionRequest {
+    let request = NewSessionRequest::new(spec.cwd.clone())
+        .additional_directories(spec.additional_directories.clone())
+        .meta(session_request_meta(spec));
+    if include_project_memory {
+        request.mcp_servers(project_memory_mcp(spec))
+    } else {
+        request
+    }
+}
+
+fn load_session_request(spec: &LaunchSpec, session_id: SessionId) -> LoadSessionRequest {
+    LoadSessionRequest::new(session_id, spec.cwd.clone())
+        .additional_directories(spec.additional_directories.clone())
+        // Loading must preserve the native session's original MCP set. Adding
+        // Hel's current project-memory server here mutates an existing Codex
+        // session and can make its history replay emit updates for tools whose
+        // creation was never part of this relay stream. New sessions receive
+        // the server above; resumed sessions keep whatever they began with.
+        .meta(session_request_meta(spec))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,8 +344,9 @@ pub enum RuntimeEvent {
     Warning {
         message: String,
     },
-    /// A client terminal started successfully. This is operational activity,
-    /// not a durable transcript item: a later ACP tool call may claim it.
+    /// A client terminal started successfully. The worker records an interim
+    /// tool call so agents that omit the ACP association do not strand its
+    /// eventual result as a standalone transcript item.
     TerminalStarted {
         terminal_id: String,
         command: String,
@@ -288,6 +452,7 @@ struct BridgeRestart {
     native_session_id: String,
     unexpected: bool,
     session_age: Duration,
+    message: &'static str,
 }
 
 async fn run_inner(
@@ -312,6 +477,13 @@ async fn run_inner(
                         rapid_deaths = 0;
                     }
                 }
+                emit_runtime_event(
+                    &events,
+                    RuntimeEvent::HarnessRestarting {
+                        message: restart.message.to_owned(),
+                    },
+                )
+                .await?;
                 spec.resume_session = Some(restart.native_session_id);
             }
         }
@@ -380,8 +552,20 @@ async fn run_bridge(
     // to kill the child, so a non-zero exit is the expected outcome.
     if !child_reaped {
         if restarting {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            if let Err(error) = child.kill().await {
+                tracing::warn!(
+                    operation = "acp_bridge_restart",
+                    %error,
+                    "could not kill ACP bridge during planned restart"
+                );
+            }
+            if let Err(error) = child.wait().await {
+                tracing::warn!(
+                    operation = "acp_bridge_restart",
+                    %error,
+                    "could not reap ACP bridge during planned restart"
+                );
+            }
         } else {
             let cleanup =
                 match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
@@ -437,23 +621,16 @@ async fn run_bridge(
             session_age: opened_now
                 .map(|opened| opened.started_at.elapsed())
                 .unwrap_or(Duration::ZERO),
+            message: ACP_BRIDGE_RESTART_WARNING,
         })),
         Err(error) => match opened_now {
             None => Err(error),
-            Some(opened) => {
-                emit_runtime_event(
-                    events,
-                    RuntimeEvent::HarnessRestarting {
-                        message: ACP_BRIDGE_LOST_WARNING.to_owned(),
-                    },
-                )
-                .await?;
-                Ok(Some(BridgeRestart {
-                    native_session_id: opened.native_session_id,
-                    unexpected: true,
-                    session_age: opened.started_at.elapsed(),
-                }))
-            }
+            Some(opened) => Ok(Some(BridgeRestart {
+                native_session_id: opened.native_session_id,
+                unexpected: true,
+                session_age: opened.started_at.elapsed(),
+                message: ACP_BRIDGE_LOST_WARNING,
+            })),
         },
     }
 }
@@ -467,16 +644,6 @@ const ADAPTER_CHATTER_PREFIX: &str = "Unexpected case: ";
 /// Kimi 0.37.x logs this for response-shaped startup frames with a null id.
 /// It is adapter routing noise and commonly precedes a useful ACP error.
 const KIMI_NULL_RESPONSE_CHATTER: &str = "Got response to unknown request null";
-
-/// Grok Build's `exit_plan_mode` tool asks the client whether the agent may
-/// leave plan mode. It is an ACP ext method, so it reaches Hel untyped, and
-/// the ext framing prefixes the method name with `_`. Both spellings are
-/// accepted so a bridge that sends the bare name still works.
-const EXIT_PLAN_MODE_METHOD: &str = "x.ai/exit_plan_mode";
-
-fn is_exit_plan_mode_method(method: &str) -> bool {
-    method.strip_prefix('_').unwrap_or(method) == EXIT_PLAN_MODE_METHOD
-}
 
 const PLAN_REVIEW_ACTION: &str = "action";
 const PLAN_REVIEW_FEEDBACK: &str = "feedback";
@@ -519,7 +686,14 @@ fn is_plan_permission(request: &RequestPermissionRequest) -> bool {
     let Ok(value) = serde_json::to_value(request) else {
         return false;
     };
-    nested_string_matches(&value, &["kind"], &|kind| kind == "plan_review")
+    // Claude Code's ExitPlanMode approval arrives as a `switch_mode` tool call
+    // whose rawInput carries the plan text and a `planFilePath`; its title is
+    // "Ready to code?" and its options are generic permission-mode ids
+    // (`default`, `acceptEdits`, `plan`, ...). None of those match a title or
+    // option-id heuristic, so key on the tool kind and the plan payload.
+    nested_string_matches(&value, &["kind"], &|kind| {
+        kind == "plan_review" || kind == "switch_mode"
+    }) || nested_string(&value, &["planFilePath", "plan_file_path"]).is_some()
         || nested_string_matches(&value, &["title", "name"], &|name| {
             let normalized = name.to_ascii_lowercase().replace([' ', '_'], "");
             normalized.contains("implementthisplan") || normalized.contains("exitplanmode")
@@ -533,13 +707,13 @@ fn is_plan_permission(request: &RequestPermissionRequest) -> bool {
         })
 }
 
-fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationRequest {
+pub(crate) fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationRequest {
     let plan = nested_string(value, &["plan", "plan_content", "planContent"])
         .unwrap_or("The agent did not provide plan text in its review request.");
     ElicitationRequest {
         id,
         title: Some("Plan review".into()),
-        message: format!("Review the agent's plan:\n\n{plan}"),
+        message: format!("{PLAN_REVIEW_MESSAGE_PREFIX}{plan}"),
         description: Some("Choose what Hel should tell the planning harness.".into()),
         fields: vec![
             ElicitationField {
@@ -551,6 +725,7 @@ fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationR
                 required: true,
                 secret: false,
                 custom_answer_for: None,
+                custom_answer_option: None,
                 kind: ElicitationFieldKind::SingleSelect {
                     options: vec![
                         ElicitationOption {
@@ -563,6 +738,14 @@ fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationR
                             value: "revise".into(),
                             title: "Revise".into(),
                             description: Some("Keep planning and incorporate feedback".into()),
+                            preview: None,
+                        },
+                        ElicitationOption {
+                            value: PLAN_REVIEW_SECOND_OPINION.into(),
+                            title: "Get a second opinion".into(),
+                            description: Some(
+                                "Ask another agent to review this plan before you decide".into(),
+                            ),
                             preview: None,
                         },
                         ElicitationOption {
@@ -586,10 +769,11 @@ fn normalized_plan_review(id: String, value: &serde_json::Value) -> ElicitationR
             ElicitationField {
                 id: PLAN_REVIEW_FEEDBACK.into(),
                 title: "Revision feedback".into(),
-                description: Some("Used only when Revise is selected".into()),
+                description: Some("Describe what the agent should change.".into()),
                 required: false,
                 secret: false,
-                custom_answer_for: None,
+                custom_answer_for: Some(PLAN_REVIEW_ACTION.into()),
+                custom_answer_option: Some("revise".into()),
                 kind: ElicitationFieldKind::Text {
                     default: None,
                     min_length: None,
@@ -624,13 +808,13 @@ fn permission_plan_response(
     response: ElicitationResponse,
 ) -> RequestPermissionResponse {
     let (action, _) = plan_review_answer(response);
-    if action == "keep_planning" {
-        return RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
-    }
     let needles: &[&str] = match action.as_str() {
         "implement" => &["implement_plan", "plan_approve", "default", "approve"],
         "revise" => &["plan_revise", "revise"],
         "exit" => &["reject_and_exit", "exit"],
+        // A second opinion is answered locally and never reaches here. If one
+        // ever did, it must not approve the plan, so it declines like every
+        // other non-approval and leaves the session in plan mode.
         _ => &[],
     };
     let selected = request
@@ -644,14 +828,36 @@ fn permission_plan_response(
                 .any(|needle| id.contains(needle) || name.contains(needle))
         })
         .or_else(|| {
-            (action == "implement")
-                .then(|| {
-                    request.options.iter().find(|option| {
-                        option.kind == PermissionOptionKind::AllowOnce
-                            || option.kind == PermissionOptionKind::AllowAlways
+            // No harness-specific option id matched. Claude's "Ready to code?"
+            // exposes only generic kinds, so fall back by intent: implement
+            // takes an allow option; every decline (revise, keep_planning,
+            // exit) takes a reject option to stay in plan mode rather than
+            // cancelling the turn.
+            if action == "implement" {
+                // Prefer the least-privileged approval so an unmatched harness
+                // never silently escalates to a bypass-permissions option.
+                request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+                    .or_else(|| {
+                        request
+                            .options
+                            .iter()
+                            .find(|option| option.kind == PermissionOptionKind::AllowAlways)
                     })
-                })
-                .flatten()
+            } else {
+                request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == PermissionOptionKind::RejectOnce)
+                    .or_else(|| {
+                        request
+                            .options
+                            .iter()
+                            .find(|option| option.kind == PermissionOptionKind::RejectAlways)
+                    })
+            }
         });
     selected.map_or_else(
         || RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
@@ -661,16 +867,6 @@ fn permission_plan_response(
             ))
         },
     )
-}
-
-fn grok_plan_response(response: ElicitationResponse) -> serde_json::Value {
-    let (action, feedback) = plan_review_answer(response);
-    match action.as_str() {
-        "implement" => serde_json::json!({ "outcome": "approved" }),
-        "exit" => serde_json::json!({ "outcome": "abandoned" }),
-        "revise" => serde_json::json!({ "outcome": "cancelled", "feedback": feedback }),
-        _ => serde_json::json!({ "outcome": "cancelled" }),
-    }
 }
 
 fn unsupported_client_request_report(method: &str) -> String {
@@ -763,6 +959,16 @@ const CANCEL_UNACKED_WARNING: &str =
     "cancel was not acknowledged within 60s; restarting the harness";
 
 const ACP_BRIDGE_LOST_WARNING: &str = "ACP bridge exited; reloading the native session";
+const ACP_BRIDGE_RESTART_WARNING: &str = "ACP bridge restarting; reloading the native session";
+
+/// Kimi may start an internal background-task notification turn as a cancelled
+/// `session/prompt` settles. Reusing that connection lets the next ACP prompt be
+/// accepted but parked behind the invisible turn, so Hel reports the new user
+/// prompt as running before Kimi has added it to the conversation. Reloading the
+/// native session gives the next durable command a genuinely idle bridge.
+fn restart_after_acknowledged_cancel(harness: HarnessKind) -> bool {
+    harness == HarnessKind::Kimi
+}
 
 /// Give up if a freshly opened session dies this many times in a row before it
 /// has lived for [`RAPID_BRIDGE_WINDOW`]. A later crash of a healthy session
@@ -784,10 +990,24 @@ where
     let notification_activity = spec.acp_activity.clone();
     let session_update_count = Arc::new(AtomicU64::new(0));
     let notification_session_update_count = session_update_count.clone();
+    // A provider may replay the native transcript as `session/update`
+    // notifications while answering `session/load`. Hel already owns that
+    // history in its durable relay, so accepting the replay would duplicate
+    // every old turn on every restart. New sessions have no old history.
+    let session_updates_enabled = Arc::new(AtomicBool::new(spec.resume_session.is_none()));
+    let notification_session_updates_enabled = session_updates_enabled.clone();
+    // Codex can finish dispatching old tool updates after `session/load` has
+    // already returned. Track only creations observed after the load boundary,
+    // so those delayed updates cannot reintroduce historical tool state into
+    // the durable relay. A live tool always announces its creation before its
+    // updates on the same ACP connection.
+    let live_tool_calls = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+    let notification_live_tool_calls = live_tool_calls.clone();
     let permission_events = events.clone();
     let permission_activity = spec.acp_activity.clone();
     let ext_events = events.clone();
     let ext_activity = spec.acp_activity.clone();
+    let ext_harness = spec.harness;
     let elicitation_events = events.clone();
     let pending_elicitations = PendingElicitations::default();
     let handler_elicitations = pending_elicitations.clone();
@@ -811,8 +1031,6 @@ where
     let wait_activity = spec.acp_activity.clone();
     let kill_activity = spec.acp_activity.clone();
     let release_activity = spec.acp_activity.clone();
-    let wait_events = events.clone();
-    let release_events = events.clone();
     // A terminal runs where the session runs unless the agent names a
     // directory of its own.
     let session_cwd = spec.cwd.clone();
@@ -836,6 +1054,16 @@ where
                         }
                         return Ok(());
                     }
+                }
+                if !notification_session_updates_enabled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if !session_update_is_relay_visible(
+                    &notification.update,
+                    &notification_live_tool_calls,
+                    &notification.session_id.to_string(),
+                ) {
+                    return Ok(());
                 }
                 let update = serde_json::to_value(notification.update).map_err(|error| {
                     agent_client_protocol::Error::internal_error().data(serde_json::Value::String(
@@ -880,7 +1108,16 @@ where
                                 .lock()
                                 .expect("pending elicitation lock poisoned")
                                 .remove(&id);
-                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            if let Err(error) =
+                                responder.respond_with_error(relay_event_channel_error())
+                            {
+                                tracing::debug!(
+                                    %id,
+                                    operation = "permission_request",
+                                    %error,
+                                    "could not report a stopped relay coordinator to ACP"
+                                );
+                            }
                             return;
                         }
                         let response = tokio::select! {
@@ -895,19 +1132,52 @@ where
                             .as_ref()
                             .map_or("cancel", ElicitationResponse::action_name)
                             .to_owned();
-                        let _ = events
+                        if let Err(error) = events
                             .send(RuntimeEvent::ElicitationResolved {
-                                elicitation_id: id,
+                                elicitation_id: id.clone(),
                                 action,
                             })
-                            .await;
+                            .await
+                        {
+                            tracing::debug!(
+                                %id,
+                                operation = "elicitation_resolved",
+                                %error,
+                                "could not report permission response to relay coordinator"
+                            );
+                        }
                         let answer = response.map_or_else(
                             || RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
                             |response| permission_plan_response(&request, response),
                         );
-                        let _ = responder.respond(answer);
+                        if let Err(error) = responder.respond(answer) {
+                            tracing::debug!(
+                                %id,
+                                operation = "permission_response",
+                                %error,
+                                "ACP permission responder was already closed"
+                            );
+                        }
                     });
                     return Ok(());
+                }
+                // A permission request that is_plan_permission() did not classify
+                // reaches the deny path below. Log its raw shape so an agent whose
+                // request form we do not yet recognize is diagnosable from
+                // worker.log instead of only surfacing as a silent denial.
+                match serde_json::to_value(&request) {
+                    Ok(raw) => tracing::debug!(
+                        target: "hel_acp::plan_diag",
+                        operation = "unclassified_permission_request",
+                        request = %raw,
+                        "permission request not classified as a plan review; raw payload follows"
+                    ),
+                    Err(error) => tracing::debug!(
+                        target: "hel_acp::plan_diag",
+                        operation = "unclassified_permission_request",
+                        %error,
+                        "permission request not classified as a plan review and could not be serialized"
+                    ),
                 }
                 if permission_policy.is_unconstrained() {
                     permission_events
@@ -1001,7 +1271,6 @@ where
                 };
                 // Handlers run on the dispatch loop, so awaiting the child here
                 // would stop every other message until it exits.
-                let events = wait_events.clone();
                 tokio::spawn(async move {
                     let exit = crate::hel_terminal::wait_for_exit(exit).await;
                     if let Err(error) = responder.respond(WaitForTerminalExitResponse::new(
@@ -1009,13 +1278,12 @@ where
                     )) {
                         // A closed channel means the relay already stopped, so
                         // this warning has nowhere left to go.
-                        let _ = events
-                            .send(RuntimeEvent::Warning {
-                                message: format!(
-                                    "report the exit of client terminal {terminal_id}: {error}"
-                                ),
-                            })
-                            .await;
+                        tracing::debug!(
+                            %terminal_id,
+                            operation = "terminal_wait_response",
+                            %error,
+                            "ACP terminal wait responder was already closed"
+                        );
                     }
                 });
                 Ok(())
@@ -1044,16 +1312,14 @@ where
                 };
                 // Reap off the dispatch loop: the supervisor still has to watch
                 // the killed child exit before it reports the terminal closed.
-                let events = release_events.clone();
                 tokio::spawn(async move {
                     if let Err(error) = supervisor.await {
-                        let _ = events
-                            .send(RuntimeEvent::Warning {
-                                message: format!(
-                                    "reap released client terminal {terminal_id}: {error}"
-                                ),
-                            })
-                            .await;
+                        tracing::warn!(
+                            %terminal_id,
+                            operation = "terminal_release_reap",
+                            %error,
+                            "released terminal supervisor failed"
+                        );
                     }
                 });
                 responder.respond(ReleaseTerminalResponse::new())
@@ -1107,7 +1373,16 @@ where
                                 .lock()
                                 .expect("pending elicitation lock poisoned")
                                 .remove(&id);
-                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            if let Err(error) =
+                                responder.respond_with_error(relay_event_channel_error())
+                            {
+                                tracing::debug!(
+                                    %id,
+                                    operation = "elicitation_request",
+                                    %error,
+                                    "could not report a stopped relay coordinator to ACP"
+                                );
+                            }
                             return;
                         }
                         let response = tokio::select! {
@@ -1122,41 +1397,67 @@ where
                             .as_ref()
                             .map_or("cancel", ElicitationResponse::action_name)
                             .to_owned();
-                        let _ = events
+                        if let Err(error) = events
                             .send(RuntimeEvent::ElicitationResolved {
-                                elicitation_id: id,
+                                elicitation_id: id.clone(),
                                 action,
                             })
-                            .await;
+                            .await
+                        {
+                            tracing::debug!(
+                                %id,
+                                operation = "elicitation_resolved",
+                                %error,
+                                "could not report elicitation response to relay coordinator"
+                            );
+                        }
                         match response {
                             Some(response) => match serde_json::to_value(response) {
                                 Ok(response) => {
-                                    let _ = responder.respond(response);
+                                    if let Err(error) = responder.respond(response) {
+                                        tracing::debug!(
+                                            %id,
+                                            operation = "elicitation_response",
+                                            %error,
+                                            "ACP elicitation responder was already closed"
+                                        );
+                                    }
                                 }
                                 Err(error) => {
-                                    let _ = responder.respond_with_error(
+                                    if let Err(error) = responder.respond_with_error(
                                         agent_client_protocol::Error::internal_error().data(
                                             serde_json::Value::String(format!(
                                                 "serialize elicitation response: {error}"
                                             )),
                                         ),
-                                    );
+                                    ) {
+                                        tracing::debug!(
+                                            %id,
+                                            operation = "elicitation_response",
+                                            %error,
+                                            "ACP elicitation error responder was already closed"
+                                        );
+                                    }
                                 }
                             },
                             None => {
-                                let _ = responder.respond_with_error(
+                                if let Err(error) = responder.respond_with_error(
                                     agent_client_protocol::Error::request_cancelled(),
-                                );
+                                ) {
+                                    tracing::debug!(
+                                        %id,
+                                        operation = "elicitation_cancel",
+                                        %error,
+                                        "ACP cancellation responder was already closed"
+                                    );
+                                }
                             }
                         }
                     });
                     return Ok(());
                 }
-                if is_exit_plan_mode_method(&method) {
-                    let id = format!(
-                        "plan-review-grok-{}",
-                        ext_review_ids.fetch_add(1, Ordering::Relaxed)
-                    );
+                if grok::handles_exit_plan_mode(ext_harness, &method) {
+                    let id = grok::plan_review_id(ext_review_ids.fetch_add(1, Ordering::Relaxed));
                     let review = normalized_plan_review(id.clone(), request.params());
                     let (answer, answer_rx) = oneshot::channel();
                     handler_elicitations
@@ -1176,7 +1477,16 @@ where
                                 .lock()
                                 .expect("pending elicitation lock poisoned")
                                 .remove(&id);
-                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            if let Err(error) =
+                                responder.respond_with_error(relay_event_channel_error())
+                            {
+                                tracing::debug!(
+                                    %id,
+                                    operation = "plan_review_request",
+                                    %error,
+                                    "could not report a stopped relay coordinator to ACP"
+                                );
+                            }
                             return;
                         }
                         let response = tokio::select! {
@@ -1191,16 +1501,31 @@ where
                             .as_ref()
                             .map_or("cancel", ElicitationResponse::action_name)
                             .to_owned();
-                        let _ = events
+                        if let Err(error) = events
                             .send(RuntimeEvent::ElicitationResolved {
-                                elicitation_id: id,
+                                elicitation_id: id.clone(),
                                 action,
                             })
-                            .await;
-                        let _ = responder.respond(response.map_or_else(
+                            .await
+                        {
+                            tracing::debug!(
+                                %id,
+                                operation = "plan_review_resolved",
+                                %error,
+                                "could not report plan review response to relay coordinator"
+                            );
+                        }
+                        if let Err(error) = responder.respond(response.map_or_else(
                             || serde_json::json!({ "outcome": "cancelled" }),
-                            grok_plan_response,
-                        ));
+                            grok::plan_response,
+                        )) {
+                            tracing::debug!(
+                                %id,
+                                operation = "plan_review_response",
+                                %error,
+                                "ACP plan review responder was already closed"
+                            );
+                        }
                     });
                     return Ok(());
                 }
@@ -1228,6 +1553,7 @@ where
                 session_elicitations,
                 opened,
                 session_update_count,
+                session_updates_enabled,
             )
             .await
             {
@@ -1251,234 +1577,6 @@ where
         .lock()
         .expect("ACP restart slot lock poisoned")
         .take())
-}
-
-/// Grok Build speaks an older ACP dialect. It never returns `configOptions`,
-/// and model and reasoning effort move through the legacy `session/set_model`
-/// method: `{sessionId, modelId}` with the effort as
-/// `_meta.reasoningEffort`. Hel synthesizes the same `SessionConfigOption`
-/// list every other harness returns, so `/model` and `/effort` behave
-/// identically everywhere.
-const GROK_SET_MODEL_METHOD: &str = "session/set_model";
-
-/// Grok Build's model catalogue, from `_meta.modelState` on the `initialize`
-/// response and `_meta["x.ai/modelState"]`-shaped payloads after a switch.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct GrokModelState {
-    current_model_id: String,
-    current_effort: Option<String>,
-    models: Vec<GrokModel>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GrokModel {
-    id: String,
-    name: String,
-    description: Option<String>,
-    /// Reasoning tiers this model accepts. Empty when it has none.
-    efforts: Vec<GrokChoice>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GrokChoice {
-    id: String,
-    name: String,
-    description: Option<String>,
-}
-
-impl GrokModelState {
-    fn current_model(&self) -> Option<&GrokModel> {
-        self.models
-            .iter()
-            .find(|model| model.id == self.current_model_id)
-    }
-}
-
-/// Read `modelState` out of a `_meta` object. `None` when the agent is not
-/// speaking this dialect, which is every harness except Grok Build.
-fn grok_model_state(
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<GrokModelState> {
-    let state = meta?.get("modelState")?;
-    grok_model_state_from_value(state)
-}
-
-fn grok_model_state_from_value(state: &serde_json::Value) -> Option<GrokModelState> {
-    let current_model_id = state.get("currentModelId")?.as_str()?.to_owned();
-    let models = state
-        .get("availableModels")?
-        .as_array()?
-        .iter()
-        .filter_map(|model| {
-            let id = model.get("modelId")?.as_str()?.to_owned();
-            let efforts = model
-                .pointer("/_meta/reasoningEfforts")
-                .and_then(serde_json::Value::as_array)
-                .map(|efforts| {
-                    efforts
-                        .iter()
-                        .filter_map(|effort| {
-                            let id = effort
-                                .get("value")
-                                .or_else(|| effort.get("id"))?
-                                .as_str()?
-                                .to_owned();
-                            Some(GrokChoice {
-                                name: effort
-                                    .get("label")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or(&id)
-                                    .to_owned(),
-                                description: effort
-                                    .get("description")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToOwned::to_owned),
-                                id,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(GrokModel {
-                name: model
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&id)
-                    .to_owned(),
-                description: model
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned),
-                id,
-                efforts,
-            })
-        })
-        .collect::<Vec<_>>();
-    let current_effort = state
-        .get("availableModels")?
-        .as_array()?
-        .iter()
-        .find(|model| {
-            model.get("modelId").and_then(serde_json::Value::as_str) == Some(&current_model_id)
-        })
-        .and_then(|model| model.pointer("/_meta/reasoningEffort"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    (!models.is_empty()).then_some(GrokModelState {
-        current_model_id,
-        current_effort,
-        models,
-    })
-}
-
-/// Present Grok Build's catalogue as the option list the rest of Hel already
-/// understands: a `model` selector, plus an `effort` selector carrying the
-/// current model's reasoning tiers.
-fn grok_config_options(state: &GrokModelState) -> Vec<SessionConfigOption> {
-    use agent_client_protocol::schema::v1::{
-        SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions,
-    };
-
-    let choice = |choice: &GrokChoice| {
-        let mut option = SessionConfigSelectOption::new(
-            SessionConfigValueId::new(choice.id.clone()),
-            choice.name.clone(),
-        );
-        option.description = choice.description.clone();
-        option
-    };
-    let mut options = vec![{
-        let models = state
-            .models
-            .iter()
-            .map(|model| {
-                choice(&GrokChoice {
-                    id: model.id.clone(),
-                    name: model.name.clone(),
-                    description: model.description.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut option = SessionConfigOption::new(
-            SessionConfigId::new("model"),
-            "Model",
-            SessionConfigKind::Select(SessionConfigSelect::new(
-                SessionConfigValueId::new(state.current_model_id.clone()),
-                SessionConfigSelectOptions::Ungrouped(models),
-            )),
-        );
-        option.category = Some(SessionConfigOptionCategory::Model);
-        option
-    }];
-    let efforts = state
-        .current_model()
-        .map(|model| model.efforts.as_slice())
-        .unwrap_or_default();
-    if !efforts.is_empty() {
-        let current = state
-            .current_effort
-            .clone()
-            .unwrap_or_else(|| efforts[0].id.clone());
-        let mut option = SessionConfigOption::new(
-            SessionConfigId::new("effort"),
-            "Reasoning effort",
-            SessionConfigKind::Select(SessionConfigSelect::new(
-                SessionConfigValueId::new(current),
-                SessionConfigSelectOptions::Ungrouped(
-                    efforts.iter().map(choice).collect::<Vec<_>>(),
-                ),
-            )),
-        );
-        option.category = Some(SessionConfigOptionCategory::ThoughtLevel);
-        options.push(option);
-    }
-    options
-}
-
-/// Translate a Hel `/model` or `/effort` change into Grok Build's
-/// `session/set_model` request. An effort change re-sends the current model,
-/// because effort only travels as meta on that same request.
-fn grok_set_model_request(
-    session_id: &SessionId,
-    state: &GrokModelState,
-    key: &str,
-    value: &str,
-) -> Result<(serde_json::Value, GrokModelState)> {
-    let mut updated = state.clone();
-    let model_id = match key {
-        "model" => {
-            ensure!(
-                state.models.iter().any(|model| model.id == value),
-                "{value:?} is not an available model value"
-            );
-            updated.current_model_id = value.to_owned();
-            // A different model has its own tiers, so the old effort no longer
-            // applies; the agent reports the new one.
-            updated.current_effort = None;
-            value.to_owned()
-        }
-        "effort" => {
-            ensure!(
-                state
-                    .current_model()
-                    .is_some_and(|model| model.efforts.iter().any(|effort| effort.id == value)),
-                "{value:?} is not an available effort value"
-            );
-            updated.current_effort = Some(value.to_owned());
-            state.current_model_id.clone()
-        }
-        _ => bail!("Grok Build has no {key} selector"),
-    };
-    let mut params = serde_json::Map::new();
-    params.insert("sessionId".into(), session_id.to_string().into());
-    params.insert("modelId".into(), model_id.into());
-    if key == "effort" {
-        params.insert(
-            "_meta".into(),
-            serde_json::json!({ "reasoningEffort": value }),
-        );
-    }
-    Ok((serde_json::Value::Object(params), updated))
 }
 
 /// Stop reason reported for a turn the bridge rejected instead of finishing.
@@ -1522,6 +1620,7 @@ async fn drive_connection(
     pending_elicitations: PendingElicitations,
     opened: Arc<Mutex<Option<OpenedSession>>>,
     session_update_count: Arc<AtomicU64>,
+    session_updates_enabled: Arc<AtomicBool>,
 ) -> Result<Option<String>> {
     // Terminals belong to the connection. However the session ends — closed,
     // failed, or with its command channel dropped — their process groups must
@@ -1536,6 +1635,7 @@ async fn drive_connection(
         &pending_elicitations,
         opened,
         &session_update_count,
+        &session_updates_enabled,
     )
     .await;
     pending_elicitations
@@ -1588,6 +1688,7 @@ async fn serve_session(
     pending_elicitations: &PendingElicitations,
     opened: Arc<Mutex<Option<OpenedSession>>>,
     session_update_count: &AtomicU64,
+    session_updates_enabled: &AtomicBool,
 ) -> Result<Option<String>> {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal_output".into(), serde_json::Value::Bool(true));
@@ -1618,7 +1719,7 @@ async fn serve_session(
     }
     // Grok Build publishes its catalogue here rather than as `configOptions`.
     let mut grok_models = (spec.harness == HarnessKind::Grok)
-        .then(|| grok_model_state(initialized.meta.as_ref()))
+        .then(|| grok::model_state(initialized.meta.as_ref()))
         .flatten();
     emit_runtime_event(
         events,
@@ -1640,15 +1741,22 @@ async fn serve_session(
 
     let loaded_session = if let Some(existing) = &spec.resume_session {
         let loaded = connection
-            .send_request(
-                LoadSessionRequest::new(SessionId::from(existing.clone()), spec.cwd.clone())
-                    .additional_directories(spec.additional_directories.clone())
-                    .mcp_servers(project_memory_mcp(spec)),
-            )
+            .send_request(load_session_request(
+                spec,
+                SessionId::from(existing.clone()),
+            ))
             .block_task()
             .await;
         spec.acp_activity.mark();
         let loaded = loaded.with_context(|| format!("load ACP session {existing}"))?;
+        if let Some(state) = grok_models.as_mut()
+            && let Some(fresh) = grok::model_state(loaded.meta.as_ref())
+        {
+            *state = fresh;
+        }
+        // The response is the boundary between provider replay and future
+        // live updates for this connection.
+        session_updates_enabled.store(true, Ordering::Release);
         Some((
             SessionId::from(existing.clone()),
             loaded.config_options,
@@ -1662,11 +1770,7 @@ async fn serve_session(
             (id, options, modes, true)
         } else {
             let created = connection
-                .send_request(
-                    NewSessionRequest::new(spec.cwd.clone())
-                        .additional_directories(spec.additional_directories.clone())
-                        .mcp_servers(project_memory_mcp(spec)),
-                )
+                .send_request(new_session_request(spec, true))
                 .block_task()
                 .await;
             spec.acp_activity.mark();
@@ -1674,7 +1778,7 @@ async fn serve_session(
             // A session may open on a different model than the agent-wide
             // default, so a fresher catalogue on the session wins.
             if let Some(state) = grok_models.as_mut()
-                && let Some(fresh) = grok_model_state(created.meta.as_ref())
+                && let Some(fresh) = grok::model_state(created.meta.as_ref())
             {
                 *state = fresh;
             }
@@ -1705,12 +1809,11 @@ async fn serve_session(
         )
         .await?;
     }
-    // Grok Build never returns `configOptions`; present its catalogue in the
-    // shape the rest of Hel reads so `/model` and `/effort` work unchanged.
-    if let Some(state) = &grok_models
-        && config_options.is_empty()
-    {
-        config_options = grok_config_options(state);
+    // Grok Build publishes model selection through its legacy catalogue. Keep
+    // any standard selectors it also returns while projecting model/effort
+    // into the shape the rest of Hel reads.
+    if let Some(state) = &grok_models {
+        grok::merge_config_options(&mut config_options, state);
     }
     emit_runtime_event(
         events,
@@ -1801,6 +1904,11 @@ async fn serve_session(
                                 },
                             )
                             .await?;
+                            if cancel_deadline.is_some()
+                                && restart_after_acknowledged_cancel(spec.harness)
+                            {
+                                return Ok(Some(session_id.to_string()));
+                            }
                             break;
                         }
                         _ = async {
@@ -1931,20 +2039,40 @@ async fn serve_session(
                                 .await?;
                             }
                             Some(CommandRequest::Compact { response, .. }) => {
-                                let _ = response.send(Err(
-                                    "cannot compact while the destination prompt is running".into(),
-                                ));
+                                if response
+                                    .send(Err(
+                                        "cannot compact while the destination prompt is running"
+                                            .into(),
+                                    ))
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "compact_rejected",
+                                        "compaction rejection receiver was already closed"
+                                    );
+                                }
                             }
                             Some(CommandRequest::ResolveElicitation {
                                 elicitation_id,
                                 response,
                                 resolved,
                             }) => {
-                                let _ = resolved.send(resolve_pending_elicitation(
-                                    pending_elicitations,
-                                    &elicitation_id,
-                                    response,
-                                ));
+                                if resolved
+                                    .send(resolve_pending_elicitation(
+                                        pending_elicitations,
+                                        &elicitation_id,
+                                        response,
+                                    ))
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "resolve_elicitation",
+                                        %elicitation_id,
+                                        "elicitation resolution receiver was already closed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1955,11 +2083,14 @@ async fn serve_session(
                 key,
                 value,
             } => {
+                let grok_model_change = grok_models.is_some() && grok::handles_config_key(&key);
                 let applied = match grok_models.as_mut() {
-                    Some(state) => set_grok_model(connection, &session_id, state, &key, &value)
-                        .await
-                        .inspect(|()| config_options = grok_config_options(state)),
-                    None => {
+                    Some(state) if grok::handles_config_key(&key) => {
+                        grok::apply_model_change(connection, &session_id, state, &key, &value)
+                            .await
+                            .inspect(|()| grok::merge_config_options(&mut config_options, state))
+                    }
+                    _ => {
                         set_session_config(
                             connection,
                             &session_id,
@@ -1984,6 +2115,11 @@ async fn serve_session(
                         .await?;
                     }
                     Err(error) => {
+                        if grok_model_change && grok::response_was_lost(&error) {
+                            return Err(error.context(
+                                "Grok model change response was lost; reload the session to reconcile its model state",
+                            ));
+                        }
                         emit_runtime_event(
                             events,
                             RuntimeEvent::CommandRejected {
@@ -2005,8 +2141,8 @@ async fn serve_session(
                         .iter()
                         .any(|mode| mode.id.to_string() == mode_id)
                 });
-                let grok_plan_fallback = spec.harness == HarnessKind::Grok
-                    && matches!(mode_id.as_str(), "plan" | "default");
+                let grok_plan_fallback =
+                    grok::permits_unadvertised_plan_mode(spec.harness, &mode_id);
                 let applied = if advertised || grok_plan_fallback {
                     connection
                         .send_request(SetSessionModeRequest::new(
@@ -2059,8 +2195,16 @@ async fn serve_session(
                 loop {
                     tokio::select! {
                         result = &mut compaction => {
-                            if let Some(response) = response.take() {
-                                let _ = response.send(result.map_err(|error| format!("{error:#}")));
+                            if let Some(response) = response.take()
+                                && response
+                                    .send(result.map_err(|error| format!("{error:#}")))
+                                    .is_err()
+                            {
+                                tracing::debug!(
+                                    session_id = %session_id,
+                                    operation = "compact",
+                                    "compaction result receiver was already closed"
+                                );
                             }
                             break;
                         }
@@ -2076,8 +2220,16 @@ async fn serve_session(
                                 .await?;
                             }
                             Some(CommandRequest::Close { request_id: close_id }) => {
-                                if let Some(response) = response.take() {
-                                    let _ = response.send(Err("session closed during compaction".into()));
+                                if let Some(response) = response.take()
+                                    && response
+                                        .send(Err("session closed during compaction".into()))
+                                        .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "compact_close",
+                                        "compaction close receiver was already closed"
+                                    );
                                 }
                                 if let Err(error) = connection.send_notification(CancelNotification::new(session_id.clone())) {
                                     emit_runtime_event(
@@ -2123,10 +2275,19 @@ async fn serve_session(
                                 return Ok(None);
                             }
                             None => {
-                                if let Some(response) = response.take() {
-                                    let _ = response.send(Err(
-                                        "ACP command channel closed while a compaction was running".into(),
-                                    ));
+                                if let Some(response) = response.take()
+                                    && response
+                                        .send(Err(
+                                            "ACP command channel closed while a compaction was running"
+                                                .into(),
+                                        ))
+                                        .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "compact_shutdown",
+                                        "compaction shutdown receiver was already closed"
+                                    );
                                 }
                                 connection
                                     .send_notification(CancelNotification::new(session_id.clone()))
@@ -2164,20 +2325,37 @@ async fn serve_session(
                                 .await?;
                             }
                             Some(CommandRequest::Compact { response, .. }) => {
-                                let _ = response.send(Err(
-                                    "a compaction is already running".into(),
-                                ));
+                                if response
+                                    .send(Err("a compaction is already running".into()))
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "compact_rejected",
+                                        "duplicate compaction rejection receiver was already closed"
+                                    );
+                                }
                             }
                             Some(CommandRequest::ResolveElicitation {
                                 elicitation_id,
                                 response,
                                 resolved,
                             }) => {
-                                let _ = resolved.send(resolve_pending_elicitation(
-                                    pending_elicitations,
-                                    &elicitation_id,
-                                    response,
-                                ));
+                                if resolved
+                                    .send(resolve_pending_elicitation(
+                                        pending_elicitations,
+                                        &elicitation_id,
+                                        response,
+                                    ))
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        operation = "resolve_elicitation",
+                                        %elicitation_id,
+                                        "elicitation resolution receiver was already closed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2191,11 +2369,21 @@ async fn serve_session(
                 response,
                 resolved,
             } => {
-                let _ = resolved.send(resolve_pending_elicitation(
-                    pending_elicitations,
-                    &elicitation_id,
-                    response,
-                ));
+                if resolved
+                    .send(resolve_pending_elicitation(
+                        pending_elicitations,
+                        &elicitation_id,
+                        response,
+                    ))
+                    .is_err()
+                {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        operation = "resolve_elicitation",
+                        %elicitation_id,
+                        "elicitation resolution receiver was already closed"
+                    );
+                }
             }
             CommandRequest::Close { request_id } => {
                 match connection
@@ -2270,27 +2458,46 @@ async fn set_session_config(
     Ok(())
 }
 
-/// Apply a `/model` or `/effort` change through Grok Build's legacy
-/// `session/set_model` method. The ACP crate has no type for it, so the
-/// request goes out as an untyped JSON-RPC message.
-async fn set_grok_model(
-    connection: &ConnectionTo<Agent>,
-    session_id: &SessionId,
-    state: &mut GrokModelState,
+/// One selectable value of a session configuration option, flattened out of
+/// the harness's ACP select shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionConfigChoice {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Every value the harness currently advertises for `key`, in advertised
+/// order and with option groups flattened.
+///
+/// Empty when the harness advertises no such option or exposes it as
+/// something other than a select, which callers read as "not configurable".
+#[must_use]
+pub fn session_config_choices(
+    options: &[SessionConfigOption],
     key: &str,
-    value: &str,
-) -> Result<()> {
-    let (params, updated) = grok_set_model_request(session_id, state, key, value)?;
-    connection
-        .send_request(
-            agent_client_protocol::UntypedMessage::new(GROK_SET_MODEL_METHOD, params)
-                .context("build Grok Build set-model request")?,
-        )
-        .block_task()
-        .await
-        .with_context(|| format!("set session {key} to {value}"))?;
-    *state = updated;
-    Ok(())
+) -> Vec<SessionConfigChoice> {
+    let Some(option) = find_session_config_option(options, key) else {
+        return Vec::new();
+    };
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    let choices = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect::<Vec<_>>(),
+        SessionConfigSelectOptions::Grouped(groups) => {
+            groups.iter().flat_map(|group| &group.options).collect()
+        }
+        _ => Vec::new(),
+    };
+    choices
+        .into_iter()
+        .map(|choice| SessionConfigChoice {
+            value: choice.value.to_string(),
+            name: choice.name.clone(),
+            description: choice.description.clone(),
+        })
+        .collect()
 }
 
 pub(crate) fn find_session_config_option<'a>(
@@ -2333,10 +2540,7 @@ async fn compact_in_scratch_session(
     scratch_outputs: &Arc<Mutex<BTreeMap<String, String>>>,
 ) -> Result<String> {
     let created = connection
-        .send_request(
-            NewSessionRequest::new(spec.cwd.clone())
-                .additional_directories(spec.additional_directories.clone()),
-        )
+        .send_request(new_session_request(spec, false))
         .block_task()
         .await
         .context("create scratch ACP session")?;
@@ -2517,2589 +2721,4 @@ pub(crate) fn select_contains(kind: &SessionConfigKind, desired: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::path::Path;
-    use std::time::Duration;
-
-    use super::*;
-    use agent_client_protocol::schema::v1::{
-        SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions,
-    };
-
-    #[test]
-    fn project_memory_mcp_honors_harness_delivery_and_claude_native_memory() {
-        let mut spec = LaunchSpec {
-            command: "/worker/hel".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: "/workspace/app".into(),
-            additional_directories: vec!["/workspace/api".into()],
-            project_memory: Some(ProjectMemoryLaunchConfig {
-                project_key: "abc".into(),
-                root: "/profile/projects/abc/memory".into(),
-                baseline_root: "/profile/projects/abc/.hel-memory-baseline".into(),
-                repository_roots: BTreeMap::from([
-                    ("app".into(), "/workspace/app".into()),
-                    ("api".into(), "/workspace/api".into()),
-                ]),
-                mcp_delivery: ProjectMemoryMcpDelivery::Acp,
-            }),
-            resume_session: None,
-            harness: HarnessKind::Codex,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let servers = project_memory_mcp(&spec);
-        let [McpServer::Stdio(server)] = servers.as_slice() else {
-            panic!("non-Claude sessions receive exactly one memory MCP server");
-        };
-        assert_eq!(server.name, "hel-project-memory");
-        assert_eq!(server.command, Path::new("/worker/hel"));
-        assert_eq!(
-            server.args,
-            [
-                "worker",
-                "memory-mcp",
-                "--root",
-                "/profile/projects/abc/memory"
-            ]
-        );
-        assert!(
-            !server
-                .args
-                .iter()
-                .any(|argument| argument.contains("store")),
-            "the model-facing service must not expose store selection"
-        );
-
-        spec.project_memory.as_mut().unwrap().mcp_delivery =
-            ProjectMemoryMcpDelivery::HarnessProfile;
-        assert!(project_memory_mcp(&spec).is_empty());
-        spec.project_memory.as_mut().unwrap().mcp_delivery = ProjectMemoryMcpDelivery::Acp;
-
-        let mut claude = spec;
-        claude.harness = HarnessKind::Claude;
-        assert!(project_memory_mcp(&claude).is_empty());
-    }
-
-    #[test]
-    fn finds_modes_in_flat_and_grouped_options() {
-        let flat =
-            SessionConfigKind::Select(agent_client_protocol::schema::v1::SessionConfigSelect::new(
-                "default",
-                vec![SessionConfigSelectOption::new("auto", "Auto")],
-            ));
-        assert!(select_contains(&flat, "auto"));
-
-        let grouped =
-            SessionConfigKind::Select(agent_client_protocol::schema::v1::SessionConfigSelect::new(
-                "default",
-                SessionConfigSelectOptions::Grouped(vec![SessionConfigSelectGroup::new(
-                    "permissions",
-                    "Permissions",
-                    vec![SessionConfigSelectOption::new(
-                        "bypassPermissions",
-                        "Bypass",
-                    )],
-                )]),
-            ));
-        assert!(select_contains(&grouped, "bypassPermissions"));
-    }
-
-    #[test]
-    fn production_compactors_are_fixed_independently_of_target_profiles() {
-        assert_eq!(
-            production_compaction_config(HarnessKind::Codex),
-            Some(ProductionCompactionConfig {
-                model: "gpt-5.6-luna",
-                effort_option: "reasoning_effort",
-                effort: "high",
-            })
-        );
-        assert_eq!(
-            production_compaction_config(HarnessKind::Claude),
-            Some(ProductionCompactionConfig {
-                model: "sonnet 5",
-                effort_option: "effort",
-                effort: "high",
-            })
-        );
-        assert_eq!(production_compaction_config(HarnessKind::Kimi), None);
-        assert_eq!(production_compaction_config(HarnessKind::Grok), None);
-    }
-
-    #[test]
-    fn live_config_finds_model_and_anvil_reasoning_effort_separately() {
-        let model = SessionConfigOption::select(
-            "model",
-            "Model",
-            "gpt-5.6-sol",
-            vec![SessionConfigSelectOption::new("gpt-5.6-sol", "Sol")],
-        )
-        .category(SessionConfigOptionCategory::Model);
-        let effort = SessionConfigOption::select(
-            "reasoning_effort",
-            "Reasoning effort",
-            "high",
-            vec![SessionConfigSelectOption::new("high", "High")],
-        )
-        .category(SessionConfigOptionCategory::Model);
-        let options = vec![model, effort];
-
-        assert_eq!(
-            find_session_config_option(&options, "model")
-                .unwrap()
-                .id
-                .to_string(),
-            "model"
-        );
-        assert_eq!(
-            find_session_config_option(&options, "effort")
-                .unwrap()
-                .id
-                .to_string(),
-            "reasoning_effort"
-        );
-    }
-
-    #[test]
-    fn permission_request_warning_explains_required_permission_modes() {
-        assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("misconfigured"));
-        assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("unconstrained"));
-    }
-
-    #[tokio::test]
-    async fn runtime_event_delivery_waits_for_bounded_channel_capacity() {
-        let (events_tx, mut events_rx) = mpsc::channel(1);
-        emit_runtime_event(
-            &events_tx,
-            RuntimeEvent::Warning {
-                message: "first".into(),
-            },
-        )
-        .await
-        .unwrap();
-
-        let blocked_tx = events_tx.clone();
-        let blocked = tokio::spawn(async move {
-            emit_runtime_event(
-                &blocked_tx,
-                RuntimeEvent::Warning {
-                    message: "second".into(),
-                },
-            )
-            .await
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !blocked.is_finished(),
-            "event producer bypassed bounded-channel backpressure"
-        );
-
-        assert!(matches!(
-            events_rx.recv().await,
-            Some(RuntimeEvent::Warning { message }) if message == "first"
-        ));
-        blocked.await.unwrap().unwrap();
-        assert!(matches!(
-            events_rx.recv().await,
-            Some(RuntimeEvent::Warning { message }) if message == "second"
-        ));
-    }
-
-    #[test]
-    fn adapter_chatter_never_becomes_error_context() {
-        assert_eq!(
-            actionable_stderr_tail(
-                "Unexpected case: {\"type\":\"vcs_state_changed\"}\nUnexpected case: {\"type\":\"other\"}"
-            ),
-            None
-        );
-        assert_eq!(
-            actionable_stderr_tail(
-                "Unexpected case: {\"type\":\"vcs_state_changed\"}\nnode: out of memory\nUnexpected case: {\"type\":\"other\"}"
-            ),
-            Some("node: out of memory".to_owned())
-        );
-        assert_eq!(
-            actionable_stderr_tail(
-                "Got response to unknown request null\nGot response to unknown request null"
-            ),
-            None
-        );
-        assert_eq!(
-            actionable_stderr_tail(
-                "Got response to unknown request null\nACP protocol failed: runtime identity missing"
-            ),
-            Some("ACP protocol failed: runtime identity missing".to_owned())
-        );
-        assert_eq!(actionable_stderr_tail("   "), None);
-    }
-
-    #[test]
-    fn an_auth_required_prompt_failure_carries_the_credential_marker() {
-        let auth = prompt_failure_warning(&agent_client_protocol::Error::auth_required());
-        assert!(auth.contains("prompt failed"), "{auth}");
-        assert!(crate::hel_credentials::auth_failure_signature(
-            HarnessKind::Claude,
-            &auth
-        ));
-
-        let other = prompt_failure_warning(&agent_client_protocol::Error::internal_error());
-        assert!(other.contains("prompt failed"), "{other}");
-        assert!(!crate::hel_credentials::auth_failure_signature(
-            HarnessKind::Claude,
-            &other
-        ));
-    }
-
-    #[test]
-    fn only_non_cancelled_prompts_without_updates_need_an_empty_response_warning() {
-        assert!(prompt_returned_without_updates(&StopReason::EndTurn, 7, 7));
-        assert!(!prompt_returned_without_updates(&StopReason::EndTurn, 7, 8));
-        assert!(!prompt_returned_without_updates(
-            &StopReason::Cancelled,
-            7,
-            7
-        ));
-    }
-
-    /// Answers `initialize` and `session/new`, then fails the first
-    /// `session/prompt` with a JSON-RPC error and completes the second.
-    async fn scripted_bridge(stream: tokio::io::DuplexStream) -> usize {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
-        let mut prompts = 0_usize;
-        while let Some(line) = lines.next_line().await.expect("read scripted bridge input") {
-            let request: serde_json::Value =
-                serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
-            let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let id = request
-                .get("id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let response = match method {
-                "initialize" => {
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}})
-                }
-                "session/new" => {
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "scripted"}})
-                }
-                "session/prompt" => {
-                    prompts += 1;
-                    if prompts == 1 {
-                        serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {"code": -32000, "message": "Authentication required"},
-                        })
-                    } else {
-                        if prompts == 3 {
-                            let update = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "method": "session/update",
-                                "params": {
-                                    "sessionId": "scripted",
-                                    "update": {
-                                        "sessionUpdate": "agent_message_chunk",
-                                        "content": {"type": "text", "text": "answer"}
-                                    }
-                                }
-                            });
-                            write
-                                .write_all(format!("{update}\n").as_bytes())
-                                .await
-                                .expect("write scripted session update");
-                        }
-                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}})
-                    }
-                }
-                _ => continue,
-            };
-            if write
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-        prompts
-    }
-
-    /// Answers `initialize` and `session/new`, then — while the prompt is in
-    /// flight — sends the client an ext request and publishes the answer as
-    /// soon as it arrives, so a silent client shows up as a timeout.
-    async fn ext_request_bridge(
-        stream: tokio::io::DuplexStream,
-        method: &'static str,
-        answered: tokio::sync::oneshot::Sender<serde_json::Value>,
-    ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
-        let mut answered = Some(answered);
-        while let Some(line) = lines.next_line().await.expect("read bridge input") {
-            let message: serde_json::Value =
-                serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
-            if message.get("id").and_then(serde_json::Value::as_str) == Some("ext-1") {
-                if let Some(answered) = answered.take() {
-                    let _ = answered.send(message);
-                }
-                continue;
-            }
-            let Some(request_method) = message.get("method").and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            let id = message
-                .get("id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let response = match request_method {
-                "initialize" => {
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}})
-                }
-                "session/new" => {
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "scripted"}})
-                }
-                // Ask the client to leave plan mode without answering the
-                // prompt: the turn only ends once the client replies, which is
-                // exactly the hang this guards against.
-                "session/prompt" => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": "ext-1",
-                    "method": method,
-                    "params": {
-                        "sessionId": "scripted",
-                        "toolCallId": "call-1",
-                        "planContent": "1. do the thing",
-                    },
-                }),
-                _ => continue,
-            };
-            if write
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    }
-
-    async fn answer_to_ext_request(
-        method: &'static str,
-        execution_policy: ExecutionPolicy,
-    ) -> serde_json::Value {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let (answered_tx, answered_rx) = tokio::sync::oneshot::channel();
-        let bridge = tokio::spawn(ext_request_bridge(bridge_stream, method, answered_tx));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-
-        let (request_tx, mut request_rx) = mpsc::channel(4);
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        // Drain events so a full channel can never be mistaken for silence.
-        let events = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Grok,
-            execution_policy,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-        request_tx
-            .send(CommandRequest::Prompt {
-                request_id: "first".into(),
-                prompt: vec![ContentBlock::Text(TextContent::new("plan it"))],
-            })
-            .await
-            .unwrap();
-
-        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), answered_rx)
-            .await
-            .expect("Hel must answer every incoming request instead of leaving the agent waiting")
-            .expect("the bridge must publish the answer");
-
-        drop(request_tx);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
-        bridge.abort();
-        events.abort();
-        answer
-    }
-
-    async fn elicitation_bridge(
-        stream: tokio::io::DuplexStream,
-        initialized: oneshot::Sender<serde_json::Value>,
-        answered: oneshot::Sender<serde_json::Value>,
-    ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
-        let mut initialized = Some(initialized);
-        let mut answered = Some(answered);
-        let mut prompt_id = None;
-        while let Some(line) = lines.next_line().await.expect("read bridge input") {
-            let message: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC");
-            if message.get("id").and_then(serde_json::Value::as_str) == Some("ask-1") {
-                if let Some(answered) = answered.take() {
-                    let _ = answered.send(message);
-                }
-                let response = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": prompt_id.take().expect("prompt id recorded"),
-                    "result": {"stopReason": "end_turn"},
-                });
-                write
-                    .write_all(format!("{response}\n").as_bytes())
-                    .await
-                    .expect("finish prompt");
-                continue;
-            }
-            let Some(method) = message.get("method").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let id = message
-                .get("id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let response = match method {
-                "initialize" => {
-                    if let Some(initialized) = initialized.take() {
-                        let _ = initialized.send(message.clone());
-                    }
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {"protocolVersion": 1},
-                    })
-                }
-                "session/new" => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {"sessionId": "scripted"},
-                }),
-                "session/prompt" => {
-                    prompt_id = Some(id);
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": "ask-1",
-                        "method": "elicitation/create",
-                        "params": {
-                            "sessionId": "scripted",
-                            "toolCallId": "question-tool",
-                            "mode": "form",
-                            "message": "Choose an architecture",
-                            "requestedSchema": {
-                                "type": "object",
-                                "required": ["architecture"],
-                                "properties": {
-                                    "architecture": {
-                                        "type": "string",
-                                        "title": "Architecture",
-                                        "oneOf": [
-                                            {"const": "thin", "title": "Thin callers"},
-                                            {"const": "dynamic", "title": "Dynamic matrix"}
-                                        ]
-                                    }
-                                }
-                            }
-                        }
-                    })
-                }
-                _ => continue,
-            };
-            if write
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn form_elicitation_is_advertised_rendered_and_answered() {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let (initialized_tx, initialized_rx) = oneshot::channel();
-        let (answered_tx, answered_rx) = oneshot::channel();
-        let bridge = tokio::spawn(elicitation_bridge(
-            bridge_stream,
-            initialized_tx,
-            answered_tx,
-        ));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-        let (request_tx, mut request_rx) = mpsc::channel(4);
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Claude,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-        let initialized = tokio::time::timeout(Duration::from_secs(5), initialized_rx)
-            .await
-            .expect("runtime initializes")
-            .expect("bridge observes initialization");
-        assert!(initialized["params"]["clientCapabilities"]["elicitation"]["form"].is_object());
-
-        request_tx
-            .send(CommandRequest::Prompt {
-                request_id: "prompt-1".into(),
-                prompt: vec![ContentBlock::Text(TextContent::new("plan it"))],
-            })
-            .await
-            .unwrap();
-        let request = loop {
-            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
-                .await
-                .expect("elicitation arrives")
-                .expect("runtime event channel stays open");
-            if let RuntimeEvent::ElicitationRequested { request } = event {
-                break request;
-            }
-        };
-        assert_eq!(request.message, "Choose an architecture");
-        assert_eq!(request.fields[0].title, "Architecture");
-        let (resolved_tx, resolved_rx) = oneshot::channel();
-        request_tx
-            .send(CommandRequest::ResolveElicitation {
-                elicitation_id: request.id,
-                response: ElicitationResponse::Accept {
-                    content: BTreeMap::from([(
-                        "architecture".into(),
-                        crate::hel_elicitation::ElicitationValue::String("thin".into()),
-                    )]),
-                },
-                resolved: resolved_tx,
-            })
-            .await
-            .unwrap();
-        assert_eq!(resolved_rx.await.unwrap(), Ok(()));
-        let answered = tokio::time::timeout(Duration::from_secs(5), answered_rx)
-            .await
-            .expect("bridge receives answer")
-            .expect("answer is published");
-        assert_eq!(answered["result"]["action"], "accept");
-        assert_eq!(answered["result"]["content"]["architecture"], "thin");
-
-        drop(request_tx);
-        tokio::time::timeout(Duration::from_secs(5), driver)
-            .await
-            .expect("runtime exits")
-            .expect("runtime task does not panic")
-            .expect("runtime exits cleanly");
-        bridge.await.unwrap();
-    }
-
-    /// Modeled on the `_meta.modelState` a signed-in `grok agent stdio`
-    /// returns from `initialize`.
-    fn grok_model_meta() -> serde_json::Map<String, serde_json::Value> {
-        let state = serde_json::json!({
-            "currentModelId": "grok-4.6",
-            "availableModels": [
-                {
-                    "modelId": "grok-4.6",
-                    "name": "Grok 4.6",
-                    "description": "SpaceXAI's latest frontier model",
-                    "_meta": {
-                        "totalContextTokens": 500_000,
-                        "supportsReasoningEffort": true,
-                        "reasoningEffort": "high",
-                        "reasoningEfforts": [
-                            {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "description": "Highest effort and reasoning level", "default": true},
-                            {"id": "high", "value": "high", "label": "High Effort", "default": true},
-                            {"id": "medium", "value": "medium", "label": "Medium Effort", "default": false},
-                            {"id": "low", "value": "low", "label": "Low Effort", "default": false}
-                        ]
-                    }
-                },
-                {
-                    "modelId": "grok-4.5",
-                    "name": "Grok 4.5",
-                    "_meta": {
-                        "supportsReasoningEffort": true,
-                        "reasoningEffort": "high",
-                        "reasoningEfforts": [
-                            {"id": "high", "value": "high", "label": "High Effort", "default": true},
-                            {"id": "low", "value": "low", "label": "Low Effort", "default": false}
-                        ]
-                    }
-                }
-            ]
-        });
-        let mut meta = serde_json::Map::new();
-        meta.insert("modelState".into(), state);
-        meta
-    }
-
-    fn select_values(option: &SessionConfigOption) -> Vec<String> {
-        let SessionConfigKind::Select(select) = &option.kind else {
-            panic!("expected a select option");
-        };
-        let agent_client_protocol::schema::v1::SessionConfigSelectOptions::Ungrouped(options) =
-            &select.options
-        else {
-            panic!("expected ungrouped options");
-        };
-        options
-            .iter()
-            .map(|option| option.value.to_string())
-            .collect()
-    }
-
-    #[test]
-    fn grok_model_state_reads_the_catalogue_out_of_initialize_meta() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
-
-        assert_eq!(state.current_model_id, "grok-4.6");
-        assert_eq!(state.current_effort.as_deref(), Some("high"));
-        assert_eq!(state.models.len(), 2);
-        assert_eq!(state.models[0].name, "Grok 4.6");
-        assert_eq!(
-            state.models[0]
-                .efforts
-                .iter()
-                .map(|effort| effort.id.as_str())
-                .collect::<Vec<_>>(),
-            ["xhigh", "high", "medium", "low"]
-        );
-        assert_eq!(state.models[1].efforts.len(), 2);
-
-        // Every other harness returns real `configOptions`, so nothing is
-        // synthesized for them.
-        assert_eq!(grok_model_state(None), None);
-        assert_eq!(
-            grok_model_state(Some(&serde_json::Map::new())),
-            None,
-            "an agent without a catalogue must not get a synthesized one"
-        );
-    }
-
-    #[test]
-    fn grok_config_options_carry_the_model_and_its_reasoning_tiers() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
-
-        let options = grok_config_options(&state);
-
-        assert_eq!(options.len(), 2);
-        assert_eq!(options[0].id.to_string(), "model");
-        assert_eq!(
-            options[0].category,
-            Some(SessionConfigOptionCategory::Model)
-        );
-        assert_eq!(select_values(&options[0]), ["grok-4.6", "grok-4.5"]);
-        assert!(select_contains(&options[0].kind, "grok-4.5"));
-
-        assert_eq!(options[1].id.to_string(), "effort");
-        assert_eq!(
-            options[1].category,
-            Some(SessionConfigOptionCategory::ThoughtLevel)
-        );
-        // Effort tiers belong to the selected model, not the whole catalogue.
-        assert_eq!(
-            select_values(&options[1]),
-            ["xhigh", "high", "medium", "low"]
-        );
-
-        // Hel's existing /model and /effort lookups find both selectors.
-        assert_eq!(
-            find_session_config_option(&options, "model").map(|option| option.id.to_string()),
-            Some("model".to_owned())
-        );
-        assert_eq!(
-            find_session_config_option(&options, "effort").map(|option| option.id.to_string()),
-            Some("effort".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_grok_model_change_sends_the_new_id_without_an_effort_meta() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
-
-        let (params, updated) =
-            grok_set_model_request(&SessionId::from("s-1"), &state, "model", "grok-4.5").unwrap();
-
-        assert_eq!(
-            params,
-            serde_json::json!({"sessionId": "s-1", "modelId": "grok-4.5"})
-        );
-        assert_eq!(updated.current_model_id, "grok-4.5");
-        // The new model has its own tiers, so the agent reports the effort.
-        assert_eq!(updated.current_effort, None);
-        // The effort selector now offers the new model's tiers.
-        assert_eq!(
-            select_values(&grok_config_options(&updated)[1]),
-            ["high", "low"]
-        );
-    }
-
-    #[test]
-    fn a_grok_effort_change_resends_the_current_model_with_the_effort_meta() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
-
-        let (params, updated) =
-            grok_set_model_request(&SessionId::from("s-1"), &state, "effort", "low").unwrap();
-
-        assert_eq!(
-            params,
-            serde_json::json!({
-                "sessionId": "s-1",
-                "modelId": "grok-4.6",
-                "_meta": {"reasoningEffort": "low"},
-            })
-        );
-        assert_eq!(updated.current_model_id, "grok-4.6");
-        assert_eq!(updated.current_effort.as_deref(), Some("low"));
-        let SessionConfigKind::Select(select) = &grok_config_options(&updated)[1].kind else {
-            panic!("expected a select option");
-        };
-        assert_eq!(select.current_value.to_string(), "low");
-    }
-
-    #[test]
-    fn grok_rejects_values_and_keys_it_has_no_selector_for() {
-        let state = grok_model_state(Some(&grok_model_meta())).unwrap();
-        let session = SessionId::from("s-1");
-
-        for (key, value) in [("model", "grok-9"), ("effort", "ludicrous")] {
-            let error = grok_set_model_request(&session, &state, key, value).unwrap_err();
-            assert!(
-                format!("{error:#}").contains(&format!("is not an available {key} value")),
-                "{error:#}"
-            );
-        }
-        let error = grok_set_model_request(&session, &state, "verbosity", "high").unwrap_err();
-        assert!(
-            format!("{error:#}").contains("no verbosity selector"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn exit_plan_mode_is_recognized_with_and_without_the_ext_prefix() {
-        assert!(is_exit_plan_mode_method("_x.ai/exit_plan_mode"));
-        assert!(is_exit_plan_mode_method("x.ai/exit_plan_mode"));
-        assert!(!is_exit_plan_mode_method("_x.ai/other"));
-        assert!(!is_exit_plan_mode_method("session/request_permission"));
-    }
-
-    #[test]
-    fn grok_plan_review_answers_are_user_selected() {
-        let review = normalized_plan_review(
-            "plan-review-grok-1".into(),
-            &serde_json::json!({"plan_content": "Do nothing"}),
-        );
-        let encoded = serde_json::to_value(&review).unwrap();
-        assert_eq!(
-            serde_json::from_value::<ElicitationRequest>(encoded).unwrap(),
-            review,
-            "normalized reviews must survive the durable relay journal"
-        );
-        let mut content = BTreeMap::new();
-        content.insert(
-            PLAN_REVIEW_ACTION.into(),
-            ElicitationValue::String("implement".into()),
-        );
-        assert_eq!(
-            grok_plan_response(ElicitationResponse::Accept { content }),
-            serde_json::json!({"outcome": "approved"})
-        );
-    }
-
-    #[test]
-    fn supported_permission_plan_reviews_are_detected_and_mapped_to_native_options() {
-        use agent_client_protocol::schema::v1::{
-            PermissionOption, ToolCallUpdate, ToolCallUpdateFields,
-        };
-
-        let fixtures = [
-            ("Implement this plan?", "IMPLEMENT_PLAN_OPTION_ID"),
-            ("ExitPlanMode", "default"),
-            ("Review plan", "plan_approve"),
-        ];
-        for (title, approval_id) in fixtures {
-            let request = RequestPermissionRequest::new(
-                "session-1",
-                ToolCallUpdate::new(
-                    "tool-1",
-                    ToolCallUpdateFields::new()
-                        .title(title.to_owned())
-                        .raw_input(serde_json::json!({"plan": "Do the work"})),
-                ),
-                vec![
-                    PermissionOption::new(approval_id, "Approve", PermissionOptionKind::AllowOnce),
-                    PermissionOption::new(
-                        "plan_revise",
-                        "Revise",
-                        PermissionOptionKind::RejectOnce,
-                    ),
-                ],
-            );
-            assert!(is_plan_permission(&request), "fixture {title}");
-            let review = normalized_plan_review(
-                "plan-review-1".into(),
-                &serde_json::to_value(&request).unwrap(),
-            );
-            assert!(review.message.contains("Do the work"));
-            let mut content = BTreeMap::new();
-            content.insert(
-                PLAN_REVIEW_ACTION.into(),
-                ElicitationValue::String("implement".into()),
-            );
-            let response =
-                permission_plan_response(&request, ElicitationResponse::Accept { content });
-            assert_eq!(
-                serde_json::to_value(response).unwrap()["outcome"]["optionId"],
-                approval_id
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn an_unknown_client_request_is_answered_with_an_error_rather_than_silence() {
-        let answer =
-            answer_to_ext_request("_someone.example/unknown", ExecutionPolicy::Unconstrained).await;
-        assert!(
-            answer.get("result").is_none(),
-            "an unimplemented request must not be answered with a result: {answer}"
-        );
-        assert_eq!(
-            answer["error"]["code"], -32601,
-            "expected a method-not-found error: {answer}"
-        );
-    }
-
-    /// Answers `initialize` (with or without Grok Build's model catalogue) and
-    /// `session/new`, then records the request Hel sends for a config change.
-    async fn config_change_bridge(
-        stream: tokio::io::DuplexStream,
-        model_catalogue: bool,
-        observed: tokio::sync::oneshot::Sender<serde_json::Value>,
-    ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
-        let mut observed = Some(observed);
-        while let Some(line) = lines.next_line().await.expect("read bridge input") {
-            let message: serde_json::Value =
-                serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
-            let Some(method) = message.get("method").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let id = message
-                .get("id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let response = match method {
-                "initialize" => {
-                    let mut result = serde_json::json!({"protocolVersion": 1});
-                    if model_catalogue {
-                        result["_meta"] = serde_json::Value::Object(grok_model_meta());
-                    }
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
-                }
-                "session/new" => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "sessionId": "scripted",
-                        // A plain harness answers with real config options.
-                        "configOptions": (!model_catalogue).then(|| serde_json::json!([{
-                            "id": "model",
-                            "name": "Model",
-                            "category": "model",
-                            "type": "select",
-                            "currentValue": "sonnet",
-                            "options": [{"value": "sonnet", "name": "Sonnet"},
-                                        {"value": "opus", "name": "Opus"}],
-                        }])),
-                    },
-                }),
-                _ => {
-                    if let Some(observed) = observed.take() {
-                        let _ = observed.send(message.clone());
-                    }
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
-                }
-            };
-            if write
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    }
-
-    async fn config_change_request(
-        harness: HarnessKind,
-        model_catalogue: bool,
-        key: &str,
-        value: &str,
-    ) -> serde_json::Value {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
-        let bridge = tokio::spawn(config_change_bridge(
-            bridge_stream,
-            model_catalogue,
-            observed_tx,
-        ));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-
-        let (request_tx, mut request_rx) = mpsc::channel(4);
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let events = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-        request_tx
-            .send(CommandRequest::SetConfig {
-                request_id: "config-1".into(),
-                key: key.to_owned(),
-                value: value.to_owned(),
-            })
-            .await
-            .unwrap();
-
-        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx)
-            .await
-            .expect("Hel must send a configuration request")
-            .expect("the bridge must publish the request");
-
-        drop(request_tx);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
-        bridge.abort();
-        events.abort();
-        observed
-    }
-
-    #[derive(Clone, Copy)]
-    enum ModeSurface {
-        Legacy,
-        Both,
-    }
-
-    async fn mode_change_bridge(
-        stream: tokio::io::DuplexStream,
-        surface: ModeSurface,
-        observed: tokio::sync::oneshot::Sender<serde_json::Value>,
-    ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let mode_option = |current: &str| {
-            serde_json::json!({
-                "id": "interaction_mode",
-                "name": "Mode",
-                "category": "mode",
-                "type": "select",
-                "currentValue": current,
-                "options": [
-                    {"value": "default", "name": "Default"},
-                    {"value": "plan", "name": "Plan"},
-                    {"value": "agent", "name": "Agent"},
-                    {"value": "agent-full-access", "name": "Full access"}
-                ]
-            })
-        };
-        let modes = serde_json::json!({
-            "currentModeId": "default",
-                "availableModes": [
-                    {"id": "default", "name": "Default"},
-                    {"id": "plan", "name": "Plan"},
-                    {"id": "agent", "name": "Agent"},
-                    {"id": "agent-full-access", "name": "Full access"}
-            ]
-        });
-        let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
-        let mut observed = Some(observed);
-        while let Some(line) = lines.next_line().await.expect("read bridge input") {
-            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
-            let Some(method) = message.get("method").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let id = message.get("id").cloned().unwrap_or_default();
-            let response = match method {
-                "initialize" => serde_json::json!({
-                    "jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}
-                }),
-                "session/new" => {
-                    let mut result = serde_json::json!({"sessionId": "scripted"});
-                    if matches!(surface, ModeSurface::Both) {
-                        result["configOptions"] = serde_json::json!([mode_option("default")]);
-                    }
-                    if matches!(surface, ModeSurface::Legacy | ModeSurface::Both) {
-                        result["modes"] = modes.clone();
-                    }
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
-                }
-                "session/set_config_option" => {
-                    if let Some(observed) = observed.take() {
-                        let _ = observed.send(message.clone());
-                    }
-                    let selected = message["params"]["value"].as_str().unwrap_or("default");
-                    serde_json::json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": {"configOptions": [mode_option(selected)]}
-                    })
-                }
-                _ => {
-                    if let Some(observed) = observed.take() {
-                        let _ = observed.send(message.clone());
-                    }
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
-                }
-            };
-            if write
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    }
-
-    async fn mode_change_request(surface: ModeSurface) -> serde_json::Value {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
-        let bridge = tokio::spawn(mode_change_bridge(bridge_stream, surface, observed_tx));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-        let (request_tx, mut request_rx) = mpsc::channel(4);
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let events = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Claude,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-        request_tx
-            .send(CommandRequest::SetSessionMode {
-                request_id: "mode-1".into(),
-                mode_id: "plan".into(),
-            })
-            .await
-            .unwrap();
-        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx)
-            .await
-            .expect("Hel must send a mode request")
-            .expect("the bridge must publish the request");
-        drop(request_tx);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
-        bridge.abort();
-        events.abort();
-        observed
-    }
-
-    #[tokio::test]
-    async fn legacy_modes_use_session_set_mode() {
-        let request = mode_change_request(ModeSurface::Legacy).await;
-
-        assert_eq!(request["method"], "session/set_mode");
-        assert_eq!(request["params"]["modeId"], "plan");
-    }
-
-    #[tokio::test]
-    async fn set_session_mode_uses_the_mode_protocol_even_when_config_is_available() {
-        let request = mode_change_request(ModeSurface::Both).await;
-
-        assert_eq!(request["method"], "session/set_mode");
-    }
-
-    #[tokio::test]
-    async fn unconstrained_policy_is_enforced_before_the_session_is_reported() {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
-        let bridge = tokio::spawn(mode_change_bridge(
-            bridge_stream,
-            ModeSurface::Both,
-            observed_tx,
-        ));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-        let (request_tx, mut request_rx) = mpsc::channel(1);
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Codex,
-            execution_policy: ExecutionPolicy::Unconstrained,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-
-        let request = tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx)
-            .await
-            .expect("Hel must enforce the target execution policy")
-            .expect("the bridge must publish the request");
-        assert_eq!(request["method"], "session/set_config_option");
-        assert_eq!(request["params"]["value"], "agent-full-access");
-
-        let mut reported_mode = None;
-        let mut configured_mode = None;
-        while reported_mode.is_none() || configured_mode.is_none() {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
-                .await
-                .expect("the configured session must be reported")
-                .expect("the runtime must keep its event channel open");
-            match event {
-                RuntimeEvent::SessionStarted { execution_mode, .. } => {
-                    reported_mode = execution_mode;
-                }
-                RuntimeEvent::SessionConfigured { config_options } => {
-                    configured_mode = Some(
-                        serde_json::to_value(config_options).unwrap()[0]["currentValue"]
-                            .as_str()
-                            .unwrap()
-                            .to_owned(),
-                    );
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(reported_mode.as_deref(), Some("agent-full-access"));
-        assert_eq!(configured_mode.as_deref(), Some("agent-full-access"));
-
-        drop(request_tx);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
-        bridge.abort();
-    }
-
-    #[tokio::test]
-    async fn a_grok_effort_change_goes_out_as_a_legacy_set_model_request() {
-        let request = config_change_request(HarnessKind::Grok, true, "effort", "low").await;
-
-        assert_eq!(request["method"], "session/set_model");
-        assert_eq!(request["params"]["sessionId"], "scripted");
-        assert_eq!(request["params"]["modelId"], "grok-4.6");
-        assert_eq!(request["params"]["_meta"]["reasoningEffort"], "low");
-    }
-
-    #[tokio::test]
-    async fn a_grok_model_change_goes_out_as_a_legacy_set_model_request() {
-        let request = config_change_request(HarnessKind::Grok, true, "model", "grok-4.5").await;
-
-        assert_eq!(request["method"], "session/set_model");
-        assert_eq!(request["params"]["modelId"], "grok-4.5");
-        assert!(
-            request["params"].get("_meta").is_none(),
-            "a model change carries no effort meta: {request}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_harness_with_real_config_options_still_uses_the_standard_acp_request() {
-        let request = config_change_request(HarnessKind::Claude, false, "model", "opus").await;
-
-        assert_eq!(request["method"], "session/set_config_option");
-        assert_eq!(request["params"]["configId"], "model");
-        assert_eq!(request["params"]["value"], "opus");
-    }
-
-    #[tokio::test]
-    async fn a_failed_prompt_fails_the_turn_and_the_runtime_keeps_serving() {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let bridge = tokio::spawn(scripted_bridge(bridge_stream));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-
-        let (request_tx, mut request_rx) = mpsc::channel(4);
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Claude,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-
-        let next_event = async |events: &mut mpsc::Receiver<RuntimeEvent>| {
-            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-                .await
-                .expect("the runtime must keep emitting events after a failed prompt")
-                .expect("the runtime must not drop its event channel")
-        };
-
-        request_tx
-            .send(CommandRequest::Prompt {
-                request_id: "first".into(),
-                prompt: vec![ContentBlock::Text(TextContent::new("hello"))],
-            })
-            .await
-            .unwrap();
-        let mut warning = None;
-        let failed = loop {
-            match next_event(&mut event_rx).await {
-                RuntimeEvent::Warning { message } => warning = Some(message),
-                RuntimeEvent::PromptFinished {
-                    request_id,
-                    stop_reason,
-                } => break (request_id, stop_reason),
-                _ => {}
-            }
-        };
-        assert_eq!(failed, ("first".to_owned(), "error".to_owned()));
-        let warning = warning.expect("a failed prompt must warn before it finishes the turn");
-        assert!(warning.contains("Authentication required"), "{warning}");
-        assert!(crate::hel_credentials::auth_failure_signature(
-            HarnessKind::Claude,
-            &warning
-        ));
-
-        request_tx
-            .send(CommandRequest::Prompt {
-                request_id: "second".into(),
-                prompt: vec![ContentBlock::Text(TextContent::new("still there?"))],
-            })
-            .await
-            .unwrap();
-        let mut empty_warning = None;
-        let completed = loop {
-            match next_event(&mut event_rx).await {
-                RuntimeEvent::Warning { message } => empty_warning = Some(message),
-                RuntimeEvent::PromptFinished {
-                    request_id,
-                    stop_reason,
-                } => break (request_id, stop_reason),
-                _ => {}
-            }
-        };
-        assert_eq!(completed, ("second".to_owned(), "EndTurn".to_owned()));
-        assert_eq!(empty_warning.as_deref(), Some(PROMPT_EMPTY_RESPONSE_MARKER));
-
-        request_tx
-            .send(CommandRequest::Prompt {
-                request_id: "third".into(),
-                prompt: vec![ContentBlock::Text(TextContent::new("answer this"))],
-            })
-            .await
-            .unwrap();
-        let mut saw_update = false;
-        let mut warning = None;
-        let completed = loop {
-            match next_event(&mut event_rx).await {
-                RuntimeEvent::SessionUpdate { .. } => saw_update = true,
-                RuntimeEvent::Warning { message } => warning = Some(message),
-                RuntimeEvent::PromptFinished {
-                    request_id,
-                    stop_reason,
-                } => break (request_id, stop_reason),
-                _ => {}
-            }
-        };
-        assert_eq!(completed, ("third".to_owned(), "EndTurn".to_owned()));
-        assert!(saw_update, "the scripted response must publish its update");
-        assert_eq!(warning, None, "a response with output must not warn");
-
-        drop(request_tx);
-        tokio::time::timeout(std::time::Duration::from_secs(5), driver)
-            .await
-            .expect("closing the command channel must end the runtime")
-            .expect("the runtime task must not panic")
-            .expect("a failed prompt must not fail the runtime");
-        assert_eq!(bridge.await.unwrap(), 3);
-    }
-
-    /// Answers `initialize` and both `session/new` calls, then leaves the
-    /// scratch `session/prompt` unanswered so a compaction stays in flight.
-    /// Every method it sees is republished so a test can wait for one.
-    async fn stalled_compaction_bridge(
-        stream: tokio::io::DuplexStream,
-        observed: mpsc::UnboundedSender<String>,
-    ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
-        let mut sessions = 0_usize;
-        while let Some(line) = lines.next_line().await.expect("read bridge input") {
-            let message: serde_json::Value =
-                serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
-            let Some(method) = message.get("method").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let _ = observed.send(method.to_owned());
-            let id = message
-                .get("id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let response = match method {
-                "initialize" => {
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}})
-                }
-                "session/new" => {
-                    sessions += 1;
-                    let session = if sessions == 1 {
-                        "destination"
-                    } else {
-                        "scratch"
-                    };
-                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": session}})
-                }
-                _ => continue,
-            };
-            if write
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_cancel_is_served_while_a_compaction_is_in_flight() {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
-        let bridge = tokio::spawn(stalled_compaction_bridge(bridge_stream, observed_tx));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-
-        let (request_tx, mut request_rx) = mpsc::channel(4);
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            // Kimi has no production compactor, so the scratch session goes
-            // straight from `session/new` to the prompt that stalls.
-            harness: HarnessKind::Kimi,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-
-        let (compacted_tx, mut compacted_rx) = oneshot::channel();
-        request_tx
-            .send(CommandRequest::Compact {
-                prompt: "summarize the transcript".into(),
-                response: compacted_tx,
-            })
-            .await
-            .unwrap();
-        loop {
-            let method =
-                tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx.recv())
-                    .await
-                    .expect("the compaction must reach the scratch prompt")
-                    .expect("the bridge must keep reporting methods");
-            if method == "session/prompt" {
-                break;
-            }
-        }
-
-        request_tx
-            .send(CommandRequest::Cancel {
-                request_id: "cancel-1".into(),
-            })
-            .await
-            .unwrap();
-        let applied = loop {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
-                .await
-                .expect("the coordinator must keep serving while a compaction runs")
-                .expect("the runtime must not drop its event channel");
-            if let RuntimeEvent::CancelApplied { request_id } = event {
-                break request_id;
-            }
-        };
-        assert_eq!(applied, "cancel-1");
-        assert!(
-            compacted_rx.try_recv().is_err(),
-            "the cancel must be served without ending the compaction"
-        );
-
-        drop(request_tx);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
-        bridge.abort();
-    }
-
-    /// Answers `initialize` and `session/new`, then holds `session/prompt`
-    /// until the test completes it. Used to prove cancel waits for a real
-    /// prompt settlement and restarts when that settlement never arrives.
-    async fn stalled_prompt_bridge(
-        stream: tokio::io::DuplexStream,
-        observed: mpsc::UnboundedSender<String>,
-        mut complete: mpsc::Receiver<()>,
-    ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
-        let mut prompt_id = None;
-        loop {
-            tokio::select! {
-                line = lines.next_line() => {
-                    let Some(line) = line.expect("read stalled bridge input") else {
-                        break;
-                    };
-                    let request: serde_json::Value =
-                        serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
-                    let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
-                        continue;
-                    };
-                    let _ = observed.send(method.to_owned());
-                    let id = request
-                        .get("id")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    let response = match method {
-                        "initialize" => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {"protocolVersion": 1},
-                        }),
-                        "session/new" | "session/load" => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {"sessionId": "scripted"},
-                        }),
-                        "session/prompt" => {
-                            prompt_id = Some(id);
-                            continue;
-                        }
-                        _ => continue,
-                    };
-                    if write
-                        .write_all(format!("{response}\n").as_bytes())
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                complete = complete.recv() => {
-                    if complete.is_none() {
-                        break;
-                    }
-                    let Some(id) = prompt_id.take() else {
-                        continue;
-                    };
-                    let response = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {"stopReason": "cancelled"},
-                    });
-                    if write
-                        .write_all(format!("{response}\n").as_bytes())
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn wait_for_runtime_event<F>(
-        events: &mut mpsc::Receiver<RuntimeEvent>,
-        mut matches: F,
-    ) -> RuntimeEvent
-    where
-        F: FnMut(&RuntimeEvent) -> bool,
-    {
-        loop {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-                .await
-                .expect("runtime event arrives")
-                .expect("runtime event channel stays open");
-            if matches(&event) {
-                return event;
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancel_that_the_agent_acks_does_not_restart_the_harness() {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
-        let (complete_tx, complete_rx) = mpsc::channel(1);
-        let bridge = tokio::spawn(stalled_prompt_bridge(
-            bridge_stream,
-            observed_tx,
-            complete_rx,
-        ));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-        let (request_tx, mut request_rx) = mpsc::channel(4);
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Kimi,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-        request_tx
-            .send(CommandRequest::Prompt {
-                request_id: "prompt-1".into(),
-                prompt: vec![ContentBlock::Text(TextContent::new("go"))],
-            })
-            .await
-            .unwrap();
-        loop {
-            let method =
-                tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx.recv())
-                    .await
-                    .expect("the prompt must reach the bridge")
-                    .expect("the bridge must keep reporting methods");
-            if method == "session/prompt" {
-                break;
-            }
-        }
-        request_tx
-            .send(CommandRequest::Cancel {
-                request_id: "cancel-1".into(),
-            })
-            .await
-            .unwrap();
-        wait_for_runtime_event(&mut event_rx, |event| {
-            matches!(event, RuntimeEvent::CancelApplied { request_id } if request_id == "cancel-1")
-        })
-        .await;
-        tokio::time::advance(CANCEL_ACK_TIMEOUT - Duration::from_secs(1)).await;
-        complete_tx.send(()).await.unwrap();
-        let finished = wait_for_runtime_event(&mut event_rx, |event| {
-            matches!(
-                event,
-                RuntimeEvent::PromptFinished { request_id, .. } if request_id == "prompt-1"
-            )
-        })
-        .await;
-        let RuntimeEvent::PromptFinished { stop_reason, .. } = finished else {
-            panic!("expected prompt finished: {finished:?}");
-        };
-        assert!(
-            stop_reason.to_lowercase().contains("cancel"),
-            "{stop_reason}"
-        );
-        drop(request_tx);
-        let restart = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
-            .await
-            .expect("runtime exits")
-            .expect("runtime task does not panic")
-            .expect("a cancelled prompt must not fail the runtime");
-        assert_eq!(restart, None);
-        bridge.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn unacked_cancel_restarts_the_harness_after_sixty_seconds() {
-        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
-        let (_complete_tx, complete_rx) = mpsc::channel(1);
-        let bridge = tokio::spawn(stalled_prompt_bridge(
-            bridge_stream,
-            observed_tx,
-            complete_rx,
-        ));
-        let (client_read, client_write) = tokio::io::split(client_stream);
-        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-        let (request_tx, mut request_rx) = mpsc::channel(4);
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let spec = LaunchSpec {
-            command: "scripted".into(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Kimi,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let driver = tokio::spawn(async move {
-            drive(
-                transport,
-                spec,
-                &mut request_rx,
-                event_tx,
-                Arc::new(Mutex::new(None)),
-            )
-            .await
-        });
-        request_tx
-            .send(CommandRequest::Prompt {
-                request_id: "prompt-1".into(),
-                prompt: vec![ContentBlock::Text(TextContent::new("go"))],
-            })
-            .await
-            .unwrap();
-        loop {
-            let method =
-                tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx.recv())
-                    .await
-                    .expect("the prompt must reach the bridge")
-                    .expect("the bridge must keep reporting methods");
-            if method == "session/prompt" {
-                break;
-            }
-        }
-        request_tx
-            .send(CommandRequest::Cancel {
-                request_id: "cancel-1".into(),
-            })
-            .await
-            .unwrap();
-        wait_for_runtime_event(&mut event_rx, |event| {
-            matches!(event, RuntimeEvent::CancelApplied { request_id } if request_id == "cancel-1")
-        })
-        .await;
-        tokio::time::advance(CANCEL_ACK_TIMEOUT).await;
-        let interrupted = wait_for_runtime_event(&mut event_rx, |event| {
-            matches!(
-                event,
-                RuntimeEvent::CommandInterrupted { request_id, .. } if request_id == "prompt-1"
-            )
-        })
-        .await;
-        let RuntimeEvent::CommandInterrupted { message, .. } = interrupted else {
-            panic!("expected interrupt: {interrupted:?}");
-        };
-        assert!(message.contains("60s"), "{message}");
-        drop(request_tx);
-        let restart = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
-            .await
-            .expect("runtime exits after an unacked cancel")
-            .expect("runtime task does not panic")
-            .expect("an unacked cancel restarts instead of failing the runtime");
-        assert_eq!(restart.as_deref(), Some("scripted"));
-        bridge.abort();
-    }
-
-    /// Terminals run real children in real process groups, which only Unix has.
-    #[cfg(unix)]
-    mod terminals {
-        use super::*;
-
-        /// Every wait carries this bound, so a handler that stalls the dispatch
-        /// loop or a child that deadlocks on a full pipe fails the test in
-        /// seconds instead of hanging the suite.
-        const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-        /// Answers `initialize` and `session/new`, writes the requests a test
-        /// scripts, and republishes every answer Hel sends back.
-        async fn client_request_bridge(
-            stream: tokio::io::DuplexStream,
-            mut scripted: mpsc::UnboundedReceiver<serde_json::Value>,
-            answers: mpsc::UnboundedSender<serde_json::Value>,
-        ) {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-            let (read, mut write) = tokio::io::split(stream);
-            let mut lines = BufReader::new(read).lines();
-            loop {
-                let outgoing = tokio::select! {
-                    line = lines.next_line() => {
-                        let Some(line) = line.expect("read bridge input") else {
-                            break;
-                        };
-                        let message: serde_json::Value =
-                            serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
-                        let Some(method) =
-                            message.get("method").and_then(serde_json::Value::as_str)
-                        else {
-                            // No method: an answer to one of the scripted requests.
-                            if answers.send(message).is_err() {
-                                break;
-                            }
-                            continue;
-                        };
-                        let id = message
-                            .get("id")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        match method {
-                            "initialize" => serde_json::json!({
-                                "jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1},
-                            }),
-                            "session/new" => serde_json::json!({
-                                "jsonrpc": "2.0", "id": id, "result": {"sessionId": "scripted"},
-                            }),
-                            _ => continue,
-                        }
-                    }
-                    request = scripted.recv() => {
-                        let Some(request) = request else {
-                            break;
-                        };
-                        request
-                    }
-                };
-                if write
-                    .write_all(format!("{outgoing}\n").as_bytes())
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
-
-        /// The agent side of a scripted connection. Answers are collected by
-        /// id, so a test can keep one request in flight while it sends others.
-        struct ScriptedAgent {
-            scripted: mpsc::UnboundedSender<serde_json::Value>,
-            answers: mpsc::UnboundedReceiver<serde_json::Value>,
-            received: BTreeMap<String, serde_json::Value>,
-            sent: usize,
-        }
-
-        impl ScriptedAgent {
-            fn send(&mut self, method: &str, params: serde_json::Value) -> String {
-                self.sent += 1;
-                let id = format!("agent-{}", self.sent);
-                self.scripted
-                    .send(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "method": method,
-                        "params": params,
-                    }))
-                    .expect("the scripted bridge must accept requests");
-                id
-            }
-
-            async fn answer(&mut self, id: &str) -> serde_json::Value {
-                loop {
-                    if let Some(answer) = self.received.remove(id) {
-                        return answer;
-                    }
-                    let answer = tokio::time::timeout(ANSWER_TIMEOUT, self.answers.recv())
-                        .await
-                        .expect(
-                            "Hel must answer every terminal request instead of leaving the agent waiting",
-                        )
-                        .expect("the bridge must keep publishing answers");
-                    let answer_id = answer
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .expect("an answer must carry the request id")
-                        .to_owned();
-                    self.received.insert(answer_id, answer);
-                }
-            }
-
-            async fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
-                let id = self.send(method, params);
-                self.answer(&id).await
-            }
-        }
-
-        struct ScriptedRuntime {
-            agent: ScriptedAgent,
-            observed: Arc<Mutex<Vec<RuntimeEvent>>>,
-            requests: mpsc::Sender<CommandRequest>,
-            driver: tokio::task::JoinHandle<Result<Option<String>>>,
-            bridge: tokio::task::JoinHandle<()>,
-            events: tokio::task::JoinHandle<()>,
-        }
-
-        impl ScriptedRuntime {
-            /// Close the command channel and wait for the runtime to finish,
-            /// which is also what tears the terminals down.
-            async fn stop(self) {
-                drop(self.requests);
-                let restart = tokio::time::timeout(ANSWER_TIMEOUT, self.driver)
-                    .await
-                    .expect("closing the command channel must end the runtime")
-                    .expect("the runtime task must not panic")
-                    .expect("terminal work must not fail the runtime");
-                assert_eq!(restart, None);
-                self.bridge.abort();
-                self.events.abort();
-            }
-        }
-
-        fn start_scripted_runtime() -> ScriptedRuntime {
-            let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-            let (scripted_tx, scripted_rx) = mpsc::unbounded_channel();
-            let (answers_tx, answers_rx) = mpsc::unbounded_channel();
-            let bridge = tokio::spawn(client_request_bridge(
-                bridge_stream,
-                scripted_rx,
-                answers_tx,
-            ));
-            let (client_read, client_write) = tokio::io::split(client_stream);
-            let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-
-            let (request_tx, mut request_rx) = mpsc::channel(4);
-            let (event_tx, mut event_rx) = mpsc::channel(64);
-            // Drain events so a full channel can never be mistaken for silence,
-            // and keep them so a test can read what the runtime reported.
-            let observed = Arc::new(Mutex::new(Vec::new()));
-            let recorder = observed.clone();
-            let events = tokio::spawn(async move {
-                while let Some(event) = event_rx.recv().await {
-                    recorder
-                        .lock()
-                        .expect("observed events lock poisoned")
-                        .push(event);
-                }
-            });
-            let spec = LaunchSpec {
-                command: "scripted".into(),
-                args: Vec::new(),
-                environment: BTreeMap::new(),
-                cwd: std::env::current_dir().unwrap(),
-                additional_directories: Vec::new(),
-                project_memory: None,
-                resume_session: None,
-                harness: HarnessKind::Kimi,
-                execution_policy: ExecutionPolicy::ConfiguredApprovals,
-                acp_activity: AcpActivityClock::default(),
-            };
-            let driver = tokio::spawn(async move {
-                drive(
-                    transport,
-                    spec,
-                    &mut request_rx,
-                    event_tx,
-                    Arc::new(Mutex::new(None)),
-                )
-                .await
-            });
-            ScriptedRuntime {
-                agent: ScriptedAgent {
-                    scripted: scripted_tx,
-                    answers: answers_rx,
-                    received: BTreeMap::new(),
-                    sent: 0,
-                },
-                observed,
-                requests: request_tx,
-                driver,
-                bridge,
-                events,
-            }
-        }
-
-        fn terminal_params(terminal_id: &str) -> serde_json::Value {
-            serde_json::json!({"sessionId": "scripted", "terminalId": terminal_id})
-        }
-
-        /// Every close report a terminal made. Waits for the first, then keeps
-        /// watching: a second report would arrive right behind it.
-        async fn terminal_close_reports(
-            observed: &Arc<Mutex<Vec<RuntimeEvent>>>,
-            terminal_id: &str,
-        ) -> Vec<RuntimeEvent> {
-            let reports = || {
-                observed
-                    .lock()
-                    .expect("observed events lock poisoned")
-                    .iter()
-                    .filter(|event| {
-                        matches!(event, RuntimeEvent::TerminalClosed { terminal_id: id, .. }
-                            if id == terminal_id)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
-            for _ in 0..100 {
-                if !reports().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            reports()
-        }
-
-        async fn create_terminal(agent: &mut ScriptedAgent, params: serde_json::Value) -> String {
-            let created = agent.call("terminal/create", params).await;
-            assert!(
-                created.get("result").is_some(),
-                "terminal/create must be answered with a result, not the catch-all's \
-                 method-not-found error: {created}"
-            );
-            created["result"]["terminalId"]
-                .as_str()
-                .unwrap_or_else(|| panic!("terminal/create must return a terminal id: {created}"))
-                .to_owned()
-        }
-
-        #[tokio::test]
-        async fn terminal_create_output_wait_and_release_round_trip() {
-            let mut runtime = start_scripted_runtime();
-            let terminal_id = create_terminal(
-                &mut runtime.agent,
-                serde_json::json!({
-                    "sessionId": "scripted",
-                    "command": "/bin/sh",
-                    // `PATH` proves the daemon environment is inherited rather
-                    // than replaced by the agent's additions.
-                    "args": ["-c", "printf 'ran %s %s' \"$HEL_TERMINAL_TEST\" \"${PATH:+inherited}\""],
-                    "env": [{"name": "HEL_TERMINAL_TEST", "value": "overlaid"}],
-                }),
-            )
-            .await;
-
-            let exited = runtime
-                .agent
-                .call("terminal/wait_for_exit", terminal_params(&terminal_id))
-                .await;
-            assert_eq!(exited["result"]["exitCode"], 0, "{exited}");
-
-            let output = runtime
-                .agent
-                .call("terminal/output", terminal_params(&terminal_id))
-                .await;
-            assert_eq!(output["result"]["output"], "ran overlaid inherited");
-            assert_eq!(output["result"]["truncated"], false);
-            assert_eq!(output["result"]["exitStatus"]["exitCode"], 0);
-
-            let released = runtime
-                .agent
-                .call("terminal/release", terminal_params(&terminal_id))
-                .await;
-            assert!(released.get("result").is_some(), "{released}");
-
-            // A released terminal is gone, and Hel says so rather than hanging.
-            let stale = runtime
-                .agent
-                .call("terminal/output", terminal_params(&terminal_id))
-                .await;
-            assert_eq!(stale["error"]["code"], -32602, "{stale}");
-            assert!(
-                stale["error"]["data"]
-                    .as_str()
-                    .is_some_and(|data| data.contains(&terminal_id)),
-                "the error must name the terminal: {stale}"
-            );
-
-            runtime.stop().await;
-        }
-
-        #[tokio::test]
-        async fn terminal_output_keeps_the_last_bytes_when_a_child_exceeds_the_limit() {
-            let mut runtime = start_scripted_runtime();
-            // 512 KiB is far past the 64 KiB pipe buffer: a supervisor that did
-            // not drain the pipes while the child ran would block it forever,
-            // and the answer timeouts would report that as a failure.
-            let script = "data=0123456789abcdef; \
-                          while [ ${#data} -lt 524288 ]; do data=\"$data$data\"; done; \
-                          printf '%s' \"$data\"; printf 'TAIL-MARKER'";
-            let limit = 8 * 1024;
-            let terminal_id = create_terminal(
-                &mut runtime.agent,
-                serde_json::json!({
-                    "sessionId": "scripted",
-                    "command": "/bin/sh",
-                    "args": ["-c", script],
-                    "outputByteLimit": limit,
-                }),
-            )
-            .await;
-
-            let exited = runtime
-                .agent
-                .call("terminal/wait_for_exit", terminal_params(&terminal_id))
-                .await;
-            assert_eq!(exited["result"]["exitCode"], 0, "{exited}");
-
-            let output = runtime
-                .agent
-                .call("terminal/output", terminal_params(&terminal_id))
-                .await;
-            let text = output["result"]["output"]
-                .as_str()
-                .unwrap_or_else(|| panic!("terminal/output must serve text: {output}"));
-            assert!(
-                text.len() <= limit,
-                "served {} bytes for a {limit} byte limit",
-                text.len()
-            );
-            assert!(
-                text.ends_with("TAIL-MARKER"),
-                "the retained output must be the tail, ended with {:?}",
-                &text[text.len().saturating_sub(32)..]
-            );
-            assert_eq!(output["result"]["truncated"], true, "{output}");
-
-            runtime.stop().await;
-        }
-
-        #[tokio::test]
-        async fn terminal_kill_reports_the_signal_and_keeps_output_readable() {
-            let mut runtime = start_scripted_runtime();
-            let terminal_id = create_terminal(
-                &mut runtime.agent,
-                serde_json::json!({
-                    "sessionId": "scripted",
-                    "command": "/bin/sh",
-                    "args": ["-c", "printf running; sleep 300"],
-                }),
-            )
-            .await;
-
-            // The wait stays outstanding while the terminal runs: an inline
-            // wait would stall the dispatch loop and nothing below could be
-            // answered.
-            let waiting = runtime
-                .agent
-                .send("terminal/wait_for_exit", terminal_params(&terminal_id));
-            let mut running = String::new();
-            for _ in 0..100 {
-                let polled = runtime
-                    .agent
-                    .call("terminal/output", terminal_params(&terminal_id))
-                    .await;
-                running = polled["result"]["output"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
-                if running == "running" {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            assert_eq!(running, "running", "a live terminal must serve its output");
-
-            let killed = runtime
-                .agent
-                .call("terminal/kill", terminal_params(&terminal_id))
-                .await;
-            assert!(killed.get("result").is_some(), "{killed}");
-
-            let exited = runtime.agent.answer(&waiting).await;
-            assert_eq!(exited["result"]["signal"], "SIGKILL", "{exited}");
-            assert!(
-                exited["result"].get("exitCode").is_none(),
-                "a killed terminal has no exit code: {exited}"
-            );
-
-            // A kill does not release the terminal.
-            let after = runtime
-                .agent
-                .call("terminal/output", terminal_params(&terminal_id))
-                .await;
-            assert_eq!(after["result"]["output"], "running");
-            assert_eq!(after["result"]["exitStatus"]["signal"], "SIGKILL");
-
-            let released = runtime
-                .agent
-                .call("terminal/release", terminal_params(&terminal_id))
-                .await;
-            assert!(released.get("result").is_some(), "{released}");
-
-            // The transcript gets one report per terminal, from whichever of
-            // kill, release, or teardown reaped the child.
-            let observed = runtime.observed.clone();
-            runtime.stop().await;
-            let reports = terminal_close_reports(&observed, &terminal_id).await;
-            assert_eq!(
-                reports.len(),
-                1,
-                "a killed and released terminal must report its close once: {reports:?}"
-            );
-            let RuntimeEvent::TerminalClosed { output, signal, .. } = &reports[0] else {
-                panic!("expected a terminal close report: {reports:?}");
-            };
-            assert_eq!(output, "running");
-            assert_eq!(signal.as_deref(), Some("SIGKILL"));
-        }
-
-        #[tokio::test]
-        async fn cancel_kills_live_client_terminals() {
-            let mut runtime = start_scripted_runtime();
-            let terminal_id = create_terminal(
-                &mut runtime.agent,
-                serde_json::json!({
-                    "sessionId": "scripted",
-                    "command": "/bin/sh",
-                    "args": ["-c", "printf running; sleep 300"],
-                }),
-            )
-            .await;
-
-            let waiting = runtime
-                .agent
-                .send("terminal/wait_for_exit", terminal_params(&terminal_id));
-            let mut running = String::new();
-            for _ in 0..100 {
-                let polled = runtime
-                    .agent
-                    .call("terminal/output", terminal_params(&terminal_id))
-                    .await;
-                running = polled["result"]["output"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
-                if running == "running" {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            assert_eq!(running, "running");
-
-            runtime
-                .requests
-                .send(CommandRequest::Cancel {
-                    request_id: "cancel-terminals".into(),
-                })
-                .await
-                .unwrap();
-
-            let exited = tokio::time::timeout(ANSWER_TIMEOUT, runtime.agent.answer(&waiting))
-                .await
-                .expect("cancel must kill the terminal so wait_for_exit can finish");
-            assert_eq!(exited["result"]["signal"], "SIGKILL", "{exited}");
-
-            runtime.stop().await;
-        }
-
-        #[tokio::test]
-        async fn terminal_create_accepts_a_grok_style_single_string_command() {
-            let mut runtime = start_scripted_runtime();
-            // Grok Build puts the whole shell line in `command` and sends no
-            // arguments at all.
-            let terminal_id = create_terminal(
-                &mut runtime.agent,
-                serde_json::json!({
-                    "sessionId": "scripted",
-                    "command": "/bin/sh -c 'printf grok-ok'",
-                    "args": [],
-                }),
-            )
-            .await;
-
-            let exited = runtime
-                .agent
-                .call("terminal/wait_for_exit", terminal_params(&terminal_id))
-                .await;
-            assert_eq!(exited["result"]["exitCode"], 0, "{exited}");
-
-            let output = runtime
-                .agent
-                .call("terminal/output", terminal_params(&terminal_id))
-                .await;
-            assert_eq!(output["result"]["output"], "grok-ok", "{output}");
-
-            runtime.stop().await;
-        }
-
-        /// A process still visible but already dead — a zombie waiting for its
-        /// parent — counts as gone; the parent died with it.
-        fn process_is_gone(pid: i32) -> bool {
-            // SAFETY: signal 0 only probes whether the process exists.
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                return true;
-            }
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    stat.rsplit(')')
-                        .next()
-                        .map(|rest| rest.trim_start().starts_with('Z'))
-                })
-                .unwrap_or(false)
-        }
-
-        /// A shell that keeps a grandchild alive and publishes both pids, so a
-        /// test can prove a kill reached the whole process group rather than
-        /// only the shell Hel spawned.
-        async fn start_terminal_with_a_grandchild(
-            runtime: &mut ScriptedRuntime,
-            pids_path: &std::path::Path,
-        ) -> Vec<i32> {
-            let script = format!(
-                "sleep 300 & printf '%s %s' \"$$\" \"$!\" > '{}'; wait",
-                pids_path.display()
-            );
-            create_terminal(
-                &mut runtime.agent,
-                serde_json::json!({
-                    "sessionId": "scripted",
-                    "command": "/bin/sh",
-                    "args": ["-c", script],
-                }),
-            )
-            .await;
-
-            let mut pids = Vec::new();
-            for _ in 0..250 {
-                if let Ok(recorded) = std::fs::read_to_string(pids_path) {
-                    pids = recorded
-                        .split_whitespace()
-                        .filter_map(|pid| pid.parse::<i32>().ok())
-                        .collect();
-                    if pids.len() == 2 {
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            assert_eq!(pids.len(), 2, "the terminal must report both of its pids");
-            pids
-        }
-
-        async fn assert_processes_are_gone(pids: &[i32]) {
-            for pid in pids {
-                let mut gone = false;
-                for _ in 0..250 {
-                    if process_is_gone(*pid) {
-                        gone = true;
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                assert!(gone, "process {pid} survived the runtime that started it");
-            }
-        }
-
-        #[tokio::test]
-        async fn runtime_teardown_kills_terminal_process_groups() {
-            let temp = tempfile::tempdir().unwrap();
-            let pids_path = temp.path().join("pids");
-            let mut runtime = start_scripted_runtime();
-            // Nothing killed or released this terminal: teardown owns it.
-            let pids = start_terminal_with_a_grandchild(&mut runtime, &pids_path).await;
-
-            runtime.stop().await;
-
-            assert_processes_are_gone(&pids).await;
-        }
-
-        #[tokio::test]
-        async fn dropping_the_connection_kills_terminal_process_groups() {
-            let temp = tempfile::tempdir().unwrap();
-            let pids_path = temp.path().join("pids");
-            let mut runtime = start_scripted_runtime();
-            let pids = start_terminal_with_a_grandchild(&mut runtime, &pids_path).await;
-
-            // A bridge that dies mid-session leaves the runtime dropping the
-            // whole connection rather than ending its command loop, so orderly
-            // teardown never runs and the terminals still must not survive.
-            runtime.driver.abort();
-
-            assert_processes_are_gone(&pids).await;
-            runtime.bridge.abort();
-            runtime.events.abort();
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dead_bridge_after_session_start_reloads_the_native_session() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker = temp.path().join("second-bridge");
-        let script = temp.path().join("dying_acp.py");
-        std::fs::write(
-            &script,
-            format!(
-                r#"
-import json, os, sys
-marker = {marker:?}
-
-def read():
-    line = sys.stdin.readline()
-    return json.loads(line) if line else None
-
-def write(payload):
-    sys.stdout.write(json.dumps(payload) + "\n")
-    sys.stdout.flush()
-
-second = os.path.exists(marker)
-while True:
-    request = read()
-    if request is None:
-        break
-    method = request.get("method")
-    ident = request.get("id")
-    if method == "initialize":
-        write({{"jsonrpc": "2.0", "id": ident, "result": {{"protocolVersion": 1}}}})
-    elif method in ("session/new", "session/load"):
-        write({{"jsonrpc": "2.0", "id": ident, "result": {{"sessionId": "scripted"}}}})
-        if not second:
-            open(marker, "w").close()
-            import time
-            time.sleep(0.2)
-            break
-    elif ident is not None:
-        write({{"jsonrpc": "2.0", "id": ident, "result": {{}}}})
-"#,
-            ),
-        )
-        .unwrap();
-
-        let (request_tx, request_rx) = mpsc::channel(1);
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let spec = LaunchSpec {
-            command: "python3".into(),
-            args: vec![script.to_string_lossy().into_owned()],
-            environment: BTreeMap::new(),
-            cwd: temp.path().to_path_buf(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Kimi,
-            execution_policy: ExecutionPolicy::ConfiguredApprovals,
-            acp_activity: AcpActivityClock::default(),
-        };
-        let runtime = tokio::spawn(run(spec, request_rx, event_tx));
-
-        let mut started = Vec::new();
-        let mut saw_reload = false;
-        loop {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
-                .await
-                .expect("ACP runtime keeps reporting")
-                .expect("event channel stays open");
-            match event {
-                RuntimeEvent::SessionStarted {
-                    native_session_id,
-                    resumed,
-                    ..
-                } => {
-                    assert_eq!(native_session_id, "scripted");
-                    started.push(resumed);
-                    if started.len() == 2 {
-                        break;
-                    }
-                }
-                RuntimeEvent::HarnessRestarting { message } => {
-                    assert!(
-                        message.contains("reloading the native session"),
-                        "{message}"
-                    );
-                    saw_reload = true;
-                }
-                RuntimeEvent::Stopped => panic!("worker stopped before reloading the session"),
-                _ => {}
-            }
-        }
-        assert!(saw_reload, "a dead bridge after session start must reload");
-        assert_eq!(started, vec![false, true], "the second open is a resume");
-
-        drop(request_tx);
-        tokio::time::timeout(std::time::Duration::from_secs(5), runtime)
-            .await
-            .expect("closing the command channel must end the runtime")
-            .expect("runtime task does not panic")
-            .expect("a recovered bridge must not fail the worker");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bridge_exit_during_initialize_returns_an_actionable_error() {
-        let (_request_tx, request_rx) = mpsc::channel(1);
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let spec = LaunchSpec {
-            command: "sh".into(),
-            args: vec![
-                "-c".into(),
-                "echo 'specific supervisor failure' >&2; exit 17".into(),
-            ],
-            environment: BTreeMap::new(),
-            cwd: std::env::current_dir().unwrap(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Kimi,
-            execution_policy: ExecutionPolicy::Unconstrained,
-            acp_activity: AcpActivityClock::default(),
-        };
-
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            run(spec, request_rx, event_tx),
-        )
-        .await
-        .expect("an exited bridge must not leave ACP initialization hanging")
-        .unwrap_err();
-        let complete_error = format!("{error:#}");
-        assert!(
-            complete_error.contains("bridge stdout must contain only JSON-RPC frames"),
-            "unexpected error: {error:#}"
-        );
-        assert!(complete_error.contains("specific supervisor failure"));
-
-        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RuntimeEvent::Warning { message } if
-            message.contains("ACP runtime failed")))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RuntimeEvent::Stopped))
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bridge_launch_failure_is_reported_before_the_runtime_stops() {
-        let temp = tempfile::tempdir().unwrap();
-        let (_request_tx, request_rx) = mpsc::channel(1);
-        let (event_tx, mut event_rx) = mpsc::channel(16);
-        let missing_bridge = temp.path().join("missing-acp-bridge");
-        let spec = LaunchSpec {
-            command: missing_bridge.clone(),
-            args: Vec::new(),
-            environment: BTreeMap::new(),
-            cwd: temp.path().to_path_buf(),
-            additional_directories: Vec::new(),
-            project_memory: None,
-            resume_session: None,
-            harness: HarnessKind::Kimi,
-            execution_policy: ExecutionPolicy::Unconstrained,
-            acp_activity: AcpActivityClock::default(),
-        };
-
-        let error = run(spec, request_rx, event_tx).await.unwrap_err();
-        assert!(
-            format!("{error:#}")
-                .contains(&format!("launch ACP bridge {}", missing_bridge.display()))
-        );
-        assert!(matches!(
-            event_rx.recv().await,
-            Some(RuntimeEvent::Warning { message }) if message.contains("ACP runtime failed")
-        ));
-        assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Stopped)));
-    }
-}
+mod tests;

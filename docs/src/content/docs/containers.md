@@ -6,10 +6,11 @@ description: Set up a disposable container target for hel and start your first i
 ## What container targets give you
 
 Each session on a container target runs in its own disposable, labeled
-container: local Podman on Linux or WSL2, or Apple's `container` runtime on
-macOS 26 or newer on Apple silicon. Target isolation selects Hel's
-`unconstrained` execution policy, which Hel translates into the selected
-harness's own control: Codex `agent-full-access`, Claude Code
+container: local Podman on Linux or WSL2, Apple's `container` runtime on macOS
+26 or newer on Apple silicon, or Podman over SSH. Container isolation always
+selects Hel's `unconstrained` execution policy. The `permissions` setting is
+only available for raw `ssh-bare` targets. Hel translates the policy into the
+selected harness's own control: Codex `agent-full-access`, Claude Code
 `bypassPermissions`, Kimi Code `auto`, Grok Build's `--always-approve` launch
 flag, or DeepSeek Harness's `danger-full-access` permission mode. Every one of
 those approves every call. Note that Kimi Code's mode is named `auto` but is
@@ -21,9 +22,10 @@ through their harnesses; Kimi Code and DeepSeek Harness do not. Hel warns
 against running either unsupported harness on a raw, unsandboxed target.
 
 Closing a session first writes and verifies a recovery archive, then removes
-that exact container. Nothing about the container persists past the session
+that exact container. No mutable session workspace persists past the session
 except what the recovery archive captured and whatever you pushed to a
-remote.
+remote. Hel may retain read-only Git objects in the host clone cache described
+below.
 
 ## Prerequisites
 
@@ -33,11 +35,11 @@ Pick one runtime:
   [Podman for Hel](/podman/) for installation and verification steps.
 - **Apple's `container` CLI** on macOS 26 or newer on Apple silicon.
 
-If you installed hel with `install.sh`, it already placed the matching
-`hel-worker-<arch>-unknown-linux-musl` companion binary next to `hel`. hel
-uses that companion to run its session relay inside Linux containers when the
-controller binary itself isn't a Linux binary for the container's
-architecture.
+Linux releases are static musl binaries, so the controller itself runs the
+session relay in same-architecture Linux containers. The installer also places
+the other supported Linux architecture's
+`hel-worker-<arch>-unknown-linux-musl` companion next to `hel`. On macOS it
+installs both Linux companions.
 
 ## Get the agent-dev image
 
@@ -92,6 +94,26 @@ versioned tags remain cached, digest references stay pinned, and
 `localhost/...` images remain local. Set `pull_policy` beside `image` to
 `always`, `newer`, `missing`, or `never` when a target needs an explicit
 policy. Existing running containers are never replaced in place.
+
+## Git clone cache
+
+Local Podman, SSH Podman, and Apple container targets cache GitHub repository
+objects under the container host user's `~/.cache/hel/git`. Before launch, Hel
+refreshes a bare mirror and creates an isolated session snapshot whose
+immutable objects are shared with ordinary filesystem hardlinks. The snapshot
+is mounted read-only and the normal in-container clone borrows its objects, so
+branch selection, checkout filters, and image-specific Git behavior remain
+unchanged.
+
+This is an optimization rather than a prerequisite. If host Git, credentials,
+or local hardlink cloning are unavailable, Hel reports the cache miss and uses
+the ordinary network clone. The first launch still populates the complete
+mirror. Hel removes session snapshots after their container, removes mirrors
+unused for 30 days, and enforces a 20 GiB least-recently-used soft cap. The
+cache can contain objects from private repositories and is created with
+user-only permissions. You can remove `~/.cache/hel/git/mirrors` while no
+launch is updating it; do not remove the `sessions` directory while managed
+containers are running.
 
 It then shows a summary of what it's about to write and asks you to confirm
 before writing `config.toml`. After you confirm, it runs a smoke test: it
@@ -153,10 +175,12 @@ launches.
 
 ## Two useful facts
 
-If the `gh` CLI on the machine running hel is authenticated, hel passes its
-active GitHub token into every freshly provisioned container as `GH_TOKEN`.
-That's what lets `gh` and HTTPS Git pushes work inside the container without
-copying any SSH keys. The token never goes into a recovery archive.
+If the `gh` CLI on the machine running hel is authenticated, hel continuously
+syncs its active GitHub token into every live non-local session. That includes
+managed containers, EC2, SSH Podman, and raw SSH targets, and lets `gh` and
+HTTPS Git pushes work without copying SSH keys. The token never goes into a
+recovery archive. Raw SSH targets are therefore inside the token's trust
+boundary; raw localhost sessions are deliberately excluded.
 
 If hel or the host crashes, containers it was managing can be orphaned —
 still running, but no longer tracked in hel's state. Use `hel recover` to

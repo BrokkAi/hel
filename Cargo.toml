@@ -11,6 +11,7 @@ include = [
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
+    "docs/PODMAN.md",
     "LICENSE",
     "licenses/THIRD_PARTY_LICENSES.html",
     "licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
@@ -21,6 +22,10 @@ include = [
 # the workspace imports use.
 [lib]
 name = "hel"
+
+[features]
+default = []
+test-hooks = []
 
 [workspace]
 members = [".", "crates/hel-tui", "crates/hel-cli", "voice-worker"]
@@ -60,11 +65,13 @@ hmac = "0.12"
 iana-time-zone = "0.1"
 libc = "0.2"
 pulldown-cmark = { version = "0.10", default-features = false }
+qrcode = { version = "0.14", default-features = false }
 signal-hook = "0.3"
 sysinfo = "0.32"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rayon = "1"
+reedline = { version = "0.51", default-features = false }
 regex = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive", "rc"] }
@@ -88,6 +95,7 @@ url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
@@ -98,3 +106,12 @@ http-body-util = "0.1"
 # binary; links and test builds get materially faster. Use a temporary
 # `debug = 2` override when a debugger needs full variable info.
 debug = "line-tables-only"
+
+# Checkpoint packaging runs in the target's development worker during normal
+# local use. Optimize the measured compression and digest hot loops without
+# changing the rest of the development build.
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

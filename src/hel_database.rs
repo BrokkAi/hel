@@ -12,15 +12,19 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::hel_config::data_dir;
 use crate::hel_state::{
-    CheckpointMetadata, HelState, ManagedWorktree, MaterializedExecutionState,
+    CheckpointMetadata, HelState, HostContainerSize, ManagedWorktree, MaterializedExecutionState,
     MaterializedQueuedPrompt, MaterializedSession, MaterializedSessionSummary, SessionRecord,
     SessionResourceAllocation, SessionState, TargetLocator, TranscriptBody, TranscriptItem,
     validate_relay_event_digest, validate_relay_event_frontier,
 };
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
+use crate::hel_workspace::{
+    DEFAULT_WORKSPACE_ID, DetachedDraft, WorkspaceRecord, new_workspace_id,
+    normalize_workspace_name,
+};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 18;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -77,802 +81,451 @@ pub struct MaterializedSessionMutation {
     pub pending_elicitations: Option<Vec<crate::hel_elicitation::ElicitationRequest>>,
 }
 
-pub fn database_path() -> PathBuf {
-    data_dir().join("hel.sqlite3")
-}
+mod schema;
 
-fn open(path: &Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create Hel data directory {}", parent.display()))?;
-    }
-    let connection =
-        Connection::open(path).with_context(|| format!("open Hel database {}", path.display()))?;
-    connection.busy_timeout(Duration::from_secs(5))?;
-    connection.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = FULL;",
-    )?;
-    verify_schema_once(path, &connection)?;
-    Ok(connection)
-}
-
-/// Databases this process has already migrated. A controller owns its store
-/// exclusively (`ControllerStoreGuard`), so a schema verified once stays
-/// verified and later connections skip the migration probes entirely.
-fn verified_schemas() -> &'static Mutex<HashSet<PathBuf>> {
-    static VERIFIED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    VERIFIED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Stable cache identity for a database. The file itself may not exist yet, so
-/// the canonicalized parent directory carries the identity.
-fn schema_cache_key(path: &Path) -> PathBuf {
-    let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return path.to_owned();
-    };
-    match (fs::canonicalize(parent), path.file_name()) {
-        (Ok(canonical), Some(name)) => canonical.join(name),
-        _ => path.to_owned(),
-    }
-}
-
-/// Run the migration ladder the first time this process opens a database.
-/// Later opens confirm only the recorded schema version, which keeps relay
-/// catch-up from paying for the full probe sequence on every connection. A
-/// database whose version no longer matches is migrated again, so a recreated
-/// file under a reused path still converges.
-fn verify_schema_once(path: &Path, connection: &Connection) -> Result<()> {
-    let key = schema_cache_key(path);
-    let mut verified = verified_schemas()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    if verified.contains(&key) {
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == SCHEMA_VERSION {
-            return Ok(());
-        }
-    }
-    // Holding the lock across the ladder keeps two first opens of the same
-    // database from running the additive migration steps against each other.
-    migrate_schema(connection)?;
-    verified.insert(key);
-    Ok(())
-}
-
-/// Forget that this process verified a database's schema. Only tests need it:
-/// they simulate a store written by an older build by editing the schema of a
-/// database this process has already opened, which no controller can do.
+pub use schema::database_path;
+use schema::open;
 #[cfg(test)]
-fn forget_verified_schema(path: &Path) {
-    verified_schemas()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&schema_cache_key(path));
-}
-
-fn migrate_schema(connection: &Connection) -> Result<()> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
-        bail!("Hel database schema {version} is newer than supported schema {SCHEMA_VERSION}");
-    }
-    if version == 0 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE schema_migrations (
-                 version INTEGER PRIMARY KEY CHECK(version > 0),
-                 applied_at TEXT NOT NULL
-             ) STRICT;
-             CREATE TABLE session_contexts (
-                 session_id TEXT PRIMARY KEY,
-                 bundle_id TEXT NOT NULL,
-                 created_at TEXT NOT NULL
-             ) STRICT;
-             CREATE TABLE sessions (
-                 session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-                 title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-                 harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi')),
-                 last_profile TEXT NOT NULL,
-                 target_template_id TEXT NOT NULL,
-                 state TEXT NOT NULL CHECK(state IN (
-                     'provisioning','running','disconnected','checkpointing','closing','destroying',
-                     'archived','lost','error','destroyed-with-data-loss'
-                 )),
-                 native_session_id TEXT,
-                 acp_session_title TEXT CHECK(acp_session_title IS NULL OR length(trim(acp_session_title)) > 0),
-                 session_title_override TEXT CHECK(session_title_override IS NULL OR length(trim(session_title_override)) > 0),
-                 updated_at TEXT NOT NULL,
-                 last_viewed_event_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_viewed_event_sequence >= 0),
-                 last_error TEXT
-             ) STRICT;
-             CREATE TABLE session_targets (
-                 session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                 kind TEXT NOT NULL CHECK(kind IN ('local-bare','local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
-                 host TEXT,
-                 resource_id TEXT,
-                 address TEXT,
-                 workspace BLOB,
-                 worker_id TEXT,
-                 CHECK(
-                     (kind = 'local-bare' AND workspace IS NOT NULL
-                      AND host IS NULL AND resource_id IS NULL AND address IS NULL AND worker_id IS NULL)
-                  OR (kind IN ('local-podman','apple-container') AND resource_id IS NOT NULL
-                      AND host IS NULL AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
-                  OR (kind = 'aws-ec2' AND resource_id IS NOT NULL
-                      AND host IS NULL AND workspace IS NULL AND worker_id IS NULL)
-                  OR (kind = 'ssh-bare' AND host IS NOT NULL AND workspace IS NOT NULL
-                      AND resource_id IS NULL AND address IS NULL)
-                  OR (kind = 'ssh-podman' AND host IS NOT NULL AND resource_id IS NOT NULL
-                      AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
-                 )
-             ) STRICT;
-             CREATE TABLE session_mounts (
-                 session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-                 ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-                 source BLOB NOT NULL,
-                 destination BLOB NOT NULL,
-                 PRIMARY KEY(session_id, ordinal),
-                 UNIQUE(session_id, destination)
-             ) STRICT;
-             CREATE TABLE session_checkpoints (
-                 session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                 archive_path BLOB NOT NULL,
-                 sha256 TEXT NOT NULL CHECK(length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
-                 created_at TEXT NOT NULL,
-                 event_sequence INTEGER NOT NULL CHECK(event_sequence >= 0)
-             ) STRICT;
-             CREATE TABLE mount_history (
-                 host TEXT NOT NULL CHECK(length(trim(host)) > 0),
-                 source BLOB NOT NULL,
-                 ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-                 PRIMARY KEY(host, ordinal),
-                 UNIQUE(host, source)
-             ) STRICT;
-             CREATE TABLE prompt_history (
-                 history_id INTEGER PRIMARY KEY,
-                 session_id TEXT NOT NULL REFERENCES session_contexts(session_id),
-                 event_sequence INTEGER NOT NULL CHECK(event_sequence >= 0),
-                 submitted_at TEXT NOT NULL,
-                 text TEXT NOT NULL CHECK(length(trim(text)) > 0),
-                 UNIQUE(session_id, event_sequence)
-             ) STRICT;
-             CREATE INDEX prompt_history_session_recent
-                 ON prompt_history(session_id, history_id DESC);
-             CREATE INDEX session_contexts_bundle
-                 ON session_contexts(bundle_id, session_id);
-             CREATE INDEX prompt_history_recent
-                 ON prompt_history(history_id DESC);
-             INSERT INTO schema_migrations(version, applied_at)
-                 VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-             PRAGMA user_version = 1;
-             COMMIT;",
-        )?;
-    }
-    if version < 2 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE sessions ADD COLUMN resource_allocation TEXT;
-             INSERT INTO schema_migrations(version, applied_at)
-                 VALUES (2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-             PRAGMA user_version = 2;
-             COMMIT;",
-        )?;
-    }
-    if version < 3 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE sessions ADD COLUMN last_checkpoint_error TEXT;
-             INSERT INTO schema_migrations(version, applied_at)
-                 VALUES (3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-             PRAGMA user_version = 3;
-             COMMIT;",
-        )?;
-    }
-    if version < 4 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE sessions ADD COLUMN project_directory BLOB;
-             INSERT INTO schema_migrations(version, applied_at)
-                 VALUES (4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-             PRAGMA user_version = 4;
-             COMMIT;",
-        )?;
-    }
-    if version < 5 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE session_targets RENAME TO session_targets_v4;
-             CREATE TABLE session_targets (
-                 session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                 kind TEXT NOT NULL CHECK(kind IN ('local-bare','local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
-                 host TEXT,
-                 resource_id TEXT,
-                 address TEXT,
-                 workspace BLOB,
-                 worker_id TEXT,
-                 CHECK(
-                     (kind = 'local-bare' AND workspace IS NOT NULL
-                      AND host IS NULL AND resource_id IS NULL AND address IS NULL AND worker_id IS NULL)
-                  OR (kind IN ('local-podman','apple-container') AND resource_id IS NOT NULL
-                      AND host IS NULL AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
-                  OR (kind = 'aws-ec2' AND resource_id IS NOT NULL
-                      AND host IS NULL AND workspace IS NULL AND worker_id IS NULL)
-                  OR (kind = 'ssh-bare' AND host IS NOT NULL AND workspace IS NOT NULL
-                      AND resource_id IS NULL AND address IS NULL)
-                  OR (kind = 'ssh-podman' AND host IS NOT NULL AND resource_id IS NOT NULL
-                      AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
-                 )
-             ) STRICT;
-             INSERT INTO session_targets
-                 SELECT * FROM session_targets_v4;
-             DROP TABLE session_targets_v4;
-             INSERT INTO schema_migrations(version, applied_at)
-                 VALUES (5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-             PRAGMA user_version = 5;
-             COMMIT;",
-        )?;
-    }
-    if version < 6 {
-        connection.execute_batch(&format!(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE session_checkpoints
-                 RENAME COLUMN event_sequence TO event_frontier;
-             ALTER TABLE prompt_history
-                 RENAME COLUMN event_sequence TO event_ordinal;
-             ALTER TABLE sessions ADD COLUMN detached_after_event_ordinal INTEGER NOT NULL
-                 DEFAULT 0 CHECK(detached_after_event_ordinal >= 0);
-             ALTER TABLE sessions ADD COLUMN managed_worktree TEXT;
-             CREATE TABLE materialized_sessions (
-                 session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                 applied_event_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(applied_event_ordinal >= 0),
-                 applied_event_digest TEXT NOT NULL
-                     DEFAULT '{RELAY_EVENT_GENESIS_DIGEST}'
-                     CHECK(length(applied_event_digest) = 64
-                           AND applied_event_digest NOT GLOB '*[^0-9a-f]*'),
-                 last_activity_at_ms INTEGER,
-                 execution_state TEXT NOT NULL DEFAULT 'idle'
-                     CHECK(execution_state IN ('idle','running','closing','closed')),
-                 running_started_at_ms INTEGER,
-                 session_title TEXT CHECK(session_title IS NULL OR length(trim(session_title)) > 0),
-                 configuration_json TEXT NOT NULL DEFAULT '{{}}',
-                 CHECK(
-                     (execution_state = 'running' AND running_started_at_ms IS NOT NULL)
-                     OR (execution_state != 'running' AND running_started_at_ms IS NULL)
-                 )
-             ) STRICT;
-             CREATE TABLE materialized_transcript_items (
-                 session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
-                 stable_id TEXT NOT NULL CHECK(length(trim(stable_id)) > 0),
-                 position INTEGER NOT NULL CHECK(position > 0),
-                 latest_content_event_ordinal INTEGER
-                     CHECK(latest_content_event_ordinal IS NULL
-                           OR latest_content_event_ordinal >= position),
-                 created_at_ms INTEGER NOT NULL,
-                 last_changed_at_ms INTEGER NOT NULL CHECK(last_changed_at_ms >= created_at_ms),
-                 body_json TEXT NOT NULL,
-                 PRIMARY KEY(session_id, stable_id)
-             ) STRICT;
-             CREATE INDEX materialized_transcript_position
-                 ON materialized_transcript_items(session_id, position, stable_id);
-             CREATE TABLE materialized_queued_prompts (
-                 session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
-                 ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-                 command_id TEXT NOT NULL CHECK(length(trim(command_id)) > 0),
-                 content_json TEXT NOT NULL,
-                 queued_at_ms INTEGER NOT NULL,
-                 PRIMARY KEY(session_id, ordinal),
-                 UNIQUE(session_id, command_id)
-             ) STRICT;
-             INSERT INTO materialized_sessions(session_id)
-                 SELECT session_id FROM sessions;
-             INSERT INTO schema_migrations(version, applied_at)
-                 VALUES (6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-             PRAGMA user_version = 6;
-             COMMIT;",
-        ))?;
-    }
-    // Both development lines used schema version 6: durable relay projection
-    // on this branch and managed raw-session worktrees on master. Structural
-    // guards make either already-written v6 database converge before the v7
-    // sessions-table rebuild, without inventing a second version-6 ledger row.
-    ensure_managed_worktree_column(connection)?;
-    if version < 7 {
-        ensure_relay_projection_schema(connection)?;
-        migrate_destroying_session_state(connection)?;
-    }
-    ensure_projection_digest_column(connection)?;
-    ensure_session_draft_input_column(connection)?;
-    if version < 8 {
-        // Queue entries gained a kind so a configuration change can wait in the
-        // same queue as prompts. Rows written before that are prompts.
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE materialized_queued_prompts
-                 ADD COLUMN kind_json TEXT NOT NULL DEFAULT '\"prompt\"';
-             INSERT INTO schema_migrations(version, applied_at)
-                 VALUES (8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-             PRAGMA user_version = 8;
-             COMMIT;",
-        )?;
-    }
-    // Runs last: it rebuilds `sessions`, so every column the steps above add
-    // must already exist to be copied forward.
-    if version < 9 {
-        migrate_grok_harness_kind(connection)?;
-    }
-    // Added after the v9 rebuild so the rebuild never has to copy them.
-    ensure_session_container_override_columns(connection)?;
-    ensure_session_mount_read_only_column(connection)?;
-    ensure_materialized_elicitation_column(connection)?;
-    if version < 10 {
-        migrate_stopped_session_state(connection)?;
-    }
-    if version < 11 {
-        migrate_deepseek_harness_kind(connection)?;
-    }
-    if version < 12 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE sessions
-                 RENAME COLUMN detached_after_event_ordinal TO viewed_through_event_ordinal;
-             UPDATE sessions
-                 SET target_template_id = 'localhost'
-                 WHERE target_template_id = 'raw-localhost';
-             INSERT INTO schema_migrations(version, applied_at)
-                 VALUES (12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-             PRAGMA user_version = 12;
-             COMMIT;",
-        )?;
-    }
-    let recorded: Option<i64> =
-        connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
-            row.get(0)
-        })?;
-    if recorded != Some(SCHEMA_VERSION) {
-        bail!(
-            "Hel database migration ledger {:?} does not match schema {}",
-            recorded,
-            SCHEMA_VERSION
-        );
-    }
-    Ok(())
-}
-
-fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
-    connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pragma_table_info(?1)
-                 WHERE name = ?2
-             )",
-            params![table, column],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
-}
-
-/// Per-session container size overrides. They are additive columns, so
-/// databases written before the dashboard could edit them open unchanged.
-fn ensure_session_container_override_columns(connection: &Connection) -> Result<()> {
-    for column in ["container_cpus", "container_memory"] {
-        if !table_has_column(connection, "sessions", column)? {
-            connection.execute_batch(&format!(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE sessions ADD COLUMN {column} TEXT;
-                 COMMIT;"
-            ))?;
-        }
-    }
-    Ok(())
-}
-
-/// Per-mount read-only flag. It is an additive column, so a database written
-/// before the mount editors offered the option opens unchanged and its mounts
-/// keep the copy-on-write overlay they were provisioned with.
-fn ensure_session_mount_read_only_column(connection: &Connection) -> Result<()> {
-    if !table_has_column(connection, "session_mounts", "read_only")? {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE session_mounts ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;
-             COMMIT;",
-        )?;
-    }
-    Ok(())
-}
-
-fn ensure_materialized_elicitation_column(connection: &Connection) -> Result<()> {
-    if !table_has_column(
-        connection,
-        "materialized_sessions",
-        "pending_elicitations_json",
-    )? {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE materialized_sessions
-                 ADD COLUMN pending_elicitations_json TEXT NOT NULL DEFAULT '[]';
-             COMMIT;",
-        )?;
-    }
-    Ok(())
-}
-
-fn ensure_managed_worktree_column(connection: &Connection) -> Result<()> {
-    if !table_has_column(connection, "sessions", "managed_worktree")? {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE sessions ADD COLUMN managed_worktree TEXT;
-             COMMIT;",
-        )?;
-    }
-    Ok(())
-}
-
-/// Complete the relay half of the colliding v6 migration for databases first
-/// opened by master, whose v6 contained only `managed_worktree`.
-fn ensure_relay_projection_schema(connection: &Connection) -> Result<()> {
-    if table_has_column(connection, "sessions", "detached_after_event_ordinal")? {
-        return Ok(());
-    }
-    connection.execute_batch(&format!(
-        "BEGIN IMMEDIATE;
-         ALTER TABLE session_checkpoints
-             RENAME COLUMN event_sequence TO event_frontier;
-         ALTER TABLE prompt_history
-             RENAME COLUMN event_sequence TO event_ordinal;
-         ALTER TABLE sessions ADD COLUMN detached_after_event_ordinal INTEGER NOT NULL
-             DEFAULT 0 CHECK(detached_after_event_ordinal >= 0);
-         CREATE TABLE materialized_sessions (
-             session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-             applied_event_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(applied_event_ordinal >= 0),
-             applied_event_digest TEXT NOT NULL
-                 DEFAULT '{RELAY_EVENT_GENESIS_DIGEST}'
-                 CHECK(length(applied_event_digest) = 64
-                       AND applied_event_digest NOT GLOB '*[^0-9a-f]*'),
-             last_activity_at_ms INTEGER,
-             execution_state TEXT NOT NULL DEFAULT 'idle'
-                 CHECK(execution_state IN ('idle','running','closing','closed')),
-             running_started_at_ms INTEGER,
-             session_title TEXT CHECK(session_title IS NULL OR length(trim(session_title)) > 0),
-             configuration_json TEXT NOT NULL DEFAULT '{{}}',
-             CHECK(
-                 (execution_state = 'running' AND running_started_at_ms IS NOT NULL)
-                 OR (execution_state != 'running' AND running_started_at_ms IS NULL)
-             )
-         ) STRICT;
-         CREATE TABLE materialized_transcript_items (
-             session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
-             stable_id TEXT NOT NULL CHECK(length(trim(stable_id)) > 0),
-             position INTEGER NOT NULL CHECK(position > 0),
-             latest_content_event_ordinal INTEGER
-                 CHECK(latest_content_event_ordinal IS NULL
-                       OR latest_content_event_ordinal >= position),
-             created_at_ms INTEGER NOT NULL,
-             last_changed_at_ms INTEGER NOT NULL CHECK(last_changed_at_ms >= created_at_ms),
-             body_json TEXT NOT NULL,
-             PRIMARY KEY(session_id, stable_id)
-         ) STRICT;
-         CREATE INDEX materialized_transcript_position
-             ON materialized_transcript_items(session_id, position, stable_id);
-         CREATE TABLE materialized_queued_prompts (
-             session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
-             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-             command_id TEXT NOT NULL CHECK(length(trim(command_id)) > 0),
-             content_json TEXT NOT NULL,
-             queued_at_ms INTEGER NOT NULL,
-             PRIMARY KEY(session_id, ordinal),
-             UNIQUE(session_id, command_id)
-         ) STRICT;
-         INSERT INTO materialized_sessions(session_id)
-             SELECT session_id FROM sessions;
-         COMMIT;",
-    ))?;
-    Ok(())
-}
-
-fn migrate_destroying_session_state(connection: &Connection) -> Result<()> {
-    // SQLite cannot widen a CHECK constraint in place. Foreign keys are
-    // disabled only around the standard table-rebuild transaction; every
-    // child continues to reference the replacement table by the same name.
-    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    let migration = connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE sessions_v7 (
-             session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-             title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi')),
-             last_profile TEXT NOT NULL,
-             target_template_id TEXT NOT NULL,
-             state TEXT NOT NULL CHECK(state IN (
-                 'provisioning','running','disconnected','checkpointing','closing','destroying',
-                 'archived','lost','error','destroyed-with-data-loss'
-             )),
-             native_session_id TEXT,
-             acp_session_title TEXT CHECK(acp_session_title IS NULL OR length(trim(acp_session_title)) > 0),
-             session_title_override TEXT CHECK(session_title_override IS NULL OR length(trim(session_title_override)) > 0),
-             updated_at TEXT NOT NULL,
-             detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
-                 CHECK(detached_after_event_ordinal >= 0),
-             last_error TEXT,
-             resource_allocation TEXT,
-             last_checkpoint_error TEXT,
-             project_directory BLOB,
-             managed_worktree TEXT
-         ) STRICT;
-         INSERT INTO sessions_v7(
-             session_id, title, harness_kind, last_profile, target_template_id, state,
-             native_session_id, acp_session_title, session_title_override, updated_at,
-             detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory, managed_worktree
-         )
-         SELECT
-             session_id, title, harness_kind, last_profile, target_template_id, state,
-             native_session_id, acp_session_title, session_title_override, updated_at,
-             detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory, managed_worktree
-         FROM sessions;
-         DROP TABLE sessions;
-         ALTER TABLE sessions_v7 RENAME TO sessions;
-         INSERT INTO schema_migrations(version, applied_at)
-             VALUES (7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-         PRAGMA user_version = 7;
-         COMMIT;",
-    );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
-    }
-    let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
-    migration.context("migrate durable destroying session state")?;
-    foreign_keys.context("restore foreign key enforcement after schema migration")?;
-    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
-    if statement.exists([])? {
-        bail!("foreign key violation after migrating durable destroying session state");
-    }
-    Ok(())
-}
-
-/// Admit the Grok Build harness. SQLite cannot widen a CHECK constraint in
-/// place, so this repeats the v7 table rebuild with the wider harness list.
-/// Foreign keys are disabled only around the rebuild transaction; every child
-/// continues to reference the replacement table by the same name.
-fn migrate_grok_harness_kind(connection: &Connection) -> Result<()> {
-    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    let migration = connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE sessions_v9 (
-             session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-             title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok')),
-             last_profile TEXT NOT NULL,
-             target_template_id TEXT NOT NULL,
-             state TEXT NOT NULL CHECK(state IN (
-                 'provisioning','running','disconnected','checkpointing','closing','destroying',
-                 'archived','lost','error','destroyed-with-data-loss'
-             )),
-             native_session_id TEXT,
-             acp_session_title TEXT CHECK(acp_session_title IS NULL OR length(trim(acp_session_title)) > 0),
-             session_title_override TEXT CHECK(session_title_override IS NULL OR length(trim(session_title_override)) > 0),
-             updated_at TEXT NOT NULL,
-             detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
-                 CHECK(detached_after_event_ordinal >= 0),
-             last_error TEXT,
-             resource_allocation TEXT,
-             last_checkpoint_error TEXT,
-             project_directory BLOB,
-             managed_worktree TEXT,
-             draft_input TEXT NOT NULL DEFAULT ''
-         ) STRICT;
-         INSERT INTO sessions_v9(
-             session_id, title, harness_kind, last_profile, target_template_id, state,
-             native_session_id, acp_session_title, session_title_override, updated_at,
-             detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory, managed_worktree, draft_input
-         )
-         SELECT
-             session_id, title, harness_kind, last_profile, target_template_id, state,
-             native_session_id, acp_session_title, session_title_override, updated_at,
-             detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory, managed_worktree, draft_input
-         FROM sessions;
-         DROP TABLE sessions;
-         ALTER TABLE sessions_v9 RENAME TO sessions;
-         INSERT INTO schema_migrations(version, applied_at)
-             VALUES (9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-         PRAGMA user_version = 9;
-         COMMIT;",
-    );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
-    }
-    let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
-    migration.context("migrate sessions table for the Grok Build harness")?;
-    foreign_keys.context("restore foreign key enforcement after schema migration")?;
-    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
-    if statement.exists([])? {
-        bail!("foreign key violation after migrating the sessions harness list");
-    }
-    Ok(())
-}
-
-/// Rename the `archived` lifecycle state to `stopped` and give sessions their
-/// own display-only `archived` flag, which now means "hidden from the resume
-/// dialog". SQLite cannot narrow or widen a CHECK constraint in place, so this
-/// repeats the v9 table rebuild with the new state list and the new column.
-/// It also adds the hidden set for native sessions Hel only reads.
-fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
-    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    let migration = connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE sessions_v10 (
-             session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-             title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok')),
-             last_profile TEXT NOT NULL,
-             target_template_id TEXT NOT NULL,
-             state TEXT NOT NULL CHECK(state IN (
-                 'provisioning','running','disconnected','checkpointing','closing','destroying',
-                 'stopped','lost','error','destroyed-with-data-loss'
-             )),
-             native_session_id TEXT,
-             acp_session_title TEXT CHECK(acp_session_title IS NULL OR length(trim(acp_session_title)) > 0),
-             session_title_override TEXT CHECK(session_title_override IS NULL OR length(trim(session_title_override)) > 0),
-             updated_at TEXT NOT NULL,
-             detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
-                 CHECK(detached_after_event_ordinal >= 0),
-             last_error TEXT,
-             resource_allocation TEXT,
-             last_checkpoint_error TEXT,
-             project_directory BLOB,
-             managed_worktree TEXT,
-             draft_input TEXT NOT NULL DEFAULT '',
-             container_cpus TEXT,
-             container_memory TEXT,
-             archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1))
-         ) STRICT;
-         INSERT INTO sessions_v10(
-             session_id, title, harness_kind, last_profile, target_template_id, state,
-             native_session_id, acp_session_title, session_title_override, updated_at,
-             detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory, managed_worktree, draft_input,
-             container_cpus, container_memory
-         )
-         SELECT
-             session_id, title, harness_kind, last_profile, target_template_id,
-             CASE state WHEN 'archived' THEN 'stopped' ELSE state END,
-             native_session_id, acp_session_title, session_title_override, updated_at,
-             detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory, managed_worktree, draft_input,
-             container_cpus, container_memory
-         FROM sessions;
-         DROP TABLE sessions;
-         ALTER TABLE sessions_v10 RENAME TO sessions;
-         CREATE TABLE hidden_native_sessions (
-             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok')),
-             native_session_id TEXT NOT NULL CHECK(length(trim(native_session_id)) > 0),
-             hidden_at TEXT NOT NULL,
-             PRIMARY KEY(harness_kind, native_session_id)
-         ) STRICT;
-         INSERT INTO schema_migrations(version, applied_at)
-             VALUES (10, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-         PRAGMA user_version = 10;
-         COMMIT;",
-    );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
-    }
-    let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
-    migration.context("migrate sessions table for the stopped session state")?;
-    foreign_keys.context("restore foreign key enforcement after schema migration")?;
-    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
-    if statement.exists([])? {
-        bail!("foreign key violation after migrating the stopped session state");
-    }
-    Ok(())
-}
-
-/// Admit DeepSeek Harness in both stored sessions and Hel's native-session
-/// hidden set. SQLite requires rebuilding tables to widen CHECK constraints.
-fn migrate_deepseek_harness_kind(connection: &Connection) -> Result<()> {
-    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    let migration = connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE sessions_v11 (
-             session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-             title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok','deepseek')),
-             last_profile TEXT NOT NULL,
-             target_template_id TEXT NOT NULL,
-             state TEXT NOT NULL CHECK(state IN (
-                 'provisioning','running','disconnected','checkpointing','closing','destroying',
-                 'stopped','lost','error','destroyed-with-data-loss'
-             )),
-             native_session_id TEXT,
-             acp_session_title TEXT CHECK(acp_session_title IS NULL OR length(trim(acp_session_title)) > 0),
-             session_title_override TEXT CHECK(session_title_override IS NULL OR length(trim(session_title_override)) > 0),
-             updated_at TEXT NOT NULL,
-             detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
-                 CHECK(detached_after_event_ordinal >= 0),
-             last_error TEXT,
-             resource_allocation TEXT,
-             last_checkpoint_error TEXT,
-             project_directory BLOB,
-             managed_worktree TEXT,
-             draft_input TEXT NOT NULL DEFAULT '',
-             container_cpus TEXT,
-             container_memory TEXT,
-             archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1))
-         ) STRICT;
-         INSERT INTO sessions_v11 SELECT * FROM sessions;
-         DROP TABLE sessions;
-         ALTER TABLE sessions_v11 RENAME TO sessions;
-         ALTER TABLE hidden_native_sessions RENAME TO hidden_native_sessions_v10;
-         CREATE TABLE hidden_native_sessions (
-             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok','deepseek')),
-             native_session_id TEXT NOT NULL CHECK(length(trim(native_session_id)) > 0),
-             hidden_at TEXT NOT NULL,
-             PRIMARY KEY(harness_kind, native_session_id)
-         ) STRICT;
-         INSERT INTO hidden_native_sessions SELECT * FROM hidden_native_sessions_v10;
-         DROP TABLE hidden_native_sessions_v10;
-         INSERT INTO schema_migrations(version, applied_at)
-             VALUES (11, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-         PRAGMA user_version = 11;
-         COMMIT;",
-    );
-    if migration.is_err() {
-        let _ = connection.execute_batch("ROLLBACK;");
-    }
-    let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
-    migration.context("migrate sessions table for DeepSeek Harness")?;
-    foreign_keys.context("restore foreign key enforcement after schema migration")?;
-    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
-    if statement.exists([])? {
-        bail!("foreign key violation after migrating the DeepSeek Harness list");
-    }
-    Ok(())
-}
-
-/// Carry unsent chat input across a detach. Added as a structural guard rather
-/// than a new schema version so databases written by either development line
-/// converge, matching `ensure_managed_worktree_column`.
-fn ensure_session_draft_input_column(connection: &Connection) -> Result<()> {
-    if !table_has_column(connection, "sessions", "draft_input")? {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE sessions ADD COLUMN draft_input TEXT NOT NULL DEFAULT '';
-             COMMIT;",
-        )?;
-    }
-    Ok(())
-}
-
-fn ensure_projection_digest_column(connection: &Connection) -> Result<()> {
-    let present = connection.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM pragma_table_info('materialized_sessions')
-             WHERE name = 'applied_event_digest'
-         )",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !present {
-        connection.execute_batch(&format!(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE materialized_sessions ADD COLUMN applied_event_digest TEXT NOT NULL
-                 DEFAULT '{RELAY_EVENT_GENESIS_DIGEST}'
-                 CHECK(length(applied_event_digest) = 64
-                       AND applied_event_digest NOT GLOB '*[^0-9a-f]*');
-             COMMIT;",
-        ))?;
-    }
-    Ok(())
-}
+use schema::{forget_verified_schema, table_has_column};
 
 pub fn load_state() -> Result<HelState> {
     load_state_from(&database_path())
+}
+
+pub fn list_workspaces() -> Result<Vec<WorkspaceRecord>> {
+    list_workspaces_from(&database_path())
+}
+
+pub fn list_workspaces_from(path: &Path) -> Result<Vec<WorkspaceRecord>> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT w.workspace_id, w.name, w.created_at, w.last_opened_at,
+                count(c.session_id)
+          FROM workspaces w
+           LEFT JOIN session_contexts c USING(workspace_id)
+          GROUP BY w.workspace_id
+         HAVING w.workspace_id != 'default' OR count(c.session_id) > 0
+          ORDER BY w.last_opened_at DESC, w.created_at DESC, w.workspace_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(WorkspaceRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            created_at: row.get(2)?,
+            last_opened_at: row.get(3)?,
+            session_count: row.get(4)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
+pub fn create_workspace(name: &str) -> Result<WorkspaceRecord> {
+    create_workspace_at(&database_path(), name)
+}
+
+/// Create the named workspace, or return the concurrently-created winner.
+///
+/// Interactive setup uses this operation after presenting a snapshot of the
+/// workspace list. Several selectors can therefore submit the same normalized
+/// name legitimately. Explicit database creation remains strict through
+/// [`create_workspace`].
+pub fn create_or_get_workspace(name: &str) -> Result<WorkspaceRecord> {
+    create_or_get_workspace_at(&database_path(), name)
+}
+
+pub fn create_or_get_workspace_at(path: &Path, name: &str) -> Result<WorkspaceRecord> {
+    let (name, name_key) = normalize_workspace_name(name)?;
+    let id = new_workspace_id()?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut connection = open(path)?;
+    let transaction = connection.transaction()?;
+    transaction
+        .execute(
+            "INSERT INTO workspaces(workspace_id, name, name_key, created_at, last_opened_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(name_key) DO NOTHING",
+            params![id, name, name_key, now],
+        )
+        .with_context(|| format!("create or find workspace {name:?}"))?;
+    let workspace = transaction.query_row(
+        "SELECT w.workspace_id, w.name, w.created_at, w.last_opened_at,
+                count(c.session_id)
+           FROM workspaces w
+           LEFT JOIN session_contexts c USING(workspace_id)
+          WHERE w.name_key = ?1
+          GROUP BY w.workspace_id",
+        params![name_key],
+        |row| {
+            Ok(WorkspaceRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                last_opened_at: row.get(3)?,
+                session_count: row.get(4)?,
+            })
+        },
+    )?;
+    transaction.commit()?;
+    Ok(workspace)
+}
+
+pub fn create_workspace_at(path: &Path, name: &str) -> Result<WorkspaceRecord> {
+    let (name, name_key) = normalize_workspace_name(name)?;
+    let id = new_workspace_id()?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let connection = open(path)?;
+    connection
+        .execute(
+            "INSERT INTO workspaces(workspace_id, name, name_key, created_at, last_opened_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![id, name, name_key, now],
+        )
+        .with_context(|| format!("create workspace {name:?}"))?;
+    Ok(WorkspaceRecord {
+        id,
+        name,
+        created_at: now.clone(),
+        last_opened_at: now,
+        session_count: 0,
+    })
+}
+
+pub fn rename_workspace(workspace_id: &str, name: &str) -> Result<()> {
+    rename_workspace_at(&database_path(), workspace_id, name)
+}
+
+pub fn rename_workspace_at(path: &Path, workspace_id: &str, name: &str) -> Result<()> {
+    let (name, name_key) = normalize_workspace_name(name)?;
+    let connection = open(path)?;
+    let changed = connection
+        .execute(
+            "UPDATE workspaces SET name = ?2, name_key = ?3 WHERE workspace_id = ?1",
+            params![workspace_id, name, name_key],
+        )
+        .with_context(|| format!("rename workspace to {name:?}"))?;
+    ensure!(changed == 1, "unknown workspace {workspace_id:?}");
+    Ok(())
+}
+
+pub fn touch_workspace(workspace_id: &str) -> Result<()> {
+    touch_workspace_at(&database_path(), workspace_id)
+}
+
+pub fn touch_workspace_at(path: &Path, workspace_id: &str) -> Result<()> {
+    let connection = open(path)?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let changed = connection.execute(
+        "UPDATE workspaces SET last_opened_at = ?2 WHERE workspace_id = ?1",
+        params![workspace_id, now],
+    )?;
+    ensure!(changed == 1, "unknown workspace {workspace_id:?}");
+    Ok(())
+}
+
+pub fn delete_empty_workspace(workspace_id: &str) -> Result<()> {
+    delete_empty_workspace_at(&database_path(), workspace_id)
+}
+
+pub fn delete_empty_workspace_at(path: &Path, workspace_id: &str) -> Result<()> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let context_count: u64 = tx.query_row(
+        "SELECT count(*) FROM session_contexts WHERE workspace_id = ?1",
+        [workspace_id],
+        |row| row.get(0),
+    )?;
+    let draft_count: u64 = tx.query_row(
+        "SELECT count(*) FROM detached_drafts WHERE workspace_id = ?1",
+        [workspace_id],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        context_count == 0 && draft_count == 0,
+        "workspace is not empty ({context_count} session histories, {draft_count} drafts)"
+    );
+    let changed = tx.execute(
+        "DELETE FROM workspaces WHERE workspace_id = ?1",
+        [workspace_id],
+    )?;
+    ensure!(changed == 1, "unknown workspace {workspace_id:?}");
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn workspace_for_session(session_id: &str) -> Result<Option<String>> {
+    workspace_for_session_at(&database_path(), session_id)
+}
+
+pub fn workspace_for_session_at(path: &Path, session_id: &str) -> Result<Option<String>> {
+    open(path)?
+        .query_row(
+            "SELECT workspace_id FROM session_contexts WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub fn session_ids_for_workspace(workspace_id: &str) -> Result<Vec<String>> {
+    session_ids_for_workspace_at(&database_path(), workspace_id)
+}
+
+pub fn session_ids_for_workspace_at(path: &Path, workspace_id: &str) -> Result<Vec<String>> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT c.session_id
+           FROM session_contexts c
+           JOIN sessions s USING(session_id)
+          WHERE c.workspace_id = ?1
+          ORDER BY c.created_at, c.session_id",
+    )?;
+    let rows = statement.query_map([workspace_id], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
+/// Assign a newly-created session context to a workspace. Existing contexts
+/// are immutable: moving sessions is deliberately outside the v1 model.
+pub fn assign_new_session_workspace(session_id: &str, workspace_id: &str) -> Result<()> {
+    assign_new_session_workspace_at(&database_path(), session_id, workspace_id)
+}
+
+pub fn assign_new_session_workspace_at(
+    path: &Path,
+    session_id: &str,
+    workspace_id: &str,
+) -> Result<()> {
+    let connection = open(path)?;
+    let current: String = connection
+        .query_row(
+            "SELECT workspace_id FROM session_contexts WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("find session context {session_id:?}"))?;
+    if current == workspace_id {
+        return Ok(());
+    }
+    ensure!(
+        current == DEFAULT_WORKSPACE_ID,
+        "session {session_id} already belongs to workspace {current}"
+    );
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
+        [workspace_id],
+        |row| row.get(0),
+    )?;
+    ensure!(exists, "unknown workspace {workspace_id:?}");
+    connection.execute(
+        "UPDATE session_contexts SET workspace_id = ?2 WHERE session_id = ?1",
+        params![session_id, workspace_id],
+    )?;
+    Ok(())
+}
+
+pub fn client_read_frontier(client_id: &str, workspace_id: &str, session_id: &str) -> Result<u64> {
+    client_read_frontier_at(&database_path(), client_id, workspace_id, session_id)
+}
+
+fn client_read_frontier_at(
+    path: &Path,
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<u64> {
+    let connection = open(path)?;
+    let client: Option<u64> = connection
+        .query_row(
+            "SELECT through_event_ordinal
+               FROM client_read_frontiers
+              WHERE client_id = ?1 AND workspace_id = ?2 AND session_id = ?3",
+            params![client_id, workspace_id, session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(frontier) = client {
+        return Ok(frontier);
+    }
+    connection
+        .query_row(
+            "SELECT s.viewed_through_event_ordinal
+               FROM sessions s JOIN session_contexts c USING(session_id)
+              WHERE s.session_id = ?1 AND c.workspace_id = ?2",
+            params![session_id, workspace_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("find session {session_id:?} in workspace {workspace_id:?}"))
+}
+
+pub fn advance_client_read_frontier(
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+    through: u64,
+) -> Result<u64> {
+    advance_client_read_frontier_at(
+        &database_path(),
+        client_id,
+        workspace_id,
+        session_id,
+        through,
+    )
+}
+
+fn advance_client_read_frontier_at(
+    path: &Path,
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+    through: u64,
+) -> Result<u64> {
+    ensure!(!client_id.trim().is_empty(), "client id is empty");
+    let connection = open(path)?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let changed = connection.execute(
+        "INSERT INTO client_read_frontiers(
+             client_id, workspace_id, session_id, through_event_ordinal, updated_at
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE EXISTS(
+              SELECT 1 FROM session_contexts
+               WHERE session_id = ?3 AND workspace_id = ?2
+          )
+         ON CONFLICT(client_id, workspace_id, session_id) DO UPDATE SET
+             through_event_ordinal = max(
+                 client_read_frontiers.through_event_ordinal,
+                 excluded.through_event_ordinal
+             ),
+             updated_at = excluded.updated_at",
+        params![client_id, workspace_id, session_id, through, now],
+    )?;
+    ensure!(
+        changed == 1,
+        "session {session_id:?} is not in workspace {workspace_id:?}"
+    );
+    client_read_frontier_at(path, client_id, workspace_id, session_id)
+}
+
+pub fn save_detached_draft(
+    workspace_id: &str,
+    session_id: Option<&str>,
+    source: &str,
+    owner_pid: Option<u32>,
+    text: &str,
+) -> Result<Option<String>> {
+    save_detached_draft_at(
+        &database_path(),
+        workspace_id,
+        session_id,
+        source,
+        owner_pid,
+        text,
+    )
+}
+
+fn save_detached_draft_at(
+    path: &Path,
+    workspace_id: &str,
+    session_id: Option<&str>,
+    source: &str,
+    owner_pid: Option<u32>,
+    text: &str,
+) -> Result<Option<String>> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    ensure!(!source.trim().is_empty(), "draft source is empty");
+    let id = new_workspace_id()?;
+    let saved_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT INTO detached_drafts(
+             draft_id, workspace_id, session_id, source, owner_pid, saved_at, text
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id,
+            workspace_id,
+            session_id,
+            source,
+            owner_pid,
+            saved_at,
+            text
+        ],
+    )?;
+    Ok(Some(id))
+}
+
+pub fn list_detached_drafts(workspace_id: &str) -> Result<Vec<DetachedDraft>> {
+    list_detached_drafts_at(&database_path(), workspace_id)
+}
+
+fn list_detached_drafts_at(path: &Path, workspace_id: &str) -> Result<Vec<DetachedDraft>> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT draft_id, workspace_id, session_id, source, owner_pid, saved_at, text,
+                recovered_at
+           FROM detached_drafts
+          WHERE workspace_id = ?1 AND recovered_at IS NULL
+          ORDER BY saved_at DESC, draft_id DESC",
+    )?;
+    let rows = statement.query_map([workspace_id], |row| {
+        Ok(DetachedDraft {
+            id: row.get(0)?,
+            workspace_id: row.get(1)?,
+            session_id: row.get(2)?,
+            source: row.get(3)?,
+            owner_pid: row.get(4)?,
+            saved_at: row.get(5)?,
+            text: row.get(6)?,
+            recovered_at: row.get(7)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
+pub fn mark_draft_recovered(draft_id: &str) -> Result<()> {
+    let connection = open(&database_path())?;
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let changed = connection.execute(
+        "UPDATE detached_drafts SET recovered_at = ?2
+          WHERE draft_id = ?1 AND recovered_at IS NULL",
+        params![draft_id, now],
+    )?;
+    ensure!(
+        changed == 1,
+        "unknown or already recovered draft {draft_id:?}"
+    );
+    Ok(())
+}
+
+/// Explicitly restore a detached draft into its session composer. This is the
+/// only operation that merges client-local draft state back into the legacy
+/// session field, and the transaction marks the source draft recovered at the
+/// same durable boundary.
+pub fn recover_detached_draft(draft_id: &str) -> Result<String> {
+    let mut connection = open(&database_path())?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (session_id, text): (Option<String>, String) = tx
+        .query_row(
+            "SELECT session_id, text FROM detached_drafts
+              WHERE draft_id = ?1 AND recovered_at IS NULL",
+            [draft_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .with_context(|| format!("find recoverable draft {draft_id:?}"))?;
+    let session_id = session_id.context("draft is not associated with a session")?;
+    let changed = tx.execute(
+        "UPDATE sessions SET draft_input = ?2 WHERE session_id = ?1",
+        params![session_id, text],
+    )?;
+    ensure!(changed == 1, "draft session no longer exists");
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    tx.execute(
+        "UPDATE detached_drafts SET recovered_at = ?2 WHERE draft_id = ?1",
+        params![draft_id, now],
+    )?;
+    tx.commit()?;
+    Ok(session_id)
 }
 
 pub fn load_state_from(path: &Path) -> Result<HelState> {
@@ -885,11 +538,13 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
                 s.viewed_through_event_ordinal, s.last_error, s.resource_allocation,
                 s.last_checkpoint_error, s.project_directory, s.managed_worktree,
                 s.draft_input, s.container_cpus, s.container_memory, s.archived
+                , c.workspace_id
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(SessionRecord {
+            workspace_id: row.get(22)?,
             archived: row.get(21)?,
             container_cpus: row.get(19)?,
             container_memory: row.get(20)?,
@@ -965,6 +620,21 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
         let (host, source) = row?;
         state.mount_history.entry(host).or_default().push(source);
     }
+    let mut statement = connection
+        .prepare("SELECT host, cpus, memory_bytes FROM host_container_sizes ORDER BY host")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            HostContainerSize {
+                cpus: row.get::<_, i64>(1)? as u64,
+                memory_bytes: row.get::<_, i64>(2)? as u64,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (host, size) = row?;
+        state.container_sizes.insert(host, size);
+    }
     state.validate()?;
     Ok(state)
 }
@@ -978,6 +648,16 @@ pub fn save_state(state: &HelState) -> Result<()> {
 /// commit concurrently without restoring stale copies of other sessions.
 pub fn save_session(session: &SessionRecord) -> Result<()> {
     save_session_to(&database_path(), session)
+}
+
+/// Persist a session and the container size it most recently launched on its
+/// host in one transaction.
+pub fn save_session_with_container_size(
+    session: &SessionRecord,
+    host: &str,
+    size: HostContainerSize,
+) -> Result<()> {
+    save_session_with_container_size_to(&database_path(), session, Some((host, size)))
 }
 
 /// Update only the fields a lifecycle transition owns on a session that
@@ -1006,6 +686,34 @@ pub fn set_session_title_override(session_id: &str, title: &str, updated_at: &st
     set_session_title_override_to(&database_path(), session_id, title, updated_at)
 }
 
+/// Rewrite a configured profile id in every persisted session in one SQLite
+/// transaction. Configuration is stored separately, so the controller owns
+/// coordinating this update with the matching config-map rename.
+pub fn rename_profile_references(old_id: &str, new_id: &str) -> Result<usize> {
+    rename_session_reference("last_profile", old_id, new_id)
+}
+
+/// Rewrite a configured target id in every persisted session in one SQLite
+/// transaction.
+pub fn rename_target_references(old_id: &str, new_id: &str) -> Result<usize> {
+    rename_session_reference("target_template_id", old_id, new_id)
+}
+
+fn rename_session_reference(column: &str, old_id: &str, new_id: &str) -> Result<usize> {
+    ensure!(
+        matches!(column, "last_profile" | "target_template_id"),
+        "unsupported session reference column"
+    );
+    let mut connection = open(&database_path())?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        &format!("UPDATE sessions SET {column} = ?2 WHERE {column} = ?1"),
+        params![old_id, new_id],
+    )?;
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// Change only whether the resume dialog hides this session. Archiving is a
 /// display choice, so it has its own writer and never rewrites lifecycle,
 /// checkpoint, or title columns another task owns.
@@ -1014,28 +722,53 @@ pub fn set_session_archived(session_id: &str, archived: bool) -> Result<()> {
 }
 
 /// Record that the managed target of an otherwise live session is definitively
-/// gone. The state predicate keeps a late poll result from overwriting a
-/// concurrent checkpoint or teardown transition.
-pub fn mark_session_target_lost(session_id: &str, detail: &str, updated_at: &str) -> Result<bool> {
-    mark_session_target_lost_to(&database_path(), session_id, detail, updated_at)
+/// gone. A verified checkpoint keeps the session recoverable as an error on the
+/// dashboard; without one, the session is lost. The state predicate keeps a
+/// late poll result from overwriting a concurrent lifecycle transition.
+pub fn mark_session_target_missing(
+    session_id: &str,
+    detail: &str,
+    updated_at: &str,
+) -> Result<Option<SessionState>> {
+    mark_session_target_missing_to(&database_path(), session_id, detail, updated_at)
 }
 
-fn mark_session_target_lost_to(
+fn mark_session_target_missing_to(
     path: &Path,
     session_id: &str,
     detail: &str,
     updated_at: &str,
-) -> Result<bool> {
-    let connection = open(path)?;
-    let changed = connection.execute(
+) -> Result<Option<SessionState>> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
         "UPDATE sessions
-         SET state = 'lost', last_error = ?2, updated_at = ?3
+         SET state = CASE
+                 WHEN EXISTS(
+                     SELECT 1 FROM session_checkpoints
+                     WHERE session_checkpoints.session_id = sessions.session_id
+                 ) THEN 'error'
+                 ELSE 'lost'
+             END,
+             last_error = ?2,
+             updated_at = ?3
          WHERE session_id = ?1
            AND state IN ('provisioning', 'running', 'disconnected', 'error')",
         params![session_id, detail, updated_at],
     )?;
     ensure!(changed <= 1, "updated {changed} sessions for {session_id}");
-    Ok(changed == 1)
+    let state = if changed == 1 {
+        let stored: String = tx.query_row(
+            "SELECT state FROM sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Some(parse_session_state(&stored))
+    } else {
+        None
+    };
+    tx.commit()?;
+    Ok(state)
 }
 
 fn set_session_archived_to(path: &Path, session_id: &str, archived: bool) -> Result<()> {
@@ -1268,6 +1001,14 @@ fn recover_interrupted_checkpointing_sessions_to(path: &Path, updated_at: &str) 
 }
 
 fn save_session_to(path: &Path, session: &SessionRecord) -> Result<()> {
+    save_session_with_container_size_to(path, session, None)
+}
+
+fn save_session_with_container_size_to(
+    path: &Path,
+    session: &SessionRecord,
+    container_size: Option<(&str, HostContainerSize)>,
+) -> Result<()> {
     validate_session_record(session)?;
 
     let mut connection = open(path)?;
@@ -1289,6 +1030,9 @@ fn save_session_to(path: &Path, session: &SessionRecord) -> Result<()> {
         );
     }
     insert_session(&tx, session)?;
+    if let Some((host, size)) = container_size {
+        write_host_container_size(&tx, host, size)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -1416,6 +1160,16 @@ fn load_materialized_session_summary_from(
     let agent_message_latest_content_ordinals = ordinal_statement
         .query_map([session_id], |row| row.get::<_, u64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let restart_pattern = format!("{}*", crate::hel_transcript::SESSION_RESTART_ITEM_PREFIX);
+    let mut restart_statement = connection.prepare(
+        "SELECT position
+         FROM materialized_transcript_items
+         WHERE session_id = ?1 AND stable_id GLOB ?2
+         ORDER BY position, stable_id",
+    )?;
+    let session_restart_event_ordinals = restart_statement
+        .query_map((session_id, restart_pattern), |row| row.get::<_, u64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(Some(MaterializedSessionSummary {
         session_id: session_id.to_owned(),
@@ -1427,6 +1181,7 @@ fn load_materialized_session_summary_from(
         last_user_message: last_user_message.map(|(_, message)| message),
         last_agent_message_follows_last_user,
         agent_message_latest_content_ordinals,
+        session_restart_event_ordinals,
     }))
 }
 
@@ -1775,6 +1530,14 @@ pub struct ProjectionPage<'a> {
     transaction: Transaction<'a>,
     applied_ordinal: u64,
     applied_digest: String,
+    dirty: bool,
+    pending: MaterializedSessionMutation,
+    pending_transcript: BTreeMap<String, PendingTranscriptMutation>,
+}
+
+struct PendingTranscriptMutation {
+    final_mutation: TranscriptMutation,
+    remove_before_upsert: bool,
 }
 
 impl ProjectionPage<'_> {
@@ -1791,7 +1554,15 @@ impl ProjectionPage<'_> {
         if event_ordinal == 0 {
             bail!("relay event ordinal must be positive");
         }
-        validate_relay_event_digest(previous_event_digest, "previous relay event digest")?;
+        // A v2 event carries no chain link (empty previous digest). Its
+        // continuity to the projection frontier is proven by ordinal
+        // contiguity plus the attach cursor the controller validated against
+        // the worker, not by an in-record back-reference; divergence is caught
+        // there, before any event is applied.
+        let chained = !previous_event_digest.is_empty();
+        if chained {
+            validate_relay_event_digest(previous_event_digest, "previous relay event digest")?;
+        }
         validate_relay_event_frontier(event_ordinal, event_digest, "relay event frontier")?;
         let session_id = self.session_id;
         let applied = self.applied_ordinal;
@@ -1815,26 +1586,86 @@ impl ProjectionPage<'_> {
                 "relay event gap for session {session_id}: expected ordinal {expected}, received {event_ordinal}"
             );
         }
-        if previous_event_digest != self.applied_digest {
+        if chained && previous_event_digest != self.applied_digest {
             bail!(
                 "relay event chain diverged for session {session_id} before ordinal {event_ordinal}: projection has {}, event follows {previous_event_digest}",
                 self.applied_digest
             );
         }
 
-        let tx = &self.transaction;
         if let Some(activity_at_ms) = mutation.last_activity_at_ms {
-            tx.execute(
-                "UPDATE materialized_sessions
-                 SET last_activity_at_ms = CASE
-                     WHEN last_activity_at_ms IS NULL OR last_activity_at_ms < ?2 THEN ?2
-                     ELSE last_activity_at_ms
-                 END
-                 WHERE session_id = ?1",
-                params![session_id, activity_at_ms],
-            )?;
+            self.pending.last_activity_at_ms = Some(
+                self.pending
+                    .last_activity_at_ms
+                    .map_or(activity_at_ms, |existing| existing.max(activity_at_ms)),
+            );
         }
         if let Some(execution) = mutation.execution {
+            self.pending.execution = Some(execution);
+        }
+        if let Some(title) = &mutation.session_title {
+            if title.as_ref().is_some_and(|title| title.trim().is_empty()) {
+                bail!("materialized session title cannot be empty");
+            }
+            self.pending.session_title = Some(title.clone());
+        }
+        if let Some(configuration) = &mutation.configuration {
+            self.pending.configuration = Some(configuration.clone());
+        }
+        for item_mutation in &mutation.transcript {
+            match item_mutation {
+                TranscriptMutation::Upsert(item) => {
+                    item.validate(event_ordinal)?;
+                    let stable_id = item.stable_id.clone();
+                    let entry = self.pending_transcript.entry(stable_id).or_insert_with(|| {
+                        PendingTranscriptMutation {
+                            final_mutation: TranscriptMutation::Upsert(item.clone()),
+                            remove_before_upsert: false,
+                        }
+                    });
+                    entry.remove_before_upsert |=
+                        matches!(&entry.final_mutation, TranscriptMutation::Remove { .. });
+                    entry.final_mutation = TranscriptMutation::Upsert(item.clone());
+                }
+                TranscriptMutation::Remove { stable_id } => {
+                    if stable_id.trim().is_empty() {
+                        bail!("cannot remove a transcript item with an empty stable id");
+                    }
+                    let removed = TranscriptMutation::Remove {
+                        stable_id: stable_id.clone(),
+                    };
+                    self.pending_transcript
+                        .entry(stable_id.clone())
+                        .and_modify(|entry| entry.final_mutation = removed.clone())
+                        .or_insert(PendingTranscriptMutation {
+                            final_mutation: removed,
+                            remove_before_upsert: false,
+                        });
+                }
+            }
+        }
+        if let Some(queued_prompts) = &mutation.queued_prompts {
+            self.pending.queued_prompts = Some(queued_prompts.clone());
+        }
+        if let Some(pending_elicitations) = &mutation.pending_elicitations {
+            self.pending.pending_elicitations = Some(pending_elicitations.clone());
+        }
+        self.applied_ordinal = event_ordinal;
+        event_digest.clone_into(&mut self.applied_digest);
+        self.dirty = true;
+        Ok(ProjectionApplyOutcome::Applied)
+    }
+
+    /// Persist the coalesced final state of this page. Intermediate event
+    /// frontiers are useful only for chain validation: a page commits or rolls
+    /// back as a unit, so writing them individually adds no recovery value.
+    fn flush(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let tx = &self.transaction;
+        let session_id = self.session_id;
+        if let Some(execution) = self.pending.execution {
             let (state, started_at_ms) = materialized_execution_columns(execution);
             tx.execute(
                 "UPDATE materialized_sessions
@@ -1843,31 +1674,34 @@ impl ProjectionPage<'_> {
                 params![session_id, state, started_at_ms],
             )?;
         }
-        if let Some(title) = &mutation.session_title {
-            if title.as_ref().is_some_and(|title| title.trim().is_empty()) {
-                bail!("materialized session title cannot be empty");
-            }
+        if let Some(title) = &self.pending.session_title {
             tx.execute(
                 "UPDATE materialized_sessions SET session_title = ?2 WHERE session_id = ?1",
                 params![session_id, title],
             )?;
         }
-        if let Some(configuration) = &mutation.configuration {
+        if let Some(configuration) = &self.pending.configuration {
             tx.execute(
                 "UPDATE materialized_sessions SET configuration_json = ?2 WHERE session_id = ?1",
                 params![session_id, serde_json::to_string(configuration)?],
             )?;
         }
-        for item_mutation in &mutation.transcript {
-            match item_mutation {
+        for pending in self.pending_transcript.values() {
+            match &pending.final_mutation {
                 TranscriptMutation::Upsert(item) => {
-                    item.validate(event_ordinal)?;
+                    // A remove followed by an upsert deliberately starts a new
+                    // item identity. Preserve that boundary even though other
+                    // repeated updates are coalesced to one write.
+                    if pending.remove_before_upsert {
+                        tx.execute(
+                            "DELETE FROM materialized_transcript_items
+                             WHERE session_id = ?1 AND stable_id = ?2",
+                            params![session_id, item.stable_id],
+                        )?;
+                    }
                     upsert_transcript_item(tx, session_id, item)?;
                 }
                 TranscriptMutation::Remove { stable_id } => {
-                    if stable_id.trim().is_empty() {
-                        bail!("cannot remove a transcript item with an empty stable id");
-                    }
                     tx.execute(
                         "DELETE FROM materialized_transcript_items
                          WHERE session_id = ?1 AND stable_id = ?2",
@@ -1876,10 +1710,10 @@ impl ProjectionPage<'_> {
                 }
             }
         }
-        if let Some(queued_prompts) = &mutation.queued_prompts {
+        if let Some(queued_prompts) = &self.pending.queued_prompts {
             replace_materialized_queue(tx, session_id, queued_prompts)?;
         }
-        if let Some(pending_elicitations) = &mutation.pending_elicitations {
+        if let Some(pending_elicitations) = &self.pending.pending_elicitations {
             tx.execute(
                 "UPDATE materialized_sessions
                  SET pending_elicitations_json = ?2 WHERE session_id = ?1",
@@ -1888,13 +1722,22 @@ impl ProjectionPage<'_> {
         }
         tx.execute(
             "UPDATE materialized_sessions
-             SET applied_event_ordinal = ?2, applied_event_digest = ?3
+             SET last_activity_at_ms = CASE
+                     WHEN ?2 IS NULL THEN last_activity_at_ms
+                     WHEN last_activity_at_ms IS NULL OR last_activity_at_ms < ?2 THEN ?2
+                     ELSE last_activity_at_ms
+                 END,
+                 applied_event_ordinal = ?3,
+                 applied_event_digest = ?4
              WHERE session_id = ?1",
-            params![session_id, event_ordinal, event_digest],
+            params![
+                session_id,
+                self.pending.last_activity_at_ms,
+                self.applied_ordinal,
+                self.applied_digest,
+            ],
         )?;
-        self.applied_ordinal = event_ordinal;
-        event_digest.clone_into(&mut self.applied_digest);
-        Ok(ProjectionApplyOutcome::Applied)
+        Ok(())
     }
 }
 
@@ -1936,10 +1779,14 @@ fn apply_projection_page_to<T>(
         transaction,
         applied_ordinal,
         applied_digest,
+        dirty: false,
+        pending: MaterializedSessionMutation::default(),
+        pending_transcript: BTreeMap::new(),
     };
     // Dropping the page on failure rolls the whole transaction back, leaving
     // the projection at the frontier the relay last saw acknowledged.
     let filled = fill(&mut page)?;
+    page.flush()?;
     page.transaction.commit()?;
     Ok(filled)
 }
@@ -2049,6 +1896,191 @@ pub fn remember_mount_sources(host: &str, mounts: &[AdditionalMount]) -> Result<
 
 /// Replace one host's remembered mount sources with exactly this list, so the
 /// dashboard can forget a directory the user no longer wants suggested.
+/// What each workspace last chose for a second opinion.
+///
+/// The selection is remembered so a repeat review does not ask again, and it
+/// is workspace scoped because a reviewer that suits one project rarely suits
+/// the next. Values are validated against what the harness advertises now
+/// before they are used, so a retired profile is harmless here.
+pub fn reviewer_defaults() -> Result<crate::hel_second_opinion::ReviewerDefaults> {
+    reviewer_defaults_in(&database_path())
+}
+
+fn reviewer_defaults_in(path: &Path) -> Result<crate::hel_second_opinion::ReviewerDefaults> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT workspace_id, profile_id, model, effort FROM second_opinion_defaults
+         ORDER BY workspace_id, profile_id, model",
+    )?;
+    let mut defaults = crate::hel_second_opinion::ReviewerDefaults::default();
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let workspace_id: String = row.get(0)?;
+        let profile_id: String = row.get(1)?;
+        let model: String = row.get(2)?;
+        let effort: String = row.get(3)?;
+        defaults.restore(&workspace_id, &profile_id, &model, &effort);
+    }
+    Ok(defaults)
+}
+
+/// Record one confirmed selection.
+pub fn remember_reviewer_selection(
+    workspace_id: &str,
+    selection: &crate::hel_second_opinion::ReviewerSelection,
+) -> Result<()> {
+    remember_reviewer_selection_in(&database_path(), workspace_id, selection)
+}
+
+fn remember_reviewer_selection_in(
+    path: &Path,
+    workspace_id: &str,
+    selection: &crate::hel_second_opinion::ReviewerSelection,
+) -> Result<()> {
+    ensure!(
+        !workspace_id.trim().is_empty(),
+        "second-opinion defaults need a workspace"
+    );
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (profile_id, model, effort) = selection.stored_values();
+    // One profile is the workspace's reviewer at a time, so the rows for the
+    // others stop being the remembered choice rather than accumulating.
+    tx.execute(
+        "DELETE FROM second_opinion_defaults WHERE workspace_id = ?1 AND profile_id <> ?2",
+        params![workspace_id, profile_id],
+    )?;
+    tx.execute(
+        "INSERT INTO second_opinion_defaults(workspace_id, profile_id, model, effort)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(workspace_id, profile_id, model) DO UPDATE SET effort = excluded.effort",
+        params![workspace_id, profile_id, model, effort],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// A second-opinion review that was still open when the UI last stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredReview {
+    pub workflow: crate::hel_second_opinion::ReviewWorkflow,
+    /// Reviewer lifetime this review belongs to. It is bumped when native
+    /// continuity is lost, so a resumed session starts a new conversation
+    /// rather than pretending to reload one that is gone.
+    pub generation: u64,
+    /// The primary's transcript frontier when the context request went out.
+    pub context_baseline: u64,
+    /// Whether the reviewer's native session is known to be gone.
+    pub native_lost: bool,
+    /// What the controller has read of the reviewer's conversation. The
+    /// reviewer's own journal is the source, but it dies with the target, so
+    /// this copy is what keeps a finished review readable afterwards.
+    pub reviewer_transcript: Vec<std::sync::Arc<crate::hel_state::TranscriptItem>>,
+}
+
+/// The open review for `session_id`, if the session has one.
+pub fn active_review(session_id: &str) -> Result<Option<StoredReview>> {
+    active_review_in(&database_path(), session_id)
+}
+
+fn active_review_in(path: &Path, session_id: &str) -> Result<Option<StoredReview>> {
+    let connection = open(path)?;
+    let row = connection
+        .query_row(
+            "SELECT workflow, generation, context_baseline, native_lost, reviewer_transcript
+             FROM second_opinion_reviews WHERE session_id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((workflow, generation, baseline, native_lost, transcript)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(StoredReview {
+        workflow: serde_json::from_str(&workflow).context("parse the stored review workflow")?,
+        generation: u64::try_from(generation).unwrap_or_default(),
+        context_baseline: u64::try_from(baseline).unwrap_or_default(),
+        native_lost: native_lost != 0,
+        reviewer_transcript: serde_json::from_str(&transcript)
+            .context("parse the stored reviewer transcript")?,
+    }))
+}
+
+/// Records the open review, replacing any earlier one for this session.
+pub fn save_active_review(session_id: &str, review: &StoredReview) -> Result<()> {
+    save_active_review_in(&database_path(), session_id, review)
+}
+
+fn save_active_review_in(path: &Path, session_id: &str, review: &StoredReview) -> Result<()> {
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT INTO second_opinion_reviews(
+             session_id, workflow, generation, context_baseline, native_lost,
+             reviewer_transcript
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+             workflow = excluded.workflow,
+             generation = excluded.generation,
+             context_baseline = excluded.context_baseline,
+             native_lost = excluded.native_lost,
+             reviewer_transcript = excluded.reviewer_transcript",
+        params![
+            session_id,
+            serde_json::to_string(&review.workflow)?,
+            i64::try_from(review.generation).unwrap_or(i64::MAX),
+            i64::try_from(review.context_baseline).unwrap_or(i64::MAX),
+            i64::from(review.native_lost),
+            serde_json::to_string(&review.reviewer_transcript)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Forgets the open review once it has finished.
+pub fn clear_active_review(session_id: &str) -> Result<()> {
+    clear_active_review_in(&database_path(), session_id)
+}
+
+fn clear_active_review_in(path: &Path, session_id: &str) -> Result<()> {
+    let connection = open(path)?;
+    connection.execute(
+        "DELETE FROM second_opinion_reviews WHERE session_id = ?1",
+        [session_id],
+    )?;
+    Ok(())
+}
+
+/// Marks this session's reviewer conversation as no longer continuable, and
+/// reports the generation a future review must start under.
+///
+/// Losing the target takes the reviewer's native session with it. The
+/// materialized transcript is kept for reference, but the next review is a new
+/// conversation, so it runs under a new generation.
+pub fn lose_reviewer_continuity(session_id: &str) -> Result<u64> {
+    lose_reviewer_continuity_in(&database_path(), session_id)
+}
+
+fn lose_reviewer_continuity_in(path: &Path, session_id: &str) -> Result<u64> {
+    let Some(mut review) = active_review_in(path, session_id)? else {
+        return Ok(0);
+    };
+    if review.native_lost {
+        return Ok(review.generation);
+    }
+    review.native_lost = true;
+    review.generation = review.generation.saturating_add(1);
+    save_active_review_in(path, session_id, &review)?;
+    Ok(review.generation)
+}
+
 pub fn replace_mount_history(host: &str, sources: &[PathBuf]) -> Result<()> {
     replace_mount_history_in(&database_path(), host, sources)
 }
@@ -2074,6 +2106,28 @@ fn write_mount_history(tx: &Transaction<'_>, host: &str, sources: &[PathBuf]) ->
         )?;
         written.push(source.clone());
     }
+    Ok(())
+}
+
+fn write_host_container_size(
+    tx: &Transaction<'_>,
+    host: &str,
+    size: HostContainerSize,
+) -> Result<()> {
+    ensure!(!host.trim().is_empty(), "container size host is empty");
+    let cpus = i64::try_from(size.cpus).context("container CPU count exceeds SQLite range")?;
+    let memory =
+        i64::try_from(size.memory_bytes).context("container memory exceeds SQLite range")?;
+    ensure!(
+        cpus > 0 && memory > 0,
+        "container size values must be positive"
+    );
+    tx.execute(
+        "INSERT INTO host_container_sizes(host, cpus, memory_bytes)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(host) DO UPDATE SET cpus = excluded.cpus, memory_bytes = excluded.memory_bytes",
+        params![host, cpus, memory],
+    )?;
     Ok(())
 }
 
@@ -2185,15 +2239,22 @@ pub fn save_state_to(path: &Path, state: &HelState) -> Result<()> {
         }
     }
     tx.execute("DELETE FROM mount_history", [])?;
+    tx.execute("DELETE FROM host_container_sizes", [])?;
     for session in state.sessions.values() {
-        if let Some(existing_bundle) = existing_contexts.get(&session.id)
-            && existing_bundle != &session.bundle_id
-        {
-            bail!(
+        if let Some((existing_bundle, existing_workspace)) = existing_contexts.get(&session.id) {
+            ensure!(
+                existing_bundle == &session.bundle_id,
                 "session {} was already associated with bundle {}, not {}",
                 session.id,
                 existing_bundle,
                 session.bundle_id
+            );
+            ensure!(
+                existing_workspace == &session.workspace_id,
+                "session {} was already associated with workspace {}, not {}",
+                session.id,
+                existing_workspace,
+                session.workspace_id
             );
         }
         insert_session(&tx, session)?;
@@ -2206,13 +2267,17 @@ pub fn save_state_to(path: &Path, state: &HelState) -> Result<()> {
             )?;
         }
     }
+    for (host, size) in &state.container_sizes {
+        write_host_container_size(&tx, host, *size)?;
+    }
     tx.commit()?;
     Ok(())
 }
 
-fn existing_contexts(tx: &Transaction<'_>) -> Result<BTreeMap<String, String>> {
-    let mut statement = tx.prepare("SELECT session_id, bundle_id FROM session_contexts")?;
-    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+fn existing_contexts(tx: &Transaction<'_>) -> Result<BTreeMap<String, (String, String)>> {
+    let mut statement =
+        tx.prepare("SELECT session_id, bundle_id, workspace_id FROM session_contexts")?;
+    let rows = statement.query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?;
     rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
 }
 
@@ -2420,10 +2485,35 @@ fn parse_materialized_execution(
 /// orphan adoption — may use this.
 fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
     tx.execute(
-        "INSERT INTO session_contexts(session_id, bundle_id, created_at) VALUES (?1, ?2, ?3)
+        "INSERT INTO session_contexts(session_id, bundle_id, created_at, workspace_id)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(session_id) DO NOTHING",
-        params![session.id, session.bundle_id, session.created_at],
+        params![
+            session.id,
+            session.bundle_id,
+            session.created_at,
+            session.workspace_id
+        ],
     )?;
+    let (stored_bundle, stored_workspace): (String, String) = tx.query_row(
+        "SELECT bundle_id, workspace_id FROM session_contexts WHERE session_id = ?1",
+        [session.id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        stored_bundle == session.bundle_id,
+        "session {} belongs to bundle {}, not {}",
+        session.id,
+        stored_bundle,
+        session.bundle_id
+    );
+    ensure!(
+        stored_workspace == session.workspace_id,
+        "session {} belongs to workspace {}, not {}",
+        session.id,
+        stored_workspace,
+        session.workspace_id
+    );
     tx.execute(
         "INSERT INTO sessions(
              session_id, title, harness_kind, last_profile, target_template_id, state,
@@ -3026,2305 +3116,4 @@ impl<'a> ValueRefExt<'a> for rusqlite::types::ValueRef<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::hel_config::HarnessKind;
-    use crate::hel_state::{ManagedWorktreeTarget, QueuedCommandKind, TranscriptBody};
-    use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
-    use rusqlite::OptionalExtension;
-
-    fn event_digest(value: u64) -> String {
-        format!("{value:064x}")
-    }
-
-    fn session(id: &str, bundle: &str) -> SessionRecord {
-        SessionRecord {
-            archived: false,
-            container_cpus: None,
-            container_memory: None,
-            id: id.into(),
-            title: "test session".into(),
-            harness_kind: HarnessKind::Codex,
-            last_profile: "codex".into(),
-            bundle_id: bundle.into(),
-            project_directory: None,
-            managed_worktree: None,
-            target_template_id: "local".into(),
-            resource_allocation: Some(SessionResourceAllocation::Container {
-                cpus: 8,
-                memory_bytes: 32 * 1024 * 1024 * 1024,
-            }),
-            additional_mounts: vec![AdditionalMount {
-                source: PathBuf::from("/host/cache"),
-                destination: PathBuf::from("/mnt/cache"),
-                read_only: false,
-            }],
-            state: SessionState::Stopped,
-            target: Some(TargetLocator::LocalPodman {
-                container_id: "container-1".into(),
-            }),
-            native_session_id: Some("native-1".into()),
-            acp_session_title: Some("Agent title".into()),
-            session_title_override: None,
-            created_at: "2026-08-12T00:00:00Z".into(),
-            updated_at: "2026-08-12T01:00:00Z".into(),
-            viewed_through_event_ordinal: 7,
-            draft_input: String::new(),
-            last_error: None,
-            last_checkpoint_error: Some("temporary recovery failure".into()),
-            checkpoint: Some(CheckpointMetadata {
-                archive_path: PathBuf::from("sessions/test.hel.zip"),
-                sha256: "a".repeat(64),
-                created_at: "2026-08-12T01:00:00Z".into(),
-                event_frontier: 6,
-            }),
-        }
-    }
-
-    fn materialized_session(session_id: &str) -> MaterializedSession {
-        MaterializedSession {
-            session_id: session_id.into(),
-            applied_event_ordinal: 7,
-            applied_event_digest: event_digest(7),
-            last_activity_at_ms: Some(1_500),
-            execution: MaterializedExecutionState::Running {
-                started_at_ms: 1_000,
-            },
-            session_title: Some("Relay refactor".into()),
-            configuration: BTreeMap::from([
-                ("model".into(), serde_json::json!("gpt-5.6-sol")),
-                ("effort".into(), serde_json::json!("high")),
-            ]),
-            transcript: vec![
-                Arc::new(TranscriptItem {
-                    stable_id: "user:1".into(),
-                    position: 1,
-                    latest_content_event_ordinal: None,
-                    created_at_ms: 1_000,
-                    last_changed_at_ms: 1_000,
-                    body: TranscriptBody::User {
-                        content: vec![serde_json::json!({
-                            "type": "text",
-                            "text": "build it"
-                        })],
-                    },
-                }),
-                Arc::new(TranscriptItem {
-                    stable_id: "agent:2".into(),
-                    position: 2,
-                    latest_content_event_ordinal: Some(2),
-                    created_at_ms: 1_100,
-                    last_changed_at_ms: 1_300,
-                    body: TranscriptBody::Agent {
-                        chunks: vec![serde_json::json!({
-                            "content": {"type": "text", "text": "Working on it"},
-                            "messageId": "answer-1",
-                            "_meta": {"provider": "test"}
-                        })],
-                        streaming: false,
-                    },
-                }),
-                Arc::new(TranscriptItem {
-                    stable_id: "tool:call-1".into(),
-                    position: 3,
-                    latest_content_event_ordinal: None,
-                    created_at_ms: 1_200,
-                    last_changed_at_ms: 1_400,
-                    body: TranscriptBody::Tool {
-                        call: serde_json::json!({
-                            "toolCallId": "call-1",
-                            "title": "Edit files",
-                            "kind": "edit",
-                            "status": "completed",
-                            "content": [{
-                                "type": "content",
-                                "content": {"type": "text", "text": "done"}
-                            }],
-                            "locations": [{"path": "src/main.rs", "line": 4}],
-                            "rawInput": {"path": "src/main.rs"},
-                            "rawOutput": {"changed": true},
-                            "_meta": {"provider": "test"}
-                        }),
-                        terminal_outputs: Vec::new(),
-                        terminal_refs: Vec::new(),
-                    },
-                }),
-                Arc::new(TranscriptItem {
-                    stable_id: "plan:1".into(),
-                    position: 4,
-                    latest_content_event_ordinal: None,
-                    created_at_ms: 1_250,
-                    last_changed_at_ms: 1_350,
-                    body: TranscriptBody::Plan {
-                        plan: serde_json::json!({
-                            "entries": [{
-                                "content": "Implement relay",
-                                "priority": "high",
-                                "status": "in_progress",
-                                "_meta": {"provider": "test"}
-                            }],
-                            "_meta": {"planProvider": "test"}
-                        }),
-                    },
-                }),
-            ],
-            queued_prompts: vec![MaterializedQueuedPrompt {
-                command_id: "prompt-2".into(),
-                kind: QueuedCommandKind::Prompt,
-                content: vec![serde_json::json!({"type": "text", "text": "then test"})],
-                queued_at_ms: 1_500,
-            }],
-            pending_elicitations: vec![crate::hel_elicitation::ElicitationRequest {
-                id: "elicitation-1".into(),
-                message: "Choose one".into(),
-                title: Some("Question".into()),
-                description: None,
-                fields: Vec::new(),
-            }],
-        }
-    }
-
-    #[test]
-    fn normalized_state_round_trip_preserves_children_and_order() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut state = HelState::default();
-        let mut record = session("session-1", "project-1");
-        record.project_directory = Some(PathBuf::from("/srv/project-1/.hel/worktrees/session-1"));
-        record.managed_worktree = Some(ManagedWorktree {
-            source_project_directory: PathBuf::from("/srv/project-1"),
-            source_repository: PathBuf::from("/srv/project-1"),
-            worktree_root: PathBuf::from("/srv/project-1/.hel/worktrees/session-1"),
-            branch: "hel/session-1".into(),
-            target: ManagedWorktreeTarget::Ssh {
-                destination: "builder".into(),
-                ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
-            },
-        });
-        record.resource_allocation = None;
-        record.target = Some(TargetLocator::LocalBare {
-            worker_root: PathBuf::from("/var/lib/hel/workers/session-1"),
-        });
-        state.sessions.insert(record.id.clone(), record);
-        state.mount_history.insert(
-            "local".into(),
-            vec![PathBuf::from("/recent"), PathBuf::from("/older")],
-        );
-
-        save_state_to(&database, &state).unwrap();
-
-        assert_eq!(load_state_from(&database).unwrap(), state);
-        let connection = open(&database).unwrap();
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        assert_eq!(
-            connection
-                .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
-                .optional()
-                .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn loading_state_does_not_restore_a_hidden_context_session_name() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut state = HelState::default();
-        let mut record = session("session-1", "project-1");
-        record.acp_session_title = Some("<hel-project-memory>private and truncated".into());
-        state.sessions.insert(record.id.clone(), record);
-        save_state_to(&database, &state).unwrap();
-
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].acp_session_title,
-            None
-        );
-    }
-
-    #[test]
-    fn container_settings_write_overrides_mounts_and_remembered_sources() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let record = session("session-1", "project-1");
-        save_session_to(&database, &record).unwrap();
-
-        set_session_container_settings_to(
-            &database,
-            "session-1",
-            Some("6"),
-            Some("12g"),
-            &[AdditionalMount {
-                source: PathBuf::from("/host/models"),
-                destination: PathBuf::from("/mnt/models"),
-                read_only: true,
-            }],
-            "2026-08-13T00:00:00Z",
-        )
-        .unwrap();
-        replace_mount_history_in(&database, "local", &[PathBuf::from("/host/models")]).unwrap();
-
-        let loaded = load_state_from(&database).unwrap();
-        let session = &loaded.sessions["session-1"];
-        assert_eq!(session.container_cpus.as_deref(), Some("6"));
-        assert_eq!(session.container_memory.as_deref(), Some("12g"));
-        assert_eq!(
-            session.additional_mounts,
-            vec![AdditionalMount {
-                source: PathBuf::from("/host/models"),
-                destination: PathBuf::from("/mnt/models"),
-                read_only: true,
-            }]
-        );
-        assert_eq!(session.updated_at, "2026-08-13T00:00:00Z");
-        assert_eq!(
-            loaded.mount_history["local"],
-            vec![PathBuf::from("/host/models")]
-        );
-    }
-
-    #[test]
-    fn mount_read_only_round_trips_through_both_writers_and_defaults_before_the_column() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut record = session("session-1", "project-1");
-        record.additional_mounts = vec![
-            AdditionalMount {
-                source: PathBuf::from("/host/cache"),
-                destination: PathBuf::from("/mnt/cache"),
-                read_only: false,
-            },
-            AdditionalMount {
-                source: PathBuf::from("/net/share"),
-                destination: PathBuf::from("/mnt/share"),
-                read_only: true,
-            },
-        ];
-
-        save_session_to(&database, &record).unwrap();
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].additional_mounts,
-            record.additional_mounts
-        );
-
-        // A database written before the column existed keeps its rows, and they
-        // load as overlay mounts.
-        let connection = open(&database).unwrap();
-        connection
-            .execute_batch(
-                "ALTER TABLE session_mounts DROP COLUMN read_only;
-                 DELETE FROM session_mounts;
-                 INSERT INTO session_mounts(session_id, ordinal, source, destination)
-                     VALUES ('session-1', 0, CAST('/net/share' AS BLOB), CAST('/mnt/share' AS BLOB));",
-            )
-            .unwrap();
-        drop(connection);
-        // Editing the schema of an already-open store is something only this
-        // test does, so it has to retract the process's verification too.
-        forget_verified_schema(&database);
-
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].additional_mounts,
-            vec![AdditionalMount {
-                source: PathBuf::from("/net/share"),
-                destination: PathBuf::from("/mnt/share"),
-                read_only: false,
-            }]
-        );
-    }
-
-    #[test]
-    fn lifecycle_save_preserves_container_settings_and_mounts() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut stale = session("session-1", "project-1");
-        stale.additional_mounts.clear();
-        save_session_to(&database, &stale).unwrap();
-
-        // A read-only mount proves the flag survives a stale lifecycle save too.
-        let attached = AdditionalMount {
-            source: PathBuf::from("/host/models"),
-            destination: PathBuf::from("/mnt/models"),
-            read_only: true,
-        };
-        set_session_container_settings_to(
-            &database,
-            "session-1",
-            Some("6"),
-            Some("12g"),
-            std::slice::from_ref(&attached),
-            "2026-08-15T00:00:00Z",
-        )
-        .unwrap();
-
-        // The lifecycle writer still holds the record as it was before the
-        // container settings were edited.
-        stale.state = SessionState::Destroying;
-        stale.updated_at = "2026-08-15T00:01:00Z".into();
-        save_lifecycle_session_to(&database, &stale).unwrap();
-
-        let loaded = load_state_from(&database).unwrap();
-        let session = &loaded.sessions["session-1"];
-        assert_eq!(session.state, SessionState::Destroying);
-        assert_eq!(session.additional_mounts, vec![attached]);
-        assert_eq!(session.container_cpus.as_deref(), Some("6"));
-        assert_eq!(session.container_memory.as_deref(), Some("12g"));
-    }
-
-    #[test]
-    fn missing_target_marks_only_a_live_session_lost() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut live = session("session-1", "project-1");
-        live.state = SessionState::Running;
-        save_session_to(&database, &live).unwrap();
-
-        assert!(
-            mark_session_target_lost_to(
-                &database,
-                "session-1",
-                "managed container is missing",
-                "2026-08-25T16:00:00Z",
-            )
-            .unwrap()
-        );
-        let loaded = load_state_from(&database).unwrap();
-        let lost = &loaded.sessions["session-1"];
-        assert_eq!(lost.state, SessionState::Lost);
-        assert_eq!(
-            lost.last_error.as_deref(),
-            Some("managed container is missing")
-        );
-
-        assert!(
-            !mark_session_target_lost_to(
-                &database,
-                "session-1",
-                "late duplicate",
-                "2026-08-25T16:01:00Z",
-            )
-            .unwrap()
-        );
-        let loaded = load_state_from(&database).unwrap();
-        assert_eq!(
-            loaded.sessions["session-1"].last_error.as_deref(),
-            Some("managed container is missing")
-        );
-    }
-
-    #[test]
-    fn checkpointed_save_preserves_container_settings_and_mounts() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut stale = session("session-1", "project-1");
-        stale.additional_mounts.clear();
-        save_session_to(&database, &stale).unwrap();
-
-        let attached = AdditionalMount {
-            source: PathBuf::from("/host/models"),
-            destination: PathBuf::from("/mnt/models"),
-            read_only: true,
-        };
-        set_session_container_settings_to(
-            &database,
-            "session-1",
-            Some("6"),
-            Some("12g"),
-            std::slice::from_ref(&attached),
-            "2026-08-15T00:00:00Z",
-        )
-        .unwrap();
-
-        let verified = CheckpointMetadata {
-            archive_path: PathBuf::from("sessions/verified.hel.zip"),
-            sha256: "c".repeat(64),
-            created_at: "2026-08-15T00:02:00Z".into(),
-            event_frontier: 21,
-        };
-        stale.state = SessionState::Running;
-        stale.updated_at = "2026-08-15T00:02:00Z".into();
-        stale.native_session_id = Some("native-checkpointed".into());
-        stale.checkpoint = Some(verified.clone());
-        save_checkpointed_session_to(&database, &stale).unwrap();
-
-        let loaded = load_state_from(&database).unwrap();
-        let session = &loaded.sessions["session-1"];
-        assert_eq!(session.checkpoint.as_ref(), Some(&verified));
-        assert_eq!(
-            session.native_session_id.as_deref(),
-            Some("native-checkpointed")
-        );
-        assert_eq!(session.additional_mounts, vec![attached]);
-        assert_eq!(session.container_cpus.as_deref(), Some("6"));
-        assert_eq!(session.container_memory.as_deref(), Some("12g"));
-    }
-
-    #[test]
-    fn lifecycle_save_fails_for_unknown_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let missing = session("session-1", "project-1");
-
-        for error in [
-            save_lifecycle_session_to(&database, &missing).unwrap_err(),
-            save_checkpointed_session_to(&database, &missing).unwrap_err(),
-        ] {
-            assert!(
-                format!("{error:#}").contains("unknown session session-1"),
-                "{error:#}"
-            );
-        }
-
-        assert!(load_state_from(&database).unwrap().sessions.is_empty());
-    }
-
-    #[test]
-    fn destroying_session_round_trip_is_durable() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut record = session("session-1", "project-1");
-        record.state = SessionState::Destroying;
-
-        save_session_to(&database, &record).unwrap();
-
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"],
-            record
-        );
-    }
-
-    #[test]
-    fn interrupted_checkpoint_recovery_is_field_scoped_and_one_shot() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut checkpointing = session("session-1", "project-1");
-        checkpointing.state = SessionState::Checkpointing;
-        checkpointing.last_error = Some("preserve this diagnostic".into());
-        let mut closing = session("session-2", "project-2");
-        closing.state = SessionState::Closing;
-        save_session_to(&database, &checkpointing).unwrap();
-        save_session_to(&database, &closing).unwrap();
-
-        assert_eq!(
-            recover_interrupted_checkpointing_sessions_to(&database, "2026-08-14T12:00:00Z")
-                .unwrap(),
-            1
-        );
-
-        let recovered = load_state_from(&database).unwrap();
-        let session = &recovered.sessions["session-1"];
-        assert_eq!(session.state, SessionState::Running);
-        assert_eq!(session.updated_at, "2026-08-14T12:00:00Z");
-        assert_eq!(
-            session.last_error.as_deref(),
-            Some("preserve this diagnostic")
-        );
-        assert_eq!(session.target, checkpointing.target);
-        assert_eq!(session.checkpoint, checkpointing.checkpoint);
-        assert!(
-            session
-                .last_checkpoint_error
-                .as_deref()
-                .is_some_and(|error| error.contains("controller restart"))
-        );
-        assert_eq!(recovered.sessions["session-2"], closing);
-        assert_eq!(
-            recover_interrupted_checkpointing_sessions_to(&database, "2026-08-14T12:01:00Z")
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn display_updates_cannot_restore_a_stale_checkpoint() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut stale = session("session-1", "project-1");
-        stale.state = SessionState::Error;
-        stale.last_error = Some("worker bootstrap failed: upload failed".into());
-        save_session_to(&database, &stale).unwrap();
-        let recovered = CheckpointMetadata {
-            archive_path: PathBuf::from("sessions/recovered.hel.zip"),
-            sha256: "b".repeat(64),
-            created_at: "2026-08-14T12:00:00Z".into(),
-            event_frontier: 42,
-        };
-        record_recovery_success_to(&database, "session-1", "native-recovered", &recovered).unwrap();
-
-        set_session_title_override_to(
-            &database,
-            "session-1",
-            "Renamed safely",
-            "2026-08-14T12:01:00Z",
-        )
-        .unwrap();
-        set_session_acp_title_to(&database, "session-1", Some("Harness title")).unwrap();
-
-        let loaded = load_state_from(&database).unwrap();
-        let session = &loaded.sessions["session-1"];
-        assert_eq!(session.checkpoint.as_ref(), Some(&recovered));
-        assert_eq!(
-            session.native_session_id.as_deref(),
-            Some("native-recovered")
-        );
-        assert_eq!(
-            session.session_title_override.as_deref(),
-            Some("Renamed safely")
-        );
-        assert_eq!(session.acp_session_title.as_deref(), Some("Harness title"));
-        assert_eq!(session.state, SessionState::Error);
-        assert_eq!(
-            session.last_error.as_deref(),
-            Some("worker bootstrap failed: upload failed")
-        );
-
-        set_session_acp_title_to(&database, "session-1", None).unwrap();
-        assert!(
-            load_state_from(&database).unwrap().sessions["session-1"]
-                .acp_session_title
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn lifecycle_write_preserves_independently_owned_session_fields() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut stale = session("session-1", "project-1");
-        stale.native_session_id = Some("native-old".into());
-        stale.acp_session_title = Some("Old harness title".into());
-        stale.session_title_override = Some("Old user title".into());
-        stale.checkpoint = Some(CheckpointMetadata {
-            archive_path: PathBuf::from("sessions/old.hel.zip"),
-            sha256: "a".repeat(64),
-            created_at: "2026-08-14T11:00:00Z".into(),
-            event_frontier: 10,
-        });
-        save_session_to(&database, &stale).unwrap();
-        let recovered = CheckpointMetadata {
-            archive_path: PathBuf::from("sessions/recovered.hel.zip"),
-            sha256: "b".repeat(64),
-            created_at: "2026-08-14T12:00:00Z".into(),
-            event_frontier: 42,
-        };
-        record_recovery_success_to(&database, "session-1", "native-recovered", &recovered).unwrap();
-        set_session_title_override_to(
-            &database,
-            "session-1",
-            "Current user title",
-            "2026-08-14T12:01:00Z",
-        )
-        .unwrap();
-        set_session_acp_title_to(&database, "session-1", Some("Current harness title")).unwrap();
-
-        stale.state = SessionState::Destroying;
-        save_lifecycle_session_to(&database, &stale).unwrap();
-
-        let loaded = load_state_from(&database).unwrap();
-        let session = &loaded.sessions["session-1"];
-        assert_eq!(session.state, SessionState::Destroying);
-        assert_eq!(
-            session.native_session_id.as_deref(),
-            Some("native-recovered")
-        );
-        assert_eq!(session.checkpoint.as_ref(), Some(&recovered));
-        assert_eq!(
-            session.session_title_override.as_deref(),
-            Some("Current user title")
-        );
-        assert_eq!(
-            session.acp_session_title.as_deref(),
-            Some("Current harness title")
-        );
-    }
-
-    #[test]
-    fn version_four_database_migrates_existing_targets_and_accepts_local_bare() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY CHECK(version > 0),
-                     applied_at TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE session_contexts (
-                     session_id TEXT PRIMARY KEY,
-                     bundle_id TEXT NOT NULL,
-                     created_at TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE sessions (
-                     session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-                     title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-                     harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi')),
-                     last_profile TEXT NOT NULL,
-                     target_template_id TEXT NOT NULL,
-                     state TEXT NOT NULL CHECK(state IN (
-                         'provisioning','running','disconnected','checkpointing','closing',
-                         'archived','lost','error','destroyed-with-data-loss'
-                     )),
-                     native_session_id TEXT,
-                     acp_session_title TEXT,
-                     session_title_override TEXT,
-                     updated_at TEXT NOT NULL,
-                     last_viewed_event_sequence INTEGER NOT NULL DEFAULT 0,
-                     last_error TEXT,
-                     resource_allocation TEXT,
-                     last_checkpoint_error TEXT,
-                     project_directory BLOB
-                 ) STRICT;
-                 CREATE TABLE session_mounts (
-                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-                     source BLOB NOT NULL,
-                     destination BLOB NOT NULL,
-                     PRIMARY KEY(session_id, ordinal),
-                     UNIQUE(session_id, destination)
-                 ) STRICT;
-                 CREATE TABLE session_checkpoints (
-                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     archive_path BLOB NOT NULL,
-                     sha256 TEXT NOT NULL,
-                     created_at TEXT NOT NULL,
-                     event_sequence INTEGER NOT NULL CHECK(event_sequence >= 0)
-                 ) STRICT;
-                 CREATE TABLE prompt_history (
-                     history_id INTEGER PRIMARY KEY,
-                     session_id TEXT NOT NULL REFERENCES session_contexts(session_id),
-                     event_sequence INTEGER NOT NULL CHECK(event_sequence >= 0),
-                     submitted_at TEXT NOT NULL,
-                     text TEXT NOT NULL CHECK(length(trim(text)) > 0),
-                     UNIQUE(session_id, event_sequence)
-                 ) STRICT;
-                 CREATE TABLE session_targets (
-                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     kind TEXT NOT NULL CHECK(kind IN ('local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
-                     host TEXT,
-                     resource_id TEXT,
-                     address TEXT,
-                     workspace BLOB,
-                     worker_id TEXT
-                 ) STRICT;
-                 INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'now'), (2, 'now'), (3, 'now'), (4, 'now');
-                 INSERT INTO session_contexts VALUES ('old-session', 'project-1', 'now');
-                 INSERT INTO sessions(
-                     session_id, title, harness_kind, last_profile, target_template_id,
-                     state, updated_at
-                 ) VALUES (
-                     'old-session', 'old session', 'codex', 'codex', 'local',
-                     'running', 'now'
-                 );
-                 INSERT INTO session_targets(session_id, kind, resource_id)
-                     VALUES ('old-session', 'local-podman', 'container-1');
-                 PRAGMA user_version = 4;",
-            )
-            .unwrap();
-        drop(connection);
-
-        let connection = open(&database).unwrap();
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        assert!(
-            connection
-                .query_row(
-                    "SELECT managed_worktree IS NULL FROM sessions WHERE session_id = 'old-session'",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT resource_id FROM session_targets WHERE session_id = 'old-session'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "container-1"
-        );
-        connection
-            .execute(
-                "DELETE FROM session_targets WHERE session_id = 'old-session'",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO session_targets(session_id, kind, workspace)
-                 VALUES ('old-session', 'local-bare', ?1)",
-                [path_to_blob(Path::new("/var/lib/hel/workers/old-session"))],
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn version_five_database_establishes_new_receipt_and_seeds_projection() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY CHECK(version > 0),
-                     applied_at TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE session_contexts (
-                     session_id TEXT PRIMARY KEY,
-                     bundle_id TEXT NOT NULL,
-                     created_at TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE sessions (
-                     session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-                     title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-                     harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi')),
-                     last_profile TEXT NOT NULL,
-                     target_template_id TEXT NOT NULL,
-                     state TEXT NOT NULL CHECK(state IN (
-                         'provisioning','running','disconnected','checkpointing','closing',
-                         'archived','lost','error','destroyed-with-data-loss'
-                     )),
-                     native_session_id TEXT,
-                     acp_session_title TEXT,
-                     session_title_override TEXT,
-                     updated_at TEXT NOT NULL,
-                     last_viewed_event_sequence INTEGER NOT NULL DEFAULT 0,
-                     last_error TEXT,
-                     resource_allocation TEXT,
-                     last_checkpoint_error TEXT,
-                     project_directory BLOB
-                 ) STRICT;
-                 CREATE TABLE session_mounts (
-                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-                     source BLOB NOT NULL,
-                     destination BLOB NOT NULL,
-                     PRIMARY KEY(session_id, ordinal),
-                     UNIQUE(session_id, destination)
-                 ) STRICT;
-                 CREATE TABLE session_checkpoints (
-                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     archive_path BLOB NOT NULL,
-                     sha256 TEXT NOT NULL,
-                     created_at TEXT NOT NULL,
-                     event_sequence INTEGER NOT NULL CHECK(event_sequence >= 0)
-                 ) STRICT;
-                 CREATE TABLE prompt_history (
-                     history_id INTEGER PRIMARY KEY,
-                     session_id TEXT NOT NULL REFERENCES session_contexts(session_id),
-                     event_sequence INTEGER NOT NULL CHECK(event_sequence >= 0),
-                     submitted_at TEXT NOT NULL,
-                     text TEXT NOT NULL CHECK(length(trim(text)) > 0),
-                     UNIQUE(session_id, event_sequence)
-                 ) STRICT;
-                 INSERT INTO schema_migrations(version, applied_at)
-                     VALUES (1, 'now'), (2, 'now'), (3, 'now'), (4, 'now'), (5, 'now');
-                 INSERT INTO session_contexts VALUES ('session-1', 'project-1', 'now');
-                 INSERT INTO sessions(
-                     session_id, title, harness_kind, last_profile, target_template_id,
-                     state, updated_at, last_viewed_event_sequence
-                 ) VALUES (
-                     'session-1', 'old session', 'codex', 'codex', 'local',
-                     'running', 'now', 41
-                 );
-                 INSERT INTO prompt_history(session_id, event_sequence, submitted_at, text)
-                     VALUES ('session-1', 9, 'now', 'remember the ordinal');
-                 PRAGMA user_version = 5;",
-            )
-            .unwrap();
-        drop(connection);
-
-        let connection = open(&database).unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT viewed_through_event_ordinal FROM sessions WHERE session_id = 'session-1'",
-                    [],
-                    |row| row.get::<_, u64>(0),
-                )
-                .unwrap(),
-            0
-        );
-        assert!(
-            connection
-                .query_row(
-                    "SELECT managed_worktree IS NULL FROM sessions WHERE session_id = 'session-1'",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT applied_event_ordinal FROM materialized_sessions WHERE session_id = 'session-1'",
-                    [],
-                    |row| row.get::<_, u64>(0),
-                )
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT text FROM prompt_history
-                     WHERE session_id = 'session-1' AND event_ordinal = 9",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "remember the ordinal"
-        );
-        connection
-            .execute(
-                "UPDATE sessions SET state = 'destroying' WHERE session_id = 'session-1'",
-                [],
-            )
-            .unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT applied_event_digest FROM materialized_sessions
-                     WHERE session_id = 'session-1'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            RELAY_EVENT_GENESIS_DIGEST
-        );
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM pragma_table_info('materialized_sessions')
-                     WHERE name = 'last_activity_at_ms'",
-                    [],
-                    |row| row.get::<_, u64>(0),
-                )
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM pragma_table_info('materialized_transcript_items')
-                     WHERE name = 'latest_content_event_ordinal'",
-                    [],
-                    |row| row.get::<_, u64>(0),
-                )
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn version_seven_database_runs_the_queue_kind_and_grok_harness_migrations() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(&format!(
-                "PRAGMA foreign_keys = ON;
-                 CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY CHECK(version > 0),
-                     applied_at TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE session_contexts (
-                     session_id TEXT PRIMARY KEY,
-                     bundle_id TEXT NOT NULL,
-                     created_at TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE sessions (
-                     session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-                     title TEXT NOT NULL CHECK(length(trim(title)) > 0),
-                     harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi')),
-                     last_profile TEXT NOT NULL,
-                     target_template_id TEXT NOT NULL,
-                     state TEXT NOT NULL CHECK(state IN (
-                         'provisioning','running','disconnected','checkpointing','closing','destroying',
-                         'archived','lost','error','destroyed-with-data-loss'
-                     )),
-                     native_session_id TEXT,
-                     acp_session_title TEXT,
-                     session_title_override TEXT,
-                     updated_at TEXT NOT NULL,
-                     detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
-                         CHECK(detached_after_event_ordinal >= 0),
-                     last_error TEXT,
-                     resource_allocation TEXT,
-                     last_checkpoint_error TEXT,
-                     project_directory BLOB,
-                     managed_worktree TEXT
-                 ) STRICT;
-                 CREATE TABLE session_targets (
-                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     kind TEXT NOT NULL CHECK(kind IN ('local-bare','local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
-                     host TEXT,
-                     resource_id TEXT,
-                     address TEXT,
-                     workspace BLOB,
-                     worker_id TEXT
-                 ) STRICT;
-                 CREATE TABLE session_mounts (
-                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-                     source BLOB NOT NULL,
-                     destination BLOB NOT NULL,
-                     PRIMARY KEY(session_id, ordinal),
-                     UNIQUE(session_id, destination)
-                 ) STRICT;
-                 CREATE TABLE session_checkpoints (
-                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     archive_path BLOB NOT NULL,
-                     sha256 TEXT NOT NULL,
-                     created_at TEXT NOT NULL,
-                     event_frontier INTEGER NOT NULL CHECK(event_frontier >= 0)
-                 ) STRICT;
-                 CREATE TABLE prompt_history (
-                     history_id INTEGER PRIMARY KEY,
-                     session_id TEXT NOT NULL REFERENCES session_contexts(session_id),
-                     event_ordinal INTEGER NOT NULL CHECK(event_ordinal >= 0),
-                     submitted_at TEXT NOT NULL,
-                     text TEXT NOT NULL CHECK(length(trim(text)) > 0),
-                     UNIQUE(session_id, event_ordinal)
-                 ) STRICT;
-                 CREATE TABLE materialized_sessions (
-                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     applied_event_ordinal INTEGER NOT NULL DEFAULT 0
-                         CHECK(applied_event_ordinal >= 0),
-                     applied_event_digest TEXT NOT NULL
-                         DEFAULT '{RELAY_EVENT_GENESIS_DIGEST}'
-                         CHECK(length(applied_event_digest) = 64
-                               AND applied_event_digest NOT GLOB '*[^0-9a-f]*'),
-                     last_activity_at_ms INTEGER,
-                     execution_state TEXT NOT NULL DEFAULT 'idle'
-                         CHECK(execution_state IN ('idle','running','closing','closed')),
-                     running_started_at_ms INTEGER,
-                     session_title TEXT,
-                     configuration_json TEXT NOT NULL DEFAULT '{{}}'
-                 ) STRICT;
-                 CREATE TABLE materialized_transcript_items (
-                     session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
-                     stable_id TEXT NOT NULL,
-                     position INTEGER NOT NULL CHECK(position > 0),
-                     latest_content_event_ordinal INTEGER,
-                     created_at_ms INTEGER NOT NULL,
-                     last_changed_at_ms INTEGER NOT NULL,
-                     body_json TEXT NOT NULL,
-                     PRIMARY KEY(session_id, stable_id)
-                 ) STRICT;
-                 CREATE TABLE materialized_queued_prompts (
-                     session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
-                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-                     command_id TEXT NOT NULL,
-                     content_json TEXT NOT NULL,
-                     queued_at_ms INTEGER NOT NULL,
-                     PRIMARY KEY(session_id, ordinal),
-                     UNIQUE(session_id, command_id)
-                 ) STRICT;
-                 INSERT INTO schema_migrations(version, applied_at)
-                     VALUES (1, 'now'), (2, 'now'), (3, 'now'), (4, 'now'), (5, 'now'),
-                            (6, 'now'), (7, 'now');
-                 INSERT INTO session_contexts VALUES ('session-1', 'project-1', 'now');
-                 INSERT INTO sessions(
-                     session_id, title, harness_kind, last_profile, target_template_id,
-                     state, updated_at, detached_after_event_ordinal, last_error
-                 ) VALUES (
-                     'session-1', 'old session', 'kimi', 'kimi-1', 'raw-localhost',
-                     'running', 'now', 12, 'nothing yet'
-                 );
-                 INSERT INTO session_contexts VALUES ('session-2', 'project-1', 'now');
-                 INSERT INTO sessions(
-                     session_id, title, harness_kind, last_profile, target_template_id,
-                     state, updated_at, detached_after_event_ordinal
-                 ) VALUES (
-                     'session-2', 'stopped session', 'kimi', 'kimi-1', 'podman',
-                     'archived', 'now', 0
-                 );
-                 INSERT INTO materialized_sessions(session_id) VALUES ('session-2');
-                 INSERT INTO session_targets(session_id, kind, resource_id)
-                     VALUES ('session-1', 'local-podman', 'container-1');
-                 INSERT INTO materialized_sessions(session_id) VALUES ('session-1');
-                 INSERT INTO materialized_queued_prompts(
-                     session_id, ordinal, command_id, content_json, queued_at_ms
-                 ) VALUES ('session-1', 0, 'queued-1', '[]', 1600);
-                 PRAGMA user_version = 7;",
-            ))
-            .unwrap();
-        drop(connection);
-
-        let connection = open(&database).unwrap();
-
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT target_template_id FROM sessions WHERE session_id = 'session-1'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "localhost"
-        );
-        // Version 8 gave queue entries a kind. A row written before it is a
-        // prompt.
-        assert!(table_has_column(&connection, "materialized_queued_prompts", "kind_json").unwrap());
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT kind_json FROM materialized_queued_prompts
-                     WHERE command_id = 'queued-1'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "\"prompt\""
-        );
-        // Version 9 rebuilt `sessions`; the existing row survives with every
-        // column intact.
-        let (title, harness, ordinal, error, draft): (String, String, u64, String, String) =
-            connection
-                .query_row(
-                    "SELECT title, harness_kind, viewed_through_event_ordinal, last_error,
-                            draft_input
-                     FROM sessions WHERE session_id = 'session-1'",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .unwrap();
-        assert_eq!(
-            (
-                title.as_str(),
-                harness.as_str(),
-                ordinal,
-                error.as_str(),
-                draft.as_str()
-            ),
-            ("old session", "kimi", 12, "nothing yet", "")
-        );
-        // Children still resolve through the replacement table.
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT resource_id FROM session_targets WHERE session_id = 'session-1'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "container-1"
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM materialized_sessions WHERE session_id = 'session-1'",
-                    [],
-                    |row| row.get::<_, u64>(0),
-                )
-                .unwrap(),
-            1
-        );
-
-        connection
-            .execute_batch(
-                "INSERT INTO session_contexts VALUES ('session-3', 'project-1', 'now');
-                 INSERT INTO sessions(
-                     session_id, title, harness_kind, last_profile, target_template_id,
-                     state, updated_at
-                 ) VALUES (
-                     'session-3', 'grok session', 'grok', 'grok-1', 'podman',
-                     'running', 'now'
-                 );",
-            )
-            .expect("a migrated database must accept a Grok Build session");
-
-        connection
-            .execute_batch(
-                "INSERT INTO session_contexts VALUES ('session-4', 'project-1', 'now');
-                 INSERT INTO sessions(
-                     session_id, title, harness_kind, last_profile, target_template_id,
-                     state, updated_at
-                 ) VALUES (
-                     'session-4', 'deepseek session', 'deepseek', 'deepseek-1', 'podman',
-                     'running', 'now'
-                 );",
-            )
-            .expect("a migrated database must accept a DeepSeek Harness session");
-
-        // Version 10 renamed the `archived` lifecycle state to `stopped` and
-        // gave sessions a display-only archived flag, defaulted off.
-        let (state, archived): (String, bool) = connection
-            .query_row(
-                "SELECT state, archived FROM sessions WHERE session_id = 'session-2'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "stopped");
-        assert!(!archived);
-        connection
-            .execute(
-                "UPDATE sessions SET state = 'archived' WHERE session_id = 'session-2'",
-                [],
-            )
-            .expect_err("the retired state name is no longer accepted");
-
-        // The hidden set for native sessions lives in Hel's own database.
-        connection
-            .execute_batch(
-                "INSERT INTO hidden_native_sessions(harness_kind, native_session_id, hidden_at)
-                     VALUES ('codex', 'native-1', 'now');",
-            )
-            .expect("a migrated database holds the native hidden set");
-    }
-
-    /// Archiving is a display choice with its own writer: it must not disturb
-    /// the lifecycle state, checkpoint, or titles other writers own.
-    #[test]
-    fn the_archived_flag_round_trips_without_touching_other_session_fields() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut session = session("session-1", "project-1");
-        save_session_to(&database, &session).unwrap();
-        assert!(!load_state_from(&database).unwrap().sessions["session-1"].archived);
-
-        set_session_archived_to(&database, "session-1", true).unwrap();
-        let reloaded = load_state_from(&database).unwrap().sessions["session-1"].clone();
-        assert!(reloaded.archived);
-        session.archived = true;
-        assert_eq!(reloaded.state, session.state);
-        assert_eq!(reloaded.checkpoint, session.checkpoint);
-        assert_eq!(reloaded.acp_session_title, session.acp_session_title);
-
-        set_session_archived_to(&database, "session-1", false).unwrap();
-        assert!(!load_state_from(&database).unwrap().sessions["session-1"].archived);
-        assert!(set_session_archived_to(&database, "missing", true).is_err());
-    }
-
-    /// Hel never writes a harness home, so the hidden set for native sessions
-    /// is Hel's own state and is keyed per harness.
-    #[test]
-    fn the_native_hidden_set_is_keyed_by_harness_and_is_idempotent() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        assert!(hidden_native_sessions_from(&database).unwrap().is_empty());
-
-        set_native_session_hidden_to(&database, HarnessKind::Codex, "native-1", true).unwrap();
-        set_native_session_hidden_to(&database, HarnessKind::Codex, "native-1", true).unwrap();
-        set_native_session_hidden_to(&database, HarnessKind::Claude, "native-1", true).unwrap();
-        assert_eq!(
-            hidden_native_sessions_from(&database).unwrap(),
-            BTreeSet::from([
-                (HarnessKind::Claude, "native-1".to_owned()),
-                (HarnessKind::Codex, "native-1".to_owned()),
-            ])
-        );
-
-        set_native_session_hidden_to(&database, HarnessKind::Codex, "native-1", false).unwrap();
-        assert_eq!(
-            hidden_native_sessions_from(&database).unwrap(),
-            BTreeSet::from([(HarnessKind::Claude, "native-1".to_owned())])
-        );
-        // Revealing something that was never hidden is not an error.
-        set_native_session_hidden_to(&database, HarnessKind::Grok, "native-9", false).unwrap();
-        assert!(set_native_session_hidden_to(&database, HarnessKind::Grok, "  ", true).is_err());
-    }
-
-    #[test]
-    fn a_fresh_database_accepts_a_session_for_every_harness_kind() {
-        let directory = tempfile::tempdir().unwrap();
-        let connection = open(&directory.path().join("hel.sqlite3")).unwrap();
-
-        for (index, kind) in HarnessKind::ALL.into_iter().enumerate() {
-            let session_id = format!("session-{index}");
-            connection
-                .execute(
-                    "INSERT INTO session_contexts VALUES (?1, 'project-1', 'now')",
-                    params![session_id],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO sessions(
-                         session_id, title, harness_kind, last_profile, target_template_id,
-                         state, updated_at
-                     ) VALUES (?1, ?2, ?3, 'profile-1', 'podman', 'running', 'now')",
-                    params![session_id, format!("{kind:?} session"), kind.id()],
-                )
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "the sessions harness_kind CHECK must admit {:?} ({:?}): {error}",
-                        kind,
-                        kind.id()
-                    )
-                });
-        }
-
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM sessions", [], |row| row
-                    .get::<_, usize>(0))
-                .unwrap(),
-            HarnessKind::ALL.len()
-        );
-    }
-
-    #[test]
-    fn master_version_six_database_converges_to_the_relay_schema() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY CHECK(version > 0),
-                     applied_at TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE session_contexts (
-                     session_id TEXT PRIMARY KEY,
-                     bundle_id TEXT NOT NULL,
-                     created_at TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE sessions (
-                     session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
-                     title TEXT,
-                     harness_kind TEXT,
-                     last_profile TEXT,
-                     target_template_id TEXT,
-                     state TEXT,
-                     native_session_id TEXT,
-                     acp_session_title TEXT,
-                     session_title_override TEXT,
-                     updated_at TEXT,
-                     last_viewed_event_sequence INTEGER NOT NULL DEFAULT 0,
-                     last_error TEXT,
-                     resource_allocation TEXT,
-                     last_checkpoint_error TEXT,
-                     project_directory BLOB,
-                     managed_worktree TEXT
-                 ) STRICT;
-                 CREATE TABLE session_mounts (
-                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-                     source BLOB NOT NULL,
-                     destination BLOB NOT NULL,
-                     PRIMARY KEY(session_id, ordinal),
-                     UNIQUE(session_id, destination)
-                 ) STRICT;
-                 CREATE TABLE session_checkpoints (
-                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                     archive_path BLOB,
-                     sha256 TEXT,
-                     created_at TEXT,
-                     event_sequence INTEGER NOT NULL DEFAULT 0
-                 ) STRICT;
-                 CREATE TABLE prompt_history (
-                     history_id INTEGER PRIMARY KEY,
-                     session_id TEXT REFERENCES session_contexts(session_id),
-                     event_sequence INTEGER NOT NULL DEFAULT 0,
-                     submitted_at TEXT,
-                     text TEXT
-                 ) STRICT;
-                 INSERT INTO schema_migrations(version, applied_at)
-                     VALUES (1, 'now'), (2, 'now'), (3, 'now'), (4, 'now'), (5, 'now'), (6, 'now');
-                 PRAGMA user_version = 6;",
-            )
-            .unwrap();
-        drop(connection);
-
-        let connection = open(&database).unwrap();
-
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        for (table, column) in [
-            ("sessions", "viewed_through_event_ordinal"),
-            ("sessions", "managed_worktree"),
-            ("session_checkpoints", "event_frontier"),
-            ("prompt_history", "event_ordinal"),
-            ("materialized_sessions", "applied_event_digest"),
-            ("materialized_sessions", "pending_elicitations_json"),
-            ("materialized_queued_prompts", "kind_json"),
-        ] {
-            assert!(table_has_column(&connection, table, column).unwrap());
-        }
-    }
-
-    #[test]
-    fn queue_entry_kinds_round_trip_and_default_to_prompt() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        let mut materialized = materialized_session("session-1");
-        materialized.queued_prompts.push(MaterializedQueuedPrompt {
-            command_id: "config-1".into(),
-            kind: QueuedCommandKind::SetConfig {
-                key: "model".into(),
-                value: "sonnet".into(),
-            },
-            content: vec![serde_json::json!({"type": "text", "text": "/model sonnet"})],
-            queued_at_ms: 1_600,
-        });
-        save_materialized_session_to(&database, &materialized).unwrap();
-
-        let loaded = load_materialized_session_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.queued_prompts, materialized.queued_prompts);
-        assert_eq!(
-            load_materialized_queued_prompts_from(&database).unwrap()["session-1"],
-            materialized.queued_prompts
-        );
-
-        // Rows written before queue entries carried a kind load as prompts.
-        let connection = open(&database).unwrap();
-        connection
-            .execute(
-                "INSERT INTO materialized_queued_prompts(
-                     session_id, ordinal, command_id, content_json, queued_at_ms
-                 ) VALUES ('session-1', 9, 'legacy-1', ?1, 1700)",
-                params![serde_json::json!([{"type": "text", "text": "older"}]).to_string()],
-            )
-            .unwrap();
-        drop(connection);
-
-        let loaded = load_materialized_session_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.queued_prompts.last().unwrap().command_id, "legacy-1");
-        assert_eq!(
-            loaded.queued_prompts.last().unwrap().kind,
-            QueuedCommandKind::Prompt
-        );
-    }
-
-    #[test]
-    fn materialized_session_round_trip_preserves_typed_projection() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        let materialized = materialized_session("session-1");
-
-        save_materialized_session_to(&database, &materialized).unwrap();
-
-        let loaded = load_materialized_session_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded, materialized);
-        assert_eq!(loaded.last_activity_at_ms(), Some(1_500));
-    }
-
-    #[test]
-    fn materialized_summary_loads_messages_without_deserializing_full_history() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        let mut materialized = materialized_session("session-1");
-        materialized.transcript.extend([
-            Arc::new(TranscriptItem {
-                stable_id: "user:5".into(),
-                position: 5,
-                latest_content_event_ordinal: None,
-                created_at_ms: 1_600,
-                last_changed_at_ms: 1_600,
-                body: TranscriptBody::User {
-                    content: vec![serde_json::json!({"type": "text", "text": "ship it"})],
-                },
-            }),
-            Arc::new(TranscriptItem {
-                stable_id: "agent:6".into(),
-                position: 6,
-                latest_content_event_ordinal: Some(7),
-                created_at_ms: 1_700,
-                last_changed_at_ms: 1_700,
-                body: TranscriptBody::Agent {
-                    chunks: vec![serde_json::json!({
-                        "content": {"type": "text", "text": "Finished"}
-                    })],
-                    streaming: false,
-                },
-            }),
-            Arc::new(TranscriptItem {
-                stable_id: "user:7".into(),
-                position: 7,
-                latest_content_event_ordinal: None,
-                created_at_ms: 1_800,
-                last_changed_at_ms: 1_800,
-                body: TranscriptBody::User {
-                    content: vec![serde_json::json!({
-                        "type": "text",
-                        "text": "one more thing"
-                    })],
-                },
-            }),
-        ]);
-        save_materialized_session_to(&database, &materialized).unwrap();
-
-        // A large or damaged tool result must not be read just to build the
-        // dashboard's two message snippets.
-        open(&database)
-            .unwrap()
-            .execute(
-                "UPDATE materialized_transcript_items
-                 SET body_json = 'not-json' WHERE stable_id = 'tool:call-1'",
-                [],
-            )
-            .unwrap();
-
-        let summary = load_materialized_session_summary_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary.last_user_message.as_deref(), Some("one more thing"));
-        assert_eq!(summary.last_agent_message.as_deref(), Some("Finished"));
-        assert!(!summary.last_agent_message_follows_last_user);
-        assert_eq!(summary.agent_message_latest_content_ordinals, vec![2, 7]);
-        assert_eq!(summary.execution, materialized.execution);
-        assert!(load_materialized_session_from(&database, "session-1").is_err());
-    }
-
-    #[test]
-    fn queued_prompt_loader_does_not_deserialize_transcript_history() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        let materialized = materialized_session("session-1");
-        let expected = materialized.queued_prompts.clone();
-        save_materialized_session_to(&database, &materialized).unwrap();
-        let connection = open(&database).unwrap();
-        connection
-            .execute(
-                "UPDATE materialized_transcript_items SET body_json = 'not-json'",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
-        let queues = load_materialized_queued_prompts_from(&database).unwrap();
-
-        assert_eq!(queues.get("session-1"), Some(&expected));
-        assert!(load_materialized_session_from(&database, "session-1").is_err());
-    }
-
-    /// Resume compares frontiers to decide whether to rebuild a projection,
-    /// and clears the queue without touching the transcript when it does not.
-    #[test]
-    fn a_queue_replacement_keeps_the_projection_frontier_and_transcript() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        let materialized = materialized_session("session-1");
-        assert!(!materialized.queued_prompts.is_empty());
-        save_materialized_session_to(&database, &materialized).unwrap();
-
-        assert_eq!(
-            materialized_event_frontier_from(&database, "session-1").unwrap(),
-            Some((materialized.applied_event_ordinal, event_digest(7)))
-        );
-        assert_eq!(
-            materialized_event_frontier_from(&database, "unknown").unwrap(),
-            None
-        );
-
-        replace_materialized_queued_prompts_in(&database, "session-1", &[]).unwrap();
-
-        let cleared = load_materialized_session_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert!(cleared.queued_prompts.is_empty());
-        assert_eq!(cleared.transcript, materialized.transcript);
-        assert_eq!(
-            cleared.applied_event_ordinal,
-            materialized.applied_event_ordinal
-        );
-        assert_eq!(
-            cleared.applied_event_digest,
-            materialized.applied_event_digest
-        );
-
-        replace_materialized_queued_prompts_in(
-            &database,
-            "session-1",
-            &materialized.queued_prompts,
-        )
-        .unwrap();
-        assert_eq!(
-            load_materialized_session_from(&database, "session-1").unwrap(),
-            Some(materialized)
-        );
-    }
-
-    #[test]
-    fn operational_session_updates_do_not_delete_its_projection() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut operational = session("session-1", "project-1");
-        save_session_to(&database, &operational).unwrap();
-        let materialized = materialized_session("session-1");
-        save_materialized_session_to(&database, &materialized).unwrap();
-
-        operational.session_title_override = Some("renamed".into());
-        save_session_to(&database, &operational).unwrap();
-
-        assert_eq!(
-            load_materialized_session_from(&database, "session-1").unwrap(),
-            Some(materialized)
-        );
-    }
-
-    #[test]
-    fn projection_event_application_is_atomic_ordered_and_idempotent() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        let first_item = TranscriptItem {
-            stable_id: "agent:1".into(),
-            position: 1,
-            latest_content_event_ordinal: Some(1),
-            created_at_ms: 100,
-            last_changed_at_ms: 100,
-            body: TranscriptBody::Agent {
-                chunks: vec![serde_json::json!({
-                    "content": {"type": "text", "text": "hel"}
-                })],
-                streaming: true,
-            },
-        };
-        let first = MaterializedSessionMutation {
-            last_activity_at_ms: Some(105),
-            execution: Some(MaterializedExecutionState::Running { started_at_ms: 90 }),
-            session_title: Some(Some("Testing".into())),
-            configuration: Some(BTreeMap::from([("model".into(), serde_json::json!("sol"))])),
-            transcript: vec![TranscriptMutation::Upsert(first_item.clone())],
-            queued_prompts: Some(vec![MaterializedQueuedPrompt {
-                command_id: "prompt-2".into(),
-                kind: QueuedCommandKind::Prompt,
-                content: vec![serde_json::json!({"type": "text", "text": "next"})],
-                queued_at_ms: 105,
-            }]),
-            pending_elicitations: None,
-        };
-        let first_digest = event_digest(1);
-        let second_digest = event_digest(2);
-        let third_digest = event_digest(3);
-        assert_eq!(
-            apply_projection_event_to(
-                &database,
-                "session-1",
-                1,
-                RELAY_EVENT_GENESIS_DIGEST,
-                &first_digest,
-                &first,
-            )
-            .unwrap(),
-            ProjectionApplyOutcome::Applied
-        );
-
-        let destructive_duplicate = MaterializedSessionMutation {
-            transcript: vec![TranscriptMutation::Remove {
-                stable_id: first_item.stable_id.clone(),
-            }],
-            ..MaterializedSessionMutation::default()
-        };
-        assert_eq!(
-            apply_projection_event_to(
-                &database,
-                "session-1",
-                1,
-                RELAY_EVENT_GENESIS_DIGEST,
-                &first_digest,
-                &destructive_duplicate,
-            )
-            .unwrap(),
-            ProjectionApplyOutcome::AlreadyApplied
-        );
-        assert!(
-            apply_projection_event_to(
-                &database,
-                "session-1",
-                1,
-                RELAY_EVENT_GENESIS_DIGEST,
-                &event_digest(99),
-                &MaterializedSessionMutation::default(),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("digest mismatch")
-        );
-        assert!(
-            apply_projection_event_to(
-                &database,
-                "session-1",
-                3,
-                &first_digest,
-                &third_digest,
-                &MaterializedSessionMutation::default()
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("expected ordinal 2")
-        );
-        assert!(
-            apply_projection_event_to(
-                &database,
-                "session-1",
-                2,
-                &event_digest(99),
-                &second_digest,
-                &MaterializedSessionMutation::default(),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("chain diverged")
-        );
-
-        let updated_item = TranscriptItem {
-            latest_content_event_ordinal: Some(2),
-            last_changed_at_ms: 120,
-            body: TranscriptBody::Agent {
-                chunks: vec![serde_json::json!({
-                    "content": {"type": "text", "text": "hello"}
-                })],
-                streaming: false,
-            },
-            ..first_item.clone()
-        };
-        apply_projection_event_to(
-            &database,
-            "session-1",
-            2,
-            &first_digest,
-            &second_digest,
-            &MaterializedSessionMutation {
-                last_activity_at_ms: Some(120),
-                transcript: vec![TranscriptMutation::Upsert(updated_item.clone())],
-                ..MaterializedSessionMutation::default()
-            },
-        )
-        .unwrap();
-
-        let regressed_content_ordinal = TranscriptItem {
-            latest_content_event_ordinal: Some(1),
-            last_changed_at_ms: 130,
-            ..updated_item.clone()
-        };
-        assert!(
-            apply_projection_event_to(
-                &database,
-                "session-1",
-                3,
-                &second_digest,
-                &third_digest,
-                &MaterializedSessionMutation {
-                    last_activity_at_ms: Some(130),
-                    transcript: vec![TranscriptMutation::Upsert(regressed_content_ordinal)],
-                    ..MaterializedSessionMutation::default()
-                }
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("latest content ordinal backwards")
-        );
-
-        let invalid_identity = TranscriptItem {
-            position: 2,
-            ..updated_item
-        };
-        assert!(
-            apply_projection_event_to(
-                &database,
-                "session-1",
-                3,
-                &second_digest,
-                &third_digest,
-                &MaterializedSessionMutation {
-                    last_activity_at_ms: Some(130),
-                    transcript: vec![TranscriptMutation::Upsert(invalid_identity)],
-                    ..MaterializedSessionMutation::default()
-                }
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("immutable identity")
-        );
-        let loaded = load_materialized_session_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.applied_event_ordinal, 2);
-        assert_eq!(loaded.applied_event_digest, second_digest);
-        assert_eq!(loaded.last_activity_at_ms(), Some(120));
-        assert_eq!(loaded.transcript.len(), 1);
-        assert_eq!(loaded.transcript[0].latest_content_event_ordinal, Some(2));
-        assert_eq!(
-            loaded.transcript[0].body,
-            TranscriptBody::Agent {
-                chunks: vec![serde_json::json!({
-                    "content": {"type": "text", "text": "hello"}
-                })],
-                streaming: false,
-            }
-        );
-    }
-
-    #[test]
-    fn detach_receipt_is_monotonic_and_cannot_pass_projection() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut operational = session("session-1", "project-1");
-        operational.viewed_through_event_ordinal = 0;
-        save_session_to(&database, &operational).unwrap();
-        let mut previous_digest = RELAY_EVENT_GENESIS_DIGEST.to_owned();
-        for ordinal in 1..=2 {
-            let digest = event_digest(ordinal);
-            apply_projection_event_to(
-                &database,
-                "session-1",
-                ordinal,
-                &previous_digest,
-                &digest,
-                &MaterializedSessionMutation::default(),
-            )
-            .unwrap();
-            previous_digest = digest;
-        }
-
-        assert_eq!(
-            advance_viewed_through_event_ordinal_to(&database, "session-1", 2).unwrap(),
-            2
-        );
-        assert_eq!(
-            advance_viewed_through_event_ordinal_to(&database, "session-1", 1).unwrap(),
-            2
-        );
-        assert!(
-            advance_viewed_through_event_ordinal_to(&database, "session-1", 3)
-                .unwrap_err()
-                .to_string()
-                .contains("projection is at 2")
-        );
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].viewed_through_event_ordinal,
-            2
-        );
-    }
-
-    #[test]
-    fn session_draft_input_round_trips_and_an_empty_draft_clears_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].draft_input,
-            ""
-        );
-
-        set_session_draft_input_at(&database, "session-1", "half typed thought").unwrap();
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].draft_input,
-            "half typed thought"
-        );
-
-        // An ordinary session save must not roll the draft back.
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].draft_input,
-            "half typed thought"
-        );
-
-        set_session_draft_input_at(&database, "session-1", "").unwrap();
-        assert_eq!(
-            load_state_from(&database).unwrap().sessions["session-1"].draft_input,
-            ""
-        );
-
-        assert!(
-            set_session_draft_input_at(&database, "missing", "text")
-                .unwrap_err()
-                .to_string()
-                .contains("unknown session missing")
-        );
-    }
-
-    #[test]
-    fn projection_activity_watermark_is_atomic_and_monotonic() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        let first_digest = event_digest(1);
-        apply_projection_event_to(
-            &database,
-            "session-1",
-            1,
-            RELAY_EVENT_GENESIS_DIGEST,
-            &first_digest,
-            &MaterializedSessionMutation {
-                last_activity_at_ms: Some(500),
-                queued_prompts: Some(vec![MaterializedQueuedPrompt {
-                    command_id: "queued-1".into(),
-                    kind: QueuedCommandKind::Prompt,
-                    content: vec![serde_json::json!({"type": "text", "text": "later"})],
-                    queued_at_ms: 500,
-                }]),
-                ..MaterializedSessionMutation::default()
-            },
-        )
-        .unwrap();
-        apply_projection_event_to(
-            &database,
-            "session-1",
-            2,
-            &first_digest,
-            &event_digest(2),
-            &MaterializedSessionMutation {
-                last_activity_at_ms: Some(400),
-                queued_prompts: Some(Vec::new()),
-                ..MaterializedSessionMutation::default()
-            },
-        )
-        .unwrap();
-
-        let loaded = load_materialized_session_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert!(loaded.queued_prompts.is_empty());
-        assert_eq!(loaded.last_activity_at_ms(), Some(500));
-        assert_eq!(loaded.applied_event_ordinal, 2);
-    }
-
-    /// One agent message per relay event, shaped so the projection can store it.
-    fn agent_message_mutation(ordinal: u64) -> MaterializedSessionMutation {
-        MaterializedSessionMutation {
-            last_activity_at_ms: Some(1_000 + ordinal as i64),
-            transcript: vec![TranscriptMutation::Upsert(TranscriptItem {
-                stable_id: format!("item-{ordinal}"),
-                position: ordinal,
-                latest_content_event_ordinal: Some(ordinal),
-                created_at_ms: 1_000 + ordinal as i64,
-                last_changed_at_ms: 1_000 + ordinal as i64,
-                body: TranscriptBody::Agent {
-                    chunks: vec![serde_json::json!({
-                        "content": {"type": "text", "text": format!("event {ordinal}")}
-                    })],
-                    streaming: false,
-                },
-            })],
-            ..MaterializedSessionMutation::default()
-        }
-    }
-
-    #[test]
-    fn projection_page_advances_the_frontier_only_when_the_whole_page_commits() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-
-        // The second event breaks the chain only after the first has written
-        // its rows, so the page has to unwind work it already did.
-        let interrupted = apply_projection_page_to(&database, "session-1", |page| {
-            page.apply(
-                1,
-                RELAY_EVENT_GENESIS_DIGEST,
-                &event_digest(1),
-                &agent_message_mutation(1),
-            )?;
-            page.apply(
-                3,
-                &event_digest(1),
-                &event_digest(3),
-                &agent_message_mutation(3),
-            )
-        })
-        .unwrap_err();
-        assert!(
-            interrupted.to_string().contains("expected ordinal 2"),
-            "unexpected page failure: {interrupted:#}"
-        );
-
-        // The relay retains everything past the last acknowledgement, so an
-        // interrupted page must leave the durable frontier where it was.
-        let rolled_back = load_materialized_session_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(rolled_back.applied_event_ordinal, 0);
-        assert_eq!(rolled_back.applied_event_digest, RELAY_EVENT_GENESIS_DIGEST);
-        assert!(rolled_back.transcript.is_empty());
-        assert_eq!(rolled_back.last_activity_at_ms(), None);
-
-        apply_projection_page_to(&database, "session-1", |page| {
-            page.apply(
-                1,
-                RELAY_EVENT_GENESIS_DIGEST,
-                &event_digest(1),
-                &agent_message_mutation(1),
-            )?;
-            page.apply(
-                2,
-                &event_digest(1),
-                &event_digest(2),
-                &agent_message_mutation(2),
-            )
-        })
-        .unwrap();
-
-        let committed = load_materialized_session_from(&database, "session-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(committed.applied_event_ordinal, 2);
-        assert_eq!(committed.applied_event_digest, event_digest(2));
-        assert_eq!(
-            committed
-                .transcript
-                .iter()
-                .map(|item| item.stable_id.clone())
-                .collect::<Vec<_>>(),
-            vec!["item-1".to_owned(), "item-2".to_owned()]
-        );
-        assert_eq!(committed.last_activity_at_ms(), Some(1_002));
-    }
-
-    /// The process caches which databases it has migrated. A database that is
-    /// gone and recreated under the same path must still be migrated.
-    #[test]
-    fn reopening_a_recreated_database_migrates_it_again() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        for suffix in ["", "-wal", "-shm"] {
-            let sidecar = directory.path().join(format!("hel.sqlite3{suffix}"));
-            if sidecar.exists() {
-                fs::remove_file(&sidecar).unwrap();
-            }
-        }
-
-        save_session_to(&database, &session("session-2", "project-1")).unwrap();
-        let state = load_state_from(&database).unwrap();
-        assert!(state.sessions.contains_key("session-2"));
-        assert!(!state.sessions.contains_key("session-1"));
-    }
-
-    /// Catch-up throughput: one durable commit per page instead of one per
-    /// event. Ignored by default because it measures wall-clock time.
-    #[test]
-    #[ignore = "timing benchmark; run with --ignored --nocapture"]
-    fn projection_page_apply_outruns_per_event_apply() {
-        const EVENTS: u64 = 2_000;
-        let directory = tempfile::tempdir().unwrap();
-
-        let per_event_database = directory.path().join("per-event/hel.sqlite3");
-        save_session_to(&per_event_database, &session("session-1", "project-1")).unwrap();
-        let started = std::time::Instant::now();
-        for ordinal in 1..=EVENTS {
-            apply_projection_event_to(
-                &per_event_database,
-                "session-1",
-                ordinal,
-                &event_digest(ordinal - 1),
-                &event_digest(ordinal),
-                &agent_message_mutation(ordinal),
-            )
-            .unwrap();
-        }
-        let per_event = started.elapsed();
-
-        let per_page_database = directory.path().join("per-page/hel.sqlite3");
-        save_session_to(&per_page_database, &session("session-1", "project-1")).unwrap();
-        let started = std::time::Instant::now();
-        apply_projection_page_to(&per_page_database, "session-1", |page| {
-            for ordinal in 1..=EVENTS {
-                page.apply(
-                    ordinal,
-                    &event_digest(ordinal - 1),
-                    &event_digest(ordinal),
-                    &agent_message_mutation(ordinal),
-                )?;
-            }
-            Ok(())
-        })
-        .unwrap();
-        let per_page = started.elapsed();
-
-        println!("{EVENTS} events per-event: {per_event:?}, one page: {per_page:?}");
-        assert_eq!(
-            load_materialized_session_from(&per_page_database, "session-1")
-                .unwrap()
-                .unwrap()
-                .applied_event_ordinal,
-            EVENTS
-        );
-        assert!(
-            per_page < per_event,
-            "one page took {per_page:?} against {per_event:?} per event"
-        );
-    }
-
-    #[test]
-    fn deleting_operational_session_retains_relational_history_context() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut state = HelState::default();
-        let record = session("session-1", "project-1");
-        state.sessions.insert(record.id.clone(), record);
-        save_state_to(&database, &state).unwrap();
-        let connection = open(&database).unwrap();
-        connection
-            .execute(
-                "INSERT INTO prompt_history(session_id, event_ordinal, submitted_at, text)
-                 VALUES ('session-1', 8, '2026-08-12T02:00:00Z', 'remember this')",
-                [],
-            )
-            .unwrap();
-
-        state.sessions.clear();
-        save_state_to(&database, &state).unwrap();
-
-        let retained: String = connection
-            .query_row(
-                "SELECT text FROM prompt_history WHERE session_id = 'session-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(retained, "remember this");
-    }
-
-    #[test]
-    fn context_rejects_reassigning_a_session_to_another_project() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        let mut state = HelState::default();
-        state
-            .sessions
-            .insert("session-1".into(), session("session-1", "project-1"));
-        save_state_to(&database, &state).unwrap();
-        state.sessions.get_mut("session-1").unwrap().bundle_id = "project-2".into();
-
-        assert!(
-            save_state_to(&database, &state)
-                .unwrap_err()
-                .to_string()
-                .contains("already associated")
-        );
-    }
-
-    #[test]
-    fn history_search_scopes_by_project_session_and_all_projects() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        for (session, bundle, sequence, text) in [
-            ("session-1", "project-1", 1, "fix parser"),
-            ("session-2", "project-1", 1, "fix renderer"),
-            ("session-3", "project-2", 1, "fix database"),
-            ("session-1", "project-1", 2, "fix parser"),
-        ] {
-            record_prompt_to(
-                &database,
-                session,
-                bundle,
-                sequence,
-                Some("2026-08-12T00:00:00Z"),
-                text,
-            )
-            .unwrap();
-        }
-
-        let project = search_prompts_from(
-            &database,
-            "session-1",
-            "project-1",
-            HistoryScope::Project,
-            "FIX",
-        )
-        .unwrap();
-        assert_eq!(
-            project
-                .iter()
-                .map(|entry| entry.text.as_str())
-                .collect::<Vec<_>>(),
-            ["fix parser", "fix renderer"]
-        );
-        let session = search_prompts_from(
-            &database,
-            "session-1",
-            "project-1",
-            HistoryScope::Session,
-            "parser",
-        )
-        .unwrap();
-        assert_eq!(session.len(), 1, "duplicate prompt text is suppressed");
-        let all = search_prompts_from(
-            &database,
-            "session-1",
-            "project-1",
-            HistoryScope::All,
-            "database",
-        )
-        .unwrap();
-        assert_eq!(all[0].session_id, "session-3");
-    }
-
-    #[test]
-    fn rebinding_a_session_moves_its_prompt_history_to_the_new_bundle() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        record_prompt_to(
-            &database,
-            "session-1",
-            "project-1",
-            1,
-            Some("2026-08-12T00:00:00Z"),
-            "fix parser",
-        )
-        .unwrap();
-
-        rebind_session_bundle_to(&database, "session-1", "project-2").unwrap();
-
-        assert!(
-            search_prompts_from(
-                &database,
-                "session-1",
-                "project-1",
-                HistoryScope::Project,
-                "fix"
-            )
-            .unwrap()
-            .is_empty()
-        );
-        assert_eq!(
-            search_prompts_from(
-                &database,
-                "session-1",
-                "project-2",
-                HistoryScope::Project,
-                "fix"
-            )
-            .unwrap()
-            .len(),
-            1
-        );
-        // Recording under the new bundle now succeeds where it would have been
-        // refused as a bundle mismatch.
-        record_prompt_to(
-            &database,
-            "session-1",
-            "project-2",
-            2,
-            Some("2026-08-12T00:01:00Z"),
-            "fix renderer",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn prompt_recording_is_idempotent_by_session_event_ordinal() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        for _ in 0..2 {
-            record_prompt_to(
-                &database,
-                "session-1",
-                "project-1",
-                7,
-                Some("2026-08-12T00:00:00Z"),
-                "ship it",
-            )
-            .unwrap();
-        }
-        let connection = open(&database).unwrap();
-        let count: i64 = connection
-            .query_row("SELECT count(*) FROM prompt_history", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn independent_session_writes_preserve_both_updates() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("hel.sqlite3");
-        save_session_to(&database, &session("session-1", "project-1")).unwrap();
-        save_session_to(&database, &session("session-2", "project-2")).unwrap();
-
-        let first_database = database.clone();
-        let first = std::thread::spawn(move || {
-            let mut record = session("session-1", "project-1");
-            record.session_title_override = Some("first changed".into());
-            save_session_to(&first_database, &record).unwrap();
-        });
-        let second_database = database.clone();
-        let second = std::thread::spawn(move || {
-            let mut record = session("session-2", "project-2");
-            record.session_title_override = Some("second changed".into());
-            save_session_to(&second_database, &record).unwrap();
-        });
-        first.join().unwrap();
-        second.join().unwrap();
-
-        let state = load_state_from(&database).unwrap();
-        assert_eq!(
-            state.sessions["session-1"]
-                .session_title_override
-                .as_deref(),
-            Some("first changed")
-        );
-        assert_eq!(
-            state.sessions["session-2"]
-                .session_title_override
-                .as_deref(),
-            Some("second changed")
-        );
-    }
-
-    #[test]
-    fn legacy_json_migration_commits_before_retaining_source_backup() {
-        let directory = tempfile::tempdir().unwrap();
-        let legacy = directory.path().join("state.json");
-        let database = directory.path().join("hel.sqlite3");
-        let mut state = HelState::default();
-        state
-            .sessions
-            .insert("session-1".into(), session("session-1", "project-1"));
-        state.save_to(&legacy).unwrap();
-
-        migrate_legacy_state_from(&legacy, &database).unwrap();
-
-        state
-            .sessions
-            .get_mut("session-1")
-            .unwrap()
-            .viewed_through_event_ordinal = 0;
-        assert_eq!(load_state_from(&database).unwrap(), state);
-        assert!(!legacy.exists());
-        assert!(directory.path().join("state.json.migrated-v1").exists());
-    }
-}
+mod tests;

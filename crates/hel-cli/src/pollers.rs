@@ -23,11 +23,13 @@ use hel::hel_credentials::{
 use hel::hel_quota::{QuotaManager, QuotaRefreshOutcome, QuotaRefreshRequest};
 use hel::hel_recovery::{RecoveryCoordinator, RecoveryResult};
 use hel::hel_session_manager::{
-    RelaySessionTarget, SessionManagerControl, SessionManagerUpdate, SessionManagerUpdates,
-    ViewError, spawn_session_manager,
+    ManagedSessionView, RelaySessionTarget, RemoteSessionRequest, SessionManagerControl,
+    SessionManagerShutdown, SessionManagerUpdate, SessionManagerUpdates, ViewError,
+    spawn_remote_session_manager,
 };
 use hel::hel_state::{
-    HelState, MaterializedSession, SessionResourceAllocation, SessionState, normalize_session_title,
+    HelState, ManagedSessionSnapshot, MaterializedSession, SessionRecord,
+    SessionResourceAllocation, SessionState, normalize_session_title,
 };
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
@@ -36,6 +38,7 @@ use hel::hel_targets::{
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::DashboardState;
 
+use crate::daemon;
 use crate::dashboard::io::DashboardIoUpdate;
 use crate::short_id;
 
@@ -84,6 +87,22 @@ impl<T> FeedSource for tokio::sync::mpsc::UnboundedReceiver<T> {
 
     fn poll_now(&mut self) -> Option<T> {
         self.try_recv().ok()
+    }
+}
+
+impl<T: Clone> FeedSource for tokio::sync::watch::Receiver<T> {
+    type Item = T;
+
+    async fn wait(&mut self) -> Option<T> {
+        self.changed().await.ok()?;
+        Some(self.borrow_and_update().clone())
+    }
+
+    fn poll_now(&mut self) -> Option<T> {
+        self.has_changed()
+            .ok()
+            .filter(|changed| *changed)
+            .map(|_| self.borrow_and_update().clone())
     }
 }
 
@@ -356,6 +375,7 @@ pub(crate) fn spawn_quota_refresher() -> (
                 }
                 changed = profiles_rx.changed() => {
                     if changed.is_err() {
+                        tracing::debug!("quota profile target feed closed; stopping quota refresher");
                         break;
                     }
                     batch = profiles_rx.borrow_and_update().clone();
@@ -390,6 +410,7 @@ async fn refresh_profile_quotas(
         .await
         .is_err()
     {
+        tracing::debug!("quota update consumer closed before refresh started");
         return false;
     }
     // Keep draining even if the UI is gone so codex clients return to the
@@ -402,6 +423,7 @@ async fn refresh_profile_quotas(
                 if delivered.load(Ordering::Acquire)
                     && updates.send(QuotaUpdate::Report(quota)).await.is_err()
                 {
+                    tracing::debug!("quota update consumer closed while reporting a profile");
                     delivered.store(false, Ordering::Release);
                 }
             }
@@ -410,10 +432,19 @@ async fn refresh_profile_quotas(
     if !delivered.into_inner() {
         return false;
     }
-    updates
+    if updates
         .send(QuotaUpdate::Finished { generation })
         .await
-        .is_ok()
+        .is_err()
+    {
+        tracing::debug!(
+            generation,
+            "quota update consumer closed before refresh completed"
+        );
+        false
+    } else {
+        true
+    }
 }
 
 pub(crate) fn complete_manual_quota_refresh(
@@ -432,17 +463,44 @@ pub(crate) fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPol
         .state
         .sessions
         .values()
-        .filter(|session| session.state.is_active() && session.target.is_some())
+        .filter(|session| session_target_is_pollable(session))
         .filter_map(|session| {
-            let spec = controller.reconnect_command(&session.id).ok()?;
+            let spec = match controller.reconnect_command(&session.id) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    tracing::warn!(session_id = %session.id, "could not build worker poll target: {error:#}");
+                    return None;
+                }
+            };
             Some(WorkerPollTarget {
                 session_id: session.id.clone(),
                 spec,
-                worker_recovery: controller.worker_recovery_plan(&session.id).ok(),
-                project_memory: controller.project_memory_sync_target(&session.id).ok(),
+                worker_recovery: match controller.worker_recovery_plan(&session.id) {
+                    Ok(plan) => Some(plan),
+                    Err(error) => {
+                        tracing::debug!(session_id = %session.id, "worker recovery target unavailable: {error:#}");
+                        None
+                    }
+                },
+                project_memory: match controller.project_memory_sync_target(&session.id) {
+                    Ok(target) => Some(target),
+                    Err(error) => {
+                        tracing::debug!(session_id = %session.id, "project memory target unavailable: {error:#}");
+                        None
+                    }
+                },
             })
         })
         .collect()
+}
+
+pub(crate) fn dashboard_worker_targets_excluding(
+    controller: &Controller,
+    excluded_sessions: &std::collections::BTreeSet<String>,
+) -> Vec<WorkerPollTarget> {
+    let mut targets = dashboard_worker_targets(controller);
+    targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    targets
 }
 
 /// Sessions whose worker can answer credential requests right now. Sessions
@@ -461,16 +519,32 @@ pub(crate) fn credential_sync_targets(controller: &Controller) -> Vec<Credential
         })
         .filter_map(|session| {
             let profile = controller.config.profiles.get(&session.last_profile)?;
-            let spec = controller.reconnect_command(&session.id).ok()?;
+            let spec = match controller.reconnect_command(&session.id) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    tracing::warn!(session_id = %session.id, "could not build credential sync target: {error:#}");
+                    return None;
+                }
+            };
+            let sync_github_token = target_syncs_github_token(session.target.as_ref());
             Some(CredentialSyncTarget {
                 session_id: session.id.clone(),
                 profile_id: session.last_profile.clone(),
                 harness: profile.kind,
                 profile_home: profile.home.clone(),
+                sync_github_token,
                 spec,
             })
         })
         .collect()
+}
+
+fn target_syncs_github_token(target: Option<&hel::hel_state::TargetLocator>) -> bool {
+    target.is_some()
+        && !matches!(
+            target,
+            Some(hel::hel_state::TargetLocator::LocalBare { .. })
+        )
 }
 
 /// One immediate sync and notice per session per cooldown, so a harness that
@@ -574,6 +648,17 @@ pub(crate) struct CredentialSyncNotices {
     last_failures: std::collections::BTreeMap<(String, Option<String>), String>,
 }
 
+pub(crate) fn log_credential_sync_actions(result: &hel::hel_credentials::CredentialSyncResult) {
+    let sessions = result.credential_sessions();
+    if sessions > 0 {
+        tracing::info!(
+            profile_id = %result.profile_id,
+            sessions,
+            "refreshed harness credentials"
+        );
+    }
+}
+
 impl CredentialSyncNotices {
     /// Healthy no-op cycles stay out of the UI; only actions, new failures, and
     /// answers to an event-triggered reconciliation are worth a notice.
@@ -669,18 +754,23 @@ impl CredentialSyncNotices {
         }
 
         let mut parts = Vec::new();
-        let credentials = result.credential_sessions();
-        if credentials > 0 {
-            parts.push(format!(
-                "Refreshed harness credentials for profile {} across {credentials} session(s).",
-                result.profile_id
-            ));
-        }
         let skills = result.skills_sessions();
         if skills > 0 {
             parts.push(format!(
                 "Synced skills for profile {} to {skills} session(s).",
                 result.profile_id
+            ));
+        }
+        let github_pushed = result.github_token_pushed_sessions();
+        if github_pushed > 0 {
+            parts.push(format!(
+                "Synced the GitHub CLI token to {github_pushed} session(s)."
+            ));
+        }
+        let github_removed = result.github_token_removed_sessions();
+        if github_removed > 0 {
+            parts.push(format!(
+                "Removed the GitHub CLI token from {github_removed} session(s)."
             ));
         }
         (!parts.is_empty()).then(|| parts.join(" "))
@@ -692,17 +782,28 @@ fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget
         .state
         .sessions
         .values()
-        .filter(|session| session.state.is_active() && session.target.is_some())
+        .filter(|session| session_target_is_pollable(session))
         .filter_map(|session| {
-            controller
-                .resource_probe(&session.id)
-                .ok()
-                .map(|probe| ResourcePollTarget {
+            match controller.resource_probe(&session.id) {
+                Ok(probe) => Some(ResourcePollTarget {
                     session_id: session.id.clone(),
                     probe,
-                })
+                }),
+                Err(error) => {
+                    tracing::warn!(session_id = %session.id, "could not build resource poll target: {error:#}");
+                    None
+                }
+            }
         })
         .collect()
+}
+
+/// `is_active` means visible on the active dashboard, not necessarily backed
+/// by a live target. A recoverable error stays visible so the user can resume
+/// its checkpoint, but its failed target must not keep reconnecting or being
+/// sampled.
+pub(crate) fn session_target_is_pollable(session: &hel::hel_state::SessionRecord) -> bool {
+    session.state.is_active() && session.state != SessionState::Error && session.target.is_some()
 }
 
 pub(crate) fn refresh_dashboard_poll_targets(
@@ -712,8 +813,7 @@ pub(crate) fn refresh_dashboard_poll_targets(
     credential_sync: &CredentialSyncHandle,
     excluded_sessions: &std::collections::BTreeSet<String>,
 ) {
-    let mut worker_targets = dashboard_worker_targets(controller);
-    worker_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    let worker_targets = dashboard_worker_targets_excluding(controller, excluded_sessions);
     worker_targets_tx.send_replace(worker_targets);
     let mut resource_targets = dashboard_resource_targets(controller);
     resource_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
@@ -745,7 +845,9 @@ pub(crate) fn spawn_aws_resource_options_resolution(
         let result = controller
             .resolve_aws_resource_options(&target_id, &CancellableProcessExecutor::new(cancelled))
             .map_err(|error| format!("{error:#}"));
-        let _ = updates.send((target_id, result));
+        if let Err(error) = updates.send((target_id.clone(), result)) {
+            tracing::debug!(target_id, %error, "AWS resource options result dropped after dashboard shutdown");
+        }
         drop(guard);
     });
 }
@@ -774,6 +876,7 @@ pub(crate) fn spawn_dashboard_resource_poller() -> (
                 }
                 changed = targets_rx.changed() => {
                     if changed.is_err() {
+                        tracing::debug!("resource poll target feed closed; stopping resource poller");
                         break;
                     }
                     targets = targets_rx
@@ -821,22 +924,34 @@ fn schedule_resource_sample(
     last_started.insert(target.session_id.clone(), now);
     let updates = updates.clone();
     tokio::spawn(async move {
-        let usage = tokio::time::timeout(
+        let usage = match tokio::time::timeout(
             RESOURCE_POLL_TIMEOUT,
             collect_session_resource_usage(&target.probe),
         )
         .await
-        .ok()
-        .and_then(Result::ok);
+        {
+            Ok(Ok(usage)) => Some(usage),
+            Ok(Err(error)) => {
+                tracing::warn!(session_id = %target.session_id, "resource probe failed: {error:#}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(session_id = %target.session_id, "resource probe timed out");
+                None
+            }
+        };
         let Some(usage) = usage else {
             return;
         };
-        let _ = updates
+        if let Err(error) = updates
             .send(ResourcePollUpdate {
-                session_id: target.session_id,
+                session_id: target.session_id.clone(),
                 usage,
             })
-            .await;
+            .await
+        {
+            tracing::debug!(session_id = %target.session_id, %error, "resource probe result dropped after dashboard shutdown");
+        }
     });
 }
 
@@ -845,7 +960,13 @@ async fn collect_session_resource_usage(
 ) -> Result<SessionResourceUsage> {
     let memory = execute_resource_command(&probe.memory).await?;
     let disk = match &probe.disk {
-        Some(command) => execute_resource_command(command).await.ok(),
+        Some(command) => match execute_resource_command(command).await {
+            Ok(output) => Some(output),
+            Err(error) => {
+                tracing::debug!(purpose = %command.purpose, "optional disk resource probe failed: {error:#}");
+                None
+            }
+        },
         None => None,
     };
     hel::hel_targets::parse_resource_usage(
@@ -856,11 +977,13 @@ async fn collect_session_resource_usage(
 
 pub(crate) fn spawn_dashboard_capacity_poller() -> (
     tokio::sync::watch::Sender<Vec<DeploymentCapacityTarget>>,
+    tokio::sync::mpsc::Sender<()>,
     tokio::sync::mpsc::Receiver<CapacityPollUpdate>,
 ) {
     let (targets_tx, mut targets_rx) =
         tokio::sync::watch::channel(Vec::<DeploymentCapacityTarget>::new());
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(64);
+    let (triggers_tx, mut triggers_rx) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {
         let mut targets = Vec::new();
         let mut interval = tokio::time::interval(CAPACITY_POLL_INTERVAL);
@@ -872,15 +995,22 @@ pub(crate) fn spawn_dashboard_capacity_poller() -> (
                 }
                 changed = targets_rx.changed() => {
                     if changed.is_err() {
+                        tracing::debug!("capacity poll target feed closed; stopping capacity poller");
                         break;
                     }
                     targets = targets_rx.borrow_and_update().clone();
                     schedule_capacity_samples(&targets, &updates_tx);
                 }
+                trigger = triggers_rx.recv() => {
+                    if trigger.is_none() {
+                        break;
+                    }
+                    schedule_capacity_samples(&targets, &updates_tx);
+                }
             }
         }
     });
-    (targets_tx, updates_rx)
+    (targets_tx, triggers_tx, updates_rx)
 }
 
 fn schedule_capacity_samples(
@@ -894,13 +1024,16 @@ fn schedule_capacity_samples(
                 .await
                 .map_err(|_| "capacity probe timed out".to_string())
                 .and_then(|result| result.map_err(|error| format!("{error:#}")));
-            let _ = updates
+            if let Err(error) = updates
                 .send(CapacityPollUpdate {
-                    target_id: target.id,
+                    target_id: target.id.clone(),
                     result,
                     sampled_at_epoch_seconds: epoch_seconds(),
                 })
-                .await;
+                .await
+            {
+                tracing::debug!(target_id = %target.id, %error, "capacity probe result dropped after dashboard shutdown");
+            }
         });
     }
 }
@@ -1036,13 +1169,291 @@ async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput
     Ok(command_output)
 }
 
-pub(crate) fn spawn_dashboard_worker_poller() -> Result<(
-    tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
-    SessionManagerUpdates,
-    SessionManagerControl,
-)> {
-    let channels = spawn_session_manager()?;
-    Ok((channels.targets, channels.updates, channels.control))
+pub(crate) struct RemoteDashboardWorkerPoller {
+    pub(crate) targets: tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
+    pub(crate) updates: SessionManagerUpdates,
+    pub(crate) control: SessionManagerControl,
+    pub(crate) shutdown: SessionManagerShutdown,
+    pub(crate) lifecycles: tokio::sync::watch::Receiver<Vec<daemon::RuntimeLifecycleView>>,
+    pub(crate) config: tokio::sync::watch::Receiver<hel::hel_config::HelConfig>,
+    pub(crate) records: tokio::sync::watch::Receiver<Vec<SessionRecord>>,
+}
+
+const PROJECTION_CONVERGENCE_RETRIES: u8 = 20;
+const PROJECTION_CONVERGENCE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionMismatch {
+    published_ordinal: u64,
+    published_digest: String,
+    durable_ordinal: u64,
+    durable_digest: String,
+}
+
+#[derive(Default)]
+struct ProjectionConvergence {
+    attempts: std::collections::BTreeMap<String, (ProjectionMismatch, u8)>,
+}
+
+impl ProjectionConvergence {
+    fn converged(&mut self, session_id: &str) {
+        self.attempts.remove(session_id);
+    }
+
+    /// Give a lifecycle rollback and the daemon's cached relay view a bounded
+    /// window to converge. Repeating the same mismatch eventually reports the
+    /// integrity failure instead of hiding it indefinitely.
+    fn should_retry(&mut self, session_id: &str, mismatch: ProjectionMismatch) -> bool {
+        let entry = self
+            .attempts
+            .entry(session_id.to_owned())
+            .or_insert_with(|| (mismatch.clone(), 0));
+        if entry.0 != mismatch {
+            *entry = (mismatch, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= PROJECTION_CONVERGENCE_RETRIES
+    }
+}
+
+pub(crate) fn spawn_remote_dashboard_worker_poller(
+    workspace_id: String,
+) -> Result<RemoteDashboardWorkerPoller> {
+    let channels = spawn_remote_session_manager()?;
+    let hel::hel_session_manager::RemoteSessionManagerChannels {
+        targets,
+        control,
+        updates,
+        shutdown,
+        publisher,
+        mut requests,
+    } = channels;
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::watch::channel(Vec::new());
+    let (config_tx, config_rx) = tokio::sync::watch::channel(hel::hel_config::HelConfig::default());
+    let (records_tx, records_rx) = tokio::sync::watch::channel(Vec::new());
+    tokio::spawn(async move {
+        let mut revision = 0_u64;
+        let mut requests_open = true;
+        let mut projection_convergence = ProjectionConvergence::default();
+        loop {
+            tokio::select! {
+                request = requests.recv(), if requests_open => {
+                    let Some(request) = request else {
+                        requests_open = false;
+                        continue;
+                    };
+                    tokio::spawn(forward_remote_session_request(request));
+                }
+                snapshot = poll_daemon_runtime(workspace_id.clone(), revision) => {
+                    match snapshot {
+                        Ok(snapshot) => {
+                            let snapshot_revision = snapshot.revision;
+                            let mut retry_projection = false;
+                            config_tx.send_if_modified(|config| {
+                                if *config == snapshot.config {
+                                    false
+                                } else {
+                                    *config = snapshot.config.clone();
+                                    true
+                                }
+                            });
+                            records_tx.send_if_modified(|records| {
+                                if *records == snapshot.records {
+                                    false
+                                } else {
+                                    records.clone_from(&snapshot.records);
+                                    true
+                                }
+                            });
+                            lifecycle_tx.send_replace(snapshot.lifecycles);
+                            for runtime in snapshot.sessions {
+                                let session_id = runtime.session_id.clone();
+                                let view = match runtime.operational {
+                                    Some(operational) => {
+                                        let loaded = tokio::task::spawn_blocking({
+                                            let session_id = session_id.clone();
+                                            move || hel::hel_database::load_materialized_session(&session_id)
+                                        }).await;
+                                        match loaded {
+                                            Ok(Ok(Some(materialized)))
+                                                if materialized.applied_event_ordinal > runtime.projection_ordinal
+                                                    || (materialized.applied_event_ordinal == runtime.projection_ordinal
+                                                        && materialized.applied_event_digest == runtime.projection_digest) =>
+                                            {
+                                                projection_convergence.converged(&session_id);
+                                                ManagedSessionView {
+                                                    snapshot: Some(ManagedSessionSnapshot {
+                                                        materialized,
+                                                        operational,
+                                                        latest_credential_sync_signal:
+                                                            runtime.latest_credential_sync_signal,
+                                                    }),
+                                                    connected: runtime.connected,
+                                                    error: runtime.error,
+                                                }
+                                            }
+                                            Ok(Ok(Some(materialized))) => {
+                                                let mismatch = ProjectionMismatch {
+                                                    published_ordinal: runtime.projection_ordinal,
+                                                    published_digest: runtime.projection_digest.clone(),
+                                                    durable_ordinal: materialized.applied_event_ordinal,
+                                                    durable_digest: materialized.applied_event_digest.clone(),
+                                                };
+                                                if projection_convergence.should_retry(&session_id, mismatch) {
+                                                    retry_projection = true;
+                                                    continue;
+                                                }
+                                                let detail = if materialized.applied_event_ordinal
+                                                    < runtime.projection_ordinal
+                                                {
+                                                    format!(
+                                                        "daemon published projection {} but SQLite contains only {} after a bounded convergence retry",
+                                                        runtime.projection_ordinal,
+                                                        materialized.applied_event_ordinal,
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "daemon and SQLite projection digests differ at ordinal {} after a bounded convergence retry",
+                                                        runtime.projection_ordinal,
+                                                    )
+                                                };
+                                                ManagedSessionView {
+                                                    snapshot: None,
+                                                    connected: false,
+                                                    error: Some(ViewError::ProjectionIntegrity(detail)),
+                                                }
+                                            }
+                                            Ok(Ok(None)) => ManagedSessionView {
+                                                snapshot: None,
+                                                connected: false,
+                                                error: Some(ViewError::ProjectionIntegrity(
+                                                    "daemon published a session with no durable projection".into(),
+                                                )),
+                                            },
+                                            Ok(Err(error)) => ManagedSessionView {
+                                                snapshot: None,
+                                                connected: false,
+                                                error: Some(ViewError::ProjectionIntegrity(format!(
+                                                    "load daemon-owned projection: {error:#}",
+                                                ))),
+                                            },
+                                            Err(error) => ManagedSessionView {
+                                                snapshot: None,
+                                                connected: false,
+                                                error: Some(ViewError::ProjectionIntegrity(format!(
+                                                    "projection load task failed: {error}",
+                                                ))),
+                                            },
+                                        }
+                                    }
+                                    None => ManagedSessionView {
+                                        snapshot: None,
+                                        connected: runtime.connected,
+                                        error: runtime.error,
+                                    },
+                                };
+                                if publisher.publish(session_id, view).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if retry_projection {
+                                tokio::time::sleep(PROJECTION_CONVERGENCE_RETRY_DELAY).await;
+                            } else {
+                                revision = revision.max(snapshot_revision);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "could not refresh sessions from controller daemon");
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    }
+                }
+            }
+            if !requests_open {
+                return;
+            }
+        }
+    });
+    Ok(RemoteDashboardWorkerPoller {
+        targets,
+        updates,
+        control,
+        shutdown,
+        lifecycles: lifecycle_rx,
+        config: config_rx,
+        records: records_rx,
+    })
+}
+
+async fn poll_daemon_runtime(
+    workspace_id: String,
+    after_revision: u64,
+) -> Result<daemon::RuntimeSnapshot> {
+    let mut daemon = daemon::connect_or_start().await?;
+    daemon.runtime_snapshot(workspace_id, after_revision).await
+}
+
+async fn forward_remote_session_request(request: RemoteSessionRequest) {
+    match request {
+        RemoteSessionRequest::Submit {
+            session_id,
+            command_id,
+            command,
+            reply,
+        } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .submit_session_command(session_id, command_id, command)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+        RemoteSessionRequest::Sync { session_id, reply } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .sync_session(session_id)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+        RemoteSessionRequest::RespondElicitation {
+            session_id,
+            elicitation_id,
+            response,
+            reply,
+        } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .respond_elicitation(session_id, elicitation_id, response)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+        RemoteSessionRequest::Reviewer {
+            session_id,
+            action,
+            reply,
+        } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .reviewer_action(session_id, action)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
+    }
 }
 
 pub(crate) fn apply_worker_poll_update(
@@ -1066,7 +1477,7 @@ pub(crate) fn apply_worker_poll_update(
         Some(ViewError::TargetMissing(detail)) => {
             dashboard.mark_transcript_unavailable(&update.session_id);
             dashboard.set_notice(format!(
-                "Session {}: {detail}; recording the session as lost…",
+                "Session {}: {detail}; recording the missing target…",
                 &update.session_id[..update.session_id.len().min(8)]
             ));
             if controller
@@ -1085,7 +1496,7 @@ pub(crate) fn apply_worker_poll_update(
             {
                 spawn_worker_record_persistence(
                     update.session_id.clone(),
-                    WorkerRecordPersistence::TargetLost {
+                    WorkerRecordPersistence::TargetMissing {
                         session_id: update.session_id.clone(),
                         detail,
                         updated_at: chrono::Utc::now()
@@ -1158,15 +1569,23 @@ pub(crate) fn apply_worker_record_update(
     Ok(changed)
 }
 
+#[derive(Debug)]
 pub(crate) enum WorkerRecordPersistence {
     AcpTitle {
         title: Option<String>,
     },
-    TargetLost {
+    TargetMissing {
         session_id: String,
         detail: String,
         updated_at: String,
     },
+}
+
+#[derive(Debug)]
+pub(crate) enum WorkerRecordPersistenceOutcome {
+    Saved,
+    TargetMissing(SessionState),
+    Unchanged,
 }
 
 fn spawn_worker_record_persistence(
@@ -1175,24 +1594,35 @@ fn spawn_worker_record_persistence(
     updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
     tracker: crate::dashboard::CriticalOperationTracker,
 ) {
-    let guard = tracker.begin(format!(
-        "saving agent title for {}",
-        crate::short_id(&session_id)
-    ));
+    let label = match &operation {
+        WorkerRecordPersistence::AcpTitle { .. } => "saving agent title for",
+        WorkerRecordPersistence::TargetMissing { .. } => "saving missing target for",
+    };
+    let guard = tracker.begin(format!("{label} {}", crate::short_id(&session_id)));
     tokio::task::spawn_blocking(move || {
         let result = match &operation {
             WorkerRecordPersistence::AcpTitle { title } => {
                 hel::hel_database::set_session_acp_title(&session_id, title.as_deref())
-                    .map(|()| true)
+                    .map(|()| WorkerRecordPersistenceOutcome::Saved)
             }
-            WorkerRecordPersistence::TargetLost {
+            WorkerRecordPersistence::TargetMissing {
                 session_id,
                 detail,
                 updated_at,
-            } => hel::hel_database::mark_session_target_lost(session_id, detail, updated_at),
+            } => hel::hel_database::mark_session_target_missing(session_id, detail, updated_at)
+                .map(|state| {
+                    state.map_or(
+                        WorkerRecordPersistenceOutcome::Unchanged,
+                        WorkerRecordPersistenceOutcome::TargetMissing,
+                    )
+                }),
         }
         .map_err(|error| format!("{error:#}"));
-        let _ = updates.send(DashboardIoUpdate::WorkerRecordPersistence { operation, result });
+        if let Err(error) =
+            updates.send(DashboardIoUpdate::WorkerRecordPersistence { operation, result })
+        {
+            tracing::debug!(%error, "worker record persistence result dropped after dashboard shutdown");
+        }
         drop(guard);
     });
 }
@@ -1222,15 +1652,12 @@ pub(crate) fn spawn_worker_diagnosis(
         })
         .await;
         let result = joined.map_err(|error| format!("worker diagnosis task failed: {error}"));
-        if updates
-            .send(DashboardIoUpdate::WorkerDiagnosis {
-                session_id: session_id.clone(),
-                episode_id,
-                result,
-            })
-            .is_err()
-        {
-            tracing::debug!(%session_id, "worker diagnosis finished after the dashboard stopped");
+        if let Err(error) = updates.send(DashboardIoUpdate::WorkerDiagnosis {
+            session_id: session_id.clone(),
+            episode_id,
+            result,
+        }) {
+            tracing::debug!(%session_id, %error, "worker diagnosis result dropped after dashboard shutdown");
         }
         drop(guard);
     });
@@ -1256,51 +1683,6 @@ fn queued_prompt_entries(
         .collect()
 }
 
-pub(crate) fn merge_recovery_result(
-    controller: &mut Controller,
-    result: hel::hel_recovery::RecoveryResult,
-) -> bool {
-    let hel::hel_recovery::RecoveryResult {
-        session_id,
-        expected_target,
-        outcome,
-        cancelled,
-    } = result;
-    if let Err(error) = controller.reload() {
-        tracing::warn!(%session_id, "could not reload a completed recovery checkpoint: {error:#}");
-        return false;
-    }
-    let Some(session) = controller.state.sessions.get_mut(&session_id) else {
-        return false;
-    };
-    if session.target.as_ref() != Some(&expected_target) || !session.state.is_active() {
-        return false;
-    }
-    match outcome {
-        Ok(artifact) => {
-            if session.checkpoint.as_ref() != Some(&artifact.metadata) {
-                tracing::warn!(
-                    %session_id,
-                    "recovery checkpoint result no longer matches the durable session record; retaining both archives"
-                );
-                return false;
-            }
-        }
-        Err(_) if cancelled => {
-            // A preempted copy was never judged, so it must not leave a
-            // checkpoint error on the session.
-            return false;
-        }
-        Err(detail) => {
-            // record_recovery_failure normally made this durable before the
-            // result was published. Preserve the diagnostic in this view if
-            // that write itself failed; later reloads remain authoritative.
-            session.last_checkpoint_error = Some(detail);
-        }
-    }
-    true
-}
-
 pub(crate) enum LifecycleSuccess {
     Created,
     Resumed {
@@ -1309,9 +1691,8 @@ pub(crate) enum LifecycleSuccess {
         materialized: Box<MaterializedSession>,
     },
     Closed,
-    Destroyed,
-    DeletedActive,
-    DeletedStopped,
+    ForceStopped,
+    DestroyedStopped,
 }
 
 pub(crate) struct LifecycleUpdate {
@@ -1374,14 +1755,11 @@ pub(crate) fn spawn_interrupted_close_recovery(
             Ok(result) => result,
             Err(error) => Err(format!("interrupted close recovery task failed: {error}")),
         };
-        if updates
-            .send(LifecycleUpdate {
-                session_id: session_id.clone(),
-                result,
-            })
-            .is_err()
-        {
-            tracing::debug!(%session_id, "interrupted close finished after its controller stopped");
+        if let Err(error) = updates.send(LifecycleUpdate {
+            session_id: session_id.clone(),
+            result,
+        }) {
+            tracing::debug!(%session_id, %error, "interrupted close result dropped after dashboard shutdown");
         }
         drop(guard);
     });
@@ -1409,6 +1787,132 @@ pub(crate) fn reserve_recovery_or_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn podman_controller(state: SessionState) -> Controller {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "podman".into(),
+            hel::hel_config::TargetTemplate::LocalPodman {
+                container: hel::hel_config::ContainerTemplate {
+                    image: "ubuntu:24.04".into(),
+                    pull_policy: Default::default(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: std::collections::BTreeMap::new(),
+                },
+            },
+        );
+        let mut hel_state = HelState::default();
+        hel_state.sessions.insert(
+            session_id.into(),
+            hel::hel_state::SessionRecord {
+                workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
+                archived: false,
+                container_cpus: None,
+                container_memory: None,
+                id: session_id.into(),
+                title: "poll target".into(),
+                harness_kind: hel::hel_config::HarnessKind::Codex,
+                last_profile: "codex".into(),
+                bundle_id: "project".into(),
+                project_directory: None,
+                managed_worktree: None,
+                target_template_id: "podman".into(),
+                resource_allocation: None,
+                additional_mounts: Vec::new(),
+                state,
+                target: Some(hel::hel_state::TargetLocator::LocalPodman {
+                    container_id: "a".repeat(64),
+                }),
+                native_session_id: None,
+                acp_session_title: None,
+                session_title_override: None,
+                created_at: "2026-08-27T00:00:00Z".into(),
+                updated_at: "2026-08-27T00:00:00Z".into(),
+                viewed_through_event_ordinal: 0,
+                draft_input: String::new(),
+                last_error: None,
+                last_checkpoint_error: None,
+                checkpoint: None,
+            },
+        );
+        Controller {
+            config,
+            state: hel_state,
+        }
+    }
+
+    #[test]
+    fn recoverable_error_session_stays_out_of_live_target_pollers() {
+        let running = podman_controller(SessionState::Running);
+        assert_eq!(dashboard_worker_targets(&running).len(), 1);
+        assert_eq!(dashboard_resource_targets(&running).len(), 1);
+
+        let recoverable_error = podman_controller(SessionState::Error);
+        assert!(dashboard_worker_targets(&recoverable_error).is_empty());
+        assert!(dashboard_resource_targets(&recoverable_error).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_owned_session_stays_out_of_worker_targets() {
+        let controller = podman_controller(SessionState::Provisioning);
+        assert_eq!(dashboard_worker_targets(&controller).len(), 1);
+
+        let excluded = controller
+            .state
+            .sessions
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(dashboard_worker_targets_excluding(&controller, &excluded).is_empty());
+    }
+
+    #[test]
+    fn projection_rollback_race_retries_before_reporting_integrity_failure() {
+        let mismatch = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "published".into(),
+            durable_ordinal: 36,
+            durable_digest: "durable".into(),
+        };
+        let mut convergence = ProjectionConvergence::default();
+
+        for _ in 0..PROJECTION_CONVERGENCE_RETRIES {
+            assert!(convergence.should_retry("session-1", mismatch.clone()));
+        }
+        assert!(
+            !convergence.should_retry("session-1", mismatch),
+            "a persistent mismatch must still become an integrity error"
+        );
+
+        convergence.converged("session-1");
+        assert!(convergence.attempts.is_empty());
+    }
+
+    #[test]
+    fn a_changed_projection_mismatch_gets_its_own_convergence_window() {
+        let mut convergence = ProjectionConvergence::default();
+        let stale_lineage = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "old-lineage".into(),
+            durable_ordinal: 36,
+            durable_digest: "checkpoint".into(),
+        };
+        for _ in 0..=PROJECTION_CONVERGENCE_RETRIES {
+            convergence.should_retry("session-1", stale_lineage.clone());
+        }
+        let equal_frontier_different_lineage = ProjectionMismatch {
+            published_ordinal: 39,
+            published_digest: "old-lineage".into(),
+            durable_ordinal: 39,
+            durable_digest: "new-lineage".into(),
+        };
+
+        assert!(convergence.should_retry("session-1", equal_frontier_different_lineage));
+    }
 
     #[test]
     fn worker_diagnosis_is_coalesced_for_one_unreachable_episode() {
@@ -1595,6 +2099,42 @@ mod tests {
     }
 
     #[test]
+    fn github_tokens_sync_to_every_remote_target_but_raw_localhost() {
+        use hel::hel_state::TargetLocator;
+
+        let remotes = [
+            TargetLocator::LocalPodman {
+                container_id: "podman".into(),
+            },
+            TargetLocator::AppleContainer {
+                container_id: "apple".into(),
+            },
+            TargetLocator::AwsEc2 {
+                instance_id: "i-123".into(),
+                address: Some("example.invalid".into()),
+            },
+            TargetLocator::SshBare {
+                host: "ssh.example".into(),
+                workspace: "/workspace".into(),
+                worker_id: None,
+            },
+            TargetLocator::SshPodman {
+                host: "ssh.example".into(),
+                container_id: "remote-podman".into(),
+            },
+        ];
+        for target in &remotes {
+            assert!(target_syncs_github_token(Some(target)), "{target:?}");
+        }
+        assert!(!target_syncs_github_token(Some(
+            &TargetLocator::LocalBare {
+                worker_root: "/tmp/worker".into(),
+            }
+        )));
+        assert!(!target_syncs_github_token(None));
+    }
+
+    #[test]
     fn an_authentication_failure_notice_says_whether_anything_was_pushed() {
         use hel::hel_credentials::{
             CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
@@ -1730,11 +2270,7 @@ mod tests {
                 outcome: Ok(vec![CredentialSyncAction::Pushed]),
             }],
         };
-        let refreshed = notices.notice(&healthy).unwrap();
-        assert!(
-            refreshed.contains("Refreshed harness credentials"),
-            "{refreshed}"
-        );
+        assert_eq!(notices.notice(&healthy), None);
         assert!(notices.notice(&failed("container is gone")).is_some());
     }
 
@@ -1759,7 +2295,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_and_credential_syncs_each_speak_in_the_notice() {
+    fn skills_and_github_syncs_speak_while_harness_credentials_stay_out_of_the_notice() {
         use hel::hel_credentials::{
             CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
         };
@@ -1774,21 +2310,30 @@ mod tests {
                     outcome: Ok(vec![
                         CredentialSyncAction::Pushed,
                         CredentialSyncAction::SkillsPushed,
+                        CredentialSyncAction::GithubTokenPushed,
                     ]),
                 },
                 CredentialSyncOutcome {
                     session_id: "018f9dd2-bbbb".into(),
-                    outcome: Ok(vec![CredentialSyncAction::SkillsPushed]),
+                    outcome: Ok(vec![
+                        CredentialSyncAction::SkillsPushed,
+                        CredentialSyncAction::GithubTokenRemoved,
+                    ]),
                 },
             ],
         };
         let notice = CredentialSyncNotices::default().notice(&result).unwrap();
+        assert!(!notice.contains("harness credentials"), "{notice}");
         assert!(
-            notice.contains("Refreshed harness credentials for profile work across 1 session(s)."),
+            notice.contains("Synced skills for profile work to 2 session(s)."),
             "{notice}"
         );
         assert!(
-            notice.contains("Synced skills for profile work to 2 session(s)."),
+            notice.contains("Synced the GitHub CLI token to 1 session(s)."),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("Removed the GitHub CLI token from 1 session(s)."),
             "{notice}"
         );
     }
