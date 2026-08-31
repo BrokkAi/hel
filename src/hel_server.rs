@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::hel_chat::BrowserTranscript;
 use crate::hel_config::{HelConfig, TargetTemplate, validate_id};
+use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse, MAX_ELICITATION_BYTES};
 use crate::hel_state::{HelState, SessionState};
 
 const COOKIE_NAME: &str = "hel_viewer_session";
@@ -203,7 +204,7 @@ pub async fn run_server(options: ServerOptions) -> AnyResult<()> {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerSnapshot {
     pub revision: u64,
@@ -239,6 +240,7 @@ impl ViewerSnapshot {
                 preview: Vec::new(),
                 queued_prompts: Vec::new(),
                 active_user_shells: Vec::new(),
+                pending_elicitations: Vec::new(),
                 conversation_available: false,
                 incompatible_resume_targets: config
                     .targets
@@ -301,7 +303,7 @@ impl ViewerSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerSession {
     pub id: String,
@@ -322,6 +324,11 @@ pub struct ViewerSession {
     pub queued_prompts: Vec<ViewerQueuedPrompt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_user_shells: Vec<ViewerUserShell>,
+    /// Form questions the session is blocked on, published so a phone can
+    /// answer them. These are the agent's own questions, already visible in
+    /// the transcript, so they travel whole rather than redacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_elicitations: Vec<ElicitationRequest>,
     pub conversation_available: bool,
     /// Target ids this session cannot resume on. Only the ids travel: the
     /// controller's reasons name project paths and SSH hosts, which this
@@ -401,7 +408,7 @@ pub struct ViewerRepository {
 /// The complete set of operations a phone may ask the controller to perform.
 /// Destructive force-cleanup and secret/config editing are intentionally not
 /// representable here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControllerAction {
     New {
@@ -444,6 +451,12 @@ pub enum ControllerAction {
     RemoveQueuedPrompt {
         session_id: String,
         queue_id: String,
+    },
+    /// Answer one of the session's pending form questions.
+    RespondElicitation {
+        session_id: String,
+        elicitation_id: String,
+        response: ElicitationResponse,
     },
 }
 
@@ -964,6 +977,34 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             validate_public_id(queue_id)?;
             require_session_record(snapshot, session_id)?;
         }
+        ControllerAction::RespondElicitation {
+            session_id,
+            elicitation_id,
+            response,
+        } => {
+            validate_public_id(session_id)?;
+            validate_public_id(elicitation_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            let request = session
+                .pending_elicitations
+                .iter()
+                .find(|request| request.id == *elicitation_id)
+                .ok_or_else(|| ApiError::not_found("unknown elicitation"))?;
+            if serde_json::to_vec(response).map_or(usize::MAX, |encoded| encoded.len())
+                > MAX_ELICITATION_BYTES
+            {
+                return Err(ApiError::bad_request("elicitation answer is too large"));
+            }
+            // The answer has to satisfy the question the agent actually asked.
+            // A phone can post one for a request the session has already
+            // replaced, and forwarding that would answer a live question with
+            // content the agent never offered.
+            if request.validate_response(response).is_err() {
+                return Err(ApiError::bad_request(
+                    "the answer does not match this elicitation request",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1270,23 +1311,40 @@ const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 
 
 const VIEWER_HTML: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="icon" href="/icon.svg"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
-<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
+<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}.elicitation{border-color:#d985ff}.elicitation-message{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 10px}.elicitation-field{display:flex;flex-direction:column;gap:4px;margin:10px 0}.elicitation-field select[multiple]{min-height:120px}.elicitation-field input[type=checkbox]{align-self:start;width:22px;height:22px}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
-<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent or use !command" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
+<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><div id="elicitations"></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent or use !command" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
 <script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells');let snapshot,currentSession,cursor=0,acknowledged=0,eventSource;
+const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells'),elicitations=document.querySelector('#elicitations');let snapshot,currentSession,cursor=0,acknowledged=0,eventSource;
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}if(response.status===202||response.status===204)return null;return response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
 function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
 function startEvents(){if(eventSource)eventSource.close();eventSource=new EventSource('/api/events');eventSource.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}
-async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventSource)startEvents();return true}catch(e){if(e.message==='unauthorized'){snapshot=undefined;currentSession=null;if(eventSource){eventSource.close();eventSource=undefined}login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}return false}}
+async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''}${x.pending_elicitations?.length?' <span class="pill alert">input needed</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);renderElicitations(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventSource)startEvents();return true}catch(e){if(e.message==='unauthorized'){snapshot=undefined;currentSession=null;if(eventSource){eventSource.close();eventSource=undefined}login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}return false}}
 async function restoreRoute(){if(!await refresh())return;const match=location.hash.match(/^#conversation\/([A-Za-z0-9_-]+)$/);if(match)await openConversation(match[1])}
 function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>';shells.innerHTML=(session.active_user_shells||[]).map(x=>`<div class="queue-item"><span>$ ${escapeHtml(x.command)}</span><button class="danger" data-shell-id="${escapeAttr(x.id)}">Cancel</button></div>`).join('')||'<p class="dim">No running shells.</p>'}
+// Every snapshot revision re-renders the conversation. Rebuilding a card the
+// user is answering would wipe the half-filled form and steal focus, so each
+// pending request keeps its live DOM until the request itself changes or
+// leaves the snapshot.
+const elicitationCards=new Map(),sentElicitations=new Set();
+function elicitationKey(sessionId,id){return `${sessionId}\u001f${id}`}
+function elicitationOptionLabel(option){return option.description?`${option.title} \u2014 ${option.description}`:option.title}
+function elicitationControl(field){if(field.kind==='single_select'||field.kind==='multi_select'){const select=document.createElement('select');select.multiple=field.kind==='multi_select';if(!select.multiple&&!field.required)select.appendChild(new Option('',''));for(const option of field.options||[])select.appendChild(new Option(elicitationOptionLabel(option),option.value));if(field.kind==='single_select'&&field.default!=null)select.value=field.default;if(select.multiple&&(field.default||[]).length)for(const option of select.options)option.selected=field.default.includes(option.value);return select}const input=document.createElement('input');input.type=field.kind==='boolean'?'checkbox':(field.kind==='integer'||field.kind==='number'?'number':(field.secret?'password':'text'));if(field.kind==='integer')input.step='1';if(field.kind==='number')input.step='any';if(field.minimum!=null)input.min=field.minimum;if(field.maximum!=null)input.max=field.maximum;if(field.min_length!=null)input.minLength=field.min_length;if(field.max_length!=null)input.maxLength=field.max_length;if(field.pattern)input.pattern=field.pattern;if(field.kind==='boolean')input.checked=field.default===true;else if(field.default!=null)input.value=String(field.default);return input}
+function elicitationFieldValue(field,control){if(field.kind==='multi_select'){const values=[...control.selectedOptions].map(option=>option.value);return values.length||field.required?values:undefined}if(field.kind==='boolean')return control.checked;if(control.value==='')return field.required&&(field.kind==='text'||field.kind==='single_select')?'':undefined;if(field.kind==='integer')return Number.parseInt(control.value,10);if(field.kind==='number')return Number(control.value);return control.value}
+// Builds the controls and returns collect(), which reads them back as ACP
+// content. A custom answer replaces the select it belongs to unless the
+// request pairs it with one specific option, which is how Hel's chat form
+// submits the same request.
+function buildElicitationForm(form,request,register){const entries=[];for(const field of request.fields||[]){const wrapper=document.createElement('label');wrapper.className='elicitation-field';const label=document.createElement('span');label.textContent=`${field.title}${field.required?' *':''}`;const control=elicitationControl(field);control.required=Boolean(field.required)&&field.kind!=='boolean';register(control);wrapper.append(label,control);if(field.description){const description=document.createElement('span');description.className='dim';description.textContent=field.description;wrapper.append(description)}if(field.kind==='multi_select'){const check=()=>{const count=control.selectedOptions.length;const few=field.min_items!=null&&(count>0||field.required)&&count<field.min_items;const many=field.max_items!=null&&count>field.max_items;control.setCustomValidity(few?`Select at least ${field.min_items} option(s).`:(many?`Select at most ${field.max_items} option(s).`:''))};control.addEventListener('change',check);check()}form.append(wrapper);entries.push({field,control})}const customByOwner=new Map();for(const entry of entries){const owner=entry.field.custom_answer_for;if(!owner||entry.field.kind!=='text'||customByOwner.has(owner))continue;const target=entries.find(candidate=>candidate.field.id===owner);if(!target||!Array.isArray(target.field.options))continue;customByOwner.set(owner,entry)}return()=>{for(const entry of entries)if(entry.field.kind==='text')entry.control.value=entry.control.value.trim();if(!form.reportValidity())return null;const active=new Map();for(const [owner,entry] of customByOwner)if(entry.control.value!=='')active.set(owner,entry);const content={};for(const entry of entries){const {field,control}=entry;if(customByOwner.get(field.custom_answer_for)===entry){if(active.has(field.custom_answer_for))content[field.id]=control.value;continue}const custom=active.get(field.id);if(custom&&custom.field.custom_answer_option==null)continue;const value=elicitationFieldValue(field,control);if(value!==undefined)content[field.id]=value}return content}}
+function buildElicitationCard(session,request){const card=document.createElement('section');card.className='card elicitation';const heading=document.createElement('strong');heading.textContent=request.title||'Input needed';const message=document.createElement('pre');message.className='elicitation-message';message.textContent=request.message;const form=document.createElement('form');const status=document.createElement('p');status.className='dim';const gated=[],register=control=>{gated.push(control);return control};const collect=buildElicitationForm(form,request,register);const actions=document.createElement('div');actions.className='row';const send=document.createElement('button');send.type='submit';send.textContent='Send answer';register(send);const decline=document.createElement('button');decline.type='button';decline.className='secondary';decline.textContent='Decline';register(decline);const cancel=document.createElement('button');cancel.type='button';cancel.className='danger';cancel.textContent='Cancel';register(cancel);decline.addEventListener('click',()=>{submitElicitation(session.id,request.id,{action:'decline'})});cancel.addEventListener('click',()=>{submitElicitation(session.id,request.id,{action:'cancel'})});actions.append(send,decline,cancel);form.append(actions);form.addEventListener('submit',event=>{event.preventDefault();const content=collect();if(content)submitElicitation(session.id,request.id,{action:'accept',content})});const nodes=[heading];if(request.description){const description=document.createElement('p');description.className='dim';description.textContent=request.description;nodes.push(description)}nodes.push(message,form,status);card.append(...nodes);return{card,setSent(sent){for(const control of gated)control.disabled=sent;status.textContent=sent?'Answer sent \u2014 waiting for the session to apply it.':''}}}
+function renderElicitations(session){const pending=(session&&session.pending_elicitations)||[];if(session)for(const key of [...sentElicitations])if(key.startsWith(`${session.id}\u001f`)&&!pending.some(request=>elicitationKey(session.id,request.id)===key))sentElicitations.delete(key);const live=new Set(),cards=[];for(const request of pending){const key=elicitationKey(session.id,request.id),signature=JSON.stringify(request);live.add(key);let entry=elicitationCards.get(key);if(!entry||entry.signature!==signature){entry=buildElicitationCard(session,request);entry.signature=signature;elicitationCards.set(key,entry)}entry.setSent(sentElicitations.has(key));cards.push(entry.card)}for(const key of [...elicitationCards.keys()])if(!live.has(key))elicitationCards.delete(key);const mounted=[...elicitations.children];if(mounted.length!==cards.length||cards.some((card,index)=>mounted[index]!==card))elicitations.replaceChildren(...cards)}
+async function submitElicitation(sessionId,elicitationId,response){const key=elicitationKey(sessionId,elicitationId);if(sentElicitations.has(key))return;sentElicitations.add(key);const rerender=()=>{const session=snapshot?.sessions.find(x=>x.id===sessionId);if(session&&sessionId===currentSession)renderElicitations(session)};rerender();try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'respond-elicitation',session_id:sessionId,elicitation_id:elicitationId,response})});document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){sentElicitations.delete(key);document.querySelector('#conversation-error').textContent=err.message;rerender()}}
 function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
 async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;if(cursor>acknowledged){const through=cursor;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through})});acknowledged=through}}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
-async function openConversation(id){const session=snapshot?.sessions.find(x=>x.id===id);if(!session?.conversation_available){showDashboard();return}currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');document.querySelector('#conversation-title').textContent=session.title;document.querySelector('#conversation-state').textContent=session.state;renderQueue(session);await loadConversation(false)}
-function showDashboard(){currentSession=null;cursor=0;acknowledged=0;location.hash='';conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
+async function openConversation(id){const session=snapshot?.sessions.find(x=>x.id===id);if(!session?.conversation_available){showDashboard();return}currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');document.querySelector('#conversation-title').textContent=session.title;document.querySelector('#conversation-state').textContent=session.state;renderQueue(session);renderElicitations(session);await loadConversation(false)}
+function showDashboard(){currentSession=null;cursor=0;acknowledged=0;location.hash='';elicitations.replaceChildren();elicitationCards.clear();conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
 document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';await restoreRoute()}catch(err){document.querySelector('#login-error').textContent=err.message}};
 logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
 newTarget.onchange=syncProjectDirectory;
@@ -1410,8 +1468,20 @@ mod tests {
     }
 
     fn app_with_conversations(conversations: BTreeMap<String, BrowserTranscript>) -> TestServer {
+        app_with(conversations, |_| {})
+    }
+
+    fn app_with_snapshot(adjust: impl FnOnce(&mut ViewerSnapshot)) -> TestServer {
+        app_with(BTreeMap::new(), adjust)
+    }
+
+    fn app_with(
+        conversations: BTreeMap<String, BrowserTranscript>,
+        adjust: impl FnOnce(&mut ViewerSnapshot),
+    ) -> TestServer {
         let (config, state) = sample_config_state();
-        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        adjust(&mut snapshot);
         let (_snapshot_tx, snapshot_rx) = watch::channel(snapshot);
         let (_conversation_tx, conversation_rx) = watch::channel(conversations);
         let (action_tx, action_rx) = mpsc::channel(8);
@@ -1559,6 +1629,290 @@ mod tests {
         assert!(!json.contains("secret.registry"));
         assert!(!json.contains("native-secret-id"));
         assert!(json.contains("\"has_error\":true"));
+    }
+
+    fn sample_elicitation() -> ElicitationRequest {
+        ElicitationRequest::from_acp_params(
+            "elicitation-1",
+            serde_json::json!({
+                "sessionId": "session-1",
+                "mode": "form",
+                "message": "Which CI architecture should the workflow use?",
+                "requestedSchema": {
+                    "type": "object",
+                    "required": ["question_0"],
+                    "properties": {
+                        "question_0": {
+                            "type": "string",
+                            "title": "CI architecture",
+                            "oneOf": [
+                                {"const": "reusable", "title": "Reusable workflow"},
+                                {"const": "matrix", "title": "Matrix job"}
+                            ]
+                        },
+                        "question_0_custom": {
+                            "type": "string",
+                            "title": "Other",
+                            "_meta": {"_askUserQuestionCustomAnswer": {
+                                "questionId": "question_0",
+                                "isCustomAnswer": true
+                            }}
+                        }
+                    }
+                }
+            }),
+        )
+        .expect("sample elicitation parses")
+    }
+
+    fn accept(pairs: &[(&str, &str)]) -> ElicitationResponse {
+        ElicitationResponse::Accept {
+            content: pairs
+                .iter()
+                .map(|(id, value)| {
+                    (
+                        (*id).to_owned(),
+                        crate::hel_elicitation::ElicitationValue::String((*value).to_owned()),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn pending_elicitation_snapshot(snapshot: &mut ViewerSnapshot) {
+        snapshot.sessions[0].pending_elicitations = vec![sample_elicitation()];
+    }
+
+    #[tokio::test]
+    async fn elicitation_answer_is_typed_and_forwarded() {
+        let (app, mut actions, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let cookie = login_cookie(&app).await;
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"respond-elicitation","session_id":"session-1","elicitation_id":"elicitation-1","response":{"action":"accept","content":{"question_0":"reusable"}}}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let action = actions.recv().await.unwrap();
+        assert_eq!(
+            action.action,
+            ControllerAction::RespondElicitation {
+                session_id: "session-1".into(),
+                elicitation_id: "elicitation-1".into(),
+                response: accept(&[("question_0", "reusable")]),
+            }
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[tokio::test]
+    async fn elicitation_answer_for_an_unknown_request_is_refused_without_reaching_the_controller()
+    {
+        let (app, mut actions, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let cookie = login_cookie(&app).await;
+        let response = app
+            .oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"respond-elicitation","session_id":"session-1","elicitation_id":"elicitation-9","response":{"action":"cancel"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[test]
+    fn elicitation_answers_are_checked_against_the_request_the_agent_asked() {
+        let (config, state) = sample_config_state();
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        pending_elicitation_snapshot(&mut snapshot);
+        let respond = |response: ElicitationResponse| ControllerAction::RespondElicitation {
+            session_id: "session-1".into(),
+            elicitation_id: "elicitation-1".into(),
+            response,
+        };
+
+        assert!(validate_action(&respond(accept(&[("question_0", "matrix")])), &snapshot).is_ok());
+        // Declining and cancelling never carry content, so they are always
+        // answerable.
+        assert!(validate_action(&respond(ElicitationResponse::Decline), &snapshot).is_ok());
+        // An option the agent never offered, a field it never published, and a
+        // missing required answer are all refused.
+        assert!(validate_action(&respond(accept(&[("question_0", "cron")])), &snapshot).is_err());
+        assert!(validate_action(&respond(accept(&[("smuggled", "yes")])), &snapshot).is_err());
+        assert!(validate_action(&respond(accept(&[])), &snapshot).is_err());
+        // A custom answer stands in for the select it belongs to, exactly as
+        // the chat form submits it.
+        assert!(
+            validate_action(
+                &respond(accept(&[("question_0_custom", "a monorepo pipeline")])),
+                &snapshot,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn oversized_elicitation_answers_are_refused() {
+        let (config, state) = sample_config_state();
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        pending_elicitation_snapshot(&mut snapshot);
+        let long = "x".repeat(MAX_ELICITATION_BYTES);
+        assert!(
+            validate_action(
+                &ControllerAction::RespondElicitation {
+                    session_id: "session-1".into(),
+                    elicitation_id: "elicitation-1".into(),
+                    response: accept(&[("question_0_custom", long.as_str())]),
+                },
+                &snapshot,
+            )
+            .is_err()
+        );
+    }
+
+    /// The card cache is the fix for answers vanishing under snapshot polls, so
+    /// it is exercised as JavaScript: the render source is lifted out of the
+    /// embedded viewer and run against a stub DOM.
+    #[test]
+    fn embedded_viewer_keeps_elicitation_answers_across_snapshot_polls() {
+        let start = VIEWER_HTML
+            .find("const elicitationCards=new Map()")
+            .expect("elicitation card cache");
+        let end = VIEWER_HTML[start..]
+            .find("async function submitElicitation")
+            .map(|offset| start + offset)
+            .expect("elicitation rendering boundary");
+        let source = &VIEWER_HTML[start..end];
+        let dom = r#"
+let replaceCalls = 0;
+class Option {
+  constructor(label, value) {
+    this.label = label;
+    this.value = value;
+    this.selected = false;
+  }
+}
+function makeEl(tag) {
+  return {
+    tagName: tag.toUpperCase(),
+    children: [],
+    options: [],
+    selectedOptions: [],
+    className: "",
+    textContent: "",
+    disabled: false,
+    required: false,
+    value: "",
+    appendChild(child) {
+      this.children.push(child);
+      if (this.tagName === "SELECT") this.options.push(child);
+      return child;
+    },
+    append(...kids) {
+      this.children.push(...kids);
+    },
+    replaceChildren(...kids) {
+      replaceCalls += 1;
+      this.children = kids;
+    },
+    addEventListener() {},
+    setCustomValidity() {},
+    reportValidity() {
+      return true;
+    },
+  };
+}
+const created = [];
+const document = {
+  createElement(tag) {
+    const el = makeEl(tag);
+    created.push(el);
+    return el;
+  },
+};
+const elicitations = makeEl("div");
+async function submitElicitation() {}
+"#;
+        let checks = r#"
+const request = {
+  id: "elicitation-1",
+  message: "Which CI architecture?",
+  title: "CI",
+  fields: [
+    {
+      id: "question_0",
+      title: "CI architecture",
+      required: false,
+      kind: "single_select",
+      options: [{ value: "reusable", title: "Reusable" }, { value: "matrix", title: "Matrix" }],
+    },
+    { id: "question_0_custom", title: "Other", required: false, kind: "text" },
+  ],
+};
+const session = { id: "session-1", pending_elicitations: [request] };
+renderElicitations(session);
+const card = elicitations.children[0];
+const select = created.find((el) => el.tagName === "SELECT");
+const text = created.find((el) => el.tagName === "INPUT");
+select.value = "reusable";
+text.value = "keep me";
+const attachments = replaceCalls;
+renderElicitations(session);
+if (elicitations.children[0] !== card) {
+  throw new Error("a snapshot rebuilt the pending card");
+}
+if (select.value !== "reusable" || text.value !== "keep me") {
+  throw new Error("a snapshot wiped the half-filled answer");
+}
+if (replaceCalls !== attachments) {
+  throw new Error("a snapshot re-attached an unchanged card and dropped focus");
+}
+sentElicitations.add(elicitationKey("session-1", request.id));
+renderElicitations(session);
+if (elicitations.children[0] !== card) {
+  throw new Error("a sent answer rebuilt the card");
+}
+if (!select.disabled || !text.disabled) {
+  throw new Error("a sent answer left the controls live");
+}
+if (select.value !== "reusable") {
+  throw new Error("a sent answer wiped the reply");
+}
+renderElicitations({ id: "session-1", pending_elicitations: [] });
+if (elicitations.children.length !== 0 || elicitationCards.size !== 0) {
+  throw new Error("an answered request stayed rendered");
+}
+if (sentElicitations.size !== 0) {
+  throw new Error("a resolved request kept its sent marker");
+}
+"#;
+        let script = format!("{dom}\n{source}\n{checks}");
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "--eval"])
+            .arg(script)
+            .output()
+            .expect("Node.js is required to exercise the embedded web viewer");
+        assert!(
+            output.status.success(),
+            "embedded viewer elicitation rendering failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]

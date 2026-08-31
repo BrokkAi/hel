@@ -470,13 +470,17 @@ pub(crate) async fn run_server(
     let mut conversations = std::collections::BTreeMap::new();
     let mut queued_prompts = projected_queued_prompts(&controller)?;
     let mut active_user_shells = std::collections::BTreeMap::new();
+    let mut pending_elicitations = std::collections::BTreeMap::new();
     let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
         &controller,
         &phone_workspaces,
         &quotas,
-        &conversations,
-        &queued_prompts,
-        &active_user_shells,
+        &PhoneSessionViews {
+            conversations: &conversations,
+            queued_prompts: &queued_prompts,
+            active_user_shells: &active_user_shells,
+            pending_elicitations: &pending_elicitations,
+        },
         revision,
     ));
     let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
@@ -574,9 +578,12 @@ pub(crate) async fn run_server(
                     &controller,
                     &phone_workspaces,
                     &quotas,
-                    &conversations,
-                    &queued_prompts,
-                    &active_user_shells,
+                    &PhoneSessionViews {
+                        conversations: &conversations,
+                        queued_prompts: &queued_prompts,
+                        active_user_shells: &active_user_shells,
+                        pending_elicitations: &pending_elicitations,
+                    },
                     $revision,
                 )) {
                     tracing::debug!(revision = $revision, %error, "phone snapshot delivery failed; no viewer is subscribed");
@@ -671,6 +678,10 @@ pub(crate) async fn run_server(
                         queued_prompts.insert(
                             update.session_id.clone(),
                             queued_prompt_projection(&snapshot.materialized),
+                        );
+                        pending_elicitations.insert(
+                            update.session_id.clone(),
+                            snapshot.materialized.pending_elicitations.clone(),
                         );
                         revision = daemon_runtime.allocate_revision();
                         conversation_tx.send_replace(conversations.clone());
@@ -850,9 +861,12 @@ pub(crate) async fn run_server(
                             &controller,
                             &phone_workspaces,
                             &quotas,
-                            &conversations,
-                            &queued_prompts,
-                            &active_user_shells,
+                            &PhoneSessionViews {
+                                conversations: &conversations,
+                                queued_prompts: &queued_prompts,
+                                active_user_shells: &active_user_shells,
+                                pending_elicitations: &pending_elicitations,
+                            },
                             revision,
                         )) {
                             tracing::debug!(revision, %error, "phone snapshot delivery failed; no viewer is subscribed");
@@ -947,6 +961,9 @@ pub(crate) async fn run_server(
                             queued_prompts.retain(|session_id, _| {
                                 controller.state.sessions.contains_key(session_id)
                             });
+                            pending_elicitations.retain(|session_id, _| {
+                                controller.state.sessions.contains_key(session_id)
+                            });
                             conversations.retain(|id, _| {
                                 controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
                             });
@@ -1012,7 +1029,8 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
         | ControllerAction::Resume { session_id, .. }
         | ControllerAction::Open { session_id }
         | ControllerAction::Cancel { session_id }
-        | ControllerAction::RemoveQueuedPrompt { session_id, .. } => Some(session_id.clone()),
+        | ControllerAction::RemoveQueuedPrompt { session_id, .. }
+        | ControllerAction::RespondElicitation { session_id, .. } => Some(session_id.clone()),
     }
 }
 
@@ -1258,18 +1276,46 @@ async fn apply_phone_action(
                 .await?;
             Ok(())
         }
+        ControllerAction::RespondElicitation {
+            session_id,
+            elicitation_id,
+            response,
+        } => {
+            services
+                .sessions
+                .session(&session_id)
+                .await?
+                .respond_elicitation(elicitation_id, response)
+                .await
+        }
     }
+}
+
+/// The live, per-session projections the phone snapshot layers on top of the
+/// controller's durable state. They arrive from relay snapshots rather than
+/// from disk, so they travel together instead of as separate arguments.
+struct PhoneSessionViews<'a> {
+    conversations: &'a std::collections::BTreeMap<String, hel::hel_chat::BrowserTranscript>,
+    queued_prompts: &'a std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>>,
+    active_user_shells:
+        &'a std::collections::BTreeMap<String, Vec<hel::hel_worker::ActiveUserShell>>,
+    pending_elicitations:
+        &'a std::collections::BTreeMap<String, Vec<hel::hel_elicitation::ElicitationRequest>>,
 }
 
 fn viewer_snapshot(
     controller: &Controller,
     workspaces: &[hel::hel_workspace::WorkspaceRecord],
     quotas: &std::collections::BTreeMap<String, ProfileQuota>,
-    conversations: &std::collections::BTreeMap<String, hel::hel_chat::BrowserTranscript>,
-    queued_prompts: &std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>>,
-    active_user_shells: &std::collections::BTreeMap<String, Vec<hel::hel_worker::ActiveUserShell>>,
+    views: &PhoneSessionViews<'_>,
     revision: u64,
 ) -> ViewerSnapshot {
+    let PhoneSessionViews {
+        conversations,
+        queued_prompts,
+        active_user_shells,
+        pending_elicitations,
+    } = views;
     let mut snapshot =
         ViewerSnapshot::from_config_state(&controller.config, &controller.state, revision);
     snapshot.workspaces = workspaces
@@ -1319,6 +1365,10 @@ fn viewer_snapshot(
                 started_at_ms: shell.started_at_ms,
             })
             .collect();
+        session.pending_elicitations = pending_elicitations
+            .get(&session.id)
+            .cloned()
+            .unwrap_or_default();
         if let Some(transcript) = conversations.get(&session.id) {
             session.conversation_available = true;
             let mut lines = transcript
@@ -1710,9 +1760,12 @@ mod tests {
                 &controller,
                 &[],
                 &quotas,
-                &std::collections::BTreeMap::new(),
-                &std::collections::BTreeMap::new(),
-                &std::collections::BTreeMap::new(),
+                &PhoneSessionViews {
+                    conversations: &std::collections::BTreeMap::new(),
+                    queued_prompts: &std::collections::BTreeMap::new(),
+                    active_user_shells: &std::collections::BTreeMap::new(),
+                    pending_elicitations: &std::collections::BTreeMap::new(),
+                },
                 1,
             )
             .profiles[0]
