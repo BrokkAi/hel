@@ -1884,7 +1884,10 @@ pub(super) fn render_transcript(
     let title = transcript_title(chat, crate::clock::epoch_seconds());
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .title(title)
+        // The border style reaches the title too, and the title is the name of
+        // the conversation you are in, not chrome. Give it the terminal's own
+        // foreground and leave the rule dim.
+        .title(Line::styled(title, Style::default().fg(Color::Reset)))
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);

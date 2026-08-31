@@ -1083,6 +1083,28 @@ pub(crate) fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut Das
     );
 }
 
+/// The colour the quota bar gives a percentage of headroom left.
+///
+/// Both collapsed panes read the same scale, which is why it lives in one
+/// place: a quota reports the headroom it has left directly, and a CPU reading
+/// is the inverse — a busy host has little left.
+fn headroom_color(headroom_percent: u8) -> Color {
+    match headroom_percent {
+        0..=20 => Color::Red,
+        21..=50 => Color::Yellow,
+        _ => Color::Green,
+    }
+}
+
+/// One reading in a collapsed pane: a name, its value, and how healthy the
+/// value is. A reading with no health to report draws in the ordinary
+/// foreground rather than claiming a colour it has not earned.
+struct SummaryReading {
+    name: String,
+    value: String,
+    color: Option<Color>,
+}
+
 /// One row summarising every target host and its CPU load, for the collapsed
 /// Targets pane.
 ///
@@ -1098,27 +1120,40 @@ pub(crate) fn minimized_targets_line(dashboard: &DashboardState, width: u16) -> 
         .capacity_details
         .values()
         .map(|detail| {
-            let reading = if detail.refreshing {
-                "refreshing…".to_string()
-            } else {
-                let value = match (&detail.target.kind, &detail.usage) {
-                    (DeploymentCapacityKind::Host, Some(usage)) => usage
-                        .cpu_percent
-                        .map_or_else(|| "no CPU".to_string(), |cpu| format!("{cpu}%")),
-                    // Fleet probes report cores, memory and disk; they never
-                    // carry a CPU percentage.
-                    (DeploymentCapacityKind::AwsFleet, Some(_)) => "no CPU".to_string(),
-                    (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => {
-                        "on demand".to_string()
-                    }
-                    _ => "unavailable".to_string(),
+            if detail.refreshing {
+                return SummaryReading {
+                    name: detail.target.host.clone(),
+                    value: "refreshing…".into(),
+                    color: None,
                 };
-                match capacity_staleness(detail, now_epoch_seconds) {
-                    Some(_) => format!("{value} (stale)"),
-                    None => value,
+            }
+            let (value, cpu_percent) = match (&detail.target.kind, &detail.usage) {
+                (DeploymentCapacityKind::Host, Some(usage)) => match usage.cpu_percent {
+                    Some(cpu) => (format!("{cpu}%"), Some(cpu)),
+                    None => ("no CPU".to_string(), None),
+                },
+                // Fleet probes report cores, memory and disk; they never carry
+                // a CPU percentage.
+                (DeploymentCapacityKind::AwsFleet, Some(_)) => ("no CPU".to_string(), None),
+                (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => {
+                    ("on demand".to_string(), None)
                 }
+                _ => ("unavailable".to_string(), None),
             };
-            format!("{} {reading}", detail.target.host)
+            let stale = capacity_staleness(detail, now_epoch_seconds).is_some();
+            SummaryReading {
+                name: detail.target.host.clone(),
+                value: if stale {
+                    format!("{value} (stale)")
+                } else {
+                    value
+                },
+                // A busy host has little headroom, so the scale runs the other
+                // way round from a quota's.
+                color: cpu_percent
+                    .filter(|_| !stale)
+                    .map(|cpu| headroom_color(100_u8.saturating_sub(cpu))),
+            }
         })
         .collect::<Vec<_>>();
     summary_row("Targets", &readings, width)
@@ -1126,56 +1161,87 @@ pub(crate) fn minimized_targets_line(dashboard: &DashboardState, width: u16) -> 
 
 /// One row summarising every profile's weekly usage, for the collapsed Quota
 /// pane. The figure is the percentage *used*, which is what the full pane's
-/// bar shows filled.
+/// bar shows filled; its colour comes from the headroom left, so the two
+/// panes agree about when a profile is in trouble.
 pub(crate) fn minimized_quota_line(dashboard: &DashboardState, width: u16) -> Line<'static> {
     let readings = dashboard
         .config
         .profiles
         .iter()
         .map(|(id, profile)| {
-            let reading = if profile.kind == HarnessKind::Deepseek {
+            if profile.kind == HarnessKind::Deepseek {
                 // Usage-priced, so there is no subscription window to fill.
-                "api".to_string()
-            } else if dashboard.quota_refreshing.contains(id) {
-                "refreshing…".to_string()
-            } else {
-                dashboard
-                    .quotas
-                    .get(id)
-                    .filter(|quota| quota.error.is_none())
-                    .and_then(ProfileQuota::weekly_window)
-                    .and_then(quota_remaining_percent)
-                    .map_or_else(
-                        || "unavailable".to_string(),
-                        |remaining| format!("{}%", 100_u8.saturating_sub(remaining)),
-                    )
-            };
-            format!("{id} {reading}")
+                return SummaryReading {
+                    name: id.clone(),
+                    value: "api".into(),
+                    color: None,
+                };
+            }
+            if dashboard.quota_refreshing.contains(id) {
+                return SummaryReading {
+                    name: id.clone(),
+                    value: "refreshing…".into(),
+                    color: None,
+                };
+            }
+            let remaining = dashboard
+                .quotas
+                .get(id)
+                .filter(|quota| quota.error.is_none())
+                .and_then(ProfileQuota::weekly_window)
+                .and_then(quota_remaining_percent);
+            match remaining {
+                Some(remaining) => SummaryReading {
+                    name: id.clone(),
+                    value: format!("{}%", 100_u8.saturating_sub(remaining)),
+                    color: Some(headroom_color(remaining)),
+                },
+                None => SummaryReading {
+                    name: id.clone(),
+                    value: "unavailable".into(),
+                    color: None,
+                },
+            }
         })
         .collect::<Vec<_>>();
     summary_row("Quota", &readings, width)
 }
 
-/// A collapsed pane's single row: a bold label, then the readings, truncated
-/// rather than wrapped so the row stays one row.
-fn summary_row(label: &str, readings: &[String], width: u16) -> Line<'static> {
-    let body = if readings.is_empty() {
-        "none configured".to_string()
-    } else {
-        readings.join("  ")
-    };
-    let width = usize::from(width);
-    let label_width = label.chars().count() + 2;
-    Line::from(vec![
-        Span::styled(
-            format!("{label}  "),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            crate::widgets::truncate_text(&body, width.saturating_sub(label_width)),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ])
+/// A collapsed pane's single row, drawn as the pane's own title so it keeps
+/// the rule the full pane has. Readings are comma-separated and truncated
+/// rather than wrapped, because the row is one row.
+fn summary_row(label: &str, readings: &[SummaryReading], width: u16) -> Line<'static> {
+    let mut spans = vec![Span::raw(format!("{label}  "))];
+    let mut used = label.chars().count() + 2;
+    // Leave room for the rule the title sits against, so the readings never
+    // push it off the row and it never butts straight against a value.
+    let budget = usize::from(width).saturating_sub(6);
+    if readings.is_empty() {
+        spans.push(Span::raw("none configured "));
+        return Line::from(spans);
+    }
+    for (index, reading) in readings.iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        let text = format!("{separator}{} {}", reading.name, reading.value);
+        let text_width = text.chars().count();
+        if used + text_width > budget {
+            spans.push(Span::raw(if index == 0 { "… " } else { ", … " }));
+            return Line::from(spans);
+        }
+        used += text_width;
+        if !separator.is_empty() {
+            spans.push(Span::raw(separator));
+        }
+        spans.push(Span::raw(format!("{} ", reading.name)));
+        spans.push(match reading.color {
+            Some(color) => Span::styled(reading.value.clone(), Style::default().fg(color)),
+            None => Span::raw(reading.value.clone()),
+        });
+    }
+    // The rule picks up where the title stops, so the title closes with a
+    // space the way a bordered pane's does.
+    spans.push(Span::raw(" "));
+    Line::from(spans)
 }
 
 fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
@@ -2533,6 +2599,74 @@ mod tests {
         assert!(quota.contains("claude-1 unavailable"), "{quota:?}");
     }
 
+    /// The collapsed rows read as pane titles: the pane's rule, plain text,
+    /// and readings separated by commas. Colour is the only thing carrying
+    /// meaning, and it comes from the same scale the full quota bar uses.
+    #[test]
+    fn the_collapsed_rows_keep_the_pane_rule_and_colour_by_headroom() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![
+            test_capacity_target(),
+            hel::hel_targets::DeploymentCapacityTarget {
+                id: "morannon".into(),
+                host: "morannon".into(),
+                ..test_capacity_target()
+            },
+        ]);
+        // A quiet host has headroom; a busy one does not.
+        dashboard.apply_deployment_capacity("local", Ok(Some(host_usage(3))), now_seconds());
+        dashboard.apply_deployment_capacity("morannon", Ok(Some(host_usage(95))), now_seconds());
+        // 63% of the weekly window left reads as 37% used, and still healthy.
+        dashboard.apply_quota(weekly_quota("claude-1", 63));
+        // 10% left is 90% used, and in trouble.
+        dashboard.apply_quota(weekly_quota("codex-1", 10));
+        dashboard.toggle_support_panes();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw the collapsed panes");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+
+        let targets_row = lines
+            .iter()
+            .position(|line| line.starts_with("Targets"))
+            .expect("the collapsed Targets row");
+        let targets = &lines[targets_row];
+        assert!(targets.contains("local 3%, morannon 95%"), "{targets:?}");
+        assert!(
+            targets.ends_with('─'),
+            "the collapsed pane keeps its rule: {targets:?}"
+        );
+
+        let quota_row = lines
+            .iter()
+            .position(|line| line.starts_with("Quota"))
+            .expect("the collapsed Quota row");
+        assert!(
+            lines[quota_row].contains("claude-1 37%, codex-1 90%"),
+            "{:?}",
+            lines[quota_row]
+        );
+
+        // The colour of a value, by the column its first digit sits in.
+        let colour_of = |row: usize, needle: &str| {
+            let column = cell_column(&lines[row], needle);
+            buffer[(column, row as u16)].fg
+        };
+        // A quiet host has headroom left, a busy one does not; a quota reads
+        // the same scale on the headroom it reports.
+        assert_eq!(colour_of(targets_row, "3%"), Color::Green);
+        assert_eq!(colour_of(targets_row, "95%"), Color::Red);
+        assert_eq!(colour_of(quota_row, "37%"), Color::Green);
+        assert_eq!(colour_of(quota_row, "90%"), Color::Red);
+        // The label and the names are ordinary text; only the values carry a
+        // colour.
+        assert_eq!(colour_of(targets_row, "Targets"), Color::Reset);
+        assert_eq!(colour_of(targets_row, "morannon"), Color::Reset);
+    }
+
     /// A collapsed pane is one row by definition, so more hosts than fit have
     /// to be cut rather than wrapped onto a second row.
     #[test]
@@ -2556,7 +2690,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1, "{lines:#?}");
         assert!(rows[0].chars().count() <= 60);
-        assert!(rows[0].ends_with('…'), "{:?}", rows[0]);
+        assert!(
+            rows[0].contains('…'),
+            "the readings are cut rather than wrapped: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[0].ends_with('─'),
+            "the collapsed pane keeps its rule: {:?}",
+            rows[0]
+        );
     }
 
     #[test]
@@ -3172,32 +3315,21 @@ mod tests {
         assert!(rendered.contains("┌ Targets"));
         assert!(!rendered.contains("[focused]"));
 
-        dashboard.handle_key(key(KeyCode::Tab));
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("╔ Quota"), "{rendered:?}");
-
-        dashboard.handle_key(key(KeyCode::Tab));
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("╔ Targets"), "{rendered:?}");
-        assert!(!rendered.contains("[focused]"));
+        for (focus, doubled) in [(Focus::Quota, "╔ Quota"), (Focus::Targets, "╔ Targets")] {
+            dashboard.focus = focus;
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .expect("draw dashboard");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains(doubled), "{focus:?}: {rendered:?}");
+            assert!(!rendered.contains("[focused]"));
+        }
     }
 
     #[test]
@@ -3222,8 +3354,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut initial_name_columns = None;
 
-        for expected_focus in [Focus::Sessions, Focus::Quota, Focus::Targets] {
-            assert_eq!(dashboard.focus, expected_focus);
+        for expected_focus in [Focus::Sessions, Focus::Targets, Focus::Quota] {
+            dashboard.focus = expected_focus;
             terminal
                 .draw(|frame| render(frame, &mut dashboard))
                 .expect("draw dashboard");
@@ -3260,8 +3392,6 @@ mod tests {
                 assert_eq!(name_columns[0], name_columns[1]);
                 initial_name_columns = Some(name_columns);
             }
-
-            dashboard.handle_key(key(KeyCode::Tab));
         }
         assert!(initial_name_columns.is_some());
     }
