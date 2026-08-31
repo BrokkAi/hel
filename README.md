@@ -153,14 +153,24 @@ agents are doing and how loaded your machines are.
 Hel opens on the session whose agent spoke most recently, with the cursor in
 Prompt.
 
-`Tab` moves the keyboard between Sessions, Quota, Targets and Prompt, and
-`Shift+Tab` reverses it. The transcript is not a Tab stop: read it with the
-mouse wheel or `PageUp`/`PageDown` from wherever you are.
+`Tab` moves the keyboard down the layout — Sessions, Prompt, Targets, Quota —
+and `Shift+Tab` reverses it. Once the support panes are collapsed the ring is
+the two panes that are still lists. The transcript is not a Tab stop: read it
+with the mouse wheel or `PageUp`/`PageDown` from wherever you are.
 
-`Ctrl+G` collapses Targets and Quota into one summary row each — host names
-with CPU load, profile names with weekly quota remaining — and gives the rows
-they free to the transcript. `Ctrl+G` again brings them back. `F2` opens the
-workspace picker, `F3` the web viewer, and `Ctrl+Q` detaches.
+`Ctrl+G` is a dial with three positions, each giving the conversation more
+room than the last, and it wraps back to the first:
+
+1. every pane at full size;
+2. Targets and Quota collapsed to one summary row each — host names with CPU
+   load, profile names with weekly quota remaining;
+3. those, and the session list down to one line per session.
+
+Tab leaves the dial where you set it, with one exception: from the third
+position, asking for another pane is asking for the session list back, so Tab
+opens the dial one position and lands on Sessions.
+
+`F2` opens the workspace picker, `F3` the web viewer, and `Ctrl+Q` detaches.
 
 The panes take plain keys, because the composer is a separate focus and never
 sees them. On Sessions: `Enter` opens the selection, `n` creates a session, `s`

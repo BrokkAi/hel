@@ -186,7 +186,8 @@ pub fn render_combined(
         return;
     }
 
-    let minimized = dashboard.support_minimized();
+    let layout = dashboard.pane_layout();
+    let minimized = layout.support_collapsed();
     let focus = dashboard.focus();
     let sessions_cap = if focus == Focus::Sessions {
         area.height / 2

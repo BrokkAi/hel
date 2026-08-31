@@ -1067,7 +1067,7 @@ impl ActiveChat {
             ChatAction::CycleFocus { reverse } => {
                 return ChatEventOutcome::CycleFocus { reverse };
             }
-            ChatAction::ToggleSupportPanes => return ChatEventOutcome::ToggleSupportPanes,
+            ChatAction::CyclePaneLayout => return ChatEventOutcome::CyclePaneLayout,
             ChatAction::OpenWebDialog => return ChatEventOutcome::OpenWebDialog,
             ChatAction::QuitDetach => {
                 self.cancel_dictation();

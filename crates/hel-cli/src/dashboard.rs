@@ -1999,8 +1999,8 @@ impl DashboardContext {
                 self.dashboard.cycle_focus(reverse);
                 self.dirty = true;
             }
-            hel::hel_chat::ChatEventOutcome::ToggleSupportPanes => {
-                self.dashboard.toggle_support_panes();
+            hel::hel_chat::ChatEventOutcome::CyclePaneLayout => {
+                self.dashboard.cycle_pane_layout();
                 self.dirty = true;
             }
             hel::hel_chat::ChatEventOutcome::OpenWebDialog => {

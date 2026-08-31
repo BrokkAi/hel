@@ -190,13 +190,13 @@ pub(crate) struct SessionRowsRendered {
 /// The Sessions pane's title.
 ///
 /// The P and S legend explains the prefixes on the expanded rows' agent
-/// lines, so it only appears while the pane is drawing them.
-pub(crate) fn sessions_pane_title(width: u16, focused: bool) -> &'static str {
+/// lines, so it only appears while the pane is drawing those rows.
+pub(crate) fn sessions_pane_title(width: u16, expanded: bool) -> &'static str {
     const FULL: &str = " Sessions · P=time since prompt · S=time since agent activity ";
     const MEDIUM: &str = " Sessions · P=prompt age · S=agent silence ";
     const COMPACT: &str = " Sessions P=prompt S=silence ";
 
-    if !focused {
+    if !expanded {
         return " Sessions ";
     }
     let available = usize::from(width.saturating_sub(2));
@@ -292,11 +292,10 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                     base_target
                 };
                 let permission = session_permission_badge(session, operation, &dashboard.config);
-                let selected = if dashboard.focus() == Focus::Sessions {
-                    dashboard.selected_session_id.as_deref() == Some(session.id.as_str())
-                } else {
-                    dashboard.current_session_id() == Some(session.id.as_str())
-                };
+                // The selection drives which conversation is on screen, so
+                // the caret marks it in both forms.
+                let selected =
+                    dashboard.selected_session_id.as_deref() == Some(session.id.as_str());
                 let prefix = if selected { "› " } else { "  " };
                 let (heading_key, heading_line) = match pending_heading.take() {
                     Some((key, line)) => (Some(key), Some(line)),
@@ -304,7 +303,7 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                 };
                 let mut lines = Vec::new();
                 lines.extend(heading_line);
-                if expanded && dashboard.focus() == Focus::Sessions {
+                if expanded && !dashboard.pane_layout().sessions_compact() {
                     expanded_session_lines(
                         &mut lines,
                         dashboard,
@@ -317,7 +316,7 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                         permission,
                         width,
                     );
-                } else if dashboard.focus() == Focus::Sessions {
+                } else if !dashboard.pane_layout().sessions_compact() {
                     lines.push(collapsed_session_line(
                         prefix,
                         &target,
@@ -334,7 +333,7 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                         usize::from(width.saturating_sub(4)),
                     ));
                 }
-                let spacing = u16::from(expanded && dashboard.focus() == Focus::Sessions);
+                let spacing = u16::from(expanded && !dashboard.pane_layout().sessions_compact());
                 rows.push(DrawnSessionRow {
                     session: Some(index),
                     heading: heading_key,
@@ -513,7 +512,8 @@ pub(crate) fn render_sessions(
 ) -> SessionRowsRendered {
     let drawn = drawn_session_rows(dashboard, area.width);
     let focused = dashboard.focus() == Focus::Sessions;
-    let mut title = vec![Span::raw(sessions_pane_title(area.width, focused))];
+    let expanded = !dashboard.pane_layout().sessions_compact();
+    let mut title = vec![Span::raw(sessions_pane_title(area.width, expanded))];
     let room = usize::from(area.width).saturating_sub(title[0].width() + 4);
     if room > 8 && !dashboard.greeting.is_empty() {
         title.push(Span::styled(
@@ -2486,7 +2486,7 @@ mod tests {
         }
 
         let before = drawn(&mut dashboard, 140, 32);
-        dashboard.toggle_support_panes();
+        dashboard.cycle_pane_layout();
         let after = drawn(&mut dashboard, 140, 32);
 
         let freed = (band(&before, "Targets", "Quota") - band(&after, "Targets", "Quota"))
@@ -2579,7 +2579,8 @@ mod tests {
     #[test]
     fn a_compact_session_row_names_its_project_target_clock_and_last_line() {
         let mut dashboard = dashboard_with_session(running_session());
-        dashboard.focus_prompt();
+        dashboard.cycle_pane_layout();
+        dashboard.cycle_pane_layout();
         apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "the latest word")]);
 
         let lines = drawn(&mut dashboard, 120, 34);
@@ -2597,7 +2598,7 @@ mod tests {
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
         dashboard.apply_deployment_capacity("local", Ok(Some(host_usage(42))), now_seconds());
         dashboard.apply_quota(weekly_quota("claude-1", 63));
-        dashboard.toggle_support_panes();
+        dashboard.cycle_pane_layout();
 
         let lines = drawn(&mut dashboard, 120, 34);
         let targets = lines
@@ -2635,7 +2636,7 @@ mod tests {
     fn an_exhausted_quota_reads_zero_in_the_collapsed_row() {
         let mut dashboard = dashboard_with_session(running_session());
         dashboard.apply_quota(weekly_quota("claude-1", 0));
-        dashboard.toggle_support_panes();
+        dashboard.cycle_pane_layout();
 
         let quota = drawn(&mut dashboard, 120, 34)
             .into_iter()
@@ -2651,7 +2652,7 @@ mod tests {
     fn the_minimized_rows_stay_explicit_about_readings_they_do_not_have() {
         let mut dashboard = dashboard_with_session(running_session());
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
-        dashboard.toggle_support_panes();
+        dashboard.cycle_pane_layout();
 
         // No sample at all.
         let lines = drawn(&mut dashboard, 120, 34);
@@ -2750,7 +2751,7 @@ mod tests {
         dashboard.apply_quota(weekly_quota("claude-1", 63));
         // Nearly none, and in trouble.
         dashboard.apply_quota(weekly_quota("codex-1", 10));
-        dashboard.toggle_support_panes();
+        dashboard.cycle_pane_layout();
 
         let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
         terminal
@@ -2811,7 +2812,7 @@ mod tests {
                 })
                 .collect(),
         );
-        dashboard.toggle_support_panes();
+        dashboard.cycle_pane_layout();
 
         let lines = drawn(&mut dashboard, 60, 34);
         let rows = lines
@@ -3497,17 +3498,16 @@ mod tests {
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>();
-            // Exactly one caret on the screen at a time: the focused pane's,
-            // and nobody else's.
-            assert_eq!(
-                lines
-                    .iter()
-                    .flat_map(|line| line.chars())
-                    .filter(|character| *character == '›')
-                    .count(),
-                1,
-                "{expected_focus:?}"
-            );
+            // The Sessions pane always marks the conversation on screen, and
+            // a focused table marks its own row. Nothing else draws a caret,
+            // so a support pane that does not have focus adds none.
+            let carets = lines
+                .iter()
+                .flat_map(|line| line.chars())
+                .filter(|character| *character == '›')
+                .count();
+            let expected_carets = usize::from(expected_focus != Focus::Sessions) + 1;
+            assert_eq!(carets, expected_carets, "{expected_focus:?}");
             if expected_focus == Focus::Sessions {
                 // Both sessions draw their expanded form, and the caret on one
                 // of them does not shift the other's columns.

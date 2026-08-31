@@ -104,9 +104,13 @@ exactly.
 The pane keys only work while a pane has focus, and the surface opens with the
 keyboard in Prompt, so a sweep has to Tab first or the letters land in the
 composer as text. Tab walks Sessions, Quota, Targets, Prompt; Shift+Tab
-reverses it. Ctrl+G collapses Targets and Quota to one row each and returns the
-keyboard to Prompt; Ctrl+G again restores them. F2 is Workspaces, F3 is the web
-viewer, Ctrl+Q detaches.
+reverses it. Ctrl+G is a three-position dial over the panes: every pane open,
+then Targets and Quota collapsed to one row each, then those plus the session
+list down to one line per session, then back to the first. It only moves the
+keyboard when the position it lands on collapses the pane the keyboard was on.
+Tab leaves the dial alone except from the last position, where it opens one
+position and lands on Sessions. F2 is Workspaces, F3 is the web viewer, Ctrl+Q
+detaches.
 
 Escape no longer quits. It cancels a running turn or a shell command and closes
 dialogs, so a sweep can use it freely — but a report that Escape "failed to
