@@ -29,10 +29,10 @@ pub use protocol::{
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
     ActiveAgentTerminal, ActiveRelayPrompt, ActiveUserShell, CheckpointPurpose,
-    ClaimedRelayCommand, QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_FORMAT_V2,
-    RelayCommand, RelayCommandKind, RelayCommandOutcome, RelayCursor, RelayEvent,
-    RelayExecutionState, RelayObservation, RelayOperationalState, UserShellResult, UserShellStatus,
-    relay_event_digest, validate_relay_event, validate_relay_event_self,
+    ClaimedRelayCommand, ClaimedSteeringPrompt, QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1,
+    RELAY_EVENT_FORMAT_V2, RelayCommand, RelayCommandKind, RelayCommandOutcome, RelayCursor,
+    RelayEvent, RelayExecutionState, RelayObservation, RelayOperationalState, UserShellResult,
+    UserShellStatus, relay_event_digest, validate_relay_event, validate_relay_event_self,
 };
 pub use types::{
     ActivePrompt, Attachment, QueuedPrompt, SequencedEvent, WorkerEvent, WorkerPhase,
@@ -1256,6 +1256,19 @@ impl DurableRelay {
         let mut claimed = Vec::with_capacity(claimable.len());
         let mut next_snapshot = self.snapshot.clone();
         for (accepted_ordinal, command_id) in claimable {
+            let steering_prompt = matches!(
+                next_snapshot.dispatches[&command_id].command,
+                RelayCommand::Cancel
+            )
+            .then(|| next_snapshot.queued_prompts.first())
+            .flatten()
+            .and_then(|queued| match &queued.payload {
+                StoredQueuedRelayPayload::Prompt { prompt } => Some(ClaimedSteeringPrompt {
+                    queued_command_id: queued.command_id.clone(),
+                    prompt: prompt.clone(),
+                }),
+                StoredQueuedRelayPayload::SetConfig { .. } => None,
+            });
             let dispatch = next_snapshot
                 .dispatches
                 .get_mut(&command_id)
@@ -1291,6 +1304,7 @@ impl DurableRelay {
                 accepted_ordinal,
                 command: dispatch.command.clone(),
                 hidden_prompt_context,
+                steering_prompt,
             });
         }
         if !claimed.is_empty() {
@@ -1376,6 +1390,7 @@ impl DurableRelay {
                 accepted_ordinal,
                 command: dispatch.command.clone(),
                 hidden_prompt_context: None,
+                steering_prompt: None,
             });
         }
         if !claimed.is_empty() {
@@ -3544,15 +3559,64 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
         submit_relay(&mut relay, "cancelled-prompt", prompt("keep running"));
-        let prompt = relay.claim_pending_commands(true).unwrap();
-        assert_eq!(prompt.len(), 1);
-        assert_eq!(prompt[0].command_id, "cancelled-prompt");
+        let claimed_prompt = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed_prompt.len(), 1);
+        assert_eq!(claimed_prompt[0].command_id, "cancelled-prompt");
 
+        submit_relay(&mut relay, "queued-correction", prompt("change direction"));
         submit_relay(&mut relay, "cancel-command", RelayCommand::Cancel);
         let cancel = relay.claim_pending_commands(true).unwrap();
         assert_eq!(cancel.len(), 1);
         assert_eq!(cancel[0].command_id, "cancel-command");
         assert!(matches!(cancel[0].command, RelayCommand::Cancel));
+        let steering = cancel[0]
+            .steering_prompt
+            .as_ref()
+            .expect("cancel carries the queued prompt head");
+        assert_eq!(steering.queued_command_id, "queued-correction");
+        assert_eq!(
+            steering.prompt,
+            vec![ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("change direction")
+            )]
+        );
+
+        relay
+            .record_command_completed(
+                "cancel-command",
+                RelayCommandOutcome::Steered {
+                    queued_command_id: "queued-correction".into(),
+                },
+            )
+            .unwrap();
+        let state = relay.operational_state();
+        assert_eq!(state.execution, RelayExecutionState::Running);
+        assert_eq!(state.active_prompt.unwrap().command_id, "cancelled-prompt");
+        assert!(state.queued_prompts.is_empty());
+
+        let mut session = crate::hel_state::MaterializedSession::empty(SESSION);
+        for event in relay.events_after(0, RELAY_EVENT_GENESIS_DIGEST).unwrap() {
+            let projected = crate::hel_projection::project_relay_event(&session, &event).unwrap();
+            crate::hel_projection::apply_committed_projection_event(
+                &mut session,
+                &event,
+                projected.mutation,
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            session.execution,
+            crate::hel_state::MaterializedExecutionState::Running { .. }
+        ));
+        assert!(session.queued_prompts.is_empty());
+        assert_eq!(
+            session
+                .transcript
+                .iter()
+                .filter(|item| matches!(item.body, crate::hel_state::TranscriptBody::User { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -3576,6 +3640,7 @@ mod tests {
         assert_eq!(cancel.len(), 1);
         assert_eq!(cancel[0].command_id, "cancel-after-config");
         assert!(matches!(cancel[0].command, RelayCommand::Cancel));
+        assert!(cancel[0].steering_prompt.is_none());
         relay
             .record_command_completed("cancel-after-config", RelayCommandOutcome::Cancelled)
             .unwrap();

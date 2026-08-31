@@ -508,6 +508,7 @@ pub enum RelayCommandOutcome {
     Configured,
     SessionModeSet,
     Cancelled,
+    Steered { queued_command_id: String },
     Closed,
     QueueChanged { removed_command_ids: Vec<String> },
     CheckpointCompleted,
@@ -517,12 +518,20 @@ pub enum RelayCommandOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClaimedSteeringPrompt {
+    pub queued_command_id: String,
+    pub prompt: Vec<ContentBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimedRelayCommand {
     pub command_id: String,
     pub accepted_ordinal: u64,
     pub command: RelayCommand,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_prompt_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_prompt: Option<ClaimedSteeringPrompt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1277,6 +1286,44 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
                     snapshot.config.insert("mode".to_owned(), mode_id);
                 }
                 (RelayCommand::Cancel, RelayCommandOutcome::Cancelled) => {}
+                (RelayCommand::Cancel, RelayCommandOutcome::Steered { queued_command_id }) => {
+                    let queued = snapshot
+                        .queued_prompts
+                        .first()
+                        .ok_or_else(|| anyhow!("steered prompt is no longer queued"))?;
+                    if queued.command_id != *queued_command_id
+                        || !matches!(queued.payload, StoredQueuedRelayPayload::Prompt { .. })
+                    {
+                        bail!("steered prompt is not the queued prompt head");
+                    }
+                    let target = snapshot
+                        .dispatches
+                        .get_mut(queued_command_id)
+                        .ok_or_else(|| anyhow!("steered unknown queued prompt"))?;
+                    if target.state != RelayDispatchState::Queued
+                        || !matches!(target.command, RelayCommand::Prompt { .. })
+                    {
+                        bail!("steered target is not a queued prompt");
+                    }
+                    target.state = RelayDispatchState::Completed;
+                    snapshot
+                        .handled_commands
+                        .get_mut(queued_command_id)
+                        .ok_or_else(|| anyhow!("steered prompt is not in the ledger"))?
+                        .terminal_ordinal = Some(event.ordinal);
+                    snapshot.queued_prompts.remove(0);
+                    if snapshot
+                        .pending_prompt_context
+                        .as_ref()
+                        .and_then(|context| context.attached_command_id.as_deref())
+                        == Some(queued_command_id.as_str())
+                    {
+                        snapshot.pending_prompt_context = None;
+                    }
+                    snapshot.pending_user_shell_contexts.retain(|context| {
+                        context.attached_command_id.as_deref() != Some(queued_command_id.as_str())
+                    });
+                }
                 (RelayCommand::Close { .. }, RelayCommandOutcome::Closed) => {
                     snapshot.execution = RelayExecutionState::Closed;
                     snapshot.active_prompt = None;

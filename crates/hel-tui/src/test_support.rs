@@ -85,6 +85,7 @@ pub(crate) fn mouse_at_row(kind: MouseEventKind, area: Rect, row_offset: u16) ->
 pub(crate) fn config() -> HelConfig {
     HelConfig {
         version: CONFIG_VERSION,
+        newer_config_version: None,
         phone: Default::default(),
         profiles: BTreeMap::from([
             (

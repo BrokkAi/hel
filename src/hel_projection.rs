@@ -3,9 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
-    ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdateFields,
+use agent_client_protocol::schema::{
+    MaybeUndefined,
+    v1::{
+        ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallStatus,
+        ToolCallUpdateFields,
+    },
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -22,7 +25,7 @@ use crate::hel_database::{
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
     TerminalOutputRecord, TranscriptBody, TranscriptItem, config_command_text,
-    normalize_session_title,
+    normalize_session_title, provisional_session_title,
 };
 use crate::hel_worker::{
     RelayCommand, RelayCommandKind, RelayEvent, RelayObservation, validate_relay_event,
@@ -433,15 +436,25 @@ fn project_observation(
             created_at_ms,
         } => match command {
             RelayCommand::Prompt { prompt } => {
+                let content = prompt
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<serde_json::Result<Vec<_>>>()?;
+                if current.session_title.is_none() {
+                    let prompt_text = crate::hel_chat::materialized_content_text(&content);
+                    if let Some(title) = current
+                        .resolved_title()
+                        .or_else(|| provisional_session_title(&prompt_text))
+                    {
+                        mutation.session_title = Some(Some(title));
+                    }
+                }
                 let mut queue = current.queued_prompts.clone();
                 queue.retain(|queued| queued.command_id != *command_id);
                 queue.push(MaterializedQueuedPrompt {
                     command_id: command_id.clone(),
                     kind: QueuedCommandKind::Prompt,
-                    content: prompt
-                        .iter()
-                        .map(serde_json::to_value)
-                        .collect::<serde_json::Result<_>>()?,
+                    content,
                     queued_at_ms: *created_at_ms,
                 });
                 mutation.queued_prompts = Some(queue);
@@ -559,6 +572,32 @@ fn project_observation(
                         .iter()
                         .any(|command_id| command_id == &queued.command_id)
                 }),
+                crate::hel_worker::RelayCommandOutcome::Steered { queued_command_id } => {
+                    let Some(queue_index) = queue
+                        .iter()
+                        .position(|queued| queued.command_id == *queued_command_id)
+                    else {
+                        bail!("steered prompt is missing from the materialized queue");
+                    };
+                    let entry = queue.remove(queue_index);
+                    if !entry.kind.is_prompt() {
+                        bail!("steered queue entry is not a prompt");
+                    }
+                    close_streams(index, mutation, event.recorded_at_ms);
+                    upsert(
+                        mutation,
+                        TranscriptItem {
+                            stable_id: format!("user:{queued_command_id}"),
+                            position: event.ordinal,
+                            latest_content_event_ordinal: None,
+                            created_at_ms: event.recorded_at_ms,
+                            last_changed_at_ms: event.recorded_at_ms,
+                            body: TranscriptBody::User {
+                                content: entry.content,
+                            },
+                        },
+                    );
+                }
                 crate::hel_worker::RelayCommandOutcome::Configured
                 | crate::hel_worker::RelayCommandOutcome::SessionModeSet
                 | crate::hel_worker::RelayCommandOutcome::Cancelled
@@ -998,12 +1037,13 @@ fn project_session_update(
             );
             mutation.configuration = Some(configuration);
         }
-        SessionUpdate::SessionInfoUpdate(update) => {
-            let value = serde_json::to_value(update)?;
-            if let Some(title) = value.get("title") {
-                mutation.session_title = Some(title.as_str().and_then(normalize_session_title));
+        SessionUpdate::SessionInfoUpdate(update) => match &update.title {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => mutation.session_title = Some(None),
+            MaybeUndefined::Value(title) => {
+                mutation.session_title = Some(normalize_session_title(title));
             }
-        }
+        },
         SessionUpdate::AvailableCommandsUpdate(_) | SessionUpdate::UsageUpdate(_) => {}
         _ => {}
     }
@@ -2991,6 +3031,155 @@ mod tests {
             },
         );
         assert_eq!(session.execution, MaterializedExecutionState::Idle);
+    }
+
+    #[test]
+    fn first_queued_prompt_seeds_a_provisional_session_title() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "prompt-1".into(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new(
+                        "  fix the flaky\nresume test  ",
+                    ))],
+                },
+                created_at_ms: 100,
+            },
+        );
+
+        assert_eq!(
+            session.session_title.as_deref(),
+            Some("fix the flaky resume test")
+        );
+    }
+
+    #[test]
+    fn harness_title_replaces_the_provisional_title() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "prompt-1".into(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("first prompt"))],
+                },
+                created_at_ms: 100,
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "prompt-2".into(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("second prompt"))],
+                },
+                created_at_ms: 200,
+            },
+        );
+        assert_eq!(session.session_title.as_deref(), Some("first prompt"));
+
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::SessionInfoUpdate(
+                    agent_client_protocol::schema::v1::SessionInfoUpdate::new()
+                        .title("Agent-generated title"),
+                )),
+            },
+        );
+
+        assert_eq!(
+            session.session_title.as_deref(),
+            Some("Agent-generated title")
+        );
+    }
+
+    #[test]
+    fn session_info_update_without_title_preserves_the_provisional_title() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "prompt-1".into(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("first prompt"))],
+                },
+                created_at_ms: 100,
+            },
+        );
+
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::SessionInfoUpdate(
+                    agent_client_protocol::schema::v1::SessionInfoUpdate::new()
+                        .updated_at("2026-08-31T12:00:00Z"),
+                )),
+            },
+        );
+
+        assert_eq!(session.session_title.as_deref(), Some("first prompt"));
+    }
+
+    #[test]
+    fn explicit_session_title_clear_restores_the_prompt_fallback() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "prompt-1".into(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("first prompt"))],
+                },
+                created_at_ms: 100,
+            },
+        );
+
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::SessionInfoUpdate(
+                    agent_client_protocol::schema::v1::SessionInfoUpdate::new().title(None),
+                )),
+            },
+        );
+
+        assert_eq!(session.session_title, None);
+        assert_eq!(session.resolved_title().as_deref(), Some("first prompt"));
+    }
+
+    #[test]
+    fn next_prompt_backfills_an_existing_untitled_session_from_its_first_prompt() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.transcript.push(Arc::new(TranscriptItem {
+            stable_id: "user:prompt-1".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 100,
+            last_changed_at_ms: 100,
+            body: TranscriptBody::User {
+                content: vec![
+                    serde_json::to_value(ContentBlock::Text(TextContent::new("original task")))
+                        .unwrap(),
+                ],
+            },
+        }));
+        assert_eq!(session.resolved_title().as_deref(), Some("original task"));
+
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "prompt-2".into(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("follow-up task"))],
+                },
+                created_at_ms: 200,
+            },
+        );
+
+        assert_eq!(session.session_title.as_deref(), Some("original task"));
     }
 
     #[test]

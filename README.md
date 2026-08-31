@@ -182,6 +182,12 @@ image = "ghcr.io/brokkai/hel/agent-dev:latest"
 # pull_policy = "auto"
 ```
 
+`version` is the config schema version. A file written by a *newer* Hel still
+loads: the settings this build understands keep working, and the config becomes
+read-only, so the older build refuses to save and never downgrades the file.
+`hel doctor` reports that state. Update Hel, or change settings with the newer
+build, to make it writable again.
+
 Profiles point at harness home directories on your machine — run as many
 profiles per harness as you have accounts. Bundles describe the repositories a
 session checks out (multi-repository bundles give agents a virtual monorepo).

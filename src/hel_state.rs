@@ -160,6 +160,35 @@ impl MaterializedSession {
         self.last_activity_at_ms
     }
 
+    /// Resolve the title exposed by a live materialized session.
+    ///
+    /// Sessions created before provisional titles were projected can still
+    /// have an untitled transcript. Derive the same bounded fallback from
+    /// their first visible user prompt when reading them.
+    pub fn resolved_title(&self) -> Option<String> {
+        self.session_title
+            .as_deref()
+            .and_then(normalize_session_title)
+            .or_else(|| {
+                self.transcript.iter().find_map(|item| {
+                    let TranscriptBody::User { content } = &item.body else {
+                        return None;
+                    };
+                    provisional_session_title(&crate::hel_chat::materialized_content_text(content))
+                })
+            })
+            .or_else(|| {
+                self.queued_prompts
+                    .iter()
+                    .filter(|prompt| prompt.kind.is_prompt())
+                    .find_map(|prompt| {
+                        provisional_session_title(&crate::hel_chat::materialized_content_text(
+                            &prompt.content,
+                        ))
+                    })
+            })
+    }
+
     pub fn unread_agent_messages_after(&self, viewed_through_event_ordinal: u64) -> u64 {
         self.transcript
             .iter()
@@ -1311,6 +1340,30 @@ pub fn normalize_session_title(title: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+/// Build the short-lived title shown before the harness supplies its own.
+///
+/// The first visible user prompt is immediately useful for identifying a
+/// session, but it can be arbitrarily large. Keep this fallback bounded; a
+/// later ACP session-info update remains authoritative and replaces it.
+pub fn provisional_session_title(prompt: &str) -> Option<String> {
+    const MAX_TITLE_CHARS: usize = 64;
+
+    let normalized = normalize_session_title(prompt)?;
+    if normalized.chars().count() <= MAX_TITLE_CHARS {
+        return Some(normalized);
+    }
+
+    let mut truncated = normalized
+        .chars()
+        .take(MAX_TITLE_CHARS - 1)
+        .collect::<String>();
+    if let Some(boundary) = truncated.rfind(char::is_whitespace) {
+        truncated.truncate(boundary);
+    }
+    truncated.push('…');
+    Some(truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1433,7 @@ mod tests {
     fn sample_config() -> HelConfig {
         HelConfig {
             version: CONFIG_VERSION,
+            newer_config_version: None,
             phone: Default::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
@@ -1973,6 +2027,24 @@ mod tests {
         }];
 
         assert_eq!(harness_session_title(&events), None);
+    }
+
+    #[test]
+    fn provisional_title_is_cleaned_and_bounded() {
+        assert_eq!(
+            provisional_session_title(concat!(
+                "<hel-project-memory>private</hel-project-memory> ",
+                "  fix the flaky\nresume test  "
+            ))
+            .as_deref(),
+            Some("fix the flaky resume test")
+        );
+
+        let prompt = format!("{}overflow", "word ".repeat(20));
+        assert_eq!(
+            provisional_session_title(&prompt).as_deref(),
+            Some(format!("{}word…", "word ".repeat(11)).as_str())
+        );
     }
 
     #[test]

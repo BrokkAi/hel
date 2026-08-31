@@ -776,6 +776,16 @@ pub(super) fn record_runtime_event(
             in_flight.remove(&request_id);
             relay.record_command_completed(&request_id, RelayCommandOutcome::Cancelled)?;
         }
+        RuntimeEvent::SteerApplied {
+            request_id,
+            queued_command_id,
+        } => {
+            in_flight.remove(&request_id);
+            relay.record_command_completed(
+                &request_id,
+                RelayCommandOutcome::Steered { queued_command_id },
+            )?;
+        }
         RuntimeEvent::CloseApplied { request_id } => {
             in_flight.remove(&request_id);
             relay.record_command_completed(&request_id, RelayCommandOutcome::Closed)?;
@@ -1033,7 +1043,10 @@ fn acp_command(claimed: &ClaimedRelayCommand) -> Option<CommandRequest> {
             request_id,
             mode_id: mode_id.clone(),
         }),
-        RelayCommand::Cancel => Some(CommandRequest::Cancel { request_id }),
+        RelayCommand::Cancel => Some(CommandRequest::Cancel {
+            request_id,
+            steering_prompt: claimed.steering_prompt.clone(),
+        }),
         RelayCommand::Close { .. } => Some(CommandRequest::Close { request_id }),
         RelayCommand::BeginCheckpoint { .. }
         | RelayCommand::RunUserShell { .. }
@@ -2290,12 +2303,11 @@ where
 }
 
 /// Signal a whole process group. Terminals reuse this so process-group
-/// termination lives in one place.
+/// termination lives in one place. A group that is already gone counts as
+/// success; anything else is reported rather than dropped.
 pub(crate) fn terminate_process_group(pid: i32, signal: i32) {
-    // SAFETY: a negative, validated child PID targets only the process
-    // group created for this supervisor's child.
-    unsafe {
-        libc::kill(-pid, signal);
+    if let Err(error) = crate::hel_subprocess::signal_process_group(pid, signal) {
+        tracing::warn!(pid, signal, %error, "could not signal process group");
     }
 }
 

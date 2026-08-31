@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::hel_chat::BrowserTranscript;
 use crate::hel_config::{HelConfig, TargetTemplate, validate_id};
+use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse, MAX_ELICITATION_BYTES};
 use crate::hel_state::{HelState, SessionState};
 
 const COOKIE_NAME: &str = "hel_viewer_session";
@@ -44,6 +45,11 @@ const CODE_LOCKOUT_BASE: Duration = Duration::from_secs(30);
 const CODE_LOCKOUT_CAP: Duration = Duration::from_secs(60 * 60);
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_PROMPT_CHARS: usize = 64 * 1024;
+/// Image prompts need far more room than any other phone request. Browser
+/// uploads are base64-encoded, so two ordinary photographs already exceed the
+/// general body limit even when each one fits it. The larger bound therefore
+/// stays scoped to the action route that carries prompts.
+const MAX_PROMPT_BODY_BYTES: usize = 32 * 1024 * 1024;
 const COOKIE_KEY_BYTES: usize = 32;
 const COOKIE_KEY_FILE: &str = "phone-cookie-key";
 
@@ -203,7 +209,7 @@ pub async fn run_server(options: ServerOptions) -> AnyResult<()> {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerSnapshot {
     pub revision: u64,
@@ -246,7 +252,9 @@ impl ViewerSnapshot {
                     preview: Vec::new(),
                     queued_prompts: Vec::new(),
                     active_user_shells: Vec::new(),
+                    pending_elicitations: Vec::new(),
                     conversation_available: false,
+                    prompt_images_supported: false,
                     finish,
                     incompatible_resume_targets: config
                         .targets
@@ -310,7 +318,7 @@ impl ViewerSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerSession {
     pub id: String,
@@ -331,11 +339,21 @@ pub struct ViewerSession {
     pub queued_prompts: Vec<ViewerQueuedPrompt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_user_shells: Vec<ViewerUserShell>,
+    /// Form questions the session is blocked on, published so a phone can
+    /// answer them. These are the agent's own questions, already visible in
+    /// the transcript, so they travel whole rather than redacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_elicitations: Vec<ElicitationRequest>,
     pub conversation_available: bool,
     /// Privacy-safe presentation of the exact resource Finish will release.
     /// Raw target locator fields never cross the viewer boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish: Option<ViewerFinish>,
+    /// Whether this session's agent advertised support for image content in
+    /// prompts. The viewer offers the image controls only when it did, and the
+    /// server refuses images for a session that did not.
+    #[serde(default)]
+    pub prompt_images_supported: bool,
     /// Target ids this session cannot resume on. Only the ids travel: the
     /// controller's reasons name project paths and SSH hosts, which this
     /// projection deliberately keeps on the controller.
@@ -432,7 +450,7 @@ pub struct ViewerRepository {
 /// The complete set of operations a phone may ask the controller to perform.
 /// Destructive force-cleanup and secret/config editing are intentionally not
 /// representable here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControllerAction {
     New {
@@ -457,6 +475,10 @@ pub enum ControllerAction {
     Prompt {
         session_id: String,
         text: String,
+        /// Images to send with the prompt. The controller turns each one into
+        /// the ACP image content block its prompt path already speaks.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ViewerPromptImage>,
     },
     RunShell {
         session_id: String,
@@ -476,6 +498,23 @@ pub enum ControllerAction {
         session_id: String,
         queue_id: String,
     },
+    /// Answer one of the session's pending form questions.
+    RespondElicitation {
+        session_id: String,
+        elicitation_id: String,
+        response: ElicitationResponse,
+    },
+}
+
+/// One image a phone attached to a prompt, still base64-encoded as the browser
+/// read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerPromptImage {
+    pub data_base64: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,7 +682,10 @@ fn router(options: ServerOptions) -> Router {
             post(mark_conversation_read),
         )
         .route("/api/events", get(events))
-        .route("/api/actions", post(action))
+        .route(
+            "/api/actions",
+            post(action).layer(DefaultBodyLimit::max(MAX_PROMPT_BODY_BYTES)),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_session,
@@ -778,6 +820,7 @@ async fn action(
     Json(action): Json<ControllerAction>,
 ) -> Result<StatusCode, ApiError> {
     validate_action(&action, &state.snapshot_rx.borrow())?;
+    let action = decode_prompt_images_off_task(action).await?;
     let (reply, outcome) = tokio::sync::oneshot::channel();
     state
         .action_tx
@@ -885,6 +928,56 @@ async fn events(State(state): State<ServerState>) -> impl IntoResponse {
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
+/// Check attached images without decoding megabytes of base64 on the task that
+/// serves the request. Everything else about an action is cheap enough to
+/// check inline; a full multi-image prompt is not.
+async fn decode_prompt_images_off_task(
+    action: ControllerAction,
+) -> Result<ControllerAction, ApiError> {
+    let ControllerAction::Prompt { images, .. } = &action else {
+        return Ok(action);
+    };
+    if images.is_empty() {
+        return Ok(action);
+    }
+    tokio::task::spawn_blocking(move || {
+        let ControllerAction::Prompt { images, .. } = &action else {
+            unreachable!("only prompt actions carry images")
+        };
+        validate_prompt_images(images)?;
+        Ok(action)
+    })
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the server could not check the attached images",
+        )
+    })?
+}
+
+fn validate_prompt_images(images: &[ViewerPromptImage]) -> Result<(), ApiError> {
+    for image in images {
+        if !image.mime_type.starts_with("image/") {
+            return Err(ApiError::bad_request(
+                "image mime type must start with image/",
+            ));
+        }
+        if image.width == 0 || image.height == 0 {
+            return Err(ApiError::bad_request(
+                "image dimensions must be greater than zero",
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.data_base64)
+            .map_err(|_| ApiError::bad_request("image data must be valid base64"))?;
+        if bytes.is_empty() {
+            return Err(ApiError::bad_request("image data must not be empty"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Result<(), ApiError> {
     match action {
         ControllerAction::New {
@@ -956,17 +1049,31 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
         }
-        ControllerAction::Prompt { session_id, text } => {
+        ControllerAction::Prompt {
+            session_id,
+            text,
+            images,
+        } => {
             validate_public_id(session_id)?;
-            require_session_record(snapshot, session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
             if text.starts_with('!') {
                 return Err(ApiError::bad_request(
                     "leading ! is reserved for shell commands",
                 ));
             }
-            if text.trim().is_empty() || text.chars().count() > MAX_PROMPT_CHARS {
+            if text.chars().count() > MAX_PROMPT_CHARS {
                 return Err(ApiError::bad_request(
                     "prompt must contain 1-65536 characters",
+                ));
+            }
+            if text.trim().is_empty() && images.is_empty() {
+                return Err(ApiError::bad_request(
+                    "prompt must contain text or an image",
+                ));
+            }
+            if !images.is_empty() && !session.prompt_images_supported {
+                return Err(ApiError::bad_request(
+                    "this session does not support image prompts",
                 ));
             }
         }
@@ -1004,6 +1111,34 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             validate_public_id(session_id)?;
             validate_public_id(queue_id)?;
             require_session_record(snapshot, session_id)?;
+        }
+        ControllerAction::RespondElicitation {
+            session_id,
+            elicitation_id,
+            response,
+        } => {
+            validate_public_id(session_id)?;
+            validate_public_id(elicitation_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            let request = session
+                .pending_elicitations
+                .iter()
+                .find(|request| request.id == *elicitation_id)
+                .ok_or_else(|| ApiError::not_found("unknown elicitation"))?;
+            if serde_json::to_vec(response).map_or(usize::MAX, |encoded| encoded.len())
+                > MAX_ELICITATION_BYTES
+            {
+                return Err(ApiError::bad_request("elicitation answer is too large"));
+            }
+            // The answer has to satisfy the question the agent actually asked.
+            // A phone can post one for a request the session has already
+            // replaced, and forwarding that would answer a live question with
+            // content the agent never offered.
+            if request.validate_response(response).is_err() {
+                return Err(ApiError::bad_request(
+                    "the answer does not match this elicitation request",
+                ));
+            }
         }
     }
     Ok(())
@@ -1311,26 +1446,69 @@ const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 
 
 const VIEWER_HTML: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="icon" href="/icon.svg"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
-<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}dialog{max-width:560px;color:inherit;background:#13161d;border:1px solid #475043;border-radius:14px;padding:18px}dialog::backdrop{background:#000a}dialog h2{margin-top:0}</style></head>
+<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}.elicitation{border-color:#d985ff}.elicitation-message{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 10px}.elicitation-field{display:flex;flex-direction:column;gap:4px;margin:10px 0}.elicitation-field select[multiple]{min-height:120px}.elicitation-field input[type=checkbox]{align-self:start;width:22px;height:22px}#prompt-text{display:block;width:100%;box-sizing:border-box;min-height:76px;max-height:40vh;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}#prompt-text:empty::before{content:attr(data-placeholder);color:#899184;pointer-events:none}#attachments{margin-top:8px}.attachment{display:flex;align-items:center;gap:8px;border:1px solid #3b424e;border-radius:9px;padding:6px 8px}.attachment img{width:44px;height:44px;object-fit:cover;border-radius:6px}.attachment button{padding:2px 10px}#conversation-feed{min-height:30vh}dialog{max-width:560px;color:inherit;background:#13161d;border:1px solid #475043;border-radius:14px;padding:18px}dialog::backdrop{background:#000a}dialog h2{margin-top:0}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
-<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Active sessions</h2><div id="active-sessions"></div></section><section><h2>Saved sessions</h2><p class="dim">Saved sessions run no workers.</p><div id="saved-sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent or use !command" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
+<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Active sessions</h2><div id="active-sessions"></div></section><section><h2>Saved sessions</h2><p class="dim">Saved sessions run no workers.</p><div id="saved-sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><div id="elicitations"></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><div id="prompt-text" class="composer-input" contenteditable="true" role="textbox" aria-multiline="true" enterkeyhint="send" spellcheck="true" aria-label="Message the agent" data-placeholder="Message the agent or use !command"></div><div id="attachments" class="row" aria-label="Attached images"></div><div class="row"><button>Send or queue</button><button type="button" id="attach-image" class="secondary" aria-label="Attach one or more images" hidden>Images</button><input id="image-picker" type="file" accept="image/*" multiple hidden></div><p id="conversation-error"></p></form></section></main>
 <dialog id="finish-dialog"><h2 id="finish-title">Finish session?</h2><p id="finish-work"></p><p id="finish-queue" class="dim"></p><p id="finish-consequence"></p><form method="dialog" class="row"><button value="cancel" class="secondary">Cancel</button><button id="finish-confirm" value="finish" class="danger">Finish</button></form></dialog>
 <script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),activeSessions=document.querySelector('#active-sessions'),savedSessions=document.querySelector('#saved-sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells'),finishDialog=document.querySelector('#finish-dialog'),finishTitle=document.querySelector('#finish-title'),finishWork=document.querySelector('#finish-work'),finishQueue=document.querySelector('#finish-queue'),finishConsequence=document.querySelector('#finish-consequence'),finishConfirm=document.querySelector('#finish-confirm');let snapshot,currentSession,cursor=0,acknowledged=0,eventSource;const pendingFinishes=new Set();
+const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),activeSessions=document.querySelector('#active-sessions'),savedSessions=document.querySelector('#saved-sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells'),elicitations=document.querySelector('#elicitations'),promptText=document.querySelector('#prompt-text'),attachments=document.querySelector('#attachments'),attachImage=document.querySelector('#attach-image'),imagePicker=document.querySelector('#image-picker'),finishDialog=document.querySelector('#finish-dialog'),finishTitle=document.querySelector('#finish-title'),finishWork=document.querySelector('#finish-work'),finishQueue=document.querySelector('#finish-queue'),finishConsequence=document.querySelector('#finish-consequence'),finishConfirm=document.querySelector('#finish-confirm');let snapshot,currentSession,cursor=0,acknowledged=0,eventSource;const pendingFinishes=new Set();
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}if(response.status===202||response.status===204)return null;return response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
 function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
 function startEvents(){if(eventSource)eventSource.close();eventSource=new EventSource('/api/events');eventSource.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}
-function sessionCard(x,saved){const finishing=pendingFinishes.has(x.id)||x.state==='finishing',state=finishing?'finishing':x.state;const details=`<p><span class="pill">${escapeHtml(state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}`;let actions;if(saved){actions=`<p class="dim">Saved · no worker running</p><div class="row"><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button></div>`}else if(x.state==='provisioning'){actions=`<div class="row"><button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button></div>`}else{actions=`<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available&&!finishing?'':'disabled'}>Open</button>${x.finish?`<button class="danger" data-action="finish" data-id="${escapeAttr(x.id)}" ${finishing?'disabled':''}>${finishing?'Finishing':'Finish'}</button>`:''}</div>`}return `<article class="card session"><h3>${escapeHtml(x.title)}</h3>${details}${actions}</article>`}
+function sessionCard(x,saved){const finishing=pendingFinishes.has(x.id)||x.state==='finishing',state=finishing?'finishing':x.state;const details=`<p><span class="pill">${escapeHtml(state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''}${x.pending_elicitations?.length?' <span class="pill alert">input needed</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}`;let actions;if(saved){actions=`<p class="dim">Saved · no worker running</p><div class="row"><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button></div>`}else if(x.state==='provisioning'){actions=`<div class="row"><button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button></div>`}else{actions=`<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available&&!finishing?'':'disabled'}>Open</button>${x.finish?`<button class="danger" data-action="finish" data-id="${escapeAttr(x.id)}" ${finishing?'disabled':''}>${finishing?'Finishing':'Finish'}</button>`:''}</div>`}return `<article class="card session"><h3>${escapeHtml(x.title)}</h3>${details}${actions}</article>`}
 function renderSessions(){const saved=snapshot.sessions.filter(x=>x.state==='saved'),active=snapshot.sessions.filter(x=>x.state!=='saved');activeSessions.innerHTML=active.map(x=>sessionCard(x,false)).join('')||'<p class="dim">No active sessions.</p>';savedSessions.innerHTML=saved.map(x=>sessionCard(x,true)).join('')||'<p class="dim">No saved sessions.</p>'}
-async function refresh(){try{snapshot=await request('/api/snapshot');for(const id of pendingFinishes){const session=snapshot.sessions.find(x=>x.id===id);if(!session||session.state==='saved'||session.has_error)pendingFinishes.delete(id)}login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();renderSessions();const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventSource)startEvents();return true}catch(e){if(e.message==='unauthorized'){snapshot=undefined;currentSession=null;if(eventSource){eventSource.close();eventSource=undefined}login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}return false}}
+async function refresh(){try{snapshot=await request('/api/snapshot');for(const id of pendingFinishes){const session=snapshot.sessions.find(x=>x.id===id);if(!session||session.state==='saved'||session.has_error)pendingFinishes.delete(id)}login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();renderSessions();const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);renderElicitations(session);renderAttachments();document.querySelector('#conversation-state').textContent=session.state}}if(!eventSource)startEvents();return true}catch(e){if(e.message==='unauthorized'){snapshot=undefined;currentSession=null;if(eventSource){eventSource.close();eventSource=undefined}login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}return false}}
 async function restoreRoute(){if(!await refresh())return;const match=location.hash.match(/^#conversation\/([A-Za-z0-9_-]+)$/);if(match)await openConversation(match[1])}
 function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>';shells.innerHTML=(session.active_user_shells||[]).map(x=>`<div class="queue-item"><span>$ ${escapeHtml(x.command)}</span><button class="danger" data-shell-id="${escapeAttr(x.id)}">Cancel</button></div>`).join('')||'<p class="dim">No running shells.</p>'}
+// Every snapshot revision re-renders the conversation. Rebuilding a card the
+// user is answering would wipe the half-filled form and steal focus, so each
+// pending request keeps its live DOM until the request itself changes or
+// leaves the snapshot.
+const elicitationCards=new Map(),sentElicitations=new Set();
+function elicitationKey(sessionId,id){return `${sessionId}\u001f${id}`}
+function elicitationOptionLabel(option){return option.description?`${option.title} \u2014 ${option.description}`:option.title}
+function elicitationControl(field){if(field.kind==='single_select'||field.kind==='multi_select'){const select=document.createElement('select');select.multiple=field.kind==='multi_select';if(!select.multiple&&!field.required)select.appendChild(new Option('',''));for(const option of field.options||[])select.appendChild(new Option(elicitationOptionLabel(option),option.value));if(field.kind==='single_select'&&field.default!=null)select.value=field.default;if(select.multiple&&(field.default||[]).length)for(const option of select.options)option.selected=field.default.includes(option.value);return select}const input=document.createElement('input');input.type=field.kind==='boolean'?'checkbox':(field.kind==='integer'||field.kind==='number'?'number':(field.secret?'password':'text'));if(field.kind==='integer')input.step='1';if(field.kind==='number')input.step='any';if(field.minimum!=null)input.min=field.minimum;if(field.maximum!=null)input.max=field.maximum;if(field.min_length!=null)input.minLength=field.min_length;if(field.max_length!=null)input.maxLength=field.max_length;if(field.pattern)input.pattern=field.pattern;if(field.kind==='boolean')input.checked=field.default===true;else if(field.default!=null)input.value=String(field.default);return input}
+function elicitationFieldValue(field,control){if(field.kind==='multi_select'){const values=[...control.selectedOptions].map(option=>option.value);return values.length||field.required?values:undefined}if(field.kind==='boolean')return control.checked;if(control.value==='')return field.required&&(field.kind==='text'||field.kind==='single_select')?'':undefined;if(field.kind==='integer')return Number.parseInt(control.value,10);if(field.kind==='number')return Number(control.value);return control.value}
+// Builds the controls and returns collect(), which reads them back as ACP
+// content. A custom answer replaces the select it belongs to unless the
+// request pairs it with one specific option, which is how Hel's chat form
+// submits the same request.
+function buildElicitationForm(form,request,register){const entries=[];for(const field of request.fields||[]){const wrapper=document.createElement('label');wrapper.className='elicitation-field';const label=document.createElement('span');label.textContent=`${field.title}${field.required?' *':''}`;const control=elicitationControl(field);control.required=Boolean(field.required)&&field.kind!=='boolean';register(control);wrapper.append(label,control);if(field.description){const description=document.createElement('span');description.className='dim';description.textContent=field.description;wrapper.append(description)}if(field.kind==='multi_select'){const check=()=>{const count=control.selectedOptions.length;const few=field.min_items!=null&&(count>0||field.required)&&count<field.min_items;const many=field.max_items!=null&&count>field.max_items;control.setCustomValidity(few?`Select at least ${field.min_items} option(s).`:(many?`Select at most ${field.max_items} option(s).`:''))};control.addEventListener('change',check);check()}form.append(wrapper);entries.push({field,control})}const customByOwner=new Map();for(const entry of entries){const owner=entry.field.custom_answer_for;if(!owner||entry.field.kind!=='text'||customByOwner.has(owner))continue;const target=entries.find(candidate=>candidate.field.id===owner);if(!target||!Array.isArray(target.field.options))continue;customByOwner.set(owner,entry)}return()=>{for(const entry of entries)if(entry.field.kind==='text')entry.control.value=entry.control.value.trim();if(!form.reportValidity())return null;const active=new Map();for(const [owner,entry] of customByOwner)if(entry.control.value!=='')active.set(owner,entry);const content={};for(const entry of entries){const {field,control}=entry;if(customByOwner.get(field.custom_answer_for)===entry){if(active.has(field.custom_answer_for))content[field.id]=control.value;continue}const custom=active.get(field.id);if(custom&&custom.field.custom_answer_option==null)continue;const value=elicitationFieldValue(field,control);if(value!==undefined)content[field.id]=value}return content}}
+function buildElicitationCard(session,request){const card=document.createElement('section');card.className='card elicitation';const heading=document.createElement('strong');heading.textContent=request.title||'Input needed';const message=document.createElement('pre');message.className='elicitation-message';message.textContent=request.message;const form=document.createElement('form');const status=document.createElement('p');status.className='dim';const gated=[],register=control=>{gated.push(control);return control};const collect=buildElicitationForm(form,request,register);const actions=document.createElement('div');actions.className='row';const send=document.createElement('button');send.type='submit';send.textContent='Send answer';register(send);const decline=document.createElement('button');decline.type='button';decline.className='secondary';decline.textContent='Decline';register(decline);const cancel=document.createElement('button');cancel.type='button';cancel.className='danger';cancel.textContent='Cancel';register(cancel);decline.addEventListener('click',()=>{submitElicitation(session.id,request.id,{action:'decline'})});cancel.addEventListener('click',()=>{submitElicitation(session.id,request.id,{action:'cancel'})});actions.append(send,decline,cancel);form.append(actions);form.addEventListener('submit',event=>{event.preventDefault();const content=collect();if(content)submitElicitation(session.id,request.id,{action:'accept',content})});const nodes=[heading];if(request.description){const description=document.createElement('p');description.className='dim';description.textContent=request.description;nodes.push(description)}nodes.push(message,form,status);card.append(...nodes);return{card,setSent(sent){for(const control of gated)control.disabled=sent;status.textContent=sent?'Answer sent \u2014 waiting for the session to apply it.':''}}}
+function renderElicitations(session){const pending=(session&&session.pending_elicitations)||[];if(session)for(const key of [...sentElicitations])if(key.startsWith(`${session.id}\u001f`)&&!pending.some(request=>elicitationKey(session.id,request.id)===key))sentElicitations.delete(key);const live=new Set(),cards=[];for(const request of pending){const key=elicitationKey(session.id,request.id),signature=JSON.stringify(request);live.add(key);let entry=elicitationCards.get(key);if(!entry||entry.signature!==signature){entry=buildElicitationCard(session,request);entry.signature=signature;elicitationCards.set(key,entry)}entry.setSent(sentElicitations.has(key));cards.push(entry.card)}for(const key of [...elicitationCards.keys()])if(!live.has(key))elicitationCards.delete(key);const mounted=[...elicitations.children];if(mounted.length!==cards.length||cards.some((card,index)=>mounted[index]!==card))elicitations.replaceChildren(...cards)}
+async function submitElicitation(sessionId,elicitationId,response){const key=elicitationKey(sessionId,elicitationId);if(sentElicitations.has(key))return;sentElicitations.add(key);const rerender=()=>{const session=snapshot?.sessions.find(x=>x.id===sessionId);if(session&&sessionId===currentSession)renderElicitations(session)};rerender();try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'respond-elicitation',session_id:sessionId,elicitation_id:elicitationId,response})});document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){sentElicitations.delete(key);document.querySelector('#conversation-error').textContent=err.message;rerender()}}
+// The composer is a contenteditable rather than a textarea so a pasted or
+// dropped image can be intercepted where it lands, and so the box grows with
+// its content without a layout read on every keystroke. Rich content is
+// refused at beforeinput, which keeps the box plain text however it arrives.
+const MAX_PROMPT_REQUEST_BYTES=32*1024*1024;
+let composerRevision=0,composerPreserveEmptyBreak=false,promptImages=[];
+function composerText(){let text='';const blocks=new Set(['DIV','P']);const append=node=>{if(node.nodeType===Node.TEXT_NODE){text+=node.nodeValue||'';return}if(node.nodeName==='BR'){if(!node.dataset.composerFiller)text+='\n';return}const block=node!==promptText&&blocks.has(node.nodeName);if(block&&text&&!text.endsWith('\n'))text+='\n';node.childNodes.forEach(append);if(block&&node.nextSibling&&!text.endsWith('\n'))text+='\n'};append(promptText);return text.replace(/\r\n?/g,'\n')}
+function setComposerText(text){promptText.textContent=text}
+function placeComposerCaretAtEnd(){const selection=window.getSelection();if(!selection)return;const range=document.createRange();range.selectNodeContents(promptText);range.collapse(false);selection.removeAllRanges();selection.addRange(range)}
+function placeComposerCaretAtPoint(x,y){let range=document.caretRangeFromPoint?.(x,y)||null;if(!range&&document.caretPositionFromPoint){const position=document.caretPositionFromPoint(x,y);if(position){range=document.createRange();range.setStart(position.offsetNode,position.offset);range.collapse(true)}}if(!range||!promptText.contains(range.startContainer))return;const selection=window.getSelection();if(!selection)return;selection.removeAllRanges();selection.addRange(range)}
+function insertComposerFallback(node,filler=null){const selection=window.getSelection();const range=selection&&selection.rangeCount?selection.getRangeAt(0):null;if(!range||!promptText.contains(range.commonAncestorContainer)){promptText.append(node);if(filler)promptText.append(filler);placeComposerCaretAtEnd();return}range.deleteContents();range.insertNode(node);if(filler)node.after(filler);range.setStartAfter(node);range.collapse(true);selection.removeAllRanges();selection.addRange(range)}
+// execCommand keeps the browser's own undo stack, so it is tried first; the
+// fallback covers engines that refuse it, and the revision check covers those
+// that run it without emitting the input event that keeps state in step.
+function runComposerEdit(command,value,fallback){promptText.focus();const revision=composerRevision;if(document.execCommand(command,false,value)){if(composerRevision===revision)composerInputChanged();return}fallback();composerInputChanged()}
+function insertComposerText(text){const normalized=text.replace(/\r\n?/g,'\n');runComposerEdit('insertText',normalized,()=>{insertComposerFallback(document.createTextNode(normalized))})}
+function insertComposerLineBreak(){composerPreserveEmptyBreak=true;try{runComposerEdit('insertLineBreak',null,()=>{const filler=document.createElement('br');filler.dataset.composerFiller='true';insertComposerFallback(document.createElement('br'),filler)});let last=promptText;while(last.lastChild)last=last.lastChild;if(last.nodeName==='BR'&&last.previousSibling?.nodeName==='BR'){last.dataset.composerFiller='true'}}finally{composerPreserveEmptyBreak=false}}
+// A cleared box can keep a stray break behind it, which leaves the placeholder
+// hidden and the box looking occupied when it holds nothing.
+function composerInputChanged(){composerRevision+=1;if(!composerPreserveEmptyBreak&&!promptText.textContent&&promptText.childNodes.length)promptText.replaceChildren()}
+function readFileAsDataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.addEventListener('load',()=>resolve(String(reader.result||'')),{once:true});reader.addEventListener('error',()=>reject(reader.error||new Error('file read failed')),{once:true});reader.readAsDataURL(file)})}
+function imageDimensions(file){return new Promise((resolve,reject)=>{const url=URL.createObjectURL(file);const image=new Image();image.addEventListener('load',()=>{const size={width:image.naturalWidth,height:image.naturalHeight};URL.revokeObjectURL(url);resolve(size)},{once:true});image.addEventListener('error',()=>{URL.revokeObjectURL(url);reject(new Error('the browser could not decode this image'))},{once:true});image.src=url})}
+async function promptImageFromFile(file){if(!file.type.startsWith('image/'))throw new Error(`${file.name||'That file'} is not an image`);if(file.size>=MAX_PROMPT_REQUEST_BYTES)throw new Error(`${file.name||'That image'} is too large for the 32 MiB request limit`);const [dataUrl,size]=await Promise.all([readFileAsDataUrl(file),imageDimensions(file)]);const comma=dataUrl.indexOf(',');if(comma<0||!dataUrl.slice(comma+1))throw new Error(`Could not read ${file.name||'that image'}`);return{data_base64:dataUrl.slice(comma+1),mime_type:file.type,width:size.width,height:size.height,name:file.name||'Pasted image'}}
+async function attachImageFiles(files){const session=snapshot?.sessions.find(x=>x.id===currentSession);if(!currentSession||!session?.prompt_images_supported||!files.length)return;const sessionId=currentSession;try{const added=[];for(const file of files)added.push(await promptImageFromFile(file));if(currentSession!==sessionId)return;promptImages=promptImages.concat(added);renderAttachments();document.querySelector('#conversation-error').textContent=''}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
+function renderAttachments(){const session=snapshot?.sessions.find(x=>x.id===currentSession);attachImage.hidden=!session?.prompt_images_supported;attachments.replaceChildren();for(const [index,image] of promptImages.entries()){const chip=document.createElement('div');chip.className='attachment';const thumb=document.createElement('img');thumb.alt='';thumb.src=`data:${image.mime_type};base64,${image.data_base64}`;const caption=document.createElement('span');caption.textContent=`${image.name} \u00b7 ${image.width}\u00d7${image.height}`;const remove=document.createElement('button');remove.type='button';remove.className='danger';remove.setAttribute('aria-label',`Remove ${image.name}`);remove.textContent='\u00d7';remove.onclick=()=>{promptImages.splice(index,1);renderAttachments()};chip.append(thumb,caption,remove);attachments.append(chip)}}
+async function submitPrompt(){if(!currentSession)return;const value=composerText(),images=promptImages;if(!value.trim()&&!images.length)return;const error=document.querySelector('#conversation-error');if(value.startsWith('!')&&images.length){error.textContent='Shell commands cannot carry images.';return}const body=value.startsWith('!')?{action:'run-shell',session_id:currentSession,command:value.slice(1)}:{action:'prompt',session_id:currentSession,text:value,images:images.map(image=>({data_base64:image.data_base64,mime_type:image.mime_type,width:image.width,height:image.height}))};const payload=JSON.stringify(body);if(new TextEncoder().encode(payload).byteLength>MAX_PROMPT_REQUEST_BYTES){error.textContent='Prompt attachments exceed the 32 MiB request limit.';return}try{await request('/api/actions',{method:'POST',body:payload});setComposerText('');promptImages=[];renderAttachments();error.textContent='';await refresh()}catch(err){error.textContent=err.message}}
 function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
 async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;if(cursor>acknowledged){const through=cursor;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through})});acknowledged=through}}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
-async function openConversation(id){const session=snapshot?.sessions.find(x=>x.id===id);if(!session?.conversation_available){showDashboard();return}currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');document.querySelector('#conversation-title').textContent=session.title;document.querySelector('#conversation-state').textContent=session.state;renderQueue(session);await loadConversation(false)}
-function showDashboard(){currentSession=null;cursor=0;acknowledged=0;location.hash='';conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
+async function openConversation(id){const session=snapshot?.sessions.find(x=>x.id===id);if(!session?.conversation_available){showDashboard();return}currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');document.querySelector('#conversation-title').textContent=session.title;document.querySelector('#conversation-state').textContent=session.state;renderQueue(session);renderElicitations(session);promptImages=[];renderAttachments();await loadConversation(false)}
+function showDashboard(){currentSession=null;cursor=0;acknowledged=0;location.hash='';elicitations.replaceChildren();elicitationCards.clear();promptImages=[];renderAttachments();conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
 function confirmFinish(session){finishTitle.textContent=`Finish ${session.title}?`;finishWork.textContent='Hel will finish the current work, then save and verify recovery.';const queued=(session.queued_prompts||[]).length;finishQueue.textContent=queued===0?'No queued prompts are waiting.':queued===1?'1 queued prompt will be saved for resume.':`${queued} queued prompts will be saved for resume.`;finishConsequence.textContent=session.finish.consequence;finishConfirm.textContent=session.finish.primary_action;finishDialog.returnValue='';finishDialog.showModal();return new Promise(resolve=>finishDialog.addEventListener('close',()=>resolve(finishDialog.returnValue==='finish'),{once:true}))}
 document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';await restoreRoute()}catch(err){document.querySelector('#login-error').textContent=err.message}};
 logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
@@ -1339,7 +1517,19 @@ newForm.onsubmit=async e=>{e.preventDefault();const target=snapshot.targets.find
 async function sessionAction(e){const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='open')return openConversation(button.dataset.id);const session=snapshot.sessions.find(x=>x.id===button.dataset.id);if(button.dataset.action==='finish'){if(!session?.finish||!await confirmFinish(session))return;pendingFinishes.add(session.id);renderSessions()}const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target;body.queue='start';if(session?.queued_prompts?.length){const choice=prompt(`This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,'start');if(choice===null)return;if(!['start','discard'].includes(choice.toLowerCase()))return alert('Enter start or discard.');body.queue=choice.toLowerCase()}}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){pendingFinishes.delete(button.dataset.id);renderSessions();actionError.textContent=err.message}}
 activeSessions.onclick=sessionAction;savedSessions.onclick=sessionAction;
 document.querySelector('#back').onclick=showDashboard;
-document.querySelector('#prompt-form').onsubmit=async e=>{e.preventDefault();const text=document.querySelector('#prompt-text'),value=text.value;const body=value.startsWith('!')?{action:'run-shell',session_id:currentSession,command:value.slice(1)}:{action:'prompt',session_id:currentSession,text:value};try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});text.value='';document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
+document.querySelector('#prompt-form').onsubmit=e=>{e.preventDefault();submitPrompt()};
+promptText.addEventListener('input',composerInputChanged);
+// Rich text, and anything a paste or drop would inject as markup, never
+// belongs in a prompt: refuse it here and re-insert the plain text instead.
+promptText.addEventListener('beforeinput',e=>{const kind=e.inputType||'';if(kind==='insertHTML'||kind.startsWith('insertFromDrop')||kind.startsWith('insertFromPaste')||kind.startsWith('format'))e.preventDefault()});
+promptText.addEventListener('paste',e=>{const files=Array.from(e.clipboardData?.items||[]).filter(item=>item.kind==='file'&&item.type.startsWith('image/')).map(item=>item.getAsFile()).filter(Boolean);if(files.length){e.preventDefault();const session=snapshot?.sessions.find(x=>x.id===currentSession);if(session?.prompt_images_supported)attachImageFiles(files);else document.querySelector('#conversation-error').textContent='This session does not support image prompts.';return}const text=e.clipboardData?.getData('text/plain');if(text===undefined)return;e.preventDefault();insertComposerText(text)});
+promptText.addEventListener('dragover',e=>{e.preventDefault();const types=Array.from(e.dataTransfer?.types||[]);if(e.dataTransfer)e.dataTransfer.dropEffect=types.some(type=>type==='text/plain'||type==='Files')?'copy':'none'});
+promptText.addEventListener('drop',e=>{e.preventDefault();placeComposerCaretAtPoint(e.clientX,e.clientY);const files=Array.from(e.dataTransfer?.files||[]).filter(file=>file.type.startsWith('image/'));if(files.length){const session=snapshot?.sessions.find(x=>x.id===currentSession);if(session?.prompt_images_supported)attachImageFiles(files);else document.querySelector('#conversation-error').textContent='This session does not support image prompts.';return}const text=e.dataTransfer?.getData('text/plain')||'';if(text)insertComposerText(text)});
+// An active IME composition steers its candidate with Enter and the arrows,
+// so the composer must not read those keys until the composition ends.
+promptText.addEventListener('keydown',e=>{if(e.isComposing||e.keyCode===229)return;if(e.key==='Enter'&&!e.shiftKey&&!e.metaKey&&!e.ctrlKey&&!e.altKey){e.preventDefault();submitPrompt();return}if(e.key==='Enter'&&e.shiftKey&&!e.metaKey&&!e.ctrlKey&&!e.altKey){e.preventDefault();insertComposerLineBreak();return}if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();submitPrompt()}});
+attachImage.onclick=()=>imagePicker.click();
+imagePicker.onchange=()=>{const files=Array.from(imagePicker.files||[]);imagePicker.value='';attachImageFiles(files)};
 queue.onclick=async e=>{const button=e.target.closest('button[data-queue-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'remove-queued-prompt',session_id:currentSession,queue_id:button.dataset.queueId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
 shells.onclick=async e=>{const button=e.target.closest('button[data-shell-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'cancel-shell',session_id:currentSession,shell_command_id:button.dataset.shellId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
 function escapeHtml(value){const e=document.createElement('span');e.textContent=value;return e.innerHTML}function escapeAttr(value){return escapeHtml(value).replaceAll('"','&quot;')}
@@ -1365,6 +1555,7 @@ mod tests {
     fn sample_config_state() -> (HelConfig, HelState) {
         let config = HelConfig {
             version: CONFIG_VERSION,
+            newer_config_version: None,
             phone: Default::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
@@ -1458,8 +1649,20 @@ mod tests {
     }
 
     fn app_with_conversations(conversations: BTreeMap<String, BrowserTranscript>) -> TestServer {
+        app_with(conversations, |_| {})
+    }
+
+    fn app_with_snapshot(adjust: impl FnOnce(&mut ViewerSnapshot)) -> TestServer {
+        app_with(BTreeMap::new(), adjust)
+    }
+
+    fn app_with(
+        conversations: BTreeMap<String, BrowserTranscript>,
+        adjust: impl FnOnce(&mut ViewerSnapshot),
+    ) -> TestServer {
         let (config, state) = sample_config_state();
-        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        adjust(&mut snapshot);
         let (_snapshot_tx, snapshot_rx) = watch::channel(snapshot);
         let (_conversation_tx, conversation_rx) = watch::channel(conversations);
         let (action_tx, action_rx) = mpsc::channel(8);
@@ -1699,6 +1902,503 @@ mod tests {
         );
     }
 
+    fn sample_elicitation() -> ElicitationRequest {
+        ElicitationRequest::from_acp_params(
+            "elicitation-1",
+            serde_json::json!({
+                "sessionId": "session-1",
+                "mode": "form",
+                "message": "Which CI architecture should the workflow use?",
+                "requestedSchema": {
+                    "type": "object",
+                    "required": ["question_0"],
+                    "properties": {
+                        "question_0": {
+                            "type": "string",
+                            "title": "CI architecture",
+                            "oneOf": [
+                                {"const": "reusable", "title": "Reusable workflow"},
+                                {"const": "matrix", "title": "Matrix job"}
+                            ]
+                        },
+                        "question_0_custom": {
+                            "type": "string",
+                            "title": "Other",
+                            "_meta": {"_askUserQuestionCustomAnswer": {
+                                "questionId": "question_0",
+                                "isCustomAnswer": true
+                            }}
+                        }
+                    }
+                }
+            }),
+        )
+        .expect("sample elicitation parses")
+    }
+
+    fn accept(pairs: &[(&str, &str)]) -> ElicitationResponse {
+        ElicitationResponse::Accept {
+            content: pairs
+                .iter()
+                .map(|(id, value)| {
+                    (
+                        (*id).to_owned(),
+                        crate::hel_elicitation::ElicitationValue::String((*value).to_owned()),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn pending_elicitation_snapshot(snapshot: &mut ViewerSnapshot) {
+        snapshot.sessions[0].pending_elicitations = vec![sample_elicitation()];
+    }
+
+    #[tokio::test]
+    async fn elicitation_answer_is_typed_and_forwarded() {
+        let (app, mut actions, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let cookie = login_cookie(&app).await;
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"respond-elicitation","session_id":"session-1","elicitation_id":"elicitation-1","response":{"action":"accept","content":{"question_0":"reusable"}}}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let action = actions.recv().await.unwrap();
+        assert_eq!(
+            action.action,
+            ControllerAction::RespondElicitation {
+                session_id: "session-1".into(),
+                elicitation_id: "elicitation-1".into(),
+                response: accept(&[("question_0", "reusable")]),
+            }
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[tokio::test]
+    async fn elicitation_answer_for_an_unknown_request_is_refused_without_reaching_the_controller()
+    {
+        let (app, mut actions, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let cookie = login_cookie(&app).await;
+        let response = app
+            .oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"respond-elicitation","session_id":"session-1","elicitation_id":"elicitation-9","response":{"action":"cancel"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[test]
+    fn elicitation_answers_are_checked_against_the_request_the_agent_asked() {
+        let (config, state) = sample_config_state();
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        pending_elicitation_snapshot(&mut snapshot);
+        let respond = |response: ElicitationResponse| ControllerAction::RespondElicitation {
+            session_id: "session-1".into(),
+            elicitation_id: "elicitation-1".into(),
+            response,
+        };
+
+        assert!(validate_action(&respond(accept(&[("question_0", "matrix")])), &snapshot).is_ok());
+        // Declining and cancelling never carry content, so they are always
+        // answerable.
+        assert!(validate_action(&respond(ElicitationResponse::Decline), &snapshot).is_ok());
+        // An option the agent never offered, a field it never published, and a
+        // missing required answer are all refused.
+        assert!(validate_action(&respond(accept(&[("question_0", "cron")])), &snapshot).is_err());
+        assert!(validate_action(&respond(accept(&[("smuggled", "yes")])), &snapshot).is_err());
+        assert!(validate_action(&respond(accept(&[])), &snapshot).is_err());
+        // A custom answer stands in for the select it belongs to, exactly as
+        // the chat form submits it.
+        assert!(
+            validate_action(
+                &respond(accept(&[("question_0_custom", "a monorepo pipeline")])),
+                &snapshot,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn oversized_elicitation_answers_are_refused() {
+        let (config, state) = sample_config_state();
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        pending_elicitation_snapshot(&mut snapshot);
+        let long = "x".repeat(MAX_ELICITATION_BYTES);
+        assert!(
+            validate_action(
+                &ControllerAction::RespondElicitation {
+                    session_id: "session-1".into(),
+                    elicitation_id: "elicitation-1".into(),
+                    response: accept(&[("question_0_custom", long.as_str())]),
+                },
+                &snapshot,
+            )
+            .is_err()
+        );
+    }
+
+    /// The card cache is the fix for answers vanishing under snapshot polls, so
+    /// it is exercised as JavaScript: the render source is lifted out of the
+    /// embedded viewer and run against a stub DOM.
+    #[test]
+    fn embedded_viewer_keeps_elicitation_answers_across_snapshot_polls() {
+        let start = VIEWER_HTML
+            .find("const elicitationCards=new Map()")
+            .expect("elicitation card cache");
+        let end = VIEWER_HTML[start..]
+            .find("async function submitElicitation")
+            .map(|offset| start + offset)
+            .expect("elicitation rendering boundary");
+        let source = &VIEWER_HTML[start..end];
+        let dom = r#"
+let replaceCalls = 0;
+class Option {
+  constructor(label, value) {
+    this.label = label;
+    this.value = value;
+    this.selected = false;
+  }
+}
+function makeEl(tag) {
+  return {
+    tagName: tag.toUpperCase(),
+    children: [],
+    options: [],
+    selectedOptions: [],
+    className: "",
+    textContent: "",
+    disabled: false,
+    required: false,
+    value: "",
+    appendChild(child) {
+      this.children.push(child);
+      if (this.tagName === "SELECT") this.options.push(child);
+      return child;
+    },
+    append(...kids) {
+      this.children.push(...kids);
+    },
+    replaceChildren(...kids) {
+      replaceCalls += 1;
+      this.children = kids;
+    },
+    addEventListener() {},
+    setCustomValidity() {},
+    reportValidity() {
+      return true;
+    },
+  };
+}
+const created = [];
+const document = {
+  createElement(tag) {
+    const el = makeEl(tag);
+    created.push(el);
+    return el;
+  },
+};
+const elicitations = makeEl("div");
+async function submitElicitation() {}
+"#;
+        let checks = r#"
+const request = {
+  id: "elicitation-1",
+  message: "Which CI architecture?",
+  title: "CI",
+  fields: [
+    {
+      id: "question_0",
+      title: "CI architecture",
+      required: false,
+      kind: "single_select",
+      options: [{ value: "reusable", title: "Reusable" }, { value: "matrix", title: "Matrix" }],
+    },
+    { id: "question_0_custom", title: "Other", required: false, kind: "text" },
+  ],
+};
+const session = { id: "session-1", pending_elicitations: [request] };
+renderElicitations(session);
+const card = elicitations.children[0];
+const select = created.find((el) => el.tagName === "SELECT");
+const text = created.find((el) => el.tagName === "INPUT");
+select.value = "reusable";
+text.value = "keep me";
+const attachments = replaceCalls;
+renderElicitations(session);
+if (elicitations.children[0] !== card) {
+  throw new Error("a snapshot rebuilt the pending card");
+}
+if (select.value !== "reusable" || text.value !== "keep me") {
+  throw new Error("a snapshot wiped the half-filled answer");
+}
+if (replaceCalls !== attachments) {
+  throw new Error("a snapshot re-attached an unchanged card and dropped focus");
+}
+sentElicitations.add(elicitationKey("session-1", request.id));
+renderElicitations(session);
+if (elicitations.children[0] !== card) {
+  throw new Error("a sent answer rebuilt the card");
+}
+if (!select.disabled || !text.disabled) {
+  throw new Error("a sent answer left the controls live");
+}
+if (select.value !== "reusable") {
+  throw new Error("a sent answer wiped the reply");
+}
+renderElicitations({ id: "session-1", pending_elicitations: [] });
+if (elicitations.children.length !== 0 || elicitationCards.size !== 0) {
+  throw new Error("an answered request stayed rendered");
+}
+if (sentElicitations.size !== 0) {
+  throw new Error("a resolved request kept its sent marker");
+}
+"#;
+        let script = format!("{dom}\n{source}\n{checks}");
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "--eval"])
+            .arg(script)
+            .output()
+            .expect("Node.js is required to exercise the embedded web viewer");
+        assert!(
+            output.status.success(),
+            "embedded viewer elicitation rendering failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn sample_image(pixels: usize) -> ViewerPromptImage {
+        ViewerPromptImage {
+            data_base64: base64::engine::general_purpose::STANDARD.encode(vec![7_u8; pixels]),
+            mime_type: "image/png".into(),
+            width: 32,
+            height: 24,
+        }
+    }
+
+    fn image_capable(snapshot: &mut ViewerSnapshot) {
+        snapshot.sessions[0].prompt_images_supported = true;
+    }
+
+    async fn post_action(app: Router, cookie: String, body: String) -> Response<Body> {
+        app.oneshot(
+            Request::post("/api/actions")
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn image_prompt_reaches_the_controller_with_its_images() {
+        let (app, mut actions, _) = app_with_snapshot(image_capable);
+        let cookie = login_cookie(&app).await;
+        let image = sample_image(8);
+        let body = serde_json::to_string(&ControllerAction::Prompt {
+            session_id: "session-1".into(),
+            text: String::new(),
+            images: vec![image.clone(), image.clone()],
+        })
+        .unwrap();
+        let response = tokio::spawn(post_action(app, cookie, body));
+        let action = actions.recv().await.unwrap();
+        assert_eq!(
+            action.action,
+            ControllerAction::Prompt {
+                session_id: "session-1".into(),
+                text: String::new(),
+                images: vec![image.clone(), image],
+            }
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::ACCEPTED);
+    }
+
+    /// Base64 inflates an upload by a third, so two ordinary photographs pass
+    /// the general body limit even when each one fits it. The action route
+    /// carries prompts, so it is the route that gets the larger bound.
+    #[tokio::test]
+    async fn multi_image_prompts_are_accepted_over_the_general_body_limit() {
+        let (app, mut actions, _) = app_with_snapshot(image_capable);
+        let cookie = login_cookie(&app).await;
+        let image = sample_image(MAX_BODY_BYTES / 2);
+        let body = serde_json::to_string(&ControllerAction::Prompt {
+            session_id: "session-1".into(),
+            text: "look at these".into(),
+            images: vec![image.clone(), image],
+        })
+        .unwrap();
+        assert!(body.len() > MAX_BODY_BYTES);
+        assert!(body.len() < MAX_PROMPT_BODY_BYTES);
+        let response = tokio::spawn(post_action(app, cookie, body));
+        let action = actions.recv().await.unwrap();
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_prompt_limit_is_still_refused() {
+        let (app, _actions, _) = app_with_snapshot(image_capable);
+        let cookie = login_cookie(&app).await;
+        let image = sample_image(MAX_PROMPT_BODY_BYTES);
+        let body = serde_json::to_string(&ControllerAction::Prompt {
+            session_id: "session-1".into(),
+            text: String::new(),
+            images: vec![image],
+        })
+        .unwrap();
+        assert!(body.len() > MAX_PROMPT_BODY_BYTES);
+        let response = post_action(app, cookie, body).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn malformed_image_payloads_never_reach_the_controller() {
+        let cases = [
+            ("aW1hZ2U=", "text/plain", 32, 24),
+            ("aW1hZ2U=", "image/png", 0, 24),
+            ("not base64!", "image/png", 32, 24),
+            ("", "image/png", 32, 24),
+        ];
+        for (data, mime, width, height) in cases {
+            let (app, mut actions, _) = app_with_snapshot(image_capable);
+            let cookie = login_cookie(&app).await;
+            let body = serde_json::to_string(&ControllerAction::Prompt {
+                session_id: "session-1".into(),
+                text: String::new(),
+                images: vec![ViewerPromptImage {
+                    data_base64: data.into(),
+                    mime_type: mime.into(),
+                    width,
+                    height,
+                }],
+            })
+            .unwrap();
+            let response = post_action(app, cookie, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "expected {data:?}/{mime} {width}x{height} to be refused"
+            );
+            assert!(actions.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn image_prompts_need_text_or_an_image_and_an_agent_that_takes_them() {
+        let (config, state) = sample_config_state();
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        let prompt = |text: &str, images: Vec<ViewerPromptImage>| ControllerAction::Prompt {
+            session_id: "session-1".into(),
+            text: text.into(),
+            images,
+        };
+
+        // Without the capability the session takes text only.
+        assert!(validate_action(&prompt("ship it", Vec::new()), &snapshot).is_ok());
+        assert!(validate_action(&prompt("", vec![sample_image(8)]), &snapshot).is_err());
+
+        image_capable(&mut snapshot);
+        // An image is a prompt on its own; nothing at all is not.
+        assert!(validate_action(&prompt("", vec![sample_image(8)]), &snapshot).is_ok());
+        assert!(validate_action(&prompt("   ", Vec::new()), &snapshot).is_err());
+        assert!(validate_action(&prompt("", Vec::new()), &snapshot).is_err());
+        // A shell command is still a shell command.
+        assert!(validate_action(&prompt("!ls", vec![sample_image(8)]), &snapshot).is_err());
+    }
+
+    /// The composer holds a DOM, not a string, so the text a prompt sends is
+    /// whatever this reader makes of that DOM. Run it as JavaScript.
+    #[test]
+    fn embedded_viewer_reads_multiline_composer_text_out_of_its_dom() {
+        let start = VIEWER_HTML
+            .find("function composerText()")
+            .expect("composer reader");
+        let end = VIEWER_HTML[start..]
+            .find("function setComposerText(")
+            .map(|offset| start + offset)
+            .expect("composer reader boundary");
+        let source = &VIEWER_HTML[start..end];
+        let harness = r##"
+const Node = { TEXT_NODE: 3 };
+function textNode(value) {
+  return { nodeType: 3, nodeValue: value, nodeName: "#text", childNodes: [], dataset: {} };
+}
+function element(name, children = [], dataset = {}) {
+  const node = { nodeType: 1, nodeName: name, dataset, childNodes: children };
+  children.forEach((child, index) => {
+    child.nextSibling = children[index + 1] || null;
+  });
+  return node;
+}
+let promptText = null;
+function read(children) {
+  promptText = element("DIV", children);
+  return composerText();
+}
+"##;
+        let checks = r#"
+const plain = read([textNode("ship it")]);
+if (plain !== "ship it") throw new Error(`plain text became ${JSON.stringify(plain)}`);
+
+const broken = read([textNode("first"), element("BR"), textNode("second")]);
+if (broken !== "first\nsecond") throw new Error(`line break became ${JSON.stringify(broken)}`);
+
+// The trailing break a browser leaves behind to keep the caret on a new line
+// is scaffolding, not a line the user typed.
+const filler = read([
+  textNode("first"),
+  element("BR"),
+  element("BR", [], { composerFiller: "true" }),
+]);
+if (filler !== "first\n") throw new Error(`filler break became ${JSON.stringify(filler)}`);
+
+const blocks = read([
+  textNode("first"),
+  element("DIV", [textNode("second")]),
+  element("DIV", [textNode("third")]),
+]);
+if (blocks !== "first\nsecond\nthird") throw new Error(`blocks became ${JSON.stringify(blocks)}`);
+
+const carriage = read([textNode("first\r\nsecond")]);
+if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(carriage)}`);
+"#;
+        let script = format!("{harness}\n{source}\n{checks}");
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "--eval"])
+            .arg(script)
+            .output()
+            .expect("Node.js is required to exercise the embedded web viewer");
+        assert!(
+            output.status.success(),
+            "embedded viewer composer reader failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[test]
     fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
         assert!(VIEWER_HTML.contains(r#"<link rel="icon" href="/icon.svg">"#));
@@ -1737,6 +2437,7 @@ mod tests {
             ControllerAction::Prompt {
                 session_id: "session-1".into(),
                 text: "ship it".into(),
+                images: Vec::new(),
             }
         );
         action.reply.send(ActionOutcome::Accepted).unwrap();
@@ -1812,6 +2513,7 @@ mod tests {
                 &ControllerAction::Prompt {
                     session_id: "session-1".into(),
                     text: "!cargo test".into(),
+                    images: Vec::new(),
                 },
                 &snapshot,
             )

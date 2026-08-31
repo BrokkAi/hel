@@ -172,7 +172,7 @@ pub fn discover_current(executor: &impl CommandExecutor) -> SetupDiscovery {
     let overrides = HarnessKind::ALL.into_iter().filter_map(|kind| {
         std::env::var_os(kind.home_env()).map(|path| (kind, PathBuf::from(path)))
     });
-    let homes = discover_harness_homes(home.as_deref(), overrides);
+    let homes = discover_harness_homes_with_executor(home.as_deref(), overrides, executor);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     SetupDiscovery {
@@ -235,22 +235,34 @@ pub fn discover_harness_homes(
     home: Option<&Path>,
     overrides: impl IntoIterator<Item = (HarnessKind, PathBuf)>,
 ) -> Vec<DiscoveredHome> {
+    discover_harness_homes_with_executor(home, overrides, &probe_executor())
+}
+
+pub(crate) fn discover_harness_homes_with_executor(
+    home: Option<&Path>,
+    overrides: impl IntoIterator<Item = (HarnessKind, PathBuf)>,
+    executor: &impl CommandExecutor,
+) -> Vec<DiscoveredHome> {
     let mut candidates = Vec::new();
     if let Some(home) = home {
         candidates.extend(
             HarnessKind::ALL
                 .into_iter()
-                .map(|kind| (kind, home.join(kind.default_home_leaf()))),
+                .map(|kind| (kind, home.join(kind.default_home_leaf()), true)),
         );
     }
-    candidates.extend(overrides);
+    candidates.extend(
+        overrides
+            .into_iter()
+            .map(|(kind, path)| (kind, path, false)),
+    );
 
     let mut seen = BTreeSet::new();
     candidates
         .into_iter()
-        .filter(|(kind, path)| seen.insert((*kind, path.clone())) && path.is_dir())
-        .map(|(kind, path)| DiscoveredHome {
-            authenticated: harness_is_authenticated(kind, &path),
+        .filter(|(kind, path, _)| seen.insert((*kind, path.clone())) && path.is_dir())
+        .map(|(kind, path, is_default_home)| DiscoveredHome {
+            authenticated: harness_is_authenticated_with(kind, &path, is_default_home, executor),
             kind,
             path,
         })
@@ -258,8 +270,108 @@ pub fn discover_harness_homes(
 }
 
 pub fn harness_is_authenticated(kind: HarnessKind, home: &Path) -> bool {
-    harness_authentication_marker(kind, home).is_file()
+    harness_is_authenticated_with_executor(kind, home, &probe_executor())
+}
+
+pub(crate) fn harness_is_authenticated_with_executor(
+    kind: HarnessKind,
+    home: &Path,
+    executor: &impl CommandExecutor,
+) -> bool {
+    let is_default_home =
+        dirs::home_dir().is_some_and(|user_home| home == user_home.join(kind.default_home_leaf()));
+    harness_is_authenticated_with(kind, home, is_default_home, executor)
+}
+
+fn harness_is_authenticated_with(
+    kind: HarnessKind,
+    home: &Path,
+    is_default_home: bool,
+    executor: &impl CommandExecutor,
+) -> bool {
+    if harness_authentication_marker(kind, home).is_file()
         || (kind == HarnessKind::Kimi && home.join("credentials").is_file())
+    {
+        return true;
+    }
+    if kind != HarnessKind::Claude {
+        return false;
+    }
+    if is_default_home && claude_keychain_reports_authenticated(executor) {
+        return true;
+    }
+    if !is_default_home && claude_cli_reports_authenticated(home, executor) {
+        return true;
+    }
+    false
+}
+
+/// Ask Claude Code about a scoped profile. Setting `CLAUDE_CONFIG_DIR` for the
+/// default home changes Claude's profile selection, so the default macOS
+/// profile is checked directly in the Keychain instead.
+fn claude_cli_reports_authenticated(home: &Path, executor: &impl CommandExecutor) -> bool {
+    let mut command = CommandSpec::new("claude", ["auth", "status", "--json"])
+        .purpose("check Claude Code authentication");
+    command.env.insert(
+        HarnessKind::Claude.home_env().to_owned(),
+        home.to_string_lossy().into_owned(),
+    );
+    let Ok(output) = executor.execute(&command) else {
+        return false;
+    };
+    if output.status != 0 {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()
+        .and_then(|status| status.get("loggedIn").and_then(serde_json::Value::as_bool))
+        == Some(true)
+}
+
+/// Mjolnir and Claude Code use this service for the default macOS profile.
+/// `security` is already authorized for the item, so this does not raise a
+/// Keychain prompt; the shared executor still bounds a wedged lookup.
+#[cfg(target_os = "macos")]
+fn claude_keychain_reports_authenticated(executor: &impl CommandExecutor) -> bool {
+    let command = CommandSpec::new(
+        "security",
+        [
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ],
+    )
+    .purpose("check Claude Code authentication in the macOS Keychain");
+    let Ok(output) = executor.execute(&command) else {
+        return false;
+    };
+    output.status == 0 && claude_credentials_contain_login(&output.stdout)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_reports_authenticated(_executor: &impl CommandExecutor) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn claude_credentials_contain_login(credentials: &[u8]) -> bool {
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(credentials) else {
+        return false;
+    };
+    [
+        "/claudeAiOauth/accessToken",
+        "/claudeAiOauth/refreshToken",
+        "/oauth/accessToken",
+        "/apiKey",
+    ]
+    .into_iter()
+    .any(|pointer| {
+        document
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 pub fn harness_authentication_marker(kind: HarnessKind, home: &Path) -> PathBuf {
@@ -1255,7 +1367,12 @@ mod tests {
         fs::write(deepseek.join(".credentials.yaml"), "version: 1\n").unwrap();
         fs::write(claude.join(".credentials.json"), "{}").unwrap();
 
-        let homes = discover_harness_homes(Some(&home), [(HarnessKind::Claude, claude.clone())]);
+        let executor = FakeExecutor::succeeds();
+        let homes = discover_harness_homes_with_executor(
+            Some(&home),
+            [(HarnessKind::Claude, claude.clone())],
+            &executor,
+        );
 
         assert_eq!(homes.len(), 5);
         assert!(homes.iter().all(|home| home.authenticated));
@@ -1282,7 +1399,8 @@ mod tests {
             fs::create_dir_all(home.join(kind.default_home_leaf())).unwrap();
         }
 
-        let homes = discover_harness_homes(Some(&home), []);
+        let executor = FakeExecutor::succeeds();
+        let homes = discover_harness_homes_with_executor(Some(&home), [], &executor);
 
         assert_eq!(homes.len(), HarnessKind::ALL.len());
         for kind in HarnessKind::ALL {
@@ -1293,6 +1411,85 @@ mod tests {
                 "{kind:?} default home"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_keychain_marks_the_default_home_authenticated_without_a_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let executor = RuntimeProbeExecutor::new([ok(
+            br#"{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh"}}"#,
+        )]);
+
+        let homes = discover_harness_homes_with_executor(Some(&home), [], &executor);
+
+        assert_eq!(
+            homes,
+            vec![DiscoveredHome {
+                kind: HarnessKind::Claude,
+                path: claude.clone(),
+                authenticated: true,
+            }]
+        );
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "security");
+        assert_eq!(
+            commands[0].args,
+            [
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w"
+            ]
+        );
+        assert!(commands[0].env.is_empty());
+    }
+
+    #[test]
+    fn claude_status_checks_a_custom_home_without_a_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let claude = directory.path().join("claude-custom");
+        fs::create_dir_all(&claude).unwrap();
+        let executor =
+            RuntimeProbeExecutor::new([ok(br#"{"loggedIn":true,"authMethod":"claude.ai"}"#)]);
+
+        let homes = discover_harness_homes_with_executor(
+            None,
+            [(HarnessKind::Claude, claude.clone())],
+            &executor,
+        );
+
+        assert_eq!(
+            homes,
+            vec![DiscoveredHome {
+                kind: HarnessKind::Claude,
+                path: claude.clone(),
+                authenticated: true,
+            }]
+        );
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "claude");
+        assert_eq!(commands[0].args, ["auth", "status", "--json"]);
+        assert_eq!(
+            commands[0].env.get("CLAUDE_CONFIG_DIR"),
+            Some(&claude.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn claude_credential_evidence_requires_a_nonempty_login_secret() {
+        assert!(claude_credentials_contain_login(
+            br#"{"claudeAiOauth":{"refreshToken":"refresh"}}"#
+        ));
+        assert!(!claude_credentials_contain_login(
+            br#"{"claudeAiOauth":{"refreshToken":"  "}}"#
+        ));
+        assert!(!claude_credentials_contain_login(b"not json"));
     }
 
     #[test]

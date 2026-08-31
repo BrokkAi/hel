@@ -1,5 +1,9 @@
 ARG NODE_IMAGE=docker.io/library/node:24-trixie
-ARG RUST_IMAGE=docker.io/library/rust:1-trixie
+# Pinned to the same compiler as rust-toolchain.toml. A floating `rust:1`
+# tag would drift away from the pin, and rustup would then download the
+# pinned toolchain on the first cargo run without the musl target and
+# components this image adds below. Bump both together.
+ARG RUST_IMAGE=docker.io/library/rust:1.96.0-trixie
 
 FROM ${NODE_IMAGE} AS node
 FROM ${RUST_IMAGE}

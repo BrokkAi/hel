@@ -20,6 +20,7 @@ The visible proof is a local Podman session whose chat can be left without stopp
 - [x] (2026-08-31 14:34Z) Replaced the terminal UI's hidden Stop workflow with target-aware Finish, Saved, and Delete language, and made leave-running behavior explicit. The complete TUI suite and termination PTY tests pass.
 - [x] (2026-08-31 14:53Z) Brought the phone viewer and its controller action schema to the same lifecycle model without exposing private target locators. Rust projection/server tests, script syntax checks, and targeted clippy pass; the real browser run is updated but cannot launch Chromium in this container because its system libraries require unavailable sudo access.
 - [x] (2026-08-31 15:00Z) Published lifecycle guidance, updated behavioral and end-to-end tests, and ran the complete locally available validation suite. Rust, lint, docs, links, and script syntax pass; real browser launch and manual Podman acceptance remain environment-skipped for the reasons recorded below.
+- [x] (2026-08-31 15:28Z) Reconciled the feature with `origin/master` at `53dffa5`, preserving the newer phone viewer's image-prompt and elicitation flows alongside target-aware Finish. The post-merge full Rust suite, formatting, Clippy, documentation build, link check, JavaScript parse, Python compile, and Playwright test discovery pass.
 
 ## Surprises & Discoveries
 
@@ -52,6 +53,9 @@ The visible proof is a local Podman session whose chat can be left without stopp
 
 - Observation: Podman is not installed in this disposable container, so the optional manual exact-container acceptance run cannot be performed here.
   Evidence: `command -v podman` returns no executable. Fake target-plan tests and the browser reliability lab's fake bare target remain the deterministic coverage for target release in this environment.
+
+- Observation: `origin/master` added phone-viewer image attachments and elicitation forms after this branch was opened, touching the same embedded viewer as target-aware Finish.
+  Evidence: the merge conflicts were confined to `src/hel_server.rs` and the public exports in `src/hel_worker.rs`. The resolved viewer maps all three projections (`finish`, `pending_elicitations`, and `prompt_images_supported`), and all 39 server tests pass together.
 
 ## Decision Log
 
@@ -378,3 +382,5 @@ Revision note (2026-08-31): Milestone 2 completed with target-aware terminal Fin
 Revision note (2026-08-31): Milestone 3 completed the privacy-safe phone projection, Finish action schema, Active/Saved rendering, target-aware web confirmation, and asynchronous Finishing state; browser reliability coverage was updated but cannot launch locally without privileged system-library installation.
 
 Revision note (2026-08-31): Milestone 4 published the lifecycle documentation, extended the browser/TUI reliability flow through Dashboard, quit warning, Finish, and Saved, and completed all locally available full-suite validation.
+
+Revision note (2026-08-31): Reconciled the completed feature with `origin/master` at `53dffa5`. The resolution retains both lifecycle Finish and the newer image/elicitation viewer capabilities; the merged tree passes 1,757 Rust tests with 9 environment or measurement tests ignored, plus formatting, Clippy, docs, links, and script checks.

@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
 use crate::hel_elicitation::{
     ElicitationField, ElicitationFieldKind, ElicitationRequest, ElicitationResponse,
-    ElicitationValue,
+    ElicitationValue, validate_field_value,
 };
 use crate::hel_selection::{
     ContentPos, FrameSurfaces, SelectionRange, SurfaceFrame, SurfaceId, extract_rows,
@@ -561,143 +561,64 @@ fn validated_value(
     value: &FieldValue,
 ) -> Result<Option<ElicitationValue>, String> {
     let missing = || Err(format!("{} is required", field.title));
-    match (&field.kind, value) {
-        (
-            ElicitationFieldKind::Text {
-                min_length,
-                max_length,
-                pattern,
-                format,
-                ..
-            },
-            FieldValue::Text(value),
-        ) => {
+    let answered = match (&field.kind, value) {
+        (ElicitationFieldKind::Text { .. }, FieldValue::Text(value)) => {
             if value.is_empty() {
                 return if field.required { missing() } else { Ok(None) };
             }
-            let length = value.chars().count();
-            if min_length.is_some_and(|minimum| length < minimum) {
-                return Err(format!("{} is too short", field.title));
-            }
-            if max_length.is_some_and(|maximum| length > maximum) {
-                return Err(format!("{} is too long", field.title));
-            }
-            if pattern.as_ref().is_some_and(|pattern| {
-                !regex::Regex::new(pattern)
-                    .expect("validated pattern")
-                    .is_match(value)
-            }) {
-                return Err(format!(
-                    "{} does not match the required format",
-                    field.title
-                ));
-            }
-            if let Some(format) = format {
-                validate_text_format(value, format)
-                    .map_err(|message| format!("{} {message}", field.title))?;
-            }
-            Ok(Some(ElicitationValue::String(value.to_string())))
+            ElicitationValue::String(value.to_string())
         }
         (ElicitationFieldKind::SingleSelect { options, .. }, FieldValue::Single(selected)) => {
             let Some(index) = selected else {
                 return if field.required { missing() } else { Ok(None) };
             };
-            Ok(Some(ElicitationValue::String(
-                options[*index].value.clone(),
-            )))
+            ElicitationValue::String(options[*index].value.clone())
         }
-        (
-            ElicitationFieldKind::MultiSelect {
-                options,
-                min_items,
-                max_items,
-                ..
-            },
-            FieldValue::Multi(selected),
-        ) => {
+        (ElicitationFieldKind::MultiSelect { options, .. }, FieldValue::Multi(selected)) => {
             if selected.is_empty() && field.required {
                 return missing();
             }
-            if min_items.is_some_and(|minimum| selected.len() < minimum) {
-                return Err(format!("{} needs more selections", field.title));
-            }
-            if max_items.is_some_and(|maximum| selected.len() > maximum) {
-                return Err(format!("{} has too many selections", field.title));
-            }
-            if selected.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(ElicitationValue::StringArray(
+            let value = ElicitationValue::StringArray(
                 selected
                     .iter()
                     .map(|index| options[*index].value.clone())
                     .collect(),
-            )))
+            );
+            // An empty optional multi-select still has to satisfy `minItems`,
+            // so the constraints are checked before the answer is dropped.
+            validate_field_value(field, &value)?;
+            if selected.is_empty() {
+                return Ok(None);
+            }
+            value
         }
         (ElicitationFieldKind::Boolean { .. }, FieldValue::Boolean(value)) => {
-            Ok(Some(ElicitationValue::Boolean(*value)))
+            ElicitationValue::Boolean(*value)
         }
-        (
-            ElicitationFieldKind::Integer {
-                minimum, maximum, ..
-            },
-            FieldValue::Text(value),
-        ) => {
+        (ElicitationFieldKind::Integer { .. }, FieldValue::Text(value)) => {
             if value.is_empty() {
                 return if field.required { missing() } else { Ok(None) };
             }
-            let value = value
-                .parse::<i64>()
-                .map_err(|_| format!("{} must be an integer", field.title))?;
-            if minimum.is_some_and(|minimum| value < minimum)
-                || maximum.is_some_and(|maximum| value > maximum)
-            {
-                return Err(format!("{} is outside the allowed range", field.title));
-            }
-            Ok(Some(ElicitationValue::Integer(value)))
+            ElicitationValue::Integer(
+                value
+                    .parse::<i64>()
+                    .map_err(|_| format!("{} must be an integer", field.title))?,
+            )
         }
-        (
-            ElicitationFieldKind::Number {
-                minimum, maximum, ..
-            },
-            FieldValue::Text(value),
-        ) => {
+        (ElicitationFieldKind::Number { .. }, FieldValue::Text(value)) => {
             if value.is_empty() {
                 return if field.required { missing() } else { Ok(None) };
             }
-            let value = value
-                .parse::<f64>()
-                .map_err(|_| format!("{} must be a number", field.title))?;
-            if !value.is_finite()
-                || minimum.is_some_and(|minimum| value < minimum)
-                || maximum.is_some_and(|maximum| value > maximum)
-            {
-                return Err(format!("{} is outside the allowed range", field.title));
-            }
-            Ok(Some(ElicitationValue::Number(value)))
+            ElicitationValue::Number(
+                value
+                    .parse::<f64>()
+                    .map_err(|_| format!("{} must be a number", field.title))?,
+            )
         }
-        _ => Err(format!("{} has an incompatible value", field.title)),
-    }
-}
-
-fn validate_text_format(value: &str, format: &str) -> Result<(), &'static str> {
-    match format {
-        "email"
-            if !value.split_once('@').is_some_and(|(local, domain)| {
-                !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
-            }) =>
-        {
-            Err("must be an email address")
-        }
-        "uri" if url::Url::parse(value).is_err() => Err("must be a URI"),
-        "date" if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err() => {
-            Err("must be a YYYY-MM-DD date")
-        }
-        "date-time" if chrono::DateTime::parse_from_rfc3339(value).is_err() => {
-            Err("must be an RFC 3339 date-time")
-        }
-        _ => Ok(()),
-    }
+        _ => return Err(format!("{} has an incompatible value", field.title)),
+    };
+    validate_field_value(field, &answered)?;
+    Ok(Some(answered))
 }
 
 pub(super) fn render_elicitation(

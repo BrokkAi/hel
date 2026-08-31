@@ -692,9 +692,12 @@ fn cancellable_command(command: &CommandSpec) -> Command {
 fn terminate_cancellable_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     // The child owns a fresh process group, so descendants such as an SSH or
-    // shell helper cannot keep its output pipes open after cancellation.
-    if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } != 0 {
-        let error = std::io::Error::last_os_error();
+    // shell helper cannot keep its output pipes open after cancellation. A
+    // group that is already gone is the wanted outcome, not a failure, so the
+    // shared helper decides what deserves a warning.
+    if let Err(error) =
+        crate::hel_subprocess::signal_process_group(child.id() as i32, libc::SIGKILL)
+    {
         tracing::warn!(pid = child.id(), %error, "could not terminate cancelled command process group");
     }
     #[cfg(not(unix))]
