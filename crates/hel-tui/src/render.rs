@@ -1763,7 +1763,7 @@ mod tests {
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("You: unanswered follow-up"));
-        assert!(rendered.contains("│ Checking the workspace"), "{rendered}");
+        assert!(rendered.contains(" Checking the workspace"), "{rendered}");
         assert!(!rendered.contains("Agent:"));
         assert!(!rendered.contains("answer 0"));
         let (user_row, user_line) = lines
@@ -1820,7 +1820,7 @@ mod tests {
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
         assert!(!rendered.contains("[idle]"), "{rendered}");
-        assert!(rendered.contains("Agent: │ Finished work"), "{rendered}");
+        assert!(rendered.contains("Agent: Finished work"), "{rendered}");
         assert!(
             rendered.contains(&format!("{activity_time}  ")),
             "{rendered}"
@@ -2245,6 +2245,30 @@ mod tests {
         assert!(hotkeys.contains("n new"), "{hotkeys:?}");
         assert!(hotkeys.contains("a mark read"), "{hotkeys:?}");
         assert!(!hotkeys.contains("[S]ort"));
+    }
+
+    /// The expanded row draws its own `Agent:`/clock prefix, so the excerpt
+    /// beside it must not arrive carrying the transcript's rail as well.
+    #[test]
+    fn an_expanded_agent_excerpt_carries_no_transcript_gutter() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.focus_sessions();
+        apply_materialized_transcript(
+            &mut dashboard,
+            vec![agent_message(1, "reliability reply: summarize the README")],
+        );
+
+        let lines = drawn(&mut dashboard, 120, 34);
+        let agent = lines
+            .iter()
+            .find(|line| line.contains("reliability reply"))
+            .expect("the agent excerpt row");
+        // The pane has focus, so its own border is the doubled glyph: any
+        // light vertical left on this row came from the transcript's rail.
+        assert!(
+            !agent.contains('\u{2502}'),
+            "the excerpt carries no transcript rail: {agent:?}"
+        );
     }
 
     /// The empty band has two causes and they need different advice. Telling
@@ -2972,7 +2996,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
-        assert_eq!(lines, ["│ two", "│ three", "│ four", "│ five"]);
+        assert_eq!(lines, ["two", "three", "four", "five"]);
         assert!(active_message_tail(None, 80, ACTIVE_MESSAGE_LINES).is_empty());
     }
 

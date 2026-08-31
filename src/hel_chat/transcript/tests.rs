@@ -1251,20 +1251,33 @@ fn transcript_blocks_keep_role_headers_and_wrapped_body_indented() {
     assert_eq!(text, ["❯ You", "│ alpha beta", "│ gamma", ""]);
 }
 
+/// A preview is the conversation's own rendering minus its rail: the same
+/// rows, wrapped the same way, without the gutter that only means something
+/// under a role header.
 #[test]
-fn agent_preview_tail_matches_the_conversation_body_rows() {
+fn agent_preview_tail_matches_the_conversation_body_rows_without_the_gutter() {
     let text = "# heading\n\nfirst paragraph with some words to wrap\n\n- alpha\n- beta";
     let entry = ChatEntry::plain(0, ChatRole::Agent, text);
+    // The conversation spends two columns on the gutter, so a preview asked
+    // for 38 columns of text renders the same rows as a 40-column transcript.
     let body = render_transcript_entry(&entry, 40, TranscriptRenderMode::Rich)
         .into_iter()
         .skip(1) // header row
         .filter(|line| !line_is_empty(line))
+        .map(without_role_gutter)
         .collect::<Vec<_>>();
     assert!(!body.is_empty());
+    assert!(
+        body.iter().all(|line| line
+            .spans
+            .first()
+            .is_none_or(|span| span.content != ROLE_GUTTER)),
+        "the comparison rows have no gutter left to match"
+    );
 
-    assert_eq!(render_agent_message_tail(text, 40, usize::MAX), body);
+    assert_eq!(render_agent_message_tail(text, 38, usize::MAX), body);
     assert_eq!(
-        render_agent_message_tail(text, 40, 2),
+        render_agent_message_tail(text, 38, 2),
         body[body.len() - 2..].to_vec()
     );
 }
@@ -1286,7 +1299,9 @@ fn agent_preview_head_removes_punctuation_before_its_ellipsis() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(rendered, ["│ first line", "│ late-corpus diagnostics…"]);
+    // No role gutter: the session list draws its own prefix in front of these
+    // rows, and a second marker there means nothing.
+    assert_eq!(rendered, ["first line", "late-corpus diagnostics…"]);
     assert!(
         lines[1]
             .spans

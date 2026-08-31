@@ -30,6 +30,9 @@ The user-visible payoff: you can read an agent's output, see what your other age
 
 ## Surprises & Discoveries
 
+- Observation: the expanded session rows drew the transcript's role gutter inside their agent excerpt, giving rows like `Agent: | reliability reply: ...` — two markers where the row already had its own prefix. It was pre-existing, inherited from the old dashboard, and only became obvious once a real agent put text there. `render_agent_message_head` and `render_agent_message_tail` build their rows with the conversation's pipeline, which adds the rail every continuation row needs *under a role header*; a summary row has no header. Both now drop it, and ask the pipeline for two more columns so the caller still gets the width it asked for.
+  Evidence: the live surface drew `║  Agent: | reliability reply: summarize the README` before the fix and `║  Agent: reliability reply: summarize the README` after.
+
 - Observation: the startup pick was broken on every reattach, and only a real session showed it. Opening a conversation needs the session manager to be managing that session, and the manager adopts sessions asynchronously after the surface starts. The pick fired at the two-second mark, the attach was refused with "session ... is not managed", and the pick — which fires once by design — gave up. Every relaunch landed on an empty conversation band with a notice the user could do nothing about. It now retries on the clock tick within a bounded window, and stays quiet while it does, because the failure resolves itself.
   Evidence: the surface drew `Could not open session: session 0a2c6cb160deadd4f84cf6708b1813fe is not managed` two seconds after launch, with the Sessions pane listing that very session as live. No unit test could have caught this: it needs a real session manager with real adoption latency.
 
