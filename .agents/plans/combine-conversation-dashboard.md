@@ -26,16 +26,18 @@ The user-visible payoff: you can read an agent's output, see what your other age
 - [x] (2026-08-31) Behaviour tests. Composer: Tab accepting an open completion before it cycles focus, and Ctrl-W and Ctrl-B reaching the composer at all. Sessions: the five-session threshold, the Others aggregation with its exact active/idle split, the current project following the conversation, the focused list ignoring the threshold, default-expanded and independent collapse, and the selection surviving the list changing under it. Rendering: the four-row expanded form, the compact row's project/target/clock/last-line, the minimized rows' CPU and weekly-percent-used, their explicit unavailable/refreshing/stale readings, and their truncation. Startup: the newest-activity pick, the creation-then-id fallback, the bounded wait, and the user taking the choice back.
 - [x] (2026-08-31) Verification. The real binary was driven in a PTY at 140x32 and 60x20: the six bands draw in order, Tab walks Sessions to Quota with the footer following, Ctrl-G collapses Targets and Quota to `Targets  local 17%` and `Quota  claude-1 unavailable codex-1 unavailable` and hands the transcript the rows they freed, Tab restores them onto Sessions, 15 rows reports `Increase height to at least 16 rows`. The band order and the collapse arithmetic are now also render tests, so they cannot regress silently.
 
-## Outstanding
-
-A workspace with live sessions has been verified through the render tests
-(compact rows, the five-session threshold, the Others aggregation, the
-four-row expanded form, independent collapse) but not yet by hand against a
-running agent, which needs a provisioned container target and harness
-credentials. That is the one check from the original test plan that automation
-here could not stand in for.
+- [x] (2026-08-31) By-hand verification against a running agent, using the repository's own fake-harness lab (`tests/e2e/prepare-luna-lab.py`, a `local-bare` target and a fake ACP bridge — no container or credentials needed). Created a session through the wizard from the Sessions pane's plain `n`, opened it, sent a prompt and saw the agent reply in the transcript, watched the compact Sessions row follow it live, walked the whole Tab ring, collapsed and restored the panes, opened the web dialog with F3, and confirmed Escape closes a dialog and never quits while an unsent draft survives. Detaching and relaunching confirmed the startup pick reopens the newest conversation with the cursor in Prompt. Two defects found and fixed; see `Surprises & Discoveries`.
 
 ## Surprises & Discoveries
+
+- Observation: the startup pick was broken on every reattach, and only a real session showed it. Opening a conversation needs the session manager to be managing that session, and the manager adopts sessions asynchronously after the surface starts. The pick fired at the two-second mark, the attach was refused with "session ... is not managed", and the pick — which fires once by design — gave up. Every relaunch landed on an empty conversation band with a notice the user could do nothing about. It now retries on the clock tick within a bounded window, and stays quiet while it does, because the failure resolves itself.
+  Evidence: the surface drew `Could not open session: session 0a2c6cb160deadd4f84cf6708b1813fe is not managed` two seconds after launch, with the Sessions pane listing that very session as live. No unit test could have caught this: it needs a real session manager with real adoption latency.
+
+- Observation: the empty prompt band lied. It always said "No live session in this workspace", including when the workspace had live sessions that simply were not open — which is what the pane directly above it was listing. There are two causes for an empty band and they need different advice.
+  Evidence: after creating a session, the surface drew the Sessions pane with `› localhost/project  fake  ...` above a prompt band reading `No live session in this workspace.`
+
+- Observation: the fake-harness lab is stateful, and re-running a scripted sequence against a lab that already has a session produces nonsense — the second run's startup pick targets the first run's session, whose worker may be gone. Every by-hand pass needs either a fresh lab or a sequence that accounts for what the previous one left behind. Two apparent product failures during this work were this, not Hel.
+  Evidence: a second scripted run against seed 4242's lab drew `Prompt (no live session)` with wizard remnants on screen, and the daemon log showed `connect worker at .../workers/ca74d3be...: No such file or directory`.
 
 - Observation: the startup fallback ranked sessions backwards. `compare_by_creation` orders oldest first, and the comparator inverted it, so a workspace whose summaries had not loaded would have opened its *oldest* session rather than its newest. The test written for the documented behaviour caught it.
   Evidence: `startup_falls_back_to_the_newest_creation_then_the_larger_id` failed with `left: Some("session-a")` against `right: Some("session-b")` before the comparator was corrected to `left.compare_by_creation(right)`.
@@ -102,7 +104,7 @@ here could not stand in for.
 
 ## Outcomes & Retrospective
 
-The feature is delivered. Hel's TUI is one screen — Sessions, transcript, Prompt, Targets, Quota, footer — with no view switch, no `View` enum, and no second renderer. `Ctrl-G` collapses the support panes instead of navigating back, `Tab` walks four focus stops, the panes take plain letters, `Escape` never quits, and Workspaces and the web viewer moved to `F2` and `F3`, which handed `Ctrl-W` and `Ctrl-B` back to the composer.
+The feature is delivered and has been driven by hand against a running agent. Hel's TUI is one screen — Sessions, transcript, Prompt, Targets, Quota, footer — with no view switch, no `View` enum, and no second renderer. `Ctrl-G` collapses the support panes instead of navigating back, `Tab` walks four focus stops, the panes take plain letters, `Escape` never quits, and Workspaces and the web viewer moved to `F2` and `F3`, which handed `Ctrl-W` and `Ctrl-B` back to the composer.
 
 Three things are worth passing on.
 
@@ -110,7 +112,9 @@ The milestone boundaries in this plan did not survive contact with the compiler.
 
 Two real defects came out of writing the tests the plan asked for rather than out of running the code. The startup fallback ranked sessions backwards, so a workspace whose summaries had not loaded would have opened its oldest conversation; and the first cut of the collapse test asserted a row count that was wrong in a way that hid a second effect (minimizing also compacts Sessions, because it moves focus to Prompt). Both are the kind of thing a screenshot would have passed.
 
-Driving the real binary in a PTY was worth more than any single test. It is what surfaced the over-long Sessions title, the guidance line clipped out of the empty prompt, and the two pane titles that still said Capacity and Profile Quotas — none of which the unit tests were looking at, because none of them were wrong in a way a test had been written to notice.
+Driving the real binary against a real session was worth more than the rest of the verification put together. The headline behaviour of this change — open the newest conversation on startup — was broken on every single reattach, and nothing short of a real session manager with real adoption latency could have shown it: the ranking was right, the state machine was right, and the attach was simply too early. The lesson is not "write more tests"; it is that a feature whose whole point is what happens when the program starts has to be watched starting.
+
+Driving the real binary in a PTY was also what caught the smaller things. It is what surfaced the over-long Sessions title, the guidance line clipped out of the empty prompt, and the two pane titles that still said Capacity and Profile Quotas — none of which the unit tests were looking at, because none of them were wrong in a way a test had been written to notice.
 
 ## Context and Orientation
 

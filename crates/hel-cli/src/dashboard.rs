@@ -74,6 +74,15 @@ const DASHBOARD_CLOCK_TICK: Duration = Duration::from_secs(1);
 /// activity; a stalled read must not leave the screen without a conversation.
 const STARTUP_SESSION_WAIT: Duration = Duration::from_secs(2);
 
+/// How long the startup pick keeps trying to open the conversation it chose.
+///
+/// Attaching needs the session manager to be managing that session, and the
+/// manager adopts sessions asynchronously after the surface starts, so the
+/// first attempt usually lands before it is ready and fails with "not
+/// managed". Retrying on the clock tick rides that out; the window bounds it
+/// so a session that never becomes managed cannot retry for ever.
+const STARTUP_SESSION_ATTACH_WINDOW: Duration = Duration::from_secs(30);
+
 /// Whether the surface still gets to choose which conversation it opens on.
 ///
 /// It waits for the stored summaries, because those carry the activity times
@@ -86,16 +95,24 @@ struct StartupSession {
     /// False once the choice has been made, or taken away.
     open_pending: bool,
     deadline: std::time::Instant,
+    /// The conversation the pick chose and is waiting on, so an attach that
+    /// lands before the session manager is ready can be tried again.
+    attempting: Option<String>,
+    /// When to stop retrying that attach.
+    give_up_at: std::time::Instant,
 }
 
 impl StartupSession {
     /// Nothing to choose: the workspace has no live session, or one is
     /// already open.
     fn idle() -> Self {
+        let now = std::time::Instant::now();
         Self {
             pending_summaries: BTreeSet::new(),
             open_pending: false,
-            deadline: std::time::Instant::now(),
+            deadline: now,
+            attempting: None,
+            give_up_at: now,
         }
     }
 
@@ -105,6 +122,8 @@ impl StartupSession {
             open_pending: !pending_summaries.is_empty(),
             pending_summaries,
             deadline: now + STARTUP_SESSION_WAIT,
+            attempting: None,
+            give_up_at: now + STARTUP_SESSION_ATTACH_WINDOW,
         }
     }
 
@@ -116,6 +135,29 @@ impl StartupSession {
     /// The user acted, so the choice is theirs now.
     fn cancel(&mut self) {
         self.open_pending = false;
+        self.attempting = None;
+    }
+
+    /// Records which conversation the pick is opening, so a failed attach can
+    /// be recognised as this one's.
+    fn attempting(&mut self, session_id: &str) {
+        self.attempting = Some(session_id.to_owned());
+    }
+
+    /// One attach failed. Returns whether the pick will try again, which is
+    /// also whether the failure is worth reporting: a manager that has not
+    /// adopted the session yet resolves itself, and saying so every second
+    /// would bury the notice bar in noise.
+    fn attach_failed(&mut self, session_id: &str, now: std::time::Instant) -> bool {
+        if self.attempting.as_deref() != Some(session_id) {
+            return false;
+        }
+        if now >= self.give_up_at {
+            self.attempting = None;
+            return false;
+        }
+        self.open_pending = true;
+        true
     }
 
     /// Whether the pick should run now. Answering `true` once retires the
@@ -1027,6 +1069,13 @@ impl DashboardContext {
         self.startup.cancel();
     }
 
+    /// Whether a failed attach belongs to the startup pick and will be tried
+    /// again on the next tick.
+    pub(super) fn retry_startup_attach(&mut self, session_id: &str) -> bool {
+        self.startup
+            .attach_failed(session_id, std::time::Instant::now())
+    }
+
     /// Opens the conversation the surface should start on, once the summaries
     /// it compares have arrived or the wait for them has run out.
     pub(super) fn maybe_open_startup_session(&mut self) {
@@ -1044,6 +1093,7 @@ impl DashboardContext {
             self.dashboard.focus_sessions();
             return;
         };
+        self.startup.attempting(&session_id);
         self.dashboard.focus_prompt();
         self.open_chat_session(&session_id);
     }
@@ -2783,6 +2833,45 @@ mod tests {
         let mut stalled = StartupSession::begin(["session-a".to_owned()], start);
         assert!(!stalled.ready(start));
         assert!(stalled.ready(start + STARTUP_SESSION_WAIT));
+    }
+
+    /// The session manager adopts sessions asynchronously after the surface
+    /// starts, so the startup pick's first attach usually lands too early.
+    /// It has to ride that out rather than give up on the first refusal.
+    #[test]
+    fn the_startup_pick_retries_an_attach_the_manager_was_not_ready_for() {
+        let start = std::time::Instant::now();
+        let mut startup = StartupSession::begin(["session-a".to_owned()], start);
+        startup.summary_arrived("session-a");
+        assert!(startup.ready(start));
+        startup.attempting("session-a");
+
+        // The refusal is not worth reporting, and the pick re-arms.
+        assert!(startup.attach_failed("session-a", start));
+        assert!(startup.ready(start));
+
+        // A failure for some other session is not this pick's business.
+        startup.attempting("session-a");
+        assert!(!startup.attach_failed("session-b", start));
+
+        // Past the window it stops retrying and the failure is reported.
+        assert!(!startup.attach_failed("session-a", start + STARTUP_SESSION_ATTACH_WINDOW));
+        assert!(!startup.ready(start + STARTUP_SESSION_ATTACH_WINDOW));
+    }
+
+    /// A user who acts during the retries takes the choice back, and the
+    /// retries stop rather than yanking a conversation open underneath them.
+    #[test]
+    fn cancelling_stops_the_startup_attach_retries() {
+        let start = std::time::Instant::now();
+        let mut startup = StartupSession::begin(["session-a".to_owned()], start);
+        startup.summary_arrived("session-a");
+        assert!(startup.ready(start));
+        startup.attempting("session-a");
+
+        startup.cancel();
+        assert!(!startup.attach_failed("session-a", start));
+        assert!(!startup.ready(start));
     }
 
     /// The user acting is the strongest signal there is about which

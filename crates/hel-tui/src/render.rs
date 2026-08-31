@@ -2247,6 +2247,24 @@ mod tests {
         assert!(!hotkeys.contains("[S]ort"));
     }
 
+    /// The empty band has two causes and they need different advice. Telling
+    /// someone there is no live session while the pane above lists one is a
+    /// plain lie.
+    #[test]
+    fn the_empty_prompt_distinguishes_no_session_from_no_conversation() {
+        let mut empty = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        let lines = drawn(&mut empty, 120, 34).join("\n");
+        assert!(lines.contains("Prompt (no live session)"), "{lines}");
+        assert!(lines.contains("n to create or s to resume"), "{lines}");
+
+        // A live session that simply is not open says so instead.
+        let mut live = dashboard_with_session(running_session());
+        let lines = drawn(&mut live, 120, 34).join("\n");
+        assert!(lines.contains("Prompt (no conversation open)"), "{lines}");
+        assert!(lines.contains("Enter on the one to open"), "{lines}");
+        assert!(!lines.contains("No live session"), "{lines}");
+    }
+
     /// The band order is the whole point of the surface: everything is on one
     /// screen, in one arrangement, at every size it draws at.
     #[test]

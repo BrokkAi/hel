@@ -1102,8 +1102,19 @@ impl DashboardContext {
                                 .as_ref()
                                 .map(hel::hel_chat::ActiveChat::session_id),
                         );
-                        self.dashboard
-                            .set_notice(format!("Could not open session: {error}"));
+                        // The startup pick often attaches before the session
+                        // manager has adopted the session. That resolves
+                        // itself, so it retries quietly rather than reporting
+                        // a failure the user can do nothing about.
+                        if self.retry_startup_attach(&session_id) {
+                            tracing::debug!(
+                                %session_id,
+                                "startup attach was early, retrying: {error}"
+                            );
+                        } else {
+                            self.dashboard
+                                .set_notice(format!("Could not open session: {error}"));
+                        }
                     }
                 }
                 self.dirty = true;

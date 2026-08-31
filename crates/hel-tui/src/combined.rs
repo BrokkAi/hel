@@ -281,7 +281,13 @@ pub fn render_combined(
             prompt_focused
         }
         None => {
-            render_empty_conversation(frame, transcript_area, prompt_area, prompt_focused);
+            render_empty_conversation(
+                frame,
+                transcript_area,
+                prompt_area,
+                prompt_focused,
+                dashboard.ordered_sessions().is_empty(),
+            );
             false
         }
     };
@@ -323,13 +329,20 @@ pub fn render_combined(
     render_modal(frame, area, dashboard);
 }
 
-/// The bordered chrome that stands in for a conversation while the workspace
-/// has no live session, with the two things the user can do about it.
+/// The bordered chrome that stands in for a conversation when none is open,
+/// and the thing the user can do about it.
+///
+/// There are two reasons for an empty band, and they need different advice:
+/// a workspace with no live session needs one created or resumed, while a
+/// workspace that has live sessions just needs one opened. Telling the second
+/// user there is no live session would be a plain lie — the pane above is
+/// listing them.
 fn render_empty_conversation(
     frame: &mut Frame,
     transcript_area: Rect,
     prompt_area: Rect,
     prompt_focused: bool,
+    no_live_session: bool,
 ) {
     frame.render_widget(
         Block::default()
@@ -342,19 +355,33 @@ fn render_empty_conversation(
     } else {
         BorderType::Plain
     };
+    let (title, lines) = if no_live_session {
+        (
+            " Prompt (no live session) ",
+            [
+                "No live session in this workspace.",
+                "Press Tab for Sessions, then n to create or s to resume.",
+            ],
+        )
+    } else {
+        (
+            " Prompt (no conversation open) ",
+            [
+                "No conversation open.",
+                "Press Tab for Sessions, then Enter on the one to open.",
+            ],
+        )
+    };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::raw("No live session in this workspace."),
-            Line::raw("Press Tab for Sessions, then n to create or s to resume."),
-        ])
-        .style(Style::default().fg(Color::DarkGray))
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(border)
-                .title(" Prompt (no live session) "),
-        ),
+        Paragraph::new(lines.map(Line::raw).to_vec())
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(border)
+                    .title(title),
+            ),
         prompt_area,
     );
 }
