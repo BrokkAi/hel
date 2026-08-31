@@ -32,7 +32,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-unknown-linux-musl
 
@@ -41,20 +41,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --assume-yes libasound2-dev musl-tools
 
-      - name: Verify tag matches Cargo.toml version
-        shell: bash
+      - name: Verify tag, manifests, and lockfile agree
         run: |
-          set -euo pipefail
-          tag="${RELEASE_TAG#v}"
-          versions="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "hel-core" or .name == "hel-tui" or .name == "hel-cli" or .name == "hel-voice-worker") | [.name, .version] | @tsv')"
-          test -n "$versions"
-          while IFS=$'\t' read -r crate version; do
-            if [ "$tag" != "$version" ]; then
-              echo "Tag version ($tag) does not match $crate version ($version)" >&2
-              exit 1
-            fi
-          done <<< "$versions"
+          node scripts/release-version.mjs check "$RELEASE_TAG"
+          cargo metadata --locked --format-version 1 >/dev/null
 
       - name: Package crates
         run: |
@@ -93,7 +83,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-unknown-linux-musl
 

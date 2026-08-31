@@ -26,8 +26,6 @@ pub enum SurfaceId {
     ReviewerTranscript,
     /// Scrollable message body of an elicitation dialog.
     ElicitationMessage,
-    /// Conversation list beside the transcript.
-    Conversations,
     /// Prompt editor.
     PromptInput,
     /// Dashboard pane, numbered in render order.
@@ -132,6 +130,24 @@ impl FrameSurfaces {
     /// Registers a surface. Later registrations sit above earlier ones.
     pub fn push(&mut self, surface: SurfaceFrame) {
         self.surfaces.push(surface);
+    }
+
+    /// Appends every surface `other` registered, preserving render order.
+    ///
+    /// One frame can be drawn by more than one renderer; this is how the
+    /// second renderer's hitboxes join the first's without either owning the
+    /// other's registry.
+    pub fn append(&mut self, other: &FrameSurfaces) {
+        self.surfaces.extend_from_slice(&other.surfaces);
+    }
+
+    /// Replaces every registration with `other`'s.
+    ///
+    /// A modal owns the frame's interaction, so everything behind it stops
+    /// being selectable rather than staying reachable underneath.
+    pub fn replace_with(&mut self, other: &FrameSurfaces) {
+        self.surfaces.clear();
+        self.surfaces.extend_from_slice(&other.surfaces);
     }
 
     /// Returns true when no surface is registered.
@@ -836,7 +852,7 @@ mod tests {
     #[test]
     fn extract_rows_reads_a_partial_first_and_last_row() {
         let buffer = buffer_with_rows(&["abcdefgh", "ijklmnop", "qrstuvwx"], 8);
-        let frame = SurfaceFrame::fixed(SurfaceId::Conversations, Rect::new(0, 0, 8, 3));
+        let frame = SurfaceFrame::fixed(SurfaceId::PromptInput, Rect::new(0, 0, 8, 3));
         let range = SelectionRange {
             start: ContentPos::new(0, 5),
             end: ContentPos::new(2, 2),

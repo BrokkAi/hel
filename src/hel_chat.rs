@@ -62,6 +62,7 @@ use autocomplete::{
 };
 use elicitation::ElicitationDialog;
 use history::{HistorySearch, HistorySearchRequest};
+pub use rendering::truncate_line_to_width;
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
 use second_opinion::{SecondOpinion, SecondOpinionIntent};
 use transcript::{
@@ -80,6 +81,21 @@ pub use transcript::{
     render_agent_message_head, render_agent_message_tail,
 };
 
+/// Where a host surface has told the chat to draw itself.
+///
+/// `transcript` and `prompt` are the *outer* rectangles including each block's
+/// border. `footer` is `Some` only when the host wants the chat to own the
+/// footer row, which it does while the composer has focus. `overlay` is the
+/// whole frame: modals and the autocomplete popup are centred and clamped
+/// inside it rather than inside the bands above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatRegions {
+    pub transcript: Rect,
+    pub prompt: Rect,
+    pub footer: Option<Rect>,
+    pub overlay: Rect,
+}
+
 /// What one terminal event asked the chat to do.
 ///
 /// `None` means the event only changed local state, which lets the caller keep
@@ -89,15 +105,15 @@ pub use transcript::{
 pub enum ChatEventOutcome {
     None,
     Handled,
-    Back {
-        last_seen_event_ordinal: u64,
+    /// Tab or Shift-Tab from the composer. The host surface owns focus, so
+    /// the chat only reports which way to walk.
+    CycleFocus {
+        reverse: bool,
     },
-    /// The user picked another conversation. The caller saves this session the
-    /// way it saves a `Back` and then opens `session_id`.
-    SwitchSession {
-        session_id: String,
-        last_seen_event_ordinal: u64,
-    },
+    /// Ctrl-G: collapse the support panes, or bring them back.
+    ToggleSupportPanes,
+    /// F3: open the web-access dialog.
+    OpenWebDialog,
     QuitDetach {
         last_seen_event_ordinal: u64,
     },
@@ -146,10 +162,12 @@ pub enum ChatAction {
     },
     PasteFromClipboard,
     ToggleVoice,
-    SwitchSession {
-        session_id: String,
+    /// Tab or Shift-Tab with no completion popup open.
+    CycleFocus {
+        reverse: bool,
     },
-    Back,
+    ToggleSupportPanes,
+    OpenWebDialog,
     QuitDetach,
 }
 
@@ -179,42 +197,15 @@ impl QueuedPrompt {
     }
 }
 
-/// What the chat's session header shows when it opens: where this session sits
-/// among the same-project active sessions, and the other sessions it lists.
+/// The stable columns the conversation's title shows, snapshotted when the
+/// chat opens.
 #[derive(Debug, Clone, Default)]
 pub struct SessionHeaderIdentity {
-    pub position: usize,
-    pub others: Vec<OtherSessionIdentity>,
-    /// Dashboard target label, including the project suffix for bare targets.
+    /// Session-list target label, including the project suffix for bare
+    /// targets.
     pub target: String,
-    /// Profile column from the dashboard's live-session summary.
+    /// Profile column from the session list's live-session summary.
     pub profile: String,
-}
-
-/// Identity of another same-project session, snapshotted when the chat opens.
-/// `position` is its place in that list at that moment, not a live value.
-#[derive(Debug, Clone)]
-pub struct OtherSessionIdentity {
-    pub session_id: String,
-    pub position: usize,
-}
-
-/// What the conversations pane says about one other session. The id travels
-/// with the activity so a row the user picks resolves to a session to open.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OtherSessionActivity {
-    session_id: String,
-    position: usize,
-    turn_started_at_epoch_seconds: Option<u64>,
-    last_agent_line: Option<String>,
-}
-
-/// Which part of the chat view the keyboard is driving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum ChatFocus {
-    #[default]
-    Prompt,
-    Conversations,
 }
 
 /// Constructors that need [`sanitize_terminal_text`], which is chat-view
@@ -339,7 +330,7 @@ pub struct ChatState {
     effort_values: Vec<SessionConfigChoice>,
     autocomplete: Option<Autocomplete>,
     anchor: TranscriptAnchor,
-    /// On entry, reveal the response advertised by the dashboard when later
+    /// On entry, reveal the response advertised by the session list when later
     /// tool activity would otherwise push it above the first viewport.
     reveal_latest_agent_on_draw: bool,
     last_viewport_height: usize,
@@ -347,24 +338,18 @@ pub struct ChatState {
     render_cache: TranscriptRenderCache,
     notices: Notices,
     voice_active: bool,
-    /// Dashboard identity and header position snapshotted when the chat opened.
-    position: usize,
+    /// Session-list identity snapshotted when the chat opened.
     header_target: String,
     header_profile: String,
     turn_started_at_epoch_seconds: Option<u64>,
     last_acp_activity_at_ms: Option<u64>,
-    other_sessions: Vec<OtherSessionActivity>,
-    focus: ChatFocus,
-    /// Where the conversations pane's window starts. `None` centres it on the
-    /// current session; the wheel pins it somewhere else until the keyboard
-    /// moves through the list again.
-    conversations_window_start: Option<usize>,
-    /// The pane's hitbox, recorded each frame so the wheel knows what it is
-    /// over. `None` before the first draw.
-    conversations_area: Option<Rect>,
     /// Selectable surfaces, rebuilt by every frame in render order so the
     /// selection engine can hit-test the screen the user is looking at.
     pub(super) frame_surfaces: FrameSurfaces,
+    /// The last frame's surfaces replace everything behind them, because a
+    /// modal owned the frame. A host that composes the chat with its own
+    /// panes reads this to decide whether to merge or replace.
+    pub(super) frame_surfaces_exclusive: bool,
     /// The row space transcript selections are measured in, re-pinned by every
     /// frame the engine is not holding a transcript selection through.
     transcript_selection: Option<TranscriptSelectionSpace>,
@@ -433,16 +418,12 @@ impl ChatState {
             render_cache: TranscriptRenderCache::default(),
             notices: Notices::default(),
             voice_active: false,
-            position: 0,
             header_target: String::new(),
             header_profile: String::new(),
             turn_started_at_epoch_seconds: None,
             last_acp_activity_at_ms: None,
-            other_sessions: Vec::new(),
-            focus: ChatFocus::Prompt,
-            conversations_window_start: None,
-            conversations_area: None,
             frame_surfaces: FrameSurfaces::new(),
+            frame_surfaces_exclusive: false,
             transcript_selection: None,
             transcript_selection_invalid: false,
             render_cache_generation: 0,
@@ -827,13 +808,7 @@ impl ChatState {
         })
     }
 
-    /// Places this session's line among the other sessions. The position is
-    /// fixed for the visit.
-    pub fn set_header_position(&mut self, position: usize) {
-        self.position = position;
-    }
-
-    /// Installs the stable dashboard columns used by the conversation title.
+    /// Installs the stable session-list columns used by the conversation title.
     pub fn set_header_summary(&mut self, target: impl Into<String>, profile: impl Into<String>) {
         self.header_target = target.into();
         self.header_profile = profile.into();
@@ -858,15 +833,6 @@ impl ChatState {
                     && !entry.text.trim().is_empty()
             })
             .map(|entry| entry.text.clone())
-    }
-
-    /// Last line of this session's most recent agent message that has text.
-    fn last_agent_line(&self) -> Option<String> {
-        self.entries
-            .iter()
-            .rev()
-            .filter(|entry| entry.role == ChatRole::Agent)
-            .find_map(|entry| last_nonempty_line(&entry.text))
     }
 
     pub fn latest_seq(&self) -> u64 {
@@ -1150,8 +1116,6 @@ impl ChatState {
         self.render_mode = TranscriptRenderMode::Rich;
         self.notices.clear();
         self.voice_active = false;
-        self.focus = ChatFocus::Prompt;
-        self.conversations_window_start = None;
     }
 
     fn set_input(&mut self, input: String) {
@@ -1230,9 +1194,12 @@ impl ChatState {
                     self.show_help();
                     ChatAction::None
                 }
+                // There is no second screen to return to any more, so
+                // /detach now means what the word says: leave Hel with the
+                // session still running on its target.
                 LocalCommand::Detach => {
                     self.clear_input();
-                    ChatAction::Back
+                    ChatAction::QuitDetach
                 }
                 LocalCommand::Model | LocalCommand::Effort => {
                     let key = if command == LocalCommand::Model {
@@ -1397,10 +1364,13 @@ impl ChatState {
         // time the session is opened, so stepping out loses nothing but field
         // text that was typed and not submitted.
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('g') {
-            return ChatAction::Back;
+            return ChatAction::ToggleSupportPanes;
         }
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('q') {
             return ChatAction::QuitDetach;
+        }
+        if code == KeyCode::F(3) {
+            return ChatAction::OpenWebDialog;
         }
 
         // The second-opinion view owns the frame while it is up: the composer
@@ -1451,10 +1421,6 @@ impl ChatState {
         if self.history_search.is_some() {
             self.handle_history_search_key(code, modifiers);
             return ChatAction::None;
-        }
-
-        if self.focus == ChatFocus::Conversations {
-            return self.handle_conversations_key(code, modifiers);
         }
 
         if code == KeyCode::Esc {
@@ -1573,14 +1539,16 @@ impl ChatState {
                 self.delete();
                 ChatAction::None
             }
-            // Tab completes an open popup first; with none open it is the
-            // handle on the conversations pane.
+            // Tab completes an open popup first; with none open it hands the
+            // keyboard to the next pane of the combined surface.
             KeyCode::Tab => {
-                if !self.accept_autocomplete() {
-                    self.focus_conversations();
+                if self.accept_autocomplete() {
+                    ChatAction::None
+                } else {
+                    ChatAction::CycleFocus { reverse: false }
                 }
-                ChatAction::None
             }
+            KeyCode::BackTab => ChatAction::CycleFocus { reverse: true },
             KeyCode::Char(character)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
@@ -1704,6 +1672,12 @@ impl ChatState {
         &self.frame_surfaces
     }
 
+    /// Whether the last frame's surfaces stand alone, because a modal owned
+    /// the frame.
+    pub fn frame_surfaces_exclusive(&self) -> bool {
+        self.frame_surfaces_exclusive
+    }
+
     /// Scrolls the elicitation message pane, for a drag held at its edge.
     pub(super) fn scroll_elicitation_message(&self, rows: isize) {
         if let Some(dialog) = self.elicitation.as_ref() {
@@ -1749,18 +1723,11 @@ impl ChatState {
             dialog.handle_mouse(mouse);
             return ChatAction::None;
         }
-        // Hover decides what scrolls; only Tab moves focus.
-        let over_conversations = self
-            .conversations_area
-            .is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)));
-        match (mouse.kind, over_conversations) {
-            (MouseEventKind::ScrollUp, true) => self.scroll_conversations(-1),
-            (MouseEventKind::ScrollDown, true) => self.scroll_conversations(1),
-            (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
-            (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
-            (MouseEventKind::Down(MouseButton::Left), true) => {
-                return self.click_conversation_row(mouse);
-            }
+        // The host routes a wheel event here only when the pointer is over
+        // the conversation, so it always drives the transcript.
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_history_up(MOUSE_SCROLL_ROWS),
+            MouseEventKind::ScrollDown => self.scroll_history_down(MOUSE_SCROLL_ROWS),
             _ => {}
         }
         ChatAction::None
@@ -2242,13 +2209,6 @@ fn turn_started_at_epoch_seconds(execution: MaterializedExecutionState) -> Optio
 
 /// Last line of a message that has any text on it, trimmed. `None` means the
 /// message is blank.
-fn last_nonempty_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty())
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2309,11 +2269,13 @@ mod tests {
         assert_eq!(freshly_opened_chat("").input, "");
     }
 
+    /// Ctrl-G no longer leaves the conversation; it collapses the support
+    /// panes around it, and the host acts on that.
     #[test]
-    fn control_g_detaches_without_emitting_close() {
+    fn control_g_asks_the_host_to_collapse_the_support_panes() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         let control_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        assert_eq!(chat.handle_key(control_g), ChatAction::Back);
+        assert_eq!(chat.handle_key(control_g), ChatAction::ToggleSupportPanes);
     }
 
     #[test]
@@ -2563,14 +2525,15 @@ mod tests {
 
     /// A pending elicitation is durable projection state, rebuilt from the
     /// session the next time it is opened, so leaving the view is a different
-    /// act from answering the agent.
+    /// act from answering the agent. The same goes for collapsing the panes
+    /// around it: neither key is an answer to the form.
     #[test]
-    fn control_g_and_control_q_leave_a_chat_whose_elicitation_is_still_open() {
+    fn control_g_and_control_q_pass_a_chat_whose_elicitation_is_still_open() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         let request = text_elicitation();
         chat.restore_elicitation(request.clone());
 
-        assert_eq!(chat.handle_key(ctrl('g')), ChatAction::Back);
+        assert_eq!(chat.handle_key(ctrl('g')), ChatAction::ToggleSupportPanes);
         assert_eq!(chat.handle_key(ctrl('q')), ChatAction::QuitDetach);
         assert_eq!(
             chat.materialized_session().pending_elicitations,
@@ -2591,13 +2554,13 @@ mod tests {
     }
 
     #[test]
-    fn escape_only_cancels_an_active_turn_and_control_g_detaches() {
+    fn escape_only_cancels_an_active_turn_and_control_g_collapses_the_panes() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let control_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(chat.handle_key(control_c), ChatAction::None);
         assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::None);
-        assert_eq!(chat.handle_key(control_g), ChatAction::Back);
+        assert_eq!(chat.handle_key(control_g), ChatAction::ToggleSupportPanes);
 
         chat.phase = WorkerPhase::Running;
         assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::Cancel);

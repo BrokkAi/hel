@@ -1804,23 +1804,24 @@ mod tests {
         assert!(rendered.contains("Search:"), "{rendered}");
     }
 
-    /// The dialog is the only surface for non-live sessions, and Ctrl+S opens it.
+    /// The dialog is the only surface for non-live sessions, and `s` on the
+    /// Sessions pane opens it.
     #[test]
     fn the_dashboard_opens_the_dialog_and_names_the_key_in_the_footer() {
         let mut dashboard = dashboard_with_session(running_session());
         assert_eq!(
-            dashboard.handle_key(ctrl_key('s')),
+            dashboard.handle_key(key(KeyCode::Char('s'))),
             DashboardAction::OpenResumeDialog
         );
         assert_eq!(dashboard.handle_key(ctrl_key('t')), DashboardAction::None);
-        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.focus, Focus::Sessions);
 
         let mut terminal = Terminal::new(TestBackend::new(140, 30)).expect("terminal");
         terminal
             .draw(|frame| crate::render::render(frame, &mut dashboard))
             .expect("draw the dashboard");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(rendered.contains("[S] Resume"), "{rendered}");
+        assert!(rendered.contains("s resume"), "{rendered}");
         assert!(!rendered.contains("Import"), "{rendered}");
     }
 

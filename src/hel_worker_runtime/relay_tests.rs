@@ -1157,7 +1157,7 @@ async fn config_during_a_prompt_waits_but_cancel_dispatches_immediately() {
             .await
             .unwrap()
             .unwrap(),
-        CommandRequest::Cancel { request_id } if request_id == "cancel-while-running"
+        CommandRequest::Cancel { request_id, .. } if request_id == "cancel-while-running"
     ));
 
     event_tx
@@ -1415,7 +1415,7 @@ async fn dispatch_batch_does_not_outgrow_the_bounded_acp_command_channel() {
             .await
             .unwrap()
             .unwrap(),
-        CommandRequest::Cancel { request_id } if request_id == "cancel-second"
+        CommandRequest::Cancel { request_id, .. } if request_id == "cancel-second"
     ));
     event_tx
         .send(RuntimeEvent::CommandRejected {
@@ -1547,7 +1547,7 @@ async fn out_of_band_sends_cannot_park_the_dispatching_coordinator() {
     );
     assert!(matches!(
         next_command(&mut command_rx).await,
-        CommandRequest::Cancel { request_id } if request_id == "cancel-batched"
+        CommandRequest::Cancel { request_id, .. } if request_id == "cancel-batched"
     ));
 
     event_tx.send(RuntimeEvent::Stopped).unwrap();
@@ -1629,7 +1629,7 @@ async fn out_of_band_traffic_shrinks_the_durable_dispatch_batch() {
     unix::wake_dispatch(&relay, &wake_tx).unwrap();
     assert!(matches!(
         next_command(&mut command_rx).await,
-        CommandRequest::Cancel { request_id } if request_id == "cancel-second"
+        CommandRequest::Cancel { request_id, .. } if request_id == "cancel-second"
     ));
 
     event_tx.send(RuntimeEvent::Stopped).unwrap();
@@ -1936,7 +1936,7 @@ async fn config_cancel_and_close_commands_have_durable_terminal_outcomes() {
     wake_tx.try_send(()).unwrap();
     assert!(matches!(
         command_rx.recv().await.unwrap(),
-        CommandRequest::Cancel { request_id } if request_id == "cancel-1"
+        CommandRequest::Cancel { request_id, .. } if request_id == "cancel-1"
     ));
     event_tx
         .send(RuntimeEvent::CancelApplied {

@@ -135,11 +135,42 @@ to build your own.
 2. Run `hel doctor` (or `hel doctor --json`) and fix what it reports, until it
    is clean. Log in to any profile that needs it with
    `hel login --profile <id>`.
-3. In the dashboard, create a session: pick a profile, a repository bundle,
-   and a target, then send your first prompt.
+3. Press `Tab` to focus Sessions, then `n` to create a session: pick a
+   profile, a repository bundle, and a target. Focus returns to the prompt;
+   send your first message.
 4. Detach whenever you like (`Ctrl+Q`). The session keeps running and your
-   queued prompts keep executing. Reattach from the dashboard, or open the
+   queued prompts keep executing. Reattach by running `hel` again, or open the
    daemon-owned web viewer shown by `hel daemon status`.
+
+## The terminal surface
+
+Hel's TUI is one screen. From top to bottom: **Sessions**, the **transcript**
+of the conversation you are in, the **Prompt** composer, **Targets**, **Quota**,
+and a footer that names the keys for whatever has focus. Nothing is behind a
+navigation step, so you can read an agent's output while seeing what your other
+agents are doing and how loaded your machines are.
+
+Hel opens on the session whose agent spoke most recently, with the cursor in
+Prompt.
+
+`Tab` moves the keyboard between Sessions, Quota, Targets and Prompt, and
+`Shift+Tab` reverses it. The transcript is not a Tab stop: read it with the
+mouse wheel or `PageUp`/`PageDown` from wherever you are.
+
+`Ctrl+G` collapses Targets and Quota into one summary row each — host names
+with CPU load, profile names with weekly percentage used — and gives the rows
+they free to the transcript. `Ctrl+G` again brings them back. `F2` opens the
+workspace picker, `F3` the web viewer, and `Ctrl+Q` detaches.
+
+The panes take plain keys, because the composer is a separate focus and never
+sees them. On Sessions: `Enter` opens the selection, `n` creates a session, `s`
+opens Resume, `e` edits, `a` marks everything read, `x` cancels an operation in
+flight, `Space` and `1`–`9` collapse and expand projects. On Targets and Quota:
+`r` refreshes and `Enter` or `e` opens that row's actions. Every list also takes
+the arrow keys, `j`/`k`, `Ctrl+N`/`Ctrl+P`, and `Home`/`End`.
+
+`Escape` belongs to the conversation: it cancels a running turn or a shell
+command, and closes a dialog. It never quits.
 
 In an attached TUI or the phone viewer, start a message with `!` to run the
 rest as `bash -lc` inside that session's target. Shell commands run in the
@@ -178,6 +209,12 @@ image = "ghcr.io/brokkai/hel/agent-dev:latest"
 # remote latest tags, keeps versioned tags cached, and pins digest references.
 # pull_policy = "auto"
 ```
+
+`version` is the config schema version. A file written by a *newer* Hel still
+loads: the settings this build understands keep working, and the config becomes
+read-only, so the older build refuses to save and never downgrades the file.
+`hel doctor` reports that state. Update Hel, or change settings with the newer
+build, to make it writable again.
 
 Profiles point at harness home directories on your machine — run as many
 profiles per harness as you have accounts. Bundles describe the repositories a

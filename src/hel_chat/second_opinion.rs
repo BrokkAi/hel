@@ -1067,7 +1067,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
-            .draw(|frame| crate::hel_chat::active::render(frame, &mut chat, false))
+            .draw(|frame| crate::hel_chat::active::render_full_frame(frame, &mut chat, false))
             .unwrap();
         let reviewer = chat.reviewer_area.expect("the split draws a reviewer pane");
         (chat, reviewer)

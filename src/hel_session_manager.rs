@@ -407,6 +407,65 @@ pub enum RemoteSessionRequest {
     },
 }
 
+impl RemoteSessionRequest {
+    /// The session this request acts on. Requests for one session have to be
+    /// carried out in the order they were made.
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Submit { session_id, .. }
+            | Self::Sync { session_id, .. }
+            | Self::RespondElicitation { session_id, .. }
+            | Self::Reviewer { session_id, .. } => session_id,
+        }
+    }
+}
+
+/// Keeps each session's relay requests in the order they were made, while
+/// letting different sessions overlap.
+///
+/// A bridge that spawns every request concurrently loses the order the caller
+/// submitted them in, and the order is load-bearing: `/effort` followed by a
+/// prompt has to reach the relay that way round, or the prompt runs under the
+/// old setting. Awaiting each request inline would restore the order but would
+/// also make one slow session block every other one, so instead each request
+/// waits on its own session's previous request and nothing else.
+#[derive(Default)]
+pub struct SessionRequestOrder {
+    latest: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+}
+
+impl SessionRequestOrder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Runs `forward` for `request` after everything already queued for the
+    /// same session has finished.
+    pub fn dispatch<F, Fut>(&mut self, request: RemoteSessionRequest, forward: F)
+    where
+        F: FnOnce(RemoteSessionRequest) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        // Sessions that have gone quiet leave a finished handle behind; drop
+        // them here so the map tracks live work rather than every session the
+        // bridge has ever served.
+        self.latest.retain(|_, handle| !handle.is_finished());
+        let session_id = request.session_id().to_owned();
+        let previous = self.latest.remove(&session_id);
+        let handle = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                // A panicked predecessor still releases its successor: the
+                // request behind it is the user's, and dropping it silently
+                // would be worse than running it late.
+                let _ = previous.await;
+            }
+            forward(request).await;
+        });
+        self.latest.insert(session_id, handle);
+    }
+}
+
 /// Exclusive owner of the manager task and every relay actor below it.
 ///
 /// Long-running control surfaces explicitly await [`Self::shutdown`] before
@@ -609,14 +668,6 @@ impl ManagedSessionHandle {
     /// holding long-lived handles use this to reacquire the current one.
     pub(crate) fn is_stopped(&self) -> bool {
         self.commands.is_closed()
-    }
-
-    /// Read the current view in place. Pollers that only need a few derived
-    /// numbers use this instead of `view()`, which clones the whole
-    /// transcript. The closure must stay synchronous and cheap: it runs while
-    /// the watch value is borrowed.
-    pub(crate) fn with_view<T>(&self, read: impl FnOnce(&ManagedSessionView) -> T) -> T {
-        read(&self.view.borrow())
     }
 
     pub fn has_changed(&self) -> Result<bool> {
@@ -1953,23 +2004,6 @@ async fn deliver_submit(
     updates: &CoalescedUpdateSender,
 ) {
     let result = submit_actor_command(target, connection, &command_id, &command).await;
-    if let Ok(ordinal) = result.as_ref() {
-        let snapshot = connection
-            .as_ref()
-            .expect("successful submission retained its connection")
-            .snapshot();
-        publish_view(
-            &target.session_id,
-            ManagedSessionView {
-                snapshot: Some(snapshot),
-                connected: true,
-                error: None,
-            },
-            view_tx,
-            updates,
-        );
-        tracing::trace!(%ordinal, %command_id, "relay command accepted");
-    }
     if let Err(error) = result.as_ref() {
         tracing::warn!(
             session_id = %target.session_id,
@@ -1985,6 +2019,11 @@ async fn deliver_submit(
     {
         *connection = None;
     }
+    let accepted = result.as_ref().ok().copied();
+    // Answer the caller the moment the relay has the command. Catching the
+    // local projection up to it is the expensive half and nobody waiting to
+    // hear "accepted" needs it first: the caller has an ordinal, and the view
+    // it would read is published below anyway.
     if reply
         .send(result.map_err(|error| format!("{error:#}")))
         .is_err()
@@ -1995,6 +2034,38 @@ async fn deliver_submit(
             %command_id,
             "submit result receiver was already closed"
         );
+    }
+    let Some(ordinal) = accepted else {
+        return;
+    };
+    tracing::trace!(%ordinal, %command_id, "relay command accepted");
+    let Some(session) = connection.as_mut() else {
+        return;
+    };
+    // The command landed either way, so a failed catch-up is a connection
+    // problem to retire rather than a failed submission: the caller has
+    // already been told the relay took it.
+    match session.sync().await {
+        Ok(snapshot) => publish_view(
+            &target.session_id,
+            ManagedSessionView {
+                snapshot: Some(snapshot),
+                connected: true,
+                error: None,
+            },
+            view_tx,
+            updates,
+        ),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %target.session_id,
+                operation = "submit",
+                %command_id,
+                error = %format!("{error:#}"),
+                "projection could not catch up to an accepted command"
+            );
+            *connection = None;
+        }
     }
 }
 
@@ -2023,7 +2094,7 @@ async fn submit_actor_command(
         let result = connection
             .as_mut()
             .context("relay is disconnected")?
-            .submit(command_id.to_owned(), command.clone())
+            .submit_accepted(command_id.to_owned(), command.clone())
             .await;
         match result {
             Ok(ordinal) => return Ok(ordinal),
@@ -2419,8 +2490,24 @@ impl StandaloneSession {
         }
     }
 
+    /// Hands one command to the relay and returns the ordinal it accepted it
+    /// at, without catching the local projection up to it.
+    ///
+    /// Callers that need the projection current call [`Self::sync`] after.
+    /// Keeping the two apart matters on the prompt path: the catch-up is the
+    /// expensive half, and a caller waiting to hear that the relay took the
+    /// command should not wait for it. It also stops a failed catch-up from
+    /// looking like a failed submission to a caller that would retry.
+    pub async fn submit_accepted(
+        &mut self,
+        command_id: String,
+        command: RelayCommand,
+    ) -> Result<u64> {
+        self.client.submit(command_id, command).await
+    }
+
     pub async fn submit(&mut self, command_id: String, command: RelayCommand) -> Result<u64> {
-        let ordinal = self.client.submit(command_id, command).await?;
+        let ordinal = self.submit_accepted(command_id, command).await?;
         self.sync_in_place().await?;
         Ok(ordinal)
     }
@@ -2730,6 +2817,132 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+
+    fn ordering_request(session_id: &str, command_id: &str) -> RemoteSessionRequest {
+        let (reply, _response) = oneshot::channel();
+        RemoteSessionRequest::Submit {
+            session_id: session_id.into(),
+            command_id: command_id.into(),
+            command: RelayCommand::SetConfig {
+                key: "effort".into(),
+                value: "high".into(),
+            },
+            reply,
+        }
+    }
+
+    /// `/effort` followed by a prompt has to reach the relay that way round,
+    /// or the prompt runs under the old setting. A bridge that spawns every
+    /// request concurrently loses that, so the order is pinned here: the
+    /// first request is held up, and the second must not overtake it.
+    #[tokio::test]
+    async fn one_session_keeps_its_requests_in_the_order_they_were_made() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut order = SessionRequestOrder::new();
+
+        for command_id in ["first", "second", "third"] {
+            let observed = Arc::clone(&observed);
+            let release = Arc::clone(&release);
+            order.dispatch(ordering_request("session-a", command_id), move |request| {
+                let RemoteSessionRequest::Submit { command_id, .. } = request else {
+                    unreachable!("the fixture only submits")
+                };
+                async move {
+                    // Only the first request waits. If the order were lost,
+                    // the other two would finish while it is held.
+                    if command_id == "first" {
+                        release.notified().await;
+                    }
+                    observed.lock().unwrap().push(command_id);
+                }
+            });
+        }
+
+        // Nothing may run while the first request is held. Yield generously:
+        // the point is that the later requests never get to run, not that
+        // they have not been polled yet.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "a later request overtook the one being held: {:?}",
+            observed.lock().unwrap()
+        );
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while observed.lock().unwrap().len() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every request ran");
+        assert_eq!(*observed.lock().unwrap(), ["first", "second", "third"]);
+    }
+
+    /// Ordering is per session: one session waiting on a slow relay must not
+    /// hold up another session's prompt.
+    #[tokio::test]
+    async fn different_sessions_still_overlap() {
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut order = SessionRequestOrder::new();
+
+        let held = Arc::clone(&release);
+        let recorder = Arc::clone(&finished);
+        order.dispatch(ordering_request("session-a", "slow"), move |_| async move {
+            held.notified().await;
+            recorder.lock().unwrap().push("slow");
+        });
+        let recorder = Arc::clone(&finished);
+        order.dispatch(ordering_request("session-b", "fast"), move |_| async move {
+            recorder.lock().unwrap().push("fast");
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while finished.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the other session ran while the first was held");
+        assert_eq!(*finished.lock().unwrap(), ["fast"]);
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while finished.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the held request ran once released");
+    }
+
+    /// A session that has gone quiet must not leave a handle behind for ever:
+    /// a long-lived daemon serves many sessions.
+    #[tokio::test]
+    async fn finished_sessions_are_forgotten() {
+        let mut order = SessionRequestOrder::new();
+        for index in 0..8 {
+            order.dispatch(
+                ordering_request(&format!("session-{index}"), "only"),
+                |_| async {},
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while order.latest.values().any(|handle| !handle.is_finished()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the request finished");
+        }
+        // The next dispatch prunes what has finished, so the map tracks live
+        // work rather than every session ever seen.
+        order.dispatch(ordering_request("session-last", "only"), |_| async {});
+        assert_eq!(order.latest.len(), 1);
+    }
 
     /// A reviewer action reaches a remote controller daemon as JSON, so both
     /// halves of the exchange have to survive that round trip intact.
@@ -3612,6 +3825,7 @@ mod tests {
     const RETURNED_LEASE_VIEW_TEST_CHILD: &str = "HEL_TEST_RETURNED_LEASE_VIEW_CHILD";
     #[cfg(unix)]
     const EXPLICIT_MEMORY_SYNC_TEST_CHILD: &str = "HEL_TEST_EXPLICIT_MEMORY_SYNC_CHILD";
+    const SUBMIT_WITHOUT_SYNC_TEST_CHILD: &str = "HEL_TEST_SUBMIT_WITHOUT_SYNC_CHILD";
     #[cfg(unix)]
     const MANAGER_SHUTDOWN_TEST_CHILD: &str = "HEL_TEST_MANAGER_SHUTDOWN_CHILD";
     const LEASED_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
@@ -3738,6 +3952,49 @@ mod tests {
         assert!(
             connection.project_memory.is_none(),
             "the explicit sync reached the relay and disabled its unavailable endpoint"
+        );
+    }
+
+    /// Catching the local projection up to an accepted command is the
+    /// expensive half of a submit, and a caller waiting to hear that the relay
+    /// took the command should not wait for it. The two are separate calls, so
+    /// the cheap one can answer first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn submitting_does_not_catch_the_projection_up_until_asked() {
+        if std::env::var_os(SUBMIT_WITHOUT_SYNC_TEST_CHILD).is_none() {
+            run_in_isolated_child(
+                SUBMIT_WITHOUT_SYNC_TEST_CHILD,
+                "submitting_does_not_catch_the_projection_up_until_asked",
+            );
+            return;
+        }
+        register_leased_relay_session();
+        let relay_root = tempfile::tempdir().unwrap();
+        let mut connection = StandaloneSession::connect(&leased_relay_target(relay_root.path()))
+            .await
+            .expect("connect to the live test relay");
+        let before = connection.materialized.applied_event_ordinal;
+
+        let ordinal = connection
+            .submit_accepted(
+                new_command_id("prompt").unwrap(),
+                RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("hello"))],
+                },
+            )
+            .await
+            .expect("the relay accepted the command");
+        assert!(ordinal > before, "the relay reported where it accepted it");
+        assert_eq!(
+            connection.materialized.applied_event_ordinal, before,
+            "the caller was answered without paying for the catch-up"
+        );
+
+        connection.sync().await.expect("catch the projection up");
+        assert!(
+            connection.materialized.applied_event_ordinal > before,
+            "the catch-up is what advances the projection"
         );
     }
 

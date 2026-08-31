@@ -21,9 +21,9 @@ use crate::hel_archive::{
     ArchiveInput, BundleManifest, CanonicalSessionSnapshot, CanonicalTranscriptBody,
     GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode, NativeArtifact, PayloadRole,
     RepositorySnapshot, SessionManifest, SystemGit, TargetManifest, collect_git_metadata_snapshot,
-    collect_git_snapshot, ensure_no_symlink_ancestors, has_origin_refs, is_secret_like_path,
-    read_archive_verified, restore_git_snapshot, validate_component, verify_archive_streaming,
-    write_archive_hashed,
+    collect_git_snapshot, ensure_branch_available_for_checkout, ensure_no_symlink_ancestors,
+    has_origin_refs, is_secret_like_path, read_archive_verified, restore_git_snapshot,
+    validate_component, verify_archive_streaming, write_archive_hashed,
 };
 use crate::hel_config::HarnessKind;
 use crate::hel_targets::{
@@ -448,6 +448,7 @@ pub fn restore_single_repository_onto_branch(
     };
     let mut snapshot = archived_repository_snapshot(&archive, repository)?;
     let archived_branch = snapshot.metadata.branch.replace(branch.to_owned());
+    ensure_branch_available_for_checkout(git, repository_path, branch)?;
     restore_git_snapshot(git, repository_path, &snapshot)
         .with_context(|| format!("restore repository {:?}", repository.metadata.id))?;
     Ok(archived_branch)
@@ -3927,6 +3928,16 @@ mod tests {
         assert!(
             format!("{error:#}").contains("restore committed branch"),
             "{error:#}"
+        );
+        assert_eq!(
+            git(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "hel/session",
+            "a rejected restore leaves the checkout on its session branch"
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("README.md")).unwrap(),
+            "edited",
+            "a rejected restore leaves the worktree unchanged"
         );
     }
 

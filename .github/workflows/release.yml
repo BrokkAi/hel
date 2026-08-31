@@ -6,17 +6,32 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-linux-amd64:
-    name: Build hel for x86_64-unknown-linux-musl
+  verify-version:
+    name: Verify release version
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag, manifests, and lockfile agree
+        run: |
+          node scripts/release-version.mjs check "$GITHUB_REF_NAME"
+          cargo metadata --locked --format-version 1 >/dev/null
+
+  build-linux-amd64:
+    name: Build hel for x86_64-unknown-linux-musl
+    needs: verify-version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-unknown-linux-musl
 
@@ -27,7 +42,7 @@ jobs:
 
       - name: Build static controller and worker
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --bin hel --target x86_64-unknown-linux-musl
 
@@ -57,12 +72,13 @@ jobs:
 
   build-linux-arm64:
     name: Build hel for aarch64-unknown-linux-musl
+    needs: verify-version
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: aarch64-unknown-linux-musl
 
@@ -73,7 +89,7 @@ jobs:
 
       - name: Build static controller and worker
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --bin hel --target aarch64-unknown-linux-musl
 
@@ -103,12 +119,13 @@ jobs:
 
   build-macos-arm64:
     name: Build hel for aarch64-apple-darwin
+    needs: verify-version
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: aarch64-apple-darwin
 
@@ -198,7 +215,12 @@ jobs:
     name: Create GitHub release
     needs: package
     runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+      contents: write
     steps:
+      - uses: actions/checkout@v6
+
       - name: Download release assets
         uses: actions/download-artifact@v8
         with:
@@ -213,3 +235,15 @@ jobs:
           files: |
             release-assets/hel-*.tar.gz
             release-assets/hel-*.tar.gz.sha256
+
+      # Releases created with GITHUB_TOKEN do not emit another workflow event.
+      # Dispatch explicitly so crates.io trusted publishing sees a supported
+      # workflow_dispatch trigger.
+      - name: Dispatch crates.io publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run publish.yml \
+            --ref "$GITHUB_REF_NAME" \
+            --raw-field release_tag="$GITHUB_REF_NAME" \
+            --raw-field publish=true

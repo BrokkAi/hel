@@ -739,6 +739,12 @@ fn validate_environment(owner: &str, environment: &BTreeMap<String, String>) -> 
 #[serde(deny_unknown_fields)]
 pub struct HelConfig {
     pub version: u32,
+    /// The version found on disk when it was above this build's
+    /// [`CONFIG_VERSION`]. Such a config loads best-effort so its settings
+    /// still work, and it is read-only: [`HelConfig::save_to`] refuses, so an
+    /// older Hel never overwrites a file a newer Hel maintains.
+    #[serde(skip)]
+    pub newer_config_version: Option<u32>,
     #[serde(default, skip_serializing_if = "PhoneConfig::is_default")]
     pub phone: PhoneConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -753,6 +759,7 @@ impl Default for HelConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            newer_config_version: None,
             phone: PhoneConfig::default(),
             profiles: BTreeMap::new(),
             bundles: BTreeMap::new(),
@@ -786,6 +793,12 @@ impl HelConfig {
         Self::load_from(&config_path())
     }
 
+    /// Read the config from `path`, returning [`HelConfig::default`] when the
+    /// file is missing or empty and an error when it is malformed.
+    ///
+    /// A file written by a *newer* Hel loads best-effort and read-only rather
+    /// than refusing to start: its settings still work, and every write path
+    /// refuses, so nothing downgrades the file.
     pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -795,6 +808,18 @@ impl HelConfig {
         if contents.trim().is_empty() {
             return Ok(Self::default());
         }
+        let document: toml::Value = contents
+            .parse()
+            .with_context(|| format!("parse Hel config {}", path.display()))?;
+        if let Some(found) = newer_version(&document) {
+            tracing::warn!(
+                path = %path.display(),
+                found_version = found,
+                supported_version = CONFIG_VERSION,
+                "Hel config was written by a newer build; loading it read-only"
+            );
+            return Ok(Self::load_newer(&contents, &document, found));
+        }
         reject_removed_profile_overrides(&contents)?;
         reject_non_bare_permissions(&contents)?;
         let config: Self = toml::from_str(&contents)
@@ -803,11 +828,71 @@ impl HelConfig {
         Ok(config)
     }
 
+    /// Best-effort read of a config a newer Hel maintains. Fields this build
+    /// does not know drop away, and a section it cannot read falls back on its
+    /// own instead of costing the whole file, so the profiles, bundles, and
+    /// targets that still parse keep working. The recorded version is what
+    /// makes the result read-only.
+    fn load_newer(contents: &str, document: &toml::Value, found: u32) -> Self {
+        let parsed = toml::from_str::<Self>(contents).ok().map(|mut config| {
+            config.version = CONFIG_VERSION;
+            config
+        });
+        let mut config = match parsed {
+            Some(config) if config.validate().is_ok() => config,
+            _ => Self::salvage(document),
+        };
+        config.newer_config_version = Some(found);
+        config
+    }
+
+    /// Recover each section on its own when the document as a whole no longer
+    /// matches this build's schema. Maps recover entry by entry, so one target
+    /// written in a future shape costs only that target.
+    fn salvage(document: &toml::Value) -> Self {
+        let mut config = Self::default();
+        if let Some(phone) = salvage_section::<PhoneConfig>(document, "phone")
+            && phone.validate().is_ok()
+        {
+            config.phone = phone;
+        }
+        config.profiles = salvage_map(document, "profiles", HarnessProfile::validate);
+        config.bundles = salvage_map(document, "bundles", ProjectBundle::validate);
+        config.targets = salvage_map(document, "targets", TargetTemplate::validate);
+        config
+    }
+
+    /// One line for surfaces that show this config when the file on disk
+    /// belongs to a newer Hel; `None` for a config this build owns.
+    pub fn newer_build_notice(&self) -> Option<String> {
+        self.newer_config_version.map(|found| {
+            format!(
+                "This config was written by a newer Hel (config version {found}; this build \
+                 supports {CONFIG_VERSION}), so it is read-only. Update Hel, or change settings \
+                 with the newer build."
+            )
+        })
+    }
+
     pub fn save(&self) -> Result<()> {
         self.save_to(&config_path())
     }
 
+    /// Refuses when the file belongs to a newer Hel -- judged by the marker
+    /// this config loaded with *and* a fresh look at the file, since a newer
+    /// build may have written it since. Overwriting would silently drop
+    /// settings this build cannot represent.
     pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(found) = self
+            .newer_config_version
+            .or_else(|| newer_version_on_disk(path))
+        {
+            bail!(
+                "{} was written by a newer Hel (config version {found}; this build writes \
+                 {CONFIG_VERSION}). Update Hel, or change settings with the newer build",
+                path.display()
+            );
+        }
         self.validate()?;
         let body = toml::to_string_pretty(self).context("serialize Hel config")?;
         atomic_write(path, body.as_bytes())
@@ -826,6 +911,14 @@ impl HelConfig {
             return Ok(false);
         }
         let mut config = Self::load_from(path)?;
+        if config.newer_config_version.is_some() {
+            // The newer Hel that owns this file renames its own targets.
+            tracing::warn!(
+                path = %path.display(),
+                "skipping the legacy localhost target rename: the config belongs to a newer Hel"
+            );
+            return Ok(false);
+        }
         let Some(legacy) = config.targets.get("raw-localhost").cloned() else {
             return Ok(false);
         };
@@ -865,6 +958,63 @@ fn reject_non_bare_permissions(contents: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The config version in `document` when it is above this build's.
+fn newer_version(document: &toml::Value) -> Option<u32> {
+    let version = document.get("version")?.as_integer()?;
+    (version > i64::from(CONFIG_VERSION)).then(|| u32::try_from(version).unwrap_or(u32::MAX))
+}
+
+/// The config version at `path` when it is above this build's. Read
+/// tolerantly: a missing or unreadable file never blocks a save.
+fn newer_version_on_disk(path: &Path) -> Option<u32> {
+    let contents = fs::read_to_string(path).ok()?;
+    newer_version(&contents.parse::<toml::Value>().ok()?)
+}
+
+/// Deserialize one top-level section, or `None` when this build cannot read
+/// the shape a newer Hel wrote.
+fn salvage_section<T: for<'de> Deserialize<'de>>(document: &toml::Value, key: &str) -> Option<T> {
+    document
+        .get(key)
+        .cloned()
+        .and_then(|value| value.try_into().ok())
+}
+
+/// Deserialize one top-level table entry by entry, dropping only the entries
+/// this build cannot read or accept.
+fn salvage_map<T, F>(document: &toml::Value, key: &str, validate: F) -> BTreeMap<String, T>
+where
+    T: for<'de> Deserialize<'de>,
+    F: Fn(&T, &str) -> Result<()>,
+{
+    let Some(table) = document.get(key).and_then(toml::Value::as_table) else {
+        return BTreeMap::new();
+    };
+    let mut kept = BTreeMap::new();
+    for (id, value) in table {
+        match value.clone().try_into::<T>() {
+            Ok(entry) => match validate(&entry, id) {
+                Ok(()) => {
+                    kept.insert(id.clone(), entry);
+                }
+                Err(error) => tracing::warn!(
+                    section = key,
+                    id,
+                    %error,
+                    "dropping a newer Hel config entry this build rejects"
+                ),
+            },
+            Err(error) => tracing::warn!(
+                section = key,
+                id,
+                %error,
+                "dropping a newer Hel config entry this build cannot read"
+            ),
+        }
+    }
+    kept
 }
 
 fn reject_removed_profile_overrides(contents: &str) -> Result<()> {
@@ -1050,6 +1200,7 @@ mod tests {
     fn sample_config() -> HelConfig {
         HelConfig {
             version: CONFIG_VERSION,
+            newer_config_version: None,
             phone: PhoneConfig::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
@@ -1547,6 +1698,126 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(&path, "\n\t").unwrap();
         assert_eq!(HelConfig::load_from(&path).unwrap(), HelConfig::default());
+    }
+
+    #[test]
+    fn newer_config_loads_read_only_instead_of_blocking_startup() {
+        // Running a newer Hel and then downgrading must not lock the user out
+        // of the older build.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let body = format!(
+            "version = {}\nsetting_from_the_future = true\n\n[targets.localhost]\nkind = \
+             \"local-bare\"\n",
+            CONFIG_VERSION + 1
+        );
+        fs::write(&path, &body).unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+
+        // The settings the newer build saved still work.
+        assert_eq!(
+            config.targets.get("localhost"),
+            Some(&TargetTemplate::LocalBare)
+        );
+        assert_eq!(config.newer_config_version, Some(CONFIG_VERSION + 1));
+        assert!(
+            config
+                .newer_build_notice()
+                .is_some_and(|notice| notice.contains("newer Hel"))
+        );
+
+        // Saving would downgrade the newer build's file, so it must refuse and
+        // leave the file byte for byte as it was.
+        let error = config.save_to(&path).unwrap_err().to_string();
+        assert!(error.contains("newer Hel"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+    }
+
+    #[test]
+    fn newer_config_keeps_the_sections_this_build_still_understands() {
+        // A future release reshapes one target and adds a section. Only the
+        // reshaped target is lost; everything else still loads.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "version = {}\n\n[future_section]\nwhatever = 1\n\n[profiles.codex-1]\nkind \
+                 = \"codex\"\nhome = \"/home/test/.codex-one\"\n\n[targets.localhost]\nkind \
+                 = \"local-bare\"\n\n[targets.future]\nkind = \"quantum-sandbox\"\n",
+                CONFIG_VERSION + 1
+            ),
+        )
+        .unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+
+        assert!(config.profiles.contains_key("codex-1"));
+        assert_eq!(
+            config.targets.get("localhost"),
+            Some(&TargetTemplate::LocalBare)
+        );
+        assert!(!config.targets.contains_key("future"));
+        assert_eq!(config.newer_config_version, Some(CONFIG_VERSION + 1));
+    }
+
+    #[test]
+    fn a_newer_config_written_after_load_still_blocks_a_save() {
+        // Another Hel may upgrade the file between this build's load and its
+        // save; the save must re-check the file rather than trust its marker.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let config = sample_config();
+        config.save_to(&path).unwrap();
+
+        let body = format!("version = {}\n", CONFIG_VERSION + 1);
+        fs::write(&path, &body).unwrap();
+
+        let error = config.save_to(&path).unwrap_err().to_string();
+        assert!(error.contains("newer Hel"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+    }
+
+    #[test]
+    fn the_legacy_localhost_rename_leaves_a_newer_config_alone() {
+        // The rename runs at daemon startup and used to be a save; against a
+        // read-only config it must skip instead of failing startup.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let body = format!(
+            "version = {}\n\n[targets.raw-localhost]\nkind = \"local-bare\"\n",
+            CONFIG_VERSION + 1
+        );
+        fs::write(&path, &body).unwrap();
+
+        assert!(!HelConfig::migrate_legacy_localhost_target_at(&path).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+    }
+
+    #[test]
+    fn an_older_config_version_is_still_rejected() {
+        // Hel has no downgrade migration, so an unrecognized older schema
+        // keeps reporting an error rather than guessing.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "version = 0\n").unwrap();
+
+        let error = HelConfig::load_from(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported Hel config version 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_newer_config_is_still_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "version = 2\nthis is not toml\n").unwrap();
+
+        let error = HelConfig::load_from(&path).unwrap_err().to_string();
+        assert!(error.contains("parse Hel config"), "{error}");
     }
 
     #[test]

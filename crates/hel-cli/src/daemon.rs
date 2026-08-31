@@ -2043,10 +2043,13 @@ fn spawn_remote_request_bridge(
     manager: SessionManagerControl,
 ) {
     tokio::spawn(async move {
+        // One session's requests reach its relay actor in the order they were
+        // made; different sessions still overlap.
+        let mut request_order = hel::hel_session_manager::SessionRequestOrder::new();
         while let Some(request) = requests.recv().await {
             let manager = manager.clone();
-            tokio::spawn(async move {
-                forward_in_process_session_request(request, manager).await;
+            request_order.dispatch(request, move |request| {
+                forward_in_process_session_request(request, manager)
             });
         }
     });

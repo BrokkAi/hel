@@ -12,6 +12,15 @@ Store design notes for LLMs or agents in `.agents/docs/`. These notes can includ
 
 Reserve `docs/` for future documentation for human readers. Do not store ExecPlans, agent runbooks, or LLM-only context in `docs/`.
 
+# Releases
+
+Follow `RELEASING.md` for every release. The release version must be committed
+in the workspace manifest, synchronized internal dependency constraints,
+`Cargo.lock`, and the generated license report before creating the tag. Run
+`node scripts/release-version.mjs check vX.Y.Z` against the clean release
+commit, and never create or push the tag until that check and the release
+validations pass.
+
 # Repository Guidelines
 
 # Git / version control

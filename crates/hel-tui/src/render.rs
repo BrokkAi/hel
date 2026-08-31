@@ -1,5 +1,5 @@
 //! Dashboard rendering: pane layout, session tables, capacity, quotas, footer.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
@@ -16,7 +16,6 @@ use hel::hel_chat::render_agent_message_head;
 use hel::hel_chat::render_agent_message_tail;
 use hel::hel_config::{HarnessKind, HelConfig, PermissionMode};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
-use hel::hel_selection::{SurfaceFrame, SurfaceId};
 use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
 
@@ -26,43 +25,24 @@ use crate::dialogs::{
     render_repository_origin, render_session_edit, render_target_actions, render_web_dialog,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
-use crate::resume::{render_resume_dialog, resume_sessions_pane};
-use crate::widgets::{bordered_content, focus_border, format_resource_bytes};
+use crate::resume::render_resume_dialog;
+use crate::widgets::{focus_border, format_resource_bytes};
 use crate::wizards::{render_new_wizard, render_resume_wizard};
-use crate::{DASHBOARD_PANE_COUNT, DashboardState, Focus, Mode, SessionOperationKind};
+use crate::{DashboardState, Focus, Mode, SessionOperationKind, SessionsRow};
 
 #[cfg(test)]
 const ACTIVE_MESSAGE_LINES: usize = 4;
 
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
-const ACTIVE_PANE_CHROME_HEIGHT: u16 = 2;
 
 #[cfg(test)]
 pub(crate) const SUMMARY_RULE: &str = "─";
 
-const DASHBOARD_FIXED_HEIGHT: u16 = 3;
-
-pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
-    dashboard.pane_areas = None;
-    dashboard.active_row_areas.clear();
-    dashboard.project_heading_areas.clear();
-    dashboard.frame_surfaces.clear();
+/// Draws the first-run screen: there is no conversation and no session list
+/// yet, so the surface explains how to get one and shows the support panes
+/// under it.
+pub(crate) fn render_onboarding_surface(frame: &mut Frame, dashboard: &mut DashboardState) {
     let area = frame.area();
-    if area.width < MINIMUM_TERMINAL_WIDTH {
-        render_terminal_too_small(
-            frame,
-            area,
-            TerminalSizeRequirement::Width(MINIMUM_TERMINAL_WIDTH),
-        );
-        return;
-    }
-    dashboard.resume_sessions_area =
-        matches!(dashboard.mode, Mode::ResumeDialog(_)).then(|| resume_sessions_pane(area));
-    if !dashboard.config_is_empty() {
-        render_adaptive_dashboard(frame, area, area, dashboard);
-        return;
-    }
-
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -70,7 +50,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
             Constraint::Min(8),
             Constraint::Length(5),
             Constraint::Length(8),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(area);
     render_dashboard_title(frame, layout[0], &dashboard.greeting);
@@ -87,7 +67,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
 ///
 /// The registry moves out for the call because the modal renderers read the
 /// rest of the dashboard while they register their own surfaces.
-fn render_modal(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
+pub(crate) fn render_modal(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
     let mut surfaces = std::mem::take(&mut dashboard.frame_surfaces);
     match &dashboard.mode {
         Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard, &mut surfaces),
@@ -129,199 +109,27 @@ fn render_dashboard_title(frame: &mut Frame, area: Rect, greeting: &str) {
     );
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PaneHeights {
-    pub(crate) active: u16,
-    pub(crate) capacity: u16,
-    pub(crate) quotas: u16,
+/// Draws the combined surface with no conversation on it.
+///
+/// Only tests use this: the binary always has an `ActiveChat` to pass, or a
+/// workspace with no live session, which is what this stands for.
+#[cfg(test)]
+pub(crate) fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
+    crate::combined::render_combined(frame, dashboard, None, false);
 }
 
-impl PaneHeights {
-    fn as_array(self) -> [u16; DASHBOARD_PANE_COUNT] {
-        [self.active, self.capacity, self.quotas]
-    }
+pub(crate) const MINIMUM_TERMINAL_WIDTH: u16 = 32;
 
-    fn from_array(heights: [u16; DASHBOARD_PANE_COUNT]) -> Self {
-        Self {
-            active: heights[0],
-            capacity: heights[1],
-            quotas: heights[2],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaneAllocation {
-    Fits(PaneHeights),
-    TooSmall { required_frame_height: u16 },
-}
-
-fn allocate_pane_heights(
-    frame_height: u16,
-    full: PaneHeights,
-    minimized: PaneHeights,
-    focus: Focus,
-) -> PaneAllocation {
-    let pane_space = frame_height.saturating_sub(DASHBOARD_FIXED_HEIGHT);
-    let full = full.as_array();
-    let minimized = minimized.as_array();
-    let minimum_total = minimized.iter().copied().fold(0_u16, u16::saturating_add);
-    if pane_space < minimum_total {
-        return PaneAllocation::TooSmall {
-            required_frame_height: DASHBOARD_FIXED_HEIGHT.saturating_add(minimum_total),
-        };
-    }
-
-    let full_total = full.iter().copied().fold(0_u16, u16::saturating_add);
-    let mut allocated = if full_total <= pane_space {
-        full
-    } else {
-        minimized
-    };
-    let allocated_total = allocated.iter().copied().fold(0_u16, u16::saturating_add);
-    let mut remaining = pane_space.saturating_sub(allocated_total);
-    if full_total > pane_space {
-        let focused = match focus {
-            Focus::Active => 0,
-            Focus::Capacity => 1,
-            Focus::Quotas => 2,
-        };
-        let growth = remaining.min(full[focused].saturating_sub(allocated[focused]));
-        allocated[focused] = allocated[focused].saturating_add(growth);
-        remaining = remaining.saturating_sub(growth);
-    }
-    allocated[0] = allocated[0].saturating_add(remaining);
-    PaneAllocation::Fits(PaneHeights::from_array(allocated))
-}
-
-fn render_adaptive_dashboard(
-    frame: &mut Frame,
-    frame_area: Rect,
-    inner: Rect,
-    dashboard: &mut DashboardState,
-) {
-    let active = dashboard
-        .ordered_sessions()
-        .into_iter()
-        .map(|session| session.id.clone())
-        .collect::<Vec<_>>();
-    let active_count = active.len();
-    let mut previous_project = None;
-    let active_row_heights = active
-        .iter()
-        .enumerate()
-        .map(|(index, id)| {
-            let session = &dashboard.state.sessions[id];
-            let source = dashboard.project_source(session);
-            let heading = u16::from(previous_project.as_ref() != Some(&source.key));
-            let expanded = dashboard.project_is_expanded(session);
-            let spacing = session_row_spacing(dashboard, &active, index, &source.key, expanded);
-            previous_project = Some(source.key);
-            heading + if expanded { 4 } else { 1 } + spacing
-        })
-        .collect::<Vec<_>>();
-    let full = PaneHeights {
-        active: active_pane_height(&active_row_heights, active_count),
-        capacity: plain_table_height(dashboard.capacity_details.len()),
-        quotas: plain_table_height(dashboard.config.profiles.len()),
-    };
-    let minimized = PaneHeights {
-        active: if dashboard.focus == Focus::Active {
-            ACTIVE_PANE_CHROME_HEIGHT
-        } else {
-            active_pane_height(&active_row_heights, active_count.min(2))
-        },
-        capacity: focused_or_minimized_table_height(
-            dashboard.focus == Focus::Capacity,
-            dashboard.capacity_details.len(),
-        ),
-        quotas: focused_or_minimized_table_height(
-            dashboard.focus == Focus::Quotas,
-            dashboard.config.profiles.len(),
-        ),
-    };
-    let allocation = allocate_pane_heights(frame_area.height, full, minimized, dashboard.focus);
-    let PaneAllocation::Fits(heights) = allocation else {
-        let PaneAllocation::TooSmall {
-            required_frame_height,
-        } = allocation
-        else {
-            unreachable!()
-        };
-        render_terminal_too_small(
-            frame,
-            frame_area,
-            TerminalSizeRequirement::Height(required_frame_height),
-        );
-        return;
-    };
-
-    let fixed = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(2),
-        ])
-        .split(inner);
-    render_dashboard_title(frame, fixed[0], &dashboard.greeting);
-    let panes = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            heights
-                .as_array()
-                .into_iter()
-                .map(Constraint::Length)
-                .collect::<Vec<_>>(),
-        )
-        .split(fixed[1]);
-    dashboard.pane_areas = Some([panes[0], panes[1], panes[2]]);
-    for (index, pane) in panes.iter().take(DASHBOARD_PANE_COUNT).enumerate() {
-        // The selectable area is the text inside the border, so a selection
-        // never picks up border glyphs or the scrollbar column.
-        dashboard.frame_surfaces.push(SurfaceFrame::fixed(
-            SurfaceId::DashboardPane(index as u8),
-            bordered_content(*pane),
-        ));
-    }
-    let rendered_rows = render_sessions(frame, panes[0], dashboard, &active);
-    dashboard.active_row_areas = rendered_rows.active_row_areas;
-    dashboard.project_heading_areas = rendered_rows.project_heading_areas;
-    render_capacity(frame, panes[1], dashboard);
-    render_quotas(frame, panes[2], dashboard);
-    render_footer(frame, fixed[2], dashboard);
-    render_modal(frame, frame_area, dashboard);
-}
-
-fn plain_table_height(rows: usize) -> u16 {
-    SESSION_TABLE_CHROME_HEIGHT.saturating_add(rows.min(u16::MAX as usize) as u16)
-}
-
-fn focused_or_minimized_table_height(focused: bool, rows: usize) -> u16 {
-    if focused {
-        SESSION_TABLE_CHROME_HEIGHT
-    } else {
-        plain_table_height(rows.min(2))
-    }
-}
-
-fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
-    let rows = rows.min(row_heights.len());
-    let row_height = row_heights[..rows]
-        .iter()
-        .copied()
-        .fold(0_u16, u16::saturating_add);
-    ACTIVE_PANE_CHROME_HEIGHT.saturating_add(row_height)
-}
-
-const MINIMUM_TERMINAL_WIDTH: u16 = 32;
-
-enum TerminalSizeRequirement {
+pub(crate) enum TerminalSizeRequirement {
     Width(u16),
     Height(u16),
 }
 
-fn render_terminal_too_small(frame: &mut Frame, area: Rect, requirement: TerminalSizeRequirement) {
+pub(crate) fn render_terminal_too_small(
+    frame: &mut Frame,
+    area: Rect,
+    requirement: TerminalSizeRequirement,
+) {
     let instructions = match requirement {
         TerminalSizeRequirement::Width(required_width) => vec![
             Line::raw(format!("Need at least {required_width} columns.")),
@@ -372,263 +180,375 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
 }
 
 /// Session-row rendering results that the caller folds back into the
-/// dashboard's mouse hitboxes once the borrow of `active` (which aliases
-/// `dashboard.state.sessions`) has ended.
-struct SessionRowsRendered {
-    active_row_areas: Vec<(usize, Rect)>,
-    project_heading_areas: Vec<(String, Rect)>,
+/// combined surface's mouse hitboxes once the borrow of the session list has
+/// ended.
+pub(crate) struct SessionRowsRendered {
+    pub(crate) session_row_areas: Vec<(usize, Rect)>,
+    pub(crate) project_heading_areas: Vec<(String, Rect)>,
 }
 
-fn session_row_spacing(
-    dashboard: &DashboardState,
-    active: &[String],
-    index: usize,
-    project_key: &str,
-    expanded: bool,
-) -> u16 {
-    u16::from(
-        active
-            .get(index + 1)
-            .and_then(|next| dashboard.state.sessions.get(next))
-            .is_some_and(|next| expanded || dashboard.project_source(next).key != project_key),
-    )
+/// The Sessions pane's title.
+///
+/// The P and S legend explains the prefixes on the expanded rows' agent
+/// lines, so it only appears while the pane is drawing them.
+pub(crate) fn sessions_pane_title(width: u16, focused: bool) -> &'static str {
+    const FULL: &str = " Sessions · P=time since prompt · S=time since agent activity ";
+    const MEDIUM: &str = " Sessions · P=prompt age · S=agent silence ";
+    const COMPACT: &str = " Sessions P=prompt S=silence ";
+
+    if !focused {
+        return " Sessions ";
+    }
+    let available = usize::from(width.saturating_sub(2));
+    if available >= FULL.chars().count() {
+        FULL
+    } else if available >= MEDIUM.chars().count() {
+        MEDIUM
+    } else {
+        COMPACT
+    }
 }
 
-/// Draws the Active pane and reports the selected session's preview hitbox and
-/// the per-row mouse hitboxes.
-fn render_sessions(
-    frame: &mut Frame,
-    active_area: Rect,
-    dashboard: &DashboardState,
-    active: &[String],
-) -> SessionRowsRendered {
+/// One table row of the Sessions pane, already laid out.
+struct DrawnSessionRow {
+    /// Index into `ordered_sessions()`, or `None` for the "Others" summary.
+    session: Option<usize>,
+    /// Project key of the heading this row carries, if it opens a group.
+    heading: Option<String>,
+    lines: Vec<Line<'static>>,
+    /// Blank rows drawn under this one, to separate groups.
+    spacing: u16,
+}
+
+impl DrawnSessionRow {
+    fn content_height(&self) -> u16 {
+        u16::try_from(self.lines.len()).unwrap_or(u16::MAX)
+    }
+}
+
+/// Lays the pane out without drawing it, so the layout can ask how tall it
+/// wants to be before it has any rows to give it.
+fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessionRow> {
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let project_count = dashboard.project_keys().len();
-    let mut short_projects = BTreeMap::<String, BTreeSet<String>>::new();
-    for session in active
-        .iter()
-        .filter_map(|id| dashboard.state.sessions.get(id))
-    {
-        short_projects
-            .entry(dashboard.project_source(session).short)
-            .or_default()
-            .insert(dashboard.project_source(session).key);
-    }
+    let sessions = dashboard.ordered_sessions();
+    // A target label repeated inside one project is ambiguous on its own, so
+    // repeats are numbered in the order they were created.
     let mut target_counts = BTreeMap::<(String, String), usize>::new();
-    for id in active {
-        let Some(session) = dashboard.state.sessions.get(id) else {
-            continue;
-        };
-        let project_key = dashboard.project_source(session).key;
-        let target = session_target_label(
-            session,
-            dashboard.session_operations.get(id),
-            &dashboard.config,
+    for session in &sessions {
+        let key = (
+            dashboard.project_source(session).key,
+            session_target_label(
+                session,
+                dashboard.session_operations.get(&session.id),
+                &dashboard.config,
+            ),
         );
-        *target_counts.entry((project_key, target)).or_default() += 1;
+        *target_counts.entry(key).or_default() += 1;
     }
     let mut target_occurrences = BTreeMap::<(String, String), usize>::new();
-    let mut previous_project = None;
-    let mut project_number = 0;
-    let mut row_meta = Vec::new();
-    let active_rows = active.iter().enumerate().filter_map(|(index, id)| {
-        let session = dashboard.state.sessions.get(id)?;
-        let source = dashboard.project_source(session);
-        let first = previous_project.as_ref() != Some(&source.key);
-        if first {
-            project_number += 1;
-            previous_project = Some(source.key.clone());
-        }
-        let mut lines = Vec::new();
-        if first {
-            let label = if short_projects
-                .get(&source.short)
-                .is_some_and(|projects| projects.len() > 1)
-            {
-                &source.full
-            } else {
-                &source.short
-            };
-            let hotkey = if project_count > 1 && project_number <= 9 {
-                format!("[{}] ", project_number)
-            } else {
-                String::new()
-            };
-            lines.push(Line::styled(
-                format!("{hotkey}{label}"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-        }
-        let detail = dashboard.session_details.get(id);
-        let unreachable = dashboard.unreachable_sessions.contains(id);
-        let target = session_target_label(
-            session,
-            dashboard.session_operations.get(id),
-            &dashboard.config,
-        );
-        let target_key = (source.key.clone(), target.clone());
-        let occurrence = target_occurrences.entry(target_key.clone()).or_default();
-        *occurrence += 1;
-        let target = if target_counts.get(&target_key).copied().unwrap_or_default() > 1 {
-            format!("{target} [{}]", *occurrence)
-        } else {
-            target
-        };
-        let expanded = dashboard.project_is_expanded(session);
-        let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
-        let prefix = if selected { "› " } else { "  " };
-        let permission = session_permission_badge(
-            session,
-            dashboard.session_operations.get(id),
-            &dashboard.config,
-        );
-        if expanded {
-            lines.push(session_top_line(
-                prefix,
-                session,
-                detail,
-                unreachable,
-                dashboard.session_operations.get(id),
-                now_epoch_seconds,
-                &target,
-                permission,
-            ));
-            lines.push(prefixed_summary_line(
-                "  ",
-                "You: ",
-                detail.and_then(|detail| detail.last_user_message.as_deref()),
-                usize::from(active_area.width.saturating_sub(4)),
-                detail.is_some_and(|detail| detail.last_agent_message_follows_last_user),
-            ));
-            let agent_excerpt = detail.and_then(|detail| {
-                if detail.last_user_message.is_none() || detail.last_agent_message_follows_last_user
-                {
-                    detail.last_agent_message.as_deref()
-                } else {
-                    detail.latest_agent_activity_after_last_user.as_deref()
+    let mut rows: Vec<DrawnSessionRow> = Vec::new();
+    let mut pending_heading: Option<(String, Line<'static>)> = None;
+    for row in dashboard.sessions_rows() {
+        match row {
+            SessionsRow::ProjectHeading { key, label, number } => {
+                let hotkey = number.map_or_else(String::new, |number| format!("[{number}] "));
+                // A heading is drawn inside the row beneath it, so the table's
+                // selection index keeps counting sessions and nothing else.
+                if let Some(last) = rows.last_mut() {
+                    last.spacing = 1;
                 }
-            });
-            let show_agent_excerpt = detail.is_none_or(|detail| {
-                detail.last_user_message.is_none()
-                    || detail.last_agent_message_follows_last_user
-                    || detail.latest_agent_activity_after_last_user.is_some()
-            });
-            if show_agent_excerpt {
-                let prefixes = dashboard_agent_prefixes(now_epoch_seconds, detail);
-                let prefix_width = prefixes.iter().map(String::len).max().unwrap_or_default();
-                let mut agent = agent_excerpt
-                    .map(|message| {
-                        render_agent_message_head(
-                            message,
-                            usize::from(active_area.width.saturating_sub(
-                                u16::try_from(prefix_width + 5).unwrap_or(u16::MAX),
-                            )),
-                            2,
-                        )
-                    })
-                    .unwrap_or_default();
-                if agent.is_empty() {
-                    agent.push(Line::raw("No messages yet"));
-                }
-                agent.resize(2, Line::default());
-                for (agent_index, mut line) in agent.into_iter().take(2).enumerate() {
-                    let mut spans = vec![Span::raw("  ")];
-                    spans.push(Span::styled(
-                        format!("{} ", prefixes[agent_index]),
+                pending_heading = Some((
+                    key,
+                    Line::styled(
+                        format!("{hotkey}{label}"),
                         Style::default().add_modifier(Modifier::BOLD),
-                    ));
-                    spans.append(&mut line.spans);
-                    lines.push(Line::from(spans));
-                }
+                    ),
+                ));
             }
-        } else {
-            lines.push(collapsed_session_line(
-                prefix,
-                &target,
-                detail,
-                unreachable,
-                now_epoch_seconds,
-                usize::from(active_area.width.saturating_sub(4)),
-                permission,
-            ));
+            SessionsRow::Session { index, expanded } => {
+                let Some(session) = sessions.get(index) else {
+                    continue;
+                };
+                let source = dashboard.project_source(session);
+                let detail = dashboard.session_details.get(&session.id);
+                let unreachable = dashboard.unreachable_sessions.contains(&session.id);
+                let operation = dashboard.session_operations.get(&session.id);
+                let base_target = session_target_label(session, operation, &dashboard.config);
+                let target_key = (source.key.clone(), base_target.clone());
+                let occurrence = target_occurrences.entry(target_key.clone()).or_default();
+                *occurrence += 1;
+                let target = if target_counts.get(&target_key).copied().unwrap_or_default() > 1 {
+                    format!("{base_target} [{}]", *occurrence)
+                } else {
+                    base_target
+                };
+                let permission = session_permission_badge(session, operation, &dashboard.config);
+                let selected = if dashboard.focus() == Focus::Sessions {
+                    dashboard.selected_session_id.as_deref() == Some(session.id.as_str())
+                } else {
+                    dashboard.current_session_id() == Some(session.id.as_str())
+                };
+                let prefix = if selected { "› " } else { "  " };
+                let (heading_key, heading_line) = match pending_heading.take() {
+                    Some((key, line)) => (Some(key), Some(line)),
+                    None => (None, None),
+                };
+                let mut lines = Vec::new();
+                lines.extend(heading_line);
+                if expanded && dashboard.focus() == Focus::Sessions {
+                    expanded_session_lines(
+                        &mut lines,
+                        dashboard,
+                        session,
+                        detail,
+                        unreachable,
+                        operation,
+                        now_epoch_seconds,
+                        &target,
+                        permission,
+                        width,
+                    );
+                } else if dashboard.focus() == Focus::Sessions {
+                    lines.push(collapsed_session_line(
+                        prefix,
+                        &target,
+                        detail,
+                        unreachable,
+                        now_epoch_seconds,
+                        usize::from(width.saturating_sub(4)),
+                        permission,
+                    ));
+                } else {
+                    lines.push(compact_session_line(
+                        prefix,
+                        &source.short,
+                        &target,
+                        detail,
+                        unreachable,
+                        now_epoch_seconds,
+                        usize::from(width.saturating_sub(4)),
+                    ));
+                }
+                let spacing = u16::from(expanded && dashboard.focus() == Focus::Sessions);
+                rows.push(DrawnSessionRow {
+                    session: Some(index),
+                    heading: heading_key,
+                    lines,
+                    spacing,
+                });
+            }
+            SessionsRow::Others { active, idle } => {
+                rows.push(DrawnSessionRow {
+                    session: None,
+                    heading: None,
+                    lines: vec![Line::styled(
+                        format!("  Others: {active} active, {idle} idle"),
+                        Style::default().fg(Color::DarkGray),
+                    )],
+                    spacing: 0,
+                });
+            }
         }
-        let heading = usize::from(first);
-        let content_height = lines.len() as u16;
-        let spacing = session_row_spacing(dashboard, active, index, &source.key, expanded);
-        row_meta.push((
-            source.key,
-            heading,
-            content_height,
-            content_height + spacing,
-        ));
-        Some(
-            Row::new([Cell::from(Text::from(lines))])
-                .height(content_height)
-                .bottom_margin(spacing),
-        )
+    }
+    // The last group never needs a trailing blank row.
+    if let Some(last) = rows.last_mut() {
+        last.spacing = 0;
+    }
+    rows
+}
+
+/// The four rows an expanded session draws: status and identity, the user's
+/// last message, and two rows of agent activity. The agent block is always
+/// two rows, even with nothing to say, so every expanded session is the same
+/// height and the layout can be computed from a count.
+#[allow(clippy::too_many_arguments)]
+fn expanded_session_lines(
+    lines: &mut Vec<Line<'static>>,
+    dashboard: &DashboardState,
+    session: &SessionRecord,
+    detail: Option<&SessionDetail>,
+    unreachable: bool,
+    operation: Option<&SessionOperationDisplay>,
+    now_epoch_seconds: u64,
+    target: &str,
+    permission: Option<Span<'static>>,
+    width: u16,
+) {
+    let selected = dashboard.selected_session_id.as_deref() == Some(session.id.as_str());
+    let prefix = if selected { "› " } else { "  " };
+    lines.push(session_top_line(
+        prefix,
+        session,
+        detail,
+        unreachable,
+        operation,
+        now_epoch_seconds,
+        target,
+        permission,
+    ));
+    lines.push(prefixed_summary_line(
+        "  ",
+        "You: ",
+        detail.and_then(|detail| detail.last_user_message.as_deref()),
+        usize::from(width.saturating_sub(4)),
+        detail.is_some_and(|detail| detail.last_agent_message_follows_last_user),
+    ));
+    let agent_excerpt = detail.and_then(|detail| {
+        if detail.last_user_message.is_none() || detail.last_agent_message_follows_last_user {
+            detail.last_agent_message.as_deref()
+        } else {
+            detail.latest_agent_activity_after_last_user.as_deref()
+        }
     });
-    let active_focused = dashboard.focus == Focus::Active;
-    let active_table = Table::new(active_rows, [Constraint::Min(1)]).block(
+    let prefixes = dashboard_agent_prefixes(now_epoch_seconds, detail);
+    let prefix_width = prefixes.iter().map(String::len).max().unwrap_or_default();
+    let mut agent = agent_excerpt
+        .map(|message| {
+            render_agent_message_head(
+                message,
+                usize::from(
+                    width.saturating_sub(u16::try_from(prefix_width + 5).unwrap_or(u16::MAX)),
+                ),
+                2,
+            )
+        })
+        .unwrap_or_default();
+    if agent.is_empty() {
+        agent.push(Line::raw("No messages yet"));
+    }
+    agent.resize(2, Line::default());
+    for (agent_index, mut line) in agent.into_iter().take(2).enumerate() {
+        let mut spans = vec![Span::raw("  ")];
+        spans.push(Span::styled(
+            format!("{} ", prefixes[agent_index]),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.append(&mut line.spans);
+        lines.push(Line::from(spans));
+    }
+}
+
+/// The one-line form the pane uses while the keyboard is elsewhere: which
+/// project, which target, how long the turn has been running, and what the
+/// agent last said.
+fn compact_session_line(
+    prefix: &str,
+    project: &str,
+    target: &str,
+    detail: Option<&SessionDetail>,
+    unreachable: bool,
+    now_epoch_seconds: u64,
+    width: usize,
+) -> Line<'static> {
+    let clock = hel::usage_format::format_turn_clock(
+        now_epoch_seconds,
+        detail.and_then(|detail| detail.current_turn_started_at),
+    );
+    let fragment = detail
+        .and_then(|detail| detail.last_agent_message.as_deref())
+        .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
+        .unwrap_or("No messages yet")
+        .trim()
+        .to_owned();
+    let style = Style::default().fg(session_band_color(detail, unreachable));
+    let lead = format!("{prefix}{project} · {target} · {clock} ");
+    let lead_width = lead.chars().count();
+    Line::styled(
+        format!(
+            "{lead}{}",
+            crate::widgets::truncate_text(&fragment, width.saturating_sub(lead_width))
+        ),
+        style,
+    )
+}
+
+/// Content rows the Sessions pane wants, excluding its border.
+pub(crate) fn sessions_content_height(dashboard: &DashboardState, width: u16) -> u16 {
+    drawn_session_rows(dashboard, width)
+        .iter()
+        .map(|row| row.content_height().saturating_add(row.spacing))
+        .fold(0, u16::saturating_add)
+}
+
+/// Draws the Sessions pane and reports the per-row mouse hitboxes.
+pub(crate) fn render_sessions(
+    frame: &mut Frame,
+    area: Rect,
+    dashboard: &DashboardState,
+) -> SessionRowsRendered {
+    let drawn = drawn_session_rows(dashboard, area.width);
+    let focused = dashboard.focus() == Focus::Sessions;
+    let mut title = vec![Span::raw(sessions_pane_title(area.width, focused))];
+    let room = usize::from(area.width).saturating_sub(title[0].width() + 4);
+    if room > 8 && !dashboard.greeting.is_empty() {
+        title.push(Span::styled(
+            format!(
+                "{} ",
+                crate::widgets::truncate_text(&dashboard.greeting, room)
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let table = Table::new(
+        drawn.iter().map(|row| {
+            Row::new([Cell::from(Text::from(row.lines.clone()))])
+                .height(row.content_height())
+                .bottom_margin(row.spacing)
+        }),
+        [Constraint::Min(1)],
+    )
+    .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(focus_border(active_focused))
-            .title(" Active "),
+            .border_type(focus_border(focused))
+            .title(Line::from(title)),
     );
-    let mut active_state = TableState::default()
-        .with_selected((dashboard.session_index < active.len()).then_some(dashboard.session_index));
-    frame.render_stateful_widget(active_table, active_area, &mut active_state);
-    let active_offset = active_state.offset();
-    let mut row_y = active_area.y + 1;
-    let mut visible_sessions = 0;
-    let mut active_row_areas = Vec::new();
+    let mut state = TableState::default().with_selected(
+        dashboard
+            .selected_visible_index()
+            .filter(|index| *index < drawn.len()),
+    );
+    frame.render_stateful_widget(table, area, &mut state);
+
+    let offset = state.offset();
+    let mut row_y = area.y + 1;
+    let mut visible = 0;
+    let mut session_row_areas = Vec::new();
     let mut project_heading_areas = Vec::new();
-    for (index, (project_key, heading, content_height, total_height)) in
-        row_meta.iter().enumerate().skip(active_offset)
-    {
-        if row_y >= active_area.bottom().saturating_sub(1) {
+    for row in drawn.iter().skip(offset) {
+        if row_y >= area.bottom().saturating_sub(1) {
             break;
         }
-        visible_sessions += 1;
-        if *heading > 0 {
+        visible += 1;
+        let heading_rows = u16::from(row.heading.is_some());
+        if let Some(key) = row.heading.clone() {
             project_heading_areas.push((
-                project_key.clone(),
+                key,
+                Rect::new(area.x + 1, row_y, area.width.saturating_sub(2), 1),
+            ));
+        }
+        if let Some(index) = row.session {
+            let session_y = row_y.saturating_add(heading_rows);
+            let height = row.content_height().saturating_sub(heading_rows);
+            session_row_areas.push((
+                index,
                 Rect::new(
-                    active_area.x + 1,
-                    row_y,
-                    active_area.width.saturating_sub(2),
-                    1,
+                    area.x.saturating_add(1),
+                    session_y,
+                    area.width.saturating_sub(2),
+                    height.min(area.bottom().saturating_sub(1).saturating_sub(session_y)),
                 ),
             ));
         }
-        let session_y = row_y.saturating_add(*heading as u16);
-        let session_height = content_height.saturating_sub(*heading as u16);
-        let row_rect = Rect::new(
-            active_area.x.saturating_add(1),
-            session_y,
-            active_area.width.saturating_sub(2),
-            session_height.min(
-                active_area
-                    .bottom()
-                    .saturating_sub(1)
-                    .saturating_sub(session_y),
-            ),
-        );
-        active_row_areas.push((index, row_rect));
-        row_y = row_y.saturating_add(*total_height);
+        row_y = row_y.saturating_add(row.content_height().saturating_add(row.spacing));
     }
-    render_session_scrollbar(
-        frame,
-        active_area,
-        active.len(),
-        active_offset,
-        visible_sessions,
-    );
+    render_session_scrollbar(frame, area, drawn.len(), offset, visible);
 
     SessionRowsRendered {
-        active_row_areas,
+        session_row_areas,
         project_heading_areas,
     }
 }
@@ -765,7 +685,7 @@ fn dashboard_agent_prefixes(now_epoch_seconds: u64, detail: Option<&SessionDetai
         .max(turn_started);
     [
         format!(
-            "T {:>DASHBOARD_CLOCK_WIDTH$}",
+            "P {:>DASHBOARD_CLOCK_WIDTH$}",
             compact_dashboard_clock(now_epoch_seconds.saturating_sub(turn_started))
         ),
         format!(
@@ -1075,7 +995,7 @@ fn capacity_staleness(detail: &CapacityDetail, now_epoch_seconds: u64) -> Option
     )
 }
 
-fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
+pub(crate) fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1124,7 +1044,7 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
             Cell::from(Line::from(in_use)),
         ])
     });
-    let focused = dashboard.focus == Focus::Capacity;
+    let focused = dashboard.focus == Focus::Targets;
     let table = Table::new(
         rows,
         [
@@ -1148,7 +1068,7 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         Block::default()
             .borders(Borders::ALL)
             .border_type(focus_border(focused))
-            .title(" Capacity "),
+            .title(" Targets "),
     );
     let mut state = TableState::default().with_selected(
         (!dashboard.capacity_details.is_empty()).then_some(dashboard.capacity_index),
@@ -1161,6 +1081,101 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         state.offset(),
         usize::from(area.height.saturating_sub(SESSION_TABLE_CHROME_HEIGHT)),
     );
+}
+
+/// One row summarising every target host and its CPU load, for the collapsed
+/// Targets pane.
+///
+/// A reading that cannot be trusted says so rather than showing a number: an
+/// unavailable probe, a sample that stopped refreshing, and a fleet reading
+/// that carries no CPU figure are all named explicitly.
+pub(crate) fn minimized_targets_line(dashboard: &DashboardState, width: u16) -> Line<'static> {
+    let now_epoch_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let readings = dashboard
+        .capacity_details
+        .values()
+        .map(|detail| {
+            let reading = if detail.refreshing {
+                "refreshing…".to_string()
+            } else {
+                let value = match (&detail.target.kind, &detail.usage) {
+                    (DeploymentCapacityKind::Host, Some(usage)) => usage
+                        .cpu_percent
+                        .map_or_else(|| "no CPU".to_string(), |cpu| format!("{cpu}%")),
+                    // Fleet probes report cores, memory and disk; they never
+                    // carry a CPU percentage.
+                    (DeploymentCapacityKind::AwsFleet, Some(_)) => "no CPU".to_string(),
+                    (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => {
+                        "on demand".to_string()
+                    }
+                    _ => "unavailable".to_string(),
+                };
+                match capacity_staleness(detail, now_epoch_seconds) {
+                    Some(_) => format!("{value} (stale)"),
+                    None => value,
+                }
+            };
+            format!("{} {reading}", detail.target.host)
+        })
+        .collect::<Vec<_>>();
+    summary_row("Targets", &readings, width)
+}
+
+/// One row summarising every profile's weekly usage, for the collapsed Quota
+/// pane. The figure is the percentage *used*, which is what the full pane's
+/// bar shows filled.
+pub(crate) fn minimized_quota_line(dashboard: &DashboardState, width: u16) -> Line<'static> {
+    let readings = dashboard
+        .config
+        .profiles
+        .iter()
+        .map(|(id, profile)| {
+            let reading = if profile.kind == HarnessKind::Deepseek {
+                // Usage-priced, so there is no subscription window to fill.
+                "api".to_string()
+            } else if dashboard.quota_refreshing.contains(id) {
+                "refreshing…".to_string()
+            } else {
+                dashboard
+                    .quotas
+                    .get(id)
+                    .filter(|quota| quota.error.is_none())
+                    .and_then(ProfileQuota::weekly_window)
+                    .and_then(quota_remaining_percent)
+                    .map_or_else(
+                        || "unavailable".to_string(),
+                        |remaining| format!("{}%", 100_u8.saturating_sub(remaining)),
+                    )
+            };
+            format!("{id} {reading}")
+        })
+        .collect::<Vec<_>>();
+    summary_row("Quota", &readings, width)
+}
+
+/// A collapsed pane's single row: a bold label, then the readings, truncated
+/// rather than wrapped so the row stays one row.
+fn summary_row(label: &str, readings: &[String], width: u16) -> Line<'static> {
+    let body = if readings.is_empty() {
+        "none configured".to_string()
+    } else {
+        readings.join("  ")
+    };
+    let width = usize::from(width);
+    let label_width = label.chars().count() + 2;
+    Line::from(vec![
+        Span::styled(
+            format!("{label}  "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            crate::widgets::truncate_text(&body, width.saturating_sub(label_width)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
 }
 
 fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
@@ -1346,7 +1361,7 @@ fn quota_column_width(
     u16::try_from(width).unwrap_or(u16::MAX).min(maximum)
 }
 
-fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
+pub(crate) fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1422,13 +1437,13 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
             .unwrap_or_else(|| "not refreshed".to_string())
     };
     let title = Line::from(vec![
-        Span::raw(" Profile Quotas "),
+        Span::raw(" Quota "),
         Span::styled(
             format!("({refresh_status}) "),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
-    let quotas_focused = dashboard.focus == Focus::Quotas;
+    let quotas_focused = dashboard.focus == Focus::Quota;
     let border_type = if quotas_focused {
         BorderType::Double
     } else {
@@ -1494,30 +1509,38 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
     );
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
-    let accelerator = if cfg!(target_os = "macos") {
-        "Cmd"
-    } else {
-        "Ctrl"
-    };
-    let actions = match dashboard.focus {
-        Focus::Active => {
-            "[N]ew · [S] Resume · [W]orkspaces · [E]dit · We[b] · mark [A]ll read · [Q]uit · Tab pane"
+/// The hotkey hints for whichever pane owns the keyboard.
+///
+/// The composer's hints come from the chat itself, because they depend on
+/// what it is doing (a queued prompt, dictation, a history search).
+pub(crate) fn combined_footer_text(dashboard: &DashboardState) -> &'static str {
+    match dashboard.focus {
+        Focus::Sessions => {
+            "Enter open · n new · s resume · e edit · a mark read · x cancel · Tab pane · Ctrl-G panes · F2 workspaces · F3 web · Ctrl-Q quit"
         }
-        Focus::Capacity => "[W]orkspaces · [E]dit targets · [R]efresh · We[b] · [Q]uit · Tab pane",
-        Focus::Quotas => "[W]orkspaces · [E]dit profile · [R]efresh · We[b] · [Q]uit · Tab pane",
+        Focus::Targets => {
+            "r refresh · Enter/e actions · Tab pane · Ctrl-G panes · F2 workspaces · F3 web · Ctrl-Q quit"
+        }
+        Focus::Quota => {
+            "r refresh · Enter/e edit profile · Tab pane · Ctrl-G panes · F2 workspaces · F3 web · Ctrl-Q quit"
+        }
+        Focus::Prompt => "Tab pane · Ctrl-G panes · F2 workspaces · F3 web · Ctrl-Q quit",
+    }
+}
+
+/// Draws the shared footer row.
+///
+/// A notice replaces the hints while one is showing, the same way the
+/// composer's own footer works, so the two are interchangeable and the row
+/// costs one line whichever surface drew it.
+pub(crate) fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
+    let notice = dashboard.notices.current();
+    let (text, color) = match notice.as_deref() {
+        Some(notice) => (notice.to_owned(), Color::Yellow),
+        None => (combined_footer_text(dashboard).to_owned(), Color::DarkGray),
     };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                format!("{accelerator} for: {actions}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Line::styled(
-                dashboard.notices.current().unwrap_or_default(),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]),
+        Paragraph::new(Line::styled(text, Style::default().fg(color))),
         area,
     );
 }
@@ -1548,6 +1571,7 @@ mod tests {
 
     use hel::hel_config::{HarnessKind, HelConfig, ProjectRepository};
     use hel::hel_quota::{ProfileQuota, QuotaWindow};
+    use hel::hel_selection::SurfaceId;
     use hel::hel_state::{
         HelState, MaterializedExecutionState, STATE_VERSION, SessionState, TranscriptBody,
     };
@@ -1585,13 +1609,10 @@ mod tests {
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
         assert!(rendered.contains("podman  [Q 1]  codex-1  ACP pretty name"));
-        assert!(!rendered.contains("  Turn "));
-        assert!(!rendered.contains("  Step "));
+        assert!(rendered.contains("Sessions · P=time since prompt · S=time since agent activity"));
         assert!(rendered.contains("  codex-1  ACP pretty name"));
         assert!(!rendered.contains("queued]"));
         assert!(rendered.contains("You: question 1"));
-        assert!(rendered.contains("T "));
-        assert!(rendered.contains("S "));
         assert!(rendered.contains("answer 1"));
 
         let buffer = terminal.backend().buffer();
@@ -1612,7 +1633,7 @@ mod tests {
         let mut dashboard = dashboard_with_session(running_session());
         dashboard.set_greeting("UNDERLYING DASHBOARD SENTINEL".into());
         assert_eq!(
-            dashboard.handle_key(crate::test_support::ctrl_key('e')),
+            dashboard.handle_key(crate::test_support::key(KeyCode::Char('e'))),
             DashboardAction::None
         );
         assert_eq!(
@@ -1636,7 +1657,10 @@ mod tests {
         // The dashboard underneath still shows through every row the modal's
         // centred popup does not cover.
         assert!(row_of("UNDERLYING DASHBOARD SENTINEL") < popup_top);
-        assert!(row_of(" Active ") < popup_top);
+        assert!(
+            row_of("podman") < popup_top,
+            "the session row behind the popup still shows"
+        );
     }
 
     #[test]
@@ -1655,7 +1679,7 @@ mod tests {
             let surface = surfaces
                 .surface(id)
                 .unwrap_or_else(|| panic!("pane {index} registered"));
-            assert_eq!(surface.rect, bordered_content(*pane));
+            assert_eq!(surface.rect, crate::widgets::bordered_content(*pane));
             assert_eq!(
                 surfaces
                     .surface_at(surface.rect.x, surface.rect.y)
@@ -1701,10 +1725,14 @@ mod tests {
                 .map(|surface| surface.id),
             Some(SurfaceId::ResumeList)
         );
-        // Beside the popup the pane underneath still owns its cells.
+        // Away from the popup the panes underneath still own their cells:
+        // the dialog covers them, it does not clear them.
+        let sessions = surfaces
+            .surface(SurfaceId::DashboardPane(0))
+            .expect("sessions pane");
         assert_eq!(
             surfaces
-                .surface_at(body.rect.x - 2, body.rect.y)
+                .surface_at(sessions.rect.x, sessions.rect.y)
                 .map(|surface| surface.id),
             Some(SurfaceId::DashboardPane(0))
         );
@@ -1735,7 +1763,7 @@ mod tests {
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("You: unanswered follow-up"));
-        assert!(rendered.contains("│ Checking the workspace"), "{rendered}");
+        assert!(rendered.contains(" Checking the workspace"), "{rendered}");
         assert!(!rendered.contains("Agent:"));
         assert!(!rendered.contains("answer 0"));
         let (user_row, user_line) = lines
@@ -1760,7 +1788,7 @@ mod tests {
 
         assert_eq!(
             dashboard_agent_prefixes(1_330, Some(&detail)),
-            ["T  5m30s", "S    33s"]
+            ["P  5m30s", "S    33s"]
         );
         assert_eq!(compact_dashboard_clock(99 * 60 + 59), "99m59s");
         assert_eq!(compact_dashboard_clock(100 * 60 + 59), "100m");
@@ -1792,7 +1820,7 @@ mod tests {
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
         assert!(!rendered.contains("[idle]"), "{rendered}");
-        assert!(rendered.contains("Agent: │ Finished work"), "{rendered}");
+        assert!(rendered.contains("Agent: Finished work"), "{rendered}");
         assert!(
             rendered.contains(&format!("{activity_time}  ")),
             "{rendered}"
@@ -1893,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn project_hotkey_expands_one_group_and_collapses_the_other() {
+    fn project_hotkeys_collapse_and_expand_groups_independently() {
         let mut first = running_session();
         first.id = "session-alpha".into();
         first.project_directory = Some("/projects/alpha".into());
@@ -1929,28 +1957,47 @@ mod tests {
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw first project");
         let first_draw = buffer_lines(terminal.backend().buffer()).join("\n");
+        // Every project starts expanded, so both groups show their full form.
         assert!(first_draw.contains("[1] alpha"));
         assert!(first_draw.contains("[2] beta"));
         assert!(first_draw.contains("You: question 0"));
-        assert!(!first_draw.contains("You: beta question"));
-        assert!(
-            first_draw
-                .lines()
-                .any(|line| line.contains("podman  ") && line.contains("beta answer")),
-            "{first_draw}"
-        );
+        assert!(first_draw.contains("You: beta question"));
 
+        // The numbered hotkey collapses only its own project.
         assert_eq!(
             dashboard.handle_key(crate::test_support::key(KeyCode::Char('2'))),
             DashboardAction::None
         );
         terminal
             .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw second project");
+            .expect("draw with beta collapsed");
         let second_draw = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(!second_draw.contains("You: question 0"));
-        assert!(second_draw.contains("You: beta question"));
-        assert_eq!(dashboard.selected_session().unwrap().id, "session-beta");
+        assert!(second_draw.contains("You: question 0"), "{second_draw}");
+        assert!(!second_draw.contains("You: beta question"), "{second_draw}");
+        assert!(
+            second_draw
+                .lines()
+                .any(|line| line.contains("podman  ") && line.contains("beta answer")),
+            "the collapsed group keeps a one-line row per session: {second_draw}"
+        );
+
+        // Collapsing alpha too leaves both groups collapsed at once.
+        dashboard.handle_key(crate::test_support::key(KeyCode::Char('1')));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw with both collapsed");
+        let third_draw = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!third_draw.contains("You: question 0"), "{third_draw}");
+        assert!(!third_draw.contains("You: beta question"), "{third_draw}");
+
+        // And the hotkey is a toggle, so pressing it again brings beta back.
+        dashboard.handle_key(crate::test_support::key(KeyCode::Char('2')));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw with beta expanded again");
+        let fourth_draw = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(fourth_draw.contains("You: beta question"), "{fourth_draw}");
+        assert!(!fourth_draw.contains("You: question 0"), "{fourth_draw}");
     }
 
     #[test]
@@ -1984,6 +2031,9 @@ mod tests {
             vec![agent_message(1, "second tail")],
         ));
         let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        // Collapse the beta project so its sessions draw their one-line form,
+        // which is where duplicate targets need their numbering.
+        dashboard.handle_key(crate::test_support::key(KeyCode::Char('2')));
 
         terminal
             .draw(|frame| render(frame, &mut dashboard))
@@ -2060,104 +2110,6 @@ mod tests {
     }
 
     #[test]
-    fn pane_allocator_fills_complete_tables_then_gives_surplus_to_active() {
-        let allocation = allocate_pane_heights(
-            32,
-            PaneHeights {
-                active: 10,
-                capacity: 5,
-                quotas: 5,
-            },
-            PaneHeights {
-                active: 4,
-                capacity: 4,
-                quotas: 4,
-            },
-            Focus::Quotas,
-        );
-
-        assert_eq!(
-            allocation,
-            PaneAllocation::Fits(PaneHeights {
-                active: 19,
-                capacity: 5,
-                quotas: 5,
-            })
-        );
-    }
-
-    #[test]
-    fn pane_allocator_grows_focus_then_active_when_tables_do_not_fit() {
-        let full = PaneHeights {
-            active: 20,
-            capacity: 10,
-            quotas: 10,
-        };
-        let minimized = PaneHeights {
-            active: 5,
-            capacity: 5,
-            quotas: 5,
-        };
-        for (focus, expected) in [
-            (
-                Focus::Active,
-                PaneHeights {
-                    active: 22,
-                    capacity: 5,
-                    quotas: 5,
-                },
-            ),
-            (
-                Focus::Capacity,
-                PaneHeights {
-                    active: 17,
-                    capacity: 10,
-                    quotas: 5,
-                },
-            ),
-            (
-                Focus::Quotas,
-                PaneHeights {
-                    active: 17,
-                    capacity: 5,
-                    quotas: 10,
-                },
-            ),
-        ] {
-            assert_eq!(
-                allocate_pane_heights(35, full, minimized, focus),
-                PaneAllocation::Fits(expected)
-            );
-        }
-    }
-
-    #[test]
-    fn active_two_row_minimum_counts_header_rows_spacer_and_borders() {
-        assert_eq!(active_pane_height(&[5, 5], 2), 12);
-        assert_eq!(active_pane_height(&[5], 1), 7);
-        assert_eq!(active_pane_height(&[], 0), 2);
-    }
-
-    #[test]
-    fn pane_allocator_reports_content_sensitive_minimum_height() {
-        let heights = PaneHeights {
-            active: 5,
-            capacity: 5,
-            quotas: 5,
-        };
-        assert_eq!(
-            allocate_pane_heights(17, heights, heights, Focus::Active),
-            PaneAllocation::TooSmall {
-                required_frame_height: 18,
-            }
-        );
-        assert!(matches!(
-            allocate_pane_heights(18, heights, heights, Focus::Active),
-            PaneAllocation::Fits(_)
-        ));
-    }
-
-    #[test]
     fn dashboard_replaces_too_short_layout_with_required_height() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         let mut terminal = Terminal::new(TestBackend::new(120, 10)).expect("terminal");
@@ -2173,11 +2125,11 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Terminal too small"));
         assert!(
-            rendered.contains("at least 13 rows (currently 10)"),
+            rendered.contains("at least 16 rows (currently 10)"),
             "{rendered:?}"
         );
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 13)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 16)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw exact minimum dashboard");
@@ -2189,8 +2141,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("Terminal too small"));
-        assert!(rendered.contains("Active"));
-        assert!(rendered.contains("Profile Quotas"));
+        assert!(rendered.contains("Sessions · P=time since prompt · S=time since agent activity"));
+        assert!(rendered.contains("Quota"));
     }
 
     #[test]
@@ -2223,13 +2175,16 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("Terminal too small"));
-        assert!(rendered.contains("Active"));
+        assert!(rendered.contains("Sessions P=prompt S=silence"));
     }
 
     #[test]
     fn new_session_picker_keeps_choices_and_controls_visible_at_minimum_width() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('n'))),
+            DashboardAction::None
+        );
         let mut terminal = Terminal::new(TestBackend::new(32, 24)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
@@ -2249,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_uses_separate_hotkey_and_notice_rows_without_an_outer_border() {
+    fn the_footer_is_one_row_that_a_notice_takes_over() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         dashboard.set_notice("Transient dashboard message");
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
@@ -2263,21 +2218,345 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), " ");
+        // The workspace greeting rides in the Sessions title rather than
+        // taking a full row of its own, so the transcript keeps that row.
+        assert!(
+            line(buffer.area.y).contains("Sessions"),
+            "{:?}",
+            line(buffer.area.y)
+        );
         assert!(line(buffer.area.y).contains("Welcome to Hel"));
         assert!(!line(buffer.area.y).contains("ACP sessions"));
-        assert!(line(buffer.area.y + 1).contains("Active"));
-        let accelerator = if cfg!(target_os = "macos") {
-            "Cmd"
-        } else {
-            "Ctrl"
-        };
-        let hotkeys = line(buffer.area.bottom() - 2);
-        assert!(hotkeys.contains(&format!("{accelerator} for: [N]ew")));
-        assert!(hotkeys.contains("mark [A]ll read"));
+        // The footer is one row: a notice replaces the hints while one is
+        // showing, so the row costs one line whichever surface drew it.
+        assert!(
+            line(buffer.area.bottom() - 1).contains("Transient dashboard message"),
+            "{:?}",
+            line(buffer.area.bottom() - 1)
+        );
+        dashboard.notices.clear();
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let buffer = terminal.backend().buffer();
+        let hotkeys = (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, buffer.area.bottom() - 1)].symbol())
+            .collect::<String>();
+        assert!(hotkeys.contains("n new"), "{hotkeys:?}");
+        assert!(hotkeys.contains("a mark read"), "{hotkeys:?}");
         assert!(!hotkeys.contains("[S]ort"));
-        assert!(!hotkeys.contains("[D]elete"));
-        assert!(line(buffer.area.bottom() - 1).contains("Transient dashboard message"));
+    }
+
+    /// The expanded row draws its own `Agent:`/clock prefix, so the excerpt
+    /// beside it must not arrive carrying the transcript's rail as well.
+    #[test]
+    fn an_expanded_agent_excerpt_carries_no_transcript_gutter() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.focus_sessions();
+        apply_materialized_transcript(
+            &mut dashboard,
+            vec![agent_message(1, "reliability reply: summarize the README")],
+        );
+
+        let lines = drawn(&mut dashboard, 120, 34);
+        let agent = lines
+            .iter()
+            .find(|line| line.contains("reliability reply"))
+            .expect("the agent excerpt row");
+        // The pane has focus, so its own border is the doubled glyph: any
+        // light vertical left on this row came from the transcript's rail.
+        assert!(
+            !agent.contains('\u{2502}'),
+            "the excerpt carries no transcript rail: {agent:?}"
+        );
+    }
+
+    /// The empty band has two causes and they need different advice. Telling
+    /// someone there is no live session while the pane above lists one is a
+    /// plain lie.
+    #[test]
+    fn the_empty_prompt_distinguishes_no_session_from_no_conversation() {
+        let mut empty = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        let lines = drawn(&mut empty, 120, 34).join("\n");
+        assert!(lines.contains("Prompt (no live session)"), "{lines}");
+        assert!(lines.contains("n to create or s to resume"), "{lines}");
+
+        // A live session that simply is not open says so instead.
+        let mut live = dashboard_with_session(running_session());
+        let lines = drawn(&mut live, 120, 34).join("\n");
+        assert!(lines.contains("Prompt (no conversation open)"), "{lines}");
+        assert!(lines.contains("Enter on the one to open"), "{lines}");
+        assert!(!lines.contains("No live session"), "{lines}");
+    }
+
+    /// The band order is the whole point of the surface: everything is on one
+    /// screen, in one arrangement, at every size it draws at.
+    #[test]
+    fn the_combined_surface_keeps_its_band_order_at_every_size() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+
+        for (width, height) in [(140, 32), (60, 20), (32, 16)] {
+            let lines = drawn(&mut dashboard, width, height);
+            let row_of = |needle: &str| {
+                lines
+                    .iter()
+                    .position(|line| line.contains(needle))
+                    .unwrap_or_else(|| panic!("missing {needle} at {width}x{height}: {lines:#?}"))
+            };
+            let sessions = row_of("Sessions");
+            let conversation = row_of("Conversation");
+            let prompt = row_of("Prompt");
+            let targets = row_of("Targets");
+            let quota = row_of("Quota");
+            assert!(
+                sessions < conversation
+                    && conversation < prompt
+                    && prompt < targets
+                    && targets < quota,
+                "band order at {width}x{height}: {lines:#?}"
+            );
+            // The footer is the last row and always says something.
+            assert!(
+                !lines[lines.len() - 1].trim().is_empty(),
+                "footer at {width}x{height}: {lines:#?}"
+            );
+        }
+    }
+
+    /// Collapsing gives the transcript exactly the rows the two tables were
+    /// using, so the point of the gesture is measurable rather than merely
+    /// visible.
+    #[test]
+    fn collapsing_the_support_panes_gives_their_rows_to_the_transcript() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        // Start on the composer, so the Sessions pane is already compact and
+        // the only thing that changes is the two tables.
+        dashboard.focus_prompt();
+        /// Rows from the start of one band to the start of the next.
+        fn band(lines: &[String], from: &str, to: &str) -> usize {
+            let start = lines
+                .iter()
+                .position(|line| line.contains(from))
+                .unwrap_or_else(|| panic!("missing {from}: {lines:#?}"));
+            let end = lines
+                .iter()
+                .position(|line| line.contains(to))
+                .unwrap_or_else(|| panic!("missing {to}: {lines:#?}"));
+            end - start
+        }
+
+        let before = drawn(&mut dashboard, 140, 32);
+        dashboard.toggle_support_panes();
+        let after = drawn(&mut dashboard, 140, 32);
+
+        let freed = (band(&before, "Targets", "Quota") - band(&after, "Targets", "Quota"))
+            + (band(&before, "Quota", "Ctrl-Q quit") - band(&after, "Quota", "Ctrl-Q quit"));
+        assert!(freed > 0, "the tables gave up nothing");
+        assert_eq!(
+            band(&after, "Conversation", "Prompt"),
+            band(&before, "Conversation", "Prompt") + freed
+        );
+        // Each collapsed pane really is one row.
+        assert_eq!(band(&after, "Targets", "Quota"), 1);
+        assert_eq!(band(&after, "Quota", "Ctrl-Q quit"), 1);
+    }
+
+    fn now_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn host_usage(cpu_percent: u8) -> hel::hel_targets::DeploymentCapacityUsage {
+        hel::hel_targets::DeploymentCapacityUsage {
+            cpu_percent: Some(cpu_percent),
+            memory_used_bytes: 1,
+            memory_total_bytes: 4,
+            logical_cores: 8,
+            disk_total_bytes: Some(64),
+        }
+    }
+
+    /// A profile quota with `remaining` percent of its weekly window left.
+    fn weekly_quota(profile_id: &str, remaining: u8) -> ProfileQuota {
+        ProfileQuota {
+            profile_id: profile_id.into(),
+            harness: HarnessKind::Claude,
+            windows: vec![QuotaWindow {
+                label: "weekly".into(),
+                remaining_percent: Some(remaining),
+                used: None,
+                limit: None,
+                resets: None,
+                resets_at_epoch_seconds: None,
+            }],
+            extra: None,
+            error: None,
+            refreshed_at_epoch_seconds: now_seconds(),
+        }
+    }
+
+    fn drawn(dashboard: &mut DashboardState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, dashboard))
+            .expect("draw the combined surface");
+        buffer_lines(terminal.backend().buffer())
+    }
+
+    /// Every expanded session is the same height, so the layout can be
+    /// computed from a count and rows never jitter as messages arrive. A
+    /// session with nothing to show still draws its two agent rows.
+    #[test]
+    fn an_expanded_session_always_draws_four_rows() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.focus_sessions();
+
+        let lines = drawn(&mut dashboard, 120, 34);
+        let first = lines
+            .iter()
+            .position(|line| line.contains("podman"))
+            .expect("the session's identity row");
+        assert!(lines[first].contains("ACP pretty name"));
+        assert!(lines[first + 1].contains("You:"), "{:?}", lines[first + 1]);
+        assert!(
+            lines[first + 2].contains("No messages yet"),
+            "{:?}",
+            lines[first + 2]
+        );
+        // The fourth row is the second agent row, blank here because there is
+        // only one line to show.
+        assert!(
+            lines[first + 3].trim_matches(['│', '║', ' ']).is_empty(),
+            "{:?}",
+            lines[first + 3]
+        );
+    }
+
+    /// The compact row is the whole summary in one line, so it has to name
+    /// the project as well: the list spans every project at this width.
+    #[test]
+    fn a_compact_session_row_names_its_project_target_clock_and_last_line() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.focus_prompt();
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "the latest word")]);
+
+        let lines = drawn(&mut dashboard, 120, 34);
+        let row = lines
+            .iter()
+            .find(|line| line.contains("podman"))
+            .expect("the session's row");
+        assert!(row.contains("hel · podman · "), "{row:?}");
+        assert!(row.contains("the latest word"), "{row:?}");
+    }
+
+    #[test]
+    fn the_minimized_rows_report_cpu_and_weekly_percent_used() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard.apply_deployment_capacity("local", Ok(Some(host_usage(42))), now_seconds());
+        dashboard.apply_quota(weekly_quota("claude-1", 63));
+        dashboard.toggle_support_panes();
+
+        let lines = drawn(&mut dashboard, 120, 34);
+        let targets = lines
+            .iter()
+            .find(|line| line.starts_with("Targets"))
+            .expect("the collapsed Targets row");
+        assert!(targets.contains("local 42%"), "{targets:?}");
+        let quota = lines
+            .iter()
+            .find(|line| line.starts_with("Quota"))
+            .expect("the collapsed Quota row");
+        // 63% of the weekly window is left, so 37% of it has been used.
+        assert!(quota.contains("claude-1 37%"), "{quota:?}");
+        // Each collapsed pane is exactly one row.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("Targets"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("Quota"))
+                .count(),
+            1
+        );
+    }
+
+    /// A reading that cannot be trusted has to say so. A number that is
+    /// actually missing, stale or inapplicable is worse than no number.
+    #[test]
+    fn the_minimized_rows_stay_explicit_about_readings_they_do_not_have() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard.toggle_support_panes();
+
+        // No sample at all.
+        let lines = drawn(&mut dashboard, 120, 34);
+        let targets = |lines: &[String]| {
+            lines
+                .iter()
+                .find(|line| line.starts_with("Targets"))
+                .expect("the collapsed Targets row")
+                .clone()
+        };
+        assert!(targets(&lines).contains("local unavailable"));
+
+        // A probe in flight.
+        dashboard.begin_capacity_refresh();
+        assert!(targets(&drawn(&mut dashboard, 120, 34)).contains("local refreshing…"));
+
+        // A sample too old to trust.
+        dashboard.apply_deployment_capacity(
+            "local",
+            Ok(Some(host_usage(7))),
+            now_seconds() - CAPACITY_SAMPLE_STALE_AFTER_SECONDS - 60,
+        );
+        assert!(
+            targets(&drawn(&mut dashboard, 120, 34)).contains("local 7% (stale)"),
+            "{:?}",
+            targets(&drawn(&mut dashboard, 120, 34))
+        );
+
+        // A quota that failed to refresh.
+        let quota = drawn(&mut dashboard, 120, 34)
+            .into_iter()
+            .find(|line| line.starts_with("Quota"))
+            .expect("the collapsed Quota row");
+        assert!(quota.contains("claude-1 unavailable"), "{quota:?}");
+    }
+
+    /// A collapsed pane is one row by definition, so more hosts than fit have
+    /// to be cut rather than wrapped onto a second row.
+    #[test]
+    fn the_minimized_rows_truncate_rather_than_wrap() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(
+            (0..8)
+                .map(|index| hel::hel_targets::DeploymentCapacityTarget {
+                    id: format!("host-{index}"),
+                    host: format!("a-rather-long-host-name-{index}"),
+                    ..test_capacity_target()
+                })
+                .collect(),
+        );
+        dashboard.toggle_support_panes();
+
+        let lines = drawn(&mut dashboard, 60, 34);
+        let rows = lines
+            .iter()
+            .filter(|line| line.starts_with("Targets"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "{lines:#?}");
+        assert!(rows[0].chars().count() <= 60);
+        assert!(rows[0].ends_with('…'), "{:?}", rows[0]);
     }
 
     #[test]
@@ -2288,7 +2567,7 @@ mod tests {
         // unread; the band still brightens because no turn is in flight.
         session.viewed_through_event_ordinal = 1;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.focus = Focus::Quotas;
+        dashboard.focus = Focus::Quota;
         let mut materialized =
             materialized_session_for("session-1", vec![agent_message(1, "seen response")]);
         materialized.execution = MaterializedExecutionState::Idle;
@@ -2303,9 +2582,9 @@ mod tests {
                 let row = (buffer.area.x..buffer.area.right())
                     .map(|x| buffer[(x, *y)].symbol())
                     .collect::<String>();
-                row.contains("ACP pretty name")
+                row.contains("podman")
             })
-            .expect("active status row");
+            .expect("the session's summary row");
         let status = (buffer.area.x..buffer.area.right())
             .map(|x| buffer[(x, status_y)].symbol())
             .collect::<String>();
@@ -2551,9 +2830,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Active"));
-        assert!(rendered.contains("Capacity"));
-        assert!(rendered.contains("Profile Quotas"));
+        assert!(rendered.contains("Sessions"));
+        assert!(rendered.contains("Targets"));
+        assert!(rendered.contains("Quota"));
     }
 
     #[test]
@@ -2632,7 +2911,7 @@ mod tests {
                 .insert(format!("profile-{index:02}"), profile.clone());
         }
         let mut dashboard = DashboardState::new(config, HelState::default(), BTreeMap::new());
-        dashboard.focus = Focus::Quotas;
+        dashboard.focus = Focus::Quota;
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
 
         terminal
@@ -2717,7 +2996,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
-        assert_eq!(lines, ["│ two", "│ three", "│ four", "│ five"]);
+        assert_eq!(lines, ["two", "three", "four", "five"]);
         assert!(active_message_tail(None, 80, ACTIVE_MESSAGE_LINES).is_empty());
     }
 
@@ -2889,8 +3168,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Active"));
-        assert!(rendered.contains("┌ Capacity"));
+        assert!(rendered.contains("╔ Sessions"));
+        assert!(rendered.contains("┌ Targets"));
         assert!(!rendered.contains("[focused]"));
 
         dashboard.handle_key(key(KeyCode::Tab));
@@ -2904,8 +3183,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Capacity"));
-        assert!(!rendered.contains("╔ Capacity in Use"));
+        assert!(rendered.contains("╔ Quota"), "{rendered:?}");
 
         dashboard.handle_key(key(KeyCode::Tab));
         terminal
@@ -2918,7 +3196,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Profile Quotas"));
+        assert!(rendered.contains("╔ Targets"), "{rendered:?}");
         assert!(!rendered.contains("[focused]"));
     }
 
@@ -2944,7 +3222,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut initial_name_columns = None;
 
-        for expected_focus in [Focus::Active, Focus::Capacity, Focus::Quotas] {
+        for expected_focus in [Focus::Sessions, Focus::Quota, Focus::Targets] {
             assert_eq!(dashboard.focus, expected_focus);
             terminal
                 .draw(|frame| render(frame, &mut dashboard))
@@ -2957,31 +3235,35 @@ mod tests {
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>();
+            // Exactly one caret on the screen at a time: the focused pane's,
+            // and nobody else's.
             assert_eq!(
                 lines
                     .iter()
                     .flat_map(|line| line.chars())
                     .filter(|character| *character == '›')
                     .count(),
-                1
+                1,
+                "{expected_focus:?}"
             );
-            let name_columns = lines
-                .iter()
-                .filter_map(|line| {
-                    line.find("ACP pretty name")
-                        .map(|byte| line[..byte].chars().count())
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(name_columns.len(), 2);
-            if let Some(initial_name_columns) = &initial_name_columns {
-                assert_eq!(&name_columns, initial_name_columns);
-            } else {
+            if expected_focus == Focus::Sessions {
+                // Both sessions draw their expanded form, and the caret on one
+                // of them does not shift the other's columns.
+                let name_columns = lines
+                    .iter()
+                    .filter_map(|line| {
+                        line.find("ACP pretty name")
+                            .map(|byte| line[..byte].chars().count())
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(name_columns.len(), 2);
                 assert_eq!(name_columns[0], name_columns[1]);
                 initial_name_columns = Some(name_columns);
             }
 
             dashboard.handle_key(key(KeyCode::Tab));
         }
+        assert!(initial_name_columns.is_some());
     }
 
     #[test]
@@ -3002,7 +3284,7 @@ mod tests {
         assert!(rendered.contains("Welcome to Hel"));
         assert!(rendered.contains("Hel needs a little fuel."));
         assert_eq!(
-            dashboard.handle_key(ctrl_key('e')),
+            dashboard.handle_key(key(KeyCode::Char('e'))),
             DashboardAction::OpenConfig
         );
     }
@@ -3058,7 +3340,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("unavailable: offline"));
-        assert!(rendered.contains("Profile Quotas (refreshed"));
+        assert!(rendered.contains("Quota (refreshed"));
         assert!(!rendered.contains("Refreshed"));
         assert!(!rendered.contains("Access"));
         assert!(!rendered.contains("agent-full-access"));

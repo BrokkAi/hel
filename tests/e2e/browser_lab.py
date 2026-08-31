@@ -27,7 +27,7 @@ def start_dashboard(lab: Lab):
     client = lab.start_tui("tui-1")
     client.wait_for("Workspaces")
     client.send(b"\r\r")
-    client.wait_for("Active")
+    client.wait_for("Sessions")
     return client
 
 
@@ -55,7 +55,10 @@ def wait_marker_or_exit(marker: pathlib.Path, browser: subprocess.Popen[bytes]) 
 
 
 def stop_from_dashboard(client) -> None:
-    client.send(b"\x05")
+    # The surface opens with the keyboard in Prompt, and the pane keys are
+    # plain letters, so Tab has to move focus first or `e` is typed as text.
+    client.send(b"\t")
+    client.send(b"e")
     client.wait_for("Edit session")
     client.send(b"\x1b[C\r")
     client.wait_for("Stop session?")

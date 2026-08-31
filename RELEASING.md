@@ -1,94 +1,117 @@
 # Releasing Hel
 
-Releases are maintainer-driven. This is the tagging runbook; see
+Releases are maintainer-driven. This is the authoritative tagging runbook; see
 [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, runtime invariants,
 tests, and dependency-license maintenance.
 
-## Versions
+## Version contract
 
-All four published crates must carry the same version, with matching
-workspace entries in `Cargo.lock`: `hel-core` (the root package; it publishes
-under that name because crates.io's `hel` belongs to an unrelated crate, while
-the library keeps the `hel` crate name), `hel-tui`, `hel-cli` (installs the
-`hel` binary), and `hel-voice-worker`. The internal dependency versions in
-`crates/hel-tui/Cargo.toml` and `crates/hel-cli/Cargo.toml` must be bumped to
-match. `install.sh`'s `SCRIPT_VERSION` is
-an independent installer logging revision and is not automatically synchronized
-to product releases.
+All four published crates inherit the release version from
+`[workspace.package]` in the root `Cargo.toml`: `hel-core`, `hel-tui`,
+`hel-cli`, and `hel-voice-worker`.
 
-`licenses/THIRD_PARTY_LICENSES.html` embeds the workspace crate versions, so a
-version bump must regenerate it. CI diffs the checked-in report against a fresh
-`cargo about generate` and fails on any difference.
+Cargo requires published path dependencies to carry a registry version and
+does not allow that version to inherit. The `hel` and `hel-tui` entries under
+`[workspace.dependencies]` therefore repeat the release version. After changing
+the workspace package version, synchronize those entries with:
 
-## What a tag triggers
+```bash
+node scripts/release-version.mjs sync
+```
 
-A `vX.Y.Z` tag triggers the GitHub release workflow. The docs workflow is
-manual-only for now; Hel does not publish a docs site yet.
+`Cargo.lock` and `licenses/THIRD_PARTY_LICENSES.html` also embed the workspace
+version and must be refreshed before tagging. `install.sh`'s `SCRIPT_VERSION`
+is an independent installer logging revision; do not synchronize it to the
+product version.
 
-The release workflow opens with a coverage gate and builds nothing until it
-passes. CI's branch and pull request triggers do not match tags, so this is the
-only check that re-runs against the tagged tree. Collecting coverage runs the
-whole workspace test suite, which means a failing test and a coverage
-regression both stop the release; tagging a commit whose coverage run was red
-on master fails here rather than shipping.
+## One-time crates.io setup
 
-The gate covers Linux tests and the coverage baseline only. Formatting, Clippy,
-the macOS and Windows test runs, the Android target check, and the
-dependency-license checks stay pull request checks, so a tag still relies on the
-tagged commit having passed CI on master.
+Each published crate must authorize this repository before the workflow can
+exchange GitHub's OIDC identity for a short-lived crates.io token. In the
+crates.io settings for `hel-core`, `hel-tui`, `hel-cli`, and
+`hel-voice-worker`, create a GitHub Trusted Publisher with these exact values:
 
-The builds cover Linux x86-64 and ARM64, Android ARM64, Windows x86-64, and a
-universal macOS archive. Desktop archives contain `mj` and the voice worker;
-Android omits the voice worker. Every archive includes the applicable licenses
-and notices and is published with a SHA-256 sidecar.
+- GitHub owner: `BrokkAi`
+- Repository: `hel`
+- Workflow: `publish.yml`
+- Environment: `crates-io`
 
-The crates.io publish does not run off the tag push. It waits for the GitHub
-Release to be published, so the coverage gate and a build failure on any
-target each stop the release before anything reaches crates.io.
+The GitHub repository must also have an environment named `crates-io`; use its
+deployment protection rules for any desired maintainer approval. No long-lived
+crates.io token or GitHub secret is needed. Trusted Publisher configuration is
+one-time per crate, but confirm it before tagging the first release that uses
+OIDC: a missing configuration is discovered only after the GitHub Release is
+already public.
 
-## Discord announcement
+## Release procedure
 
-To announce a published GitHub Release in Discord, set the
-`DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
-webhook URL. The release workflow reuses GitHub's generated release notes,
-prevents mentions from being parsed, suppresses automatic link embeds, and
-leaves a failed Discord delivery as a warning so it cannot invalidate an
-already-published release.
+1. Set `[workspace.package] version` in the root `Cargo.toml` to the next
+   version. Do this before creating a tag.
+2. Synchronize the repeated versions, refresh the lockfile, and regenerate the
+   license report:
 
-## crates.io publishing
+   ```bash
+   node scripts/release-version.mjs sync
+   cargo metadata --format-version 1 >/dev/null
+   cargo about generate --workspace --offline --config licenses/about.toml \
+     --locked --fail licenses/about.hbs -o licenses/THIRD_PARTY_LICENSES.html
+   ```
 
-`publish.yml` publishes `hel-core`, `hel-tui`, `hel-cli`, and
-`hel-voice-worker`, in that dependency order. It refuses to publish when the
-tag differs from any crate version, and packages all four crates ahead of the
-`crates-io` environment gate so a packaging failure surfaces without spending
-an approval (`hel-tui` and `hel-cli` package with `--no-verify` because their
-dependencies are not on the registry until the same run publishes them).
+3. Validate the candidate version and repository:
 
-Publishing runs automatically once the release workflow succeeds. The automated
-release job explicitly dispatches `publish.yml` after creating the GitHub
-Release. This uses a trigger supported by crates.io trusted publishing; GitHub
-does not emit a second workflow from release events created with its workflow
-token, and crates.io rejects the `workflow_run` trigger. A release published by
-another actor also starts `publish.yml` through its release event.
+   ```bash
+   node scripts/release-version.mjs check vX.Y.Z
+   cargo metadata --locked --format-version 1 >/dev/null
+   cargo fmt --check
+   cargo test
+   cargo clippy --all-targets -- -D warnings
+   ```
 
-Each crate is skipped when that version is already on the registry. That is the
-recovery path if one crate publishes and the other fails: re-running resumes at
-the crate that did not land. crates.io reserves a version number permanently
-once published and yanking does not release it, so a shipped version can never
-be republished.
+   Run `cargo test` outside the restricted sandbox as required by `AGENTS.md`.
+   Run any additional cross-platform, packaging, or manual checks relevant to
+   the changes in the release.
 
-To package a tag without publishing, run the workflow manually with `publish`
-off and inspect its `.crate` artifact.
+4. Commit the version bump and generated files. Push that commit and wait for
+   the branch CI checks to pass. Re-run the version checks on the clean commit
+   that will be tagged.
+5. Create and push an annotated tag on that exact commit:
 
-## Before tagging
+   ```bash
+   git tag -a vX.Y.Z -m "Release X.Y.Z"
+   git push origin vX.Y.Z
+   ```
 
-Confirm that:
+6. Watch the `Release Hel` workflow. It checks the tag against the workspace
+   version and lockfile before any build. It then packages x86-64 Linux musl,
+   ARM64 Linux musl, and ARM64 macOS archives, publishes the GitHub Release and
+   checksums, and dispatches the crates.io workflow.
+7. Approve the `crates-io` environment when requested. `publish.yml` verifies
+   and packages the tagged source, authenticates through each crate's Trusted
+   Publisher configuration, then publishes `hel-core`, `hel-tui`, `hel-cli`,
+   and `hel-voice-worker` in dependency order. An already-published crate
+   version is skipped, so rerunning the workflow safely resumes a partial
+   publication.
+8. Verify the GitHub Release assets and confirm all four crates show `X.Y.Z` on
+   crates.io. Test the documented installer against the new tag.
 
-1. Both crate manifests and their `Cargo.lock` workspace entries match the intended tag.
-2. Formatting, Clippy, release builds, tests, and relevant cross-platform or
-   packaging checks pass.
-3. Dependency-license policy and generated notice reports are current.
-4. User-facing installation, configuration, and release documentation reflects
-   the shipped behavior.
-5. The release commit is merged and the tagged commit is the exact commit meant
-   to be published.
+To package an existing tag without publishing crates, run `publish.yml`
+manually with `publish` disabled and inspect its `.crate` artifact.
+
+If crates.io authentication failed because Trusted Publishing was not
+configured, add the four configurations above and retry the existing immutable
+tag with:
+
+```bash
+gh workflow run publish.yml \
+  --ref vX.Y.Z \
+  --raw-field release_tag=vX.Y.Z \
+  --raw-field publish=true
+```
+
+## Recovery
+
+Do not move or overwrite a tag after its GitHub Release is public. Release
+assets and cloned tags may already be cached even when download counts are low.
+If a bad tag was published, document the bad release, make the correction on
+the branch, and release the next patch version. A crates.io version is reserved
+permanently once published; yanking it does not make the version reusable.

@@ -1927,9 +1927,29 @@ fn transcript_title(chat: &ChatState, now_epoch_seconds: u64) -> String {
 const ROLE_GUTTER: &str = "│ ";
 const ROLE_GUTTER_WIDTH: usize = 2;
 
+/// Body rows of an agent message for a summary viewport: the conversation's
+/// own rendering, minus the parts that only make sense inside it.
+///
+/// No header row, blank rows dropped, and no role gutter. The gutter marks
+/// continuation rows underneath a role header; a summary row has no header and
+/// carries its own prefix, so a gutter there is a second marker for nothing.
+/// The wrap width is widened by the gutter it drops, so the caller gets the
+/// `width` columns of text it asked for.
+fn preview_rows(source: &str, width: usize) -> Vec<Line<'static>> {
+    let entry = ChatEntry::plain(0, ChatRole::Agent, source);
+    entry_body_rows(
+        &entry,
+        width.saturating_add(ROLE_GUTTER_WIDTH),
+        TranscriptRenderMode::Rich,
+    )
+    .into_iter()
+    .filter(|line| !line_is_empty(line))
+    .map(without_role_gutter)
+    .collect()
+}
+
 /// The last rows of an agent message for a small preview viewport, rendered
-/// by the same pipeline as the conversation view. Only viewport concerns
-/// differ: no header row, blank rows dropped, at most `maximum_lines` kept.
+/// by the same pipeline as the conversation view.
 pub fn render_agent_message_tail(
     source: &str,
     width: usize,
@@ -1938,17 +1958,13 @@ pub fn render_agent_message_tail(
     if width == 0 || maximum_lines == 0 {
         return Vec::new();
     }
-    let entry = ChatEntry::plain(0, ChatRole::Agent, source);
-    let lines = entry_body_rows(&entry, width, TranscriptRenderMode::Rich)
-        .into_iter()
-        .filter(|line| !line_is_empty(line))
-        .collect::<Vec<_>>();
+    let lines = preview_rows(source, width);
     let start = lines.len().saturating_sub(maximum_lines);
     lines.into_iter().skip(start).collect()
 }
 
-/// First rows of an agent message for dashboard summaries. Rich formatting is
-/// retained, but the final visible row announces omitted content.
+/// First rows of an agent message for session-list summaries. Rich formatting
+/// is retained, but the final visible row announces omitted content.
 pub fn render_agent_message_head(
     source: &str,
     width: usize,
@@ -1957,20 +1973,11 @@ pub fn render_agent_message_head(
     if width == 0 || maximum_lines == 0 {
         return Vec::new();
     }
-    let entry = ChatEntry::plain(0, ChatRole::Agent, source);
-    let mut lines = entry_body_rows(&entry, width, TranscriptRenderMode::Rich)
-        .into_iter()
-        .filter(|line| !line_is_empty(line))
-        .collect::<Vec<_>>();
+    let mut lines = preview_rows(source, width);
     let truncated = lines.len() > maximum_lines;
     lines.truncate(maximum_lines);
     if truncated && let Some(last) = lines.last_mut() {
-        let preserved_spans = usize::from(
-            last.spans
-                .first()
-                .is_some_and(|span| span.content == ROLE_GUTTER),
-        );
-        append_trimmed_ellipsis(last, preserved_spans);
+        append_trimmed_ellipsis(last, 0);
     }
     lines
 }
@@ -2249,6 +2256,19 @@ fn with_role_gutter(line: Line<'static>, style: Style) -> Line<'static> {
     spans.push(Span::styled(ROLE_GUTTER, style));
     spans.extend(line.spans);
     Line::from(spans)
+}
+
+/// Drops the leading role gutter from a rendered row, for viewports that do
+/// not draw the rail it belongs to.
+fn without_role_gutter(mut line: Line<'static>) -> Line<'static> {
+    if line
+        .spans
+        .first()
+        .is_some_and(|span| span.content == ROLE_GUTTER)
+    {
+        line.spans.remove(0);
+    }
+    line
 }
 
 fn line_is_empty(line: &Line<'_>) -> bool {

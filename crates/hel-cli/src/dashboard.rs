@@ -38,7 +38,7 @@ use hel::hel_targets::DeploymentCapacityTarget;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, PreparedMaterializedSessionDetail,
-    SessionOperationKind, render, resume_profile_placeholders,
+    SessionOperationKind, render_combined, resume_profile_placeholders,
 };
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -68,6 +68,137 @@ use crate::{TerminalGuard, short_id, startup_greeting};
 /// Redraw cadence for displays that move with the wall clock: turn timers,
 /// countdowns, and elapsed times.
 const DASHBOARD_CLOCK_TICK: Duration = Duration::from_secs(1);
+
+/// How long the surface waits for stored session summaries before it opens a
+/// conversation anyway. The summaries decide which session has the newest
+/// activity; a stalled read must not leave the screen without a conversation.
+const STARTUP_SESSION_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the startup pick keeps trying to open the conversation it chose.
+///
+/// Attaching needs the session manager to be managing that session, and the
+/// manager adopts sessions asynchronously after the surface starts, so the
+/// first attempt usually lands before it is ready and fails with "not
+/// managed". Retrying on the clock tick rides that out; the window bounds it
+/// so a session that never becomes managed cannot retry for ever.
+const STARTUP_SESSION_ATTACH_WINDOW: Duration = Duration::from_secs(30);
+
+/// Whether the surface still gets to choose which conversation it opens on.
+///
+/// It waits for the stored summaries, because those carry the activity times
+/// the choice compares — but only for [`STARTUP_SESSION_WAIT`], and only until
+/// the user makes the choice themselves.
+#[derive(Debug)]
+struct StartupSession {
+    /// Live sessions whose stored summary has not come back yet.
+    pending_summaries: BTreeSet<String>,
+    /// False once the choice has been made, or taken away.
+    open_pending: bool,
+    deadline: std::time::Instant,
+    /// The conversation the pick chose and is waiting on, so an attach that
+    /// lands before the session manager is ready can be tried again.
+    attempting: Option<String>,
+    /// When to stop retrying that attach.
+    give_up_at: std::time::Instant,
+}
+
+impl StartupSession {
+    /// Nothing to choose: the workspace has no live session, or one is
+    /// already open.
+    fn idle() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            pending_summaries: BTreeSet::new(),
+            open_pending: false,
+            deadline: now,
+            attempting: None,
+            give_up_at: now,
+        }
+    }
+
+    fn begin(session_ids: impl IntoIterator<Item = String>, now: std::time::Instant) -> Self {
+        let pending_summaries = session_ids.into_iter().collect::<BTreeSet<_>>();
+        Self {
+            open_pending: !pending_summaries.is_empty(),
+            pending_summaries,
+            deadline: now + STARTUP_SESSION_WAIT,
+            attempting: None,
+            give_up_at: now + STARTUP_SESSION_ATTACH_WINDOW,
+        }
+    }
+
+    /// One session has answered, whether its summary loaded or failed.
+    fn summary_arrived(&mut self, session_id: &str) {
+        self.pending_summaries.remove(session_id);
+    }
+
+    /// The user acted, so the choice is theirs now.
+    fn cancel(&mut self) {
+        self.open_pending = false;
+        self.attempting = None;
+    }
+
+    /// Records which conversation the pick is opening, so a failed attach can
+    /// be recognised as this one's.
+    fn attempting(&mut self, session_id: &str) {
+        self.attempting = Some(session_id.to_owned());
+    }
+
+    /// One attach failed. Returns whether the pick will try again, which is
+    /// also whether the failure is worth reporting: a manager that has not
+    /// adopted the session yet resolves itself, and saying so every second
+    /// would bury the notice bar in noise.
+    fn attach_failed(&mut self, session_id: &str, now: std::time::Instant) -> bool {
+        if self.attempting.as_deref() != Some(session_id) {
+            return false;
+        }
+        if now >= self.give_up_at {
+            self.attempting = None;
+            return false;
+        }
+        self.open_pending = true;
+        true
+    }
+
+    /// Whether the pick should run now. Answering `true` once retires the
+    /// choice, so a later tick cannot open a second conversation.
+    fn ready(&mut self, now: std::time::Instant) -> bool {
+        if !self.open_pending {
+            return false;
+        }
+        if !self.pending_summaries.is_empty() && now < self.deadline {
+            return false;
+        }
+        self.open_pending = false;
+        true
+    }
+}
+
+/// The live session the surface should open on: the one with the newest
+/// recorded activity.
+///
+/// Ties break by newest creation time and then by the larger session id, so
+/// the choice is the same on every run. When no summary carried an activity
+/// time — none is stored yet, or every read failed — every session ranks equal
+/// on the first key and creation time decides, which is the intended fallback
+/// rather than an accident.
+fn startup_session_choice<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionRecord>,
+    activity_at_ms: impl Fn(&str) -> Option<u64>,
+) -> Option<String> {
+    sessions
+        .into_iter()
+        .max_by(|left, right| {
+            activity_at_ms(&left.id)
+                .unwrap_or(0)
+                .cmp(&activity_at_ms(&right.id).unwrap_or(0))
+                // `compare_by_creation` orders oldest first, so the newer of
+                // the two is the greater under `max_by`.
+                .then_with(|| left.compare_by_creation(right))
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|session| session.id.clone())
+}
 /// Redraw cadence while a dialog animates on its own.
 const IMPORT_PROGRESS_TICK: Duration = Duration::from_millis(125);
 /// Scroll cadence while a drag is held past a scrollable surface's edge.
@@ -201,16 +332,6 @@ fn shutdown_wait_notice(blockers: &[String]) -> Option<String> {
     }
 }
 
-/// Which view the one loop is drawing. The chat view is data rather than a
-/// nested loop, so its background feeds stay live while the session list is on
-/// screen and returning to a session is only a redraw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum View {
-    Dashboard,
-    /// Only valid while the loop holds an `ActiveChat`.
-    Chat,
-}
-
 pub(crate) struct ActiveDashboardImport {
     task_id: u64,
     pub(crate) cancelled: Arc<AtomicBool>,
@@ -229,16 +350,16 @@ pub(crate) struct DashboardContext {
     /// Absent only while the setup dialog owns the terminal; see
     /// [`DashboardContext::run_setup_dialog`].
     events: Option<event::EventStream>,
-    pub(crate) view: View,
-    /// At most one chat stays warm: the session opened last. Its feeds keep
-    /// running off screen, so reopening it costs a draw rather than a rebuild.
+    /// The conversation on screen. One chat stays warm at a time; its feeds
+    /// keep running while another pane has the keyboard, so switching back is
+    /// a redraw rather than a rebuild.
     pub(crate) active_chat: Option<hel::hel_chat::ActiveChat>,
     /// Session-manager attachment is asynchronous: an actor may need to
     /// answer from a worker or relay before a chat can be built.
     pub(crate) opening_chat_session: Option<String>,
-    /// Conversation-to-conversation navigation asks the newly opened chat to
-    /// retain focus in its conversation list after the async attachment.
-    pub(crate) opening_chat_focus_conversations: bool,
+    /// Which conversation the surface opens on, and whether it is still the
+    /// surface's choice to make.
+    startup: StartupSession,
     /// The first pass always draws; after that a redraw needs a wakeup.
     pub(crate) dirty: bool,
     /// The notice generation the frame on screen was drawn from. Background
@@ -431,6 +552,12 @@ pub(crate) async fn run_dashboard_for_workspace(
                     continue;
                 }
                 let mut event = event?;
+                // The user acting is the strongest signal there is about which
+                // conversation they want, so it takes the choice away from the
+                // startup pick before that pick can override their input.
+                if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+                    context.cancel_startup_session();
+                }
                 // Key repeats and pastes arrive as several ready events. The
                 // buffered ones are handled before drawing, but the first event
                 // that asks for work ends the batch so that dispatch still
@@ -449,7 +576,7 @@ pub(crate) async fn run_dashboard_for_workspace(
                                 context.copy_selection(surface, range)?;
                                 true
                             }
-                            SelectionRouting::Forward(event) => dispatch_to_view(
+                            SelectionRouting::Forward(event) => dispatch_event(
                                 &mut context,
                                 event,
                                 &mut action,
@@ -480,10 +607,10 @@ pub(crate) async fn run_dashboard_for_workspace(
             // whether or not the chat is on screen, which is what keeps an
             // off-screen chat current.
             () = hel::hel_chat::ActiveChat::pump(context.active_chat.as_mut()) => {
-                context.dirty |= context.view == View::Chat;
-                if context.view == View::Chat {
-                    context.acknowledge_visible_chat();
-                }
+                // The conversation is always on screen, so its own feeds
+                // always redraw it and always advance its read receipt.
+                context.dirty = true;
+                context.acknowledge_visible_chat();
             }
             update = context.quota.wait(), if context.quota.is_open() => {
                 let woke = context.quota.accept(update);
@@ -551,17 +678,15 @@ pub(crate) async fn run_dashboard_for_workspace(
                 // Resume search covers the moving "Last active" text, so the
                 // same clock that redraws the dialog rebuilds its rows.
                 context.dashboard.rebuild_resume_rows();
-                context.dirty |= match (context.view, context.active_chat.as_ref()) {
-                    (View::Chat, Some(chat)) => chat.needs_clock_tick(),
-                    _ => true,
-                };
+                // The support panes carry clocks whatever has the keyboard, so
+                // the surface redraws every second regardless.
+                context.dirty = true;
+                context.maybe_open_startup_session();
             }
             // The import progress dialog reports how long a step has stalled
             // and the resume dialog spins while it scans; both need a faster
             // tick, and only while they are on screen.
-            _ = import_tick.tick(),
-                if context.dashboard.needs_fast_tick() && context.view == View::Dashboard =>
-            {
+            _ = import_tick.tick(), if context.dashboard.needs_fast_tick() => {
                 context.dirty = true;
             }
             // A drag held past a scrollable surface's edge keeps scrolling it
@@ -805,10 +930,9 @@ impl DashboardContext {
             dashboard,
             notices,
             events: Some(event::EventStream::new()),
-            view: View::Dashboard,
             active_chat: None,
             opening_chat_session: None,
-            opening_chat_focus_conversations: false,
+            startup: StartupSession::idle(),
             dirty: true,
             drawn_notice_generation: 0,
             controller_changed: true,
@@ -912,6 +1036,17 @@ impl DashboardContext {
             .filter(|session| session.state.is_active())
             .map(|session| (session.id.clone(), session.viewed_through_event_ordinal))
             .collect::<Vec<_>>();
+        // The startup pick compares recorded activity, which is exactly what
+        // these summaries carry, so it waits for them.
+        self.startup = StartupSession::begin(
+            sessions.iter().map(|(id, _)| id.clone()),
+            std::time::Instant::now(),
+        );
+        if sessions.is_empty() {
+            // With nothing to talk to, the keyboard belongs on the list, where
+            // a session can be created or resumed.
+            self.dashboard.focus_sessions();
+        }
         for (session_id, viewed_through_event_ordinal) in sessions {
             spawn_stored_session_summary(
                 session_id,
@@ -919,6 +1054,48 @@ impl DashboardContext {
                 self.dashboard_io_tx.clone(),
             );
         }
+    }
+
+    /// Records that one live session's stored summary has arrived, however it
+    /// turned out, and opens the startup conversation once they all have.
+    pub(super) fn finish_startup_summary(&mut self, session_id: &str) {
+        self.startup.summary_arrived(session_id);
+        self.maybe_open_startup_session();
+    }
+
+    /// The user took the choice into their own hands, so the surface stops
+    /// trying to pick a conversation for them.
+    fn cancel_startup_session(&mut self) {
+        self.startup.cancel();
+    }
+
+    /// Whether a failed attach belongs to the startup pick and will be tried
+    /// again on the next tick.
+    pub(super) fn retry_startup_attach(&mut self, session_id: &str) -> bool {
+        self.startup
+            .attach_failed(session_id, std::time::Instant::now())
+    }
+
+    /// Opens the conversation the surface should start on, once the summaries
+    /// it compares have arrived or the wait for them has run out.
+    pub(super) fn maybe_open_startup_session(&mut self) {
+        if !self.startup.ready(std::time::Instant::now()) {
+            return;
+        }
+        let Some(session_id) = startup_session_choice(
+            self.controller
+                .state
+                .sessions
+                .values()
+                .filter(|session| session.state.is_active()),
+            |session_id| self.dashboard.session_activity_at_ms(session_id),
+        ) else {
+            self.dashboard.focus_sessions();
+            return;
+        };
+        self.startup.attempting(&session_id);
+        self.dashboard.focus_prompt();
+        self.open_chat_session(&session_id);
     }
 
     pub(super) fn resolve_project_sources(&mut self) {
@@ -985,29 +1162,18 @@ impl DashboardContext {
             terminal,
             dashboard,
             active_chat,
-            view,
             selection,
             selection_text,
             ..
         } = self;
         let transcript_selected = selection.active_surface() == Some(SurfaceId::Transcript);
         // The highlight and the extraction both run inside the draw closure,
-        // once the view has drawn: the surfaces are registered by that render
-        // and the cells the selection covers only exist in this frame.
-        match (*view, active_chat.as_mut()) {
-            (View::Chat, Some(chat)) => {
-                terminal.terminal.draw(|frame| {
-                    chat.draw(frame, transcript_selected);
-                    *selection_text = draw_selection(frame, selection, chat.frame_surfaces());
-                })?;
-            }
-            _ => {
-                terminal.terminal.draw(|frame| {
-                    render(frame, dashboard);
-                    *selection_text = draw_selection(frame, selection, dashboard.frame_surfaces());
-                })?;
-            }
-        }
+        // once the surface has drawn: the hitboxes are registered by that
+        // render and the cells the selection covers only exist in this frame.
+        terminal.terminal.draw(|frame| {
+            render_combined(frame, dashboard, active_chat.as_mut(), transcript_selected);
+            *selection_text = draw_selection(frame, selection, dashboard.frame_surfaces());
+        })?;
         // The transcript reports a row space it can no longer measure the
         // selection in — a width change, a rebuilt cache, a jump across the
         // deep past. Dropping the selection is the honest answer; walking
@@ -1024,12 +1190,11 @@ impl DashboardContext {
         Ok(())
     }
 
-    /// The surfaces the view on screen registered on its last frame.
+    /// The hitboxes the surface registered on its last frame. The combined
+    /// renderer merges the conversation's into this one registry, so there is
+    /// only ever one to consult.
     fn frame_surfaces(&self) -> &FrameSurfaces {
-        match (self.view, self.active_chat.as_ref()) {
-            (View::Chat, Some(chat)) => chat.frame_surfaces(),
-            _ => self.dashboard.frame_surfaces(),
-        }
+        self.dashboard.frame_surfaces()
     }
 
     /// The surface a held drag is asking to scroll, if any.
@@ -1055,16 +1220,10 @@ impl DashboardContext {
         self.draw()?;
         let Self {
             selection,
-            active_chat,
             dashboard,
-            view,
             ..
         } = self;
-        let surfaces = match (*view, active_chat.as_ref()) {
-            (View::Chat, Some(chat)) => chat.frame_surfaces(),
-            _ => dashboard.frame_surfaces(),
-        };
-        selection.retrack(surfaces);
+        selection.retrack(dashboard.frame_surfaces());
         Ok(())
     }
 
@@ -1073,16 +1232,10 @@ impl DashboardContext {
     fn route_selection(&mut self, event: Event) -> SelectionRouting {
         let Self {
             selection,
-            active_chat,
             dashboard,
-            view,
             ..
         } = self;
-        let surfaces = match (*view, active_chat.as_ref()) {
-            (View::Chat, Some(chat)) => chat.frame_surfaces(),
-            _ => dashboard.frame_surfaces(),
-        };
-        route_selection_event(selection, surfaces, event)
+        route_selection_event(selection, dashboard.frame_surfaces(), event)
     }
 
     /// Copies the finished selection to the system and terminal clipboards.
@@ -1206,30 +1359,26 @@ impl DashboardContext {
         }
     }
 
-    /// Opens or reveals the chat for `session_id` without waiting on the
-    /// session manager. Attaching can involve worker/relay I/O, so the result
-    /// comes back through the dashboard I/O channel and the current view stays
-    /// responsive while it is in flight.
+    /// Opens the conversation for `session_id` without waiting on the session
+    /// manager. Attaching can involve worker/relay I/O, so the result comes
+    /// back through the dashboard I/O channel and the surface stays responsive
+    /// while it is in flight.
+    ///
+    /// The conversation being replaced is saved first: it holds unsent input
+    /// and a read position that a quit or a crash would otherwise lose.
     pub(crate) fn open_chat_session(&mut self, session_id: &str) {
-        self.open_chat_session_with_focus(session_id, false);
-    }
-
-    fn open_chat_session_with_focus(&mut self, session_id: &str, focus_conversations: bool) {
+        self.dashboard.select_active_session(session_id);
         if self
             .active_chat
             .as_ref()
             .is_some_and(|chat| chat.session_id() == session_id && chat.session_feed_open())
         {
-            if focus_conversations && let Some(chat) = self.active_chat.as_mut() {
-                chat.focus_conversations();
-            }
-            self.view = View::Chat;
+            self.dashboard.set_current_session(Some(session_id));
             self.acknowledge_visible_chat();
             self.dirty = true;
             return;
         }
         if self.opening_chat_session.as_deref() == Some(session_id) {
-            self.opening_chat_focus_conversations |= focus_conversations;
             return;
         }
         if self.opening_chat_session.is_some() {
@@ -1242,33 +1391,19 @@ impl DashboardContext {
             ));
             return;
         };
-        let project_key = self.dashboard.project_source(&session_record).key;
-        let mut active = self
-            .controller
-            .state
-            .sessions
-            .values()
-            .filter(|record| {
-                record.state.is_active() && self.dashboard.project_source(record).key == project_key
-            })
-            .collect::<Vec<_>>();
-        active.sort_by(|left, right| left.compare_by_creation(right));
-        let mut header = hel::hel_chat::SessionHeaderIdentity {
+        if let Some(ordinal) = self
+            .active_chat
+            .as_ref()
+            .filter(|chat| chat.session_id() != session_id)
+            .map(hel::hel_chat::ActiveChat::latest_event_ordinal)
+        {
+            self.record_detach(ordinal);
+        }
+        let header = hel::hel_chat::SessionHeaderIdentity {
             target: session_record
                 .project_target(&self.controller.config, &session_record.target_template_id),
             profile: session_record.last_profile.clone(),
-            ..Default::default()
         };
-        for (position, record) in active.into_iter().enumerate() {
-            if record.id == session_id {
-                header.position = position;
-            } else {
-                header.others.push(hel::hel_chat::OtherSessionIdentity {
-                    session_id: record.id.clone(),
-                    position,
-                });
-            }
-        }
         let sessions = self.worker_commands_tx.clone();
         let notices = self.notices.clone();
         let updates = self.dashboard_io_tx.clone();
@@ -1276,7 +1411,7 @@ impl DashboardContext {
         let bundle_id = session_record.bundle_id.clone();
         let draft = session_record.draft_input.clone();
         self.opening_chat_session = Some(session_id.clone());
-        self.opening_chat_focus_conversations = focus_conversations;
+        self.dashboard.set_current_session(Some(&session_id));
         self.dashboard.set_notice("Opening session…");
         tokio::spawn(async move {
             let result = sessions
@@ -1812,49 +1947,34 @@ impl DashboardContext {
     async fn apply_chat_outcome(&mut self, outcome: hel::hel_chat::ChatEventOutcome) {
         match outcome {
             hel::hel_chat::ChatEventOutcome::None | hel::hel_chat::ChatEventOutcome::Handled => {}
-            hel::hel_chat::ChatEventOutcome::SwitchSession {
-                session_id,
-                last_seen_event_ordinal,
-            } => {
-                // The session being left is saved exactly as `Back` saves it;
-                // only the view it hands over to differs.
-                self.record_detach(last_seen_event_ordinal);
-                // Keep the session list on the conversation now on screen, so
-                // returning to it lands where the user left off.
-                self.dashboard.select_active_session(&session_id);
-                // The view stays on a chat either way: the session that opened,
-                // or the one still here with the notice saying why it did not.
-                //
-                // The user arrived by walking the list, so the pane keeps focus
-                // and the next key walks on from here.
-                self.open_chat_session_with_focus(&session_id, true);
+            hel::hel_chat::ChatEventOutcome::CycleFocus { reverse } => {
+                self.dashboard.cycle_focus(reverse);
+                self.dirty = true;
             }
-            hel::hel_chat::ChatEventOutcome::Back {
-                last_seen_event_ordinal,
-            } => {
-                self.leave_chat(last_seen_event_ordinal);
+            hel::hel_chat::ChatEventOutcome::ToggleSupportPanes => {
+                self.dashboard.toggle_support_panes();
+                self.dirty = true;
+            }
+            hel::hel_chat::ChatEventOutcome::OpenWebDialog => {
+                let action = self.dashboard.open_web_dialog();
+                if let Err(error) = actions::apply_dashboard_action(self, action).await {
+                    self.dashboard
+                        .set_failure_notice(format!("Could not load web access: {error:#}"));
+                }
+                self.dirty = true;
             }
             hel::hel_chat::ChatEventOutcome::QuitDetach {
                 last_seen_event_ordinal,
             } => {
-                let persist = self.leave_chat(last_seen_event_ordinal);
-                // The critical-operation guard keeps the TUI alive until this
-                // durable write finishes, while unrelated reads remain free
-                // to be abandoned.
+                // The warm chat goes on holding this input in memory, so save
+                // it before the process goes away. The critical-operation
+                // guard keeps the TUI alive until the durable write finishes,
+                // while unrelated reads remain free to be abandoned.
+                let persist = self.record_detach(last_seen_event_ordinal);
                 drop(persist);
                 self.request_shutdown();
             }
         }
-    }
-
-    /// Returns to the session list. The chat stays warm behind it, so its feeds
-    /// keep following the worker and reopening it costs a draw.
-    fn leave_chat(&mut self, last_seen_event_ordinal: u64) -> Option<tokio::task::JoinHandle<()>> {
-        self.view = View::Dashboard;
-        self.dirty = true;
-        // The warm chat goes on holding this input in memory, so save it here:
-        // a quit or a crash while it is off screen would otherwise lose it.
-        self.record_detach(last_seen_event_ordinal)
     }
 
     /// Persists how far the warm chat has been read and the draft it holds.
@@ -1997,20 +2117,39 @@ fn record_chat_detach_state(
     ))
 }
 
-/// Hands one event to the view on screen and reports whether the loop may keep
-/// batching, which it may while the event asked for no work.
-fn dispatch_to_view(
+/// Hands one event to the part of the surface it belongs to, and reports
+/// whether the loop may keep batching, which it may while the event asked for
+/// no work.
+///
+/// A mouse event goes where the pointer is, not where the keyboard is: the
+/// wheel over the transcript scrolls the transcript even while a pane has
+/// focus, and a click there hands the keyboard back to the composer. Keys go
+/// to the modal if one is open, then to the composer if it has focus, and
+/// otherwise to the panes.
+fn dispatch_event(
     context: &mut DashboardContext,
     event: Event,
     action: &mut DashboardAction,
     chat_outcome: &mut hel::hel_chat::ChatEventOutcome,
 ) -> bool {
-    match (context.view, context.active_chat.as_mut()) {
-        (View::Chat, Some(chat)) => {
+    let to_chat = match &event {
+        Event::Mouse(mouse) if !context.dashboard.modal_open() => {
+            let over_chat = context
+                .dashboard
+                .chat_region_contains(mouse.column, mouse.row);
+            if over_chat && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                context.dashboard.focus_prompt();
+            }
+            over_chat
+        }
+        _ => !context.dashboard.modal_open() && context.dashboard.prompt_has_focus(),
+    };
+    match context.active_chat.as_mut().filter(|_| to_chat) {
+        Some(chat) => {
             *chat_outcome = chat.handle_event(event);
             matches!(*chat_outcome, hel::hel_chat::ChatEventOutcome::None)
         }
-        _ => {
+        None => {
             *action = dashboard_event_action(&mut context.dashboard, event);
             context.controller_changed = true;
             matches!(*action, DashboardAction::None)
@@ -2138,18 +2277,17 @@ fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> Dashb
     }
 }
 
+/// Workspaces answers from every surface, including a modal, so it is caught
+/// before the surface sees the key.
+///
+/// It moved off Ctrl-W and onto F2 because Ctrl-W is the composer's
+/// kill-previous-word, and with the composer always on screen the accelerator
+/// could no longer be spent on a global.
 fn workspace_picker_event(event: &Event) -> bool {
     let Event::Key(key) = event else {
         return false;
     };
-    let accelerator = if cfg!(target_os = "macos") {
-        KeyModifiers::SUPER
-    } else {
-        KeyModifiers::CONTROL
-    };
-    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        && key.modifiers.contains(accelerator)
-        && key.code == KeyCode::Char('w')
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) && key.code == KeyCode::F(2)
 }
 
 pub(crate) fn resume_progress_notice(
@@ -2290,8 +2428,9 @@ mod tests {
         ));
     }
 
-    /// Draws the dashboard exactly as the loop does, so the highlight and the
-    /// extraction see the frame the view just produced.
+    /// Draws the combined surface exactly as the loop does, so the highlight
+    /// and the extraction see the frame it just produced. No conversation is
+    /// attached, which stands for a workspace whose sessions are all stopped.
     fn draw_with_selection(
         terminal: &mut Terminal<TestBackend>,
         dashboard: &mut DashboardState,
@@ -2300,10 +2439,10 @@ mod tests {
         let mut text = None;
         terminal
             .draw(|frame| {
-                render(frame, dashboard);
+                render_combined(frame, dashboard, None, false);
                 text = draw_selection(frame, selection, dashboard.frame_surfaces());
             })
-            .expect("draw dashboard");
+            .expect("draw the combined surface");
         text
     }
 
@@ -2570,16 +2709,192 @@ mod tests {
             dashboard_event_action(&mut dashboard, Event::Resize(80, 24)),
             DashboardAction::None
         ));
+        // Escape no longer quits the combined surface, so a key that does
+        // ask for work stands in for it here.
         assert!(matches!(
             dashboard_event_action(
                 &mut dashboard,
                 Event::Key(crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyCode::F(2),
                     crossterm::event::KeyModifiers::NONE,
                 )),
             ),
-            DashboardAction::QuitDetach
+            DashboardAction::OpenWorkspacePicker
         ));
+    }
+
+    fn live_session(id: &str, created_at: &str) -> hel::hel_state::SessionRecord {
+        hel::hel_state::SessionRecord {
+            workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
+            archived: false,
+            container_cpus: None,
+            container_memory: None,
+            id: id.into(),
+            title: id.into(),
+            harness_kind: hel::hel_config::HarnessKind::Codex,
+            last_profile: "codex-1".into(),
+            bundle_id: "hel".into(),
+            project_directory: None,
+            managed_worktree: None,
+            target_template_id: "podman".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: SessionState::Running,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: created_at.into(),
+            updated_at: created_at.into(),
+            viewed_through_event_ordinal: 0,
+            draft_input: String::new(),
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        }
+    }
+
+    /// The conversation worth opening on is the one whose agent spoke most
+    /// recently, which is what the stored summaries record.
+    #[test]
+    fn startup_opens_the_session_with_the_newest_materialized_activity() {
+        let sessions = [
+            live_session("session-a", "2026-08-01T00:00:00Z"),
+            live_session("session-b", "2026-08-02T00:00:00Z"),
+            live_session("session-c", "2026-08-03T00:00:00Z"),
+        ];
+        let activity = |id: &str| match id {
+            "session-a" => Some(10),
+            "session-b" => Some(300),
+            "session-c" => Some(200),
+            _ => None,
+        };
+
+        assert_eq!(
+            startup_session_choice(sessions.iter(), activity),
+            Some("session-b".into())
+        );
+    }
+
+    /// With no activity recorded — nothing stored yet, or every read failed —
+    /// every session ranks equal on the first key, so the newest one wins.
+    #[test]
+    fn startup_falls_back_to_the_newest_creation_then_the_larger_id() {
+        let sessions = [
+            live_session("session-a", "2026-08-01T00:00:00Z"),
+            live_session("session-b", "2026-08-03T00:00:00Z"),
+            live_session("session-c", "2026-08-02T00:00:00Z"),
+        ];
+        assert_eq!(
+            startup_session_choice(sessions.iter(), |_| None),
+            Some("session-b".into())
+        );
+
+        // A tie on creation time too still resolves the same way on every
+        // run, rather than following the iteration order.
+        let tied = [
+            live_session("session-a", "2026-08-01T00:00:00Z"),
+            live_session("session-z", "2026-08-01T00:00:00Z"),
+        ];
+        assert_eq!(
+            startup_session_choice(tied.iter(), |_| None),
+            Some("session-z".into())
+        );
+        assert_eq!(
+            startup_session_choice(tied.iter().rev(), |_| None),
+            Some("session-z".into())
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_no_live_session_has_nothing_to_open() {
+        assert_eq!(
+            startup_session_choice(std::iter::empty(), |_| Some(1)),
+            None
+        );
+    }
+
+    /// The pick waits for the summaries it compares, but not for ever, and it
+    /// only ever fires once.
+    #[test]
+    fn the_startup_pick_waits_for_its_summaries_then_gives_up() {
+        let start = std::time::Instant::now();
+        let mut startup =
+            StartupSession::begin(["session-a".to_owned(), "session-b".to_owned()], start);
+
+        assert!(!startup.ready(start), "both summaries are still pending");
+        startup.summary_arrived("session-a");
+        assert!(!startup.ready(start), "one summary is still pending");
+        startup.summary_arrived("session-b");
+        assert!(startup.ready(start));
+        assert!(!startup.ready(start), "the choice is made only once");
+
+        // A summary that never comes back stops holding the surface up.
+        let mut stalled = StartupSession::begin(["session-a".to_owned()], start);
+        assert!(!stalled.ready(start));
+        assert!(stalled.ready(start + STARTUP_SESSION_WAIT));
+    }
+
+    /// The session manager adopts sessions asynchronously after the surface
+    /// starts, so the startup pick's first attach usually lands too early.
+    /// It has to ride that out rather than give up on the first refusal.
+    #[test]
+    fn the_startup_pick_retries_an_attach_the_manager_was_not_ready_for() {
+        let start = std::time::Instant::now();
+        let mut startup = StartupSession::begin(["session-a".to_owned()], start);
+        startup.summary_arrived("session-a");
+        assert!(startup.ready(start));
+        startup.attempting("session-a");
+
+        // The refusal is not worth reporting, and the pick re-arms.
+        assert!(startup.attach_failed("session-a", start));
+        assert!(startup.ready(start));
+
+        // A failure for some other session is not this pick's business.
+        startup.attempting("session-a");
+        assert!(!startup.attach_failed("session-b", start));
+
+        // Past the window it stops retrying and the failure is reported.
+        assert!(!startup.attach_failed("session-a", start + STARTUP_SESSION_ATTACH_WINDOW));
+        assert!(!startup.ready(start + STARTUP_SESSION_ATTACH_WINDOW));
+    }
+
+    /// A user who acts during the retries takes the choice back, and the
+    /// retries stop rather than yanking a conversation open underneath them.
+    #[test]
+    fn cancelling_stops_the_startup_attach_retries() {
+        let start = std::time::Instant::now();
+        let mut startup = StartupSession::begin(["session-a".to_owned()], start);
+        startup.summary_arrived("session-a");
+        assert!(startup.ready(start));
+        startup.attempting("session-a");
+
+        startup.cancel();
+        assert!(!startup.attach_failed("session-a", start));
+        assert!(!startup.ready(start));
+    }
+
+    /// The user acting is the strongest signal there is about which
+    /// conversation they want, so it takes the choice away.
+    #[test]
+    fn a_user_who_acts_first_keeps_the_choice() {
+        let start = std::time::Instant::now();
+        let mut startup = StartupSession::begin(["session-a".to_owned()], start);
+
+        startup.cancel();
+        startup.summary_arrived("session-a");
+        assert!(!startup.ready(start));
+        assert!(!startup.ready(start + STARTUP_SESSION_WAIT * 10));
+    }
+
+    /// An empty workspace has nothing to wait for, so the surface never holds
+    /// the keyboard back from the Sessions pane.
+    #[test]
+    fn a_workspace_with_no_live_session_never_arms_the_startup_pick() {
+        let start = std::time::Instant::now();
+        let mut startup = StartupSession::begin(std::iter::empty(), start);
+        assert!(!startup.ready(start));
+        assert!(!startup.ready(start + STARTUP_SESSION_WAIT));
     }
 
     #[test]

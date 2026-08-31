@@ -268,11 +268,7 @@ fn matching_indices<T>(
 pub(super) fn builtin_command_choices() -> Vec<CommandChoice> {
     [
         ("help", "show available Hel and agent commands", None),
-        (
-            "detach",
-            "return to the dashboard without stopping the worker",
-            None,
-        ),
+        ("detach", "leave Hel without stopping the worker", None),
         (
             "model",
             "change the active model, queued while the agent is busy",
@@ -431,6 +427,56 @@ mod tests {
         assert!(prompt_invokes_command("/goal finish it", "goal"));
         assert!(!prompt_invokes_command("/Goal finish it", "goal"));
         assert!(!prompt_invokes_command("/goalkeeper", "goal"));
+    }
+
+    /// Tab has two jobs now: finish a completion, and hand the keyboard to
+    /// the next pane. An open popup wins, so a Tab meant for the completion
+    /// can never move focus out from under it.
+    #[test]
+    fn tab_accepts_an_open_completion_before_it_cycles_focus() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.handle_key(key(KeyCode::Char('/')));
+        chat.handle_key(key(KeyCode::Char('h')));
+        assert!(chat.autocomplete.is_some(), "the popup is open");
+
+        assert_eq!(chat.handle_key(key(KeyCode::Tab)), ChatAction::None);
+        assert!(chat.autocomplete.is_none(), "the popup was accepted");
+        assert_eq!(chat.input, "/help ");
+
+        // With nothing to complete, the same key is the handle on the next
+        // pane.
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Tab)),
+            ChatAction::CycleFocus { reverse: false }
+        );
+        assert_eq!(
+            chat.handle_key(key(KeyCode::BackTab)),
+            ChatAction::CycleFocus { reverse: true }
+        );
+    }
+
+    /// The composer's word-kill and cursor keys used to be eaten before it
+    /// saw them: Ctrl-W by the workspace picker, Ctrl-B by the web dialog.
+    /// Both accelerators are the composer's again.
+    #[test]
+    fn the_composer_keeps_control_w_and_control_b() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        for character in "one two".chars() {
+            chat.handle_key(key(KeyCode::Char(character)));
+        }
+
+        let control =
+            |character: char| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+        assert_eq!(chat.handle_key(control('w')), ChatAction::None);
+        assert_eq!(chat.input, "one ", "Ctrl-W kills the previous word");
+
+        assert_eq!(chat.handle_key(control('b')), ChatAction::None);
+        assert_eq!(
+            chat.input_cursor, 3,
+            "Ctrl-B steps the cursor back one character"
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ use hel::hel_session_manager::{
 };
 use hel::hel_state::{
     HelState, ManagedSessionSnapshot, MaterializedSession, SessionRecord,
-    SessionResourceAllocation, SessionState, normalize_session_title,
+    SessionResourceAllocation, SessionState,
 };
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
@@ -1235,6 +1235,9 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         let mut revision = 0_u64;
         let mut requests_open = true;
         let mut projection_convergence = ProjectionConvergence::default();
+        // One session's requests reach the daemon in the order they were made;
+        // different sessions still overlap.
+        let mut request_order = hel::hel_session_manager::SessionRequestOrder::new();
         loop {
             tokio::select! {
                 request = requests.recv(), if requests_open => {
@@ -1242,7 +1245,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                         requests_open = false;
                         continue;
                     };
-                    tokio::spawn(forward_remote_session_request(request));
+                    request_order.dispatch(request, forward_remote_session_request);
                 }
                 snapshot = poll_daemon_runtime(workspace_id.clone(), revision) => {
                     match snapshot {
@@ -1536,11 +1539,7 @@ pub(crate) fn apply_worker_record_update(
     let Some(session) = controller.state.sessions.get(&update.session_id) else {
         return Ok(false);
     };
-    let projected_title = snapshot
-        .materialized
-        .session_title
-        .as_deref()
-        .and_then(normalize_session_title);
+    let projected_title = snapshot.materialized.resolved_title();
     let changed_title =
         (session.acp_session_title != projected_title).then(|| projected_title.clone());
     let mut changed = false;
