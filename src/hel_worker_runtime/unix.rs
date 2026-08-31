@@ -1849,6 +1849,8 @@ pub(super) fn configure_github_cli(
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    const ORIGINAL_BASH_ENV: &str = "HEL_ORIGINAL_BASH_ENV";
+
     let bin = root.join("bin");
     if std::fs::symlink_metadata(&bin).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         bail!(
@@ -1894,23 +1896,65 @@ exec gh "$@"
     crate::hel_config::atomic_write_existing(&wrapper, WRAPPER.as_bytes())?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
 
+    // Harnesses can start `bash -lc`, whose login profile may replace PATH
+    // after the ACP bridge inherited it. BASH_ENV is read after that profile.
+    let shell_environment = root.join("github-shell-env");
+    if std::fs::symlink_metadata(&shell_environment)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        bail!(
+            "GitHub CLI shell environment {} is a symbolic link",
+            shell_environment.display()
+        );
+    }
+    const SHELL_ENVIRONMENT: &str = r#"if [ -n "${HEL_ORIGINAL_BASH_ENV:-}" ] && [ "${HEL_ORIGINAL_BASH_ENV}" != "${BASH_ENV:-}" ] && [ -r "${HEL_ORIGINAL_BASH_ENV}" ]; then
+    . "${HEL_ORIGINAL_BASH_ENV}"
+fi
+if [ -n "${HEL_GITHUB_CLI_BIN:-}" ]; then
+    case ":${PATH:-}:" in
+        *:"${HEL_GITHUB_CLI_BIN}":*) ;;
+        *) PATH="${HEL_GITHUB_CLI_BIN}${PATH:+:${PATH}}"; export PATH ;;
+    esac
+fi
+"#;
+    crate::hel_config::atomic_write_existing(&shell_environment, SHELL_ENVIRONMENT.as_bytes())?;
+    std::fs::set_permissions(&shell_environment, std::fs::Permissions::from_mode(0o600))?;
+
     let inherited_path = environment
         .get("PATH")
         .cloned()
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
+    let bin_text = bin.to_string_lossy().into_owned();
     environment.insert(
         "PATH".into(),
-        if inherited_path.is_empty() {
-            bin.to_string_lossy().into_owned()
+        if std::env::split_paths(std::ffi::OsStr::new(&inherited_path))
+            .any(|entry| entry.as_path() == bin.as_path())
+        {
+            inherited_path
+        } else if inherited_path.is_empty() {
+            bin_text.clone()
         } else {
-            format!("{}:{inherited_path}", bin.to_string_lossy())
+            format!("{bin_text}:{inherited_path}")
         },
     );
-    environment.insert(
-        super::GITHUB_CLI_BIN_ENV.into(),
-        bin.to_string_lossy().into_owned(),
-    );
+    environment.insert(super::GITHUB_CLI_BIN_ENV.into(), bin_text);
+    let shell_environment_text = shell_environment.to_string_lossy().into_owned();
+    let original_bash_env = environment
+        .get("BASH_ENV")
+        .filter(|configured| configured.as_str() != shell_environment_text)
+        .cloned()
+        .or_else(|| environment.get(ORIGINAL_BASH_ENV).cloned());
+    match original_bash_env {
+        Some(original) => {
+            environment.insert(ORIGINAL_BASH_ENV.into(), original);
+        }
+        None => {
+            environment.remove(ORIGINAL_BASH_ENV);
+        }
+    }
+    environment.insert("BASH_ENV".into(), shell_environment_text);
+    configure_github_git_helpers(environment, &wrapper)?;
 
     let inherited_token = std::env::var("GH_TOKEN")
         .ok()
@@ -1920,6 +1964,62 @@ exec gh "$@"
     {
         crate::hel_credentials::write_github_token(&root.join("github-token"), token.as_bytes())?;
     }
+    Ok(())
+}
+
+fn configure_github_git_helpers(
+    environment: &mut BTreeMap<String, String>,
+    wrapper: &std::path::Path,
+) -> Result<()> {
+    // Environment config stays scoped to the harness process tree. The empty
+    // value clears image/user helpers before the absolute Hel helper is added.
+    let helper = format!(
+        "!{} auth git-credential",
+        crate::hel_targets::posix_quote(&wrapper.to_string_lossy())
+    );
+    for host in ["github.com", "gist.github.com"] {
+        let key = format!("credential.https://{host}.helper");
+        append_git_config(environment, &key, "")?;
+        append_git_config(environment, &key, &helper)?;
+    }
+    Ok(())
+}
+
+fn append_git_config(
+    environment: &mut BTreeMap<String, String>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let count = environment
+        .get("GIT_CONFIG_COUNT")
+        .map(|count| {
+            count
+                .parse::<usize>()
+                .with_context(|| format!("invalid GIT_CONFIG_COUNT {count:?}"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if (0..count).any(|index| {
+        environment
+            .get(&format!("GIT_CONFIG_KEY_{index}"))
+            .map(String::as_str)
+            == Some(key)
+            && environment
+                .get(&format!("GIT_CONFIG_VALUE_{index}"))
+                .map(String::as_str)
+                == Some(value)
+    }) {
+        return Ok(());
+    }
+    environment.insert(format!("GIT_CONFIG_KEY_{count}"), key.to_owned());
+    environment.insert(format!("GIT_CONFIG_VALUE_{count}"), value.to_owned());
+    environment.insert(
+        "GIT_CONFIG_COUNT".into(),
+        count
+            .checked_add(1)
+            .context("too many inherited Git configuration entries")?
+            .to_string(),
+    );
     Ok(())
 }
 
