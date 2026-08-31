@@ -17,7 +17,7 @@ The user-visible payoff: you can read an agent's output, see what your other age
 ## Progress
 
 - [x] (2026-08-31) Researched the current split: `crates/hel-tui/src/lib.rs` (dashboard reducer), `crates/hel-tui/src/render.rs` (dashboard rendering), `src/hel_chat.rs` and `src/hel_chat/active.rs` (chat state and rendering), `crates/hel-cli/src/dashboard.rs` (the one event loop and the `View` switch). Wrote this ExecPlan.
-- [ ] Milestone 1 — Area-scoped chat rendering (`ChatRegions`, `ActiveChat::draw_in`, `FrameSurfaces` merge helpers).
+- [x] (2026-08-31) Milestone 1 — Area-scoped chat rendering. `FrameSurfaces::append`/`replace_with` in `src/hel_selection.rs`; `ChatRegions` and `ChatState::frame_surfaces_exclusive` in `src/hel_chat.rs`; `render_in`, `render_chat_footer`, `ActiveChat::draw_in` and `ActiveChat::desired_prompt_height` in `src/hel_chat/active.rs`. The whole-frame `render` is now a thin caller of `render_in`, so the old two-screen behaviour is unchanged.
 - [ ] Milestone 2 — Combined focus model, minimize state, and the rationalized keymap reducer.
 - [ ] Milestone 3 — Sessions pane projection and rendering.
 - [ ] Milestone 4 — The combined renderer and its height allocation.
@@ -28,6 +28,9 @@ The user-visible payoff: you can read an agent's output, see what your other age
 
 - Observation: `Ctrl-W` is intercepted globally by the controller before any view sees it, so the chat composer's `Ctrl-W` (kill previous word) has never worked in Hel.
   Evidence: `crates/hel-cli/src/dashboard.rs`, function `workspace_picker_event`, called first inside the event batch loop in `run_dashboard_for_workspace`; `src/hel_chat.rs` `handle_key` has a `KeyCode::Char('w')` arm under `KeyModifiers::CONTROL` that is unreachable. Moving Workspaces to `F2` fixes this as a side effect.
+
+- Observation: the chat's transcript block draws its title over the region's first row without a left corner glyph, so a render test must look for the title text rather than a box-drawing character; and the composer's border is the doubled variant whenever it has focus.
+  Evidence: `draw_in_places_the_transcript_and_prompt_in_the_given_regions` first failed with `transcript border: " Conversation \u{2500}\u{2500}..."` and then with `the prompt's bottom border closes the region: "\u{255a}\u{2550}..."`.
 
 - Observation: the PTY termination test and two end-to-end Python labs key off the literal pane title `Active` and off `Escape` as the quit key, so renaming the pane and making `Escape` non-quitting breaks them.
   Evidence: `crates/hel-cli/tests/termination_pty.rs` line 16 `const READY_MARKER: &[u8] = b"Active";` and line 367 `master.write_all(b"\x1b")`; `tests/e2e/browser_lab.py` line 30 and `tests/e2e/test_hook_chaos.py` lines 67, 71 and 188 all wait for `"Active"`.

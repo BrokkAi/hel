@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
@@ -44,7 +44,7 @@ use super::transcript::{
     render_transcript,
 };
 use super::{
-    ChatAction, ChatEventOutcome, ChatFocus, ChatState, MOUSE_SCROLL_ROWS, Notices,
+    ChatAction, ChatEventOutcome, ChatFocus, ChatRegions, ChatState, MOUSE_SCROLL_ROWS, Notices,
     OtherSessionActivity, OtherSessionIdentity, SessionHeaderIdentity, last_nonempty_line,
     queued_prompt_preview, turn_band_color, turn_started_at_epoch_seconds,
 };
@@ -1965,6 +1965,46 @@ impl ActiveChat {
         render(frame, &mut self.state, transcript_selected);
     }
 
+    /// Rows the composer wants at `width`: the wrapped input, up to three
+    /// queued-prompt previews, and the block's own border rows.
+    pub fn desired_prompt_height(&self, width: u16) -> u16 {
+        let content_width = usize::from(width.saturating_sub(2)).max(1);
+        let input_rows =
+            u16::try_from(input_visual_rows(&self.state.input, content_width)).unwrap_or(u16::MAX);
+        let queued = u16::try_from(self.state.queued_prompts.len().min(3)).unwrap_or(3);
+        input_rows.saturating_add(queued).saturating_add(2).max(4)
+    }
+
+    /// Draws the transcript and the composer into `regions`, for a host that
+    /// owns the rest of the frame.
+    ///
+    /// `prompt_focused` says whether the composer owns the keyboard; only then
+    /// does it draw a cursor and a double border. `transcript_selected` says
+    /// the selection engine still owns a selection on the transcript, so its
+    /// row space has to stay frozen for this frame.
+    pub fn draw_in(
+        &mut self,
+        frame: &mut Frame,
+        regions: ChatRegions,
+        prompt_focused: bool,
+        transcript_selected: bool,
+    ) {
+        self.state.recovery_phase = self.recovery_phase();
+        render_in(
+            frame,
+            &mut self.state,
+            regions,
+            prompt_focused,
+            transcript_selected,
+        );
+    }
+
+    /// Whether the last frame's surfaces stand alone, because a modal owned
+    /// the frame.
+    pub fn frame_surfaces_exclusive(&self) -> bool {
+        self.state.frame_surfaces_exclusive()
+    }
+
     /// The transcript text a finished selection covers.
     pub fn transcript_selection_text(&mut self, range: &SelectionRange) -> Option<String> {
         self.state.transcript_selection_text(range)
@@ -2080,11 +2120,7 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
     } else {
         BorderType::Plain
     };
-    let prompt_border = if chat.focus == ChatFocus::Prompt {
-        BorderType::Double
-    } else {
-        BorderType::Plain
-    };
+    let prompt_focused = chat.focus == ChatFocus::Prompt;
     let conversations_block = Block::default()
         .borders(Borders::ALL)
         .border_type(conversations_border)
@@ -2093,10 +2129,6 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
     // Consumers (mouse hover/click/scroll) map a screen row against this
     // rect, so it must be the pane's inner area, not the bordered outline.
     chat.conversations_area = Some(conversations_inner);
-    chat.frame_surfaces.push(SurfaceFrame::fixed(
-        SurfaceId::Conversations,
-        conversations_inner,
-    ));
     frame.render_widget(conversations_block, conversations_area);
     frame.render_widget(Paragraph::new(pane.lines), conversations_inner);
     if chat.focus == ChatFocus::Conversations
@@ -2114,9 +2146,57 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
             buffer[(x, y)].set_bg(Color::DarkGray);
         }
     }
-    // While the split is up the primary keeps the left half and the reviewer
-    // takes the right. Each pane registers its own selection surface and keeps
-    // its own scroll, so neither moves the reader's place in the other.
+    render_in(
+        frame,
+        chat,
+        ChatRegions {
+            transcript: transcript_area,
+            prompt: prompt_area,
+            footer: Some(footer_area),
+            overlay: inner,
+        },
+        prompt_focused,
+        transcript_selected,
+    );
+    // `render_in` owns the registry for the frame, so the pane drawn before it
+    // registers afterwards. A modal that claimed the frame keeps it: nothing
+    // behind an open dialog stays selectable.
+    if !chat.frame_surfaces_exclusive {
+        chat.frame_surfaces.push(SurfaceFrame::fixed(
+            SurfaceId::Conversations,
+            conversations_inner,
+        ));
+    }
+}
+
+/// Draws the transcript and the composer into `regions`.
+///
+/// `prompt_focused` says whether the composer owns the keyboard; only then
+/// does it draw a cursor and a double border. `transcript_selected` says the
+/// selection engine still owns a selection on the transcript, so its row
+/// space has to stay frozen for this frame.
+pub(super) fn render_in(
+    frame: &mut Frame,
+    chat: &mut ChatState,
+    regions: ChatRegions,
+    prompt_focused: bool,
+    transcript_selected: bool,
+) {
+    chat.frame_surfaces.clear();
+    chat.frame_surfaces_exclusive = false;
+    // Modals and the completion popup are centred in the whole frame, not
+    // in the band the transcript happens to have been given.
+    let inner = regions.overlay;
+    let transcript_area = regions.transcript;
+    let prompt_area = regions.prompt;
+    let prompt_width = usize::from(prompt_area.width.saturating_sub(2)).max(1);
+    // Focus shows as a double border on whichever pane owns the keyboard, so
+    // the split stays obvious without the eye following a moving band.
+    let prompt_border = if prompt_focused {
+        BorderType::Double
+    } else {
+        BorderType::Plain
+    };
     let split = chat.second_opinion_split();
     let (primary_area, reviewer_area) = if split {
         let halves = Layout::default()
@@ -2212,7 +2292,7 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
             .push(SurfaceFrame::fixed(SurfaceId::PromptInput, prompt_inner));
         // The cursor belongs to whatever has focus, so the composer only shows one
         // while the keyboard is driving it.
-        if chat.history_search.is_none() && chat.focus == ChatFocus::Prompt {
+        if chat.history_search.is_none() && prompt_focused {
             set_input_cursor(
                 frame,
                 prompt_inner,
@@ -2223,7 +2303,44 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
             );
         }
     }
-    let default_footer = if chat.focus == ChatFocus::Conversations {
+    if let Some(footer_area) = regions.footer {
+        render_chat_footer(frame, footer_area, chat, prompt_focused);
+    }
+    // The popup overlays the prompt and whatever sits above it, so it
+    // registers last and wins the cells it covers.
+    if let Some(popup) = render_autocomplete(frame, prompt_area, chat) {
+        chat.frame_surfaces
+            .push(SurfaceFrame::fixed(SurfaceId::AutocompletePopup, popup));
+    }
+    if let Some(SecondOpinion::Setup { captured, setup }) = chat.second_opinion() {
+        // The waterfall owns the frame's interaction, so the chat behind it
+        // stops being selectable while a reviewer is being chosen.
+        let area = centered(inner, 60, 16);
+        let body = render_setup(frame, area, captured, setup);
+        chat.frame_surfaces.clear();
+        chat.frame_surfaces
+            .push(SurfaceFrame::fixed(SurfaceId::ModalBody, body));
+        return;
+    }
+    if let Some(dialog) = chat.elicitation.as_ref() {
+        // The dialog owns the frame's interaction while it is up, so the chat
+        // behind it stops being selectable and the dialog registers its own
+        // surfaces in its place.
+        chat.frame_surfaces.clear();
+        render_elicitation(frame, dialog, &mut chat.frame_surfaces);
+    }
+}
+
+/// Draws the one-row footer under the conversation: the reverse-i-search
+/// prompt when one is open, else the shared notice, else the hotkey hints
+/// for the composer.
+pub(super) fn render_chat_footer(
+    frame: &mut Frame,
+    footer_area: Rect,
+    chat: &ChatState,
+    prompt_focused: bool,
+) {
+    let default_footer = if !prompt_focused {
         "Ctrl-G dashboard · j/k or ↑/↓ switch conversation · PgUp/PgDn transcript · Enter/Tab prompt"
     } else if chat.voice_active {
         "Ctrl-G dashboard · Listening… Alt-V stop · PgUp/PgDn transcript"
@@ -2258,29 +2375,6 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
             footer_area.x + column.min(usize::from(footer_area.width.saturating_sub(1))) as u16,
             footer_area.y,
         ));
-    }
-    // The popup overlays the prompt and whatever sits above it, so it
-    // registers last and wins the cells it covers.
-    if let Some(popup) = render_autocomplete(frame, prompt_area, chat) {
-        chat.frame_surfaces
-            .push(SurfaceFrame::fixed(SurfaceId::AutocompletePopup, popup));
-    }
-    if let Some(SecondOpinion::Setup { captured, setup }) = chat.second_opinion() {
-        // The waterfall owns the frame's interaction, so the chat behind it
-        // stops being selectable while a reviewer is being chosen.
-        let area = centered(inner, 60, 16);
-        let body = render_setup(frame, area, captured, setup);
-        chat.frame_surfaces.clear();
-        chat.frame_surfaces
-            .push(SurfaceFrame::fixed(SurfaceId::ModalBody, body));
-        return;
-    }
-    if let Some(dialog) = chat.elicitation.as_ref() {
-        // The dialog owns the frame's interaction while it is up, so the chat
-        // behind it stops being selectable and the dialog registers its own
-        // surfaces in its place.
-        chat.frame_surfaces.clear();
-        render_elicitation(frame, dialog, &mut chat.frame_surfaces);
     }
 }
 
@@ -3386,6 +3480,94 @@ mod tests {
 
         assert!(chat.conversations_window_start.is_none());
         assert_eq!(window_projects(&chat, 7)[0], "project-2");
+    }
+
+    /// A host that owns the rest of the frame gives the chat two rectangles;
+    /// nothing it draws may leak outside them.
+    #[test]
+    fn draw_in_places_the_transcript_and_prompt_in_the_given_regions() {
+        let mut chat = windowed_chat(1, 0);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        let regions = ChatRegions {
+            transcript: Rect::new(0, 4, 80, 12),
+            prompt: Rect::new(0, 16, 80, 5),
+            footer: None,
+            overlay: Rect::new(0, 0, 80, 24),
+        };
+
+        terminal
+            .draw(|frame| render_in(frame, &mut chat, regions, true, false))
+            .expect("draw chat");
+
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        for y in 0..4 {
+            assert_eq!(
+                row(y).trim(),
+                "",
+                "row {y} sits above the transcript region and must stay untouched"
+            );
+        }
+        assert!(
+            row(4).contains("Conversation"),
+            "the transcript's titled border is the region's first row: {:?}",
+            row(4)
+        );
+        assert!(
+            row(16).contains("Prompt"),
+            "the prompt's titled border is at the region's top: {:?}",
+            row(16)
+        );
+        // The composer has focus here, so its border is the doubled variant.
+        assert!(
+            row(20).starts_with('\u{255a}'),
+            "the prompt's bottom border closes the region: {:?}",
+            row(20)
+        );
+        for y in 21..24 {
+            assert_eq!(
+                row(y).trim(),
+                "",
+                "row {y} sits below the prompt region and must stay untouched"
+            );
+        }
+    }
+
+    /// The cursor belongs to whatever owns the keyboard, and the host decides
+    /// that, so the composer only shows one when it is told it has focus.
+    #[test]
+    fn draw_in_draws_a_cursor_only_when_the_prompt_has_focus() {
+        use ratatui::backend::Backend as _;
+
+        let mut chat = windowed_chat(1, 0);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        let regions = ChatRegions {
+            transcript: Rect::new(0, 0, 80, 16),
+            prompt: Rect::new(0, 16, 80, 6),
+            footer: Some(Rect::new(0, 22, 80, 1)),
+            overlay: Rect::new(0, 0, 80, 24),
+        };
+
+        terminal
+            .draw(|frame| render_in(frame, &mut chat, regions, false, false))
+            .expect("draw chat");
+        terminal.backend_mut().assert_cursor_position((0, 0));
+
+        terminal
+            .draw(|frame| render_in(frame, &mut chat, regions, true, false))
+            .expect("draw chat");
+        let cursor = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor position");
+        assert!(
+            cursor.y > 16 && cursor.y < 21,
+            "the cursor sits inside the prompt region: {cursor:?}"
+        );
     }
 
     #[test]

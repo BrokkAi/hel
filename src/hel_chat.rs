@@ -80,6 +80,21 @@ pub use transcript::{
     render_agent_message_head, render_agent_message_tail,
 };
 
+/// Where a host surface has told the chat to draw itself.
+///
+/// `transcript` and `prompt` are the *outer* rectangles including each block's
+/// border. `footer` is `Some` only when the host wants the chat to own the
+/// footer row, which it does while the composer has focus. `overlay` is the
+/// whole frame: modals and the autocomplete popup are centred and clamped
+/// inside it rather than inside the bands above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatRegions {
+    pub transcript: Rect,
+    pub prompt: Rect,
+    pub footer: Option<Rect>,
+    pub overlay: Rect,
+}
+
 /// What one terminal event asked the chat to do.
 ///
 /// `None` means the event only changed local state, which lets the caller keep
@@ -365,6 +380,10 @@ pub struct ChatState {
     /// Selectable surfaces, rebuilt by every frame in render order so the
     /// selection engine can hit-test the screen the user is looking at.
     pub(super) frame_surfaces: FrameSurfaces,
+    /// The last frame's surfaces replace everything behind them, because a
+    /// modal owned the frame. A host that composes the chat with its own
+    /// panes reads this to decide whether to merge or replace.
+    pub(super) frame_surfaces_exclusive: bool,
     /// The row space transcript selections are measured in, re-pinned by every
     /// frame the engine is not holding a transcript selection through.
     transcript_selection: Option<TranscriptSelectionSpace>,
@@ -443,6 +462,7 @@ impl ChatState {
             conversations_window_start: None,
             conversations_area: None,
             frame_surfaces: FrameSurfaces::new(),
+            frame_surfaces_exclusive: false,
             transcript_selection: None,
             transcript_selection_invalid: false,
             render_cache_generation: 0,
@@ -1702,6 +1722,12 @@ impl ChatState {
     /// The surfaces the last frame registered, for the selection engine.
     pub fn frame_surfaces(&self) -> &FrameSurfaces {
         &self.frame_surfaces
+    }
+
+    /// Whether the last frame's surfaces stand alone, because a modal owned
+    /// the frame.
+    pub fn frame_surfaces_exclusive(&self) -> bool {
+        self.frame_surfaces_exclusive
     }
 
     /// Scrolls the elicitation message pane, for a drag held at its edge.

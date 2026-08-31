@@ -134,6 +134,24 @@ impl FrameSurfaces {
         self.surfaces.push(surface);
     }
 
+    /// Appends every surface `other` registered, preserving render order.
+    ///
+    /// One frame can be drawn by more than one renderer; this is how the
+    /// second renderer's hitboxes join the first's without either owning the
+    /// other's registry.
+    pub fn append(&mut self, other: &FrameSurfaces) {
+        self.surfaces.extend_from_slice(&other.surfaces);
+    }
+
+    /// Replaces every registration with `other`'s.
+    ///
+    /// A modal owns the frame's interaction, so everything behind it stops
+    /// being selectable rather than staying reachable underneath.
+    pub fn replace_with(&mut self, other: &FrameSurfaces) {
+        self.surfaces.clear();
+        self.surfaces.extend_from_slice(&other.surfaces);
+    }
+
     /// Returns true when no surface is registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
