@@ -27,7 +27,7 @@ jobs:
 
       - name: Build static controller and worker
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --bin hel --target x86_64-unknown-linux-musl
 
@@ -73,7 +73,7 @@ jobs:
 
       - name: Build static controller and worker
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --bin hel --target aarch64-unknown-linux-musl
 
