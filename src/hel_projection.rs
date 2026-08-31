@@ -3,9 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
-    ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdateFields,
+use agent_client_protocol::schema::{
+    MaybeUndefined,
+    v1::{
+        ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallStatus,
+        ToolCallUpdateFields,
+    },
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -1008,12 +1011,13 @@ fn project_session_update(
             );
             mutation.configuration = Some(configuration);
         }
-        SessionUpdate::SessionInfoUpdate(update) => {
-            let value = serde_json::to_value(update)?;
-            if let Some(title) = value.get("title") {
-                mutation.session_title = Some(title.as_str().and_then(normalize_session_title));
+        SessionUpdate::SessionInfoUpdate(update) => match &update.title {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => mutation.session_title = Some(None),
+            MaybeUndefined::Value(title) => {
+                mutation.session_title = Some(normalize_session_title(title));
             }
-        }
+        },
         SessionUpdate::AvailableCommandsUpdate(_) | SessionUpdate::UsageUpdate(_) => {}
         _ => {}
     }
@@ -3064,6 +3068,60 @@ mod tests {
             session.session_title.as_deref(),
             Some("Agent-generated title")
         );
+    }
+
+    #[test]
+    fn session_info_update_without_title_preserves_the_provisional_title() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "prompt-1".into(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("first prompt"))],
+                },
+                created_at_ms: 100,
+            },
+        );
+
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::SessionInfoUpdate(
+                    agent_client_protocol::schema::v1::SessionInfoUpdate::new()
+                        .updated_at("2026-08-31T12:00:00Z"),
+                )),
+            },
+        );
+
+        assert_eq!(session.session_title.as_deref(), Some("first prompt"));
+    }
+
+    #[test]
+    fn explicit_session_title_clear_restores_the_prompt_fallback() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "prompt-1".into(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("first prompt"))],
+                },
+                created_at_ms: 100,
+            },
+        );
+
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::SessionInfoUpdate(
+                    agent_client_protocol::schema::v1::SessionInfoUpdate::new().title(None),
+                )),
+            },
+        );
+
+        assert_eq!(session.session_title, None);
+        assert_eq!(session.resolved_title().as_deref(), Some("first prompt"));
     }
 
     #[test]
