@@ -54,11 +54,9 @@ def wait_marker_or_exit(marker: pathlib.Path, browser: subprocess.Popen[bytes]) 
     raise ScenarioFailure("Playwright did not reach its offline synchronization point")
 
 
-def stop_from_dashboard(client) -> None:
-    client.send(b"\x05")
-    client.wait_for("Edit session")
-    client.send(b"\x1b[C\r")
-    client.wait_for("Stop session?")
+def finish_from_dashboard(client) -> None:
+    client.send(b"\x06")
+    client.wait_for("Finish session?")
     client.send(b"\r")
 
 
@@ -108,17 +106,17 @@ def run(lab: Lab) -> None:
         time.sleep(0.5)
         dashboard.wait_for(title)
         lab.record_action("dashboard-resized", rows=40, columns=150)
-        stop_from_dashboard(dashboard)
+        finish_from_dashboard(dashboard)
         snapshot = lab.wait_snapshot(
             lambda value: any(
-                item.get("title") == title and item.get("state") == "stopped"
+                item.get("title") == title and item.get("state") == "saved"
                 for item in value.get("sessions", [])
             ),
-            "TUI-stopped browser session",
+            "TUI-finished browser session",
         )
         session = next(item for item in snapshot["sessions"] if item["title"] == title)
-        changed_marker.write_text("TUI stop reached durable state\n")
-        lab.record_action("tui-stopped-session", session_id=session["id"])
+        changed_marker.write_text("TUI Finish reached durable state\n")
+        lab.record_action("tui-finished-session", session_id=session["id"])
         try:
             return_code = browser.wait(timeout=TIMEOUT * 2)
         except subprocess.TimeoutExpired as error:

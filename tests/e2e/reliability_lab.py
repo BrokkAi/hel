@@ -857,14 +857,14 @@ kind = "local-bare"
         self.record_action("clients-converged", session_id=session_id, clients=3)
 
         status, _ = self.request(
-            "POST", "/api/actions", {"action": "close", "session_id": session_id}
+            "POST", "/api/actions", {"action": "finish", "session_id": session_id}
         )
         if status != 202:
-            raise ScenarioFailure(f"close action returned {status}")
-        self.record_action("close", session_id=session_id)
+            raise ScenarioFailure(f"Finish action returned {status}")
+        self.record_action("finish", session_id=session_id)
         self.wait_snapshot(
-            lambda value: (self.session(value, session_id) or {}).get("state") == "stopped",
-            "stopped session",
+            lambda value: (self.session(value, session_id) or {}).get("state") == "saved",
+            "saved session",
         )
 
         quit_one = first.quit()

@@ -240,7 +240,7 @@ def run_hook(lab: Lab, hook: str) -> None:
                 (item for item in snapshot.get("sessions", []) if item.get("title") == title),
                 None,
             )
-            if session is None or session.get("state") in {"running", "error", "stopped"}:
+            if session is None or session.get("state") in {"running", "error", "saved"}:
                 break
             time.sleep(0.1)
         else:
@@ -267,7 +267,7 @@ def run_hook(lab: Lab, hook: str) -> None:
         if status != 202:
             raise ScenarioFailure(f"prompt action returned {status}")
         crash_and_restart_daemon(lab, hook, port, 1)
-        wait_session(lab, title, {"running", "stopped"})
+        wait_session(lab, title, {"running", "saved"})
         deadline = time.monotonic() + TIMEOUT
         while time.monotonic() < deadline:
             status, transcript = lab.request("GET", f"/api/conversations/{session_id}")
@@ -291,20 +291,20 @@ def run_hook(lab: Lab, hook: str) -> None:
 def finish(lab: Lab) -> None:
     snapshot = lab.snapshot()
     for session in snapshot.get("sessions", []):
-        if session.get("state") == "stopped":
+        if session.get("state") == "saved":
             continue
         session_id = str(session["id"])
         status, _ = lab.request(
-            "POST", "/api/actions", {"action": "close", "session_id": session_id}
+            "POST", "/api/actions", {"action": "finish", "session_id": session_id}
         )
         if status != 202:
-            raise ScenarioFailure(f"close action for {session_id} returned {status}")
+            raise ScenarioFailure(f"Finish action for {session_id} returned {status}")
         lab.wait_snapshot(
             lambda value, selected=session_id: any(
-                item.get("id") == selected and item.get("state") == "stopped"
+                item.get("id") == selected and item.get("state") == "saved"
                 for item in value.get("sessions", [])
             ),
-            f"stopped session {session_id}",
+            f"saved session {session_id}",
         )
     for client in lab.clients:
         client.terminate()

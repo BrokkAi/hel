@@ -87,12 +87,15 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await expect.poll(() => fs.existsSync(changedMarker)).toBe(true);
     await context.setOffline(false);
 
-    await expect(session).toContainText('stopped');
+    await expect(session).toContainText('Saved · no worker running');
     await session.getByRole('button', { name: 'Resume' }).click();
     await expect(session).toContainText('running');
-    page.once('dialog', dialog => dialog.accept());
-    await session.getByRole('button', { name: 'Stop' }).click();
-    await expect(session).toContainText('stopped');
+    await session.getByRole('button', { name: 'Finish' }).click();
+    const finish = page.locator('#finish-dialog');
+    await expect(finish).toContainText('finish the current work');
+    await expect(finish).toContainText('selected project directory will remain unchanged');
+    await finish.getByRole('button', { name: 'Stop worker and save' }).click();
+    await expect(session).toContainText('Saved · no worker running');
     await expect(page.locator('#action-error')).toHaveText('');
     expect(responseErrors).toEqual([]);
 

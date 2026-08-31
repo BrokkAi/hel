@@ -18,7 +18,7 @@ The visible proof is a local Podman session whose chat can be left without stopp
 - [x] (2026-08-31 12:51Z) Resolved the first-version product model: one Finish intent, target-specific consequences derived from ownership already encoded by the target kind, and no new per-session policy choice.
 - [x] (2026-08-31 13:57Z) Implemented the shared finish-effect model and distinguished a finish checkpoint from an ordinary recovery checkpoint. Focused checkpoint tests passed on the container's `aarch64-unknown-linux-gnu` host target.
 - [x] (2026-08-31 14:34Z) Replaced the terminal UI's hidden Stop workflow with target-aware Finish, Saved, and Delete language, and made leave-running behavior explicit. The complete TUI suite and termination PTY tests pass.
-- [ ] Bring the phone viewer and its controller action schema to the same lifecycle model without exposing private target locators.
+- [x] (2026-08-31 14:53Z) Brought the phone viewer and its controller action schema to the same lifecycle model without exposing private target locators. Rust projection/server tests, script syntax checks, and targeted clippy pass; the real browser run is updated but cannot launch Chromium in this container because its system libraries require unavailable sudo access.
 - [ ] Publish the lifecycle guidance, update behavioral and end-to-end tests, run the complete validation suite, and record results here.
 
 ## Surprises & Discoveries
@@ -46,6 +46,9 @@ The visible proof is a local Podman session whose chat can be left without stopp
 
 - Observation: a chat reducer knows only the currently open conversation, while the dashboard reducer owns the workspace-wide live-session count required by the quit warning.
   Evidence: `src/hel_chat.rs` emits `ChatEventOutcome::QuitDetach` without a workspace snapshot; `crates/hel-cli/src/dashboard.rs` receives that outcome, persists the draft, returns to the dashboard state, and can then call `DashboardState::request_quit` with the full session map.
+
+- Observation: Playwright's pinned Chromium downloads successfully in this container, but the image omits its native ATK, DBus, GBM, XKB, ALSA, and accessibility libraries. Playwright's dependency installer invokes sudo, which this disposable environment does not authorize.
+  Evidence: `tests/e2e/run-browser-reliability.sh --seed 31082026 target/aarch64-unknown-linux-gnu/debug/hel` reached Playwright and exited before browser synchronization with the native-dependency diagnostic. The artifact is under `target/reliability-artifacts/browser-tui-convergence-seed-31082026-34463`; Rust HTTP/projection tests and standalone JavaScript/Python syntax checks pass.
 
 ## Decision Log
 
@@ -93,6 +96,10 @@ The visible proof is a local Podman session whose chat can be left without stopp
   Rationale: this preserves the chat reducer's narrow responsibility and ensures the warning counts every live session rather than only the conversation that happened to be open. No checkpoint or lifecycle operation is started by this navigation path.
   Date/Author: 2026-08-31 / Codex
 
+- Decision: Partition phone cards into Active sessions and Saved sessions, and use a page-owned Finish dialog rather than the browser's native confirm prompt.
+  Rationale: a native confirm prompt cannot display the target-specific primary action label carried by `ViewerFinish`. The page-owned dialog can present active-work, queued-work, and target-effect copy together, while local pending state immediately renders Finishing and disables duplicate actions before the next asynchronous snapshot arrives.
+  Date/Author: 2026-08-31 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 established the core contract without changing an existing UI action. All six live target locators now map to a privacy-safe `SessionFinishEffect` and target-specific copy. Relay protocol 7 carries `CheckpointPurpose::Finish`; older durable commands still decode as Recovery, and a close against an older live worker first replaces that worker. A Finish barrier waits for the active effect, preserves previously accepted queued prompts in the canonical archive projection, rejects new work, and resumes the queue if its controller disconnects. A database-backed lifecycle test also proves that failed Finish export leaves the target and Running state intact and never invokes the target teardown command.
@@ -100,6 +107,8 @@ Milestone 1 established the core contract without changing an existing UI action
 The focused checkpoint run passed 120 tests (one ignored), including relay runtime and controller latch coverage. The four named Finish/recovery state-machine tests, archive projection test, target-effect test, backward-serde test, and failed-export lifecycle path pass on `aarch64-unknown-linux-gnu`.
 
 Milestone 2 made Finish a direct Ctrl+F action with a consequence and primary button derived from the exact live target. Stop no longer appears in Edit. Chat advertises `/dashboard` and Ctrl+G as navigation that leaves the worker running, while `/detach` remains a hidden compatibility alias. Quit now starts on Cancel whenever live sessions would remain. Inactive rows live under Saved sessions, which explains that they run no workers and retain local disk; Hide and Delete permanently now describe their actual effects. The complete `hel-tui` suite passed 199 tests (one ignored), the focused CLI dashboard tests passed 16 tests, and both termination PTY tests passed on `aarch64-unknown-linux-gnu`. The remaining work is phone convergence, documentation, browser/end-to-end coverage, and repository-wide validation.
+
+Milestone 3 added an optional, privacy-safe `ViewerFinish` projection and changed the public phone action atomically from `close` to `finish`; the daemon still delegates to its internal close implementation. Viewer state now renders Closing as Finishing and Stopped as Saved. Active and Saved cards are separate, never expose Finish and Resume together, and the Finish dialog uses the projected consequence and target-specific primary label. Six-locator projection coverage proves raw hosts, paths, container IDs, worker IDs, instance IDs, and addresses stay out of serialized snapshots. The 28 `hel_server` tests, 16 CLI server tests, JavaScript syntax check, Python compile check, and targeted all-target clippy pass. The browser/TUI reliability scenario now exercises Finish and Saved, but its local execution is deferred to an environment with Playwright's native libraries because this container cannot install them without sudo.
 
 ## Context and Orientation
 
@@ -360,3 +369,5 @@ Revision note (2026-08-31): Milestone 1 source inspection corrected the queue de
 Revision note (2026-08-31): Milestone 1 completed with protocol 7, backward-compatible Recovery decoding, automatic worker replacement for old Finish peers, privacy-safe target effects, canonical queue preservation, cancellation recovery, and verify-before-teardown coverage.
 
 Revision note (2026-08-31): Milestone 2 completed with target-aware terminal Finish, explicit leave-running navigation and quit behavior, Saved/Hide/Delete vocabulary, and passing TUI, CLI dashboard, and PTY coverage.
+
+Revision note (2026-08-31): Milestone 3 completed the privacy-safe phone projection, Finish action schema, Active/Saved rendering, target-aware web confirmation, and asynchronous Finishing state; browser reliability coverage was updated but cannot launch locally without privileged system-library installation.

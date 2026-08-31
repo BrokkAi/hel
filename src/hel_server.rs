@@ -224,31 +224,40 @@ impl ViewerSnapshot {
         let sessions = state
             .sessions
             .values()
-            .map(|session| ViewerSession {
-                id: session.id.clone(),
-                workspace_id: session.workspace_id.clone(),
-                title: session.display_title().to_owned(),
-                harness_kind: session.harness_kind.id().into(),
-                profile_id: session.last_profile.clone(),
-                bundle_id: session.bundle_id.clone(),
-                target_id: session.target_template_id.clone(),
-                state: session_state_name(session.state).into(),
-                created_at: session.created_at.clone(),
-                updated_at: session.updated_at.clone(),
-                has_error: session.last_error.is_some(),
-                preview: Vec::new(),
-                queued_prompts: Vec::new(),
-                active_user_shells: Vec::new(),
-                conversation_available: false,
-                incompatible_resume_targets: config
-                    .targets
-                    .keys()
-                    .filter(|target_id| {
-                        crate::hel_controller::resume_compatibility(session, config, target_id)
-                            .is_err()
-                    })
-                    .cloned()
-                    .collect(),
+            .map(|session| {
+                let finish = session
+                    .state
+                    .is_active()
+                    .then(|| crate::hel_controller::session_finish_effect(session).ok())
+                    .flatten()
+                    .map(ViewerFinish::from_effect);
+                ViewerSession {
+                    id: session.id.clone(),
+                    workspace_id: session.workspace_id.clone(),
+                    title: session.display_title().to_owned(),
+                    harness_kind: session.harness_kind.id().into(),
+                    profile_id: session.last_profile.clone(),
+                    bundle_id: session.bundle_id.clone(),
+                    target_id: session.target_template_id.clone(),
+                    state: session_state_name(session.state).into(),
+                    created_at: session.created_at.clone(),
+                    updated_at: session.updated_at.clone(),
+                    has_error: session.last_error.is_some(),
+                    preview: Vec::new(),
+                    queued_prompts: Vec::new(),
+                    active_user_shells: Vec::new(),
+                    conversation_available: false,
+                    finish,
+                    incompatible_resume_targets: config
+                        .targets
+                        .keys()
+                        .filter(|target_id| {
+                            crate::hel_controller::resume_compatibility(session, config, target_id)
+                                .is_err()
+                        })
+                        .cloned()
+                        .collect(),
+                }
             })
             .collect();
         let profiles = config
@@ -323,11 +332,33 @@ pub struct ViewerSession {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_user_shells: Vec<ViewerUserShell>,
     pub conversation_available: bool,
+    /// Privacy-safe presentation of the exact resource Finish will release.
+    /// Raw target locator fields never cross the viewer boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<ViewerFinish>,
     /// Target ids this session cannot resume on. Only the ids travel: the
     /// controller's reasons name project paths and SSH hosts, which this
     /// projection deliberately keeps on the controller.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incompatible_resume_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerFinish {
+    pub kind: String,
+    pub consequence: String,
+    pub primary_action: String,
+}
+
+impl ViewerFinish {
+    fn from_effect(effect: crate::hel_controller::SessionFinishEffect) -> Self {
+        Self {
+            kind: effect.kind().into(),
+            consequence: effect.consequence().into(),
+            primary_action: effect.primary_action().into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,7 +466,7 @@ pub enum ControllerAction {
         session_id: String,
         shell_command_id: String,
     },
-    Close {
+    Finish {
         session_id: String,
     },
     Cancel {
@@ -456,7 +487,7 @@ pub enum ResumeQueueDisposition {
 
 /// The controller's answer to one phone action.
 ///
-/// The answer means "accepted", not "finished": provisioning, resume and close
+/// The answer means "accepted", not "finished": provisioning, resume and Finish
 /// run for minutes, and a phone on a mobile network drops a request held open
 /// that long. How the action then goes travels in snapshots — session state,
 /// queued prompts, transcripts, and `has_error`.
@@ -739,7 +770,7 @@ async fn snapshot(State(state): State<ServerState>) -> Response<Body> {
 
 /// Hand one validated action to the controller and answer as soon as the
 /// controller accepts it. Waiting for completion would hold the request open
-/// for the whole of a provision, resume or close, which mobile networks end
+/// for the whole of a provision, resume or Finish, which mobile networks end
 /// long before the work does — reporting failure for an action that is in fact
 /// still running.
 async fn action(
@@ -897,6 +928,9 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             validate_public_id(profile_id)?;
             validate_public_id(target_id)?;
             let session = require_session_record(snapshot, session_id)?;
+            if session.state != "saved" {
+                return Err(ApiError::bad_request("only saved sessions can be resumed"));
+            }
             require_profile(snapshot, profile_id)?;
             require_target(snapshot, target_id)?;
             if session
@@ -909,9 +943,16 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
                 ));
             }
         }
-        ControllerAction::Open { session_id }
-        | ControllerAction::Close { session_id }
-        | ControllerAction::Cancel { session_id } => {
+        ControllerAction::Finish { session_id } => {
+            validate_public_id(session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if session.finish.is_none() {
+                return Err(ApiError::bad_request(
+                    "only active sessions with a live target can be finished",
+                ));
+            }
+        }
+        ControllerAction::Open { session_id } | ControllerAction::Cancel { session_id } => {
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
         }
@@ -1197,9 +1238,9 @@ const fn session_state_name(state: SessionState) -> &'static str {
         SessionState::Running => "running",
         SessionState::Disconnected => "disconnected",
         SessionState::Checkpointing => "checkpointing",
-        SessionState::Closing => "closing",
-        SessionState::Destroying => "destroying",
-        SessionState::Stopped => "stopped",
+        SessionState::Closing => "finishing",
+        SessionState::Destroying => "deleting",
+        SessionState::Stopped => "saved",
         SessionState::Lost => "lost",
         SessionState::Error => "error",
         SessionState::DestroyedWithDataLoss => "destroyed-with-data-loss",
@@ -1270,28 +1311,33 @@ const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 
 
 const VIEWER_HTML: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="icon" href="/icon.svg"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
-<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
+<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}dialog{max-width:560px;color:inherit;background:#13161d;border:1px solid #475043;border-radius:14px;padding:18px}dialog::backdrop{background:#000a}dialog h2{margin-top:0}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
-<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent or use !command" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
+<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Active sessions</h2><div id="active-sessions"></div></section><section><h2>Saved sessions</h2><p class="dim">Saved sessions run no workers.</p><div id="saved-sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent or use !command" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
+<dialog id="finish-dialog"><h2 id="finish-title">Finish session?</h2><p id="finish-work"></p><p id="finish-queue" class="dim"></p><p id="finish-consequence"></p><form method="dialog" class="row"><button value="cancel" class="secondary">Cancel</button><button id="finish-confirm" value="finish" class="danger">Finish</button></form></dialog>
 <script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells');let snapshot,currentSession,cursor=0,acknowledged=0,eventSource;
+const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),activeSessions=document.querySelector('#active-sessions'),savedSessions=document.querySelector('#saved-sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells'),finishDialog=document.querySelector('#finish-dialog'),finishTitle=document.querySelector('#finish-title'),finishWork=document.querySelector('#finish-work'),finishQueue=document.querySelector('#finish-queue'),finishConsequence=document.querySelector('#finish-consequence'),finishConfirm=document.querySelector('#finish-confirm');let snapshot,currentSession,cursor=0,acknowledged=0,eventSource;const pendingFinishes=new Set();
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}if(response.status===202||response.status===204)return null;return response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
 function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
 function startEvents(){if(eventSource)eventSource.close();eventSource=new EventSource('/api/events');eventSource.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}
-async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventSource)startEvents();return true}catch(e){if(e.message==='unauthorized'){snapshot=undefined;currentSession=null;if(eventSource){eventSource.close();eventSource=undefined}login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}return false}}
+function sessionCard(x,saved){const finishing=pendingFinishes.has(x.id)||x.state==='finishing',state=finishing?'finishing':x.state;const details=`<p><span class="pill">${escapeHtml(state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}`;let actions;if(saved){actions=`<p class="dim">Saved · no worker running</p><div class="row"><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button></div>`}else if(x.state==='provisioning'){actions=`<div class="row"><button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button></div>`}else{actions=`<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available&&!finishing?'':'disabled'}>Open</button>${x.finish?`<button class="danger" data-action="finish" data-id="${escapeAttr(x.id)}" ${finishing?'disabled':''}>${finishing?'Finishing':'Finish'}</button>`:''}</div>`}return `<article class="card session"><h3>${escapeHtml(x.title)}</h3>${details}${actions}</article>`}
+function renderSessions(){const saved=snapshot.sessions.filter(x=>x.state==='saved'),active=snapshot.sessions.filter(x=>x.state!=='saved');activeSessions.innerHTML=active.map(x=>sessionCard(x,false)).join('')||'<p class="dim">No active sessions.</p>';savedSessions.innerHTML=saved.map(x=>sessionCard(x,true)).join('')||'<p class="dim">No saved sessions.</p>'}
+async function refresh(){try{snapshot=await request('/api/snapshot');for(const id of pendingFinishes){const session=snapshot.sessions.find(x=>x.id===id);if(!session||session.state==='saved'||session.has_error)pendingFinishes.delete(id)}login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();renderSessions();const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventSource)startEvents();return true}catch(e){if(e.message==='unauthorized'){snapshot=undefined;currentSession=null;if(eventSource){eventSource.close();eventSource=undefined}login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}return false}}
 async function restoreRoute(){if(!await refresh())return;const match=location.hash.match(/^#conversation\/([A-Za-z0-9_-]+)$/);if(match)await openConversation(match[1])}
 function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>';shells.innerHTML=(session.active_user_shells||[]).map(x=>`<div class="queue-item"><span>$ ${escapeHtml(x.command)}</span><button class="danger" data-shell-id="${escapeAttr(x.id)}">Cancel</button></div>`).join('')||'<p class="dim">No running shells.</p>'}
 function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
 async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;if(cursor>acknowledged){const through=cursor;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through})});acknowledged=through}}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
 async function openConversation(id){const session=snapshot?.sessions.find(x=>x.id===id);if(!session?.conversation_available){showDashboard();return}currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');document.querySelector('#conversation-title').textContent=session.title;document.querySelector('#conversation-state').textContent=session.state;renderQueue(session);await loadConversation(false)}
 function showDashboard(){currentSession=null;cursor=0;acknowledged=0;location.hash='';conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
+function confirmFinish(session){finishTitle.textContent=`Finish ${session.title}?`;finishWork.textContent='Hel will finish the current work, then save and verify recovery.';const queued=(session.queued_prompts||[]).length;finishQueue.textContent=queued===0?'No queued prompts are waiting.':queued===1?'1 queued prompt will be saved for resume.':`${queued} queued prompts will be saved for resume.`;finishConsequence.textContent=session.finish.consequence;finishConfirm.textContent=session.finish.primary_action;finishDialog.returnValue='';finishDialog.showModal();return new Promise(resolve=>finishDialog.addEventListener('close',()=>resolve(finishDialog.returnValue==='finish'),{once:true}))}
 document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';await restoreRoute()}catch(err){document.querySelector('#login-error').textContent=err.message}};
 logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
 newTarget.onchange=syncProjectDirectory;
 newForm.onsubmit=async e=>{e.preventDefault();const target=snapshot.targets.find(x=>x.id===newTarget.value);try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'new',title:document.querySelector('#new-title').value,profile_id:newProfile.value,bundle_id:newBundle.value,target_id:newTarget.value,project_directory:target?.requires_project_directory?newProjectDirectory.value:null})});document.querySelector('#new-title').value='';actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
-sessions.onclick=async e=>{const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='open')return openConversation(button.dataset.id);if(button.dataset.action==='close'&&!confirm('Save a recovery copy, stop, and destroy this session target? Queued prompts will be preserved.'))return;const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target;const session=snapshot.sessions.find(x=>x.id===button.dataset.id);body.queue='start';if(session?.queued_prompts?.length){const choice=prompt(`This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,'start');if(choice===null)return;if(!['start','discard'].includes(choice.toLowerCase()))return alert('Enter start or discard.');body.queue=choice.toLowerCase()}}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
+async function sessionAction(e){const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='open')return openConversation(button.dataset.id);const session=snapshot.sessions.find(x=>x.id===button.dataset.id);if(button.dataset.action==='finish'){if(!session?.finish||!await confirmFinish(session))return;pendingFinishes.add(session.id);renderSessions()}const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target;body.queue='start';if(session?.queued_prompts?.length){const choice=prompt(`This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,'start');if(choice===null)return;if(!['start','discard'].includes(choice.toLowerCase()))return alert('Enter start or discard.');body.queue=choice.toLowerCase()}}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){pendingFinishes.delete(button.dataset.id);renderSessions();actionError.textContent=err.message}}
+activeSessions.onclick=sessionAction;savedSessions.onclick=sessionAction;
 document.querySelector('#back').onclick=showDashboard;
 document.querySelector('#prompt-form').onsubmit=async e=>{e.preventDefault();const text=document.querySelector('#prompt-text'),value=text.value;const body=value.startsWith('!')?{action:'run-shell',session_id:currentSession,command:value.slice(1)}:{action:'prompt',session_id:currentSession,text:value};try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});text.value='';document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
 queue.onclick=async e=>{const button=e.target.closest('button[data-queue-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'remove-queued-prompt',session_id:currentSession,queue_id:button.dataset.queueId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
@@ -1314,7 +1360,7 @@ mod tests {
         CONFIG_VERSION, ContainerTemplate, HarnessKind, HarnessProfile, ProjectBundle,
         ProjectRepository,
     };
-    use crate::hel_state::{STATE_VERSION, SessionRecord};
+    use crate::hel_state::{STATE_VERSION, SessionRecord, TargetLocator};
 
     fn sample_config_state() -> (HelConfig, HelState) {
         let config = HelConfig {
@@ -1380,7 +1426,9 @@ mod tests {
                     resource_allocation: None,
                     additional_mounts: vec![],
                     state: SessionState::Running,
-                    target: None,
+                    target: Some(TargetLocator::LocalPodman {
+                        container_id: "private-container-id".into(),
+                    }),
                     native_session_id: Some("native-secret-id".into()),
                     acp_session_title: Some("Build Hel".into()),
                     session_title_override: None,
@@ -1558,12 +1606,114 @@ mod tests {
         assert!(!json.contains("secret-target"));
         assert!(!json.contains("secret.registry"));
         assert!(!json.contains("native-secret-id"));
+        assert!(!json.contains("private-container-id"));
         assert!(json.contains("\"has_error\":true"));
+        assert!(json.contains("\"kind\":\"local-podman-container\""));
+        assert!(json.contains("The Hel session container will be removed"));
+    }
+
+    #[test]
+    fn viewer_finish_projection_is_target_aware_without_locators() {
+        let (config, mut state) = sample_config_state();
+        let cases = [
+            (
+                TargetLocator::LocalBare {
+                    worker_root: "/private/local-worker".into(),
+                },
+                "local-bare-worker",
+                "selected project directory will remain unchanged",
+                "Stop worker and save",
+            ),
+            (
+                TargetLocator::LocalPodman {
+                    container_id: "private-local-container".into(),
+                },
+                "local-podman-container",
+                "This computer and other containers will remain unchanged",
+                "Remove container and save",
+            ),
+            (
+                TargetLocator::AppleContainer {
+                    container_id: "private-apple-container".into(),
+                },
+                "apple-container",
+                "This computer and other containers will remain unchanged",
+                "Remove container and save",
+            ),
+            (
+                TargetLocator::SshBare {
+                    host: "private-bare-host".into(),
+                    workspace: "/private/remote-worker".into(),
+                    worker_id: Some("private-worker-id".into()),
+                },
+                "remote-bare-worker",
+                "remote host and selected project directory will remain unchanged",
+                "Stop worker and save",
+            ),
+            (
+                TargetLocator::SshPodman {
+                    host: "private-podman-host".into(),
+                    container_id: "private-remote-container".into(),
+                },
+                "remote-podman-container",
+                "host and other containers will remain unchanged",
+                "Remove container and save",
+            ),
+            (
+                TargetLocator::AwsEc2 {
+                    instance_id: "private-instance-id".into(),
+                    address: Some("private-instance-address".into()),
+                },
+                "aws-ec2-instance",
+                "EC2 session instance will be terminated",
+                "Terminate instance and save",
+            ),
+        ];
+
+        for (target, expected_kind, consequence, primary_action) in cases {
+            state.sessions.get_mut("session-1").unwrap().target = Some(target);
+            let snapshot = ViewerSnapshot::from_config_state(&config, &state, 9);
+            let finish = snapshot.sessions[0].finish.as_ref().unwrap();
+            assert_eq!(finish.kind, expected_kind);
+            assert!(finish.consequence.contains(consequence));
+            assert_eq!(finish.primary_action, primary_action);
+            let json = serde_json::to_string(&snapshot).unwrap();
+            assert!(!json.contains("private-"), "locator leaked in {json}");
+        }
+    }
+
+    #[test]
+    fn saved_viewer_session_has_no_finish_projection() {
+        let (config, mut state) = sample_config_state();
+        let session = state.sessions.get_mut("session-1").unwrap();
+        session.state = SessionState::Stopped;
+        session.target = None;
+
+        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 9);
+        assert_eq!(snapshot.sessions[0].state, "saved");
+        assert!(snapshot.sessions[0].finish.is_none());
+        assert!(
+            !serde_json::to_string(&snapshot.sessions[0])
+                .unwrap()
+                .contains("\"finish\"")
+        );
     }
 
     #[test]
     fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
         assert!(VIEWER_HTML.contains(r#"<link rel="icon" href="/icon.svg">"#));
+    }
+
+    #[test]
+    fn viewer_page_separates_active_finish_from_saved_resume() {
+        assert!(VIEWER_HTML.contains("Active sessions"));
+        assert!(VIEWER_HTML.contains("Saved sessions run no workers"));
+        assert!(VIEWER_HTML.contains(r#"data-action="finish""#));
+        assert!(VIEWER_HTML.contains("session.finish.consequence"));
+        assert!(VIEWER_HTML.contains("session.finish.primary_action"));
+        assert!(VIEWER_HTML.contains("Saved · no worker running"));
+        assert!(!VIEWER_HTML.contains(r#"data-action="close""#));
+        assert!(!VIEWER_HTML.contains(">Stop</button>"));
     }
 
     #[tokio::test]
@@ -1592,6 +1742,35 @@ mod tests {
         action.reply.send(ActionOutcome::Accepted).unwrap();
         let response = response.await.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn finish_action_is_typed_and_forwarded() {
+        let (app, mut actions, _) = app();
+        let cookie = login_cookie(&app).await;
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"finish","session_id":"session-1"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let action = actions.recv().await.unwrap();
+        assert_eq!(
+            action.action,
+            ControllerAction::Finish {
+                session_id: "session-1".into(),
+            }
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::ACCEPTED
+        );
     }
 
     #[tokio::test]
@@ -1784,7 +1963,7 @@ mod tests {
 
     #[tokio::test]
     async fn action_validation_accepts_cross_harness_resume_and_rejects_unknown() {
-        let (mut config, state) = sample_config_state();
+        let (mut config, mut state) = sample_config_state();
         config.profiles.insert(
             "claude-1".into(),
             HarnessProfile {
@@ -1795,6 +1974,9 @@ mod tests {
                 environment: BTreeMap::new(),
             },
         );
+        let session = state.sessions.get_mut("session-1").unwrap();
+        session.state = SessionState::Stopped;
+        session.target = None;
         let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
         validate_action(
             &ControllerAction::Resume {
@@ -1808,7 +1990,7 @@ mod tests {
         .unwrap();
 
         let error = validate_action(
-            &ControllerAction::Close {
+            &ControllerAction::Finish {
                 session_id: "not-managed".into(),
             },
             &snapshot,
@@ -1818,11 +2000,71 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_actions_are_available_only_in_the_matching_viewer_state() {
+        let (config, mut state) = sample_config_state();
+        let active = ViewerSnapshot::from_config_state(&config, &state, 1);
+        assert!(
+            validate_action(
+                &ControllerAction::Finish {
+                    session_id: "session-1".into(),
+                },
+                &active,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_action(
+                &ControllerAction::Resume {
+                    session_id: "session-1".into(),
+                    profile_id: "codex-1".into(),
+                    target_id: "podman".into(),
+                    queue: ResumeQueueDisposition::Start,
+                },
+                &active,
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let session = state.sessions.get_mut("session-1").unwrap();
+        session.state = SessionState::Stopped;
+        session.target = None;
+        let saved = ViewerSnapshot::from_config_state(&config, &state, 2);
+        assert_eq!(
+            validate_action(
+                &ControllerAction::Finish {
+                    session_id: "session-1".into(),
+                },
+                &saved,
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            validate_action(
+                &ControllerAction::Resume {
+                    session_id: "session-1".into(),
+                    profile_id: "codex-1".into(),
+                    target_id: "podman".into(),
+                    queue: ResumeQueueDisposition::Start,
+                },
+                &saved,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn resume_action_refuses_a_target_the_session_cannot_use() {
-        let (mut config, state) = sample_config_state();
+        let (mut config, mut state) = sample_config_state();
         // A project that only exists on GitHub cannot become a checkout on this
         // machine, so the bare target stays out of reach for its sessions.
         config.bundles.get_mut("hel").unwrap().repositories[0].local = None;
+        let session = state.sessions.get_mut("session-1").unwrap();
+        session.state = SessionState::Stopped;
+        session.target = None;
         let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
         assert_eq!(
             snapshot.sessions[0].incompatible_resume_targets,
@@ -1997,7 +2239,9 @@ mod tests {
                     Request::post("/api/actions")
                         .header(COOKIE, cookie)
                         .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(r#"{"action":"close","session_id":"session-1"}"#))
+                        .body(Body::from(
+                            r#"{"action":"finish","session_id":"session-1"}"#,
+                        ))
                         .unwrap(),
                 ),
             );

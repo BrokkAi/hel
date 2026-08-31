@@ -33,6 +33,17 @@ pub enum SessionFinishEffect {
 }
 
 impl SessionFinishEffect {
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::StopLocalBareWorker => "local-bare-worker",
+            Self::RemoveLocalPodmanContainer => "local-podman-container",
+            Self::RemoveAppleContainer => "apple-container",
+            Self::StopRemoteBareWorker => "remote-bare-worker",
+            Self::RemoveRemotePodmanContainer => "remote-podman-container",
+            Self::TerminateAwsEc2Instance => "aws-ec2-instance",
+        }
+    }
+
     pub const fn consequence(self) -> &'static str {
         match self {
             Self::StopLocalBareWorker => {
@@ -615,7 +626,8 @@ mod tests {
             let effect = session_finish_effect(&session).unwrap();
             assert_eq!(effect, expected);
             let rendered = format!(
-                "{} {} {}",
+                "{} {} {} {}",
+                effect.kind(),
                 effect.consequence(),
                 effect.primary_action(),
                 effect.completed_summary()

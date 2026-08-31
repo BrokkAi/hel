@@ -207,7 +207,7 @@ struct PhoneActionStarted {
 /// The phone replies the control loop still owes.
 ///
 /// A phone is answered as soon as its action is admitted, because provisioning,
-/// resume and close run for minutes and a request held open that long dies on a
+/// resume and Finish run for minutes and a request held open that long dies on a
 /// mobile network. `new` is the one action whose acceptance means more than
 /// admission: the phone has no session id until the provisional session is
 /// published, so its reply is parked here until the loop publishes it — or
@@ -1008,7 +1008,7 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
         ControllerAction::Prompt { session_id, .. }
         | ControllerAction::RunShell { session_id, .. }
         | ControllerAction::CancelShell { session_id, .. }
-        | ControllerAction::Close { session_id }
+        | ControllerAction::Finish { session_id }
         | ControllerAction::Resume { session_id, .. }
         | ControllerAction::Open { session_id }
         | ControllerAction::Cancel { session_id }
@@ -1216,7 +1216,7 @@ async fn apply_phone_action(
                 .await?;
             Ok(())
         }
-        ControllerAction::Close { session_id } => {
+        ControllerAction::Finish { session_id } => {
             services.daemon_runtime.close_session(session_id).await
         }
         ControllerAction::Resume {
