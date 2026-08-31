@@ -189,12 +189,13 @@ pub(crate) struct SessionRowsRendered {
 
 /// The Sessions pane's title.
 ///
-/// The P and S legend explains the prefixes on the expanded rows' agent
-/// lines, so it only appears while the pane is drawing those rows.
+/// The Turn and Step legend explains the prefixes on the expanded rows' agent
+/// lines, so it only appears while the pane is drawing those rows, and only
+/// while the pane is wide enough to spell it out.
 pub(crate) fn sessions_pane_title(width: u16, expanded: bool) -> &'static str {
-    const FULL: &str = " Sessions · P=time since prompt · S=time since agent activity ";
-    const MEDIUM: &str = " Sessions · P=prompt age · S=agent silence ";
-    const COMPACT: &str = " Sessions P=prompt S=silence ";
+    const FULL: &str = " Sessions · Turn=time since prompt · Step=time since agent activity ";
+    const MEDIUM: &str = " Sessions · Turn=prompt age · Step=agent silence ";
+    const COMPACT: &str = " Sessions Turn=prompt Step=silence ";
 
     if !expanded {
         return " Sessions ";
@@ -204,8 +205,12 @@ pub(crate) fn sessions_pane_title(width: u16, expanded: bool) -> &'static str {
         FULL
     } else if available >= MEDIUM.chars().count() {
         MEDIUM
-    } else {
+    } else if available >= COMPACT.chars().count() {
         COMPACT
+    } else {
+        // Narrower than the shortest legend. The rows label their own clocks,
+        // so the pane keeps its name and drops the key.
+        " Sessions "
     }
 }
 
@@ -708,11 +713,11 @@ fn dashboard_agent_prefixes(now_epoch_seconds: u64, detail: Option<&SessionDetai
         .max(turn_started);
     [
         format!(
-            "P {:>DASHBOARD_CLOCK_WIDTH$}",
+            "Turn {:>DASHBOARD_CLOCK_WIDTH$}",
             compact_dashboard_clock(now_epoch_seconds.saturating_sub(turn_started))
         ),
         format!(
-            "S {:>DASHBOARD_CLOCK_WIDTH$}",
+            "Step {:>DASHBOARD_CLOCK_WIDTH$}",
             compact_dashboard_clock(now_epoch_seconds.saturating_sub(step_started))
         ),
     ]
@@ -1731,7 +1736,9 @@ mod tests {
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
         assert!(rendered.contains("podman  [Q 1]  codex-1  ACP pretty name"));
-        assert!(rendered.contains("Sessions · P=time since prompt · S=time since agent activity"));
+        assert!(
+            rendered.contains("Sessions · Turn=time since prompt · Step=time since agent activity")
+        );
         assert!(rendered.contains("  codex-1  ACP pretty name"));
         assert!(!rendered.contains("queued]"));
         assert!(rendered.contains("You: question 1"));
@@ -1901,6 +1908,22 @@ mod tests {
     }
 
     #[test]
+    fn the_sessions_title_keeps_its_clock_key_only_while_the_key_fits() {
+        // Every tier names both clocks the rows name, and each one fits the
+        // width that selects it.
+        for width in [120, 60, 40, 32] {
+            let title = sessions_pane_title(width, true);
+            assert!(title.chars().count() <= usize::from(width) - 2, "{title:?}");
+            if width > 32 {
+                assert!(title.contains("Turn"), "{title:?}");
+                assert!(title.contains("Step"), "{title:?}");
+            }
+        }
+        assert_eq!(sessions_pane_title(32, true), " Sessions ");
+        assert_eq!(sessions_pane_title(120, false), " Sessions ");
+    }
+
+    #[test]
     fn dashboard_agent_prefixes_show_active_clocks_and_idle_activity_time() {
         let detail = SessionDetail {
             current_turn_started_at: Some(1_000),
@@ -1910,7 +1933,7 @@ mod tests {
 
         assert_eq!(
             dashboard_agent_prefixes(1_330, Some(&detail)),
-            ["P  5m30s", "S    33s"]
+            ["Turn  5m30s", "Step    33s"]
         );
         assert_eq!(compact_dashboard_clock(99 * 60 + 59), "99m59s");
         assert_eq!(compact_dashboard_clock(100 * 60 + 59), "100m");
@@ -2295,7 +2318,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("Terminal too small"));
-        assert!(rendered.contains("Sessions · P=time since prompt · S=time since agent activity"));
+        assert!(
+            rendered.contains("Sessions · Turn=time since prompt · Step=time since agent activity")
+        );
         assert!(rendered.contains("Quota"));
     }
 
@@ -2329,7 +2354,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("Terminal too small"));
-        assert!(rendered.contains("Sessions P=prompt S=silence"));
+        assert!(rendered.contains("Sessions"));
     }
 
     #[test]
