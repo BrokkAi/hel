@@ -961,12 +961,12 @@ impl DashboardState {
     /// composer.
     ///
     /// The conversation already follows the selection, so Enter's job is to
-    /// take the user to the prompt for the row they are on. It means one thing
-    /// whatever state the session is in: it used to divert a failed session
-    /// into the resume wizard, which made the key unpredictable, opening a
-    /// conversation or a multi-step dialog depending on a state the row barely
-    /// showed. A failed session still has a transcript worth reading, and its
-    /// error is reported alongside it.
+    /// take the user to the prompt for the row they are on. A failed session
+    /// is the one exception: it asks first, because reading what it did and
+    /// putting it back on a fresh target are both reasonable answers to the
+    /// same key. That is a prompt rather than the silent diversion into the
+    /// resume wizard this used to do - the row is red, and the dialog says
+    /// what failed.
     fn open_selected_session(&mut self) -> DashboardAction {
         let Some(session) = self.selected_session() else {
             return DashboardAction::None;
@@ -978,10 +978,17 @@ impl DashboardState {
             ));
             return DashboardAction::None;
         }
-        if session.state == SessionState::Error
-            && let Some(error) = session.last_error.clone()
-        {
-            self.notices.set(error);
+        // A failed session has two reasonable answers - read what it did, or
+        // put it back on a fresh target - and recovery replaces the target, so
+        // the surface asks rather than guessing.
+        if session.state == SessionState::Error {
+            let confirmation = Confirmation::RecoverFailed {
+                session_id: session.id.clone(),
+                error: session.last_error.clone(),
+                recoverable: session.checkpoint.is_some(),
+            };
+            self.mode = Mode::Confirm(ConfirmDialog::new(confirmation));
+            return DashboardAction::None;
         }
         let session_id = session.id.clone();
         self.focus = Focus::Prompt;
@@ -2608,11 +2615,11 @@ mod tests {
         );
     }
 
-    /// Enter means one thing on this pane. A failed session still has a
-    /// transcript worth reading, so Enter opens it rather than diverting into
-    /// a wizard, and its recorded error is reported alongside.
+    /// A failed session has two reasonable answers to Enter, and recovery
+    /// replaces the target, so the surface asks instead of guessing. The row
+    /// is red before the key is ever pressed, so the dialog is not a surprise.
     #[test]
-    fn opening_a_failed_session_opens_it_and_reports_its_error() {
+    fn enter_on_a_failed_session_offers_recovery_and_the_transcript() {
         let mut session = stopped_session();
         session.state = SessionState::Error;
         session.last_error = Some("worker bootstrap failed: upload failed".into());
@@ -2620,22 +2627,68 @@ mod tests {
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!(
+                "expected the failed-session prompt, got {:?}",
+                dashboard.mode
+            )
+        };
+        assert_eq!(
+            dialog.confirmation,
+            Confirmation::RecoverFailed {
+                session_id: "session-1".into(),
+                error: Some("worker bootstrap failed: upload failed".into()),
+                recoverable: true,
+            }
+        );
+
+        // The prompt draws, names what failed, and offers both answers.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw the failed-session prompt");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Session failed"), "{rendered}");
+        assert!(rendered.contains("worker bootstrap failed"), "{rendered}");
+        assert!(rendered.contains("Open transcript"), "{rendered}");
+        assert!(rendered.contains("Recover"), "{rendered}");
+
+        // Reading what it did changes nothing about the session.
+        dashboard.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Open {
                 session_id: "session-1".into()
             }
         );
-        assert!(
-            matches!(dashboard.mode, Mode::Dashboard),
-            "no wizard came up in place of the conversation"
-        );
+        assert_eq!(dashboard.focus, Focus::Prompt);
+    }
+
+    /// Recovery is only on offer when there is a verified copy to recover
+    /// from; without one the prompt says so rather than showing a button that
+    /// cannot work.
+    #[test]
+    fn a_failed_session_without_a_recovery_copy_is_not_offered_recovery() {
+        let mut session = stopped_session();
+        session.state = SessionState::Error;
+        session.checkpoint = None;
+        session.last_error = Some("worker bootstrap failed".into());
+        let mut dashboard = dashboard_with_session(session);
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!("expected the failed-session prompt")
+        };
         assert_eq!(
-            dashboard.notice().as_deref(),
-            Some("worker bootstrap failed: upload failed")
-        );
-        assert_eq!(
-            dashboard.focus,
-            Focus::Prompt,
-            "Enter takes the user to the composer for that session"
+            dialog.confirmation,
+            Confirmation::RecoverFailed {
+                session_id: "session-1".into(),
+                error: Some("worker bootstrap failed".into()),
+                recoverable: false,
+            }
         );
     }
 }

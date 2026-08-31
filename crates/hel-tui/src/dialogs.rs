@@ -220,6 +220,16 @@ pub(crate) enum Confirmation {
         /// cancelling destruction leaves the user where they were.
         reopen: Option<Box<crate::resume::ResumeDialog>>,
     },
+    /// Enter on a failed session. Opening its conversation and recovering it
+    /// are both reasonable answers, and recovery replaces the target, so the
+    /// surface asks rather than guessing.
+    RecoverFailed {
+        session_id: String,
+        error: Option<String>,
+        /// Whether a verified recovery copy exists to resume from. Without one
+        /// there is nothing to recover and only the transcript is on offer.
+        recoverable: bool,
+    },
 }
 
 /// A confirmation dialog plus the index of its focused button.
@@ -271,6 +281,10 @@ fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] 
         Confirmation::Close { .. } => &["Cancel", "Stop"],
         Confirmation::DestroyStopped { .. } => &["Cancel", "Destroy"],
         Confirmation::CloseFailed { .. } => &["Cancel", "Force stop", "Retry stop"],
+        Confirmation::RecoverFailed {
+            recoverable: true, ..
+        } => &["Cancel", "Open transcript", "Recover"],
+        Confirmation::RecoverFailed { .. } => &["Cancel", "Open transcript"],
         Confirmation::ForceStop { .. } => &[],
     }
 }
@@ -1134,6 +1148,35 @@ fn confirmation_body(confirmation: &Confirmation) -> (&'static str, Vec<Line<'st
                 ),
             ],
         ),
+        Confirmation::RecoverFailed {
+            session_id,
+            error,
+            recoverable,
+        } => {
+            let mut lines = vec![Line::raw(format!("Session: {session_id}")), Line::raw("")];
+            match error {
+                Some(error) => lines.push(Line::styled(
+                    format!("Failed: {error}"),
+                    Style::default().fg(Color::Yellow),
+                )),
+                None => lines.push(Line::raw("This session failed without a recorded error.")),
+            }
+            lines.push(Line::raw(""));
+            if *recoverable {
+                lines.push(Line::raw(
+                    "Recover restores the session onto a fresh target from its recovery copy.",
+                ));
+                lines.push(Line::raw(
+                    "Its transcript is readable either way; opening it changes nothing.",
+                ));
+            } else {
+                lines.push(Line::raw(
+                    "There is no verified recovery copy, so this session cannot be resumed.",
+                ));
+                lines.push(Line::raw("Its transcript is still readable."));
+            }
+            (" Session failed ", lines)
+        }
         Confirmation::ForceStop { session_id, typed } => (
             " FORCE STOP · RECENT WORK MAY BE LOST ",
             vec![
@@ -1167,6 +1210,7 @@ pub(crate) fn render_confirmation(
             ..
         } => 13,
         Confirmation::Close { .. } | Confirmation::DestroyStopped { .. } => 10,
+        Confirmation::RecoverFailed { .. } => 12,
         Confirmation::ForceStop { .. } => 10,
     };
     let (title, mut lines) = confirmation_body(confirmation);
@@ -1944,6 +1988,15 @@ impl DashboardState {
             (Confirmation::CloseFailed { session_id, .. }, 2) => {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
+            }
+            (Confirmation::RecoverFailed { session_id, .. }, 1) => {
+                self.cancel_modal();
+                self.focus = crate::Focus::Prompt;
+                DashboardAction::Open { session_id }
+            }
+            (Confirmation::RecoverFailed { session_id, .. }, 2) => {
+                self.cancel_modal();
+                self.begin_resume_for(&session_id)
             }
             (Confirmation::DestroyStopped { reopen, .. }, _) => {
                 self.restore_after_confirmation(reopen);

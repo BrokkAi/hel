@@ -275,6 +275,12 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                 let source = dashboard.project_source(session);
                 let detail = dashboard.session_details.get(&session.id);
                 let unreachable = dashboard.unreachable_sessions.contains(&session.id);
+                let facts = SessionRowFacts {
+                    detail,
+                    unreachable,
+                    state: session.state,
+                    now_epoch_seconds,
+                };
                 let operation = dashboard.session_operations.get(&session.id);
                 let base_target = session_target_label(session, operation, &dashboard.config);
                 let target_key = (source.key.clone(), base_target.clone());
@@ -315,9 +321,7 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                     lines.push(collapsed_session_line(
                         prefix,
                         &target,
-                        detail,
-                        unreachable,
-                        now_epoch_seconds,
+                        facts,
                         usize::from(width.saturating_sub(4)),
                         permission,
                     ));
@@ -326,9 +330,7 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                         prefix,
                         &source.short,
                         &target,
-                        detail,
-                        unreachable,
-                        now_epoch_seconds,
+                        facts,
                         usize::from(width.saturating_sub(4)),
                     ));
                 }
@@ -434,26 +436,56 @@ fn expanded_session_lines(
 /// The one-line form the pane uses while the keyboard is elsewhere: which
 /// project, which target, how long the turn has been running, and what the
 /// agent last said.
+/// What a one-line session row needs to know about the session behind it.
+///
+/// Both one-line forms derive the same three things from it - the turn clock,
+/// the last thing the agent said, and the colour the row carries - so they
+/// derive them in one place.
+#[derive(Clone, Copy)]
+struct SessionRowFacts<'a> {
+    detail: Option<&'a SessionDetail>,
+    unreachable: bool,
+    state: SessionState,
+    now_epoch_seconds: u64,
+}
+
+impl SessionRowFacts<'_> {
+    fn style(&self) -> Style {
+        Style::default().fg(session_band_color(
+            self.detail,
+            self.unreachable,
+            self.state,
+        ))
+    }
+
+    fn clock(&self) -> String {
+        hel::usage_format::format_turn_clock(
+            self.now_epoch_seconds,
+            self.detail
+                .and_then(|detail| detail.current_turn_started_at),
+        )
+    }
+
+    /// The last non-empty line the agent said, or why there is none.
+    fn last_agent_line(&self) -> &str {
+        self.detail
+            .and_then(|detail| detail.last_agent_message.as_deref())
+            .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
+            .unwrap_or("No messages yet")
+            .trim()
+    }
+}
+
 fn compact_session_line(
     prefix: &str,
     project: &str,
     target: &str,
-    detail: Option<&SessionDetail>,
-    unreachable: bool,
-    now_epoch_seconds: u64,
+    facts: SessionRowFacts<'_>,
     width: usize,
 ) -> Line<'static> {
-    let clock = hel::usage_format::format_turn_clock(
-        now_epoch_seconds,
-        detail.and_then(|detail| detail.current_turn_started_at),
-    );
-    let fragment = detail
-        .and_then(|detail| detail.last_agent_message.as_deref())
-        .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
-        .unwrap_or("No messages yet")
-        .trim()
-        .to_owned();
-    let style = Style::default().fg(session_band_color(detail, unreachable));
+    let clock = facts.clock();
+    let fragment = facts.last_agent_line().to_owned();
+    let style = facts.style();
     let lead = format!("{prefix}{project} · {target} · {clock} ");
     let lead_width = lead.chars().count();
     Line::styled(
@@ -556,22 +588,13 @@ pub(crate) fn render_sessions(
 fn collapsed_session_line(
     prefix: &str,
     target: &str,
-    detail: Option<&SessionDetail>,
-    unreachable: bool,
-    now_epoch_seconds: u64,
+    facts: SessionRowFacts<'_>,
     width: usize,
     permission: Option<Span<'static>>,
 ) -> Line<'static> {
-    let clock = hel::usage_format::format_turn_clock(
-        now_epoch_seconds,
-        detail.and_then(|detail| detail.current_turn_started_at),
-    );
-    let fragment = detail
-        .and_then(|detail| detail.last_agent_message.as_deref())
-        .and_then(|message| message.lines().rev().find(|line| !line.trim().is_empty()))
-        .unwrap_or("No messages yet")
-        .trim();
-    let style = Style::default().fg(session_band_color(detail, unreachable));
+    let clock = facts.clock();
+    let fragment = facts.last_agent_line();
+    let style = facts.style();
     let mut lead_width = prefix.chars().count() + target.chars().count() + 2;
     let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
     if let Some(permission) = permission {
@@ -643,7 +666,7 @@ fn session_top_line(
     let summary_tail = summary
         .strip_prefix(target)
         .expect("session summary starts with its target");
-    let style = Style::default().fg(session_band_color(detail, unreachable));
+    let style = Style::default().fg(session_band_color(detail, unreachable, session.state));
     let mut spans = vec![Span::styled(format!("{prefix}{target}"), style)];
     if let Some(permission) = permission {
         spans.push(Span::styled("  ", style));
@@ -902,8 +925,17 @@ fn session_name(session: &SessionRecord) -> &str {
 /// Color of an active session's summary band. An unreachable target is red so
 /// it stands out; otherwise unread sessions are highlighted and the rest keep
 /// the default. A session whose detail has not loaded yet keeps the default.
-fn session_band_color(detail: Option<&SessionDetail>, unreachable: bool) -> Color {
-    if unreachable {
+/// The colour a session's summary rows carry.
+///
+/// Red means the session needs attention rather than reading: its relay is
+/// unreachable, or the session itself failed. Everything else distinguishes
+/// unread work from work already seen.
+fn session_band_color(
+    detail: Option<&SessionDetail>,
+    unreachable: bool,
+    state: SessionState,
+) -> Color {
+    if unreachable || state == SessionState::Error {
         return Color::Red;
     }
     match detail {
@@ -1159,10 +1191,13 @@ pub(crate) fn minimized_targets_line(dashboard: &DashboardState, width: u16) -> 
     summary_row("Targets", &readings, width)
 }
 
-/// One row summarising every profile's weekly usage, for the collapsed Quota
-/// pane. The figure is the percentage *used*, which is what the full pane's
-/// bar shows filled; its colour comes from the headroom left, so the two
-/// panes agree about when a profile is in trouble.
+/// One row summarising every profile's weekly quota, for the collapsed Quota
+/// pane.
+///
+/// The figure is the percentage *remaining*, which is the number the full
+/// pane's bar prints beside itself: an exhausted profile reads 0% in both. Its
+/// colour comes from that same headroom, so the two panes agree about when a
+/// profile is in trouble.
 pub(crate) fn minimized_quota_line(dashboard: &DashboardState, width: u16) -> Line<'static> {
     let readings = dashboard
         .config
@@ -1193,7 +1228,7 @@ pub(crate) fn minimized_quota_line(dashboard: &DashboardState, width: u16) -> Li
             match remaining {
                 Some(remaining) => SummaryReading {
                     name: id.clone(),
-                    value: format!("{}%", 100_u8.saturating_sub(remaining)),
+                    value: format!("{remaining}%"),
                     color: Some(headroom_color(remaining)),
                 },
                 None => SummaryReading {
@@ -1211,11 +1246,16 @@ pub(crate) fn minimized_quota_line(dashboard: &DashboardState, width: u16) -> Li
 /// the rule the full pane has. Readings are comma-separated and truncated
 /// rather than wrapped, because the row is one row.
 fn summary_row(label: &str, readings: &[SummaryReading], width: u16) -> Line<'static> {
-    let mut spans = vec![Span::raw(format!("{label}  "))];
-    let mut used = label.chars().count() + 2;
-    // Leave room for the rule the title sits against, so the readings never
-    // push it off the row and it never butts straight against a value.
-    let budget = usize::from(width).saturating_sub(6);
+    // A collapsed pane is still a pane, so its one row opens the way a
+    // bordered one does and the rule carries on between the label and the
+    // readings: `─ Quota ── claude-1 63% ────`.
+    const OPENING: &str = "─ ";
+    const DIVIDER: &str = " ── ";
+    let mut spans = vec![Span::raw(format!("{OPENING}{label}{DIVIDER}"))];
+    let mut used = OPENING.chars().count() + label.chars().count() + DIVIDER.chars().count();
+    // Leave room for the rule the title runs into, so the readings never push
+    // it off the row and it never butts straight against a value.
+    let budget = usize::from(width).saturating_sub(4);
     if readings.is_empty() {
         spans.push(Span::raw("none configured "));
         return Line::from(spans);
@@ -2126,26 +2166,42 @@ mod tests {
             current_turn_started_at: Some(1),
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&normal), false), Color::Yellow);
+        assert_eq!(
+            session_band_color(Some(&normal), false, SessionState::Running),
+            Color::Yellow
+        );
 
         let unread = SessionDetail {
             current_turn_started_at: Some(1),
             unread_agent_messages: 1,
             ..SessionDetail::default()
         };
-        assert_eq!(session_band_color(Some(&unread), false), Color::LightYellow);
+        assert_eq!(
+            session_band_color(Some(&unread), false, SessionState::Running),
+            Color::LightYellow
+        );
 
         let unread_idle = SessionDetail {
             unread_agent_messages: 1,
             ..SessionDetail::default()
         };
         assert_eq!(
-            session_band_color(Some(&unread_idle), false),
+            session_band_color(Some(&unread_idle), false, SessionState::Running),
             Color::LightBlue
         );
 
-        let collapsed =
-            collapsed_session_line("› ", "podman", Some(&unread_idle), false, 1, 80, None);
+        let collapsed = collapsed_session_line(
+            "› ",
+            "podman",
+            SessionRowFacts {
+                detail: Some(&unread_idle),
+                unreachable: false,
+                state: SessionState::Running,
+                now_epoch_seconds: 1,
+            },
+            80,
+            None,
+        );
         assert_eq!(collapsed.style.fg, Some(Color::LightBlue));
 
         let restarted_idle = SessionDetail {
@@ -2153,7 +2209,7 @@ mod tests {
             ..SessionDetail::default()
         };
         assert_eq!(
-            session_band_color(Some(&restarted_idle), false),
+            session_band_color(Some(&restarted_idle), false, SessionState::Running),
             Color::LightBlue
         );
 
@@ -2163,15 +2219,31 @@ mod tests {
             ..SessionDetail::default()
         };
         assert_eq!(
-            session_band_color(Some(&restarted_running), false),
+            session_band_color(Some(&restarted_running), false, SessionState::Running),
             Color::LightYellow
         );
 
         // An unreachable target is red, overriding every other state.
-        assert_eq!(session_band_color(Some(&unread), true), Color::Red);
-        assert_eq!(session_band_color(None, true), Color::Red);
-        let unreachable_line =
-            collapsed_session_line("› ", "podman", Some(&unread_idle), true, 1, 80, None);
+        assert_eq!(
+            session_band_color(Some(&unread), true, SessionState::Running),
+            Color::Red
+        );
+        assert_eq!(
+            session_band_color(None, true, SessionState::Running),
+            Color::Red
+        );
+        let unreachable_line = collapsed_session_line(
+            "› ",
+            "podman",
+            SessionRowFacts {
+                detail: Some(&unread_idle),
+                unreachable: true,
+                state: SessionState::Running,
+                now_epoch_seconds: 1,
+            },
+            80,
+            None,
+        );
         assert_eq!(unreachable_line.style.fg, Some(Color::Red));
     }
 
@@ -2530,30 +2602,47 @@ mod tests {
         let lines = drawn(&mut dashboard, 120, 34);
         let targets = lines
             .iter()
-            .find(|line| line.starts_with("Targets"))
+            .find(|line| line.contains("─ Targets ──"))
             .expect("the collapsed Targets row");
         assert!(targets.contains("local 42%"), "{targets:?}");
         let quota = lines
             .iter()
-            .find(|line| line.starts_with("Quota"))
+            .find(|line| line.contains("─ Quota ──"))
             .expect("the collapsed Quota row");
-        // 63% of the weekly window is left, so 37% of it has been used.
-        assert!(quota.contains("claude-1 37%"), "{quota:?}");
+        // The open pane prints the remaining percentage; so does this row.
+        assert!(quota.contains("claude-1 63%"), "{quota:?}");
         // Each collapsed pane is exactly one row.
         assert_eq!(
             lines
                 .iter()
-                .filter(|line| line.starts_with("Targets"))
+                .filter(|line| line.contains("─ Targets ──"))
                 .count(),
             1
         );
         assert_eq!(
             lines
                 .iter()
-                .filter(|line| line.starts_with("Quota"))
+                .filter(|line| line.contains("─ Quota ──"))
                 .count(),
             1
         );
+    }
+
+    /// An exhausted profile reads 0%, the same as the open pane's bar. Showing
+    /// how much has been *used* would read 100% there, which looks like a
+    /// profile in the best possible shape rather than one with nothing left.
+    #[test]
+    fn an_exhausted_quota_reads_zero_in_the_collapsed_row() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.apply_quota(weekly_quota("claude-1", 0));
+        dashboard.toggle_support_panes();
+
+        let quota = drawn(&mut dashboard, 120, 34)
+            .into_iter()
+            .find(|line| line.contains("─ Quota ──"))
+            .expect("the collapsed Quota row");
+        assert!(quota.contains("claude-1 0%"), "{quota:?}");
+        assert!(!quota.contains("claude-1 100%"), "{quota:?}");
     }
 
     /// A reading that cannot be trusted has to say so. A number that is
@@ -2569,7 +2658,7 @@ mod tests {
         let targets = |lines: &[String]| {
             lines
                 .iter()
-                .find(|line| line.starts_with("Targets"))
+                .find(|line| line.contains("─ Targets ──"))
                 .expect("the collapsed Targets row")
                 .clone()
         };
@@ -2594,9 +2683,50 @@ mod tests {
         // A quota that failed to refresh.
         let quota = drawn(&mut dashboard, 120, 34)
             .into_iter()
-            .find(|line| line.starts_with("Quota"))
+            .find(|line| line.contains("─ Quota ──"))
             .expect("the collapsed Quota row");
         assert!(quota.contains("claude-1 unavailable"), "{quota:?}");
+    }
+
+    /// A failed session used to render identically to a healthy one, so the
+    /// only thing that told you it had failed was pressing Enter on it. Red
+    /// is the same signal an unreachable relay carries: this row needs
+    /// attention rather than reading.
+    #[test]
+    fn a_failed_session_draws_a_red_summary_in_both_pane_modes() {
+        for focus in [Focus::Sessions, Focus::Prompt] {
+            let mut healthy = dashboard_with_session(running_session());
+            healthy.focus = focus;
+            let mut failed = {
+                let mut session = running_session();
+                session.state = SessionState::Error;
+                session.last_error = Some("worker bootstrap failed".into());
+                dashboard_with_session(session)
+            };
+            failed.focus = focus;
+
+            let row_colour = |dashboard: &mut DashboardState| {
+                let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+                terminal
+                    .draw(|frame| render(frame, dashboard))
+                    .expect("draw the session list");
+                let buffer = terminal.backend().buffer();
+                let lines = buffer_lines(buffer);
+                let row = lines
+                    .iter()
+                    .position(|line| line.contains("podman"))
+                    .expect("the session's row");
+                let column = cell_column(&lines[row], "podman");
+                buffer[(column, row as u16)].fg
+            };
+
+            assert_eq!(row_colour(&mut failed), Color::Red, "{focus:?}");
+            assert_ne!(
+                row_colour(&mut healthy),
+                Color::Red,
+                "{focus:?}: only a session that needs attention is red"
+            );
+        }
     }
 
     /// The collapsed rows read as pane titles: the pane's rule, plain text,
@@ -2616,9 +2746,9 @@ mod tests {
         // A quiet host has headroom; a busy one does not.
         dashboard.apply_deployment_capacity("local", Ok(Some(host_usage(3))), now_seconds());
         dashboard.apply_deployment_capacity("morannon", Ok(Some(host_usage(95))), now_seconds());
-        // 63% of the weekly window left reads as 37% used, and still healthy.
+        // Plenty of the weekly window left.
         dashboard.apply_quota(weekly_quota("claude-1", 63));
-        // 10% left is 90% used, and in trouble.
+        // Nearly none, and in trouble.
         dashboard.apply_quota(weekly_quota("codex-1", 10));
         dashboard.toggle_support_panes();
 
@@ -2631,7 +2761,7 @@ mod tests {
 
         let targets_row = lines
             .iter()
-            .position(|line| line.starts_with("Targets"))
+            .position(|line| line.contains("─ Targets ──"))
             .expect("the collapsed Targets row");
         let targets = &lines[targets_row];
         assert!(targets.contains("local 3%, morannon 95%"), "{targets:?}");
@@ -2642,11 +2772,11 @@ mod tests {
 
         let quota_row = lines
             .iter()
-            .position(|line| line.starts_with("Quota"))
+            .position(|line| line.contains("─ Quota ──"))
             .expect("the collapsed Quota row");
         assert!(
-            lines[quota_row].contains("claude-1 37%, codex-1 90%"),
-            "{:?}",
+            lines[quota_row].contains("claude-1 63%, codex-1 10%"),
+            "the row reads the remaining percentage the open pane prints: {:?}",
             lines[quota_row]
         );
 
@@ -2659,8 +2789,8 @@ mod tests {
         // the same scale on the headroom it reports.
         assert_eq!(colour_of(targets_row, "3%"), Color::Green);
         assert_eq!(colour_of(targets_row, "95%"), Color::Red);
-        assert_eq!(colour_of(quota_row, "37%"), Color::Green);
-        assert_eq!(colour_of(quota_row, "90%"), Color::Red);
+        assert_eq!(colour_of(quota_row, "63%"), Color::Green);
+        assert_eq!(colour_of(quota_row, "10%"), Color::Red);
         // The label and the names are ordinary text; only the values carry a
         // colour.
         assert_eq!(colour_of(targets_row, "Targets"), Color::Reset);
@@ -2686,7 +2816,7 @@ mod tests {
         let lines = drawn(&mut dashboard, 60, 34);
         let rows = lines
             .iter()
-            .filter(|line| line.starts_with("Targets"))
+            .filter(|line| line.contains("─ Targets ──"))
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1, "{lines:#?}");
         assert!(rows[0].chars().count() <= 60);

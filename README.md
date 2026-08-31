@@ -158,7 +158,7 @@ Prompt.
 mouse wheel or `PageUp`/`PageDown` from wherever you are.
 
 `Ctrl+G` collapses Targets and Quota into one summary row each — host names
-with CPU load, profile names with weekly percentage used — and gives the rows
+with CPU load, profile names with weekly quota remaining — and gives the rows
 they free to the transcript. `Ctrl+G` again brings them back. `F2` opens the
 workspace picker, `F3` the web viewer, and `Ctrl+Q` detaches.
 
