@@ -6,37 +6,43 @@ tests, and dependency-license maintenance.
 
 ## Version contract
 
-A release uses one version everywhere. Before creating `vX.Y.Z`, set `X.Y.Z`
-in:
+All four published crates inherit the release version from
+`[workspace.package]` in the root `Cargo.toml`: `hel-core`, `hel-tui`,
+`hel-cli`, and `hel-voice-worker`.
 
-- The `hel-core`, `hel-tui`, `hel-cli`, and `hel-voice-worker` package versions.
-- The `hel-core` and `hel-tui` dependency constraints in
-  `crates/hel-tui/Cargo.toml` and `crates/hel-cli/Cargo.toml`.
-- The four workspace package entries in `Cargo.lock`.
+Cargo requires published path dependencies to carry a registry version and
+does not allow that version to inherit. The `hel` and `hel-tui` entries under
+`[workspace.dependencies]` therefore repeat the release version. After changing
+the workspace package version, synchronize those entries with:
 
-The relevant manifests are `Cargo.toml`, `crates/hel-tui/Cargo.toml`,
-`crates/hel-cli/Cargo.toml`, and `voice-worker/Cargo.toml`.
+```bash
+node scripts/release-version.mjs sync
+```
 
-`licenses/THIRD_PARTY_LICENSES.html` embeds the workspace versions and must be
-regenerated after the bump. `install.sh`'s `SCRIPT_VERSION` is an independent
-installer logging revision; do not synchronize it to the product version.
+`Cargo.lock` and `licenses/THIRD_PARTY_LICENSES.html` also embed the workspace
+version and must be refreshed before tagging. `install.sh`'s `SCRIPT_VERSION`
+is an independent installer logging revision; do not synchronize it to the
+product version.
 
 ## Release procedure
 
-1. Choose the next version and update every location in the version contract.
-   Do this before creating a tag.
-2. Refresh and inspect the lockfile and generated license report:
+1. Set `[workspace.package] version` in the root `Cargo.toml` to the next
+   version. Do this before creating a tag.
+2. Synchronize the repeated versions, refresh the lockfile, and regenerate the
+   license report:
 
    ```bash
+   node scripts/release-version.mjs sync
    cargo metadata --no-deps --format-version 1 >/dev/null
    cargo about generate --workspace --offline --config licenses/about.toml \
      --locked --fail licenses/about.hbs -o licenses/THIRD_PARTY_LICENSES.html
    ```
 
-3. Validate the candidate version and the repository:
+3. Validate the candidate version and repository:
 
    ```bash
-   scripts/check-release-version.sh vX.Y.Z
+   node scripts/release-version.mjs check vX.Y.Z
+   cargo metadata --locked --no-deps --format-version 1 >/dev/null
    cargo fmt --check
    cargo test
    cargo clippy --all-targets -- -D warnings
@@ -47,7 +53,7 @@ installer logging revision; do not synchronize it to the product version.
    the changes in the release.
 
 4. Commit the version bump and generated files. Push that commit and wait for
-   the branch CI checks to pass. Re-run the version check on the clean commit
+   the branch CI checks to pass. Re-run the version checks on the clean commit
    that will be tagged.
 5. Create and push an annotated tag on that exact commit:
 
@@ -56,11 +62,10 @@ installer logging revision; do not synchronize it to the product version.
    git push origin vX.Y.Z
    ```
 
-6. Watch the `Release Hel` workflow. It checks the tag against all workspace
-   package versions and internal dependency constraints before any build. It
-   then builds and packages x86-64 Linux musl, ARM64 Linux musl, and ARM64 macOS
-   archives, publishes the GitHub Release and checksums, and dispatches the
-   crates.io workflow.
+6. Watch the `Release Hel` workflow. It checks the tag against the workspace
+   version and lockfile before any build. It then packages x86-64 Linux musl,
+   ARM64 Linux musl, and ARM64 macOS archives, publishes the GitHub Release and
+   checksums, and dispatches the crates.io workflow.
 7. Approve the `crates-io` environment when requested. `publish.yml` verifies
    and packages the tagged source before publishing `hel-core`, `hel-tui`,
    `hel-cli`, and `hel-voice-worker` in dependency order. An already-published

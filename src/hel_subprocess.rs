@@ -104,6 +104,40 @@ pub fn run_with_input(command: &mut Command, input: &[u8]) -> Result<Output> {
     Ok(output)
 }
 
+/// Send `signal` to the process group led by `pid`.
+///
+/// Every caller signals a group it created for its own child, and wants that
+/// group gone. `ESRCH` means it already is, so it reports success rather than
+/// a failure. Darwin excludes zombies while counting signalable members of a
+/// group and returns `EPERM` once that count reaches zero, which for a group
+/// we own likewise means only exiting descendants remain. Any other error is
+/// a real teardown failure and is returned so the caller can report it.
+#[cfg(unix)]
+pub fn signal_process_group(pid: i32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: the negated pid targets only the process group this process
+    // created for its own child.
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if group_signal_error_is_ignorable(&error) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(unix)]
+fn group_signal_error_is_ignorable(error: &std::io::Error) -> bool {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if error.raw_os_error() == Some(libc::EPERM) {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +182,60 @@ mod tests {
         let mut command = Command::new("true");
         let output = run_with_input(&mut command, &[]).expect("run_with_input should succeed");
         assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signalling_a_group_that_is_already_gone_succeeds() {
+        // Cancelling a command whose child already exited is the common case;
+        // it must not look like a teardown failure.
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        command.process_group(0);
+        let mut child = command.spawn().expect("spawn short-lived child");
+        let pid = child.id() as i32;
+        child.wait().expect("reap short-lived child");
+
+        signal_process_group(pid, libc::SIGKILL)
+            .expect("signalling an already-exited process group must succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signalling_a_live_group_reports_a_real_failure() {
+        // An invalid signal number is a caller bug, not a group that already
+        // exited, so it must surface instead of being swallowed.
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        command.process_group(0);
+        let mut child = command.spawn().expect("spawn long-lived child");
+        let pid = child.id() as i32;
+
+        let error =
+            signal_process_group(pid, 1234).expect_err("an invalid signal number must be reported");
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+
+        signal_process_group(pid, libc::SIGKILL).expect("terminate the test child");
+        child.wait().expect("reap long-lived child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_signal_error_only_ignores_a_gone_owned_group() {
+        let missing = std::io::Error::from_raw_os_error(libc::ESRCH);
+        assert!(group_signal_error_is_ignorable(&missing));
+
+        let invalid = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(!group_signal_error_is_ignorable(&invalid));
+
+        let denied = std::io::Error::from_raw_os_error(libc::EPERM);
+        #[cfg(target_os = "macos")]
+        assert!(group_signal_error_is_ignorable(&denied));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!group_signal_error_is_ignorable(&denied));
     }
 }
