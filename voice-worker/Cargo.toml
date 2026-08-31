@@ -2,6 +2,7 @@
 name = "hel-voice-worker"
 version.workspace = true
 edition = "2024"
+rust-version.workspace = true
 description = "Native local speech-recognition sidecar for Hel"
 license = "GPL-3.0-only"
 repository = "https://github.com/BrokkAi/hel"

@@ -2,6 +2,7 @@
 name = "hel-cli"
 version.workspace = true
 edition = "2024"
+rust-version.workspace = true
 description = "Hel: session control plane for ACP coding agents (installs the `hel` binary)"
 license = "GPL-3.0-only"
 repository = "https://github.com/BrokkAi/hel"
