@@ -18,13 +18,23 @@ The user-visible payoff: you can read an agent's output, see what your other age
 
 - [x] (2026-08-31) Researched the current split: `crates/hel-tui/src/lib.rs` (dashboard reducer), `crates/hel-tui/src/render.rs` (dashboard rendering), `src/hel_chat.rs` and `src/hel_chat/active.rs` (chat state and rendering), `crates/hel-cli/src/dashboard.rs` (the one event loop and the `View` switch). Wrote this ExecPlan.
 - [x] (2026-08-31) Milestone 1 — Area-scoped chat rendering. `FrameSurfaces::append`/`replace_with` in `src/hel_selection.rs`; `ChatRegions` and `ChatState::frame_surfaces_exclusive` in `src/hel_chat.rs`; `render_in`, `render_chat_footer`, `ActiveChat::draw_in` and `ActiveChat::desired_prompt_height` in `src/hel_chat/active.rs`. The whole-frame `render` is now a thin caller of `render_in`, so the old two-screen behaviour is unchanged.
-- [ ] Milestone 2 — Combined focus model, minimize state, and the rationalized keymap reducer.
-- [ ] Milestone 3 — Sessions pane projection and rendering.
-- [ ] Milestone 4 — The combined renderer and its height allocation.
-- [ ] Milestone 5 — Controller integration: remove `View`, route events, startup session selection, delete the old conversations pane.
-- [ ] Milestone 6 — Documentation, test-harness updates, and full validation.
+- [x] (2026-08-31) Milestone 2 — Combined focus model, minimize state, and the keymap. `Focus` is now public with four stops and `FOCUS_ORDER`; `DashboardState` gained `support_minimized`, `collapsed_project_keys`, `current_session_id` and `selected_session_id`, and lost `session_index` and `expanded_project_key`. `ChatEventOutcome` lost `Back` and `SwitchSession` and gained `CycleFocus`, `ToggleSupportPanes` and `OpenWebDialog`.
+- [x] (2026-08-31) Milestone 3 — Sessions pane projection and rendering (completed: `SessionsRow`, `sessions_rows`, `current_project_key`, `visible_session_indices`, and a rewritten `render_sessions` drawing compact one-line, collapsed one-line, and four-row expanded forms; remaining: the behaviour tests for the five-session threshold and the Others aggregation, which land next).
+- [x] (2026-08-31) Milestone 4 — The combined renderer. `crates/hel-tui/src/combined.rs` holds `render_combined` and `allocate_combined_heights`; `render.rs` gained `minimized_targets_line`, `minimized_quota_line` and `combined_footer_text`, and lost the old three-pane `allocate_pane_heights` and `render_adaptive_dashboard`. Pane titles now read Sessions, Targets and Quota.
+- [x] (2026-08-31) Milestone 5 — Controller integration (completed: `View` deleted, one draw and one hitbox registry, mouse routed by pointer and keys by focus, F2 intercept, startup selection with its two-second bound and its user-input cancellation, the outgoing conversation saved on every switch; remaining: the controller behaviour tests, which land with the Milestone 3 tests).
+- [ ] Milestone 6 — Documentation, test-harness updates, and full validation (completed: `crates/hel-cli/tests/termination_pty.rs` now waits for `Sessions` and quits with Ctrl-Q; remaining: README, `docs/src/content/docs/containers.md`, `.agents/docs/parallel-luna-testing.md`, the two Python labs, and the module docs).
+- [ ] Behaviour tests still to write: the five-session threshold and the Others aggregation, the four-row expanded form, independent collapse, the minimized Targets and Quota rows, and the startup selection and its fallbacks.
 
 ## Surprises & Discoveries
+
+- Observation: Milestones 2 and 5 could not be separated. Changing `ChatEventOutcome` breaks every reference to the conversations pane, and the pane cannot compile without the outcomes it returns, so the pane, its background poller, `ChatFocus`, `OtherSessionIdentity` and `SurfaceId::Conversations` all had to go in the same change as the new focus model. Nothing was lost by doing it early: the Sessions pane already switched sessions through `DashboardAction::Open`, so the only capability missing in between was the in-chat switching shortcut.
+  Evidence: `cargo check -p hel-core` after the outcome change reported `no variant named 'SwitchSession' found for enum 'ChatAction'` at `src/hel_chat/active.rs:161`, inside `neighbour_session`, which is conversations-pane code.
+
+- Observation: `/detach` used to mean "return to the dashboard". With one surface there is nothing to return to, so it now quits and leaves the session running — which is what the word says, and what `Ctrl-Q` does.
+  Evidence: `src/hel_chat.rs`, `LocalCommand::Detach` now yields `ChatAction::QuitDetach`; the command's description in `src/hel_chat/autocomplete.rs` changed from "return to the dashboard without stopping the worker" to "leave Hel without stopping the worker".
+
+- Observation: the P and S legend in the Sessions title explains prefixes that only the expanded rows draw, so on a compact pane it was pure noise competing with the workspace name for title width. The title now carries the legend only while the pane has focus.
+  Evidence: the first live capture at 140x32 read `Sessions · P=time since prompt · S=time since agent activity scratchpad · Hel is other people's agents`, running the whole width with no expanded row on screen.
 
 - Observation: `Ctrl-W` is intercepted globally by the controller before any view sees it, so the chat composer's `Ctrl-W` (kill previous word) has never worked in Hel.
   Evidence: `crates/hel-cli/src/dashboard.rs`, function `workspace_picker_event`, called first inside the event batch loop in `run_dashboard_for_workspace`; `src/hel_chat.rs` `handle_key` has a `KeyCode::Char('w')` arm under `KeyModifiers::CONTROL` that is unreachable. Moving Workspaces to `F2` fixes this as a side effect.
@@ -36,6 +46,14 @@ The user-visible payoff: you can read an agent's output, see what your other age
   Evidence: `crates/hel-cli/tests/termination_pty.rs` line 16 `const READY_MARKER: &[u8] = b"Active";` and line 367 `master.write_all(b"\x1b")`; `tests/e2e/browser_lab.py` line 30 and `tests/e2e/test_hook_chaos.py` lines 67, 71 and 188 all wait for `"Active"`.
 
 ## Decision Log
+
+- Decision: `truncate_line_to_width` moved from `pub(super)` to `pub` in `src/hel_chat/rendering.rs` and is re-exported from `hel::hel_chat`, rather than being deleted as dead code or copied into `hel-tui`.
+  Rationale: it became dead when the conversations pane went, but the Sessions pane needs exactly the same style-preserving truncation. One implementation in one place beats a second copy in the other crate.
+  Date/Author: 2026-08-31, implementer.
+
+- Decision: `select_active_session` no longer moves focus onto the Sessions pane.
+  Rationale: it is called whenever a conversation opens, including from the startup pick and from a background arrival. Stealing the keyboard out of the composer because a session appeared is exactly the kind of surprise the combined surface exists to avoid. The caller decides where focus belongs.
+  Date/Author: 2026-08-31, implementer.
 
 - Decision: The combined renderer lives in `hel-tui` and takes `Option<&mut hel::hel_chat::ActiveChat>`, rather than the chat rendering the support panes.
   Rationale: `hel-tui` already depends on the `hel` library crate (`crates/hel-tui/Cargo.toml`, `hel.workspace = true`), and `ActiveChat` lives in `hel`. The reverse dependency does not exist and must not be created. Putting the whole-frame layout in one place keeps the pane heights, the modal overlay order, and the hitbox registry consistent.

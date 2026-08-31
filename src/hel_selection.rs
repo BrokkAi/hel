@@ -26,8 +26,6 @@ pub enum SurfaceId {
     ReviewerTranscript,
     /// Scrollable message body of an elicitation dialog.
     ElicitationMessage,
-    /// Conversation list beside the transcript.
-    Conversations,
     /// Prompt editor.
     PromptInput,
     /// Dashboard pane, numbered in render order.
@@ -854,7 +852,7 @@ mod tests {
     #[test]
     fn extract_rows_reads_a_partial_first_and_last_row() {
         let buffer = buffer_with_rows(&["abcdefgh", "ijklmnop", "qrstuvwx"], 8);
-        let frame = SurfaceFrame::fixed(SurfaceId::Conversations, Rect::new(0, 0, 8, 3));
+        let frame = SurfaceFrame::fixed(SurfaceId::PromptInput, Rect::new(0, 0, 8, 3));
         let range = SelectionRange {
             start: ContentPos::new(0, 5),
             end: ContentPos::new(2, 2),

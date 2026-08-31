@@ -2056,20 +2056,20 @@ mod tests {
     }
 
     fn open_container_editor(dashboard: &mut DashboardState) {
-        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Char('e')));
         dashboard.handle_key(key(KeyCode::Right));
         dashboard.handle_key(key(KeyCode::Enter));
         assert!(matches!(dashboard.mode, Mode::EditContainer(_)));
     }
 
     fn open_rename_editor(dashboard: &mut DashboardState) {
-        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Char('e')));
         dashboard.handle_key(key(KeyCode::Enter));
         assert!(matches!(dashboard.mode, Mode::Rename(_)));
     }
 
     fn open_stop_dialog(dashboard: &mut DashboardState) {
-        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Char('e')));
         let stop_index = match &dashboard.mode {
             Mode::SessionEdit(dialog) => dialog.stop_index(),
             _ => panic!("expected session edit dialog"),
@@ -2101,7 +2101,10 @@ mod tests {
             hel::hel_state::HelState::default(),
             Default::default(),
         );
-        assert_eq!(empty.handle_key(ctrl_key('e')), DashboardAction::OpenConfig);
+        assert_eq!(
+            empty.handle_key(key(KeyCode::Char('e'))),
+            DashboardAction::OpenConfig
+        );
         assert!(matches!(empty.mode, Mode::Dashboard));
 
         let mut dashboard = dashboard_with_container_session();

@@ -448,7 +448,7 @@ fn wrap_input_line(line: &str, offset: usize, width: usize) -> Vec<Vec<InputGrap
 mod tests {
     use super::*;
     use crate::hel_chat::test_support::{ctrl, key, snapshot};
-    use crate::hel_chat::{ChatAction, active::render};
+    use crate::hel_chat::{ChatAction, active::render_full_frame as render};
     use crate::hel_worker::{ActivePrompt, WorkerPhase};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;

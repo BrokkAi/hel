@@ -795,7 +795,7 @@ pub(super) fn append_trimmed_ellipsis(line: &mut Line<'static>, preserved_spans:
 
 /// Truncate a styled line to `width` characters, keeping each span's style and
 /// marking the cut with `…` in the style of the span it landed in.
-pub(super) fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
+pub fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
     let total = line
         .spans
         .iter()

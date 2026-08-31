@@ -268,11 +268,7 @@ fn matching_indices<T>(
 pub(super) fn builtin_command_choices() -> Vec<CommandChoice> {
     [
         ("help", "show available Hel and agent commands", None),
-        (
-            "detach",
-            "return to the dashboard without stopping the worker",
-            None,
-        ),
+        ("detach", "leave Hel without stopping the worker", None),
         (
             "model",
             "change the active model, queued while the agent is busy",

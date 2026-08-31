@@ -29,6 +29,7 @@ use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
 use crate::resume::ResumeDialog;
 use crate::wizards::{MountFocus, NewWizard, ResumeWizard, WizardStep};
 
+mod combined;
 mod dialogs;
 mod ingest;
 mod render;
@@ -39,16 +40,36 @@ mod wizards;
 #[cfg(test)]
 mod test_support;
 
+pub use crate::combined::render_combined;
 pub use crate::dialogs::{ImportProfileOption, ImportSessionOption};
 pub use crate::ingest::{
     MaterializedProjectionCache, PreparedMaterializedSessionDetail,
     PreparedMaterializedSessionSummary,
 };
-pub use crate::render::render;
 pub use crate::resume::resume_profile_placeholders;
 
-/// Active sessions, capacity, and quotas. Sessions that are not live live in
-/// the resume dialog instead of a dashboard pane.
+/// How many live sessions the compact Sessions list shows in full before it
+/// narrows to the current project and counts the rest.
+pub(crate) const COMPACT_SESSION_LIMIT: usize = 5;
+
+/// One drawn row of the Sessions pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionsRow {
+    /// A project name with its 1-9 toggle number. Focused mode only.
+    ProjectHeading {
+        key: String,
+        label: String,
+        number: Option<usize>,
+    },
+    /// A live session, by index into `ordered_sessions()`. `expanded` picks
+    /// the four-row form over the one-line form.
+    Session { index: usize, expanded: bool },
+    /// The live sessions the compact list left out.
+    Others { active: usize, idle: usize },
+}
+
+/// Sessions, targets, and quotas. Sessions that are not live live in
+/// the resume dialog instead of a support pane.
 pub(crate) const DASHBOARD_PANE_COUNT: usize = 3;
 
 pub(crate) const MOUSE_SCROLL_ROWS: isize = 3;
@@ -222,12 +243,22 @@ impl SessionOperationKind {
     }
 }
 
+/// Which part of the combined surface owns the keyboard.
+///
+/// The three support panes and the composer are one Tab ring; the transcript
+/// is not a stop on it, because it is read with the wheel and PageUp/PageDown
+/// rather than driven from the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Focus {
-    Active,
-    Capacity,
-    Quotas,
+pub enum Focus {
+    Sessions,
+    Quota,
+    Targets,
+    Prompt,
 }
+
+/// Tab order. Shift-Tab walks it backwards.
+pub(crate) const FOCUS_ORDER: [Focus; 4] =
+    [Focus::Sessions, Focus::Quota, Focus::Targets, Focus::Prompt];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -311,11 +342,25 @@ pub struct DashboardState {
     pub(crate) checkpoint_archive_sizes: BTreeMap<String, Option<u64>>,
     pub(crate) session_operations: BTreeMap<String, SessionOperationDisplay>,
     pub(crate) capacity_details: BTreeMap<String, CapacityDetail>,
-    pub(crate) session_index: usize,
+    /// Selection anchor for the Sessions pane, by id rather than position: the
+    /// pane shows different row sets in its compact and focused modes, so a
+    /// position would silently point at a different session when focus moves.
+    pub(crate) selected_session_id: Option<String>,
     pub(crate) capacity_index: usize,
     pub(crate) quota_index: usize,
     pub(crate) focus: Focus,
+    /// Targets and Quota are collapsed to one summary row each and Sessions
+    /// stays compact. While this is true, focus is always [`Focus::Prompt`].
+    pub(crate) support_minimized: bool,
+    /// The session whose conversation is on screen, or is being opened. It
+    /// decides which project the compact Sessions list belongs to.
+    pub(crate) current_session_id: Option<String>,
     pub(crate) pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
+    /// Where the conversation's transcript and composer sat on the last
+    /// frame, so the controller can route a mouse event by what the pointer
+    /// is over rather than by what has focus.
+    pub(crate) chat_transcript_area: Option<Rect>,
+    pub(crate) chat_prompt_area: Option<Rect>,
     pub(crate) resume_sessions_area: Option<Rect>,
     /// Selectable surfaces, rebuilt by every frame in render order so the
     /// selection engine can hit-test the screen the user is looking at.
@@ -330,9 +375,12 @@ pub struct DashboardState {
     /// active session list. Each rect spans the summary line and every
     /// visible preview line beneath it, so a click anywhere on the row
     /// selects it.
-    pub(crate) active_row_areas: Vec<(usize, Rect)>,
+    pub(crate) session_row_areas: Vec<(usize, Rect)>,
     pub(crate) project_heading_areas: Vec<(String, Rect)>,
-    pub(crate) expanded_project_key: Option<String>,
+    /// Projects the user has collapsed in the focused Sessions pane. Absent
+    /// means expanded, so a project that appears later starts expanded without
+    /// any extra bookkeeping.
+    pub(crate) collapsed_project_keys: BTreeSet<String>,
     /// The pane, row index, and time of the most recent left click on a
     /// session row, so the next click can be recognized as a double click.
     last_row_click: Option<(Focus, usize, Instant)>,
@@ -355,18 +403,22 @@ impl DashboardState {
             checkpoint_archive_sizes: BTreeMap::new(),
             session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
-            session_index: 0,
+            selected_session_id: None,
             capacity_index: 0,
             quota_index: 0,
-            focus: Focus::Active,
+            focus: Focus::Sessions,
+            support_minimized: false,
+            current_session_id: None,
             pane_areas: None,
+            chat_transcript_area: None,
+            chat_prompt_area: None,
             resume_sessions_area: None,
             frame_surfaces: FrameSurfaces::new(),
             hidden_native_sessions: BTreeSet::new(),
             resume_rows: Vec::new(),
-            active_row_areas: Vec::new(),
+            session_row_areas: Vec::new(),
             project_heading_areas: Vec::new(),
-            expanded_project_key: None,
+            collapsed_project_keys: BTreeSet::new(),
             last_row_click: None,
             mode: Mode::Dashboard,
             notices: Notices::default(),
@@ -382,12 +434,102 @@ impl DashboardState {
         dashboard
     }
 
+    /// Moves the Sessions selection onto `session_id` without changing focus.
     pub fn select_active_session(&mut self, session_id: &str) {
-        let (active, _) = partition_sessions(self.state.sessions.values());
-        if let Some(index) = active.iter().position(|session| session.id == session_id) {
-            self.focus = Focus::Active;
-            self.session_index = index;
+        if self
+            .state
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.state.is_active())
+        {
+            self.selected_session_id = Some(session_id.to_owned());
         }
+    }
+
+    /// The part of the combined surface that owns the keyboard.
+    pub fn focus(&self) -> Focus {
+        self.focus
+    }
+
+    pub fn prompt_has_focus(&self) -> bool {
+        self.focus == Focus::Prompt
+    }
+
+    pub fn focus_prompt(&mut self) {
+        self.focus = Focus::Prompt;
+    }
+
+    /// Focuses the Sessions pane and restores the support panes, so the pane
+    /// the keyboard lands on is the full one.
+    pub fn focus_sessions(&mut self) {
+        self.support_minimized = false;
+        self.focus = Focus::Sessions;
+        self.clamp_selections();
+    }
+
+    /// Moves focus one stop along the Tab ring, restoring the support panes
+    /// first. That single rule is what makes Tab out of a minimized composer
+    /// bring the panes back and land on Sessions, and Shift-Tab land on
+    /// Targets.
+    pub fn cycle_focus(&mut self, reverse: bool) {
+        self.support_minimized = false;
+        self.focus = cycle_control(self.focus, &FOCUS_ORDER, reverse);
+        self.clamp_selections();
+    }
+
+    /// Collapses or restores Targets and Quota. Minimizing always hands the
+    /// keyboard back to the composer, because the panes it leaves on screen
+    /// are summaries rather than lists.
+    pub fn toggle_support_panes(&mut self) {
+        self.support_minimized = !self.support_minimized;
+        if self.support_minimized {
+            self.focus = Focus::Prompt;
+        }
+        self.clamp_selections();
+    }
+
+    pub fn support_minimized(&self) -> bool {
+        self.support_minimized
+    }
+
+    /// Whether a modal dialog or wizard owns the keyboard.
+    pub fn modal_open(&self) -> bool {
+        !matches!(self.mode, Mode::Dashboard)
+    }
+
+    /// Records the conversation on screen, which decides which project the
+    /// compact Sessions list belongs to.
+    pub fn set_current_session(&mut self, session_id: Option<&str>) {
+        self.current_session_id = session_id.map(str::to_owned);
+        self.clamp_selections();
+    }
+
+    /// When this session's materialized projection last changed, in
+    /// milliseconds since the epoch. `None` while nothing has been projected
+    /// for it yet.
+    pub fn session_activity_at_ms(&self, session_id: &str) -> Option<u64> {
+        self.session_details
+            .get(session_id)
+            .and_then(|detail| detail.last_activity_at_ms)
+    }
+
+    pub fn current_session_id(&self) -> Option<&str> {
+        self.current_session_id.as_deref()
+    }
+
+    /// Whether the pointer is over the conversation the surface is drawing.
+    /// A click there belongs to the chat, whatever has focus.
+    pub fn chat_region_contains(&self, column: u16, row: u16) -> bool {
+        [self.chat_transcript_area, self.chat_prompt_area]
+            .into_iter()
+            .flatten()
+            .any(|area| rect_contains(area, column, row))
+    }
+
+    /// Opens the web-access dialog and asks the controller to load it.
+    pub fn open_web_dialog(&mut self) -> DashboardAction {
+        self.mode = Mode::Web(WebDialog::loading());
+        DashboardAction::LoadWebAccess
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
@@ -418,7 +560,10 @@ impl DashboardState {
         if !text_focused && dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('c') {
             return DashboardAction::QuitDetach;
         }
-        if !text_focused && dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('w') {
+        // Workspaces moved off Ctrl-W and onto F2, because Ctrl-W is the
+        // composer's kill-previous-word and the composer is now always on
+        // screen. Like quit, it answers from every surface including a modal.
+        if key.code == KeyCode::F(2) {
             return DashboardAction::OpenWorkspacePicker;
         }
 
@@ -567,15 +712,16 @@ impl DashboardState {
                 .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
             {
                 let project_key = project_key.clone();
-                self.expand_project(&project_key);
+                self.focus_sessions();
+                self.toggle_project(&project_key);
                 return DashboardAction::None;
             }
             if let Some(&(index, _)) = self
-                .active_row_areas
+                .session_row_areas
                 .iter()
                 .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
             {
-                return self.handle_row_click(Focus::Active, index);
+                return self.handle_row_click(Focus::Sessions, index);
             }
             // The click missed every row; forget any pending double click so
             // a stray click elsewhere can't pair up with the next row click.
@@ -586,10 +732,10 @@ impl DashboardState {
                 .into_iter()
                 .position(|area| rect_contains(area, mouse.column, mouse.row))
                 .map(|index| match index {
-                    0 => Focus::Active,
-                    1 => Focus::Capacity,
-                    2 => Focus::Quotas,
-                    _ => unreachable!("dashboard has exactly three panes"),
+                    0 => Focus::Sessions,
+                    1 => Focus::Targets,
+                    2 => Focus::Quota,
+                    _ => unreachable!("the surface has exactly three support panes"),
                 })
         });
         let Some(hovered) = hovered else {
@@ -598,6 +744,14 @@ impl DashboardState {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_selection_for(hovered, -MOUSE_SCROLL_ROWS),
             MouseEventKind::ScrollDown => self.scroll_selection_for(hovered, MOUSE_SCROLL_ROWS),
+            // A press on a collapsed Targets or Quota row brings the panes
+            // back and hands that pane the keyboard, so one click gets from a
+            // summary to the table it summarises.
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.support_minimized = false;
+                self.focus = hovered;
+                self.clamp_selections();
+            }
             _ => {}
         }
         DashboardAction::None
@@ -606,8 +760,23 @@ impl DashboardState {
     /// Selects the clicked row and, if it's the second click on the same row
     /// within `DOUBLE_CLICK_INTERVAL`, performs the same action Enter would.
     fn handle_row_click(&mut self, focus: Focus, index: usize) -> DashboardAction {
+        // A click on a minimized pane restores it, the same as clicking one of
+        // the collapsed Targets or Quota rows: minimized always means the
+        // composer owns the keyboard, so a click that focuses a pane has to
+        // bring that pane back first.
+        self.support_minimized = false;
         self.focus = focus;
-        self.set_selection_for(focus, index);
+        if focus == Focus::Sessions {
+            let clicked = self
+                .ordered_sessions()
+                .get(index)
+                .map(|session| session.id.clone());
+            if clicked.is_some() {
+                self.selected_session_id = clicked;
+            }
+        } else {
+            self.set_selection_for(focus, index);
+        }
         let now = Instant::now();
         let is_double_click = matches!(
             self.last_row_click,
@@ -625,52 +794,99 @@ impl DashboardState {
         }
     }
 
+    /// Keys for the combined surface's panes.
+    ///
+    /// The composer is a separate focus and never reaches here, so the pane
+    /// actions are plain letters rather than accelerated ones: no key typed at
+    /// a pane can be mistaken for text.
     fn handle_dashboard_key(&mut self, key: KeyEvent) -> DashboardAction {
         let command = dashboard_accelerator(key.modifiers);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        // Keys that mean the same thing wherever the keyboard is.
         match (key.code, command) {
-            (KeyCode::Char('q') | KeyCode::Char('c'), true) | (KeyCode::Esc, _) => {
-                DashboardAction::QuitDetach
+            (KeyCode::Char('c'), true) => return DashboardAction::QuitDetach,
+            (KeyCode::Char('g'), true) => {
+                self.toggle_support_panes();
+                return DashboardAction::None;
             }
+            (KeyCode::F(3), _) => return self.open_web_dialog(),
             (KeyCode::Tab, _) => {
                 self.cycle_focus(false);
-                DashboardAction::None
+                return DashboardAction::None;
             }
             (KeyCode::BackTab, _) => {
                 self.cycle_focus(true);
-                DashboardAction::None
+                return DashboardAction::None;
             }
-            (KeyCode::Char('b'), true) => {
-                self.mode = Mode::Web(WebDialog::loading());
-                DashboardAction::LoadWebAccess
-            }
-            (KeyCode::Up | KeyCode::Char('k'), false) => {
+            // Escape belongs to the composer and to modals. On a pane it does
+            // nothing: the combined surface is quit with Ctrl-Q, and a stray
+            // Escape must never take the whole screen away.
+            (KeyCode::Esc, _) => return DashboardAction::None,
+            _ => {}
+        }
+        // List navigation, shared by all three panes.
+        match (key.code, command) {
+            (KeyCode::Up | KeyCode::Char('k'), false) | (KeyCode::Char('p'), true) => {
                 self.move_selection(-1);
-                DashboardAction::None
+                return DashboardAction::None;
             }
-            (KeyCode::Down | KeyCode::Char('j'), false) => {
+            (KeyCode::Down | KeyCode::Char('j'), false) | (KeyCode::Char('n'), true) => {
                 self.move_selection(1);
-                DashboardAction::None
+                return DashboardAction::None;
             }
             (KeyCode::Home, _) => {
-                self.set_selection(0);
-                DashboardAction::None
+                self.set_selection_for(self.focus, 0);
+                return DashboardAction::None;
             }
             (KeyCode::End, _) => {
-                let len = self.focus_len();
-                self.set_selection(len.saturating_sub(1));
+                let len = self.focus_len_for(self.focus);
+                self.set_selection_for(self.focus, len.saturating_sub(1));
+                return DashboardAction::None;
+            }
+            _ => {}
+        }
+        // Setup and the session editor never both apply: setup only opens
+        // while the config is empty, and an empty config has no sessions.
+        if plain && key.code == KeyCode::Char('e') && self.config_is_empty() {
+            return DashboardAction::OpenConfig;
+        }
+        match self.focus {
+            Focus::Sessions => self.handle_sessions_key(key.code, plain),
+            Focus::Targets => match (key.code, plain) {
+                (KeyCode::Char('r'), true) => DashboardAction::RefreshCapacity,
+                (KeyCode::Enter, _) | (KeyCode::Char('e'), true) => {
+                    self.begin_target_actions();
+                    DashboardAction::None
+                }
+                _ => DashboardAction::None,
+            },
+            Focus::Quota => match (key.code, plain) {
+                (KeyCode::Char('r'), true) => DashboardAction::RefreshQuotas,
+                (KeyCode::Enter, _) | (KeyCode::Char('e'), true) => {
+                    self.begin_profile_rename();
+                    DashboardAction::None
+                }
+                _ => DashboardAction::None,
+            },
+            Focus::Prompt => DashboardAction::None,
+        }
+    }
+
+    /// Keys the Sessions pane owns. All plain, because the composer is
+    /// elsewhere.
+    fn handle_sessions_key(&mut self, code: KeyCode, plain: bool) -> DashboardAction {
+        match (code, plain) {
+            (KeyCode::Enter, _) => self.open_or_resume(),
+            (KeyCode::Char('n'), true) => self.begin_new(),
+            (KeyCode::Char('s'), true) => DashboardAction::OpenResumeDialog,
+            (KeyCode::Char('e'), true) => {
+                self.begin_session_edit();
                 DashboardAction::None
             }
-            (KeyCode::Char('a'), true) if self.focus == Focus::Active => self.mark_all_read(),
-            (KeyCode::Char(digit @ '1'..='9'), false) if self.focus == Focus::Active => {
-                self.expand_project_number(digit.to_digit(10).unwrap_or(0) as usize);
-                DashboardAction::None
-            }
-            (KeyCode::Char(' '), _) if self.focus == Focus::Active => {
-                self.expand_selected_project();
-                DashboardAction::None
-            }
-            (KeyCode::Char('n'), true) if self.focus == Focus::Active => self.begin_new(),
-            (KeyCode::Char('x'), true) if self.focus == Focus::Active => {
+            (KeyCode::Char('a'), true) => self.mark_all_read(),
+            (KeyCode::Char('x'), true) => {
                 let operation = self.selected_session().and_then(|session| {
                     self.session_operations
                         .get(&session.id)
@@ -680,33 +896,13 @@ impl DashboardState {
                     DashboardAction::CancelOperation { session_id, kind }
                 })
             }
-            (KeyCode::Char('s'), true) if self.focus == Focus::Active => {
-                DashboardAction::OpenResumeDialog
-            }
-            (KeyCode::Char('r'), true) if self.focus == Focus::Capacity => {
-                DashboardAction::RefreshCapacity
-            }
-            (KeyCode::Char('r'), true) if self.focus == Focus::Quotas => {
-                DashboardAction::RefreshQuotas
-            }
-            // Setup and the container editor never both apply: setup only
-            // opens while the config is empty, and an empty config has no
-            // sessions to select.
-            (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
-            (KeyCode::Char('e'), true) if self.focus == Focus::Active => {
-                self.begin_session_edit();
+            (KeyCode::Char(' '), true) => {
+                self.toggle_selected_project();
                 DashboardAction::None
             }
-            (KeyCode::Char('e'), true) if self.focus == Focus::Capacity => {
-                self.begin_target_actions();
+            (KeyCode::Char(digit @ '1'..='9'), true) => {
+                self.toggle_project_number(digit.to_digit(10).unwrap_or(0) as usize);
                 DashboardAction::None
-            }
-            (KeyCode::Char('e'), true) if self.focus == Focus::Quotas => {
-                self.begin_profile_rename();
-                DashboardAction::None
-            }
-            (KeyCode::Enter, _) | (KeyCode::Char('o'), true) if self.focus == Focus::Active => {
-                self.open_or_resume()
             }
             _ => DashboardAction::None,
         }
@@ -730,10 +926,6 @@ impl DashboardState {
     }
 
     fn open_or_resume(&mut self) -> DashboardAction {
-        if self.focus == Focus::Active && !self.selected_project_is_expanded() {
-            self.expand_selected_project();
-            return DashboardAction::None;
-        }
         let Some(session) = self.selected_session() else {
             return DashboardAction::None;
         };
@@ -767,10 +959,136 @@ impl DashboardState {
     }
 
     pub(crate) fn selected_session(&self) -> Option<&SessionRecord> {
-        if self.focus != Focus::Active {
-            return None;
+        let selected = self.selected_session_id.as_deref()?;
+        self.ordered_sessions()
+            .into_iter()
+            .find(|session| session.id == selected)
+    }
+
+    /// The live sessions the Sessions pane is showing, as indices into
+    /// [`Self::ordered_sessions`].
+    pub(crate) fn visible_session_indices(&self) -> Vec<usize> {
+        self.sessions_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SessionsRow::Session { index, .. } => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The project the compact list belongs to: the conversation on screen,
+    /// falling back to whatever the pane has selected.
+    pub(crate) fn current_project_key(&self) -> Option<String> {
+        self.current_session_id
+            .as_deref()
+            .and_then(|id| self.state.sessions.get(id))
+            .filter(|session| session.state.is_active())
+            .or_else(|| self.selected_session())
+            .map(|session| self.project_source(session).key)
+    }
+
+    /// The rows the Sessions pane draws.
+    ///
+    /// The pane has two modes. Focused, it is the full list: every project,
+    /// with a heading and four rows per expanded session. Unfocused, it is a
+    /// one-line-per-session summary that stays small — and once more than
+    /// [`COMPACT_SESSION_LIMIT`] sessions are live it narrows to the current
+    /// project and counts the rest, because a list longer than that stops
+    /// being glanceable and starts eating the transcript.
+    pub(crate) fn sessions_rows(&self) -> Vec<SessionsRow> {
+        let sessions = self.ordered_sessions();
+        if self.focus == Focus::Sessions {
+            return self.expanded_sessions_rows(&sessions);
         }
-        self.ordered_sessions().get(self.session_index).copied()
+        if sessions.len() <= COMPACT_SESSION_LIMIT {
+            return (0..sessions.len())
+                .map(|index| SessionsRow::Session {
+                    index,
+                    expanded: false,
+                })
+                .collect();
+        }
+        let current = self.current_project_key();
+        let mut rows = Vec::new();
+        let mut active = 0;
+        let mut idle = 0;
+        for (index, session) in sessions.iter().enumerate() {
+            if current
+                .as_ref()
+                .is_some_and(|key| *key == self.project_source(session).key)
+            {
+                rows.push(SessionsRow::Session {
+                    index,
+                    expanded: false,
+                });
+            } else if self
+                .session_details
+                .get(&session.id)
+                .is_some_and(|detail| detail.current_turn_started_at.is_some())
+            {
+                active += 1;
+            } else {
+                idle += 1;
+            }
+        }
+        if active + idle > 0 {
+            rows.push(SessionsRow::Others { active, idle });
+        }
+        rows
+    }
+
+    fn expanded_sessions_rows(&self, sessions: &[&SessionRecord]) -> Vec<SessionsRow> {
+        // Two projects can share a short name, in which case both need their
+        // full names to stay distinguishable.
+        let mut short_names = BTreeMap::<String, BTreeSet<String>>::new();
+        for session in sessions {
+            let source = self.project_source(session);
+            short_names
+                .entry(source.short)
+                .or_default()
+                .insert(source.key);
+        }
+        let numbered = self.project_keys().len() > 1;
+        let mut rows = Vec::new();
+        let mut previous = None;
+        let mut number = 0;
+        for (index, session) in sessions.iter().enumerate() {
+            let source = self.project_source(session);
+            if previous.as_ref() != Some(&source.key) {
+                number += 1;
+                let label = if short_names
+                    .get(&source.short)
+                    .is_some_and(|projects| projects.len() > 1)
+                {
+                    source.full.clone()
+                } else {
+                    source.short.clone()
+                };
+                rows.push(SessionsRow::ProjectHeading {
+                    key: source.key.clone(),
+                    label,
+                    number: (numbered && number <= 9).then_some(number),
+                });
+                previous = Some(source.key.clone());
+            }
+            rows.push(SessionsRow::Session {
+                index,
+                expanded: !self.collapsed_project_keys.contains(&source.key),
+            });
+        }
+        rows
+    }
+
+    /// Where the selection sits among the rows on screen, for the table's
+    /// highlight. `None` when nothing is selected or the selection is not on
+    /// screen.
+    pub(crate) fn selected_visible_index(&self) -> Option<usize> {
+        let selected = self.selected_session_id.as_deref()?;
+        let sessions = self.ordered_sessions();
+        self.visible_session_indices()
+            .into_iter()
+            .position(|index| sessions.get(index).is_some_and(|s| s.id == selected))
     }
 
     /// The sessions the dashboard lists, in creation order. Only live
@@ -817,44 +1135,37 @@ impl DashboardState {
         keys
     }
 
-    pub(crate) fn project_is_expanded(&self, session: &SessionRecord) -> bool {
-        let keys = self.project_keys();
-        keys.len() <= 1
-            || self.expanded_project_key.as_ref() == Some(&self.project_source(session).key)
+    /// Whether this session's project draws its full four-row form. Projects
+    /// default to expanded; only an explicit collapse takes that away.
+    pub fn project_is_expanded(&self, session: &SessionRecord) -> bool {
+        !self
+            .collapsed_project_keys
+            .contains(&self.project_source(session).key)
     }
 
-    fn selected_project_is_expanded(&self) -> bool {
-        self.selected_session()
-            .is_none_or(|session| self.project_is_expanded(session))
-    }
-
-    fn expand_project(&mut self, project_key: &str) {
-        self.expanded_project_key = Some(project_key.to_owned());
-        if let Some(index) = self
-            .ordered_sessions()
-            .iter()
-            .position(|session| self.project_source(session).key == project_key)
-        {
-            self.focus = Focus::Active;
-            self.session_index = index;
+    /// Collapses an expanded project or expands a collapsed one, leaving
+    /// every other project alone.
+    fn toggle_project(&mut self, project_key: &str) {
+        if !self.collapsed_project_keys.remove(project_key) {
+            self.collapsed_project_keys.insert(project_key.to_owned());
         }
     }
 
-    fn expand_selected_project(&mut self) {
+    fn toggle_selected_project(&mut self) {
         let key = self
             .selected_session()
             .map(|session| self.project_source(session).key);
         if let Some(key) = key {
-            self.expanded_project_key = Some(key);
+            self.toggle_project(&key);
         }
     }
 
-    fn expand_project_number(&mut self, number: usize) {
+    fn toggle_project_number(&mut self, number: usize) {
         if number == 0 {
             return;
         }
         if let Some(key) = self.project_keys().get(number - 1).cloned() {
-            self.expand_project(&key);
+            self.toggle_project(&key);
         }
     }
 
@@ -933,37 +1244,44 @@ impl DashboardState {
         self.rebuild_resume_rows();
     }
 
-    fn focus_len(&self) -> usize {
-        self.focus_len_for(self.focus)
-    }
-
     fn focus_len_for(&self, focus: Focus) -> usize {
         match focus {
-            Focus::Active => self.ordered_sessions().len(),
-            Focus::Capacity => self.capacity_details.len(),
-            Focus::Quotas => self.config.profiles.len(),
+            Focus::Sessions => self.visible_session_indices().len(),
+            Focus::Targets => self.capacity_details.len(),
+            Focus::Quota => self.config.profiles.len(),
+            Focus::Prompt => 0,
         }
     }
 
-    fn set_selection(&mut self, index: usize) {
-        self.set_selection_for(self.focus, index);
-    }
-
+    /// Moves the focused list's selection to `index`, counted among the rows
+    /// currently on screen.
     fn set_selection_for(&mut self, focus: Focus, index: usize) {
         match focus {
-            Focus::Active => self.session_index = index,
-            Focus::Capacity => self.capacity_index = index,
-            Focus::Quotas => self.quota_index = index,
+            Focus::Sessions => {
+                let sessions = self.ordered_sessions();
+                self.selected_session_id = self
+                    .visible_session_indices()
+                    .get(index)
+                    .and_then(|session| sessions.get(*session))
+                    .map(|session| session.id.clone());
+            }
+            Focus::Targets => self.capacity_index = index,
+            Focus::Quota => self.quota_index = index,
+            Focus::Prompt => {}
+        }
+    }
+
+    fn selection_for(&self, focus: Focus) -> usize {
+        match focus {
+            Focus::Sessions => self.selected_visible_index().unwrap_or(0),
+            Focus::Targets => self.capacity_index,
+            Focus::Quota => self.quota_index,
+            Focus::Prompt => 0,
         }
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.focus_len();
-        match self.focus {
-            Focus::Active => move_index(&mut self.session_index, len, delta),
-            Focus::Capacity => move_index(&mut self.capacity_index, len, delta),
-            Focus::Quotas => move_index(&mut self.quota_index, len, delta),
-        }
+        self.scroll_selection_for(self.focus, delta);
     }
 
     fn scroll_selection_for(&mut self, focus: Focus, delta: isize) {
@@ -972,49 +1290,31 @@ impl DashboardState {
             self.set_selection_for(focus, 0);
             return;
         }
-        let current = match focus {
-            Focus::Active => self.session_index,
-            Focus::Capacity => self.capacity_index,
-            Focus::Quotas => self.quota_index,
-        };
-        let next = if delta.is_negative() {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            current
-                .saturating_add(delta as usize)
-                .min(len.saturating_sub(1))
-        };
-        self.set_selection_for(focus, next);
-    }
-
-    fn cycle_focus(&mut self, reverse: bool) {
-        self.focus = match (self.focus, reverse) {
-            (Focus::Active, false) | (Focus::Quotas, true) => Focus::Capacity,
-            (Focus::Capacity, false) | (Focus::Active, true) => Focus::Quotas,
-            (Focus::Quotas, false) | (Focus::Capacity, true) => Focus::Active,
-        };
-        let active_len = self.ordered_sessions().len();
-        if self.focus == Focus::Active {
-            self.session_index = self.session_index.min(active_len.saturating_sub(1));
-        }
+        let mut index = self.selection_for(focus).min(len.saturating_sub(1));
+        move_index(&mut index, len, delta);
+        self.set_selection_for(focus, index);
     }
 
     pub(crate) fn clamp_selections(&mut self) {
-        let active_len = self.ordered_sessions().len();
-        self.session_index = self.session_index.min(active_len.saturating_sub(1));
-        let project_keys = self.project_keys();
-        if project_keys.len() == 1 {
-            self.expanded_project_key = project_keys.first().cloned();
-        } else if !self
-            .expanded_project_key
+        // The selection is anchored by id, so it survives the list changing
+        // under it; it only moves when the session it named stopped being on
+        // screen.
+        let sessions = self.ordered_sessions();
+        let visible = self
+            .visible_session_indices()
+            .into_iter()
+            .filter_map(|index| sessions.get(index).map(|session| session.id.clone()))
+            .collect::<Vec<_>>();
+        if !self
+            .selected_session_id
             .as_ref()
-            .is_some_and(|key| project_keys.contains(key))
+            .is_some_and(|id| visible.contains(id))
         {
-            self.expanded_project_key = self
-                .selected_session()
-                .map(|session| self.project_source(session).key)
-                .or_else(|| project_keys.first().cloned());
+            self.selected_session_id = visible.first().cloned();
         }
+        let project_keys = self.project_keys();
+        self.collapsed_project_keys
+            .retain(|key| project_keys.contains(key));
         self.quota_index = self
             .quota_index
             .min(self.config.profiles.len().saturating_sub(1));
@@ -1119,33 +1419,46 @@ mod tests {
 
     use crate::render::render;
 
+    /// The composer is a separate focus, so a pane's actions are plain
+    /// letters: nothing typed at a pane can be mistaken for prompt text.
     #[test]
-    fn dashboard_actions_require_control_while_navigation_does_not() {
+    fn plain_keys_drive_the_focused_pane() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
         assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('s'))),
+            DashboardAction::OpenResumeDialog
+        );
+        dashboard.cancel_modal();
+        assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('n'))),
             DashboardAction::None
         );
-        assert!(matches!(dashboard.mode, Mode::Dashboard));
+        assert!(matches!(dashboard.mode, Mode::New(_)));
+        dashboard.cancel_modal();
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('q'))),
+            dashboard.handle_key(key(KeyCode::Char('e'))),
             DashboardAction::None
         );
-        assert_eq!(dashboard.handle_key(ctrl_key('k')), DashboardAction::None);
-        assert_eq!(dashboard.handle_key(ctrl_key('u')), DashboardAction::None);
+        assert!(matches!(dashboard.mode, Mode::SessionEdit(_)));
+        dashboard.cancel_modal();
+        // A pane key that belongs to a different pane does nothing here.
         assert_eq!(
-            dashboard.handle_key(ctrl_key('s')),
-            DashboardAction::OpenResumeDialog
+            dashboard.handle_key(key(KeyCode::Char('r'))),
+            DashboardAction::None
         );
+
         assert_eq!(
-            dashboard.handle_key(ctrl_key('w')),
+            dashboard.handle_key(key(KeyCode::F(2))),
             DashboardAction::OpenWorkspacePicker
         );
-        assert_eq!(dashboard.handle_key(ctrl_key('t')), DashboardAction::None);
-        assert_eq!(dashboard.handle_key(ctrl_key('i')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::F(3))),
+            DashboardAction::LoadWebAccess
+        );
+        dashboard.cancel_modal();
         assert_eq!(
             dashboard.handle_key(ctrl_key('v')),
             DashboardAction::PasteFromClipboard
@@ -1154,47 +1467,205 @@ mod tests {
             dashboard.handle_key(ctrl_key('q')),
             DashboardAction::QuitDetach
         );
-
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Tab)),
-            DashboardAction::None
-        );
-        assert_eq!(dashboard.focus, Focus::Capacity);
     }
 
     #[test]
-    fn dashboard_action_hotkeys_follow_the_focused_pane() {
+    fn pane_actions_follow_the_focused_pane() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
-        assert_eq!(dashboard.handle_key(ctrl_key('r')), DashboardAction::None);
-        assert_eq!(
-            dashboard.handle_key(ctrl_key('b')),
-            DashboardAction::LoadWebAccess
-        );
-        dashboard.cancel_modal();
-
         dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Capacity);
-        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Targets);
         assert_eq!(
-            dashboard.handle_key(ctrl_key('r')),
+            dashboard.handle_key(key(KeyCode::Char('r'))),
             DashboardAction::RefreshCapacity
         );
         assert_eq!(
-            dashboard.handle_key(ctrl_key('w')),
-            DashboardAction::OpenWorkspacePicker
+            dashboard.handle_key(key(KeyCode::Char('n'))),
+            DashboardAction::None,
+            "n creates a session only from the Sessions pane"
         );
 
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Quotas);
-        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
+        dashboard.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dashboard.focus, Focus::Quota);
         assert_eq!(
-            dashboard.handle_key(ctrl_key('r')),
+            dashboard.handle_key(key(KeyCode::Char('r'))),
             DashboardAction::RefreshQuotas
         );
-        assert_eq!(dashboard.handle_key(ctrl_key('u')), DashboardAction::None);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('e'))),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::ConfigId(_)));
+    }
+
+    #[test]
+    fn tab_walks_sessions_quota_targets_prompt_and_back() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        assert_eq!(dashboard.focus, Focus::Sessions);
+
+        for expected in [Focus::Quota, Focus::Targets, Focus::Prompt, Focus::Sessions] {
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Tab)),
+                DashboardAction::None
+            );
+            assert_eq!(dashboard.focus, expected);
+        }
+    }
+
+    #[test]
+    fn shift_tab_walks_the_reverse_order() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        for expected in [Focus::Prompt, Focus::Targets, Focus::Quota, Focus::Sessions] {
+            dashboard.handle_key(key(KeyCode::BackTab));
+            assert_eq!(dashboard.focus, expected);
+        }
+    }
+
+    /// Minimizing leaves only summary rows behind, so the keyboard goes back
+    /// to the one surface that is still a full control: the composer.
+    #[test]
+    fn ctrl_g_minimizes_and_always_focuses_prompt() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Targets);
+
+        assert_eq!(dashboard.handle_key(ctrl_key('g')), DashboardAction::None);
+        assert!(dashboard.support_minimized());
+        assert_eq!(dashboard.focus, Focus::Prompt);
+
+        assert_eq!(dashboard.handle_key(ctrl_key('g')), DashboardAction::None);
+        assert!(!dashboard.support_minimized());
+        assert_eq!(
+            dashboard.focus,
+            Focus::Prompt,
+            "restoring the panes keeps the composer"
+        );
+    }
+
+    #[test]
+    fn tab_from_a_minimized_prompt_restores_the_panes_it_walks_into() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+
+        let mut forward = dashboard_with_session(session.clone());
+        forward.handle_key(ctrl_key('g'));
+        forward.handle_key(key(KeyCode::Tab));
+        assert!(!forward.support_minimized());
+        assert_eq!(forward.focus, Focus::Sessions);
+
+        let mut reverse = dashboard_with_session(session);
+        reverse.handle_key(ctrl_key('g'));
+        reverse.handle_key(key(KeyCode::BackTab));
+        assert!(!reverse.support_minimized());
+        assert_eq!(reverse.focus, Focus::Targets);
+    }
+
+    /// The combined surface is quit with Ctrl-Q. A stray Escape must never
+    /// take the conversation off the screen.
+    #[test]
+    fn escape_never_quits_the_combined_surface() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        for expected in [Focus::Sessions, Focus::Quota, Focus::Targets, Focus::Prompt] {
+            assert_eq!(dashboard.focus, expected);
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Esc)),
+                DashboardAction::None,
+                "{expected:?}"
+            );
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_move_the_focused_list() {
+        let sessions = (0..3)
+            .map(|index| {
+                let mut session = stopped_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(dashboard.selected_visible_index(), Some(0));
+        dashboard.handle_key(ctrl_key('n'));
+        dashboard.handle_key(ctrl_key('n'));
+        assert_eq!(dashboard.selected_visible_index(), Some(2));
+        dashboard.handle_key(ctrl_key('p'));
+        assert_eq!(dashboard.selected_visible_index(), Some(1));
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Quota);
+        dashboard.handle_key(ctrl_key('n'));
+        assert_eq!(dashboard.quota_index, 1);
+        dashboard.handle_key(ctrl_key('p'));
+        assert_eq!(dashboard.quota_index, 0);
+    }
+
+    /// Each numbered project answers only for itself, so several can be
+    /// collapsed at once and the rest stay expanded.
+    #[test]
+    fn digits_toggle_projects_independently() {
+        let sessions = (0..3)
+            .map(|index| {
+                let mut session = stopped_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                session.project_directory = Some(format!("/projects/p{index}").into());
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        let keys = dashboard.project_keys();
+        assert_eq!(keys.len(), 3);
+        let expanded = |dashboard: &DashboardState| {
+            dashboard
+                .project_keys()
+                .into_iter()
+                .map(|key| !dashboard.collapsed_project_keys.contains(&key))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(expanded(&dashboard), [true, true, true]);
+
+        dashboard.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(expanded(&dashboard), [false, true, true]);
+        dashboard.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(expanded(&dashboard), [false, true, false]);
+        dashboard.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(expanded(&dashboard), [true, true, false]);
     }
 
     #[test]
@@ -1210,7 +1681,7 @@ mod tests {
         );
 
         assert_eq!(
-            dashboard.handle_key(ctrl_key('x')),
+            dashboard.handle_key(key(KeyCode::Char('x'))),
             DashboardAction::CancelOperation {
                 session_id,
                 kind: SessionOperationKind::Launching,
@@ -1261,7 +1732,7 @@ mod tests {
         let shown_at = Instant::now();
 
         assert_eq!(
-            dashboard.handle_key_at(ctrl_key('a'), shown_at),
+            dashboard.handle_key_at(key(KeyCode::Char('a')), shown_at),
             DashboardAction::None
         );
         assert_eq!(dashboard.notice().as_deref(), Some("No unread sessions."));
@@ -1270,7 +1741,10 @@ mod tests {
     #[test]
     fn ctrl_q_quits_without_mutating_any_dashboard_modal() {
         let mut new_session = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        assert_eq!(new_session.handle_key(ctrl_key('n')), DashboardAction::None);
+        assert_eq!(
+            new_session.handle_key(key(KeyCode::Char('n'))),
+            DashboardAction::None
+        );
 
         let mut resume = dashboard_with_session(stopped_session());
         assert_eq!(open_resume_wizard(&mut resume), DashboardAction::None);
@@ -1279,7 +1753,10 @@ mod tests {
         running.state = SessionState::Running;
         running.checkpoint = None;
         let mut rename = dashboard_with_session(running);
-        assert_eq!(rename.handle_key(ctrl_key('e')), DashboardAction::None);
+        assert_eq!(
+            rename.handle_key(key(KeyCode::Char('e'))),
+            DashboardAction::None
+        );
         assert_eq!(
             rename.handle_key(key(KeyCode::Enter)),
             DashboardAction::None
@@ -1364,8 +1841,7 @@ mod tests {
             Some("session-0")
         );
         dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Capacity);
-        assert!(dashboard.selected_session().is_none());
+        assert_eq!(dashboard.focus, Focus::Quota);
     }
 
     #[test]
@@ -1436,7 +1912,7 @@ mod tests {
         );
 
         assert_eq!(
-            dashboard.handle_key(ctrl_key('a')),
+            dashboard.handle_key(key(KeyCode::Char('a'))),
             DashboardAction::MarkAllRead {
                 receipts: vec![("session-1".into(), 4)]
             }
@@ -1461,7 +1937,7 @@ mod tests {
         );
 
         assert_eq!(
-            dashboard.handle_key(ctrl_key('a')),
+            dashboard.handle_key(key(KeyCode::Char('a'))),
             DashboardAction::MarkAllRead {
                 receipts: vec![("session-1".into(), 3)]
             }
@@ -1477,7 +1953,7 @@ mod tests {
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
-        dashboard.handle_key(ctrl_key('e'));
+        dashboard.handle_key(key(KeyCode::Char('e')));
         dashboard.handle_key(key(KeyCode::Enter));
         let Mode::Rename(editor) = &mut dashboard.mode else {
             panic!("expected rename editor")
@@ -1492,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_navigation_keeps_four_distinct_panes() {
+    fn the_tab_ring_visits_every_pane_and_keeps_the_session_selection() {
         let mut active = stopped_session();
         active.id = "session-0".into();
         active.state = SessionState::Running;
@@ -1512,26 +1988,23 @@ mod tests {
         );
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
 
-        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.focus, Focus::Sessions);
         assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
         dashboard.handle_key(key(KeyCode::Down));
         assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
 
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Capacity);
-        assert!(dashboard.selected_session().is_none());
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Quotas);
-        assert!(dashboard.selected_session().is_none());
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Active);
+        // The selection is anchored by session id, so it survives focus
+        // moving away and Tab lands the user back where they were.
+        for expected in [Focus::Quota, Focus::Targets, Focus::Prompt, Focus::Sessions] {
+            dashboard.handle_key(key(KeyCode::Tab));
+            assert_eq!(dashboard.focus, expected);
+            assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
+        }
 
-        dashboard.handle_key(key(KeyCode::BackTab));
-        assert_eq!(dashboard.focus, Focus::Quotas);
-        dashboard.handle_key(key(KeyCode::BackTab));
-        assert_eq!(dashboard.focus, Focus::Capacity);
-        dashboard.handle_key(key(KeyCode::BackTab));
-        assert_eq!(dashboard.focus, Focus::Active);
+        for expected in [Focus::Prompt, Focus::Targets, Focus::Quota, Focus::Sessions] {
+            dashboard.handle_key(key(KeyCode::BackTab));
+            assert_eq!(dashboard.focus, expected);
+        }
     }
 
     #[test]
@@ -1555,19 +2028,30 @@ mod tests {
             BTreeMap::new(),
         );
 
-        assert_eq!(dashboard.session_index, 0);
+        assert_eq!(dashboard.selected_visible_index(), Some(0));
         dashboard.handle_key(key(KeyCode::Up));
-        assert_eq!(dashboard.session_index, 0, "Up at the first row stays put");
+        assert_eq!(
+            dashboard.selected_visible_index(),
+            Some(0),
+            "Up at the first row stays put"
+        );
 
         dashboard.handle_key(key(KeyCode::Down));
         dashboard.handle_key(key(KeyCode::Down));
-        assert_eq!(dashboard.session_index, 2);
+        assert_eq!(dashboard.selected_visible_index(), Some(2));
         dashboard.handle_key(key(KeyCode::Down));
-        assert_eq!(dashboard.session_index, 2, "Down at the last row stays put");
+        assert_eq!(
+            dashboard.selected_visible_index(),
+            Some(2),
+            "Down at the last row stays put"
+        );
     }
 
+    /// Every project starts expanded, and a collapsed one is still a list of
+    /// sessions: Enter opens the row under the caret rather than spending the
+    /// key on the group.
     #[test]
-    fn opening_the_selected_project_group_preserves_the_selected_session() {
+    fn enter_opens_the_selected_session_even_inside_a_collapsed_project() {
         let sessions = (0..3)
             .map(|index| {
                 let mut session = stopped_session();
@@ -1592,26 +2076,23 @@ mod tests {
             },
             BTreeMap::new(),
         );
-        let other_key = dashboard
-            .project_source(&dashboard.state.sessions["session-2"])
-            .key;
-        dashboard.expand_project(&other_key);
-        dashboard.session_index = dashboard
-            .ordered_sessions()
-            .iter()
-            .position(|session| session.id == "session-1")
-            .unwrap();
-        let selected_index = dashboard.session_index;
-        assert!(!dashboard.selected_project_is_expanded());
-
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
+        dashboard.select_active_session("session-1");
+        assert!(
+            dashboard.project_is_expanded(dashboard.selected_session().unwrap()),
+            "projects default to expanded"
         );
 
-        assert_eq!(dashboard.session_index, selected_index);
+        // Collapsing the selected session's project leaves the selection, and
+        // Enter still opens it.
+        dashboard.handle_key(key(KeyCode::Char(' ')));
+        assert!(!dashboard.project_is_expanded(dashboard.selected_session().unwrap()));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::Open {
+                session_id: "session-1".into()
+            }
+        );
         assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
-        assert!(dashboard.selected_project_is_expanded());
     }
 
     #[test]
@@ -1641,15 +2122,15 @@ mod tests {
         let pane_areas = dashboard.pane_areas.expect("dashboard pane hitboxes");
 
         dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[0]));
-        assert_eq!(dashboard.session_index, 3);
+        assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 3);
         dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane_areas[0]));
-        assert_eq!(dashboard.session_index, 0);
+        assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 0);
 
-        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.focus, Focus::Sessions);
         dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[2]));
         assert_eq!(dashboard.quota_index, 2);
-        assert_eq!(dashboard.session_index, 0);
-        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 0);
+        assert_eq!(dashboard.focus, Focus::Sessions);
     }
 
     #[test]
@@ -1659,10 +2140,14 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw active row hitboxes");
-        assert_eq!(dashboard.session_index, 0, "starts on the first session");
+        assert_eq!(
+            dashboard.selected_visible_index().unwrap_or(0),
+            0,
+            "starts on the first session"
+        );
 
         let (_, row) = *dashboard
-            .active_row_areas
+            .session_row_areas
             .iter()
             .find(|(index, _)| *index == 2)
             .expect("the third active row has a recorded hitbox");
@@ -1679,10 +2164,11 @@ mod tests {
         ));
 
         assert_eq!(
-            dashboard.session_index, 2,
+            dashboard.selected_visible_index().unwrap_or(0),
+            2,
             "clicking the tail line selected the row, not just its summary line"
         );
-        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.focus, Focus::Sessions);
     }
 
     #[test]
@@ -1694,7 +2180,7 @@ mod tests {
             .expect("draw active row hitboxes");
 
         let (_, row) = *dashboard
-            .active_row_areas
+            .session_row_areas
             .iter()
             .find(|(index, _)| *index == 1)
             .expect("the second active row has a recorded hitbox");
@@ -1705,7 +2191,7 @@ mod tests {
         ));
 
         assert_eq!(action, DashboardAction::None);
-        assert_eq!(dashboard.session_index, 1);
+        assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 1);
     }
 
     #[test]
@@ -1717,7 +2203,7 @@ mod tests {
             .expect("draw active row hitboxes");
 
         let (_, row) = *dashboard
-            .active_row_areas
+            .session_row_areas
             .iter()
             .find(|(index, _)| *index == 1)
             .expect("the second active row has a recorded hitbox");
@@ -1734,7 +2220,7 @@ mod tests {
             },
             "a quick second click on the same row opens it, matching Enter"
         );
-        assert_eq!(dashboard.session_index, 1);
+        assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 1);
     }
 
     #[test]
@@ -1747,7 +2233,7 @@ mod tests {
 
         let row_for = |index: usize| {
             *dashboard
-                .active_row_areas
+                .session_row_areas
                 .iter()
                 .find(|(row_index, _)| *row_index == index)
                 .map(|(_, area)| area)
@@ -1772,7 +2258,8 @@ mod tests {
         ));
         assert_eq!(second, DashboardAction::None);
         assert_eq!(
-            dashboard.session_index, 1,
+            dashboard.selected_visible_index().unwrap_or(0),
+            1,
             "the second click's row is selected"
         );
     }
@@ -1827,7 +2314,7 @@ mod tests {
             },
             BTreeMap::new(),
         );
-        dashboard.focus = Focus::Quotas;
+        dashboard.focus = Focus::Quota;
 
         let mut refreshed = dashboard.state.clone();
         refreshed
@@ -1836,7 +2323,10 @@ mod tests {
         dashboard.set_state(refreshed);
         dashboard.select_active_session("new-session");
 
-        assert_eq!(dashboard.focus, Focus::Active);
+        // Selecting a session no longer steals the keyboard: the caller
+        // decides where focus belongs, so a background arrival cannot pull it
+        // out of the composer.
+        assert_eq!(dashboard.focus, Focus::Quota);
         assert_eq!(dashboard.selected_session().unwrap().id, "new-session");
     }
 
@@ -1848,21 +2338,19 @@ mod tests {
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
-        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.focus, Focus::Sessions);
 
         let mut state = dashboard.state.clone();
         state.sessions.get_mut("session-1").unwrap().state = SessionState::Stopped;
         dashboard.set_state(state);
-        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.focus, Focus::Sessions);
         assert!(dashboard.ordered_sessions().is_empty());
         assert!(dashboard.selected_session().is_none());
 
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Capacity);
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Quotas);
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Active);
+        for expected in [Focus::Quota, Focus::Targets, Focus::Prompt, Focus::Sessions] {
+            dashboard.handle_key(key(KeyCode::Tab));
+            assert_eq!(dashboard.focus, expected);
+        }
     }
 
     #[test]

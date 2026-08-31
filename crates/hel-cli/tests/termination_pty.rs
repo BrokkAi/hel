@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const READY_MARKER: &[u8] = b"Active";
+/// The Sessions pane's title, which is on screen as soon as the combined
+/// surface has drawn its first frame.
+const READY_MARKER: &[u8] = b"Sessions";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The DECSET pair crossterm 0.29 writes for `EnableMouseCapture` and
@@ -364,7 +366,9 @@ fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
     );
 
     let quit_started = Instant::now();
-    master.write_all(b"\x1b").expect("send dashboard quit key");
+    // Ctrl-Q. Escape belongs to the composer and to modals now; it no longer
+    // quits, so it would hang this test rather than exercise the detach.
+    master.write_all(b"\x11").expect("send the quit key");
     let status = wait_for_exit(
         child.child_mut(),
         &mut master,

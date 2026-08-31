@@ -1055,16 +1055,21 @@ impl DashboardContext {
             DashboardIoUpdate::MaterializedSessionProjection { session_id, result } => {
                 self.finish_materialized_projection(session_id, result);
             }
-            DashboardIoUpdate::StoredSessionSummary { session_id, result } => match result {
-                Ok(summary) => {
-                    self.dashboard
-                        .apply_prepared_materialized_session_summary(summary);
+            DashboardIoUpdate::StoredSessionSummary { session_id, result } => {
+                match result {
+                    Ok(summary) => {
+                        self.dashboard
+                            .apply_prepared_materialized_session_summary(summary);
+                    }
+                    Err(error) => tracing::warn!(
+                        %session_id,
+                        "could not restore stored session summary: {error}"
+                    ),
                 }
-                Err(error) => tracing::warn!(
-                    %session_id,
-                    "could not restore stored dashboard summary: {error}"
-                ),
-            },
+                // Either way this session has answered, so the startup pick is
+                // one summary closer to being able to choose.
+                self.finish_startup_summary(&session_id);
+            }
             DashboardIoUpdate::ProjectSource { session_id, result } => {
                 self.project_sources_in_flight.remove(&session_id);
                 match result {
@@ -1082,21 +1087,24 @@ impl DashboardContext {
                     return;
                 }
                 self.opening_chat_session = None;
-                let focus_conversations =
-                    std::mem::take(&mut self.opening_chat_focus_conversations);
                 match *result {
-                    Ok(mut chat) => {
-                        if focus_conversations {
-                            chat.focus_conversations();
-                        }
+                    Ok(chat) => {
                         self.active_chat = Some(chat);
-                        self.view = crate::dashboard::View::Chat;
+                        self.dashboard.set_current_session(Some(&session_id));
                         self.dashboard.clear_notice();
                         self.acknowledge_visible_chat();
                     }
-                    Err(error) => self
-                        .dashboard
-                        .set_notice(format!("Could not open session: {error}")),
+                    Err(error) => {
+                        // Nothing opened, so the compact session list must not
+                        // go on claiming a conversation is on screen.
+                        self.dashboard.set_current_session(
+                            self.active_chat
+                                .as_ref()
+                                .map(hel::hel_chat::ActiveChat::session_id),
+                        );
+                        self.dashboard
+                            .set_notice(format!("Could not open session: {error}"));
+                    }
                 }
                 self.dirty = true;
             }

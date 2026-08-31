@@ -611,14 +611,6 @@ impl ManagedSessionHandle {
         self.commands.is_closed()
     }
 
-    /// Read the current view in place. Pollers that only need a few derived
-    /// numbers use this instead of `view()`, which clones the whole
-    /// transcript. The closure must stay synchronous and cheap: it runs while
-    /// the watch value is borrowed.
-    pub(crate) fn with_view<T>(&self, read: impl FnOnce(&ManagedSessionView) -> T) -> T {
-        read(&self.view.borrow())
-    }
-
     pub fn has_changed(&self) -> Result<bool> {
         self.view.has_changed().context("session manager stopped")
     }
