@@ -19,7 +19,7 @@ The visible proof is a local Podman session whose chat can be left without stopp
 - [x] (2026-08-31 13:57Z) Implemented the shared finish-effect model and distinguished a finish checkpoint from an ordinary recovery checkpoint. Focused checkpoint tests passed on the container's `aarch64-unknown-linux-gnu` host target.
 - [x] (2026-08-31 14:34Z) Replaced the terminal UI's hidden Stop workflow with target-aware Finish, Saved, and Delete language, and made leave-running behavior explicit. The complete TUI suite and termination PTY tests pass.
 - [x] (2026-08-31 14:53Z) Brought the phone viewer and its controller action schema to the same lifecycle model without exposing private target locators. Rust projection/server tests, script syntax checks, and targeted clippy pass; the real browser run is updated but cannot launch Chromium in this container because its system libraries require unavailable sudo access.
-- [ ] Publish the lifecycle guidance, update behavioral and end-to-end tests, run the complete validation suite, and record results here.
+- [x] (2026-08-31 15:00Z) Published lifecycle guidance, updated behavioral and end-to-end tests, and ran the complete locally available validation suite. Rust, lint, docs, links, and script syntax pass; real browser launch and manual Podman acceptance remain environment-skipped for the reasons recorded below.
 
 ## Surprises & Discoveries
 
@@ -49,6 +49,9 @@ The visible proof is a local Podman session whose chat can be left without stopp
 
 - Observation: Playwright's pinned Chromium downloads successfully in this container, but the image omits its native ATK, DBus, GBM, XKB, ALSA, and accessibility libraries. Playwright's dependency installer invokes sudo, which this disposable environment does not authorize.
   Evidence: `tests/e2e/run-browser-reliability.sh --seed 31082026 target/aarch64-unknown-linux-gnu/debug/hel` reached Playwright and exited before browser synchronization with the native-dependency diagnostic. The artifact is under `target/reliability-artifacts/browser-tui-convergence-seed-31082026-34463`; Rust HTTP/projection tests and standalone JavaScript/Python syntax checks pass.
+
+- Observation: Podman is not installed in this disposable container, so the optional manual exact-container acceptance run cannot be performed here.
+  Evidence: `command -v podman` returns no executable. Fake target-plan tests and the browser reliability lab's fake bare target remain the deterministic coverage for target release in this environment.
 
 ## Decision Log
 
@@ -109,6 +112,8 @@ The focused checkpoint run passed 120 tests (one ignored), including relay runti
 Milestone 2 made Finish a direct Ctrl+F action with a consequence and primary button derived from the exact live target. Stop no longer appears in Edit. Chat advertises `/dashboard` and Ctrl+G as navigation that leaves the worker running, while `/detach` remains a hidden compatibility alias. Quit now starts on Cancel whenever live sessions would remain. Inactive rows live under Saved sessions, which explains that they run no workers and retain local disk; Hide and Delete permanently now describe their actual effects. The complete `hel-tui` suite passed 199 tests (one ignored), the focused CLI dashboard tests passed 16 tests, and both termination PTY tests passed on `aarch64-unknown-linux-gnu`. The remaining work is phone convergence, documentation, browser/end-to-end coverage, and repository-wide validation.
 
 Milestone 3 added an optional, privacy-safe `ViewerFinish` projection and changed the public phone action atomically from `close` to `finish`; the daemon still delegates to its internal close implementation. Viewer state now renders Closing as Finishing and Stopped as Saved. Active and Saved cards are separate, never expose Finish and Resume together, and the Finish dialog uses the projected consequence and target-specific primary label. Six-locator projection coverage proves raw hosts, paths, container IDs, worker IDs, instance IDs, and addresses stay out of serialized snapshots. The 28 `hel_server` tests, 16 CLI server tests, JavaScript syntax check, Python compile check, and targeted all-target clippy pass. The browser/TUI reliability scenario now exercises Finish and Saved, but its local execution is deferred to an environment with Playwright's native libraries because this container cannot install them without sudo.
+
+Milestone 4 added the human-facing Session lifecycle guide, linked it from the docs landing page and container guide, and updated the README's first-run and durability language. The browser/TUI reliability scenario now enters chat, proves Ctrl+G leaves the session Running, opens and cancels the live-session quit warning, then completes target-aware Finish and observes Saved before the phone resumes and finishes it again. The full host-target Rust run passed 1,723 tests with 9 environment-dependent tests ignored; `cargo fmt --check`, workspace all-target clippy with warnings denied, Astro check/build, 228-link validation, JavaScript syntax, and Python compilation all pass. The real Playwright scenario and optional manual Podman run are the only environment-skipped checks, with no product-test failure observed.
 
 ## Context and Orientation
 
@@ -371,3 +376,5 @@ Revision note (2026-08-31): Milestone 1 completed with protocol 7, backward-comp
 Revision note (2026-08-31): Milestone 2 completed with target-aware terminal Finish, explicit leave-running navigation and quit behavior, Saved/Hide/Delete vocabulary, and passing TUI, CLI dashboard, and PTY coverage.
 
 Revision note (2026-08-31): Milestone 3 completed the privacy-safe phone projection, Finish action schema, Active/Saved rendering, target-aware web confirmation, and asynchronous Finishing state; browser reliability coverage was updated but cannot launch locally without privileged system-library installation.
+
+Revision note (2026-08-31): Milestone 4 published the lifecycle documentation, extended the browser/TUI reliability flow through Dashboard, quit warning, Finish, and Saved, and completed all locally available full-suite validation.

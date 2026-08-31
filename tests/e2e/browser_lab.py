@@ -60,6 +60,20 @@ def finish_from_dashboard(client) -> None:
     client.send(b"\r")
 
 
+def return_to_dashboard_without_finishing(client) -> None:
+    client.send(b"\r")
+    client.wait_for("worker keeps running")
+    client.send(b"\x07")
+    client.wait_for("Active")
+
+
+def cancel_quit_while_session_is_live(client) -> None:
+    client.send(b"\x11")
+    client.wait_for("1 session will keep running")
+    client.send(b"\r")
+    client.wait_for("Active")
+
+
 def run(lab: Lab) -> None:
     port = lab.prepare(phone_tls=True)
     dashboard = start_dashboard(lab)
@@ -100,6 +114,18 @@ def run(lab: Lab) -> None:
     try:
         wait_marker_or_exit(ready_marker, browser)
         dashboard.wait_for(title)
+        return_to_dashboard_without_finishing(dashboard)
+        live = lab.wait_snapshot(
+            lambda value: any(
+                item.get("title") == title and item.get("state") == "running"
+                for item in value.get("sessions", [])
+            ),
+            "Ctrl+G kept browser session running",
+        )
+        live_session = next(item for item in live["sessions"] if item["title"] == title)
+        lab.record_action("tui-dashboard-kept-running", session_id=live_session["id"])
+        cancel_quit_while_session_is_live(dashboard)
+        lab.record_action("tui-live-quit-cancelled", session_id=live_session["id"])
         dashboard.resize(18, 72)
         time.sleep(0.2)
         dashboard.resize(40, 150)

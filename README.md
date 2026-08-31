@@ -137,9 +137,12 @@ to build your own.
    `hel login --profile <id>`.
 3. In the dashboard, create a session: pick a profile, a repository bundle,
    and a target, then send your first prompt.
-4. Detach whenever you like (`Ctrl+Q`). The session keeps running and your
-   queued prompts keep executing. Reattach from the dashboard, or open the
-   daemon-owned web viewer shown by `hel daemon status`.
+4. Return to the dashboard whenever you like (`Ctrl+G` or `/dashboard`). The
+   worker keeps running and queued prompts keep executing. When the run is
+   complete, use **Finish** (`Ctrl+F`) to save recovery and release its target;
+   the logical session then appears under **Saved sessions**. The
+   daemon-owned web viewer shown by `hel daemon status` offers the same
+   lifecycle.
 
 In an attached TUI or the phone viewer, start a message with `!` to run the
 rest as `bash -lc` inside that session's target. Shell commands run in the
@@ -259,14 +262,16 @@ tailscale_detect = true
 
 Hel saves a recovery copy automatically after completed turns when the session
 is idle (at most every ten minutes), and `hel checkpoint --session <id>`
-forces one. Recovery archives are verified end to end; a normal Stop writes
-and verifies the archive before any teardown, and refuses teardown if
-verification fails. Explicit force-destroy is the data-loss escape hatch.
+forces one. Recovery archives are verified end to end; normal Finish writes
+and verifies recovery before any target teardown, and refuses teardown if
+verification fails. Explicit Force finish is the data-loss escape hatch.
 
-A stopped session resumes by provisioning a fresh target from its archive,
-with its pending prompt queue intact (resume asks whether to keep or discard
-it). A session recorded under one harness can be resumed under another; Hel
-condenses the transcript into a size-bounded handoff for the new harness.
+A Saved session runs no worker and resumes by provisioning a fresh target from
+its archive, with its pending prompt queue intact (Resume asks whether to keep
+or discard it). It uses controller disk even when hidden; Hide only organizes
+the list, while Delete permanently removes recovery and frees that storage. A
+session recorded under one harness can be resumed under another; Hel condenses
+the transcript into a size-bounded handoff for the new harness.
 
 If Hel or its host crashes, workers and their queued prompts keep running.
 `hel recover scan` finds managed containers and instances that are no longer

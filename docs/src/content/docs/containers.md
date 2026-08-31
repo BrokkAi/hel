@@ -21,11 +21,15 @@ behavior instead. Codex, Claude Code, and Grok Build expose guardian modes
 through their harnesses; Kimi Code and DeepSeek Harness do not. Hel warns
 against running either unsupported harness on a raw, unsandboxed target.
 
-Closing a session first writes and verifies a recovery archive, then removes
-that exact container. No mutable session workspace persists past the session
-except what the recovery archive captured and whatever you pushed to a
-remote. Hel may retain read-only Git objects in the host clone cache described
-below.
+Finishing a session first writes and verifies recovery, then removes that exact
+container. For Podman over SSH, Finish removes the session container while
+preserving the SSH host and its other containers. No mutable session workspace
+persists past Finish except what recovery captured and whatever you pushed to
+a remote. The resulting logical session remains available under **Saved
+sessions** and can be resumed on a fresh target. Hel may retain read-only Git
+objects in the host clone cache described below. See [Session
+lifecycle](/session-lifecycle/) for the full Dashboard, Finish, Saved, Hide,
+and Delete workflow.
 
 ## Prerequisites
 
