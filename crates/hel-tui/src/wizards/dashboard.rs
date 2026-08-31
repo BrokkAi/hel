@@ -1462,13 +1462,6 @@ impl DashboardState {
         self.resolve_all_aws_resource_options_action()
     }
 
-    pub(crate) fn begin_resume(&mut self) -> DashboardAction {
-        let Some(session_id) = self.selected_session().map(|session| session.id.clone()) else {
-            return DashboardAction::None;
-        };
-        self.begin_resume_for(&session_id)
-    }
-
     /// Open the resume wizard for one session by id. The dashboard reaches
     /// this for a failed but checkpointed session; the resume dialog reaches it
     /// for a stopped one.

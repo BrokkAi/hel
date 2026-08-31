@@ -261,9 +261,59 @@ pub enum Focus {
     Prompt,
 }
 
-/// Tab order. Shift-Tab walks it backwards.
+/// Tab order, which follows the layout down the screen: Sessions above the
+/// conversation, the composer under it, then the two support panes. Shift-Tab
+/// walks it backwards.
 pub(crate) const FOCUS_ORDER: [Focus; 4] =
-    [Focus::Sessions, Focus::Quota, Focus::Targets, Focus::Prompt];
+    [Focus::Sessions, Focus::Prompt, Focus::Targets, Focus::Quota];
+
+/// Tab order once the support panes are collapsed. They are summaries with
+/// nothing to drive, so Tab walks the two panes that are still lists.
+pub(crate) const COLLAPSED_FOCUS_ORDER: [Focus; 2] = [Focus::Sessions, Focus::Prompt];
+
+/// How much room the surface gives the conversation, from least to most.
+///
+/// The three positions are a chain rather than a set of independent switches:
+/// each one collapses what the one before it collapsed and a little more. So
+/// they are one dial, and `Ctrl-G` turns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneLayout {
+    /// Every pane at full size.
+    #[default]
+    Expanded,
+    /// Targets and Quota collapsed to one summary row each.
+    SupportCollapsed,
+    /// Those, and the session list down to one line per session.
+    Minimal,
+}
+
+impl PaneLayout {
+    /// The next position round the dial.
+    #[must_use]
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::Expanded => Self::SupportCollapsed,
+            Self::SupportCollapsed => Self::Minimal,
+            Self::Minimal => Self::Expanded,
+        }
+    }
+
+    /// Whether Targets and Quota are summary rows rather than tables.
+    #[must_use]
+    pub fn support_collapsed(self) -> bool {
+        matches!(self, Self::SupportCollapsed | Self::Minimal)
+    }
+
+    /// Whether the session list is down to one line per session.
+    ///
+    /// This follows the dial rather than focus, so the two collapsed
+    /// positions stay different from one another whatever has the keyboard,
+    /// and the pane does not change shape underneath a Tab.
+    #[must_use]
+    pub fn sessions_compact(self) -> bool {
+        matches!(self, Self::Minimal)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -354,9 +404,8 @@ pub struct DashboardState {
     pub(crate) capacity_index: usize,
     pub(crate) quota_index: usize,
     pub(crate) focus: Focus,
-    /// Targets and Quota are collapsed to one summary row each and Sessions
-    /// stays compact. While this is true, focus is always [`Focus::Prompt`].
-    pub(crate) support_minimized: bool,
+    /// How much room the panes are leaving the conversation.
+    pub(crate) layout: PaneLayout,
     /// The session whose conversation is on screen, or is being opened. It
     /// decides which project the compact Sessions list belongs to.
     pub(crate) current_session_id: Option<String>,
@@ -412,7 +461,7 @@ impl DashboardState {
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Sessions,
-            support_minimized: false,
+            layout: PaneLayout::default(),
             current_session_id: None,
             pane_areas: None,
             chat_transcript_area: None,
@@ -464,37 +513,59 @@ impl DashboardState {
         self.focus = Focus::Prompt;
     }
 
-    /// Focuses the Sessions pane and restores the support panes, so the pane
-    /// the keyboard lands on is the full one.
+    /// Focuses the Sessions pane, opening the panes far enough that the list
+    /// it lands on is the full one.
     pub fn focus_sessions(&mut self) {
-        self.support_minimized = false;
+        if self.layout.sessions_compact() {
+            self.layout = PaneLayout::SupportCollapsed;
+        }
         self.focus = Focus::Sessions;
         self.clamp_selections();
     }
 
-    /// Moves focus one stop along the Tab ring, restoring the support panes
-    /// first. That single rule is what makes Tab out of a minimized composer
-    /// bring the panes back and land on Sessions, and Shift-Tab land on
-    /// Targets.
+    /// Moves focus one stop along the Tab ring.
+    ///
+    /// Tab does not turn the dial back, with one exception: from the position
+    /// that has reduced the session list to one line each, asking for another
+    /// pane means asking for the list back, so it opens far enough to give it
+    /// and lands there. Anywhere else the dial is the user's setting and Tab
+    /// leaves it alone.
     pub fn cycle_focus(&mut self, reverse: bool) {
-        self.support_minimized = false;
-        self.focus = cycle_control(self.focus, &FOCUS_ORDER, reverse);
-        self.clamp_selections();
-    }
-
-    /// Collapses or restores Targets and Quota. Minimizing always hands the
-    /// keyboard back to the composer, because the panes it leaves on screen
-    /// are summaries rather than lists.
-    pub fn toggle_support_panes(&mut self) {
-        self.support_minimized = !self.support_minimized;
-        if self.support_minimized {
-            self.focus = Focus::Prompt;
+        if self.layout.sessions_compact() {
+            self.focus_sessions();
+            return;
         }
+        let order: &[Focus] = if self.layout.support_collapsed() {
+            &COLLAPSED_FOCUS_ORDER
+        } else {
+            &FOCUS_ORDER
+        };
+        // Collapsing can leave focus on a pane that is no longer in the ring;
+        // start the walk from the composer so Tab still goes somewhere sensible.
+        let from = if order.contains(&self.focus) {
+            self.focus
+        } else {
+            Focus::Prompt
+        };
+        self.focus = cycle_control(from, order, reverse);
         self.clamp_selections();
     }
 
-    pub fn support_minimized(&self) -> bool {
-        self.support_minimized
+    /// Turns the dial one position, giving the conversation more room each
+    /// time and wrapping back to every pane open.
+    ///
+    /// It always hands the keyboard to the composer. Asking for room around
+    /// the conversation and asking to work in it are the same gesture, so the
+    /// dial takes the user there rather than leaving them on a pane they were
+    /// only passing through.
+    pub fn cycle_pane_layout(&mut self) {
+        self.layout = self.layout.cycled();
+        self.focus = Focus::Prompt;
+        self.clamp_selections();
+    }
+
+    pub fn pane_layout(&self) -> PaneLayout {
+        self.layout
     }
 
     /// Whether a modal dialog or wizard owns the keyboard.
@@ -520,6 +591,12 @@ impl DashboardState {
 
     pub fn current_session_id(&self) -> Option<&str> {
         self.current_session_id.as_deref()
+    }
+
+    /// The session the Sessions pane has selected. The conversation on screen
+    /// follows this, so moving the selection moves the transcript.
+    pub fn selected_session_id(&self) -> Option<&str> {
+        self.selected_session_id.as_deref()
     }
 
     /// Whether the pointer is over the conversation the surface is drawing.
@@ -753,7 +830,7 @@ impl DashboardState {
             // back and hands that pane the keyboard, so one click gets from a
             // summary to the table it summarises.
             MouseEventKind::Down(MouseButton::Left) => {
-                self.support_minimized = false;
+                self.layout = PaneLayout::Expanded;
                 self.focus = hovered;
                 self.clamp_selections();
             }
@@ -765,11 +842,12 @@ impl DashboardState {
     /// Selects the clicked row and, if it's the second click on the same row
     /// within `DOUBLE_CLICK_INTERVAL`, performs the same action Enter would.
     fn handle_row_click(&mut self, focus: Focus, index: usize) -> DashboardAction {
-        // A click on a minimized pane restores it, the same as clicking one of
-        // the collapsed Targets or Quota rows: minimized always means the
-        // composer owns the keyboard, so a click that focuses a pane has to
-        // bring that pane back first.
-        self.support_minimized = false;
+        // Clicking a row is asking to work with it, so the pane opens far
+        // enough to be worked with - the same as clicking one of the collapsed
+        // Targets or Quota rows opens the table it summarises.
+        if self.layout.sessions_compact() {
+            self.layout = PaneLayout::SupportCollapsed;
+        }
         self.focus = focus;
         if focus == Focus::Sessions {
             let clicked = self
@@ -792,7 +870,7 @@ impl DashboardState {
         );
         if is_double_click {
             self.last_row_click = None;
-            self.open_or_resume()
+            self.open_selected_session()
         } else {
             self.last_row_click = Some((focus, index, now));
             DashboardAction::None
@@ -813,7 +891,7 @@ impl DashboardState {
         match (key.code, command) {
             (KeyCode::Char('c'), true) => return DashboardAction::QuitDetach,
             (KeyCode::Char('g'), true) => {
-                self.toggle_support_panes();
+                self.cycle_pane_layout();
                 return DashboardAction::None;
             }
             (KeyCode::F(3), _) => return self.open_web_dialog(),
@@ -883,7 +961,7 @@ impl DashboardState {
     /// elsewhere.
     fn handle_sessions_key(&mut self, code: KeyCode, plain: bool) -> DashboardAction {
         match (code, plain) {
-            (KeyCode::Enter, _) => self.open_or_resume(),
+            (KeyCode::Enter, _) => self.open_selected_session(),
             (KeyCode::Char('n'), true) => self.begin_new(),
             (KeyCode::Char('s'), true) => DashboardAction::OpenResumeDialog,
             (KeyCode::Char('e'), true) => {
@@ -930,7 +1008,17 @@ impl DashboardState {
         }
     }
 
-    fn open_or_resume(&mut self) -> DashboardAction {
+    /// Opens the selected session's conversation and hands the keyboard to its
+    /// composer.
+    ///
+    /// The conversation already follows the selection, so Enter's job is to
+    /// take the user to the prompt for the row they are on. A failed session
+    /// is the one exception: it asks first, because reading what it did and
+    /// putting it back on a fresh target are both reasonable answers to the
+    /// same key. That is a prompt rather than the silent diversion into the
+    /// resume wizard this used to do - the row is red, and the dialog says
+    /// what failed.
+    fn open_selected_session(&mut self) -> DashboardAction {
         let Some(session) = self.selected_session() else {
             return DashboardAction::None;
         };
@@ -941,26 +1029,21 @@ impl DashboardState {
             ));
             return DashboardAction::None;
         }
+        // A failed session has two reasonable answers - read what it did, or
+        // put it back on a fresh target - and recovery replaces the target, so
+        // the surface asks rather than guessing.
         if session.state == SessionState::Error {
-            if session.checkpoint.is_some() {
-                return self.begin_resume();
-            } else {
-                self.notices.set(
-                    session
-                        .last_error
-                        .clone()
-                        .unwrap_or_else(|| "Session failed without a recorded error.".into()),
-                );
-            }
+            let confirmation = Confirmation::RecoverFailed {
+                session_id: session.id.clone(),
+                error: session.last_error.clone(),
+                recoverable: session.checkpoint.is_some(),
+            };
+            self.mode = Mode::Confirm(ConfirmDialog::new(confirmation));
             return DashboardAction::None;
         }
-        if session.state.is_active() {
-            DashboardAction::Open {
-                session_id: session.id.clone(),
-            }
-        } else {
-            self.begin_resume()
-        }
+        let session_id = session.id.clone();
+        self.focus = Focus::Prompt;
+        DashboardAction::Open { session_id }
     }
 
     pub(crate) fn selected_session(&self) -> Option<&SessionRecord> {
@@ -1003,15 +1086,20 @@ impl DashboardState {
 
     /// The rows the Sessions pane draws.
     ///
-    /// The pane has two modes. Focused, it is the full list: every project,
-    /// with a heading and four rows per expanded session. Unfocused, it is a
-    /// one-line-per-session summary that stays small — and once more than
-    /// [`COMPACT_SESSION_LIMIT`] sessions are live it narrows to the current
-    /// project and counts the rest, because a list longer than that stops
-    /// being glanceable and starts eating the transcript.
+    /// The pane has two forms, and which one it takes follows the pane dial
+    /// rather than focus. Until the dial reaches its last position it is the
+    /// full list: every project, with a heading and four rows per expanded
+    /// session. At that position it is a one-line-per-session summary — and
+    /// once more than [`COMPACT_SESSION_LIMIT`] sessions are live it narrows
+    /// to the current project and counts the rest, because a list longer than
+    /// that stops being glanceable and starts eating the transcript.
+    ///
+    /// Keying this on the dial rather than on focus is what keeps the two
+    /// collapsed positions distinguishable whatever has the keyboard, and it
+    /// stops the pane changing shape underneath a Tab.
     pub(crate) fn sessions_rows(&self) -> Vec<SessionsRow> {
         let sessions = self.ordered_sessions();
-        if self.focus == Focus::Sessions {
+        if !self.layout.sessions_compact() {
             return self.expanded_sessions_rows(&sessions);
         }
         if sessions.len() <= COMPACT_SESSION_LIMIT {
@@ -1501,7 +1589,7 @@ mod tests {
             "n creates a session only from the Sessions pane"
         );
 
-        dashboard.handle_key(key(KeyCode::BackTab));
+        dashboard.handle_key(key(KeyCode::Tab));
         assert_eq!(dashboard.focus, Focus::Quota);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('r'))),
@@ -1515,13 +1603,14 @@ mod tests {
     }
 
     #[test]
-    fn tab_walks_sessions_quota_targets_prompt_and_back() {
+    fn tab_walks_the_layout_order_and_back() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         assert_eq!(dashboard.focus, Focus::Sessions);
 
-        for expected in [Focus::Quota, Focus::Targets, Focus::Prompt, Focus::Sessions] {
+        // The ring follows the layout down the screen.
+        for expected in [Focus::Prompt, Focus::Targets, Focus::Quota, Focus::Sessions] {
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Tab)),
                 DashboardAction::None
@@ -1536,52 +1625,99 @@ mod tests {
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
-        for expected in [Focus::Prompt, Focus::Targets, Focus::Quota, Focus::Sessions] {
+        for expected in [Focus::Quota, Focus::Targets, Focus::Prompt, Focus::Sessions] {
             dashboard.handle_key(key(KeyCode::BackTab));
             assert_eq!(dashboard.focus, expected);
         }
     }
 
-    /// Minimizing leaves only summary rows behind, so the keyboard goes back
-    /// to the one surface that is still a full control: the composer.
+    /// The dial is one chain of three positions, and it wraps.
     #[test]
-    fn ctrl_g_minimizes_and_always_focuses_prompt() {
+    fn ctrl_g_turns_the_dial_one_position_at_a_time() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(key(KeyCode::Tab));
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Targets);
+        assert_eq!(dashboard.pane_layout(), PaneLayout::Expanded);
 
-        assert_eq!(dashboard.handle_key(ctrl_key('g')), DashboardAction::None);
-        assert!(dashboard.support_minimized());
-        assert_eq!(dashboard.focus, Focus::Prompt);
-
-        assert_eq!(dashboard.handle_key(ctrl_key('g')), DashboardAction::None);
-        assert!(!dashboard.support_minimized());
-        assert_eq!(
-            dashboard.focus,
-            Focus::Prompt,
-            "restoring the panes keeps the composer"
-        );
+        for expected in [
+            PaneLayout::SupportCollapsed,
+            PaneLayout::Minimal,
+            PaneLayout::Expanded,
+        ] {
+            assert_eq!(dashboard.handle_key(ctrl_key('g')), DashboardAction::None);
+            assert_eq!(dashboard.pane_layout(), expected);
+        }
     }
 
+    /// Asking for room around the conversation and asking to work in it are
+    /// the same gesture, so the dial always lands in the composer.
     #[test]
-    fn tab_from_a_minimized_prompt_restores_the_panes_it_walks_into() {
+    fn ctrl_g_always_hands_the_keyboard_to_the_composer() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
 
-        let mut forward = dashboard_with_session(session.clone());
-        forward.handle_key(ctrl_key('g'));
-        forward.handle_key(key(KeyCode::Tab));
-        assert!(!forward.support_minimized());
-        assert_eq!(forward.focus, Focus::Sessions);
+        for start in [Focus::Sessions, Focus::Prompt, Focus::Targets, Focus::Quota] {
+            let mut dashboard = dashboard_with_session(session.clone());
+            dashboard.focus = start;
+            for _ in 0..3 {
+                assert_eq!(dashboard.handle_key(ctrl_key('g')), DashboardAction::None);
+                assert_eq!(dashboard.focus, Focus::Prompt, "from {start:?}");
+            }
+            assert_eq!(dashboard.pane_layout(), PaneLayout::Expanded);
+        }
+    }
 
-        let mut reverse = dashboard_with_session(session);
-        reverse.handle_key(ctrl_key('g'));
-        reverse.handle_key(key(KeyCode::BackTab));
-        assert!(!reverse.support_minimized());
-        assert_eq!(reverse.focus, Focus::Targets);
+    /// Whether the panes are up is the user's choice; Tab must not undo it.
+    /// With the support panes collapsed the ring is the two panes that are
+    /// still lists.
+    #[test]
+    fn tab_keeps_the_support_panes_collapsed_and_walks_the_two_that_remain() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.handle_key(ctrl_key('g'));
+        assert_eq!(dashboard.pane_layout(), PaneLayout::SupportCollapsed);
+        assert_eq!(dashboard.focus, Focus::Prompt);
+
+        for expected in [Focus::Sessions, Focus::Prompt, Focus::Sessions] {
+            dashboard.handle_key(key(KeyCode::Tab));
+            assert_eq!(dashboard.focus, expected);
+            assert_eq!(
+                dashboard.pane_layout(),
+                PaneLayout::SupportCollapsed,
+                "Tab left the dial where the user set it"
+            );
+        }
+        for expected in [Focus::Prompt, Focus::Sessions] {
+            dashboard.handle_key(key(KeyCode::BackTab));
+            assert_eq!(dashboard.focus, expected);
+            assert_eq!(dashboard.pane_layout(), PaneLayout::SupportCollapsed);
+        }
+    }
+
+    /// The last position has reduced the session list to one line each, so
+    /// asking for another pane there is asking for the list back: Tab opens
+    /// the dial one position and lands on it.
+    #[test]
+    fn tab_out_of_the_last_position_gives_the_session_list_back() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+
+        for (key_code, label) in [(KeyCode::Tab, "Tab"), (KeyCode::BackTab, "Shift-Tab")] {
+            let mut dashboard = dashboard_with_session(session.clone());
+            dashboard.handle_key(ctrl_key('g'));
+            dashboard.handle_key(ctrl_key('g'));
+            assert_eq!(dashboard.pane_layout(), PaneLayout::Minimal);
+            dashboard.focus_prompt();
+
+            dashboard.handle_key(key(key_code));
+            assert_eq!(
+                dashboard.pane_layout(),
+                PaneLayout::SupportCollapsed,
+                "{label} opened the dial one position"
+            );
+            assert_eq!(dashboard.focus, Focus::Sessions, "{label}");
+        }
     }
 
     /// The combined surface is quit with Ctrl-Q. A stray Escape must never
@@ -1592,7 +1728,7 @@ mod tests {
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
-        for expected in [Focus::Sessions, Focus::Quota, Focus::Targets, Focus::Prompt] {
+        for expected in [Focus::Sessions, Focus::Prompt, Focus::Targets, Focus::Quota] {
             assert_eq!(dashboard.focus, expected);
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Esc)),
@@ -1631,7 +1767,7 @@ mod tests {
         dashboard.handle_key(ctrl_key('p'));
         assert_eq!(dashboard.selected_visible_index(), Some(1));
 
-        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(dashboard.focus, Focus::Quota);
         dashboard.handle_key(ctrl_key('n'));
         assert_eq!(dashboard.quota_index, 1);
@@ -1693,7 +1829,7 @@ mod tests {
     fn the_compact_list_shows_every_project_up_to_five_sessions() {
         for count in [0, 1, 5] {
             let mut dashboard = dashboard_with_live_sessions(count, 2);
-            dashboard.focus_prompt();
+            dashboard.layout = PaneLayout::Minimal;
             assert_eq!(
                 session_row_indices(&dashboard),
                 (0..count).collect::<Vec<_>>(),
@@ -1711,7 +1847,7 @@ mod tests {
         // Six sessions, two per project: the current project keeps two rows
         // and the other four are counted.
         let mut dashboard = dashboard_with_live_sessions(6, 2);
-        dashboard.focus_prompt();
+        dashboard.layout = PaneLayout::Minimal;
         dashboard.set_current_session(Some("session-0"));
         // One of the four excluded sessions has a turn running.
         apply_materialized_transcript_for(
@@ -1733,7 +1869,7 @@ mod tests {
     #[test]
     fn the_compact_list_always_shows_at_least_one_project() {
         let mut dashboard = dashboard_with_live_sessions(6, 2);
-        dashboard.focus_prompt();
+        dashboard.layout = PaneLayout::Minimal;
         dashboard.set_current_session(None);
         dashboard.selected_session_id = None;
 
@@ -1744,7 +1880,7 @@ mod tests {
     #[test]
     fn the_others_count_follows_the_conversation_on_screen() {
         let mut dashboard = dashboard_with_live_sessions(6, 3);
-        dashboard.focus_prompt();
+        dashboard.layout = PaneLayout::Minimal;
 
         dashboard.set_current_session(Some("session-0"));
         assert_eq!(session_row_indices(&dashboard), [0, 1, 2]);
@@ -2043,7 +2179,7 @@ mod tests {
             Some("session-0")
         );
         dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Quota);
+        assert_eq!(dashboard.focus, Focus::Prompt);
     }
 
     #[test]
@@ -2197,13 +2333,13 @@ mod tests {
 
         // The selection is anchored by session id, so it survives focus
         // moving away and Tab lands the user back where they were.
-        for expected in [Focus::Quota, Focus::Targets, Focus::Prompt, Focus::Sessions] {
+        for expected in [Focus::Prompt, Focus::Targets, Focus::Quota, Focus::Sessions] {
             dashboard.handle_key(key(KeyCode::Tab));
             assert_eq!(dashboard.focus, expected);
             assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
         }
 
-        for expected in [Focus::Prompt, Focus::Targets, Focus::Quota, Focus::Sessions] {
+        for expected in [Focus::Quota, Focus::Targets, Focus::Prompt, Focus::Sessions] {
             dashboard.handle_key(key(KeyCode::BackTab));
             assert_eq!(dashboard.focus, expected);
         }
@@ -2549,7 +2685,7 @@ mod tests {
         assert!(dashboard.ordered_sessions().is_empty());
         assert!(dashboard.selected_session().is_none());
 
-        for expected in [Focus::Quota, Focus::Targets, Focus::Prompt, Focus::Sessions] {
+        for expected in [Focus::Prompt, Focus::Targets, Focus::Quota, Focus::Sessions] {
             dashboard.handle_key(key(KeyCode::Tab));
             assert_eq!(dashboard.focus, expected);
         }
@@ -2569,25 +2705,13 @@ mod tests {
         );
     }
 
+    /// A failed session has two reasonable answers to Enter, and recovery
+    /// replaces the target, so the surface asks instead of guessing. The row
+    /// is red before the key is ever pressed, so the dialog is not a surprise.
     #[test]
-    fn opening_a_failed_session_with_a_checkpoint_starts_resume() {
+    fn enter_on_a_failed_session_offers_recovery_and_the_transcript() {
         let mut session = stopped_session();
         session.state = SessionState::Error;
-        session.last_error = Some("resume failed: worker upload source was replaced".into());
-        let mut dashboard = dashboard_with_session(session);
-
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert!(matches!(dashboard.mode, Mode::Resume(_)));
-    }
-
-    #[test]
-    fn opening_a_failed_session_without_a_checkpoint_preserves_the_actionable_error() {
-        let mut session = stopped_session();
-        session.state = SessionState::Error;
-        session.checkpoint = None;
         session.last_error = Some("worker bootstrap failed: upload failed".into());
         let mut dashboard = dashboard_with_session(session);
 
@@ -2595,9 +2719,66 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::None
         );
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!(
+                "expected the failed-session prompt, got {:?}",
+                dashboard.mode
+            )
+        };
         assert_eq!(
-            dashboard.notice().as_deref(),
-            Some("worker bootstrap failed: upload failed")
+            dialog.confirmation,
+            Confirmation::RecoverFailed {
+                session_id: "session-1".into(),
+                error: Some("worker bootstrap failed: upload failed".into()),
+                recoverable: true,
+            }
+        );
+
+        // The prompt draws, names what failed, and offers both answers.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw the failed-session prompt");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Session failed"), "{rendered}");
+        assert!(rendered.contains("worker bootstrap failed"), "{rendered}");
+        assert!(rendered.contains("Open transcript"), "{rendered}");
+        assert!(rendered.contains("Recover"), "{rendered}");
+
+        // Reading what it did changes nothing about the session.
+        dashboard.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::Open {
+                session_id: "session-1".into()
+            }
+        );
+        assert_eq!(dashboard.focus, Focus::Prompt);
+    }
+
+    /// Recovery is only on offer when there is a verified copy to recover
+    /// from; without one the prompt says so rather than showing a button that
+    /// cannot work.
+    #[test]
+    fn a_failed_session_without_a_recovery_copy_is_not_offered_recovery() {
+        let mut session = stopped_session();
+        session.state = SessionState::Error;
+        session.checkpoint = None;
+        session.last_error = Some("worker bootstrap failed".into());
+        let mut dashboard = dashboard_with_session(session);
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!("expected the failed-session prompt")
+        };
+        assert_eq!(
+            dialog.confirmation,
+            Confirmation::RecoverFailed {
+                session_id: "session-1".into(),
+                error: Some("worker bootstrap failed".into()),
+                recoverable: false,
+            }
         );
     }
 }

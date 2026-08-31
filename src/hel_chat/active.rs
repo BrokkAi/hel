@@ -1091,7 +1091,7 @@ impl ActiveChat {
             ChatAction::CycleFocus { reverse } => {
                 return ChatEventOutcome::CycleFocus { reverse };
             }
-            ChatAction::ToggleSupportPanes => return ChatEventOutcome::ToggleSupportPanes,
+            ChatAction::CyclePaneLayout => return ChatEventOutcome::CyclePaneLayout,
             ChatAction::OpenWebDialog => return ChatEventOutcome::OpenWebDialog,
             ChatAction::QuitDetach => {
                 self.cancel_dictation();
@@ -2656,6 +2656,45 @@ mod tests {
         chat.mark_prompt_submitted("please ship the release");
         assert!(prompt_title(&chat, 0).contains("Running"));
         assert!(!prompt_title(&chat, 0).contains("Pursuing goal"));
+    }
+
+    /// The title names the conversation you are in. The rule around it is
+    /// chrome and stays dim; the name must not be dimmed with it.
+    #[test]
+    fn the_conversation_title_is_not_dimmed_with_its_rule() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| render_full_frame(frame, &mut chat, false))
+            .expect("draw chat");
+
+        let buffer = terminal.backend().buffer();
+        let cells: Vec<_> = (0..80)
+            .map(|x| buffer[(x, 0)].symbol().to_owned())
+            .collect();
+        let title_start = cells
+            .windows(1)
+            .position(|cell| cell[0] == "C")
+            .expect("the title is on the top row");
+        for offset in 0.."Conversation".chars().count() {
+            let column = u16::try_from(title_start + offset).unwrap();
+            assert_eq!(
+                buffer[(column, 0)].fg,
+                Color::Reset,
+                "the title draws in the terminal's own foreground: {}",
+                cells.concat()
+            );
+        }
+        let rule = cells
+            .iter()
+            .rposition(|cell| cell == "\u{2500}")
+            .expect("the rule follows the title");
+        assert_eq!(
+            buffer[(u16::try_from(rule).unwrap(), 0)].fg,
+            Color::DarkGray,
+            "the rule stays chrome"
+        );
     }
 
     /// A host that owns the rest of the frame gives the chat two rectangles;

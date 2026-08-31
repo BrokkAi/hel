@@ -28,6 +28,20 @@ The user-visible payoff: you can read an agent's output, see what your other age
 
 - [x] (2026-08-31) By-hand verification against a running agent, using the repository's own fake-harness lab (`tests/e2e/prepare-luna-lab.py`, a `local-bare` target and a fake ACP bridge — no container or credentials needed). Created a session through the wizard from the Sessions pane's plain `n`, opened it, sent a prompt and saw the agent reply in the transcript, watched the compact Sessions row follow it live, walked the whole Tab ring, collapsed and restored the panes, opened the web dialog with F3, and confirmed Escape closes a dialog and never quits while an unsent draft survives. Detaching and relaunching confirmed the startup pick reopens the newest conversation with the cursor in Prompt. Two defects found and fixed; see `Surprises & Discoveries`.
 
+- [x] (2026-08-31) Refinements from hands-on use, after the merge. Tab now follows
+  the layout (Sessions, Prompt, Targets, Quota) and Enter in Sessions always opens
+  the selected session, offering recovery when it failed; the conversation follows
+  the selection. Collapsed panes keep their border chrome (`─ Quota ── claude-1 63% ──`),
+  read in the normal weight, and colour their readings by the same red/yellow/green
+  thresholds the open panes use — quota by headroom remaining, target CPU inverted.
+  Failed sessions carry a red band. `Ctrl+G` became a three-position dial (every pane,
+  support panes collapsed, session list compact as well) and always leaves the keyboard
+  in Prompt. EC2 fleets report `3 VMs` instead of `on demand`, in both pane forms.
+  The expanded session rows label their clocks `Turn` and `Step` in full, restoring
+  the wording a stray rename had shortened to `P` and `S`; the Sessions title keeps
+  the matching key while it fits and drops it when the pane is too narrow for even
+  the shortest form.
+
 ## Surprises & Discoveries
 
 - Observation: the expanded session rows drew the transcript's role gutter inside their agent excerpt, giving rows like `Agent: | reliability reply: ...` — two markers where the row already had its own prefix. It was pre-existing, inherited from the old dashboard, and only became obvious once a real agent put text there. `render_agent_message_head` and `render_agent_message_tail` build their rows with the conversation's pipeline, which adds the rail every continuation row needs *under a role header*; a summary row has no header. Both now drop it, and ask the pipeline for two more columns so the caller still gets the width it asked for.

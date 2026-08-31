@@ -357,6 +357,10 @@ pub(crate) struct DashboardContext {
     /// Session-manager attachment is asynchronous: an actor may need to
     /// answer from a worker or relay before a chat can be built.
     pub(crate) opening_chat_session: Option<String>,
+    /// The conversation the selection has moved on to while an attach is still
+    /// in flight. Only the newest is kept: walking the session list must not
+    /// queue an attach per row it passes through.
+    pending_chat_session: Option<String>,
     /// Which conversation the surface opens on, and whether it is still the
     /// surface's choice to make.
     startup: StartupSession,
@@ -694,6 +698,9 @@ pub(crate) async fn run_dashboard_for_workspace(
         if !context.shutdown_requested {
             context.apply_chat_outcome(chat_outcome).await;
             actions::apply_dashboard_action(&mut context, action).await?;
+            // The Sessions pane is a list of conversations, not a list of
+            // things to go and open, so the transcript follows its selection.
+            context.follow_selected_session();
         }
         if context.shutdown_requested {
             if context.refresh_shutdown_notice() {
@@ -926,6 +933,7 @@ impl DashboardContext {
             events: Some(event::EventStream::new()),
             active_chat: None,
             opening_chat_session: None,
+            pending_chat_session: None,
             startup: StartupSession::idle(),
             dirty: true,
             drawn_notice_generation: 0,
@@ -1055,6 +1063,41 @@ impl DashboardContext {
     pub(super) fn finish_startup_summary(&mut self, session_id: &str) {
         self.startup.summary_arrived(session_id);
         self.maybe_open_startup_session();
+    }
+
+    /// Opens whatever the selection moved on to while an attach was running.
+    pub(super) fn open_pending_chat_session(&mut self) {
+        if let Some(session_id) = self.pending_chat_session.take() {
+            self.open_chat_session(&session_id);
+        }
+    }
+
+    /// Brings the conversation on screen into line with the Sessions pane's
+    /// selection.
+    ///
+    /// Moving the selection moves the transcript, so the pane reads as a list
+    /// of conversations rather than a list of things to go and open. Attaching
+    /// is asynchronous and coalesced, so walking the list costs one attach for
+    /// the row the user stops on rather than one per row passed through.
+    pub(crate) fn follow_selected_session(&mut self) {
+        let Some(selected) = self.dashboard.selected_session_id().map(str::to_owned) else {
+            return;
+        };
+        if self.opening_chat_session.as_deref() == Some(selected.as_str()) {
+            return;
+        }
+        if self.opening_chat_session.is_some() {
+            self.pending_chat_session = Some(selected);
+            return;
+        }
+        if self
+            .active_chat
+            .as_ref()
+            .is_some_and(|chat| chat.session_id() == selected)
+        {
+            return;
+        }
+        self.open_chat_session(&selected);
     }
 
     /// The user took the choice into their own hands, so the surface stops
@@ -1373,12 +1416,17 @@ impl DashboardContext {
             return;
         }
         if self.opening_chat_session.as_deref() == Some(session_id) {
+            self.pending_chat_session = None;
             return;
         }
         if self.opening_chat_session.is_some() {
-            self.dashboard.set_notice("A session is already opening…");
+            // Hold the newest request rather than refusing it. The selection
+            // drives this, so a refusal would leave the conversation showing a
+            // row the user has already moved off.
+            self.pending_chat_session = Some(session_id.to_owned());
             return;
         }
+        self.pending_chat_session = None;
         let Some(session_record) = self.controller.state.sessions.get(session_id).cloned() else {
             self.dashboard.set_notice(format!(
                 "Could not open session: unknown session {session_id}"
@@ -1982,8 +2030,8 @@ impl DashboardContext {
                 self.dashboard.cycle_focus(reverse);
                 self.dirty = true;
             }
-            hel::hel_chat::ChatEventOutcome::ToggleSupportPanes => {
-                self.dashboard.toggle_support_panes();
+            hel::hel_chat::ChatEventOutcome::CyclePaneLayout => {
+                self.dashboard.cycle_pane_layout();
                 self.dirty = true;
             }
             hel::hel_chat::ChatEventOutcome::OpenWebDialog => {

@@ -110,8 +110,8 @@ pub enum ChatEventOutcome {
     CycleFocus {
         reverse: bool,
     },
-    /// Ctrl-G: collapse the support panes, or bring them back.
-    ToggleSupportPanes,
+    /// Ctrl-G: turn the pane dial one position.
+    CyclePaneLayout,
     /// F3: open the web-access dialog.
     OpenWebDialog,
     QuitDetach {
@@ -166,7 +166,7 @@ pub enum ChatAction {
     CycleFocus {
         reverse: bool,
     },
-    ToggleSupportPanes,
+    CyclePaneLayout,
     OpenWebDialog,
     QuitDetach,
 }
@@ -1364,7 +1364,7 @@ impl ChatState {
         // time the session is opened, so stepping out loses nothing but field
         // text that was typed and not submitted.
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('g') {
-            return ChatAction::ToggleSupportPanes;
+            return ChatAction::CyclePaneLayout;
         }
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('q') {
             return ChatAction::QuitDetach;
@@ -2272,10 +2272,10 @@ mod tests {
     /// Ctrl-G no longer leaves the conversation; it collapses the support
     /// panes around it, and the host acts on that.
     #[test]
-    fn control_g_asks_the_host_to_collapse_the_support_panes() {
+    fn control_g_asks_the_host_to_turn_the_pane_dial() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         let control_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        assert_eq!(chat.handle_key(control_g), ChatAction::ToggleSupportPanes);
+        assert_eq!(chat.handle_key(control_g), ChatAction::CyclePaneLayout);
     }
 
     #[test]
@@ -2533,7 +2533,7 @@ mod tests {
         let request = text_elicitation();
         chat.restore_elicitation(request.clone());
 
-        assert_eq!(chat.handle_key(ctrl('g')), ChatAction::ToggleSupportPanes);
+        assert_eq!(chat.handle_key(ctrl('g')), ChatAction::CyclePaneLayout);
         assert_eq!(chat.handle_key(ctrl('q')), ChatAction::QuitDetach);
         assert_eq!(
             chat.materialized_session().pending_elicitations,
@@ -2560,7 +2560,7 @@ mod tests {
         let control_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(chat.handle_key(control_c), ChatAction::None);
         assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::None);
-        assert_eq!(chat.handle_key(control_g), ChatAction::ToggleSupportPanes);
+        assert_eq!(chat.handle_key(control_g), ChatAction::CyclePaneLayout);
 
         chat.phase = WorkerPhase::Running;
         assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::Cancel);

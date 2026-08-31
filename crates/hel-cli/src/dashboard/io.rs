@@ -1115,6 +1115,9 @@ impl DashboardContext {
                         }
                     }
                 }
+                // The selection may have moved on while this attach was in
+                // flight; the newest row wins.
+                self.open_pending_chat_session();
                 self.dirty = true;
             }
             DashboardIoUpdate::CreateSession(update) => self.apply_create_session_update(*update),

@@ -186,7 +186,8 @@ pub fn render_combined(
         return;
     }
 
-    let minimized = dashboard.support_minimized();
+    let layout = dashboard.pane_layout();
+    let minimized = layout.support_collapsed();
     let focus = dashboard.focus();
     let sessions_cap = if focus == Focus::Sessions {
         area.height / 2
@@ -295,12 +296,18 @@ pub fn render_combined(
     // Targets and Quota keep their pane numbers whether they are full tables
     // or one-row summaries, so a click resolves to the same pane either way.
     if minimized {
+        // Drawn as the pane's own title so a collapsed pane keeps the rule the
+        // full one has, rather than becoming a loose line of text.
         frame.render_widget(
-            Paragraph::new(minimized_targets_line(dashboard, targets_area.width)),
+            Block::default()
+                .borders(Borders::TOP)
+                .title(minimized_targets_line(dashboard, targets_area.width)),
             targets_area,
         );
         frame.render_widget(
-            Paragraph::new(minimized_quota_line(dashboard, quota_area.width)),
+            Block::default()
+                .borders(Borders::TOP)
+                .title(minimized_quota_line(dashboard, quota_area.width)),
             quota_area,
         );
         dashboard.frame_surfaces.push(SurfaceFrame::fixed(
