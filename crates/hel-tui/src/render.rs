@@ -765,11 +765,11 @@ fn dashboard_agent_prefixes(now_epoch_seconds: u64, detail: Option<&SessionDetai
         .max(turn_started);
     [
         format!(
-            "T {:>DASHBOARD_CLOCK_WIDTH$}",
+            "Turn {:>DASHBOARD_CLOCK_WIDTH$}",
             compact_dashboard_clock(now_epoch_seconds.saturating_sub(turn_started))
         ),
         format!(
-            "S {:>DASHBOARD_CLOCK_WIDTH$}",
+            "Step {:>DASHBOARD_CLOCK_WIDTH$}",
             compact_dashboard_clock(now_epoch_seconds.saturating_sub(step_started))
         ),
     ]
@@ -1585,13 +1585,11 @@ mod tests {
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
         assert!(rendered.contains("podman  [Q 1]  codex-1  ACP pretty name"));
-        assert!(!rendered.contains("  Turn "));
-        assert!(!rendered.contains("  Step "));
+        assert!(rendered.contains("Turn "));
+        assert!(rendered.contains("Step "));
         assert!(rendered.contains("  codex-1  ACP pretty name"));
         assert!(!rendered.contains("queued]"));
         assert!(rendered.contains("You: question 1"));
-        assert!(rendered.contains("T "));
-        assert!(rendered.contains("S "));
         assert!(rendered.contains("answer 1"));
 
         let buffer = terminal.backend().buffer();
@@ -1760,7 +1758,7 @@ mod tests {
 
         assert_eq!(
             dashboard_agent_prefixes(1_330, Some(&detail)),
-            ["T  5m30s", "S    33s"]
+            ["Turn  5m30s", "Step    33s"]
         );
         assert_eq!(compact_dashboard_clock(99 * 60 + 59), "99m59s");
         assert_eq!(compact_dashboard_clock(100 * 60 + 59), "100m");
