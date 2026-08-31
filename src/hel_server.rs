@@ -1319,6 +1319,7 @@ mod tests {
     fn sample_config_state() -> (HelConfig, HelState) {
         let config = HelConfig {
             version: CONFIG_VERSION,
+            newer_config_version: None,
             phone: Default::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),

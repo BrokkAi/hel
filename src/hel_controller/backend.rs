@@ -1275,6 +1275,7 @@ mod tests {
         };
         let config = HelConfig {
             version: crate::hel_config::CONFIG_VERSION,
+            newer_config_version: None,
             phone: Default::default(),
             profiles: BTreeMap::new(),
             bundles: BTreeMap::new(),

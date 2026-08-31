@@ -1417,6 +1417,7 @@ mod tests {
         Controller {
             config: HelConfig {
                 version: CONFIG_VERSION,
+                newer_config_version: None,
                 phone: Default::default(),
                 profiles: ids
                     .iter()
