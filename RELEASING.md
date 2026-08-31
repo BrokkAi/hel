@@ -24,6 +24,25 @@ version and must be refreshed before tagging. `install.sh`'s `SCRIPT_VERSION`
 is an independent installer logging revision; do not synchronize it to the
 product version.
 
+## One-time crates.io setup
+
+Each published crate must authorize this repository before the workflow can
+exchange GitHub's OIDC identity for a short-lived crates.io token. In the
+crates.io settings for `hel-core`, `hel-tui`, `hel-cli`, and
+`hel-voice-worker`, create a GitHub Trusted Publisher with these exact values:
+
+- GitHub owner: `BrokkAi`
+- Repository: `hel`
+- Workflow: `publish.yml`
+- Environment: `crates-io`
+
+The GitHub repository must also have an environment named `crates-io`; use its
+deployment protection rules for any desired maintainer approval. No long-lived
+crates.io token or GitHub secret is needed. Trusted Publisher configuration is
+one-time per crate, but confirm it before tagging the first release that uses
+OIDC: a missing configuration is discovered only after the GitHub Release is
+already public.
+
 ## Release procedure
 
 1. Set `[workspace.package] version` in the root `Cargo.toml` to the next
@@ -67,15 +86,27 @@ product version.
    ARM64 Linux musl, and ARM64 macOS archives, publishes the GitHub Release and
    checksums, and dispatches the crates.io workflow.
 7. Approve the `crates-io` environment when requested. `publish.yml` verifies
-   and packages the tagged source before publishing `hel-core`, `hel-tui`,
-   `hel-cli`, and `hel-voice-worker` in dependency order. An already-published
-   crate version is skipped, so rerunning the workflow safely resumes a partial
+   and packages the tagged source, authenticates through each crate's Trusted
+   Publisher configuration, then publishes `hel-core`, `hel-tui`, `hel-cli`,
+   and `hel-voice-worker` in dependency order. An already-published crate
+   version is skipped, so rerunning the workflow safely resumes a partial
    publication.
 8. Verify the GitHub Release assets and confirm all four crates show `X.Y.Z` on
    crates.io. Test the documented installer against the new tag.
 
 To package an existing tag without publishing crates, run `publish.yml`
 manually with `publish` disabled and inspect its `.crate` artifact.
+
+If crates.io authentication failed because Trusted Publishing was not
+configured, add the four configurations above and retry the existing immutable
+tag with:
+
+```bash
+gh workflow run publish.yml \
+  --ref vX.Y.Z \
+  --raw-field release_tag=vX.Y.Z \
+  --raw-field publish=true
+```
 
 ## Recovery
 
