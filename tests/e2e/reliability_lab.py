@@ -193,6 +193,25 @@ class PtyClient:
             f"{self.name} did not display {marker!r}: {self.text()[-4000:]}"
         )
 
+    def wait_for_absence(self, marker: str, timeout: float = TIMEOUT) -> None:
+        deadline = time.monotonic() + timeout
+        absent_since: float | None = None
+        while time.monotonic() < deadline:
+            if marker not in self.text():
+                absent_since = absent_since or time.monotonic()
+                if time.monotonic() - absent_since >= 0.2:
+                    return
+            else:
+                absent_since = None
+            if self.process.poll() is not None:
+                raise ScenarioFailure(
+                    f"{self.name} exited before {marker!r} disappeared: {self.text()[-4000:]}"
+                )
+            time.sleep(0.05)
+        raise ScenarioFailure(
+            f"{self.name} still displayed {marker!r}: {self.text()[-4000:]}"
+        )
+
     def send(self, data: bytes) -> None:
         os.write(self.master, data)
 
@@ -866,6 +885,13 @@ kind = "local-bare"
             lambda value: (self.session(value, session_id) or {}).get("state") == "saved",
             "saved session",
         )
+        first.wait_for_absence(title)
+        second.wait_for_absence(title)
+        terminal = self.snapshot()
+        revision = int(terminal["revision"])
+        self.record_client_revision("tui-1", revision)
+        self.record_client_revision("tui-2", revision)
+        self.record_action("clients-finish-converged", session_id=session_id, clients=3)
 
         quit_one = first.quit()
         self.record_process("stopped", "tui-1", first.process.pid)

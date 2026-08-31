@@ -21,6 +21,7 @@ The visible proof is a local Podman session whose chat can be left without stopp
 - [x] (2026-08-31 14:53Z) Brought the phone viewer and its controller action schema to the same lifecycle model without exposing private target locators. Rust projection/server tests, script syntax checks, and targeted clippy pass; the real browser run is updated but cannot launch Chromium in this container because its system libraries require unavailable sudo access.
 - [x] (2026-08-31 15:00Z) Published lifecycle guidance, updated behavioral and end-to-end tests, and ran the complete locally available validation suite. Rust, lint, docs, links, and script syntax pass; real browser launch and manual Podman acceptance remain environment-skipped for the reasons recorded below.
 - [x] (2026-08-31 15:28Z) Reconciled the feature with `origin/master` at `53dffa5`, preserving the newer phone viewer's image-prompt and elicitation flows alongside target-aware Finish. The post-merge full Rust suite, formatting, Clippy, documentation build, link check, JavaScript parse, Python compile, and Playwright test discovery pass.
+- [x] (2026-08-31 15:36Z) Fixed the CI reliability scenario to wait for both TUI projections to converge after a phone-initiated Finish before asserting immediate quit. The exact three-client scenario now passes locally with zero leaked processes.
 
 ## Surprises & Discoveries
 
@@ -56,6 +57,9 @@ The visible proof is a local Podman session whose chat can be left without stopp
 
 - Observation: `origin/master` added phone-viewer image attachments and elicitation forms after this branch was opened, touching the same embedded viewer as target-aware Finish.
   Evidence: the merge conflicts were confined to `src/hel_server.rs` and the public exports in `src/hel_worker.rs`. The resolved viewer maps all three projections (`finish`, `pending_elicitations`, and `prompt_images_supported`), and all 39 server tests pass together.
+
+- Observation: the deterministic three-client CI scenario treated the phone snapshot reaching Saved as if both TUI clients had already ingested that revision.
+  Evidence: the failed artifact showed a valid database and completed Finish, while the second TUI received Ctrl+Q just before its terminal projection update and correctly opened the new live-session warning. Waiting for the finished title to disappear stably from both terminal screens makes the scenario prove three-client terminal convergence before testing immediate quit.
 
 ## Decision Log
 
@@ -384,3 +388,5 @@ Revision note (2026-08-31): Milestone 3 completed the privacy-safe phone project
 Revision note (2026-08-31): Milestone 4 published the lifecycle documentation, extended the browser/TUI reliability flow through Dashboard, quit warning, Finish, and Saved, and completed all locally available full-suite validation.
 
 Revision note (2026-08-31): Reconciled the completed feature with `origin/master` at `53dffa5`. The resolution retains both lifecycle Finish and the newer image/elicitation viewer capabilities; the merged tree passes 1,757 Rust tests with 9 environment or measurement tests ignored, plus formatting, Clippy, docs, links, and script checks.
+
+Revision note (2026-08-31): GitHub's three-client smoke test exposed a projection race in the test sequence, not a lifecycle failure: one TUI was asked to quit before it had observed the phone-initiated terminal revision. The harness now waits for both terminal screens to remove the finished session, records that convergence, and then verifies both dashboards quit promptly.
