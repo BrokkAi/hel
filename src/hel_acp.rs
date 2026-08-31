@@ -15,7 +15,9 @@ pub(crate) use terminal_compat::{fallback_terminal_tool_call_id, is_fallback_ter
 use dialect::grok;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,7 +37,7 @@ use agent_client_protocol::schema::v1::{
     StopReason, TerminalExitStatus, TerminalId, TerminalOutputRequest, TerminalOutputResponse,
     TextContent, ToolCallUpdateFields, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
+use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo, UntypedMessage};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
@@ -51,7 +53,7 @@ use crate::hel_elicitation::{
 use crate::hel_terminal::{
     DEFAULT_TERMINAL_OUTPUT_BYTES, TerminalExit, TerminalRegistry, TerminalSpawn,
 };
-use crate::hel_worker::AcpActivityClock;
+use crate::hel_worker::{AcpActivityClock, ClaimedSteeringPrompt};
 use crate::hel_worker_runtime::{ProjectMemoryLaunchConfig, ProjectMemoryMcpDelivery};
 
 pub(crate) fn plan_review_carries_native_feedback(id: &str) -> bool {
@@ -295,6 +297,7 @@ pub enum CommandRequest {
     },
     Cancel {
         request_id: String,
+        steering_prompt: Option<ClaimedSteeringPrompt>,
     },
     Close {
         request_id: String,
@@ -407,6 +410,10 @@ pub enum RuntimeEvent {
     },
     CancelApplied {
         request_id: String,
+    },
+    SteerApplied {
+        request_id: String,
+        queued_command_id: String,
     },
     CloseApplied {
         request_id: String,
@@ -1677,6 +1684,100 @@ async fn apply_cancel(
     }
 }
 
+const SESSION_STEERING_METHOD: &str = "_session/steering";
+
+fn steering_supported_from_meta(meta: Option<&agent_client_protocol::schema::v1::Meta>) -> bool {
+    meta.and_then(|meta| meta.get("steering"))
+        .and_then(|steering| steering.get("supported"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+struct PendingSteer {
+    request_id: String,
+    queued_command_id: String,
+    response: Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<serde_json::Value, agent_client_protocol::Error>,
+                > + Send,
+        >,
+    >,
+}
+
+fn start_steer(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    request_id: String,
+    steering_prompt: ClaimedSteeringPrompt,
+) -> PendingSteer {
+    let request = UntypedMessage {
+        method: SESSION_STEERING_METHOD.to_owned(),
+        params: serde_json::json!({
+            "sessionId": session_id,
+            "prompt": steering_prompt.prompt,
+            "_meta": { "steering": { "idleBehavior": "promptRequired" } },
+        }),
+    };
+    PendingSteer {
+        request_id,
+        queued_command_id: steering_prompt.queued_command_id,
+        response: Box::pin(connection.send_request(request).block_task()),
+    }
+}
+
+async fn settle_steer(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    events: &mpsc::Sender<RuntimeEvent>,
+    terminals: &TerminalRegistry,
+    pending: PendingSteer,
+    outcome: std::result::Result<serde_json::Value, agent_client_protocol::Error>,
+    turn_running: bool,
+) -> Result<bool> {
+    match outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("outcome"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("injected") => {
+            emit_runtime_event(
+                events,
+                RuntimeEvent::SteerApplied {
+                    request_id: pending.request_id,
+                    queued_command_id: pending.queued_command_id,
+                },
+            )
+            .await?;
+            Ok(false)
+        }
+        outcome => {
+            let detached_turn = outcome == Some("startedNewTurn");
+            if turn_running || detached_turn {
+                apply_cancel(
+                    connection,
+                    session_id,
+                    pending.request_id,
+                    events,
+                    terminals,
+                )
+                .await?;
+                Ok(true)
+            } else {
+                emit_runtime_event(
+                    events,
+                    RuntimeEvent::CancelApplied {
+                        request_id: pending.request_id,
+                    },
+                )
+                .await?;
+                Ok(false)
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_session(
     connection: &ConnectionTo<Agent>,
@@ -1717,6 +1818,7 @@ async fn serve_session(
             initialized.protocol_version
         );
     }
+    let steering_supported = steering_supported_from_meta(initialized.meta.as_ref());
     // Grok Build publishes its catalogue here rather than as `configOptions`.
     let mut grok_models = (spec.harness == HarnessKind::Grok)
         .then(|| grok::model_state(initialized.meta.as_ref()))
@@ -1859,10 +1961,41 @@ async fn serve_session(
                     .block_task();
                 tokio::pin!(prompt);
                 let mut cancel_deadline = None;
+                let mut pending_steer: Option<PendingSteer> = None;
                 loop {
                     tokio::select! {
                         response = &mut prompt => {
                             spec.acp_activity.mark();
+                            if let Some(mut pending) = pending_steer.take() {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    pending.response.as_mut(),
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => {
+                                        settle_steer(
+                                            connection,
+                                            &session_id,
+                                            events,
+                                            terminals,
+                                            pending,
+                                            outcome,
+                                            false,
+                                        )
+                                        .await?;
+                                    }
+                                    Err(_) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CancelApplied {
+                                                request_id: pending.request_id,
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
                             // A rejected prompt fails the turn, not the worker: the
                             // bridge can still serve later prompts. A JSON-RPC
                             // error stays on this connection; a dead transport
@@ -1934,19 +2067,63 @@ async fn serve_session(
                             .await?;
                             return Ok(Some(session_id.to_string()));
                         }
+                        steer_outcome = async {
+                            pending_steer
+                                .as_mut()
+                                .expect("steering branch is guarded")
+                                .response
+                                .as_mut()
+                                .await
+                        }, if pending_steer.is_some() => {
+                            let pending = pending_steer
+                                .take()
+                                .expect("steering branch is guarded");
+                            if settle_steer(
+                                connection,
+                                &session_id,
+                                events,
+                                terminals,
+                                pending,
+                                steer_outcome,
+                                true,
+                            )
+                            .await?
+                                && cancel_deadline.is_none()
+                            {
+                                cancel_deadline =
+                                    Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
+                            }
+                        }
                         command = requests.recv() => match command {
-                            Some(CommandRequest::Cancel { request_id: cancel_id }) => {
-                                apply_cancel(
-                                    connection,
-                                    &session_id,
-                                    cancel_id,
-                                    events,
-                                    terminals,
-                                )
-                                .await?;
-                                if cancel_deadline.is_none() {
-                                    cancel_deadline =
-                                        Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
+                            Some(CommandRequest::Cancel {
+                                request_id: cancel_id,
+                                steering_prompt,
+                            }) => {
+                                if steering_supported
+                                    && pending_steer.is_none()
+                                    && cancel_deadline.is_none()
+                                    && let Some(steering_prompt) = steering_prompt
+                                {
+                                    pending_steer = Some(start_steer(
+                                        connection,
+                                        &session_id,
+                                        cancel_id,
+                                        steering_prompt,
+                                    ));
+                                } else {
+                                    apply_cancel(
+                                        connection,
+                                        &session_id,
+                                        cancel_id,
+                                        events,
+                                        terminals,
+                                    )
+                                    .await?;
+                                    if cancel_deadline.is_none() {
+                                        cancel_deadline = Some(
+                                            tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT,
+                                        );
+                                    }
                                 }
                             }
                             Some(CommandRequest::Close { request_id: close_id }) => {
@@ -2209,7 +2386,10 @@ async fn serve_session(
                             break;
                         }
                         command = requests.recv() => match command {
-                            Some(CommandRequest::Cancel { request_id: cancel_id }) => {
+                            Some(CommandRequest::Cancel {
+                                request_id: cancel_id,
+                                ..
+                            }) => {
                                 apply_cancel(
                                     connection,
                                     &session_id,
@@ -2361,7 +2541,7 @@ async fn serve_session(
                     }
                 }
             }
-            CommandRequest::Cancel { request_id } => {
+            CommandRequest::Cancel { request_id, .. } => {
                 apply_cancel(connection, &session_id, request_id, events, terminals).await?;
             }
             CommandRequest::ResolveElicitation {

@@ -36,7 +36,7 @@ default-members = [".", "crates/hel-tui", "crates/hel-cli"]
 # inherits it with `version.workspace = true`, so the four package versions
 # cannot drift apart (RELEASING.md requires them to match).
 [workspace.package]
-version = "0.2.0"
+version = "0.3.1"
 # The real compiler floor is the pinned toolchain in `rust-toolchain.toml`,
 # not just what edition 2024 implies. Declaring it makes `cargo install` on an
 # older compiler fail with a clear version message instead of mid-build
@@ -50,8 +50,8 @@ rust-version = "1.96"
 # `node scripts/release-version.mjs check` (run in CI) fails when these fall
 # behind the workspace version.
 [workspace.dependencies]
-hel = { path = ".", package = "hel-core", version = "0.2.0" }
-hel-tui = { path = "crates/hel-tui", version = "0.2.0" }
+hel = { path = ".", package = "hel-core", version = "0.3.1" }
+hel-tui = { path = "crates/hel-tui", version = "0.3.1" }
 
 [workspace.lints.clippy]
 disallowed_methods = "warn"
@@ -60,7 +60,7 @@ disallowed_methods = "warn"
 workspace = true
 
 [dependencies]
-agent-client-protocol = { version = "1", features = ["unstable_session_fork", "unstable_end_turn_token_usage", "unstable_elicitation", "unstable_auth_methods", "unstable_cancel_request"] }
+agent-client-protocol = { version = "2", features = ["unstable_session_fork", "unstable_end_turn_token_usage", "unstable_elicitation", "unstable_auth_methods"] }
 anyhow = "1"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 axum = "0.8"
