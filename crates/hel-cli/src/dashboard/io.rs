@@ -148,6 +148,11 @@ pub(crate) enum DashboardIoUpdate {
         target: ArchiveWriteTarget,
         result: std::result::Result<(), String>,
     },
+    ManagerReply {
+        request_id: u64,
+        source_session_id: Option<String>,
+        result: std::result::Result<String, String>,
+    },
 }
 
 /// Which hidden-row store an archive write was aimed at, and what the record
@@ -1052,6 +1057,13 @@ impl DashboardContext {
                     self.dirty = true;
                 }
             }
+            DashboardIoUpdate::ManagerReply {
+                request_id,
+                source_session_id,
+                result,
+            } => self
+                .dashboard
+                .apply_manager_reply(request_id, source_session_id, result),
             DashboardIoUpdate::MaterializedSessionProjection { session_id, result } => {
                 self.finish_materialized_projection(session_id, result);
             }

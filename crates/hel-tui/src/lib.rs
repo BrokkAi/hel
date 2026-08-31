@@ -31,6 +31,7 @@ use crate::wizards::{MountFocus, NewWizard, ResumeWizard, WizardStep};
 
 mod dialogs;
 mod ingest;
+mod manager;
 mod render;
 mod resume;
 mod widgets;
@@ -44,6 +45,7 @@ pub use crate::ingest::{
     MaterializedProjectionCache, PreparedMaterializedSessionDetail,
     PreparedMaterializedSessionSummary,
 };
+pub use crate::manager::ManagerQuery;
 pub use crate::render::render;
 pub use crate::resume::resume_profile_placeholders;
 
@@ -186,6 +188,9 @@ pub enum DashboardAction {
     },
     OpenWorkspacePicker,
     QuitDetach,
+    /// Ask the workspace-level advisory manager through an idle session's
+    /// disposable scratch model.
+    AskManager(ManagerQuery),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +251,8 @@ pub(crate) enum Mode {
     Importing(ImportProgress),
     ConfirmImportBundle(ImportBundleConfirmation),
     Confirm(ConfirmDialog),
+    /// Workspace-wide session assessment and its independent mini transcript.
+    Manager,
 }
 
 /// What a key press means for a focusable button row.
@@ -339,6 +346,7 @@ pub struct DashboardState {
     pub(crate) mode: Mode,
     pub(crate) notices: Notices,
     pub(crate) greeting: String,
+    pub(crate) manager: manager::ManagerState,
 }
 
 impl DashboardState {
@@ -371,6 +379,7 @@ impl DashboardState {
             mode: Mode::Dashboard,
             notices: Notices::default(),
             greeting: "Welcome to Hel".into(),
+            manager: manager::ManagerState::default(),
         };
         dashboard.session_details = dashboard
             .state
@@ -403,6 +412,14 @@ impl DashboardState {
         }
         if is_paste_shortcut(key) {
             return DashboardAction::PasteFromClipboard;
+        }
+        if dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('m') {
+            if matches!(self.mode, Mode::Manager) {
+                self.mode = Mode::Dashboard;
+            } else {
+                self.open_manager();
+            }
+            return DashboardAction::None;
         }
         let text_focused = self.text_input_focused();
         if text_focused
@@ -458,6 +475,7 @@ impl DashboardState {
                 self.handle_import_bundle_key(key.code, confirmation)
             }
             Mode::Confirm(dialog) => self.handle_confirmation_key(key, dialog),
+            Mode::Manager => self.handle_manager_key(key),
         }
     }
 
@@ -473,6 +491,7 @@ impl DashboardState {
                 confirmation: Confirmation::ForceStop { .. },
                 ..
             }) => true,
+            Mode::Manager => self.manager.focus == manager::ManagerFocus::Prompt,
             _ => false,
         }
     }
@@ -525,6 +544,9 @@ impl DashboardState {
             {
                 dialog.replacement.push_str(&pasted);
                 dialog.error = None;
+            }
+            Mode::Manager if self.manager.focus == manager::ManagerFocus::Prompt => {
+                self.manager.input.push_str(&pasted);
             }
             _ => {}
         }
@@ -1000,6 +1022,7 @@ impl DashboardState {
     }
 
     pub(crate) fn clamp_selections(&mut self) {
+        self.clamp_manager_selection();
         let active_len = self.ordered_sessions().len();
         self.session_index = self.session_index.min(active_len.saturating_sub(1));
         let project_keys = self.project_keys();

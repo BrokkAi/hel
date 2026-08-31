@@ -34,6 +34,45 @@ pub(crate) async fn apply_dashboard_action(
 ) -> Result<()> {
     match action {
         DashboardAction::None => {}
+        DashboardAction::AskManager(query) => {
+            let control = context.worker_commands_tx.clone();
+            let updates = context.dashboard_io_tx.clone();
+            tokio::spawn(async move {
+                let mut selected = None;
+                let mut last_error = None;
+                for session_id in query.backend_session_ids {
+                    match control.session(session_id.clone()).await {
+                        Ok(session) => {
+                            selected = Some((session_id, session));
+                            break;
+                        }
+                        Err(error) => last_error = Some(format!("{error:#}")),
+                    }
+                }
+                let (source_session_id, result) = match selected {
+                    Some((session_id, session)) => {
+                        let result = session
+                            .compact(query.model_prompt)
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                        (Some(session_id), result)
+                    }
+                    None => (
+                        None,
+                        Err(last_error.unwrap_or_else(|| {
+                            "no idle manager model provider is still connected".into()
+                        })),
+                    ),
+                };
+                if let Err(error) = updates.send(DashboardIoUpdate::ManagerReply {
+                    request_id: query.request_id,
+                    source_session_id,
+                    result,
+                }) {
+                    tracing::debug!(%error, "manager reply dropped after dashboard shutdown");
+                }
+            });
+        }
         DashboardAction::QuitDetach => {
             context.request_shutdown();
         }

@@ -26,6 +26,9 @@ Hel exists for the second case.
   structurally excludes credentials from event streams and recovery archives.
 - **One view of capacity.** Sessions, per-profile quota and usage, and host
   capacity in one dashboard — and on your phone through the persistent Hel daemon.
+- **An advisory manager.** Press `Ctrl+M` in the terminal dashboard to review
+  idle sessions and old archives, ask for a workspace-wide work summary, and
+  open Hel's explicit stop or cleanup confirmations.
 - **Agents can operate it.** `hel doctor --json` and `hel setup instructions`
   are designed so your coding agent can converge a host to session-ready by
   looping on machine-readable checks.
@@ -47,8 +50,10 @@ Hel exists for the second case.
 
 ## Non-goals
 
-- **Hel is not an agent.** It does not write code, plan, or pick models. It
-  manages harnesses that do.
+- **No autonomous orchestration.** The dashboard manager can analyze redacted
+  session status through an idle session's scratch model, but it does not write
+  code, schedule work, or execute lifecycle suggestions. Stop and permanent
+  cleanup remain typed Hel operations with explicit confirmation.
 - **No privileged host setup.** Hel will not install Podman, edit
   `subuid`/`subgid`, create AWS launch templates or security groups, or make
   SSH hosts reachable. You (or your agent, with your credentials) do that;
@@ -140,6 +145,14 @@ to build your own.
 4. Detach whenever you like (`Ctrl+Q`). The session keeps running and your
    queued prompts keep executing. Reattach from the dashboard, or open the
    daemon-owned web viewer shown by `hel daemon status`.
+
+From the terminal dashboard, press `Ctrl+M` for the workspace manager. It marks
+live sessions as working, queued, ready, unreachable, or idle; a session becomes
+a stop candidate only after two hours of projected inactivity. Archived stopped
+sessions become cleanup candidates after thirty days. Manager questions use a
+disposable scratch model from a connected idle session and never appear in that
+coding session's transcript. If every session is busy, the manager waits for you
+to retry instead of delaying agent work.
 
 In an attached TUI or the phone viewer, start a message with `!` to run the
 rest as `bash -lc` inside that session's target. Shell commands run in the

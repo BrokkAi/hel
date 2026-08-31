@@ -41,7 +41,7 @@ use crate::pollers::{
     reserve_recovery_or_cancel, spawn_interrupted_close_recovery,
 };
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -246,6 +246,10 @@ enum DaemonAction {
     SyncSession {
         session_id: String,
     },
+    CompactSession {
+        session_id: String,
+        prompt: String,
+    },
     RespondElicitation {
         session_id: String,
         elicitation_id: String,
@@ -310,6 +314,7 @@ enum DaemonReply {
     MaterializedSession(MaterializedSession),
     RegisteredSession(Box<RegisteredSession>),
     Ordinal(u64),
+    Text(String),
     Reviewer(Box<hel::hel_session_manager::ReviewerOutcome>),
     Done,
 }
@@ -1531,6 +1536,20 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) async fn compact_session(
+        &mut self,
+        session_id: String,
+        prompt: String,
+    ) -> Result<String> {
+        match self
+            .request(DaemonAction::CompactSession { session_id, prompt })
+            .await?
+        {
+            DaemonReply::Text(text) => Ok(text),
+            reply => bail!("unexpected scratch model reply {reply:?}"),
+        }
+    }
+
     pub(crate) async fn respond_elicitation(
         &mut self,
         session_id: String,
@@ -2080,6 +2099,16 @@ async fn forward_in_process_session_request(
                 .map_err(|error| format!("{error:#}"));
             let _ = reply.send(result);
         }
+        RemoteSessionRequest::Compact {
+            session_id,
+            prompt,
+            reply,
+        } => {
+            let result = async { manager.session(session_id).await?.compact(prompt).await }
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
         RemoteSessionRequest::RespondElicitation {
             session_id,
             elicitation_id,
@@ -2342,6 +2371,15 @@ async fn handle_action(
                 .sync_now()
                 .await?;
             Ok(DaemonReply::Done)
+        }
+        DaemonAction::CompactSession { session_id, prompt } => {
+            let text = state
+                .session_manager
+                .session(session_id)
+                .await?
+                .compact(prompt)
+                .await?;
+            Ok(DaemonReply::Text(text))
         }
         DaemonAction::RespondElicitation {
             session_id,

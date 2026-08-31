@@ -20,7 +20,7 @@ use crate::hel_projection::{
     ProjectionIndex, apply_committed_projection_event_indexed, materialized_session_from_canonical,
     project_relay_event_indexed,
 };
-use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
+use crate::hel_state::{ManagedSessionSnapshot, MaterializedExecutionState, MaterializedSession};
 use crate::hel_targets::{
     CancellableProcessExecutor, CommandExecutor, CommandPlan, CommandSpec, TargetRecoveryOutcome,
     TargetRecoveryPlan, ensure_recovery_target_running,
@@ -394,6 +394,11 @@ pub enum RemoteSessionRequest {
         session_id: String,
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
+    Compact {
+        session_id: String,
+        prompt: String,
+        reply: oneshot::Sender<std::result::Result<String, String>>,
+    },
     RespondElicitation {
         session_id: String,
         elicitation_id: String,
@@ -656,6 +661,20 @@ impl ManagedSessionHandle {
         self.enqueue_sync().await?.wait().await
     }
 
+    /// Run an advisory prompt in a disposable ACP session without adding it
+    /// to this session's projected conversation.
+    pub async fn compact(&self, prompt: String) -> Result<String> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(ActorCommand::Compact { prompt, reply })
+            .await
+            .context("session manager stopped")?;
+        result
+            .await
+            .context("session manager stopped")?
+            .map_err(anyhow::Error::msg)
+    }
+
     pub async fn respond_elicitation(
         &self,
         elicitation_id: String,
@@ -796,6 +815,10 @@ enum ActorCommand {
     Sync {
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
+    Compact {
+        prompt: String,
+        reply: oneshot::Sender<std::result::Result<String, String>>,
+    },
     RespondElicitation {
         elicitation_id: String,
         response: ElicitationResponse,
@@ -818,6 +841,7 @@ impl ActorCommand {
         match self {
             Self::Submit { .. } => "submit",
             Self::Sync { .. } => "sync",
+            Self::Compact { .. } => "compact",
             Self::RespondElicitation { .. } => "respond_elicitation",
             Self::Reviewer { action, .. } => action.operation_name(),
             Self::Lease { .. } => "lease",
@@ -841,6 +865,15 @@ impl ActorCommand {
                         %session_id,
                         operation = "sync",
                         "sync rejection receiver was already closed"
+                    );
+                }
+            }
+            Self::Compact { reply, .. } => {
+                if reply.send(Err(message.to_owned())).is_err() {
+                    tracing::debug!(
+                        %session_id,
+                        operation = "compact",
+                        "compact rejection receiver was already closed"
                     );
                 }
             }
@@ -1082,6 +1115,11 @@ async fn run_remote_session_actor(
                 session_id: session_id.clone(),
                 reply,
             },
+            ActorCommand::Compact { prompt, reply } => RemoteSessionRequest::Compact {
+                session_id: session_id.clone(),
+                prompt,
+                reply,
+            },
             ActorCommand::RespondElicitation {
                 elicitation_id,
                 response,
@@ -1111,6 +1149,9 @@ async fn run_remote_session_actor(
                 }
                 RemoteSessionRequest::Sync { reply, .. }
                 | RemoteSessionRequest::RespondElicitation { reply, .. } => {
+                    let _ = reply.send(Err("controller daemon request bridge stopped".into()));
+                }
+                RemoteSessionRequest::Compact { reply, .. } => {
                     let _ = reply.send(Err("controller daemon request bridge stopped".into()));
                 }
                 RemoteSessionRequest::Reviewer { reply, .. } => {
@@ -1675,13 +1716,70 @@ async fn run_session_actor(
                                 "explicit relay synchronization failed"
                             );
                         }
-                    if reply.send(result.map_err(|error| format!("{error:#}"))).is_err() {
-                        tracing::debug!(
-                            session_id = %target.session_id,
-                            operation = "sync",
-                            "sync result receiver was already closed"
-                        );
+                        if reply
+                            .send(result.map_err(|error| format!("{error:#}")))
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                operation = "sync",
+                                "sync result receiver was already closed"
+                            );
+                        }
                     }
+                    ActorCommand::Compact { prompt, reply } => {
+                        if lifecycle.is_leased() {
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                operation = "compact",
+                                "rejecting scratch model request while session is leased"
+                            );
+                            if reply
+                                .send(Err("session is reserved for a lifecycle operation".into()))
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    session_id = %target.session_id,
+                                    operation = "compact",
+                                    "compact rejection receiver was already closed"
+                                );
+                            }
+                            continue;
+                        }
+                        let result = async {
+                            sync_actor_connection(&target, &mut connection).await?;
+                            let connection = connection
+                                .as_mut()
+                                .context("relay is disconnected")?;
+                            let snapshot = connection.snapshot();
+                            ensure!(
+                                matches!(
+                                    snapshot.materialized.execution,
+                                    MaterializedExecutionState::Idle
+                                ) && snapshot.materialized.queued_prompts.is_empty(),
+                                "session is no longer idle; manager scratch request was not started"
+                            );
+                            connection.compact(prompt).await
+                        }
+                        .await;
+                        if let Err(error) = &result {
+                            tracing::warn!(
+                                session_id = %target.session_id,
+                                operation = "compact",
+                                error = %error,
+                                "scratch model request failed"
+                            );
+                        }
+                        if reply
+                            .send(result.map_err(|error| format!("{error:#}")))
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                operation = "compact",
+                                "compact result receiver was already closed"
+                            );
+                        }
                     }
                     ActorCommand::Reviewer { action, reply } => {
                         if lifecycle.is_leased() {
@@ -4197,6 +4295,27 @@ mod tests {
             _ => panic!("unexpected remote session request"),
         }
         assert_eq!(submitted.wait().await.unwrap(), 8);
+
+        let compact_session = session.clone();
+        let compact = tokio::spawn(async move {
+            compact_session
+                .compact("summarize the dashboard".into())
+                .await
+        });
+        let request = remote.requests.recv().await.unwrap();
+        match request {
+            RemoteSessionRequest::Compact {
+                session_id,
+                prompt,
+                reply,
+            } => {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(prompt, "summarize the dashboard");
+                reply.send(Ok("everything is healthy".into())).unwrap();
+            }
+            _ => panic!("unexpected remote scratch-model request"),
+        }
+        assert_eq!(compact.await.unwrap().unwrap(), "everything is healthy");
         remote.shutdown.shutdown().await.unwrap();
     }
 }

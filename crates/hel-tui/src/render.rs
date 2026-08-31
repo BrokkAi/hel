@@ -26,6 +26,9 @@ use crate::dialogs::{
     render_repository_origin, render_session_edit, render_target_actions, render_web_dialog,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay};
+use crate::manager::{
+    ManagerFocus, ManagerMessageRole, ManagerRecommendation, format_age, manager_status_label,
+};
 use crate::resume::{render_resume_dialog, resume_sessions_pane};
 use crate::widgets::{bordered_content, focus_border, format_resource_bytes};
 use crate::wizards::{render_new_wizard, render_resume_wizard};
@@ -54,6 +57,10 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
             area,
             TerminalSizeRequirement::Width(MINIMUM_TERMINAL_WIDTH),
         );
+        return;
+    }
+    if matches!(dashboard.mode, Mode::Manager) {
+        render_manager(frame, area, dashboard);
         return;
     }
     dashboard.resume_sessions_area =
@@ -111,9 +118,204 @@ fn render_modal(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
             render_import_bundle_confirmation(frame, area, confirmation, &mut surfaces)
         }
         Mode::Confirm(dialog) => render_confirmation(frame, area, dialog, &mut surfaces),
+        Mode::Manager => {}
         Mode::Dashboard => {}
     }
     dashboard.frame_surfaces = surfaces;
+}
+
+fn render_manager(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
+    let fixed = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(8),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    render_dashboard_title(frame, fixed[0], "Dashboard manager");
+    let body = if area.width >= 90 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+            .split(fixed[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(fixed[1])
+    };
+    render_manager_sessions(frame, body[0], dashboard);
+    render_manager_transcript(frame, body[1], dashboard);
+    render_manager_prompt(frame, fixed[2], dashboard);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" focus  "),
+            Span::styled("s", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" stop idle  "),
+            Span::styled("a", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" archive  "),
+            Span::styled("d", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" clean up  "),
+            Span::styled("Esc/Ctrl+M", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" close"),
+        ])),
+        fixed[3],
+    );
+}
+
+fn render_manager_sessions(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
+    let rows = dashboard.manager_rows();
+    let visible = usize::from(area.height.saturating_sub(2) / 2).max(1);
+    let selected = dashboard
+        .manager
+        .session_index
+        .min(rows.len().saturating_sub(1));
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(rows.len().saturating_sub(visible));
+    let mut lines = Vec::new();
+    if rows.is_empty() {
+        lines.push(Line::styled(
+            "No sessions in this workspace.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    for (index, row) in rows.iter().enumerate().skip(start).take(visible) {
+        let selected = index == selected;
+        let style = if selected {
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let short_id = row.session_id.chars().take(8).collect::<String>();
+        lines.push(Line::styled(
+            format!(
+                "{} {}  [{short_id}]",
+                if selected { "›" } else { " " },
+                row.title
+            ),
+            style,
+        ));
+        let age = row
+            .age_seconds
+            .map(|age| format!(" · {} ago", format_age(age)))
+            .unwrap_or_default();
+        let recommendation = match row.recommendation {
+            Some(ManagerRecommendation::Stop) => " · press s to stop",
+            Some(ManagerRecommendation::Destroy) => " · press d to clean up",
+            None => "",
+        };
+        lines.push(Line::styled(
+            format!(
+                "  {} · {} → {}{age}{recommendation}",
+                manager_status_label(row.status),
+                row.project,
+                row.target,
+            ),
+            style,
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(focus_border(
+                    dashboard.manager.focus == ManagerFocus::Sessions,
+                ))
+                .title(format!(" Sessions · {} ", rows.len())),
+        ),
+        area,
+    );
+}
+
+fn render_manager_transcript(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
+    let messages = &dashboard.manager.messages;
+    let end = messages
+        .len()
+        .saturating_sub(dashboard.manager.transcript_scroll)
+        .max(1)
+        .min(messages.len());
+    let visible_messages = usize::from(area.height.saturating_sub(2) / 2).max(2);
+    let start = end.saturating_sub(visible_messages);
+    let mut lines = Vec::new();
+    for message in &messages[start..end] {
+        let (label, style) = match message.role {
+            ManagerMessageRole::User => (
+                "You",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            ManagerMessageRole::Manager => (
+                "Manager",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            ManagerMessageRole::System => (
+                "Hel",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        };
+        lines.push(Line::styled(format!("{label}:"), style));
+        lines.extend(
+            message
+                .text
+                .lines()
+                .map(|line| Line::raw(format!("  {line}"))),
+        );
+        lines.push(Line::raw(""));
+    }
+    if dashboard.manager.in_flight.is_some() {
+        lines.push(Line::styled(
+            "Manager is thinking…",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let provider = dashboard
+        .manager
+        .last_provider
+        .as_deref()
+        .map(|id| format!(" · via {}", id.chars().take(8).collect::<String>()))
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(focus_border(
+                    dashboard.manager.focus == ManagerFocus::Transcript,
+                ))
+                .title(format!(" Manager transcript{provider} ")),
+        ),
+        area,
+    );
+}
+
+fn render_manager_prompt(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
+    let focused = dashboard.manager.focus == ManagerFocus::Prompt;
+    let value = if focused {
+        dashboard.manager.input.with_cursor_marker("▏")
+    } else if dashboard.manager.input.is_empty() {
+        "Ask for a status summary…".into()
+    } else {
+        dashboard.manager.input.value().to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(value).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(focus_border(focused))
+                .title(" Prompt · Enter to send "),
+        ),
+        area,
+    );
 }
 
 fn render_dashboard_title(frame: &mut Frame, area: Rect, greeting: &str) {

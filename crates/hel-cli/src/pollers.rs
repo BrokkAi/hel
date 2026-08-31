@@ -1422,6 +1422,21 @@ async fn forward_remote_session_request(request: RemoteSessionRequest) {
             .map_err(|error| format!("{error:#}"));
             let _ = reply.send(result);
         }
+        RemoteSessionRequest::Compact {
+            session_id,
+            prompt,
+            reply,
+        } => {
+            let result = async {
+                daemon::connect_or_start()
+                    .await?
+                    .compact_session(session_id, prompt)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(result);
+        }
         RemoteSessionRequest::RespondElicitation {
             session_id,
             elicitation_id,
