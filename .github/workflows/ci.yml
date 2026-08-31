@@ -29,6 +29,9 @@ jobs:
       with:
         node-version: 24
 
+    - name: Check workspace release versions
+      run: node scripts/release-version.mjs check
+
     - name: Install pinned license tools
       run: |
         cargo install --locked cargo-about --version 0.9.1 --features cli

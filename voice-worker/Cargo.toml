@@ -1,6 +1,6 @@
 [package]
 name = "hel-voice-worker"
-version = "0.2.0"
+version.workspace = true
 edition = "2024"
 description = "Native local speech-recognition sidecar for Hel"
 license = "GPL-3.0-only"

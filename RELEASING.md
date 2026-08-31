@@ -6,14 +6,25 @@ tests, and dependency-license maintenance.
 
 ## Versions
 
-All four published crates must carry the same version, with matching
-workspace entries in `Cargo.lock`: `hel-core` (the root package; it publishes
-under that name because crates.io's `hel` belongs to an unrelated crate, while
-the library keeps the `hel` crate name), `hel-tui`, `hel-cli` (installs the
-`hel` binary), and `hel-voice-worker`. The internal dependency versions in
-`crates/hel-tui/Cargo.toml` and `crates/hel-cli/Cargo.toml` must be bumped to
-match. `install.sh`'s `SCRIPT_VERSION` is
-an independent installer logging revision and is not automatically synchronized
+All four published crates carry the same version: `hel-core` (the root
+package; it publishes under that name because crates.io's `hel` belongs to an
+unrelated crate, while the library keeps the `hel` crate name), `hel-tui`,
+`hel-cli` (installs the `hel` binary), and `hel-voice-worker`. Each one
+inherits `[workspace.package] version` in the root `Cargo.toml`, so a bump
+edits that single line.
+
+Cargo also requires each published path dependency to carry a registry
+version and does not let that version inherit, so `[workspace.dependencies]`
+in the same file repeats the number. After bumping `[workspace.package]`, run:
+
+```sh
+node scripts/release-version.mjs sync
+cargo metadata --no-deps --format-version 1 > /dev/null   # refreshes Cargo.lock
+```
+
+CI runs `node scripts/release-version.mjs check` and fails when those repeats
+fall behind the workspace version. `install.sh`'s `SCRIPT_VERSION` is an
+independent installer logging revision and is not automatically synchronized
 to product releases.
 
 `licenses/THIRD_PARTY_LICENSES.html` embeds the workspace crate versions, so a
