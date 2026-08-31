@@ -2247,6 +2247,276 @@ mod tests {
         assert!(!hotkeys.contains("[S]ort"));
     }
 
+    /// The band order is the whole point of the surface: everything is on one
+    /// screen, in one arrangement, at every size it draws at.
+    #[test]
+    fn the_combined_surface_keeps_its_band_order_at_every_size() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+
+        for (width, height) in [(140, 32), (60, 20), (32, 16)] {
+            let lines = drawn(&mut dashboard, width, height);
+            let row_of = |needle: &str| {
+                lines
+                    .iter()
+                    .position(|line| line.contains(needle))
+                    .unwrap_or_else(|| panic!("missing {needle} at {width}x{height}: {lines:#?}"))
+            };
+            let sessions = row_of("Sessions");
+            let conversation = row_of("Conversation");
+            let prompt = row_of("Prompt");
+            let targets = row_of("Targets");
+            let quota = row_of("Quota");
+            assert!(
+                sessions < conversation
+                    && conversation < prompt
+                    && prompt < targets
+                    && targets < quota,
+                "band order at {width}x{height}: {lines:#?}"
+            );
+            // The footer is the last row and always says something.
+            assert!(
+                !lines[lines.len() - 1].trim().is_empty(),
+                "footer at {width}x{height}: {lines:#?}"
+            );
+        }
+    }
+
+    /// Collapsing gives the transcript exactly the rows the two tables were
+    /// using, so the point of the gesture is measurable rather than merely
+    /// visible.
+    #[test]
+    fn collapsing_the_support_panes_gives_their_rows_to_the_transcript() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        // Start on the composer, so the Sessions pane is already compact and
+        // the only thing that changes is the two tables.
+        dashboard.focus_prompt();
+        /// Rows from the start of one band to the start of the next.
+        fn band(lines: &[String], from: &str, to: &str) -> usize {
+            let start = lines
+                .iter()
+                .position(|line| line.contains(from))
+                .unwrap_or_else(|| panic!("missing {from}: {lines:#?}"));
+            let end = lines
+                .iter()
+                .position(|line| line.contains(to))
+                .unwrap_or_else(|| panic!("missing {to}: {lines:#?}"));
+            end - start
+        }
+
+        let before = drawn(&mut dashboard, 140, 32);
+        dashboard.toggle_support_panes();
+        let after = drawn(&mut dashboard, 140, 32);
+
+        let freed = (band(&before, "Targets", "Quota") - band(&after, "Targets", "Quota"))
+            + (band(&before, "Quota", "Ctrl-Q quit") - band(&after, "Quota", "Ctrl-Q quit"));
+        assert!(freed > 0, "the tables gave up nothing");
+        assert_eq!(
+            band(&after, "Conversation", "Prompt"),
+            band(&before, "Conversation", "Prompt") + freed
+        );
+        // Each collapsed pane really is one row.
+        assert_eq!(band(&after, "Targets", "Quota"), 1);
+        assert_eq!(band(&after, "Quota", "Ctrl-Q quit"), 1);
+    }
+
+    fn now_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn host_usage(cpu_percent: u8) -> hel::hel_targets::DeploymentCapacityUsage {
+        hel::hel_targets::DeploymentCapacityUsage {
+            cpu_percent: Some(cpu_percent),
+            memory_used_bytes: 1,
+            memory_total_bytes: 4,
+            logical_cores: 8,
+            disk_total_bytes: Some(64),
+        }
+    }
+
+    /// A profile quota with `remaining` percent of its weekly window left.
+    fn weekly_quota(profile_id: &str, remaining: u8) -> ProfileQuota {
+        ProfileQuota {
+            profile_id: profile_id.into(),
+            harness: HarnessKind::Claude,
+            windows: vec![QuotaWindow {
+                label: "weekly".into(),
+                remaining_percent: Some(remaining),
+                used: None,
+                limit: None,
+                resets: None,
+                resets_at_epoch_seconds: None,
+            }],
+            extra: None,
+            error: None,
+            refreshed_at_epoch_seconds: now_seconds(),
+        }
+    }
+
+    fn drawn(dashboard: &mut DashboardState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, dashboard))
+            .expect("draw the combined surface");
+        buffer_lines(terminal.backend().buffer())
+    }
+
+    /// Every expanded session is the same height, so the layout can be
+    /// computed from a count and rows never jitter as messages arrive. A
+    /// session with nothing to show still draws its two agent rows.
+    #[test]
+    fn an_expanded_session_always_draws_four_rows() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.focus_sessions();
+
+        let lines = drawn(&mut dashboard, 120, 34);
+        let first = lines
+            .iter()
+            .position(|line| line.contains("podman"))
+            .expect("the session's identity row");
+        assert!(lines[first].contains("ACP pretty name"));
+        assert!(lines[first + 1].contains("You:"), "{:?}", lines[first + 1]);
+        assert!(
+            lines[first + 2].contains("No messages yet"),
+            "{:?}",
+            lines[first + 2]
+        );
+        // The fourth row is the second agent row, blank here because there is
+        // only one line to show.
+        assert!(
+            lines[first + 3].trim_matches(['│', '║', ' ']).is_empty(),
+            "{:?}",
+            lines[first + 3]
+        );
+    }
+
+    /// The compact row is the whole summary in one line, so it has to name
+    /// the project as well: the list spans every project at this width.
+    #[test]
+    fn a_compact_session_row_names_its_project_target_clock_and_last_line() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.focus_prompt();
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "the latest word")]);
+
+        let lines = drawn(&mut dashboard, 120, 34);
+        let row = lines
+            .iter()
+            .find(|line| line.contains("podman"))
+            .expect("the session's row");
+        assert!(row.contains("hel · podman · "), "{row:?}");
+        assert!(row.contains("the latest word"), "{row:?}");
+    }
+
+    #[test]
+    fn the_minimized_rows_report_cpu_and_weekly_percent_used() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard.apply_deployment_capacity("local", Ok(Some(host_usage(42))), now_seconds());
+        dashboard.apply_quota(weekly_quota("claude-1", 63));
+        dashboard.toggle_support_panes();
+
+        let lines = drawn(&mut dashboard, 120, 34);
+        let targets = lines
+            .iter()
+            .find(|line| line.starts_with("Targets"))
+            .expect("the collapsed Targets row");
+        assert!(targets.contains("local 42%"), "{targets:?}");
+        let quota = lines
+            .iter()
+            .find(|line| line.starts_with("Quota"))
+            .expect("the collapsed Quota row");
+        // 63% of the weekly window is left, so 37% of it has been used.
+        assert!(quota.contains("claude-1 37%"), "{quota:?}");
+        // Each collapsed pane is exactly one row.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("Targets"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("Quota"))
+                .count(),
+            1
+        );
+    }
+
+    /// A reading that cannot be trusted has to say so. A number that is
+    /// actually missing, stale or inapplicable is worse than no number.
+    #[test]
+    fn the_minimized_rows_stay_explicit_about_readings_they_do_not_have() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard.toggle_support_panes();
+
+        // No sample at all.
+        let lines = drawn(&mut dashboard, 120, 34);
+        let targets = |lines: &[String]| {
+            lines
+                .iter()
+                .find(|line| line.starts_with("Targets"))
+                .expect("the collapsed Targets row")
+                .clone()
+        };
+        assert!(targets(&lines).contains("local unavailable"));
+
+        // A probe in flight.
+        dashboard.begin_capacity_refresh();
+        assert!(targets(&drawn(&mut dashboard, 120, 34)).contains("local refreshing…"));
+
+        // A sample too old to trust.
+        dashboard.apply_deployment_capacity(
+            "local",
+            Ok(Some(host_usage(7))),
+            now_seconds() - CAPACITY_SAMPLE_STALE_AFTER_SECONDS - 60,
+        );
+        assert!(
+            targets(&drawn(&mut dashboard, 120, 34)).contains("local 7% (stale)"),
+            "{:?}",
+            targets(&drawn(&mut dashboard, 120, 34))
+        );
+
+        // A quota that failed to refresh.
+        let quota = drawn(&mut dashboard, 120, 34)
+            .into_iter()
+            .find(|line| line.starts_with("Quota"))
+            .expect("the collapsed Quota row");
+        assert!(quota.contains("claude-1 unavailable"), "{quota:?}");
+    }
+
+    /// A collapsed pane is one row by definition, so more hosts than fit have
+    /// to be cut rather than wrapped onto a second row.
+    #[test]
+    fn the_minimized_rows_truncate_rather_than_wrap() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(
+            (0..8)
+                .map(|index| hel::hel_targets::DeploymentCapacityTarget {
+                    id: format!("host-{index}"),
+                    host: format!("a-rather-long-host-name-{index}"),
+                    ..test_capacity_target()
+                })
+                .collect(),
+        );
+        dashboard.toggle_support_panes();
+
+        let lines = drawn(&mut dashboard, 60, 34);
+        let rows = lines
+            .iter()
+            .filter(|line| line.starts_with("Targets"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "{lines:#?}");
+        assert!(rows[0].chars().count() <= 60);
+        assert!(rows[0].ends_with('…'), "{:?}", rows[0]);
+    }
+
     #[test]
     fn read_idle_session_uses_the_normal_summary_color() {
         let mut session = stopped_session();

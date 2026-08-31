@@ -1,5 +1,6 @@
-//! The live chat view: the conversations pane, the background feeds behind an
-//! open session, and the frame the dashboard draws.
+//! The live conversation: the background feeds behind an open session, and the
+//! transcript and composer the combined surface asks it to draw into the
+//! regions it has chosen.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -270,7 +271,7 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
     let view = match view {
         Ok(view) => view,
         Err(error) => {
-            // Keep the transcript readable rather than tearing the dashboard
+            // Keep the transcript readable rather than tearing the surface
             // down around a stopped manager.
             tracing::warn!(error = format!("{error:#}"), "chat session view failed");
             state.set_notice(format!("connection lost: {error:#}"));
@@ -328,10 +329,10 @@ fn detach_chat(state: &mut ChatState) -> u64 {
 
 /// A chat view and every background feed behind it.
 ///
-/// The dashboard owns one of these while a session is open and keeps it after
-/// the user returns to the session list, so the view stays current off screen
-/// and reopening the same session is only a redraw. Dropping it detaches the
-/// proxy and leaves the target worker alive.
+/// The combined surface owns one of these for the conversation on screen. It
+/// keeps following the worker while another pane has the keyboard, so nothing
+/// is lost while the user looks elsewhere. Dropping it detaches the proxy and
+/// leaves the target worker alive.
 pub struct ActiveChat {
     state: ChatState,
     session: ManagedSessionHandle,
@@ -370,18 +371,18 @@ pub struct ActiveChat {
 
 impl ActiveChat {
     /// Builds the view from the session's current snapshot and starts its
-    /// background feeds. Cheap enough to call from the dashboard loop: the
+    /// background feeds. Cheap enough to call from the surface's loop: the
     /// only work done here is converting the tail of the transcript, a bounded
     /// number of items. Every other step, including converting the history in
     /// front of that tail, is a spawned task.
     ///
     /// `draft` is the unsent input saved when this session was last detached.
-    /// Only a fresh view takes it: a warm chat the dashboard kept alive already
+    /// Only a fresh view takes it: a warm chat the surface kept alive already
     /// holds newer input than the database copy.
     ///
     /// `notices` is the process-wide notifications bar; it is installed on the
     /// new state before any notice is raised below, so recovery and connection
-    /// notices land in the same shared slot the dashboard reads.
+    /// notices land in the same shared slot the surface reads.
     ///
     #[allow(clippy::too_many_arguments)]
     pub fn open(
@@ -586,7 +587,7 @@ impl ActiveChat {
         }
     }
 
-    /// The composer's current text. The dashboard saves this on detach so
+    /// The composer's current text. The surface saves this on detach so
     /// unsent input survives a quit or a crash while the view is off screen.
     pub fn draft(&self) -> &str {
         &self.state.input
@@ -2132,7 +2133,7 @@ mod tests {
         chat.set_input("half typed thought".into());
 
         // Detaching keeps the composer intact: the warm chat goes on holding
-        // it, and the dashboard reads it here to write it to the session row.
+        // it, and the surface reads it here to write it to the session row.
         detach_chat(&mut chat);
         assert_eq!(chat.input, "half typed thought");
 
@@ -2444,7 +2445,7 @@ mod tests {
         // truncated, so the footer text comparisons below are meaningful.
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
 
-        // Set from "outside", the way the dashboard's clone of the same handle
+        // Set from "outside", the way the surface's clone of the same handle
         // would.
         shared.set("Background import finished");
         terminal

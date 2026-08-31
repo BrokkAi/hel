@@ -1,7 +1,12 @@
-//! Full-screen dashboard and session picker for Hel.
+//! State and input handling for Hel's combined terminal surface.
 //!
-//! This module deliberately has no provisioning or persistence side effects.
-//! Input is reduced to [`DashboardAction`] values for the controller to run.
+//! One screen holds the Sessions pane, the conversation, the Prompt composer,
+//! and the Targets and Quota summaries; [`crate::combined::render_combined`]
+//! draws it. This module owns what that surface knows and what a key press
+//! means to it.
+//!
+//! It deliberately has no provisioning or persistence side effects. Input is
+//! reduced to [`DashboardAction`] values for the controller to run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -978,7 +983,14 @@ impl DashboardState {
     }
 
     /// The project the compact list belongs to: the conversation on screen,
-    /// falling back to whatever the pane has selected.
+    /// falling back to whatever the pane has selected, and then to the first
+    /// live session.
+    ///
+    /// The last fallback matters. Without it a workspace with more than
+    /// [`COMPACT_SESSION_LIMIT`] live sessions and no conversation open would
+    /// exclude every session, leaving nothing selectable, which would in turn
+    /// keep the selection empty: a pane showing only a count of sessions it
+    /// refuses to list.
     pub(crate) fn current_project_key(&self) -> Option<String> {
         self.current_session_id
             .as_deref()
@@ -986,6 +998,7 @@ impl DashboardState {
             .filter(|session| session.state.is_active())
             .or_else(|| self.selected_session())
             .map(|session| self.project_source(session).key)
+            .or_else(|| self.project_keys().into_iter().next())
     }
 
     /// The rows the Sessions pane draws.
@@ -1624,6 +1637,195 @@ mod tests {
         assert_eq!(dashboard.quota_index, 1);
         dashboard.handle_key(ctrl_key('p'));
         assert_eq!(dashboard.quota_index, 0);
+    }
+
+    /// Builds `count` live sessions, `per_project` of them in each project,
+    /// so the compact list's threshold and grouping can be exercised.
+    fn dashboard_with_live_sessions(count: usize, per_project: usize) -> DashboardState {
+        let sessions = (0..count)
+            .map(|index| {
+                let mut session = stopped_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                session.created_at = format!("2026-08-{:02}T00:00:00Z", index + 1);
+                session.project_directory =
+                    Some(format!("/projects/p{}", index / per_project.max(1)).into());
+                (session.id.clone(), session)
+            })
+            .collect();
+        DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        )
+    }
+
+    fn session_row_indices(dashboard: &DashboardState) -> Vec<usize> {
+        dashboard
+            .sessions_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SessionsRow::Session { index, .. } => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn others_row(dashboard: &DashboardState) -> Option<(usize, usize)> {
+        dashboard
+            .sessions_rows()
+            .into_iter()
+            .find_map(|row| match row {
+                SessionsRow::Others { active, idle } => Some((active, idle)),
+                _ => None,
+            })
+    }
+
+    /// A short list is worth showing in full whatever project each session
+    /// belongs to; that is what makes the compact pane a glance rather than a
+    /// navigation step.
+    #[test]
+    fn the_compact_list_shows_every_project_up_to_five_sessions() {
+        for count in [0, 1, 5] {
+            let mut dashboard = dashboard_with_live_sessions(count, 2);
+            dashboard.focus_prompt();
+            assert_eq!(
+                session_row_indices(&dashboard),
+                (0..count).collect::<Vec<_>>(),
+                "{count} live sessions"
+            );
+            assert_eq!(others_row(&dashboard), None, "{count} live sessions");
+        }
+    }
+
+    /// Past the threshold the list narrows to the project the conversation
+    /// belongs to and counts the rest, so it stays one glance instead of
+    /// growing without limit.
+    #[test]
+    fn beyond_five_sessions_the_compact_list_narrows_and_counts_the_rest() {
+        // Six sessions, two per project: the current project keeps two rows
+        // and the other four are counted.
+        let mut dashboard = dashboard_with_live_sessions(6, 2);
+        dashboard.focus_prompt();
+        dashboard.set_current_session(Some("session-0"));
+        // One of the four excluded sessions has a turn running.
+        apply_materialized_transcript_for(
+            &mut dashboard,
+            "session-3",
+            vec![agent_message(1, "still working")],
+        );
+
+        assert_eq!(session_row_indices(&dashboard), [0, 1]);
+        assert_eq!(others_row(&dashboard), Some((1, 3)));
+        // The counted sessions are not selectable, so navigation cannot land
+        // on a row that is not on screen.
+        assert_eq!(dashboard.visible_session_indices(), [0, 1]);
+    }
+
+    /// A long list with no conversation open still lists a project. Showing
+    /// only a count of sessions the pane will not list is not a state worth
+    /// having, and it would trap the selection empty.
+    #[test]
+    fn the_compact_list_always_shows_at_least_one_project() {
+        let mut dashboard = dashboard_with_live_sessions(6, 2);
+        dashboard.focus_prompt();
+        dashboard.set_current_session(None);
+        dashboard.selected_session_id = None;
+
+        assert_eq!(session_row_indices(&dashboard), [0, 1]);
+        assert_eq!(others_row(&dashboard), Some((0, 4)));
+    }
+
+    #[test]
+    fn the_others_count_follows_the_conversation_on_screen() {
+        let mut dashboard = dashboard_with_live_sessions(6, 3);
+        dashboard.focus_prompt();
+
+        dashboard.set_current_session(Some("session-0"));
+        assert_eq!(session_row_indices(&dashboard), [0, 1, 2]);
+        assert_eq!(others_row(&dashboard), Some((0, 3)));
+
+        dashboard.set_current_session(Some("session-5"));
+        assert_eq!(session_row_indices(&dashboard), [3, 4, 5]);
+        assert_eq!(others_row(&dashboard), Some((0, 3)));
+    }
+
+    /// The threshold is about keeping an unfocused pane small. Once the pane
+    /// has the keyboard it is the list the user is working in, so it shows
+    /// everything.
+    #[test]
+    fn the_focused_list_ignores_the_five_session_threshold() {
+        let mut dashboard = dashboard_with_live_sessions(6, 2);
+        dashboard.focus_sessions();
+        dashboard.set_current_session(Some("session-0"));
+
+        assert_eq!(session_row_indices(&dashboard), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(others_row(&dashboard), None);
+        // Three projects, each with a heading and a toggle number.
+        let headings = dashboard
+            .sessions_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SessionsRow::ProjectHeading { number, .. } => Some(number),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(headings, [Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn every_project_starts_expanded_and_collapsing_one_leaves_the_others() {
+        let mut dashboard = dashboard_with_live_sessions(4, 2);
+        dashboard.focus_sessions();
+        let expanded = |dashboard: &DashboardState| {
+            dashboard
+                .sessions_rows()
+                .into_iter()
+                .filter_map(|row| match row {
+                    SessionsRow::Session { expanded, .. } => Some(expanded),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(expanded(&dashboard), [true, true, true, true]);
+
+        dashboard.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(expanded(&dashboard), [true, true, false, false]);
+        dashboard.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            expanded(&dashboard),
+            [false, false, false, false],
+            "Space collapses the selected session's own project"
+        );
+    }
+
+    /// A session that disappears must not take the selection somewhere the
+    /// user did not put it: the anchor is an id, so it lands on a real row.
+    #[test]
+    fn the_selection_survives_the_list_changing_under_it() {
+        let mut dashboard = dashboard_with_live_sessions(3, 3);
+        dashboard.focus_sessions();
+        dashboard.select_active_session("session-1");
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
+
+        // Focus moving away and back does not move the selection.
+        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
+
+        let mut state = dashboard.state.clone();
+        state.sessions.get_mut("session-1").unwrap().state = SessionState::Stopped;
+        dashboard.set_state(state);
+        assert_eq!(
+            dashboard.selected_session().unwrap().id,
+            "session-0",
+            "the selection falls back to the first row still on screen"
+        );
     }
 
     /// Each numbered project answers only for itself, so several can be

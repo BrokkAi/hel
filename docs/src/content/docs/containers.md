@@ -148,7 +148,8 @@ hel doctor --json --smoke
 hel
 ```
 
-This opens the dashboard. Press **Ctrl+N** to start the new-session wizard.
+This opens Hel's terminal surface. Press **Tab** to focus the Sessions pane,
+then **n** to start the new-session wizard.
 It walks you through picking a profile, a target, and a bundle.
 
 Before launch, you can size the container's CPU and memory allocation. The

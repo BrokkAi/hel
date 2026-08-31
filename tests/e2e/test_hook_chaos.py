@@ -64,11 +64,11 @@ def start_dashboard(lab: Lab, name: str, create_workspace: bool) -> object:
     deadline = time.monotonic() + TIMEOUT
     while time.monotonic() < deadline:
         screen = client.text()
-        if "Active" in screen:
+        if "Sessions" in screen:
             return client
         if "Workspaces" in screen:
             client.send(b"\r\r" if create_workspace else b"\r")
-            client.wait_for("Active")
+            client.wait_for("Sessions")
             return client
         if client.process.poll() is not None:
             raise ScenarioFailure(f"{name} exited before reaching the dashboard")
@@ -185,7 +185,7 @@ def run_hook(lab: Lab, hook: str) -> None:
 
     first.wait_for("Workspaces")
     first.send(b"\r\r")
-    first.wait_for("Active")
+    first.wait_for("Sessions")
     login_web(lab, port)
 
     if hook == "config_replacement_before_reference_migration":

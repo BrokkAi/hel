@@ -73,6 +73,90 @@ const DASHBOARD_CLOCK_TICK: Duration = Duration::from_secs(1);
 /// conversation anyway. The summaries decide which session has the newest
 /// activity; a stalled read must not leave the screen without a conversation.
 const STARTUP_SESSION_WAIT: Duration = Duration::from_secs(2);
+
+/// Whether the surface still gets to choose which conversation it opens on.
+///
+/// It waits for the stored summaries, because those carry the activity times
+/// the choice compares — but only for [`STARTUP_SESSION_WAIT`], and only until
+/// the user makes the choice themselves.
+#[derive(Debug)]
+struct StartupSession {
+    /// Live sessions whose stored summary has not come back yet.
+    pending_summaries: BTreeSet<String>,
+    /// False once the choice has been made, or taken away.
+    open_pending: bool,
+    deadline: std::time::Instant,
+}
+
+impl StartupSession {
+    /// Nothing to choose: the workspace has no live session, or one is
+    /// already open.
+    fn idle() -> Self {
+        Self {
+            pending_summaries: BTreeSet::new(),
+            open_pending: false,
+            deadline: std::time::Instant::now(),
+        }
+    }
+
+    fn begin(session_ids: impl IntoIterator<Item = String>, now: std::time::Instant) -> Self {
+        let pending_summaries = session_ids.into_iter().collect::<BTreeSet<_>>();
+        Self {
+            open_pending: !pending_summaries.is_empty(),
+            pending_summaries,
+            deadline: now + STARTUP_SESSION_WAIT,
+        }
+    }
+
+    /// One session has answered, whether its summary loaded or failed.
+    fn summary_arrived(&mut self, session_id: &str) {
+        self.pending_summaries.remove(session_id);
+    }
+
+    /// The user acted, so the choice is theirs now.
+    fn cancel(&mut self) {
+        self.open_pending = false;
+    }
+
+    /// Whether the pick should run now. Answering `true` once retires the
+    /// choice, so a later tick cannot open a second conversation.
+    fn ready(&mut self, now: std::time::Instant) -> bool {
+        if !self.open_pending {
+            return false;
+        }
+        if !self.pending_summaries.is_empty() && now < self.deadline {
+            return false;
+        }
+        self.open_pending = false;
+        true
+    }
+}
+
+/// The live session the surface should open on: the one with the newest
+/// recorded activity.
+///
+/// Ties break by newest creation time and then by the larger session id, so
+/// the choice is the same on every run. When no summary carried an activity
+/// time — none is stored yet, or every read failed — every session ranks equal
+/// on the first key and creation time decides, which is the intended fallback
+/// rather than an accident.
+fn startup_session_choice<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionRecord>,
+    activity_at_ms: impl Fn(&str) -> Option<u64>,
+) -> Option<String> {
+    sessions
+        .into_iter()
+        .max_by(|left, right| {
+            activity_at_ms(&left.id)
+                .unwrap_or(0)
+                .cmp(&activity_at_ms(&right.id).unwrap_or(0))
+                // `compare_by_creation` orders oldest first, so the newer of
+                // the two is the greater under `max_by`.
+                .then_with(|| left.compare_by_creation(right))
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|session| session.id.clone())
+}
 /// Redraw cadence while a dialog animates on its own.
 const IMPORT_PROGRESS_TICK: Duration = Duration::from_millis(125);
 /// Scroll cadence while a drag is held past a scrollable surface's edge.
@@ -231,15 +315,9 @@ pub(crate) struct DashboardContext {
     /// Session-manager attachment is asynchronous: an actor may need to
     /// answer from a worker or relay before a chat can be built.
     pub(crate) opening_chat_session: Option<String>,
-    /// Live sessions whose stored summary has not come back yet. The startup
-    /// pick waits for these so it can compare real activity timestamps.
-    startup_summaries_pending: BTreeSet<String>,
-    /// True until the surface has chosen its first conversation, or the user
-    /// has acted and taken the choice away from it.
-    startup_open_pending: bool,
-    /// A bound on that wait, so a stalled read cannot leave the surface
-    /// without a conversation for ever.
-    startup_deadline: std::time::Instant,
+    /// Which conversation the surface opens on, and whether it is still the
+    /// surface's choice to make.
+    startup: StartupSession,
     /// The first pass always draws; after that a redraw needs a wakeup.
     pub(crate) dirty: bool,
     /// The notice generation the frame on screen was drawn from. Background
@@ -812,9 +890,7 @@ impl DashboardContext {
             events: Some(event::EventStream::new()),
             active_chat: None,
             opening_chat_session: None,
-            startup_summaries_pending: BTreeSet::new(),
-            startup_open_pending: false,
-            startup_deadline: std::time::Instant::now() + STARTUP_SESSION_WAIT,
+            startup: StartupSession::idle(),
             dirty: true,
             drawn_notice_generation: 0,
             controller_changed: true,
@@ -920,9 +996,10 @@ impl DashboardContext {
             .collect::<Vec<_>>();
         // The startup pick compares recorded activity, which is exactly what
         // these summaries carry, so it waits for them.
-        self.startup_summaries_pending = sessions.iter().map(|(id, _)| id.clone()).collect();
-        self.startup_open_pending = !sessions.is_empty();
-        self.startup_deadline = std::time::Instant::now() + STARTUP_SESSION_WAIT;
+        self.startup = StartupSession::begin(
+            sessions.iter().map(|(id, _)| id.clone()),
+            std::time::Instant::now(),
+        );
         if sessions.is_empty() {
             // With nothing to talk to, the keyboard belongs on the list, where
             // a session can be created or resumed.
@@ -940,57 +1017,33 @@ impl DashboardContext {
     /// Records that one live session's stored summary has arrived, however it
     /// turned out, and opens the startup conversation once they all have.
     pub(super) fn finish_startup_summary(&mut self, session_id: &str) {
-        self.startup_summaries_pending.remove(session_id);
+        self.startup.summary_arrived(session_id);
         self.maybe_open_startup_session();
     }
 
     /// The user took the choice into their own hands, so the surface stops
     /// trying to pick a conversation for them.
     fn cancel_startup_session(&mut self) {
-        self.startup_open_pending = false;
+        self.startup.cancel();
     }
 
-    /// Opens the conversation the surface should start on: the live session
-    /// with the newest materialized activity.
-    ///
-    /// Ties break by newest creation time and then by the larger session id,
-    /// so the choice is the same on every run. When no summary carried an
-    /// activity time — because none is stored yet, or every read failed —
-    /// every session ranks equal on the first key and creation time decides,
-    /// which is the intended fallback rather than an accident.
+    /// Opens the conversation the surface should start on, once the summaries
+    /// it compares have arrived or the wait for them has run out.
     pub(super) fn maybe_open_startup_session(&mut self) {
-        if !self.startup_open_pending {
+        if !self.startup.ready(std::time::Instant::now()) {
             return;
         }
-        if !self.startup_summaries_pending.is_empty()
-            && std::time::Instant::now() < self.startup_deadline
-        {
-            return;
-        }
-        self.startup_open_pending = false;
-        let mut live = self
-            .controller
-            .state
-            .sessions
-            .values()
-            .filter(|session| session.state.is_active())
-            .collect::<Vec<_>>();
-        if live.is_empty() {
+        let Some(session_id) = startup_session_choice(
+            self.controller
+                .state
+                .sessions
+                .values()
+                .filter(|session| session.state.is_active()),
+            |session_id| self.dashboard.session_activity_at_ms(session_id),
+        ) else {
             self.dashboard.focus_sessions();
             return;
-        }
-        live.sort_by(|left, right| {
-            let activity = |session: &SessionRecord| {
-                self.dashboard
-                    .session_activity_at_ms(&session.id)
-                    .unwrap_or(0)
-            };
-            activity(right)
-                .cmp(&activity(left))
-                .then_with(|| right.compare_by_creation(left))
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        let session_id = live[0].id.clone();
+        };
         self.dashboard.focus_prompt();
         self.open_chat_session(&session_id);
     }
@@ -2618,6 +2671,141 @@ mod tests {
             ),
             DashboardAction::OpenWorkspacePicker
         ));
+    }
+
+    fn live_session(id: &str, created_at: &str) -> hel::hel_state::SessionRecord {
+        hel::hel_state::SessionRecord {
+            workspace_id: hel::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
+            archived: false,
+            container_cpus: None,
+            container_memory: None,
+            id: id.into(),
+            title: id.into(),
+            harness_kind: hel::hel_config::HarnessKind::Codex,
+            last_profile: "codex-1".into(),
+            bundle_id: "hel".into(),
+            project_directory: None,
+            managed_worktree: None,
+            target_template_id: "podman".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: SessionState::Running,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: created_at.into(),
+            updated_at: created_at.into(),
+            viewed_through_event_ordinal: 0,
+            draft_input: String::new(),
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        }
+    }
+
+    /// The conversation worth opening on is the one whose agent spoke most
+    /// recently, which is what the stored summaries record.
+    #[test]
+    fn startup_opens_the_session_with_the_newest_materialized_activity() {
+        let sessions = [
+            live_session("session-a", "2026-08-01T00:00:00Z"),
+            live_session("session-b", "2026-08-02T00:00:00Z"),
+            live_session("session-c", "2026-08-03T00:00:00Z"),
+        ];
+        let activity = |id: &str| match id {
+            "session-a" => Some(10),
+            "session-b" => Some(300),
+            "session-c" => Some(200),
+            _ => None,
+        };
+
+        assert_eq!(
+            startup_session_choice(sessions.iter(), activity),
+            Some("session-b".into())
+        );
+    }
+
+    /// With no activity recorded — nothing stored yet, or every read failed —
+    /// every session ranks equal on the first key, so the newest one wins.
+    #[test]
+    fn startup_falls_back_to_the_newest_creation_then_the_larger_id() {
+        let sessions = [
+            live_session("session-a", "2026-08-01T00:00:00Z"),
+            live_session("session-b", "2026-08-03T00:00:00Z"),
+            live_session("session-c", "2026-08-02T00:00:00Z"),
+        ];
+        assert_eq!(
+            startup_session_choice(sessions.iter(), |_| None),
+            Some("session-b".into())
+        );
+
+        // A tie on creation time too still resolves the same way on every
+        // run, rather than following the iteration order.
+        let tied = [
+            live_session("session-a", "2026-08-01T00:00:00Z"),
+            live_session("session-z", "2026-08-01T00:00:00Z"),
+        ];
+        assert_eq!(
+            startup_session_choice(tied.iter(), |_| None),
+            Some("session-z".into())
+        );
+        assert_eq!(
+            startup_session_choice(tied.iter().rev(), |_| None),
+            Some("session-z".into())
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_no_live_session_has_nothing_to_open() {
+        assert_eq!(
+            startup_session_choice(std::iter::empty(), |_| Some(1)),
+            None
+        );
+    }
+
+    /// The pick waits for the summaries it compares, but not for ever, and it
+    /// only ever fires once.
+    #[test]
+    fn the_startup_pick_waits_for_its_summaries_then_gives_up() {
+        let start = std::time::Instant::now();
+        let mut startup =
+            StartupSession::begin(["session-a".to_owned(), "session-b".to_owned()], start);
+
+        assert!(!startup.ready(start), "both summaries are still pending");
+        startup.summary_arrived("session-a");
+        assert!(!startup.ready(start), "one summary is still pending");
+        startup.summary_arrived("session-b");
+        assert!(startup.ready(start));
+        assert!(!startup.ready(start), "the choice is made only once");
+
+        // A summary that never comes back stops holding the surface up.
+        let mut stalled = StartupSession::begin(["session-a".to_owned()], start);
+        assert!(!stalled.ready(start));
+        assert!(stalled.ready(start + STARTUP_SESSION_WAIT));
+    }
+
+    /// The user acting is the strongest signal there is about which
+    /// conversation they want, so it takes the choice away.
+    #[test]
+    fn a_user_who_acts_first_keeps_the_choice() {
+        let start = std::time::Instant::now();
+        let mut startup = StartupSession::begin(["session-a".to_owned()], start);
+
+        startup.cancel();
+        startup.summary_arrived("session-a");
+        assert!(!startup.ready(start));
+        assert!(!startup.ready(start + STARTUP_SESSION_WAIT * 10));
+    }
+
+    /// An empty workspace has nothing to wait for, so the surface never holds
+    /// the keyboard back from the Sessions pane.
+    #[test]
+    fn a_workspace_with_no_live_session_never_arms_the_startup_pick() {
+        let start = std::time::Instant::now();
+        let mut startup = StartupSession::begin(std::iter::empty(), start);
+        assert!(!startup.ready(start));
+        assert!(!startup.ready(start + STARTUP_SESSION_WAIT));
     }
 
     #[test]

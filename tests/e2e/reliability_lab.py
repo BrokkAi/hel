@@ -764,7 +764,7 @@ kind = "local-bare"
         first = self.start_tui("tui-1")
         first.wait_for("Workspaces")
         first.send(b"\r\r")
-        first.wait_for("Active")
+        first.wait_for("Sessions")
         code, _ = self.wait_daemon_status(port)
         self.base_url = f"http://127.0.0.1:{port}"
         status, _ = self.request("POST", "/auth/session", {"code": code})
@@ -775,7 +775,7 @@ kind = "local-bare"
         second = self.start_tui("tui-2")
         second.wait_for("Workspaces")
         second.send(b"\r")
-        second.wait_for("Active")
+        second.wait_for("Sessions")
         deadline = time.monotonic() + 5
         attached = 0
         while time.monotonic() < deadline:

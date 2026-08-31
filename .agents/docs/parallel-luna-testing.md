@@ -84,21 +84,33 @@ Do not add the optional `vision` capability. Screenshots remain available for ex
 `shared-web` waits for the exact current-attempt readiness marker, authenticates through the disposable Web dialog, and runs mission M5 plus the web half of M1 and M2. It drives the real page through accessibility snapshots and role- or label-based actions. It exercises desktop and mobile viewport sizes, browser history, logout, cookie expiry, offline/online SSE recovery, stale conversations, lifecycle actions, and convergence with both dashboards. It may request shared actions through a phase-unique append-only log such as `$HEL_PARALLEL_RUN/attempt-2-web-requests.md`, but it never manipulates shared Hel processes directly.
 
 For the repository fake/local-bare lab, the exact new-session sequence is:
-Ctrl+N, Enter on the fake profile, Enter on localhost, replace the project
-field with the lab's exact absolute `project` directory, Enter to validate,
-wait for the 4/4 review, then Enter on the default Create button. The fake
-profile's quota row can say that Codex is unavailable while the configured fake
-ACP executable remains fully launchable; quota health is not harness health.
+Tab to move focus from Prompt to the Sessions pane, plain `n`, Enter on the
+fake profile, Enter on localhost, replace the project field with the lab's
+exact absolute `project` directory, Enter to validate, wait for the 4/4 review,
+then Enter on the default Create button. The fake profile's quota row can say
+that Codex is unavailable while the configured fake ACP executable remains
+fully launchable; quota health is not harness health.
 
 Launch or relaunch the TUI by running plain `$HEL_LUNA_BINARY` in the prepared
 environment and selecting the existing workspace when necessary. Hel has no
 `dashboard <workspace>` subcommand; treating that invented command's parser
 error as a product failure invalidates the phase.
 
-Dashboard help labels such as `[Q]uit` and `We[b]` mean Ctrl+Q and Ctrl+B.
-Record modifiers exactly. Escape from the main dashboard intentionally detaches
-and quits, so never append Escape mechanically after Ctrl+G or another
-dashboard transition during a hotkey sweep.
+Hel has one surface: Sessions, the transcript, Prompt, Targets, Quota, and a
+footer. The footer names the keys for whatever has focus, and it names them
+literally — `n new` means the plain letter `n`, not Ctrl+N. Record modifiers
+exactly.
+
+The pane keys only work while a pane has focus, and the surface opens with the
+keyboard in Prompt, so a sweep has to Tab first or the letters land in the
+composer as text. Tab walks Sessions, Quota, Targets, Prompt; Shift+Tab
+reverses it. Ctrl+G collapses Targets and Quota to one row each and returns the
+keyboard to Prompt; Ctrl+G again restores them. F2 is Workspaces, F3 is the web
+viewer, Ctrl+Q detaches.
+
+Escape no longer quits. It cancels a running turn or a shell command and closes
+dialogs, so a sweep can use it freely — but a report that Escape "failed to
+quit" is a stale expectation, not a defect.
 
 Workers must not fix defects during the campaign. They may minimize a reproduction inside their disposable lab. Once the exact sequence and evidence are preserved, they finish their assigned missions even if another finding has already been recorded.
 

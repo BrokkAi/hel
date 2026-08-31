@@ -22,10 +22,23 @@ The user-visible payoff: you can read an agent's output, see what your other age
 - [x] (2026-08-31) Milestone 3 — Sessions pane projection and rendering (completed: `SessionsRow`, `sessions_rows`, `current_project_key`, `visible_session_indices`, and a rewritten `render_sessions` drawing compact one-line, collapsed one-line, and four-row expanded forms; remaining: the behaviour tests for the five-session threshold and the Others aggregation, which land next).
 - [x] (2026-08-31) Milestone 4 — The combined renderer. `crates/hel-tui/src/combined.rs` holds `render_combined` and `allocate_combined_heights`; `render.rs` gained `minimized_targets_line`, `minimized_quota_line` and `combined_footer_text`, and lost the old three-pane `allocate_pane_heights` and `render_adaptive_dashboard`. Pane titles now read Sessions, Targets and Quota.
 - [x] (2026-08-31) Milestone 5 — Controller integration (completed: `View` deleted, one draw and one hitbox registry, mouse routed by pointer and keys by focus, F2 intercept, startup selection with its two-second bound and its user-input cancellation, the outgoing conversation saved on every switch; remaining: the controller behaviour tests, which land with the Milestone 3 tests).
-- [ ] Milestone 6 — Documentation, test-harness updates, and full validation (completed: `crates/hel-cli/tests/termination_pty.rs` now waits for `Sessions` and quits with Ctrl-Q; remaining: README, `docs/src/content/docs/containers.md`, `.agents/docs/parallel-luna-testing.md`, the two Python labs, and the module docs).
-- [ ] Behaviour tests still to write: the five-session threshold and the Others aggregation, the four-row expanded form, independent collapse, the minimized Targets and Quota rows, and the startup selection and its fallbacks.
+- [x] (2026-08-31) Milestone 6 — Documentation and test harnesses. README gained a `The terminal surface` section and a corrected Quickstart; `docs/src/content/docs/containers.md` names the new first-session keys; `.agents/docs/parallel-luna-testing.md` describes the one surface, the plain pane keys, the Tab-first requirement, and that Escape no longer quits; `crates/hel-cli/tests/termination_pty.rs` waits for `Sessions` and quits with Ctrl-Q; the three Python labs wait for `Sessions` and `browser_lab.py` tabs to the pane before pressing `e`; the module docs of `crates/hel-tui/src/lib.rs` and `src/hel_chat/active.rs` describe the combined surface.
+- [x] (2026-08-31) Behaviour tests. Sessions: the five-session threshold, the Others aggregation with its exact active/idle split, the current project following the conversation, the focused list ignoring the threshold, default-expanded and independent collapse, and the selection surviving the list changing under it. Rendering: the four-row expanded form, the compact row's project/target/clock/last-line, the minimized rows' CPU and weekly-percent-used, their explicit unavailable/refreshing/stale readings, and their truncation. Startup: the newest-activity pick, the creation-then-id fallback, the bounded wait, and the user taking the choice back.
+- [x] (2026-08-31) Verification. The real binary was driven in a PTY at 140x32 and 60x20: the six bands draw in order, Tab walks Sessions to Quota with the footer following, Ctrl-G collapses Targets and Quota to `Targets  local 17%` and `Quota  claude-1 unavailable codex-1 unavailable` and hands the transcript the rows they freed, Tab restores them onto Sessions, 15 rows reports `Increase height to at least 16 rows`. The band order and the collapse arithmetic are now also render tests, so they cannot regress silently.
+
+## Outstanding
+
+A workspace with live sessions has been verified through the render tests
+(compact rows, the five-session threshold, the Others aggregation, the
+four-row expanded form, independent collapse) but not yet by hand against a
+running agent, which needs a provisioned container target and harness
+credentials. That is the one check from the original test plan that automation
+here could not stand in for.
 
 ## Surprises & Discoveries
+
+- Observation: the startup fallback ranked sessions backwards. `compare_by_creation` orders oldest first, and the comparator inverted it, so a workspace whose summaries had not loaded would have opened its *oldest* session rather than its newest. The test written for the documented behaviour caught it.
+  Evidence: `startup_falls_back_to_the_newest_creation_then_the_larger_id` failed with `left: Some("session-a")` against `right: Some("session-b")` before the comparator was corrected to `left.compare_by_creation(right)`.
 
 - Observation: Milestones 2 and 5 could not be separated. Changing `ChatEventOutcome` breaks every reference to the conversations pane, and the pane cannot compile without the outcomes it returns, so the pane, its background poller, `ChatFocus`, `OtherSessionIdentity` and `SurfaceId::Conversations` all had to go in the same change as the new focus model. Nothing was lost by doing it early: the Sessions pane already switched sessions through `DashboardAction::Open`, so the only capability missing in between was the in-chat switching shortcut.
   Evidence: `cargo check -p hel-core` after the outcome change reported `no variant named 'SwitchSession' found for enum 'ChatAction'` at `src/hel_chat/active.rs:161`, inside `neighbour_session`, which is conversations-pane code.
@@ -89,7 +102,15 @@ The user-visible payoff: you can read an agent's output, see what your other age
 
 ## Outcomes & Retrospective
 
-Not started. Fill in at the end of each milestone and at completion: what was achieved, what remains, and what the work taught.
+The feature is delivered. Hel's TUI is one screen — Sessions, transcript, Prompt, Targets, Quota, footer — with no view switch, no `View` enum, and no second renderer. `Ctrl-G` collapses the support panes instead of navigating back, `Tab` walks four focus stops, the panes take plain letters, `Escape` never quits, and Workspaces and the web viewer moved to `F2` and `F3`, which handed `Ctrl-W` and `Ctrl-B` back to the composer.
+
+Three things are worth passing on.
+
+The milestone boundaries in this plan did not survive contact with the compiler. Milestones 2 and 5 were one change: `ChatEventOutcome` and the conversations pane are the same knot, and pulling either unravels the other. The plan's own ordering hazard note was about the opposite risk — deleting the pane too early — and it turned out to be unfounded, because the Sessions pane already switched sessions through `DashboardAction::Open`. A plan can sequence work that the type system will not let you sequence; the honest response is to merge the milestones and say so, which is what the Progress and Surprises sections now do.
+
+Two real defects came out of writing the tests the plan asked for rather than out of running the code. The startup fallback ranked sessions backwards, so a workspace whose summaries had not loaded would have opened its oldest conversation; and the first cut of the collapse test asserted a row count that was wrong in a way that hid a second effect (minimizing also compacts Sessions, because it moves focus to Prompt). Both are the kind of thing a screenshot would have passed.
+
+Driving the real binary in a PTY was worth more than any single test. It is what surfaced the over-long Sessions title, the guidance line clipped out of the empty prompt, and the two pane titles that still said Capacity and Profile Quotas — none of which the unit tests were looking at, because none of them were wrong in a way a test had been written to notice.
 
 ## Context and Orientation
 
