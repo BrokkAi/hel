@@ -16,7 +16,7 @@ The visible proof is a local Podman session whose chat can be left without stopp
 
 - [x] (2026-08-31 12:51Z) Read the current chat navigation, dashboard lifecycle, checkpoint/close, target teardown, saved-session, phone viewer, documentation, and test paths.
 - [x] (2026-08-31 12:51Z) Resolved the first-version product model: one Finish intent, target-specific consequences derived from ownership already encoded by the target kind, and no new per-session policy choice.
-- [ ] Implement the shared finish-effect model and make a finish checkpoint preserve unstarted queued work.
+- [x] (2026-08-31 13:57Z) Implemented the shared finish-effect model and distinguished a finish checkpoint from an ordinary recovery checkpoint. Focused checkpoint tests passed on the container's `aarch64-unknown-linux-gnu` host target.
 - [ ] Replace the terminal UI's hidden Stop workflow with target-aware Finish, Saved, and Delete language, and make leave-running behavior explicit.
 - [ ] Bring the phone viewer and its controller action schema to the same lifecycle model without exposing private target locators.
 - [ ] Publish the lifecycle guidance, update behavioral and end-to-end tests, run the complete validation suite, and record results here.
@@ -32,14 +32,17 @@ The visible proof is a local Podman session whose chat can be left without stopp
 - Observation: target teardown is already operationally target-specific. Local and remote Podman remove only the session container, Apple containers are removed, EC2 instances are terminated, and bare targets stop Hel runtime state rather than deleting the selected project directory.
   Evidence: `src/hel_targets.rs::close_plan` contains one exact-resource command per `TargetLocator` variant. For SSH bare sessions, the locator's `workspace` is the Hel-owned session path produced by `workspace_for`; the user's selected `SessionRecord::project_directory` is separate and is not passed to `close_plan`.
 
-- Observation: the current phone confirmation claims that queued prompts are preserved, but an ordinary checkpoint barrier waits behind earlier queued work. A finish requested behind an active turn can therefore start queued prompts before reaching its checkpoint.
-  Evidence: `src/hel_server.rs` renders “Queued prompts will be preserved,” while `src/hel_worker.rs::claim_pending_commands_up_to` calls `promote_next_queued_command` before admitting the next checkpoint barrier. Finish needs a queue-preserving checkpoint policy rather than copy alone.
+- Observation: checkpoint submission already freezes the unstarted prompt/configuration queue while allowing an active effect to settle. The missing distinction is that an ordinary recovery checkpoint and the checkpoint held through close carry the same command shape, so the relay cannot reject brand-new work specifically after Finish has been requested.
+  Evidence: `src/hel_worker.rs::promote_next_queued_command` refuses promotion whenever `pending_checkpoint_barrier` is true, including while the barrier waits behind an active prompt. `RelayCommand::BeginCheckpoint` currently carries only a free-form reason, and the relay accepts queue entries behind an ordinary active barrier.
 
 - Observation: “archive” already means hide, not retain or copy. A stopped session's verified recovery file exists independently of its `archived` flag.
   Evidence: `src/hel_state.rs::SessionRecord::archived` documents that it is display-only, and `crates/hel-tui/src/resume.rs` filters hidden rows while separately loading checkpoint file sizes.
 
 - Observation: the phone snapshot intentionally excludes SSH hosts, filesystem paths, AWS details, and concrete resource locators.
   Evidence: `src/hel_server.rs::ViewerSnapshot::from_config_state` documents this privacy boundary. Target-aware copy sent to the browser must therefore use a safe effect category, never raw locator data.
+
+- Observation: this disposable container includes an aarch64 Rust toolchain but not the repository's default `x86_64-unknown-linux-musl` standard library.
+  Evidence: the default focused test failed with “can't find crate for `core`”; the same tests pass with `--target aarch64-unknown-linux-gnu`, as prescribed for non-x86_64 hosts in `AGENTS.md`.
 
 ## Decision Log
 
@@ -63,6 +66,14 @@ The visible proof is a local Podman session whose chat can be left without stopp
   Rationale: silently draining a potentially long queue contradicts “I am finished” and can continue consuming remote resources. Abruptly cancelling the active turn risks losing the work the user is trying to preserve. The deterministic default is to finish the one already-running effect and save everything not yet started for an optional later resume.
   Date/Author: 2026-08-31 / Codex
 
+- Decision: Represent the distinction as `CheckpointPurpose::Recovery` versus `CheckpointPurpose::Finish`, not as a queue policy.
+  Rationale: the existing relay already freezes unstarted queue entries for every pending checkpoint. Purpose is the actual missing state: Finish additionally rejects new effectful submissions so the exact close checkpoint cannot drift, while Recovery continues accepting work behind a temporary barrier.
+  Date/Author: 2026-08-31 / Codex
+
+- Decision: Once a Finish barrier is durable, reject every new relay command except the exact Close, checkpoint completion, or checkpoint release operations.
+  Rationale: even relay-local queue edits and notices advance the event frontier and would invalidate the checkpoint cursor that Close must seal. Retries of commands accepted before Finish remain idempotent because duplicate-command handling runs before this admission gate.
+  Date/Author: 2026-08-31 / Codex
+
 - Decision: Keep saved sessions indefinitely by default, show that they use disk but no running compute, and rename the existing archive control to Hide.
   Rationale: a recovery archive may be the only copy of uncommitted work, so automatic destructive retention is unsafe as a first step. Users should not have to choose a deletion date when finishing. Showing per-session and total saved storage makes eventual cleanup an informed, non-urgent choice. Hide is honest about the existing display-only flag.
   Date/Author: 2026-08-31 / Codex
@@ -77,7 +88,9 @@ The visible proof is a local Podman session whose chat can be left without stopp
 
 ## Outcomes & Retrospective
 
-No implementation has begun. The plan fixes the intended contract before changing code: Back is navigation, Finish is safe resource release with target-specific effects, Saved is recoverable without live compute, Hide is organization only, and Delete is permanent. Update this section after each milestone with observed behavior, remaining gaps, and any divergence from that contract.
+Milestone 1 established the core contract without changing an existing UI action. All six live target locators now map to a privacy-safe `SessionFinishEffect` and target-specific copy. Relay protocol 7 carries `CheckpointPurpose::Finish`; older durable commands still decode as Recovery, and a close against an older live worker first replaces that worker. A Finish barrier waits for the active effect, preserves previously accepted queued prompts in the canonical archive projection, rejects new work, and resumes the queue if its controller disconnects. A database-backed lifecycle test also proves that failed Finish export leaves the target and Running state intact and never invokes the target teardown command.
+
+The focused checkpoint run passed 120 tests (one ignored), including relay runtime and controller latch coverage. The four named Finish/recovery state-machine tests, archive projection test, target-effect test, backward-serde test, and failed-export lifecycle path pass on `aarch64-unknown-linux-gnu`. The remaining work is the terminal and phone vocabulary/actions, quit warning, documentation, and end-to-end validation.
 
 ## Context and Orientation
 
@@ -104,17 +117,17 @@ The phone UI is an HTML/JavaScript page embedded in `src/hel_server.rs`. `Viewer
 
 ## Plan of Work
 
-### Milestone 1: encode finish semantics and preserve queued work
+### Milestone 1: encode finish semantics and seal new work
 
 First make the core behavior precise without changing a button. In `src/hel_controller/lifecycle.rs`, add a public, copyable `SessionFinishEffect` enum with the six current effects: stopping a local bare worker, removing a local Podman container, removing an Apple container, stopping a remote bare worker, removing a remote Podman container, and terminating an EC2 instance. Export it from `src/hel_controller.rs`. Add `session_finish_effect(session: &SessionRecord) -> Result<SessionFinishEffect>`, which requires an active `session.target` and classifies the canonical locator. Give the enum privacy-safe methods returning the confirmation consequence and primary action label. Copy must name what is preserved as well as what is released; for example, the SSH Podman consequence says the session container will be removed and the SSH host will remain.
 
 Do not place raw locator fields in these strings. Add unit tests that construct all locator variants and assert meaningful behavior: a local bare effect mentions preserving the project, an SSH effect mentions preserving the host, and EC2 says terminate. Strengthen existing `src/hel_targets/tests.rs` behavior tests so every effect remains paired with the actual teardown plan. Those tests must inspect commands produced for fake exact identifiers; they must never execute real Podman, SSH, Apple container, or AWS cleanup.
 
-Next make “queued work is saved” true. In `src/hel_worker/snapshot.rs`, extend `RelayCommand::BeginCheckpoint` with a serializable `CheckpointQueuePolicy` whose values are `Drain` and `Preserve`. Existing periodic/manual checkpoints use Drain. The close checkpoint in `src/hel_controller/lifecycle.rs` uses Preserve. Bump the relay protocol version and make a Preserve command require that version, because an older worker cannot safely interpret the new policy.
+Next make the finish intent explicit at the relay. In `src/hel_worker/snapshot.rs`, extend `RelayCommand::BeginCheckpoint` with a serializable `CheckpointPurpose` whose values are `Recovery` and `Finish`. Existing periodic/manual checkpoints use Recovery. The checkpoint held through close in `src/hel_controller/lifecycle.rs` uses Finish. Bump the relay protocol version and make a Finish command require that version, because an older worker cannot safely interpret the new purpose.
 
-Update `src/hel_worker.rs::claim_pending_commands_up_to` and its helper predicates so a Preserve barrier waits for already-started ACP work and user shells to become terminal but takes precedence over unstarted queued prompts and configuration changes. Once such a barrier has been accepted, reject new prompts, user shells, and configuration or mode changes with a clear “session is finishing” invalid-state error; never allow post-finish work to drift past the exact checkpoint cut. The materialized checkpoint must still contain the queue entries accepted before Finish. If the controller connection disappears or the lifecycle operation is cancelled before the barrier completes, `cancel_checkpoint_barrier_on_disconnect` must interrupt either queue policy and resume normal promotion. Ordinary Drain barriers must retain their existing command ordering.
+Keep the existing queue-freezing behavior in `src/hel_worker.rs::promote_next_queued_command` and add a `finish_checkpoint_pending` predicate over nonterminal Finish barriers. Once such a barrier has been accepted, reject new prompts, user shells, and configuration or mode changes with a clear “session is finishing” invalid-state error; never allow post-finish work to drift past the exact checkpoint cut. The active effect may finish, and the materialized checkpoint must still contain queue entries accepted before Finish. If the controller connection disappears or the lifecycle operation is cancelled before the barrier completes, `cancel_checkpoint_barrier_on_disconnect` must interrupt either purpose and resume normal promotion. Ordinary Recovery barriers must continue accepting work behind the barrier and retain their existing command ordering after release.
 
-Add state-machine tests named along the lines of `finish_checkpoint_waits_for_active_prompt_and_preserves_queue`, `finish_checkpoint_rejects_no_queue_entries_but_promotes_none`, `cancelled_finish_checkpoint_resumes_the_queue`, and `ordinary_checkpoint_still_drains_earlier_queue_entries`. Add a controller checkpoint test proving the canonical archive contains a preserved queued prompt and a lifecycle test proving no target teardown is attempted when the finish checkpoint fails.
+Add state-machine tests named along the lines of `finish_checkpoint_waits_for_active_prompt_and_preserves_queue`, `finish_checkpoint_rejects_new_work`, `cancelled_finish_checkpoint_resumes_the_queue`, and `recovery_checkpoint_still_accepts_work_behind_the_barrier`. Add a controller checkpoint test proving the canonical archive contains a preserved queued prompt and a lifecycle test proving no target teardown is attempted when the finish checkpoint fails.
 
 This milestone is complete when core tests show that Finish has one safe target effect, does not leak locator details into its presentation, allows a current effect to settle, preserves all unstarted work, and retains the existing verify-before-teardown invariant.
 
@@ -174,7 +187,7 @@ After Milestone 1, format and run the focused core tests:
     cargo test -p hel-core lifecycle
     cargo test -p hel-core hel_targets
 
-The expected evidence is that the named finish tests pass, a Preserve barrier leaves queued command IDs in the snapshot/archive, a cancelled barrier permits the next queued command to start, and fake target plans contain the exact target-specific teardown command without executing it.
+The expected evidence is that the named finish tests pass, a Finish barrier leaves pre-existing queued command IDs in the snapshot/archive and rejects new work, a cancelled barrier permits the next queued command to start, and fake target plans contain the exact target-specific teardown command without executing it.
 
 After Milestone 2, run the TUI, CLI, and PTY behavior tests:
 
@@ -228,7 +241,7 @@ In chat, the footer and `/dashboard` autocomplete state that the worker remains 
 
 On a selected active session, Ctrl+F is directly discoverable. The confirmation describes one and only one exact effect appropriate to the live locator. Remote effects explicitly preserve their host; bare effects explicitly preserve the selected project; EC2 explicitly terminates the session instance. No confirmation or phone payload prints a private host, path, container ID, or instance ID.
 
-When Finish is requested during a running turn, that turn becomes terminal before the checkpoint barrier is admitted, no queued prompt or queued configuration change starts, and the resulting archive retains the pre-existing queue. A new prompt submitted after the Preserve barrier is accepted is rejected with a clear Finishing message; it must never enter the archived queue or run ahead of the finish checkpoint. Cancelling before the exact close is sealed releases the barrier and permits normal work to resume. A failed checkpoint leaves the target present. A successful checkpoint is verified before the target-specific teardown command runs.
+When Finish is requested during a running turn, that turn becomes terminal before the checkpoint barrier is admitted, no queued prompt or queued configuration change starts, and the resulting archive retains the pre-existing queue. A new prompt submitted after the Finish barrier is accepted is rejected with a clear Finishing message; it must never enter the archived queue or run ahead of the finish checkpoint. Cancelling before the exact close is sealed releases the barrier and permits normal work to resume. A failed checkpoint leaves the target present. A successful checkpoint is verified before the target-specific teardown command runs.
 
 After success, the active row disappears only because the same logical session appears under **Saved sessions**. The UI says no worker is running, shows its stored archive size when available, and offers Resume. Resume provisions a fresh disposable target or reconnects a bare project according to the existing resume rules. Hide removes the row from the default list without changing its file or lifecycle state. Delete permanently removes the archive and record only after confirmation.
 
@@ -244,11 +257,11 @@ The plan intentionally avoids a database migration. Existing `SessionState::Stop
 
 Finish remains retryable through the current durable Closing recovery. The controller persists intent before checkpointing, verifies the installed archive before cleanup, and uses exact, idempotent target identifiers. Preserve those properties. If an implementation fails after the checkpoint but before teardown, let the existing interrupted-close recovery finish it; do not mark the session Saved until target absence is confirmed. If it fails before a verified checkpoint, restore the prior active state and do not tear anything down.
 
-A cancelled Preserve checkpoint must be explicitly covered because a stuck barrier would pause a remote queue indefinitely. The connection-drop interruption path is the recovery mechanism; tests must simulate cancellation while the barrier is queued behind active work and while it is active.
+A cancelled Finish checkpoint must be explicitly covered because a stuck barrier would pause a remote queue indefinitely. The connection-drop interruption path is the recovery mechanism; tests must simulate cancellation while the barrier is queued behind active work and while it is active.
 
 Never test destructive target commands against an unresolved environment variable, broad path, arbitrary Podman list, or real cloud account. Use fake executors and generated fixture IDs. For the optional manual Podman run, record the exact session container from Hel state before acting and stop it through Hel. If manual cleanup is necessary after a product failure, use `hel recover scan` to identify the exact Hel-managed resource before any destroy command.
 
-If the new terminology causes an unforeseen regression, the UI commits can be reverted independently without reverting the queue-preserving checkpoint or target-effect tests. Do not revert checkpoint safety to make copy changes pass.
+If the new terminology causes an unforeseen regression, the UI commits can be reverted independently without reverting the finish-purpose checkpoint or target-effect tests. Do not revert checkpoint safety to make copy changes pass.
 
 ## Artifacts and Notes
 
@@ -303,12 +316,12 @@ In `src/hel_worker/snapshot.rs`, define:
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
-    pub enum CheckpointQueuePolicy {
-        Drain,
-        Preserve,
+    pub enum CheckpointPurpose {
+        Recovery,
+        Finish,
     }
 
-and carry it on `RelayCommand::BeginCheckpoint`. Give the policy a default of Drain and use `#[serde(default)]` on the field so existing durable journal and snapshot records still decode. Preserve is used only for the checkpoint held through a close. It must affect relay promotion, not archive filtering: queued commands remain first-class durable state.
+and carry it on `RelayCommand::BeginCheckpoint`. Give the purpose a default of Recovery and use `#[serde(default)]` on the field so existing durable journal and snapshot records still decode. Finish is used only for the checkpoint held through a close. It seals new effectful submissions while reusing the existing queue freeze; queued commands remain first-class durable state.
 
 At the TUI boundary, the resulting action variants are:
 
@@ -332,3 +345,7 @@ and make `ViewerSession::finish` optional. The controller action is:
 The serialized action verb is `finish`. Do not serialize or interpolate any field from `TargetLocator` into `ViewerFinish`.
 
 Revision note (2026-08-31): Initial plan created after tracing the current detach, stop, destroy, queue, target-teardown, saved-session, and phone-viewer paths. It resolves the design around a single Finish intent with target-aware effects, rather than a uniform physical teardown or a new policy choice for every user.
+
+Revision note (2026-08-31): Milestone 1 source inspection corrected the queue design. Pending checkpoint barriers already freeze unstarted queue entries; the plan now adds a Finish purpose solely to reject new work and protect the exact checkpoint cut.
+
+Revision note (2026-08-31): Milestone 1 completed with protocol 7, backward-compatible Recovery decoding, automatic worker replacement for old Finish peers, privacy-safe target effects, canonical queue preservation, cancellation recovery, and verify-before-teardown coverage.

@@ -12,9 +12,10 @@ use tokio::sync::mpsc;
 use super::*;
 use crate::hel_acp::{CommandRequest, RuntimeEvent};
 use crate::hel_worker::{
-    DurableRelay, RELAY_EVENT_GENESIS_DIGEST, RELAY_PROTOCOL_VERSION, RelayCommand, RelayErrorCode,
-    RelayExecutionState, RelayObservation, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
-    RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
+    CheckpointPurpose, DurableRelay, RELAY_EVENT_GENESIS_DIGEST, RELAY_PROTOCOL_VERSION,
+    RelayCommand, RelayErrorCode, RelayExecutionState, RelayObservation, RelayProtocolError,
+    RelayRequest, RelayRequestEnvelope, RelayResponseBody, RelayResponseEnvelope,
+    RelayResponsePayload,
 };
 
 const SESSION_ID: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
@@ -1854,6 +1855,7 @@ async fn config_cancel_and_close_commands_have_durable_terminal_outcomes() {
         "barrier-before-close",
         RelayCommand::BeginCheckpoint {
             reason: Some("close test".into()),
+            purpose: CheckpointPurpose::Finish,
         },
     );
     wake_tx.try_send(()).unwrap();
@@ -2200,6 +2202,7 @@ async fn checkpoint_waits_for_current_session_configuration_then_stays_local() {
         "checkpoint-1",
         RelayCommand::BeginCheckpoint {
             reason: Some("test".into()),
+            purpose: CheckpointPurpose::Recovery,
         },
     );
     let relay = Arc::new(Mutex::new(durable));
@@ -2273,6 +2276,7 @@ async fn checkpoint_waits_for_an_in_flight_config_command() {
         "barrier-after-config",
         RelayCommand::BeginCheckpoint {
             reason: Some("after config".into()),
+            purpose: CheckpointPurpose::Recovery,
         },
     );
     let relay = Arc::new(Mutex::new(durable));
@@ -2371,6 +2375,7 @@ async fn a_released_checkpoint_barrier_is_not_cancelled_when_its_connection_drop
         "released-barrier",
         RelayCommand::BeginCheckpoint {
             reason: Some("early release".into()),
+            purpose: CheckpointPurpose::Recovery,
         },
     );
     submit(
@@ -2484,6 +2489,7 @@ async fn checkpoint_wake_records_already_queued_runtime_events_first() {
         "checkpoint-after-queued-event",
         RelayCommand::BeginCheckpoint {
             reason: Some("ordering test".into()),
+            purpose: CheckpointPurpose::Recovery,
         },
     );
     wake_tx.try_send(()).unwrap();
@@ -2532,6 +2538,7 @@ async fn checkpoint_wake_is_not_starved_by_a_runtime_event_flood() {
         "checkpoint-during-event-flood",
         RelayCommand::BeginCheckpoint {
             reason: Some("event flood fairness".into()),
+            purpose: CheckpointPurpose::Recovery,
         },
     );
     let relay = Arc::new(Mutex::new(durable));
@@ -2613,6 +2620,7 @@ async fn checkpoint_freezes_effectful_commands_submitted_after_the_barrier() {
         "barrier-before-config",
         RelayCommand::BeginCheckpoint {
             reason: Some("freeze later work".into()),
+            purpose: CheckpointPurpose::Recovery,
         },
     );
     submit(
@@ -2784,6 +2792,7 @@ async fn client_disconnect_releases_checkpoint_and_runs_queued_prompt() {
             command_id: "checkpoint-1".into(),
             command: RelayCommand::BeginCheckpoint {
                 reason: Some("test disconnect".into()),
+                purpose: CheckpointPurpose::Recovery,
             },
         },
     };
@@ -3036,6 +3045,7 @@ async fn disconnect_between_close_and_checkpoint_completion_dispatches_close() {
             command_id: "barrier-before-close".into(),
             command: RelayCommand::BeginCheckpoint {
                 reason: Some("disconnect race".into()),
+                purpose: CheckpointPurpose::Finish,
             },
         },
     };
@@ -3175,6 +3185,7 @@ async fn closed_relay_stays_attachable_after_the_acp_runtime_stops() {
         "barrier-before-close",
         RelayCommand::BeginCheckpoint {
             reason: Some("close test".into()),
+            purpose: CheckpointPurpose::Finish,
         },
     );
     let claimed = durable.claim_pending_commands(true).unwrap();
@@ -3285,6 +3296,7 @@ async fn daemon_restart_serves_a_closed_relay_without_starting_acp() {
         "barrier-before-restart-close",
         RelayCommand::BeginCheckpoint {
             reason: Some("closed restart test".into()),
+            purpose: CheckpointPurpose::Finish,
         },
     );
     let barrier = durable.claim_pending_commands(true).unwrap();

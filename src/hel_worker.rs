@@ -28,11 +28,11 @@ pub use protocol::{
 #[cfg(unix)]
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
-    ActiveAgentTerminal, ActiveRelayPrompt, ActiveUserShell, ClaimedRelayCommand,
-    QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_FORMAT_V2, RelayCommand,
-    RelayCommandKind, RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState,
-    RelayObservation, RelayOperationalState, UserShellResult, UserShellStatus, relay_event_digest,
-    validate_relay_event, validate_relay_event_self,
+    ActiveAgentTerminal, ActiveRelayPrompt, ActiveUserShell, CheckpointPurpose,
+    ClaimedRelayCommand, QueuedRelayPrompt, RELAY_EVENT_FORMAT_V1, RELAY_EVENT_FORMAT_V2,
+    RelayCommand, RelayCommandKind, RelayCommandOutcome, RelayCursor, RelayEvent,
+    RelayExecutionState, RelayObservation, RelayOperationalState, UserShellResult, UserShellStatus,
+    relay_event_digest, validate_relay_event, validate_relay_event_self,
 };
 pub use types::{
     ActivePrompt, Attachment, QueuedPrompt, SequencedEvent, WorkerEvent, WorkerPhase,
@@ -94,7 +94,9 @@ const RELAY_SNAPSHOT_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 /// Current durable ACP relay protocol. Peers that only speak an older
 /// version in [`RELAY_MIN_PROTOCOL_VERSION`]..=this range still connect.
 /// Protocol 0 is the retired pre-relay worker protocol and is rejected.
-pub const RELAY_PROTOCOL_VERSION: u32 = 6;
+/// Protocol 7 distinguishes Finish checkpoints, which seal new work, from
+/// ordinary recovery checkpoints.
+pub const RELAY_PROTOCOL_VERSION: u32 = 7;
 pub const RELAY_MIN_PROTOCOL_VERSION: u32 = 1;
 /// Digest for the empty relay event prefix (ordinal zero).
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
@@ -893,6 +895,21 @@ impl DurableRelay {
                 None,
             )));
         }
+        if self.finish_checkpoint_pending()
+            && !matches!(
+                &command,
+                RelayCommand::Close { .. }
+                    | RelayCommand::CompleteCheckpoint { .. }
+                    | RelayCommand::ReleaseCheckpoint { .. }
+            )
+        {
+            return Ok(Err(relay_protocol_error(
+                RelayErrorCode::InvalidState,
+                "relay session is finishing",
+                false,
+                None,
+            )));
+        }
         if let RelayCommand::Prompt { prompt } = &command
             && prompt.is_empty()
         {
@@ -1452,6 +1469,26 @@ impl DurableRelay {
                     .map(|handled| (command_id.clone(), handled.accepted_ordinal))
             })
             .min_by_key(|(_, accepted)| *accepted)
+    }
+
+    /// A Finish barrier is the user's durable cut: commands accepted before it
+    /// remain recoverable, but nothing new may move the frontier before Close
+    /// seals that exact checkpoint.
+    fn finish_checkpoint_pending(&self) -> bool {
+        self.snapshot.dispatches.values().any(|dispatch| {
+            matches!(
+                dispatch.command,
+                RelayCommand::BeginCheckpoint {
+                    purpose: CheckpointPurpose::Finish,
+                    ..
+                }
+            ) && matches!(
+                dispatch.state,
+                RelayDispatchState::Queued
+                    | RelayDispatchState::Pending
+                    | RelayDispatchState::InFlight
+            )
+        })
     }
 
     pub fn record_observation(&mut self, observation: RelayObservation) -> Result<u64> {
@@ -2316,7 +2353,10 @@ pub(crate) mod test_support {
         submit_relay(
             relay,
             command_id,
-            RelayCommand::BeginCheckpoint { reason: None },
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Recovery,
+            },
         );
         let claimed = relay.claim_pending_commands(true).unwrap();
         assert_eq!(claimed.len(), 1);
@@ -2858,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_barrier_pauses_offline_prompt_promotion_until_release() {
+    fn recovery_checkpoint_still_accepts_work_behind_the_barrier() {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
         submit_relay(
@@ -2866,6 +2906,7 @@ mod tests {
             "barrier-command",
             RelayCommand::BeginCheckpoint {
                 reason: Some("test".into()),
+                purpose: CheckpointPurpose::Recovery,
             },
         );
         submit_relay(&mut relay, "after-barrier", prompt("later"));
@@ -2889,13 +2930,182 @@ mod tests {
     }
 
     #[test]
+    fn finish_checkpoint_waits_for_active_prompt_and_preserves_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "active-prompt", prompt("finish this"));
+        let active = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(active[0].command_id, "active-prompt");
+        submit_relay(&mut relay, "saved-prompt", prompt("resume this later"));
+        submit_relay(
+            &mut relay,
+            "finish-barrier",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("finish session".into()),
+                purpose: CheckpointPurpose::Finish,
+            },
+        );
+
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+        assert_eq!(queued_command_ids(&relay), vec!["saved-prompt"]);
+
+        finish_prompt(&mut relay, "active-prompt");
+        let barrier = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(barrier.len(), 1);
+        assert_eq!(barrier[0].command_id, "finish-barrier");
+        assert_eq!(queued_command_ids(&relay), vec!["saved-prompt"]);
+        relay.record_checkpoint_ready("finish-barrier").unwrap();
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+        assert_eq!(queued_command_ids(&relay), vec!["saved-prompt"]);
+    }
+
+    #[test]
+    fn finish_checkpoint_projection_preserves_queue_for_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "active-prompt", prompt("finish this"));
+        assert_eq!(relay.claim_pending_commands(true).unwrap().len(), 1);
+        submit_relay(&mut relay, "saved-prompt", prompt("resume this later"));
+        submit_relay(
+            &mut relay,
+            "finish-barrier",
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Finish,
+            },
+        );
+        finish_prompt(&mut relay, "active-prompt");
+        assert_eq!(relay.claim_pending_commands(true).unwrap().len(), 1);
+        relay.record_checkpoint_ready("finish-barrier").unwrap();
+
+        let mut materialized = crate::hel_state::MaterializedSession::empty(SESSION);
+        for event in relay.events_after(0, RELAY_EVENT_GENESIS_DIGEST).unwrap() {
+            let projected = crate::hel_projection::project_relay_event(&materialized, &event)
+                .expect("project Finish checkpoint event");
+            crate::hel_projection::apply_committed_projection_event(
+                &mut materialized,
+                &event,
+                projected.mutation,
+            )
+            .expect("apply Finish checkpoint event");
+        }
+        let canonical = crate::hel_projection::canonical_session_from_materialized(&materialized)
+            .expect("build canonical archive session");
+        assert_eq!(canonical.queued_prompts.len(), 1);
+        assert_eq!(canonical.queued_prompts[0].command_id, "saved-prompt");
+    }
+
+    #[test]
+    fn finish_checkpoint_rejects_new_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(
+            &mut relay,
+            "finish-barrier",
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Finish,
+            },
+        );
+
+        for (command_id, command) in [
+            ("late-prompt", prompt("too late")),
+            (
+                "late-shell",
+                RelayCommand::RunUserShell {
+                    command: "pwd".into(),
+                },
+            ),
+            ("late-config", set_config("model", "later")),
+            (
+                "late-mode",
+                RelayCommand::SetSessionMode {
+                    mode_id: "plan".into(),
+                },
+            ),
+        ] {
+            let response = relay.handle(relay_request(
+                &format!("request-{command_id}"),
+                RelayRequest::Submit {
+                    command_id: command_id.to_owned(),
+                    command,
+                },
+            ));
+            assert!(matches!(
+                response.body,
+                RelayResponseBody::Error {
+                    error: RelayProtocolError {
+                        code: RelayErrorCode::InvalidState,
+                        ref message,
+                        ..
+                    }
+                } if message == "relay session is finishing"
+            ));
+            assert!(!relay.snapshot.handled_commands.contains_key(command_id));
+        }
+    }
+
+    #[test]
+    fn cancelled_finish_checkpoint_resumes_the_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "active-prompt", prompt("finish this"));
+        assert_eq!(relay.claim_pending_commands(true).unwrap().len(), 1);
+        submit_relay(&mut relay, "queued-prompt", prompt("continue later"));
+        submit_relay(
+            &mut relay,
+            "finish-barrier",
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Finish,
+            },
+        );
+
+        assert!(
+            relay
+                .cancel_checkpoint_barrier_on_disconnect("finish-barrier")
+                .unwrap()
+                .is_some()
+        );
+        finish_prompt(&mut relay, "active-prompt");
+        let next = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].command_id, "queued-prompt");
+    }
+
+    #[test]
+    fn checkpoint_purpose_defaults_to_recovery_for_old_durable_commands() {
+        let command: RelayCommand =
+            serde_json::from_str(r#"{"type":"begin_checkpoint","data":{"reason":null}}"#).unwrap();
+        assert_eq!(
+            command,
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Recovery,
+            }
+        );
+        assert_eq!(command.minimum_protocol(), RELAY_MIN_PROTOCOL_VERSION);
+        assert_eq!(
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Finish,
+            }
+            .minimum_protocol(),
+            7
+        );
+    }
+
+    #[test]
     fn controller_disconnect_cannot_leave_checkpoint_barrier_paused() {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
         submit_relay(
             &mut relay,
             "barrier-disconnect",
-            RelayCommand::BeginCheckpoint { reason: None },
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Recovery,
+            },
         );
         submit_relay(&mut relay, "queued-offline", prompt("continue"));
         assert_eq!(relay.claim_pending_commands(true).unwrap().len(), 1);
@@ -2969,7 +3179,10 @@ mod tests {
         submit_relay(
             &mut relay,
             "unready-barrier",
-            RelayCommand::BeginCheckpoint { reason: None },
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Recovery,
+            },
         );
         assert_eq!(relay.claim_pending_commands(true).unwrap().len(), 1);
         let unready = submit_release(&mut relay, "release-unready", "unready-barrier");
@@ -3119,12 +3332,18 @@ mod tests {
         submit_relay(
             &mut relay,
             "first-barrier",
-            RelayCommand::BeginCheckpoint { reason: None },
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Recovery,
+            },
         );
         submit_relay(
             &mut relay,
             "second-barrier",
-            RelayCommand::BeginCheckpoint { reason: None },
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Recovery,
+            },
         );
 
         let first = relay.claim_pending_commands(true).unwrap();
@@ -3179,7 +3398,10 @@ mod tests {
         submit_relay(
             &mut relay,
             "control-barrier",
-            RelayCommand::BeginCheckpoint { reason: None },
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Recovery,
+            },
         );
 
         let control = relay.claim_pending_commands(true).unwrap();
@@ -3299,7 +3521,10 @@ mod tests {
         submit_relay(
             &mut relay,
             "barrier-command",
-            RelayCommand::BeginCheckpoint { reason: None },
+            RelayCommand::BeginCheckpoint {
+                reason: None,
+                purpose: CheckpointPurpose::Recovery,
+            },
         );
         assert!(
             relay.claim_pending_commands(true).unwrap().is_empty(),

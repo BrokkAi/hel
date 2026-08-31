@@ -2201,6 +2201,10 @@ pub struct StandaloneSession {
 }
 
 impl StandaloneSession {
+    pub(crate) fn protocol_version(&self) -> u32 {
+        self.client.protocol_version()
+    }
+
     pub fn set_project_memory_target(&mut self, target: Option<ProjectMemorySyncTarget>) {
         self.project_memory = target;
     }

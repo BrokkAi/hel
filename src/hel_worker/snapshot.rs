@@ -24,6 +24,14 @@ use super::{
     RELAY_STATE_VERSION, RELAY_TRUNCATION_FLOOR,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointPurpose {
+    #[default]
+    Recovery,
+    Finish,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -61,6 +69,8 @@ pub enum RelayCommand {
     },
     BeginCheckpoint {
         reason: Option<String>,
+        #[serde(default)]
+        purpose: CheckpointPurpose,
     },
     CompleteCheckpoint {
         barrier_command_id: String,
@@ -88,6 +98,10 @@ pub enum RelayCommand {
 impl RelayCommand {
     pub const fn minimum_protocol(&self) -> u32 {
         match self {
+            Self::BeginCheckpoint {
+                purpose: CheckpointPurpose::Finish,
+                ..
+            } => 7,
             Self::RunUserShell { .. } | Self::CancelUserShell { .. } => 5,
             _ => super::RELAY_MIN_PROTOCOL_VERSION,
         }

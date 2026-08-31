@@ -28,7 +28,7 @@ use crate::hel_state::{
     SessionState,
 };
 use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, ProcessExecutor};
-use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
+use crate::hel_worker::{CheckpointPurpose, RelayCommand, RelayCursor, RelayExecutionState};
 
 use super::backend::backend_locator;
 use super::readiness::{connect_started_worker_with_timeout, wait_for_native_session};
@@ -662,6 +662,10 @@ impl Controller {
             id: session.bundle_id.clone(),
             primary_repository,
         };
+        let checkpoint_purpose = match exclusivity {
+            LatchExclusivity::ReleaseAfterLatch => CheckpointPurpose::Recovery,
+            LatchExclusivity::HoldThroughClose => CheckpointPurpose::Finish,
+        };
         let session_manifest = |native_session_id: &str| SessionManifest {
             id: session.id.clone(),
             title: session.title.clone(),
@@ -737,6 +741,29 @@ impl Controller {
                 &reconnect,
             )
             .await?;
+        let required_protocol = RelayCommand::BeginCheckpoint {
+            reason: None,
+            purpose: checkpoint_purpose,
+        }
+        .minimum_protocol();
+        if relay.connection_mut().protocol_version() < required_protocol {
+            tracing::info!(
+                session_id,
+                required_protocol,
+                "restarting worker to support the Finish checkpoint"
+            );
+            let connection = self
+                .restart_worker_for_checkpoint(
+                    session_id,
+                    executor,
+                    &backend,
+                    &worker_root,
+                    &reconnect,
+                )
+                .await?;
+            relay.replace_connection(connection);
+            restarted_worker = true;
+        }
         if let Some(progress) = progress {
             progress(RecoveryCheckpointPhase::Snapshotting);
         }
@@ -754,6 +781,7 @@ impl Controller {
                         barrier_command_id.clone(),
                         RelayCommand::BeginCheckpoint {
                             reason: Some("controller archive checkpoint".into()),
+                            purpose: checkpoint_purpose,
                         },
                     )
                     .await?;
@@ -2572,7 +2600,10 @@ mod tests {
         connection
             .submit(
                 barrier_command_id.clone(),
-                RelayCommand::BeginCheckpoint { reason: None },
+                RelayCommand::BeginCheckpoint {
+                    reason: None,
+                    purpose: CheckpointPurpose::Recovery,
+                },
             )
             .await
             .unwrap();
@@ -3071,7 +3102,7 @@ mod tests {
                 }],
             },
         );
-        let controller = Controller {
+        let mut controller = Controller {
             config,
             state: HelState {
                 sessions: BTreeMap::from([(LATCH_RELAY_SESSION.into(), session)]),
@@ -3170,6 +3201,30 @@ mod tests {
             "{error:#}"
         );
         assert!(checkpoint.archive_path.exists());
+
+        let finish_error = controller
+            .close_session_managed_controlled(LATCH_RELAY_SESSION, &executor, &channels.control)
+            .await
+            .expect_err("a failed Finish checkpoint must abort target cleanup");
+        assert!(
+            format!("{finish_error:#}").contains("no target is provisioned for this test"),
+            "{finish_error:#}"
+        );
+        assert!(
+            !executor.purposes().iter().any(|purpose| purpose
+                == "stop the local Hel worker and remove exact local Hel worker state"),
+            "target teardown ran after a failed Finish checkpoint: {:?}",
+            executor.purposes()
+        );
+        assert!(
+            controller.state.sessions[LATCH_RELAY_SESSION]
+                .target
+                .is_some()
+        );
+        assert_eq!(
+            controller.state.sessions[LATCH_RELAY_SESSION].state,
+            SessionState::Running
+        );
     }
     #[cfg(unix)]
     fn relay_starts(path: &Path) -> usize {

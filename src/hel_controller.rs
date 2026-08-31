@@ -56,6 +56,7 @@ use backend::validate_resource_allocation;
 use provisioning::apply_failed_new_session_rollback;
 
 pub use checkpoint::{CheckpointArtifact, reconcile_managed_checkpoint_archives};
+pub use lifecycle::{SessionFinishEffect, session_finish_effect};
 pub use recovery_scan::{RecoveryCandidate, RecoveryScan};
 pub use resume::{
     ResumeRepositorySourceMismatch, ResumeRepositorySourcePreflight, ResumeRepositorySourceReceipt,

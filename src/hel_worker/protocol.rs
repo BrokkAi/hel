@@ -216,7 +216,8 @@ impl RelayRequest {
 
     /// Oldest protocol that understands this method or command payload. Form
     /// answers landed in protocol 2, hidden context in 3, project-memory sync
-    /// in 4, user shell commands in 5, and the reviewer sidecar in 6.
+    /// in 4, user shell commands in 5, the reviewer sidecar in 6, and Finish
+    /// checkpoints in 7.
     pub const fn minimum_protocol(&self) -> u32 {
         match self {
             Self::RespondElicitation { .. } => 2,

@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::hel_session_manager::{SessionManagerControl, new_command_id};
-use crate::hel_state::{CheckpointMetadata, SessionRecord, SessionState};
+use crate::hel_state::{CheckpointMetadata, SessionRecord, SessionState, TargetLocator};
 use crate::hel_targets::{self, CommandExecutor, ProcessExecutor};
 use crate::hel_worker::{RelayCommand, RelayExecutionState};
 
@@ -17,6 +17,73 @@ use super::checkpoint::{
 use super::provisioning::retire_git_broker;
 use super::worktree::{cleanup_managed_worktree, retire_managed_worktree};
 use super::{Controller, now, persist_session_record_transition_or_restore};
+
+/// The resource-level consequence of safely finishing one live session.
+///
+/// Variants intentionally carry no locator data so the same value is safe to
+/// render in the local TUI and expose through the privacy-filtered phone view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFinishEffect {
+    StopLocalBareWorker,
+    RemoveLocalPodmanContainer,
+    RemoveAppleContainer,
+    StopRemoteBareWorker,
+    RemoveRemotePodmanContainer,
+    TerminateAwsEc2Instance,
+}
+
+impl SessionFinishEffect {
+    pub const fn consequence(self) -> &'static str {
+        match self {
+            Self::StopLocalBareWorker => {
+                "The local Hel worker will stop and Hel runtime files will be removed. The selected project directory will remain unchanged."
+            }
+            Self::RemoveLocalPodmanContainer => {
+                "The Hel session container will be removed. This computer and other containers will remain unchanged."
+            }
+            Self::RemoveAppleContainer => {
+                "The Hel session container will be removed. This computer and other containers will remain unchanged."
+            }
+            Self::StopRemoteBareWorker => {
+                "The remote Hel worker will stop and Hel runtime files will be removed. The remote host and selected project directory will remain unchanged."
+            }
+            Self::RemoveRemotePodmanContainer => {
+                "The Hel session container will be removed from the remote host. The host and other containers will remain unchanged."
+            }
+            Self::TerminateAwsEc2Instance => {
+                "The Hel-created EC2 session instance will be terminated."
+            }
+        }
+    }
+
+    pub const fn primary_action(self) -> &'static str {
+        match self {
+            Self::StopLocalBareWorker | Self::StopRemoteBareWorker => "Stop worker and save",
+            Self::RemoveLocalPodmanContainer
+            | Self::RemoveAppleContainer
+            | Self::RemoveRemotePodmanContainer => "Remove container and save",
+            Self::TerminateAwsEc2Instance => "Terminate instance and save",
+        }
+    }
+}
+
+/// Classify the exact live resource a successful finish will release.
+pub fn session_finish_effect(session: &SessionRecord) -> Result<SessionFinishEffect> {
+    Ok(
+        match session
+            .target
+            .as_ref()
+            .context("session has no live target")?
+        {
+            TargetLocator::LocalBare { .. } => SessionFinishEffect::StopLocalBareWorker,
+            TargetLocator::LocalPodman { .. } => SessionFinishEffect::RemoveLocalPodmanContainer,
+            TargetLocator::AppleContainer { .. } => SessionFinishEffect::RemoveAppleContainer,
+            TargetLocator::AwsEc2 { .. } => SessionFinishEffect::TerminateAwsEc2Instance,
+            TargetLocator::SshBare { .. } => SessionFinishEffect::StopRemoteBareWorker,
+            TargetLocator::SshPodman { .. } => SessionFinishEffect::RemoveRemotePodmanContainer,
+        },
+    )
+}
 
 impl Controller {
     /// Checkpoint, ask the harness to close, and only then tear down the exact
@@ -484,6 +551,78 @@ mod tests {
     use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, ProcessExecutor};
 
     use super::*;
+
+    #[test]
+    fn finish_effects_describe_release_without_exposing_locator_details() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let effects = [
+            (
+                TargetLocator::LocalBare {
+                    worker_root: format!("/var/lib/hel/{session_id}").into(),
+                },
+                SessionFinishEffect::StopLocalBareWorker,
+            ),
+            (
+                TargetLocator::LocalPodman {
+                    container_id: "private-local-container".into(),
+                },
+                SessionFinishEffect::RemoveLocalPodmanContainer,
+            ),
+            (
+                TargetLocator::AppleContainer {
+                    container_id: "private-apple-container".into(),
+                },
+                SessionFinishEffect::RemoveAppleContainer,
+            ),
+            (
+                TargetLocator::AwsEc2 {
+                    instance_id: "i-private".into(),
+                    address: Some("private.example.com".into()),
+                },
+                SessionFinishEffect::TerminateAwsEc2Instance,
+            ),
+            (
+                TargetLocator::SshBare {
+                    host: "private.example.com".into(),
+                    workspace: format!(".local/share/hel/workspaces/{session_id}").into(),
+                    worker_id: None,
+                },
+                SessionFinishEffect::StopRemoteBareWorker,
+            ),
+            (
+                TargetLocator::SshPodman {
+                    host: "private.example.com".into(),
+                    container_id: "private-remote-container".into(),
+                },
+                SessionFinishEffect::RemoveRemotePodmanContainer,
+            ),
+        ];
+
+        for (target, expected) in effects {
+            let mut session = checkpoint_test_session(session_id);
+            session.target = Some(target);
+            let effect = session_finish_effect(&session).unwrap();
+            assert_eq!(effect, expected);
+            let rendered = format!("{} {}", effect.consequence(), effect.primary_action());
+            assert!(!rendered.contains("private"), "{rendered}");
+        }
+
+        assert!(
+            SessionFinishEffect::StopLocalBareWorker
+                .consequence()
+                .contains("project directory")
+        );
+        assert!(
+            SessionFinishEffect::RemoveRemotePodmanContainer
+                .consequence()
+                .contains("remote host")
+        );
+        assert!(
+            SessionFinishEffect::TerminateAwsEc2Instance
+                .consequence()
+                .contains("terminated")
+        );
+    }
 
     #[test]
     fn starting_close_persists_its_intent_before_checkpointing() {
