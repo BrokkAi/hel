@@ -471,6 +471,7 @@ pub(crate) async fn run_server(
     let mut queued_prompts = projected_queued_prompts(&controller)?;
     let mut active_user_shells = std::collections::BTreeMap::new();
     let mut pending_elicitations = std::collections::BTreeMap::new();
+    let mut prompt_images = std::collections::BTreeSet::new();
     let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
         &controller,
         &phone_workspaces,
@@ -480,6 +481,7 @@ pub(crate) async fn run_server(
             queued_prompts: &queued_prompts,
             active_user_shells: &active_user_shells,
             pending_elicitations: &pending_elicitations,
+            prompt_images: &prompt_images,
         },
         revision,
     ));
@@ -583,6 +585,7 @@ pub(crate) async fn run_server(
                         queued_prompts: &queued_prompts,
                         active_user_shells: &active_user_shells,
                         pending_elicitations: &pending_elicitations,
+                        prompt_images: &prompt_images,
                     },
                     $revision,
                 )) {
@@ -683,6 +686,11 @@ pub(crate) async fn run_server(
                             update.session_id.clone(),
                             snapshot.materialized.pending_elicitations.clone(),
                         );
+                        if agent_accepts_prompt_images(&snapshot.operational) {
+                            prompt_images.insert(update.session_id.clone());
+                        } else {
+                            prompt_images.remove(&update.session_id);
+                        }
                         revision = daemon_runtime.allocate_revision();
                         conversation_tx.send_replace(conversations.clone());
                         publish_snapshot!(revision);
@@ -866,6 +874,7 @@ pub(crate) async fn run_server(
                                 queued_prompts: &queued_prompts,
                                 active_user_shells: &active_user_shells,
                                 pending_elicitations: &pending_elicitations,
+                                prompt_images: &prompt_images,
                             },
                             revision,
                         )) {
@@ -964,6 +973,9 @@ pub(crate) async fn run_server(
                             pending_elicitations.retain(|session_id, _| {
                                 controller.state.sessions.contains_key(session_id)
                             });
+                            prompt_images.retain(|session_id| {
+                                controller.state.sessions.contains_key(session_id)
+                            });
                             conversations.retain(|id, _| {
                                 controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
                             });
@@ -1017,6 +1029,16 @@ pub(crate) async fn run_server(
 /// says which feed and exits non-zero instead of reporting success.
 fn feed_stopped(shutting_down: bool, reason: &'static str) -> Option<anyhow::Error> {
     (!shutting_down).then(|| anyhow::anyhow!(reason))
+}
+
+/// Whether a session's agent said it accepts image content in prompts. An
+/// agent that has not answered `initialize` yet has advertised nothing, so the
+/// phone is not offered controls the agent may refuse.
+fn agent_accepts_prompt_images(operational: &hel::hel_worker::RelayOperationalState) -> bool {
+    operational
+        .agent_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.prompt_capabilities.image)
 }
 
 fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
@@ -1188,7 +1210,11 @@ async fn apply_phone_action(
                 })
                 .await
         }
-        ControllerAction::Prompt { session_id, text } => {
+        ControllerAction::Prompt {
+            session_id,
+            text,
+            images,
+        } => {
             services
                 .sessions
                 .wait_for_session(&session_id, Duration::from_secs(5))
@@ -1196,9 +1222,7 @@ async fn apply_phone_action(
                 .submit(
                     new_command_id("phone-prompt")?,
                     RelayCommand::Prompt {
-                        prompt: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
-                            agent_client_protocol::schema::v1::TextContent::new(text),
-                        )],
+                        prompt: phone_prompt_blocks(text, images),
                     },
                 )
                 .await?;
@@ -1301,6 +1325,28 @@ struct PhoneSessionViews<'a> {
         &'a std::collections::BTreeMap<String, Vec<hel::hel_worker::ActiveUserShell>>,
     pending_elicitations:
         &'a std::collections::BTreeMap<String, Vec<hel::hel_elicitation::ElicitationRequest>>,
+    /// Sessions whose agent advertised image support in prompts.
+    prompt_images: &'a std::collections::BTreeSet<String>,
+}
+
+/// The ACP content blocks one phone prompt becomes: its text, then each
+/// attached image as the image block the prompt path already carries.
+fn phone_prompt_blocks(
+    text: String,
+    images: Vec<hel::hel_server::ViewerPromptImage>,
+) -> Vec<agent_client_protocol::schema::v1::ContentBlock> {
+    use agent_client_protocol::schema::v1::{ContentBlock, ImageContent, TextContent};
+
+    let mut prompt = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        prompt.push(ContentBlock::Text(TextContent::new(text)));
+    }
+    prompt.extend(
+        images.into_iter().map(|image| {
+            ContentBlock::Image(ImageContent::new(image.data_base64, image.mime_type))
+        }),
+    );
+    prompt
 }
 
 fn viewer_snapshot(
@@ -1315,6 +1361,7 @@ fn viewer_snapshot(
         queued_prompts,
         active_user_shells,
         pending_elicitations,
+        prompt_images,
     } = views;
     let mut snapshot =
         ViewerSnapshot::from_config_state(&controller.config, &controller.state, revision);
@@ -1369,6 +1416,7 @@ fn viewer_snapshot(
             .get(&session.id)
             .cloned()
             .unwrap_or_default();
+        session.prompt_images_supported = prompt_images.contains(&session.id);
         if let Some(transcript) = conversations.get(&session.id) {
             session.conversation_available = true;
             let mut lines = transcript
@@ -1456,6 +1504,82 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_prompt_becomes_its_text_then_its_images() {
+        use agent_client_protocol::schema::v1::ContentBlock;
+
+        let image = |data: &str| hel::hel_server::ViewerPromptImage {
+            data_base64: data.into(),
+            mime_type: "image/png".into(),
+            width: 32,
+            height: 24,
+        };
+        let blocks = phone_prompt_blocks(
+            "look at this".into(),
+            vec![image("aW1hZ2U="), image("c2Vjb25k")],
+        );
+        let ContentBlock::Text(text) = &blocks[0] else {
+            panic!("the prompt leads with its text");
+        };
+        assert_eq!(text.text, "look at this");
+        let ContentBlock::Image(first) = &blocks[1] else {
+            panic!("each attachment travels as an image block");
+        };
+        assert_eq!(first.data, "aW1hZ2U=");
+        assert_eq!(first.mime_type, "image/png");
+        assert!(matches!(blocks[2], ContentBlock::Image(_)));
+        assert_eq!(blocks.len(), 3);
+
+        // An image needs no words with it, and an empty text block would be a
+        // message the user never wrote.
+        let images_only = phone_prompt_blocks(String::new(), vec![image("aW1hZ2U=")]);
+        assert_eq!(images_only.len(), 1);
+        assert!(matches!(images_only[0], ContentBlock::Image(_)));
+    }
+
+    #[test]
+    fn image_prompts_are_offered_only_after_the_agent_advertises_them() {
+        use agent_client_protocol::schema::v1::AgentCapabilities;
+        use hel::hel_worker::{RelayExecutionState, RelayOperationalState};
+
+        let operational = |agent_capabilities| RelayOperationalState {
+            session_id: "session-1".into(),
+            execution: RelayExecutionState::Idle,
+            latest_ordinal: 0,
+            latest_digest: String::new(),
+            acknowledged_through: 0,
+            acknowledged_digest: String::new(),
+            recovery_floor_ordinal: 0,
+            recovery_floor_digest: String::new(),
+            native_session_id: None,
+            agent_capabilities,
+            agent_info: None,
+            config_options: Vec::new(),
+            modes: None,
+            available_commands: Vec::new(),
+            config: std::collections::BTreeMap::new(),
+            active_prompt: None,
+            queued_prompts: Vec::new(),
+            active_user_shells: Vec::new(),
+            active_agent_terminals: Vec::new(),
+            checkpoint_barrier: None,
+            checkpoint_ready: None,
+            last_acp_activity_at_ms: None,
+        };
+
+        // A session whose agent has not answered `initialize` has advertised
+        // nothing, so the phone is not offered a control the agent may refuse.
+        assert!(!agent_accepts_prompt_images(&operational(None)));
+        assert!(!agent_accepts_prompt_images(&operational(Some(Box::new(
+            AgentCapabilities::default()
+        )))));
+        let mut capabilities = AgentCapabilities::default();
+        capabilities.prompt_capabilities.image = true;
+        assert!(agent_accepts_prompt_images(&operational(Some(Box::new(
+            capabilities
+        )))));
+    }
+
+    #[test]
     fn tailscale_listener_preserves_the_configured_port() {
         assert_eq!(
             tailscale_bind("127.0.0.1:4765".parse().unwrap()),
@@ -1494,6 +1618,7 @@ mod tests {
         ControllerAction::Prompt {
             session_id: "session-1".into(),
             text: "ship it".into(),
+            images: Vec::new(),
         }
     }
 
@@ -1765,6 +1890,7 @@ mod tests {
                     queued_prompts: &std::collections::BTreeMap::new(),
                     active_user_shells: &std::collections::BTreeMap::new(),
                     pending_elicitations: &std::collections::BTreeMap::new(),
+                    prompt_images: &std::collections::BTreeSet::new(),
                 },
                 1,
             )
