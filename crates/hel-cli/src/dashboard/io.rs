@@ -532,11 +532,19 @@ pub(crate) fn spawn_dashboard_rename(
 ) {
     let renamed_session_id = session_id.clone();
     let requested_title = title.clone();
+    let runtime = tokio::runtime::Handle::current();
     spawn_critical_io(
         tracker,
         format!("renaming session {}", short_id(&session_id)),
         updates,
-        move || Controller::load()?.rename_session(&renamed_session_id, &requested_title),
+        move || {
+            runtime.block_on(async {
+                daemon::connect_or_start()
+                    .await?
+                    .set_session_title(renamed_session_id, requested_title)
+                    .await
+            })
+        },
         move |result| DashboardIoUpdate::RenameSession {
             session_id,
             title,
@@ -608,19 +616,24 @@ pub(crate) fn spawn_dashboard_container_settings(
     tracker: CriticalOperationTracker,
 ) {
     let session_id = request.session_id.clone();
+    let runtime = tokio::runtime::Handle::current();
     spawn_critical_io(
         tracker,
         format!("saving container settings for {}", short_id(&session_id)),
         updates,
         move || {
-            let mut controller = Controller::load()?;
-            controller.update_session_container_settings(
-                &request.session_id,
-                request.cpus,
-                request.memory,
-                request.additional_mounts,
-                request.mount_history,
-            )?;
+            runtime.block_on(async {
+                daemon::connect_or_start()
+                    .await?
+                    .set_session_container_settings(
+                        request.session_id,
+                        request.cpus,
+                        request.memory,
+                        request.additional_mounts,
+                        request.mount_history,
+                    )
+                    .await
+            })?;
             // Return a fresh durable snapshot so the dashboard can update its
             // state without synchronously reloading the database while it is
             // applying the worker result.
@@ -643,35 +656,25 @@ pub(crate) fn spawn_detached_session_state_persist(
     tracker: CriticalOperationTracker,
 ) -> JoinHandle<()> {
     let persisted_session_id = session_id.clone();
+    let runtime = tokio::runtime::Handle::current();
     spawn_critical_io(
         tracker,
         format!("saving draft for {}", short_id(&session_id)),
         updates,
         move || {
-            let receipt = hel::hel_database::advance_client_read_frontier(
-                &client_id,
-                &workspace_id,
-                &persisted_session_id,
-                event_ordinal,
-            )
-            .and_then(|_| {
-                hel::hel_database::advance_viewed_through_event_ordinal(
-                    &persisted_session_id,
-                    event_ordinal,
-                )
+            runtime.block_on(async {
+                daemon::connect_or_start()
+                    .await?
+                    .persist_detached_session_state(
+                        client_id,
+                        workspace_id,
+                        persisted_session_id,
+                        event_ordinal,
+                        std::process::id(),
+                        draft,
+                    )
+                    .await
             })
-            .map(|_| ());
-            // Save the draft even when the receipt was rejected: losing typed
-            // text is worse than an out-of-date read marker.
-            let saved_draft = hel::hel_database::save_detached_draft(
-                &workspace_id,
-                Some(&persisted_session_id),
-                &client_id,
-                Some(std::process::id()),
-                &draft,
-            )
-            .map(|_| ());
-            receipt.and(saved_draft)
         },
         move |result| DashboardIoUpdate::DetachedSessionState { session_id, result },
     )
@@ -686,22 +689,17 @@ pub(crate) fn spawn_read_receipt_persist(
     tracker: CriticalOperationTracker,
 ) {
     let persisted_session_id = session_id.clone();
+    let runtime = tokio::runtime::Handle::current();
     spawn_critical_io(
         tracker,
         format!("saving read status for {}", short_id(&session_id)),
         updates,
         move || {
-            hel::hel_database::advance_client_read_frontier(
-                &client_id,
-                &workspace_id,
-                &persisted_session_id,
-                through,
-            )
-            .and_then(|_| {
-                hel::hel_database::advance_viewed_through_event_ordinal(
-                    &persisted_session_id,
-                    through,
-                )
+            runtime.block_on(async {
+                daemon::connect_or_start()
+                    .await?
+                    .persist_read_receipt(client_id, workspace_id, persisted_session_id, through)
+                    .await
             })
         },
         move |result| DashboardIoUpdate::ReadReceipt { session_id, result },

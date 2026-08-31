@@ -568,7 +568,7 @@ kind = "local-bare"
     def daemon_request(self, action: dict[str, object], request_id: int = 99) -> object:
         metadata = json.loads((self.data / "daemon.json").read_text())
         envelope = {
-            "protocol_version": 3,
+            "protocol_version": 4,
             "request_id": request_id,
             "token": metadata["token"],
             "action": action,

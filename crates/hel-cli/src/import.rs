@@ -362,6 +362,18 @@ fn confirm_import_safety(
 }
 
 pub(crate) fn persist_imported_session(session: &SessionRecord) -> Result<()> {
+    let session = session.clone();
+    tokio::runtime::Handle::try_current()
+        .context("import persistence requires the Hel async runtime")?
+        .block_on(async {
+            crate::daemon::connect_or_start()
+                .await?
+                .persist_imported_session(session)
+                .await
+        })
+}
+
+pub(crate) fn persist_imported_session_locally(session: &SessionRecord) -> Result<()> {
     hel::hel_database::save_session(session)?;
     let checkpoint = session
         .checkpoint

@@ -6,6 +6,118 @@ use crate::hel_state::{
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 use rusqlite::OptionalExtension;
 
+#[test]
+fn database_writer_orders_jobs_and_survives_an_operation_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let owner = start_database_writer_at(&database, false).unwrap();
+    let writer = owner.writer.clone();
+
+    writer
+        .execute("create_test_log", |connection| {
+            connection.execute_batch(
+                "CREATE TABLE writer_test_log (
+                    sequence INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                 ) STRICT;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    for (sequence, value) in [(1_i64, "first"), (2, "second"), (3, "third")] {
+        writer
+            .execute("append_test_log", move |connection| {
+                connection.execute(
+                    "INSERT INTO writer_test_log(sequence, value) VALUES (?1, ?2)",
+                    params![sequence, value],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let failure = writer
+        .execute::<(), _>("expected_failure", |connection| {
+            connection.execute("INSERT INTO missing_table VALUES (1)", [])?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(failure.to_string().contains("missing_table"));
+    let values = writer
+        .execute("read_test_log", |connection| {
+            let mut statement =
+                connection.prepare("SELECT value FROM writer_test_log ORDER BY sequence")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert_eq!(values, ["first", "second", "third"]);
+    owner.shutdown().unwrap();
+}
+
+#[test]
+fn database_writer_applies_bounded_backpressure_and_drains_accepted_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let owner = start_database_writer_at(&database, false).unwrap();
+    let writer = owner.writer.clone();
+    let (started_tx, started_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    writer
+        .sender
+        .send(DatabaseWriterMessage::Run {
+            label: "block_test_writer",
+            job: Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }),
+        })
+        .unwrap();
+    started_rx.recv().unwrap();
+
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..DATABASE_WRITE_QUEUE_CAPACITY {
+        let completed = completed.clone();
+        writer
+            .sender
+            .try_send(DatabaseWriterMessage::Run {
+                label: "queued_test_write",
+                job: Box::new(move |_| {
+                    completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }),
+            })
+            .unwrap();
+    }
+    assert!(matches!(
+        writer.sender.try_send(DatabaseWriterMessage::Run {
+            label: "queue_overflow_probe",
+            job: Box::new(|_| {}),
+        }),
+        Err(std::sync::mpsc::TrySendError::Full(_))
+    ));
+
+    release_tx.send(()).unwrap();
+    owner.shutdown().unwrap();
+    assert_eq!(
+        completed.load(std::sync::atomic::Ordering::Relaxed),
+        DATABASE_WRITE_QUEUE_CAPACITY
+    );
+}
+
+#[test]
+fn database_writer_reports_a_fatal_job_panic_without_hanging_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let owner = start_database_writer_at(&database, false).unwrap();
+    let writer = owner.writer.clone();
+
+    let operation = writer
+        .execute::<(), _>("panic_probe", |_| panic!("intentional writer panic"))
+        .unwrap_err();
+    assert!(operation.to_string().contains("writer stopped"));
+    let shutdown = owner.shutdown().unwrap_err();
+    assert!(shutdown.to_string().contains("intentional writer panic"));
+}
+
 fn event_digest(value: u64) -> String {
     format!("{value:064x}")
 }
@@ -2150,6 +2262,35 @@ fn detach_receipt_is_monotonic_and_cannot_pass_projection() {
     );
     assert_eq!(
         load_state_from(&database).unwrap().sessions["session-1"].viewed_through_event_ordinal,
+        2
+    );
+
+    let mut connection = open(&database).unwrap();
+    assert_eq!(
+        persist_read_receipt_with(
+            &mut connection,
+            "client-a",
+            DEFAULT_WORKSPACE_ID,
+            "session-1",
+            2,
+        )
+        .unwrap(),
+        2
+    );
+    assert!(
+        persist_read_receipt_with(
+            &mut connection,
+            "client-a",
+            DEFAULT_WORKSPACE_ID,
+            "session-1",
+            3,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("projection is at 2")
+    );
+    assert_eq!(
+        client_read_frontier_at(&database, "client-a", DEFAULT_WORKSPACE_ID, "session-1").unwrap(),
         2
     );
 }

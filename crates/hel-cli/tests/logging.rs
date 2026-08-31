@@ -20,8 +20,17 @@ fn top_level_failure_is_written_to_a_private_per_run_log() {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
-    assert_eq!(logs.len(), 1);
-    let contents = fs::read_to_string(&logs[0]).unwrap();
+    assert_eq!(
+        logs.len(),
+        2,
+        "checkpoint starts the database-owning daemon"
+    );
+    let (command_log, _) = logs
+        .iter()
+        .map(|path| (path, fs::read_to_string(path).unwrap()))
+        .find(|(_, contents)| contents.contains("command=\"checkpoint\""))
+        .expect("one log belongs to the checkpoint client");
+    let contents = fs::read_to_string(command_log).unwrap();
     assert!(contents.contains("Hel started"));
     assert!(contents.contains("command=\"checkpoint\""));
     assert!(contents.contains("Hel exited with an error"));
@@ -31,8 +40,10 @@ fn top_level_failure_is_written_to_a_private_per_run_log() {
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            fs::metadata(&logs[0]).unwrap().permissions().mode() & 0o777,
-            0o600
+            logs.iter()
+                .map(|path| fs::metadata(path).unwrap().permissions().mode() & 0o777)
+                .collect::<Vec<_>>(),
+            vec![0o600; logs.len()]
         );
     }
 }

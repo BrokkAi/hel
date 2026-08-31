@@ -19,8 +19,6 @@ pub(super) enum ChatRemoteOperation {
     Prompt {
         command_id: String,
         text: String,
-        session_id: String,
-        bundle_id: String,
     },
     RunShell {
         command_id: String,
@@ -43,8 +41,6 @@ pub(super) enum ChatRemoteOperation {
         control: PlanControl,
         requested_active: bool,
         prompt: Option<String>,
-        session_id: String,
-        bundle_id: String,
     },
     Cancel {
         command_id: String,
@@ -55,8 +51,6 @@ pub(super) enum ChatRemoteOperation {
         request: ElicitationRequest,
         response: ElicitationResponse,
         plan_followup: Option<PlanReviewFollowup>,
-        session_id: String,
-        bundle_id: String,
     },
 }
 
@@ -67,7 +61,6 @@ pub(super) enum ChatRemoteResult {
         text: String,
         result: std::result::Result<u64, String>,
     },
-    PromptHistoryWarning(String),
     RunShell {
         command: String,
         result: std::result::Result<u64, String>,
@@ -123,7 +116,6 @@ impl ChatRemoteResult {
                 result: Err(error), ..
             }
             | Self::WorkerFailed(error) => Some(error),
-            Self::PromptHistoryWarning(error) => Some(error),
             _ => None,
         }
     }
@@ -327,12 +319,7 @@ async fn enqueue_chat_remote_operation(
                 );
             }
         },
-        ChatRemoteOperation::Prompt {
-            command_id,
-            text,
-            session_id,
-            bundle_id,
-        } => {
+        ChatRemoteOperation::Prompt { command_id, text } => {
             let response = session
                 .enqueue_submit(
                     command_id,
@@ -368,29 +355,6 @@ async fn enqueue_chat_remote_operation(
                                 result: Ok(ordinal),
                             },
                         );
-                        let history_text = text;
-                        let history = tokio::task::spawn_blocking(move || {
-                            crate::hel_database::record_prompt(
-                                &session_id,
-                                &bundle_id,
-                                ordinal,
-                                None,
-                                &history_text,
-                            )
-                        })
-                        .await;
-                        let warning = match history {
-                            Ok(Ok(())) => None,
-                            Ok(Err(error)) => Some(format!("{error:#}")),
-                            Err(error) => Some(format!("history task failed: {error}")),
-                        };
-                        if let Some(warning) = warning {
-                            publish_chat_remote_result(
-                                &results,
-                                &attached,
-                                ChatRemoteResult::PromptHistoryWarning(warning),
-                            );
-                        }
                     });
                 }
                 Err(error) => {
@@ -540,8 +504,6 @@ async fn enqueue_chat_remote_operation(
             control,
             requested_active,
             prompt,
-            session_id,
-            bundle_id,
         } => {
             let session = session.clone();
             let results = results.clone();
@@ -580,28 +542,6 @@ async fn enqueue_chat_remote_operation(
                         .wait()
                         .await
                         .map_err(|error| format!("mode changed, but prompt failed: {error:#}"))?;
-                    let history_text = text;
-                    let history = tokio::task::spawn_blocking(move || {
-                        crate::hel_database::record_prompt(
-                            &session_id,
-                            &bundle_id,
-                            ordinal,
-                            None,
-                            &history_text,
-                        )
-                    })
-                    .await
-                    .map_err(|error| format!("history task failed: {error}"))?
-                    .map_err(|error| {
-                        format!("prompt was sent, but history was not saved: {error:#}")
-                    });
-                    if let Err(error) = history {
-                        publish_chat_remote_result(
-                            &results,
-                            &attached,
-                            ChatRemoteResult::PromptHistoryWarning(error),
-                        );
-                    }
                     Ok(Some(ordinal))
                 }
                 .await;
@@ -660,8 +600,6 @@ async fn enqueue_chat_remote_operation(
             request,
             response,
             plan_followup,
-            session_id,
-            bundle_id,
         } => {
             let session = session.clone();
             let results = results.clone();
@@ -697,7 +635,7 @@ async fn enqueue_chat_remote_operation(
                             })?;
                     }
                     if let Some(prompt) = followup.prompt {
-                        let ordinal = session
+                        session
                             .submit(
                                 format!("plan-review-{}-feedback", request.id),
                                 RelayCommand::Prompt {
@@ -712,24 +650,6 @@ async fn enqueue_chat_remote_operation(
                                     "review answered, but revision feedback was not sent: {error:#}"
                                 )
                             })?;
-                        let history = tokio::task::spawn_blocking(move || {
-                            crate::hel_database::record_prompt(
-                                &session_id,
-                                &bundle_id,
-                                ordinal,
-                                None,
-                                &prompt,
-                            )
-                        })
-                        .await
-                        .map_err(|error| format!("history task failed: {error}"))?;
-                        if let Err(error) = history {
-                            publish_chat_remote_result(
-                                &results,
-                                &attached,
-                                ChatRemoteResult::PromptHistoryWarning(format!("{error:#}")),
-                            );
-                        }
                     }
                     Ok(())
                 }
@@ -784,9 +704,6 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
         } => chat.set_notice(format!(
             "Prompt accepted by relay at {ordinal}: {}",
             queued_prompt_preview(&text)
-        )),
-        ChatRemoteResult::PromptHistoryWarning(history_error) => chat.set_notice(format!(
-            "Prompt was accepted, but history was not saved: {history_error}"
         )),
         ChatRemoteResult::Prompt {
             text,
@@ -937,8 +854,6 @@ mod tests {
             .send(ChatRemoteOperation::Prompt {
                 command_id: "prompt-1".into(),
                 text: "keep going".into(),
-                session_id: "session-replaced".into(),
-                bundle_id: "bundle-1".into(),
             })
             .await
             .unwrap();
@@ -968,8 +883,6 @@ mod tests {
             ChatRemoteOperation::Prompt {
                 command_id: "prompt-1".into(),
                 text: "unsent prompt".into(),
-                session_id: "session-1".into(),
-                bundle_id: "bundle-1".into(),
             },
             &mut chat,
         );
@@ -1023,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_acceptance_clears_sending_before_history_is_saved() {
+    fn relay_acceptance_reports_the_durable_ordinal() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         apply_chat_remote_result(
             &mut chat,
@@ -1036,16 +949,6 @@ mod tests {
             chat.notice()
                 .as_deref()
                 .is_some_and(|notice| notice.contains("accepted by relay at 42"))
-        );
-
-        apply_chat_remote_result(
-            &mut chat,
-            ChatRemoteResult::PromptHistoryWarning("database busy".into()),
-        );
-        assert!(
-            chat.notice()
-                .as_deref()
-                .is_some_and(|notice| notice.contains("accepted, but history was not saved"))
         );
     }
 

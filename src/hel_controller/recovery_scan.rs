@@ -14,7 +14,7 @@ use super::backend::{ContainerOverrides, backend_locator, backend_target};
 use super::readiness::wait_for_native_session;
 use super::{Controller, backend_ssh, now, ssh_args_with_identity};
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryCandidate {
     pub session_id: String,
     pub target_template_id: String,
@@ -22,7 +22,7 @@ pub struct RecoveryCandidate {
     pub ownership: Option<WorkerOwnership>,
 }
 
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryScan {
     pub candidates: Vec<RecoveryCandidate>,
     pub warnings: Vec<String>,

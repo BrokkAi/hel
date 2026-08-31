@@ -1598,24 +1598,34 @@ fn spawn_worker_record_persistence(
         WorkerRecordPersistence::TargetMissing { .. } => "saving missing target for",
     };
     let guard = tracker.begin(format!("{label} {}", crate::short_id(&session_id)));
-    tokio::task::spawn_blocking(move || {
-        let result = match &operation {
-            WorkerRecordPersistence::AcpTitle { title } => {
-                hel::hel_database::set_session_acp_title(&session_id, title.as_deref())
-                    .map(|()| WorkerRecordPersistenceOutcome::Saved)
-            }
-            WorkerRecordPersistence::TargetMissing {
-                session_id,
-                detail,
-                updated_at,
-            } => hel::hel_database::mark_session_target_missing(session_id, detail, updated_at)
-                .map(|state| {
-                    state.map_or(
-                        WorkerRecordPersistenceOutcome::Unchanged,
-                        WorkerRecordPersistenceOutcome::TargetMissing,
+    tokio::spawn(async move {
+        let result = async {
+            let mut daemon = daemon::connect_or_start().await?;
+            match &operation {
+                WorkerRecordPersistence::AcpTitle { title } => daemon
+                    .set_session_acp_title(session_id, title.clone())
+                    .await
+                    .map(|()| WorkerRecordPersistenceOutcome::Saved),
+                WorkerRecordPersistence::TargetMissing {
+                    session_id,
+                    detail,
+                    updated_at,
+                } => daemon
+                    .mark_session_target_missing(
+                        session_id.clone(),
+                        detail.clone(),
+                        updated_at.clone(),
                     )
-                }),
+                    .await
+                    .map(|state| {
+                        state.map_or(
+                            WorkerRecordPersistenceOutcome::Unchanged,
+                            WorkerRecordPersistenceOutcome::TargetMissing,
+                        )
+                    }),
+            }
         }
+        .await
         .map_err(|error| format!("{error:#}"));
         if let Err(error) =
             updates.send(DashboardIoUpdate::WorkerRecordPersistence { operation, result })

@@ -27,7 +27,7 @@ use hel::hel_state::{
 };
 use hel::hel_targets::{
     AdditionalMount, CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec,
-    ProvisionStage, ProvisionStageGuard,
+    ProcessExecutor, ProvisionStage, ProvisionStageGuard,
 };
 use hel::hel_worker::{RelayCommand, RelayOperationalState};
 use hel::hel_workspace::WorkspaceRecord;
@@ -41,7 +41,7 @@ use crate::pollers::{
     reserve_recovery_or_cancel, spawn_interrupted_close_recovery,
 };
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -223,6 +223,78 @@ enum DaemonAction {
     Detach {
         client_id: String,
     },
+    PersistReadReceipt {
+        client_id: String,
+        workspace_id: String,
+        session_id: String,
+        through: u64,
+    },
+    PersistDetachedSessionState {
+        client_id: String,
+        workspace_id: String,
+        session_id: String,
+        through: u64,
+        owner_pid: u32,
+        draft: String,
+    },
+    SetSessionArchived {
+        session_id: String,
+        archived: bool,
+    },
+    SetNativeSessionHidden {
+        harness: hel::hel_config::HarnessKind,
+        native_session_id: String,
+        hidden: bool,
+    },
+    SaveActiveReview {
+        session_id: String,
+        review: hel::hel_database::StoredReview,
+    },
+    ClearActiveReview {
+        session_id: String,
+    },
+    RememberReviewerSelection {
+        workspace_id: String,
+        selection: hel::hel_second_opinion::ReviewerSelection,
+    },
+    PersistImportedSession {
+        session: Box<SessionRecord>,
+    },
+    SetSessionTitle {
+        session_id: String,
+        title: String,
+    },
+    SetSessionContainerSettings {
+        session_id: String,
+        cpus: Option<String>,
+        memory: Option<String>,
+        mounts: Vec<AdditionalMount>,
+        mount_history: Vec<PathBuf>,
+    },
+    SetSessionAcpTitle {
+        session_id: String,
+        title: Option<String>,
+    },
+    MarkSessionTargetMissing {
+        session_id: String,
+        detail: String,
+        updated_at: String,
+    },
+    CheckpointSession {
+        session_id: String,
+    },
+    ScanRecovery,
+    AdoptRecovery {
+        session_id: String,
+        target_id: String,
+        profile: Option<String>,
+        bundle: Option<String>,
+    },
+    DestroyRecovery {
+        session_id: String,
+        target_id: String,
+        confirmation: String,
+    },
     Snapshot {
         workspace_id: String,
     },
@@ -310,6 +382,10 @@ enum DaemonReply {
     MaterializedSession(MaterializedSession),
     RegisteredSession(Box<RegisteredSession>),
     Ordinal(u64),
+    Text(String),
+    OptionalSessionState(Option<SessionState>),
+    Checkpoint(hel::hel_state::CheckpointMetadata),
+    RecoveryScan(hel::hel_controller::RecoveryScan),
     Reviewer(Box<hel::hel_session_manager::ReviewerOutcome>),
     Done,
 }
@@ -1461,6 +1537,271 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) async fn persist_read_receipt(
+        &mut self,
+        client_id: String,
+        workspace_id: String,
+        session_id: String,
+        through: u64,
+    ) -> Result<u64> {
+        match self
+            .request(DaemonAction::PersistReadReceipt {
+                client_id,
+                workspace_id,
+                session_id,
+                through,
+            })
+            .await?
+        {
+            DaemonReply::Ordinal(ordinal) => Ok(ordinal),
+            reply => bail!("unexpected read-receipt reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn persist_detached_session_state(
+        &mut self,
+        client_id: String,
+        workspace_id: String,
+        session_id: String,
+        through: u64,
+        owner_pid: u32,
+        draft: String,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::PersistDetachedSessionState {
+                client_id,
+                workspace_id,
+                session_id,
+                through,
+                owner_pid,
+                draft,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected detached-session-state reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn set_session_archived(
+        &mut self,
+        session_id: String,
+        archived: bool,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SetSessionArchived {
+                session_id,
+                archived,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected session-archive reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn set_native_session_hidden(
+        &mut self,
+        harness: hel::hel_config::HarnessKind,
+        native_session_id: String,
+        hidden: bool,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SetNativeSessionHidden {
+                harness,
+                native_session_id,
+                hidden,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected native-session visibility reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn save_active_review(
+        &mut self,
+        session_id: String,
+        review: hel::hel_database::StoredReview,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SaveActiveReview { session_id, review })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected save-review reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn clear_active_review(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::ClearActiveReview { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected clear-review reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn remember_reviewer_selection(
+        &mut self,
+        workspace_id: String,
+        selection: hel::hel_second_opinion::ReviewerSelection,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::RememberReviewerSelection {
+                workspace_id,
+                selection,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected reviewer-selection reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn persist_imported_session(&mut self, session: SessionRecord) -> Result<()> {
+        match self
+            .request(DaemonAction::PersistImportedSession {
+                session: Box::new(session),
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected imported-session reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn set_session_title(
+        &mut self,
+        session_id: String,
+        title: String,
+    ) -> Result<String> {
+        match self
+            .request(DaemonAction::SetSessionTitle { session_id, title })
+            .await?
+        {
+            DaemonReply::Text(title) => Ok(title),
+            reply => bail!("unexpected session-title reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn set_session_container_settings(
+        &mut self,
+        session_id: String,
+        cpus: Option<String>,
+        memory: Option<String>,
+        mounts: Vec<AdditionalMount>,
+        mount_history: Vec<PathBuf>,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SetSessionContainerSettings {
+                session_id,
+                cpus,
+                memory,
+                mounts,
+                mount_history,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected container-settings reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn set_session_acp_title(
+        &mut self,
+        session_id: String,
+        title: Option<String>,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SetSessionAcpTitle { session_id, title })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected ACP-title reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn mark_session_target_missing(
+        &mut self,
+        session_id: String,
+        detail: String,
+        updated_at: String,
+    ) -> Result<Option<SessionState>> {
+        match self
+            .request(DaemonAction::MarkSessionTargetMissing {
+                session_id,
+                detail,
+                updated_at,
+            })
+            .await?
+        {
+            DaemonReply::OptionalSessionState(state) => Ok(state),
+            reply => bail!("unexpected target-missing reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn checkpoint_session(
+        &mut self,
+        session_id: String,
+    ) -> Result<hel::hel_state::CheckpointMetadata> {
+        match self
+            .request(DaemonAction::CheckpointSession { session_id })
+            .await?
+        {
+            DaemonReply::Checkpoint(checkpoint) => Ok(checkpoint),
+            reply => bail!("unexpected checkpoint reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn scan_recovery(&mut self) -> Result<hel::hel_controller::RecoveryScan> {
+        match self.request(DaemonAction::ScanRecovery).await? {
+            DaemonReply::RecoveryScan(scan) => Ok(scan),
+            reply => bail!("unexpected recovery-scan reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn adopt_recovery(
+        &mut self,
+        session_id: String,
+        target_id: String,
+        profile: Option<String>,
+        bundle: Option<String>,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::AdoptRecovery {
+                session_id,
+                target_id,
+                profile,
+                bundle,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected recovery-adopt reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn destroy_recovery(
+        &mut self,
+        session_id: String,
+        target_id: String,
+        confirmation: String,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::DestroyRecovery {
+                session_id,
+                target_id,
+                confirmation,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected recovery-destroy reply {reply:?}"),
+        }
+    }
+
     pub(crate) async fn snapshot(&mut self, workspace_id: String) -> Result<WorkspaceSnapshot> {
         match self
             .request(DaemonAction::Snapshot { workspace_id })
@@ -1768,7 +2109,8 @@ pub(crate) fn maintain_attachment(
 }
 
 pub(crate) async fn run_daemon_process() -> Result<()> {
-    let _guard = ControllerStoreGuard::acquire()?;
+    let guard = ControllerStoreGuard::acquire()?;
+    let database_writer = guard.start_database_writer()?;
     Controller::recover_config_id_rename()?;
     HelConfig::migrate_legacy_localhost_target()?;
     let config = HelConfig::load()?;
@@ -1929,6 +2271,9 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
     {
         tracing::warn!(%error, "could not remove daemon metadata");
     }
+    tokio::task::spawn_blocking(move || database_writer.shutdown())
+        .await
+        .context("database writer shutdown task panicked")??;
     Ok(())
 }
 
@@ -2285,6 +2630,191 @@ async fn handle_action(
             state.attachments().remove(&client_id);
             Ok(DaemonReply::Done)
         }
+        DaemonAction::PersistReadReceipt {
+            client_id,
+            workspace_id,
+            session_id,
+            through,
+        } => {
+            let frontier = blocking(move || {
+                hel::hel_database::persist_read_receipt(
+                    &client_id,
+                    &workspace_id,
+                    &session_id,
+                    through,
+                )
+            })
+            .await?;
+            Ok(DaemonReply::Ordinal(frontier))
+        }
+        DaemonAction::PersistDetachedSessionState {
+            client_id,
+            workspace_id,
+            session_id,
+            through,
+            owner_pid,
+            draft,
+        } => {
+            blocking(move || {
+                let receipt = hel::hel_database::persist_read_receipt(
+                    &client_id,
+                    &workspace_id,
+                    &session_id,
+                    through,
+                )
+                .map(|_| ());
+                // Draft durability is independent of receipt validity. A
+                // stale or malformed receipt must never discard typed text.
+                let saved_draft = hel::hel_database::save_detached_draft(
+                    &workspace_id,
+                    Some(&session_id),
+                    &client_id,
+                    Some(owner_pid),
+                    &draft,
+                )
+                .map(|_| ());
+                receipt.and(saved_draft)
+            })
+            .await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::SetSessionArchived {
+            session_id,
+            archived,
+        } => {
+            blocking(move || hel::hel_database::set_session_archived(&session_id, archived))
+                .await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::SetNativeSessionHidden {
+            harness,
+            native_session_id,
+            hidden,
+        } => {
+            blocking(move || {
+                hel::hel_database::set_native_session_hidden(harness, &native_session_id, hidden)
+            })
+            .await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::SaveActiveReview { session_id, review } => {
+            blocking(move || hel::hel_database::save_active_review(&session_id, &review)).await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::ClearActiveReview { session_id } => {
+            blocking(move || hel::hel_database::clear_active_review(&session_id)).await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::RememberReviewerSelection {
+            workspace_id,
+            selection,
+        } => {
+            blocking(move || {
+                hel::hel_database::remember_reviewer_selection(&workspace_id, &selection)
+            })
+            .await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::PersistImportedSession { session } => {
+            blocking(move || crate::import::persist_imported_session_locally(&session)).await?;
+            refresh_runtime_controller(state).await;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::SetSessionTitle { session_id, title } => {
+            let title =
+                blocking(move || Controller::load()?.rename_session(&session_id, &title)).await?;
+            refresh_runtime_controller(state).await;
+            Ok(DaemonReply::Text(title))
+        }
+        DaemonAction::SetSessionContainerSettings {
+            session_id,
+            cpus,
+            memory,
+            mounts,
+            mount_history,
+        } => {
+            blocking(move || {
+                Controller::load()?.update_session_container_settings(
+                    &session_id,
+                    cpus,
+                    memory,
+                    mounts,
+                    mount_history,
+                )
+            })
+            .await?;
+            refresh_runtime_controller(state).await;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::SetSessionAcpTitle { session_id, title } => {
+            blocking(move || {
+                hel::hel_database::set_session_acp_title(&session_id, title.as_deref())
+            })
+            .await?;
+            refresh_runtime_controller(state).await;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::MarkSessionTargetMissing {
+            session_id,
+            detail,
+            updated_at,
+        } => {
+            let changed = blocking(move || {
+                hel::hel_database::mark_session_target_missing(&session_id, &detail, &updated_at)
+            })
+            .await?;
+            refresh_runtime_controller(state).await;
+            Ok(DaemonReply::OptionalSessionState(changed))
+        }
+        DaemonAction::CheckpointSession { session_id } => {
+            ensure_no_active_lifecycle(state)?;
+            let mut controller = blocking(Controller::load).await?;
+            let checkpoint = controller.checkpoint_session(&session_id).await?;
+            refresh_runtime_controller(state).await;
+            Ok(DaemonReply::Checkpoint(checkpoint))
+        }
+        DaemonAction::ScanRecovery => {
+            let scan =
+                blocking(|| Ok(Controller::load()?.scan_orphan_workers(&ProcessExecutor))).await?;
+            Ok(DaemonReply::RecoveryScan(scan))
+        }
+        DaemonAction::AdoptRecovery {
+            session_id,
+            target_id,
+            profile,
+            bundle,
+        } => {
+            ensure_no_active_lifecycle(state)?;
+            let mut controller = blocking(Controller::load).await?;
+            controller
+                .adopt_orphan_worker(
+                    &session_id,
+                    &target_id,
+                    profile.as_deref(),
+                    bundle.as_deref(),
+                    &ProcessExecutor,
+                )
+                .await?;
+            refresh_runtime_controller(state).await;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::DestroyRecovery {
+            session_id,
+            target_id,
+            confirmation,
+        } => {
+            ensure_no_active_lifecycle(state)?;
+            blocking(move || {
+                Controller::load()?.destroy_orphan_worker(
+                    &session_id,
+                    &target_id,
+                    &confirmation,
+                    &ProcessExecutor,
+                )
+            })
+            .await?;
+            Ok(DaemonReply::Done)
+        }
         DaemonAction::Snapshot { workspace_id } => {
             let snapshot = blocking(move || workspace_snapshot(&workspace_id)).await?;
             Ok(DaemonReply::Snapshot(snapshot))
@@ -2326,10 +2856,38 @@ async fn handle_action(
             command_id,
             command,
         } => {
+            let history = if let RelayCommand::Prompt { prompt } = &command {
+                let values = serde_json::to_value(prompt)?;
+                let values = values
+                    .as_array()
+                    .context("serialized prompt content is not an array")?;
+                let text = hel::hel_chat::materialized_content_text(values);
+                let bundle_id = state
+                    .controller
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .state
+                    .sessions
+                    .get(&session_id)
+                    .with_context(|| format!("unknown session {session_id}"))?
+                    .bundle_id
+                    .clone();
+                Some((bundle_id, text))
+            } else {
+                None
+            };
             let session = state.session_manager.session(session_id).await?;
-            Ok(DaemonReply::Ordinal(
-                session.submit(command_id, command).await?,
-            ))
+            let session_id = session.session_id().to_owned();
+            let ordinal = session.submit(command_id, command).await?;
+            if let Some((bundle_id, text)) = history
+                && let Err(error) = blocking(move || {
+                    hel::hel_database::record_prompt(&session_id, &bundle_id, ordinal, None, &text)
+                })
+                .await
+            {
+                tracing::warn!(%error, "prompt was accepted but its history could not be stored");
+            }
+            Ok(DaemonReply::Ordinal(ordinal))
         }
         DaemonAction::ReviewerAction { session_id, action } => {
             let session = state.session_manager.session(session_id).await?;
@@ -2585,6 +3143,56 @@ mod tests {
         let response: ResponseEnvelope = read_frame(&mut stream).await.unwrap();
         assert_eq!(response.request_id, 42);
         assert_eq!(response.result.unwrap_err(), "daemon authentication failed");
+        drop(stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn protocol_four_rejects_a_version_three_client_before_dispatch() {
+        assert_eq!(PROTOCOL_VERSION, 4);
+        let state = test_runtime_state();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let metadata = DaemonMetadata {
+            protocol_version: PROTOCOL_VERSION,
+            pid: 1,
+            address,
+            token: "right-token".into(),
+            started_at: "now".into(),
+            build_version: "test".into(),
+        };
+        let server_metadata = metadata.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(stream, server_metadata, state, CancellationToken::new())
+                .await
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        write_frame(
+            &mut stream,
+            &RequestEnvelope {
+                protocol_version: 3,
+                request_id: 43,
+                token: metadata.token,
+                action: DaemonAction::PersistReadReceipt {
+                    client_id: "client-a".into(),
+                    workspace_id: "workspace-a".into(),
+                    session_id: "session-a".into(),
+                    through: 7,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let response: ResponseEnvelope = read_frame(&mut stream).await.unwrap();
+        assert_eq!(response.request_id, 43);
+        assert!(
+            response
+                .result
+                .unwrap_err()
+                .contains("incompatible daemon protocol 3; expected 4")
+        );
         drop(stream);
         server.await.unwrap();
     }

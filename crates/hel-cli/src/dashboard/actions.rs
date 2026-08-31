@@ -173,13 +173,21 @@ pub(crate) async fn apply_dashboard_action(
         } => {
             let what = format!("session {}", short_id(&session_id));
             let id = session_id.clone();
+            let runtime = tokio::runtime::Handle::current();
             spawn_archive_write(
                 what,
                 ArchiveWriteTarget::Session {
                     session_id: session_id.clone(),
                     archived: !archived,
                 },
-                move || hel::hel_database::set_session_archived(&id, archived),
+                move || {
+                    runtime.block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .set_session_archived(id, archived)
+                            .await
+                    })
+                },
                 context.dashboard_io_tx.clone(),
                 context.critical_operations.clone(),
             );
@@ -195,15 +203,17 @@ pub(crate) async fn apply_dashboard_action(
             hidden,
         } => {
             let what = format!("native session {}", short_id(&native_session_id));
+            let runtime = tokio::runtime::Handle::current();
             spawn_archive_write(
                 what,
                 ArchiveWriteTarget::HiddenNativeSessions,
                 move || {
-                    hel::hel_database::set_native_session_hidden(
-                        harness_kind,
-                        &native_session_id,
-                        hidden,
-                    )
+                    runtime.block_on(async {
+                        daemon::connect_or_start()
+                            .await?
+                            .set_native_session_hidden(harness_kind, native_session_id, hidden)
+                            .await
+                    })
                 },
                 context.dashboard_io_tx.clone(),
                 context.critical_operations.clone(),

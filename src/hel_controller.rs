@@ -109,6 +109,12 @@ impl ControllerStoreGuard {
         }
         Ok(Self { file })
     }
+
+    /// Start the sole production SQLite writer after controller exclusivity
+    /// has been established by this guard.
+    pub fn start_database_writer(&self) -> Result<crate::hel_database::DatabaseWriterOwner> {
+        crate::hel_database::start_database_writer()
+    }
 }
 
 impl Drop for ControllerStoreGuard {

@@ -487,12 +487,6 @@ pub(super) fn retain_workspace_sessions(
     for session in controller.state.sessions.values_mut() {
         let frontier =
             hel::hel_database::client_read_frontier(client_id, workspace_id, &session.id)?;
-        hel::hel_database::advance_client_read_frontier(
-            client_id,
-            workspace_id,
-            &session.id,
-            frontier,
-        )?;
         session.viewed_through_event_ordinal = frontier;
     }
     Ok(())
@@ -1410,6 +1404,36 @@ impl DashboardContext {
         let session_id = session_id.to_owned();
         let bundle_id = session_record.bundle_id.clone();
         let draft = session_record.draft_input.clone();
+        let (persistence_tx, mut persistence_rx) =
+            tokio::sync::mpsc::unbounded_channel::<hel::hel_chat::ChatPersistenceRequest>();
+        tokio::spawn(async move {
+            while let Some(request) = persistence_rx.recv().await {
+                let result = async {
+                    let mut daemon = crate::daemon::connect_or_start().await?;
+                    match request {
+                        hel::hel_chat::ChatPersistenceRequest::SaveReview {
+                            session_id,
+                            review,
+                        } => daemon.save_active_review(session_id, review).await,
+                        hel::hel_chat::ChatPersistenceRequest::ClearReview { session_id } => {
+                            daemon.clear_active_review(session_id).await
+                        }
+                        hel::hel_chat::ChatPersistenceRequest::RememberReviewerSelection {
+                            workspace_id,
+                            selection,
+                        } => {
+                            daemon
+                                .remember_reviewer_selection(workspace_id, selection)
+                                .await
+                        }
+                    }
+                }
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(%error, "could not persist chat state through the daemon");
+                }
+            }
+        });
         self.opening_chat_session = Some(session_id.clone());
         self.dashboard.set_current_session(Some(&session_id));
         self.dashboard.set_notice("Opening session…");
@@ -1418,8 +1442,15 @@ impl DashboardContext {
                 .session(session_id.clone())
                 .await
                 .map(|managed| {
-                    hel::hel_chat::ActiveChat::open(
-                        managed, &bundle_id, None, sessions, header, draft, notices,
+                    hel::hel_chat::ActiveChat::open_with_persistence(
+                        managed,
+                        &bundle_id,
+                        None,
+                        sessions,
+                        header,
+                        draft,
+                        notices,
+                        Some(persistence_tx),
                     )
                 })
                 .map_err(|error| format!("{error:#}"));

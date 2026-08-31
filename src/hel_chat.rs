@@ -73,7 +73,7 @@ use transcript::{
 
 const MOUSE_SCROLL_ROWS: usize = 3;
 
-pub use active::ActiveChat;
+pub use active::{ActiveChat, ChatPersistenceRequest};
 pub use second_opinion::SecondOpinionIntent as SecondOpinionRequest;
 pub use transcript::{
     BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, format_event_time,

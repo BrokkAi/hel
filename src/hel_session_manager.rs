@@ -2563,46 +2563,45 @@ impl StandaloneSession {
                     let mut projection = projection;
                     let mut projection_index = ProjectionIndex::new(&projection);
                     let mut credential_sync_signal = None;
-                    apply_projection_page(&session_id, |committed| {
-                        for event in &events {
-                            let mutation =
-                                project_relay_event_indexed(&projection, &projection_index, event)?
-                                    .mutation;
-                            match committed.apply(
-                                event.ordinal,
-                                &event.previous_digest,
-                                &event.digest,
-                                &mutation,
-                            )? {
-                                ProjectionApplyOutcome::Applied => {
-                                    // The mutation commits with the page, so
-                                    // hand its values to the projection rather
-                                    // than copying them again.
-                                    apply_committed_projection_event_indexed(
-                                        &mut projection,
-                                        &mut projection_index,
-                                        event,
-                                        mutation,
-                                    )?;
-                                    if let Some(reason) = relay_event_credential_sync_reason(event)
-                                    {
-                                        credential_sync_signal = Some(CredentialSyncSignal {
-                                            ordinal: event.ordinal,
-                                            reason,
-                                        });
-                                    }
-                                }
+                    let mut prepared = Vec::with_capacity(events.len());
+                    for event in &events {
+                        let mutation =
+                            project_relay_event_indexed(&projection, &projection_index, event)?
+                                .mutation;
+                        prepared.push((
+                            event.ordinal,
+                            event.previous_digest.clone(),
+                            event.digest.clone(),
+                            mutation.clone(),
+                        ));
+                        apply_committed_projection_event_indexed(
+                            &mut projection,
+                            &mut projection_index,
+                            event,
+                            mutation,
+                        )?;
+                        if let Some(reason) = relay_event_credential_sync_reason(event) {
+                            credential_sync_signal = Some(CredentialSyncSignal {
+                                ordinal: event.ordinal,
+                                reason,
+                            });
+                        }
+                    }
+                    drop(projection_index);
+                    apply_projection_page(&session_id, move |committed| {
+                        for (ordinal, previous_digest, digest, mutation) in prepared {
+                            match committed.apply(ordinal, &previous_digest, &digest, &mutation)? {
+                                ProjectionApplyOutcome::Applied => {}
                                 ProjectionApplyOutcome::AlreadyApplied => {
                                     return Err(ProjectionAdvancedError {
-                                        event_ordinal: event.ordinal,
+                                        event_ordinal: ordinal,
                                     }
                                     .into());
                                 }
                             }
                         }
-                        Ok(())
-                    })?;
-                    Ok((projection, credential_sync_signal))
+                        Ok((projection, credential_sync_signal))
+                    })
                 },
             )
             .await

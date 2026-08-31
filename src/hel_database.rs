@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -84,9 +87,225 @@ pub struct MaterializedSessionMutation {
 mod schema;
 
 pub use schema::database_path;
-use schema::open;
 #[cfg(test)]
 use schema::{forget_verified_schema, table_has_column};
+use schema::{open, open_reader};
+
+const DATABASE_WRITE_QUEUE_CAPACITY: usize = 256;
+static DATABASE_WRITER_REQUIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+type DatabaseWriteJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+
+enum DatabaseWriterMessage {
+    Run {
+        label: &'static str,
+        job: DatabaseWriteJob,
+    },
+    Shutdown,
+}
+
+/// Cloneable submission handle for the daemon's ordered SQLite write lane.
+///
+/// Calling [`DatabaseWriter::execute`] is synchronous and may apply bounded
+/// backpressure, so async and UI callers must invoke database mutations from
+/// their existing supervised blocking tasks.
+#[derive(Clone)]
+pub struct DatabaseWriter {
+    id: u64,
+    sender: SyncSender<DatabaseWriterMessage>,
+}
+
+impl std::fmt::Debug for DatabaseWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DatabaseWriter")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DatabaseWriter {
+    fn execute<T, F>(&self, label: &'static str, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        self.sender
+            .send(DatabaseWriterMessage::Run {
+                label,
+                job: Box::new(move |connection| {
+                    let _ = reply_tx.send(operation(connection));
+                }),
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("submit database writer operation {label}: writer stopped")
+            })?;
+        reply_rx
+            .recv()
+            .with_context(|| format!("database writer stopped during {label}"))?
+    }
+}
+
+/// Owns the daemon's writer thread and persistent SQLite connection.
+///
+/// The owner is deliberately not cloneable. Dropping it removes the global
+/// submission handle, drains accepted work in FIFO order, and joins the
+/// thread before releasing the connection.
+pub struct DatabaseWriterOwner {
+    writer: DatabaseWriter,
+    thread: Option<JoinHandle<()>>,
+    stopped: Receiver<Result<()>>,
+}
+
+impl std::fmt::Debug for DatabaseWriterOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DatabaseWriterOwner")
+            .field("writer", &self.writer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DatabaseWriterOwner {
+    pub fn shutdown(mut self) -> Result<()> {
+        self.shutdown_inner()
+    }
+
+    fn shutdown_inner(&mut self) -> Result<()> {
+        if self.thread.is_none() {
+            return Ok(());
+        }
+        clear_database_writer(self.writer.id);
+        let send_result = self.writer.sender.send(DatabaseWriterMessage::Shutdown);
+        let worker_result = self
+            .stopped
+            .recv()
+            .context("database writer stopped without reporting its result")?;
+        let join_result = self
+            .thread
+            .take()
+            .expect("database writer thread checked above")
+            .join();
+        if let Err(panic) = join_result {
+            std::panic::resume_unwind(panic);
+        }
+        match (send_result, worker_result) {
+            (_, Err(error)) => Err(error),
+            (Err(_), Ok(())) => bail!("request database writer shutdown: writer stopped"),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+}
+
+impl Drop for DatabaseWriterOwner {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown_inner() {
+            tracing::error!(%error, "database writer did not shut down cleanly");
+        }
+    }
+}
+
+fn database_writer_slot() -> &'static Mutex<Option<DatabaseWriter>> {
+    static WRITER: OnceLock<Mutex<Option<DatabaseWriter>>> = OnceLock::new();
+    WRITER.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_database_writer(id: u64) {
+    let mut installed = database_writer_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if installed.as_ref().is_some_and(|writer| writer.id == id) {
+        *installed = None;
+    }
+}
+
+pub(crate) fn start_database_writer() -> Result<DatabaseWriterOwner> {
+    start_database_writer_at(&database_path(), true)
+}
+
+fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<DatabaseWriterOwner> {
+    static NEXT_WRITER_ID: AtomicU64 = AtomicU64::new(1);
+
+    let connection = schema::open_writer(path)?;
+    let (sender, receiver) = sync_channel(DATABASE_WRITE_QUEUE_CAPACITY);
+    let (stopped_tx, stopped) = sync_channel(1);
+    let id = NEXT_WRITER_ID.fetch_add(1, Ordering::Relaxed);
+    let writer = DatabaseWriter { id, sender };
+    if install_globally {
+        let mut installed = database_writer_slot()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ensure!(installed.is_none(), "database writer is already running");
+        *installed = Some(writer.clone());
+        DATABASE_WRITER_REQUIRED.store(true, Ordering::Release);
+    }
+    let thread = match thread::Builder::new()
+        .name("hel-database-writer".to_owned())
+        .spawn(move || {
+            let mut connection = connection;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                loop {
+                    match receiver.recv() {
+                        Ok(DatabaseWriterMessage::Run { label, job }) => {
+                            tracing::trace!(operation = label, "running database writer operation");
+                            job(&mut connection);
+                        }
+                        Ok(DatabaseWriterMessage::Shutdown) => break Ok(()),
+                        Err(error) => {
+                            break Err(error).context("database writer queue disconnected");
+                        }
+                    }
+                }
+            }))
+            .unwrap_or_else(|panic| {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic payload");
+                Err(anyhow::anyhow!("database writer thread panicked: {detail}"))
+            });
+            clear_database_writer(id);
+            let _ = stopped_tx.send(result);
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            if install_globally {
+                clear_database_writer(id);
+            }
+            return Err(error).context("spawn database writer thread");
+        }
+    };
+    Ok(DatabaseWriterOwner {
+        writer,
+        thread: Some(thread),
+        stopped,
+    })
+}
+
+fn submit_database_write<T, F>(label: &'static str, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+{
+    let writer = database_writer_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    if let Some(writer) = writer {
+        writer.execute(label, operation)
+    } else if DATABASE_WRITER_REQUIRED.load(Ordering::Acquire) {
+        bail!("database writer is not available for operation {label}")
+    } else {
+        // Unit tests and isolated library tools use temporary databases
+        // without starting the production daemon. Production callers install
+        // the writer immediately after acquiring ControllerStoreGuard.
+        let mut connection = schema::open_writer(&database_path())?;
+        operation(&mut connection)
+    }
+}
 
 pub fn load_state() -> Result<HelState> {
     load_state_from(&database_path())
@@ -97,7 +316,7 @@ pub fn list_workspaces() -> Result<Vec<WorkspaceRecord>> {
 }
 
 pub fn list_workspaces_from(path: &Path) -> Result<Vec<WorkspaceRecord>> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let mut statement = connection.prepare(
         "SELECT w.workspace_id, w.name, w.created_at, w.last_opened_at,
                 count(c.session_id)
@@ -120,7 +339,10 @@ pub fn list_workspaces_from(path: &Path) -> Result<Vec<WorkspaceRecord>> {
 }
 
 pub fn create_workspace(name: &str) -> Result<WorkspaceRecord> {
-    create_workspace_at(&database_path(), name)
+    let name = name.to_owned();
+    submit_database_write("create_workspace", move |_| {
+        create_workspace_at(&database_path(), &name)
+    })
 }
 
 /// Create the named workspace, or return the concurrently-created winner.
@@ -130,7 +352,10 @@ pub fn create_workspace(name: &str) -> Result<WorkspaceRecord> {
 /// name legitimately. Explicit database creation remains strict through
 /// [`create_workspace`].
 pub fn create_or_get_workspace(name: &str) -> Result<WorkspaceRecord> {
-    create_or_get_workspace_at(&database_path(), name)
+    let name = name.to_owned();
+    submit_database_write("create_or_get_workspace", move |_| {
+        create_or_get_workspace_at(&database_path(), &name)
+    })
 }
 
 pub fn create_or_get_workspace_at(path: &Path, name: &str) -> Result<WorkspaceRecord> {
@@ -191,7 +416,11 @@ pub fn create_workspace_at(path: &Path, name: &str) -> Result<WorkspaceRecord> {
 }
 
 pub fn rename_workspace(workspace_id: &str, name: &str) -> Result<()> {
-    rename_workspace_at(&database_path(), workspace_id, name)
+    let workspace_id = workspace_id.to_owned();
+    let name = name.to_owned();
+    submit_database_write("rename_workspace", move |_| {
+        rename_workspace_at(&database_path(), &workspace_id, &name)
+    })
 }
 
 pub fn rename_workspace_at(path: &Path, workspace_id: &str, name: &str) -> Result<()> {
@@ -208,7 +437,10 @@ pub fn rename_workspace_at(path: &Path, workspace_id: &str, name: &str) -> Resul
 }
 
 pub fn touch_workspace(workspace_id: &str) -> Result<()> {
-    touch_workspace_at(&database_path(), workspace_id)
+    let workspace_id = workspace_id.to_owned();
+    submit_database_write("touch_workspace", move |_| {
+        touch_workspace_at(&database_path(), &workspace_id)
+    })
 }
 
 pub fn touch_workspace_at(path: &Path, workspace_id: &str) -> Result<()> {
@@ -223,7 +455,10 @@ pub fn touch_workspace_at(path: &Path, workspace_id: &str) -> Result<()> {
 }
 
 pub fn delete_empty_workspace(workspace_id: &str) -> Result<()> {
-    delete_empty_workspace_at(&database_path(), workspace_id)
+    let workspace_id = workspace_id.to_owned();
+    submit_database_write("delete_empty_workspace", move |_| {
+        delete_empty_workspace_at(&database_path(), &workspace_id)
+    })
 }
 
 pub fn delete_empty_workspace_at(path: &Path, workspace_id: &str) -> Result<()> {
@@ -257,7 +492,7 @@ pub fn workspace_for_session(session_id: &str) -> Result<Option<String>> {
 }
 
 pub fn workspace_for_session_at(path: &Path, session_id: &str) -> Result<Option<String>> {
-    open(path)?
+    open_reader(path)?
         .query_row(
             "SELECT workspace_id FROM session_contexts WHERE session_id = ?1",
             [session_id],
@@ -272,7 +507,7 @@ pub fn session_ids_for_workspace(workspace_id: &str) -> Result<Vec<String>> {
 }
 
 pub fn session_ids_for_workspace_at(path: &Path, workspace_id: &str) -> Result<Vec<String>> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let mut statement = connection.prepare(
         "SELECT c.session_id
            FROM session_contexts c
@@ -287,7 +522,11 @@ pub fn session_ids_for_workspace_at(path: &Path, workspace_id: &str) -> Result<V
 /// Assign a newly-created session context to a workspace. Existing contexts
 /// are immutable: moving sessions is deliberately outside the v1 model.
 pub fn assign_new_session_workspace(session_id: &str, workspace_id: &str) -> Result<()> {
-    assign_new_session_workspace_at(&database_path(), session_id, workspace_id)
+    let session_id = session_id.to_owned();
+    let workspace_id = workspace_id.to_owned();
+    submit_database_write("assign_new_session_workspace", move |_| {
+        assign_new_session_workspace_at(&database_path(), &session_id, &workspace_id)
+    })
 }
 
 pub fn assign_new_session_workspace_at(
@@ -333,7 +572,7 @@ fn client_read_frontier_at(
     workspace_id: &str,
     session_id: &str,
 ) -> Result<u64> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let client: Option<u64> = connection
         .query_row(
             "SELECT through_event_ordinal
@@ -363,13 +602,96 @@ pub fn advance_client_read_frontier(
     session_id: &str,
     through: u64,
 ) -> Result<u64> {
-    advance_client_read_frontier_at(
-        &database_path(),
-        client_id,
-        workspace_id,
-        session_id,
-        through,
-    )
+    let client_id = client_id.to_owned();
+    let workspace_id = workspace_id.to_owned();
+    let session_id = session_id.to_owned();
+    submit_database_write("advance_client_read_frontier", move |_| {
+        advance_client_read_frontier_at(
+            &database_path(),
+            &client_id,
+            &workspace_id,
+            &session_id,
+            through,
+        )
+    })
+}
+
+/// Atomically advance both the per-client and legacy session read frontiers.
+/// Neither value changes when validation or persistence fails.
+pub fn persist_read_receipt(
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+    through: u64,
+) -> Result<u64> {
+    let client_id = client_id.to_owned();
+    let workspace_id = workspace_id.to_owned();
+    let session_id = session_id.to_owned();
+    submit_database_write("persist_read_receipt", move |connection| {
+        persist_read_receipt_with(connection, &client_id, &workspace_id, &session_id, through)
+    })
+}
+
+fn persist_read_receipt_with(
+    connection: &mut Connection,
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+    through: u64,
+) -> Result<u64> {
+    ensure!(!client_id.trim().is_empty(), "client id is empty");
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let applied = transaction
+        .query_row(
+            "SELECT applied_event_ordinal FROM materialized_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?
+        .with_context(|| format!("unknown session {session_id}"))?;
+    ensure!(
+        through <= applied,
+        "cannot acknowledge event ordinal {through} for session {session_id}; projection is at {applied}"
+    );
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let changed = transaction.execute(
+        "INSERT INTO client_read_frontiers(
+             client_id, workspace_id, session_id, through_event_ordinal, updated_at
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE EXISTS(
+              SELECT 1 FROM session_contexts
+               WHERE session_id = ?3 AND workspace_id = ?2
+          )
+         ON CONFLICT(client_id, workspace_id, session_id) DO UPDATE SET
+             through_event_ordinal = max(
+                 client_read_frontiers.through_event_ordinal,
+                 excluded.through_event_ordinal
+             ),
+             updated_at = excluded.updated_at",
+        params![client_id, workspace_id, session_id, through, now],
+    )?;
+    ensure!(
+        changed == 1,
+        "session {session_id:?} is not in workspace {workspace_id:?}"
+    );
+    let changed = transaction.execute(
+        "UPDATE sessions
+         SET viewed_through_event_ordinal = max(viewed_through_event_ordinal, ?2)
+         WHERE session_id = ?1",
+        params![session_id, through],
+    )?;
+    ensure!(changed == 1, "unknown session {session_id}");
+    let frontier = transaction.query_row(
+        "SELECT through_event_ordinal
+           FROM client_read_frontiers
+          WHERE client_id = ?1 AND workspace_id = ?2 AND session_id = ?3",
+        params![client_id, workspace_id, session_id],
+        |row| row.get(0),
+    )?;
+    transaction.commit()?;
+    Ok(frontier)
 }
 
 fn advance_client_read_frontier_at(
@@ -413,14 +735,20 @@ pub fn save_detached_draft(
     owner_pid: Option<u32>,
     text: &str,
 ) -> Result<Option<String>> {
-    save_detached_draft_at(
-        &database_path(),
-        workspace_id,
-        session_id,
-        source,
-        owner_pid,
-        text,
-    )
+    let workspace_id = workspace_id.to_owned();
+    let session_id = session_id.map(str::to_owned);
+    let source = source.to_owned();
+    let text = text.to_owned();
+    submit_database_write("save_detached_draft", move |_| {
+        save_detached_draft_at(
+            &database_path(),
+            &workspace_id,
+            session_id.as_deref(),
+            &source,
+            owner_pid,
+            &text,
+        )
+    })
 }
 
 fn save_detached_draft_at(
@@ -460,7 +788,7 @@ pub fn list_detached_drafts(workspace_id: &str) -> Result<Vec<DetachedDraft>> {
 }
 
 fn list_detached_drafts_at(path: &Path, workspace_id: &str) -> Result<Vec<DetachedDraft>> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let mut statement = connection.prepare(
         "SELECT draft_id, workspace_id, session_id, source, owner_pid, saved_at, text,
                 recovered_at
@@ -484,7 +812,14 @@ fn list_detached_drafts_at(path: &Path, workspace_id: &str) -> Result<Vec<Detach
 }
 
 pub fn mark_draft_recovered(draft_id: &str) -> Result<()> {
-    let connection = open(&database_path())?;
+    let draft_id = draft_id.to_owned();
+    submit_database_write("mark_draft_recovered", move |_| {
+        mark_draft_recovered_at(&database_path(), &draft_id)
+    })
+}
+
+fn mark_draft_recovered_at(path: &Path, draft_id: &str) -> Result<()> {
+    let connection = open(path)?;
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let changed = connection.execute(
         "UPDATE detached_drafts SET recovered_at = ?2
@@ -503,7 +838,14 @@ pub fn mark_draft_recovered(draft_id: &str) -> Result<()> {
 /// session field, and the transaction marks the source draft recovered at the
 /// same durable boundary.
 pub fn recover_detached_draft(draft_id: &str) -> Result<String> {
-    let mut connection = open(&database_path())?;
+    let draft_id = draft_id.to_owned();
+    submit_database_write("recover_detached_draft", move |_| {
+        recover_detached_draft_at(&database_path(), &draft_id)
+    })
+}
+
+fn recover_detached_draft_at(path: &Path, draft_id: &str) -> Result<String> {
+    let mut connection = open(path)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (session_id, text): (Option<String>, String) = tx
         .query_row(
@@ -529,7 +871,7 @@ pub fn recover_detached_draft(draft_id: &str) -> Result<String> {
 }
 
 pub fn load_state_from(path: &Path) -> Result<HelState> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let mut state = HelState::default();
     let mut statement = connection.prepare(
         "SELECT s.session_id, s.title, s.harness_kind, s.last_profile, c.bundle_id,
@@ -640,14 +982,20 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
 }
 
 pub fn save_state(state: &HelState) -> Result<()> {
-    save_state_to(&database_path(), state)
+    let state = state.clone();
+    submit_database_write("save_state", move |_| {
+        save_state_to(&database_path(), &state)
+    })
 }
 
 /// Persist one operational session without rewriting unrelated controller
 /// state. Dashboard lifecycle jobs use this path so independent jobs can
 /// commit concurrently without restoring stale copies of other sessions.
 pub fn save_session(session: &SessionRecord) -> Result<()> {
-    save_session_to(&database_path(), session)
+    let session = session.clone();
+    submit_database_write("save_session", move |_| {
+        save_session_to(&database_path(), &session)
+    })
 }
 
 /// Persist a session and the container size it most recently launched on its
@@ -657,33 +1005,51 @@ pub fn save_session_with_container_size(
     host: &str,
     size: HostContainerSize,
 ) -> Result<()> {
-    save_session_with_container_size_to(&database_path(), session, Some((host, size)))
+    let session = session.clone();
+    let host = host.to_owned();
+    submit_database_write("save_session_with_container_size", move |_| {
+        save_session_with_container_size_to(&database_path(), &session, Some((&host, size)))
+    })
 }
 
 /// Update only the fields a lifecycle transition owns on a session that
 /// already exists. Everything else — display titles, checkpoints, container
 /// settings, and attached directories — stays with its own writer.
 pub fn save_lifecycle_session(session: &SessionRecord) -> Result<()> {
-    save_lifecycle_session_to(&database_path(), session)
+    let session = session.clone();
+    submit_database_write("save_lifecycle_session", move |_| {
+        save_lifecycle_session_to(&database_path(), &session)
+    })
 }
 
 /// Install a lifecycle transition together with the checkpoint it just
 /// verified and the harness session id that produced it.
 pub fn save_checkpointed_session(session: &SessionRecord) -> Result<()> {
-    save_checkpointed_session_to(&database_path(), session)
+    let session = session.clone();
+    submit_database_write("save_checkpointed_session", move |_| {
+        save_checkpointed_session_to(&database_path(), &session)
+    })
 }
 
 /// Recover lifecycle rows stranded by a process exit during checkpoint
 /// creation. This must be called once by the top-level controller process
 /// while it owns the controller-store guard, not by per-operation reloads.
 pub fn recover_interrupted_checkpointing_sessions(updated_at: &str) -> Result<usize> {
-    recover_interrupted_checkpointing_sessions_to(&database_path(), updated_at)
+    let updated_at = updated_at.to_owned();
+    submit_database_write("recover_interrupted_checkpointing_sessions", move |_| {
+        recover_interrupted_checkpointing_sessions_to(&database_path(), &updated_at)
+    })
 }
 
 /// Change only the user-owned display name. This avoids writing a stale
 /// SessionRecord over independently committed checkpoint or relay metadata.
 pub fn set_session_title_override(session_id: &str, title: &str, updated_at: &str) -> Result<()> {
-    set_session_title_override_to(&database_path(), session_id, title, updated_at)
+    let session_id = session_id.to_owned();
+    let title = title.to_owned();
+    let updated_at = updated_at.to_owned();
+    submit_database_write("set_session_title_override", move |_| {
+        set_session_title_override_to(&database_path(), &session_id, &title, &updated_at)
+    })
 }
 
 /// Rewrite a configured profile id in every persisted session in one SQLite
@@ -699,12 +1065,25 @@ pub fn rename_target_references(old_id: &str, new_id: &str) -> Result<usize> {
     rename_session_reference("target_template_id", old_id, new_id)
 }
 
-fn rename_session_reference(column: &str, old_id: &str, new_id: &str) -> Result<usize> {
+fn rename_session_reference(column: &'static str, old_id: &str, new_id: &str) -> Result<usize> {
     ensure!(
         matches!(column, "last_profile" | "target_template_id"),
         "unsupported session reference column"
     );
-    let mut connection = open(&database_path())?;
+    let old_id = old_id.to_owned();
+    let new_id = new_id.to_owned();
+    submit_database_write("rename_session_reference", move |_| {
+        rename_session_reference_at(&database_path(), column, &old_id, &new_id)
+    })
+}
+
+fn rename_session_reference_at(
+    path: &Path,
+    column: &str,
+    old_id: &str,
+    new_id: &str,
+) -> Result<usize> {
+    let mut connection = open(path)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let changed = tx.execute(
         &format!("UPDATE sessions SET {column} = ?2 WHERE {column} = ?1"),
@@ -718,7 +1097,10 @@ fn rename_session_reference(column: &str, old_id: &str, new_id: &str) -> Result<
 /// display choice, so it has its own writer and never rewrites lifecycle,
 /// checkpoint, or title columns another task owns.
 pub fn set_session_archived(session_id: &str, archived: bool) -> Result<()> {
-    set_session_archived_to(&database_path(), session_id, archived)
+    let session_id = session_id.to_owned();
+    submit_database_write("set_session_archived", move |_| {
+        set_session_archived_to(&database_path(), &session_id, archived)
+    })
 }
 
 /// Record that the managed target of an otherwise live session is definitively
@@ -730,7 +1112,12 @@ pub fn mark_session_target_missing(
     detail: &str,
     updated_at: &str,
 ) -> Result<Option<SessionState>> {
-    mark_session_target_missing_to(&database_path(), session_id, detail, updated_at)
+    let session_id = session_id.to_owned();
+    let detail = detail.to_owned();
+    let updated_at = updated_at.to_owned();
+    submit_database_write("mark_session_target_missing", move |_| {
+        mark_session_target_missing_to(&database_path(), &session_id, &detail, &updated_at)
+    })
 }
 
 fn mark_session_target_missing_to(
@@ -792,7 +1179,7 @@ pub fn hidden_native_sessions() -> Result<BTreeSet<(crate::hel_config::HarnessKi
 fn hidden_native_sessions_from(
     path: &Path,
 ) -> Result<BTreeSet<(crate::hel_config::HarnessKind, String)>> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let mut statement =
         connection.prepare("SELECT harness_kind, native_session_id FROM hidden_native_sessions")?;
     let rows = statement.query_map([], |row| {
@@ -815,7 +1202,10 @@ pub fn set_native_session_hidden(
     native_session_id: &str,
     hidden: bool,
 ) -> Result<()> {
-    set_native_session_hidden_to(&database_path(), harness, native_session_id, hidden)
+    let native_session_id = native_session_id.to_owned();
+    submit_database_write("set_native_session_hidden", move |_| {
+        set_native_session_hidden_to(&database_path(), harness, &native_session_id, hidden)
+    })
 }
 
 fn set_native_session_hidden_to(
@@ -855,14 +1245,21 @@ pub fn set_session_container_settings(
     mounts: &[AdditionalMount],
     updated_at: &str,
 ) -> Result<()> {
-    set_session_container_settings_to(
-        &database_path(),
-        session_id,
-        cpus,
-        memory,
-        mounts,
-        updated_at,
-    )
+    let session_id = session_id.to_owned();
+    let cpus = cpus.map(str::to_owned);
+    let memory = memory.map(str::to_owned);
+    let mounts = mounts.to_vec();
+    let updated_at = updated_at.to_owned();
+    submit_database_write("set_session_container_settings", move |_| {
+        set_session_container_settings_to(
+            &database_path(),
+            &session_id,
+            cpus.as_deref(),
+            memory.as_deref(),
+            &mounts,
+            &updated_at,
+        )
+    })
 }
 
 fn set_session_container_settings_to(
@@ -937,7 +1334,11 @@ fn set_session_title_override_to(
 /// Persist the latest ACP-provided title without replacing unrelated session
 /// fields that may have changed in another supervised controller task.
 pub fn set_session_acp_title(session_id: &str, title: Option<&str>) -> Result<()> {
-    set_session_acp_title_to(&database_path(), session_id, title)
+    let session_id = session_id.to_owned();
+    let title = title.map(str::to_owned);
+    submit_database_write("set_session_acp_title", move |_| {
+        set_session_acp_title_to(&database_path(), &session_id, title.as_deref())
+    })
 }
 
 fn set_session_acp_title_to(path: &Path, session_id: &str, title: Option<&str>) -> Result<()> {
@@ -963,10 +1364,29 @@ pub fn mark_session_worker_connected(
     native_session_id: Option<&str>,
     updated_at: &str,
 ) -> Result<()> {
+    let session_id = session_id.to_owned();
+    let native_session_id = native_session_id.map(str::to_owned);
+    let updated_at = updated_at.to_owned();
+    submit_database_write("mark_session_worker_connected", move |_| {
+        mark_session_worker_connected_to(
+            &database_path(),
+            &session_id,
+            native_session_id.as_deref(),
+            &updated_at,
+        )
+    })
+}
+
+fn mark_session_worker_connected_to(
+    path: &Path,
+    session_id: &str,
+    native_session_id: Option<&str>,
+    updated_at: &str,
+) -> Result<()> {
     if updated_at.trim().is_empty() {
         bail!("worker connection timestamp is empty");
     }
-    let connection = open(&database_path())?;
+    let connection = open(path)?;
     let changed = connection.execute(
         "UPDATE sessions
          SET state = 'running',
@@ -1073,7 +1493,14 @@ fn validate_session_record(session: &SessionRecord) -> Result<()> {
 /// Remove one operational session while retaining its relational history
 /// context and prompt history.
 pub fn delete_session(session_id: &str) -> Result<()> {
-    let connection = open(&database_path())?;
+    let session_id = session_id.to_owned();
+    submit_database_write("delete_session", move |_| {
+        delete_session_from(&database_path(), &session_id)
+    })
+}
+
+fn delete_session_from(path: &Path, session_id: &str) -> Result<()> {
+    let connection = open(path)?;
     connection.execute("DELETE FROM sessions WHERE session_id = ?1", [session_id])?;
     Ok(())
 }
@@ -1095,7 +1522,7 @@ fn load_materialized_session_summary_from(
     path: &Path,
     session_id: &str,
 ) -> Result<Option<MaterializedSessionSummary>> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let row = connection
         .query_row(
             "SELECT applied_event_ordinal, last_activity_at_ms, execution_state,
@@ -1276,7 +1703,7 @@ fn materialized_event_frontier_from(
     path: &Path,
     session_id: &str,
 ) -> Result<Option<(u64, String)>> {
-    Ok(open(path)?
+    Ok(open_reader(path)?
         .query_row(
             "SELECT applied_event_ordinal, applied_event_digest
              FROM materialized_sessions WHERE session_id = ?1",
@@ -1293,7 +1720,11 @@ pub fn replace_materialized_queued_prompts(
     session_id: &str,
     queued_prompts: &[MaterializedQueuedPrompt],
 ) -> Result<()> {
-    replace_materialized_queued_prompts_in(&database_path(), session_id, queued_prompts)
+    let session_id = session_id.to_owned();
+    let queued_prompts = queued_prompts.to_vec();
+    submit_database_write("replace_materialized_queued_prompts", move |_| {
+        replace_materialized_queued_prompts_in(&database_path(), &session_id, &queued_prompts)
+    })
 }
 
 fn replace_materialized_queued_prompts_in(
@@ -1322,7 +1753,7 @@ pub fn load_materialized_queued_prompts() -> Result<BTreeMap<String, Vec<Materia
 fn load_materialized_queued_prompts_from(
     path: &Path,
 ) -> Result<BTreeMap<String, Vec<MaterializedQueuedPrompt>>> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let mut statement = connection.prepare(
         "SELECT session_id, command_id, kind_json, content_json, queued_at_ms
          FROM materialized_queued_prompts
@@ -1363,7 +1794,7 @@ fn load_materialized_session_from(
     path: &Path,
     session_id: &str,
 ) -> Result<Option<MaterializedSession>> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     load_materialized_session_with(&connection, session_id)
 }
 
@@ -1506,7 +1937,10 @@ fn load_materialized_session_with(
 /// checkpoint. Operational `SessionRecord` metadata and read receipts are not
 /// modified.
 pub fn save_materialized_session(materialized: &MaterializedSession) -> Result<()> {
-    save_materialized_session_to(&database_path(), materialized)
+    let materialized = materialized.clone();
+    submit_database_write("save_materialized_session", move |_| {
+        save_materialized_session_to(&database_path(), &materialized)
+    })
 }
 
 fn save_materialized_session_to(path: &Path, materialized: &MaterializedSession) -> Result<()> {
@@ -1747,17 +2181,32 @@ impl ProjectionPage<'_> {
 /// acknowledge the page's last ordinal to the relay after this returns.
 pub fn apply_projection_page<T>(
     session_id: &str,
-    fill: impl FnOnce(&mut ProjectionPage<'_>) -> Result<T>,
-) -> Result<T> {
-    apply_projection_page_to(&database_path(), session_id, fill)
+    fill: impl FnOnce(&mut ProjectionPage<'_>) -> Result<T> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    let session_id = session_id.to_owned();
+    submit_database_write("apply_projection_page", move |connection| {
+        apply_projection_page_with(connection, &session_id, fill)
+    })
 }
 
+#[cfg(test)]
 fn apply_projection_page_to<T>(
     path: &Path,
     session_id: &str,
     fill: impl FnOnce(&mut ProjectionPage<'_>) -> Result<T>,
 ) -> Result<T> {
     let mut connection = open(path)?;
+    apply_projection_page_with(&mut connection, session_id, fill)
+}
+
+fn apply_projection_page_with<T>(
+    connection: &mut Connection,
+    session_id: &str,
+    fill: impl FnOnce(&mut ProjectionPage<'_>) -> Result<T>,
+) -> Result<T> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (applied_ordinal, applied_digest) = transaction
@@ -1799,16 +2248,23 @@ pub fn apply_projection_event(
     event_digest: &str,
     mutation: &MaterializedSessionMutation,
 ) -> Result<ProjectionApplyOutcome> {
-    apply_projection_event_to(
-        &database_path(),
-        session_id,
-        event_ordinal,
-        previous_event_digest,
-        event_digest,
-        mutation,
-    )
+    let session_id = session_id.to_owned();
+    let previous_event_digest = previous_event_digest.to_owned();
+    let event_digest = event_digest.to_owned();
+    let mutation = mutation.clone();
+    submit_database_write("apply_projection_event", move |connection| {
+        apply_projection_page_with(connection, &session_id, |page| {
+            page.apply(
+                event_ordinal,
+                &previous_event_digest,
+                &event_digest,
+                &mutation,
+            )
+        })
+    })
 }
 
+#[cfg(test)]
 fn apply_projection_event_to(
     path: &Path,
     session_id: &str,
@@ -1825,7 +2281,10 @@ fn apply_projection_event_to(
 /// Advance the persisted detach/read receipt monotonically. A receipt cannot
 /// acknowledge an event the controller projection has not durably applied.
 pub fn advance_viewed_through_event_ordinal(session_id: &str, through: u64) -> Result<u64> {
-    advance_viewed_through_event_ordinal_to(&database_path(), session_id, through)
+    let session_id = session_id.to_owned();
+    submit_database_write("advance_viewed_through_event_ordinal", move |_| {
+        advance_viewed_through_event_ordinal_to(&database_path(), &session_id, through)
+    })
 }
 
 fn advance_viewed_through_event_ordinal_to(
@@ -1867,7 +2326,11 @@ fn advance_viewed_through_event_ordinal_to(
 /// receipt this is not monotonic: a draft can shrink, and an empty string
 /// clears it.
 pub fn set_session_draft_input(session_id: &str, draft: &str) -> Result<()> {
-    set_session_draft_input_at(&database_path(), session_id, draft)
+    let session_id = session_id.to_owned();
+    let draft = draft.to_owned();
+    submit_database_write("set_session_draft_input", move |_| {
+        set_session_draft_input_at(&database_path(), &session_id, &draft)
+    })
 }
 
 fn set_session_draft_input_at(path: &Path, session_id: &str, draft: &str) -> Result<()> {
@@ -1887,11 +2350,14 @@ pub fn remember_mount_sources(host: &str, mounts: &[AdditionalMount]) -> Result<
     if mounts.is_empty() {
         return Ok(());
     }
-    remember_sources(
-        &database_path(),
-        host,
-        mounts.iter().map(|mount| mount.source.clone()),
-    )
+    let host = host.to_owned();
+    let sources = mounts
+        .iter()
+        .map(|mount| mount.source.clone())
+        .collect::<Vec<_>>();
+    submit_database_write("remember_mount_sources", move |_| {
+        remember_sources(&database_path(), &host, sources)
+    })
 }
 
 /// Replace one host's remembered mount sources with exactly this list, so the
@@ -1907,7 +2373,7 @@ pub fn reviewer_defaults() -> Result<crate::hel_second_opinion::ReviewerDefaults
 }
 
 fn reviewer_defaults_in(path: &Path) -> Result<crate::hel_second_opinion::ReviewerDefaults> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let mut statement = connection.prepare(
         "SELECT workspace_id, profile_id, model, effort FROM second_opinion_defaults
          ORDER BY workspace_id, profile_id, model",
@@ -1929,7 +2395,11 @@ pub fn remember_reviewer_selection(
     workspace_id: &str,
     selection: &crate::hel_second_opinion::ReviewerSelection,
 ) -> Result<()> {
-    remember_reviewer_selection_in(&database_path(), workspace_id, selection)
+    let workspace_id = workspace_id.to_owned();
+    let selection = selection.clone();
+    submit_database_write("remember_reviewer_selection", move |_| {
+        remember_reviewer_selection_in(&database_path(), &workspace_id, &selection)
+    })
 }
 
 fn remember_reviewer_selection_in(
@@ -1961,7 +2431,7 @@ fn remember_reviewer_selection_in(
 }
 
 /// A second-opinion review that was still open when the UI last stopped.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredReview {
     pub workflow: crate::hel_second_opinion::ReviewWorkflow,
     /// Reviewer lifetime this review belongs to. It is bumped when native
@@ -1984,7 +2454,7 @@ pub fn active_review(session_id: &str) -> Result<Option<StoredReview>> {
 }
 
 fn active_review_in(path: &Path, session_id: &str) -> Result<Option<StoredReview>> {
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let row = connection
         .query_row(
             "SELECT workflow, generation, context_baseline, native_lost, reviewer_transcript
@@ -2016,7 +2486,11 @@ fn active_review_in(path: &Path, session_id: &str) -> Result<Option<StoredReview
 
 /// Records the open review, replacing any earlier one for this session.
 pub fn save_active_review(session_id: &str, review: &StoredReview) -> Result<()> {
-    save_active_review_in(&database_path(), session_id, review)
+    let session_id = session_id.to_owned();
+    let review = review.clone();
+    submit_database_write("save_active_review", move |_| {
+        save_active_review_in(&database_path(), &session_id, &review)
+    })
 }
 
 fn save_active_review_in(path: &Path, session_id: &str, review: &StoredReview) -> Result<()> {
@@ -2046,7 +2520,10 @@ fn save_active_review_in(path: &Path, session_id: &str, review: &StoredReview) -
 
 /// Forgets the open review once it has finished.
 pub fn clear_active_review(session_id: &str) -> Result<()> {
-    clear_active_review_in(&database_path(), session_id)
+    let session_id = session_id.to_owned();
+    submit_database_write("clear_active_review", move |_| {
+        clear_active_review_in(&database_path(), &session_id)
+    })
 }
 
 fn clear_active_review_in(path: &Path, session_id: &str) -> Result<()> {
@@ -2065,7 +2542,10 @@ fn clear_active_review_in(path: &Path, session_id: &str) -> Result<()> {
 /// materialized transcript is kept for reference, but the next review is a new
 /// conversation, so it runs under a new generation.
 pub fn lose_reviewer_continuity(session_id: &str) -> Result<u64> {
-    lose_reviewer_continuity_in(&database_path(), session_id)
+    let session_id = session_id.to_owned();
+    submit_database_write("lose_reviewer_continuity", move |_| {
+        lose_reviewer_continuity_in(&database_path(), &session_id)
+    })
 }
 
 fn lose_reviewer_continuity_in(path: &Path, session_id: &str) -> Result<u64> {
@@ -2082,7 +2562,11 @@ fn lose_reviewer_continuity_in(path: &Path, session_id: &str) -> Result<u64> {
 }
 
 pub fn replace_mount_history(host: &str, sources: &[PathBuf]) -> Result<()> {
-    replace_mount_history_in(&database_path(), host, sources)
+    let host = host.to_owned();
+    let sources = sources.to_vec();
+    submit_database_write("replace_mount_history", move |_| {
+        replace_mount_history_in(&database_path(), &host, &sources)
+    })
 }
 
 fn replace_mount_history_in(path: &Path, host: &str, sources: &[PathBuf]) -> Result<()> {
@@ -2132,11 +2616,11 @@ fn write_host_container_size(
 }
 
 pub fn remember_project_directory(host: &str, directory: &Path) -> Result<()> {
-    remember_sources(
-        &database_path(),
-        &format!("project:{host}"),
-        std::iter::once(directory.to_path_buf()),
-    )
+    let host = format!("project:{host}");
+    let directory = directory.to_path_buf();
+    submit_database_write("remember_project_directory", move |_| {
+        remember_sources(&database_path(), &host, std::iter::once(directory))
+    })
 }
 
 fn remember_sources(
@@ -2169,7 +2653,17 @@ pub fn record_recovery_success(
     native_session_id: &str,
     checkpoint: &CheckpointMetadata,
 ) -> Result<()> {
-    record_recovery_success_to(&database_path(), session_id, native_session_id, checkpoint)
+    let session_id = session_id.to_owned();
+    let native_session_id = native_session_id.to_owned();
+    let checkpoint = checkpoint.clone();
+    submit_database_write("record_recovery_success", move |_| {
+        record_recovery_success_to(
+            &database_path(),
+            &session_id,
+            &native_session_id,
+            &checkpoint,
+        )
+    })
 }
 
 fn record_recovery_success_to(
@@ -2211,7 +2705,15 @@ fn record_recovery_success_to(
 }
 
 pub fn record_recovery_failure(session_id: &str, detail: &str) -> Result<()> {
-    let connection = open(&database_path())?;
+    let session_id = session_id.to_owned();
+    let detail = detail.to_owned();
+    submit_database_write("record_recovery_failure", move |_| {
+        record_recovery_failure_to(&database_path(), &session_id, &detail)
+    })
+}
+
+fn record_recovery_failure_to(path: &Path, session_id: &str, detail: &str) -> Result<()> {
+    let connection = open(path)?;
     let changed = connection.execute(
         "UPDATE sessions SET last_checkpoint_error = ?2 WHERE session_id = ?1",
         params![session_id, detail],
@@ -2859,7 +3361,11 @@ fn load_checkpoints(connection: &Connection, state: &mut HelState) -> Result<()>
 /// representations: the project is the same, so its history follows it, and
 /// only the name Hel files it under changes.
 pub fn rebind_session_bundle(session_id: &str, bundle_id: &str) -> Result<()> {
-    rebind_session_bundle_to(&database_path(), session_id, bundle_id)
+    let session_id = session_id.to_owned();
+    let bundle_id = bundle_id.to_owned();
+    submit_database_write("rebind_session_bundle", move |_| {
+        rebind_session_bundle_to(&database_path(), &session_id, &bundle_id)
+    })
 }
 
 fn rebind_session_bundle_to(path: &Path, session_id: &str, bundle_id: &str) -> Result<()> {
@@ -2886,14 +3392,20 @@ pub fn record_prompt(
     submitted_at: Option<&str>,
     text: &str,
 ) -> Result<()> {
-    record_prompt_to(
-        &database_path(),
-        session_id,
-        bundle_id,
-        event_ordinal,
-        submitted_at,
-        text,
-    )
+    let session_id = session_id.to_owned();
+    let bundle_id = bundle_id.to_owned();
+    let submitted_at = submitted_at.map(str::to_owned);
+    let text = text.to_owned();
+    submit_database_write("record_prompt", move |_| {
+        record_prompt_to(
+            &database_path(),
+            &session_id,
+            &bundle_id,
+            event_ordinal,
+            submitted_at.as_deref(),
+            &text,
+        )
+    })
 }
 
 fn record_prompt_to(
@@ -2956,7 +3468,7 @@ fn search_prompts_from(
     query: &str,
 ) -> Result<Vec<PromptHistoryEntry>> {
     const PAGE_SIZE: usize = 256;
-    let connection = open(path)?;
+    let connection = open_reader(path)?;
     let query = query.to_lowercase();
     let mut seen = std::collections::HashSet::new();
     let mut matches = Vec::new();

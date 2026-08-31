@@ -1,10 +1,11 @@
 use super::*;
+use rusqlite::OpenFlags;
 
 pub fn database_path() -> PathBuf {
     data_dir().join("hel.sqlite3")
 }
 
-pub(super) fn open(path: &Path) -> Result<Connection> {
+pub(super) fn open_writer(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create Hel data directory {}", parent.display()))?;
@@ -18,6 +19,46 @@ pub(super) fn open(path: &Path) -> Result<Connection> {
          PRAGMA synchronous = FULL;",
     )?;
     verify_schema_once(path, &connection)?;
+    Ok(connection)
+}
+
+pub(super) fn open(path: &Path) -> Result<Connection> {
+    open_writer(path)
+}
+
+/// Open an existing database without permitting schema or data mutation.
+/// Client processes use this path so an accidental write fails locally
+/// instead of competing with the daemon's writer.
+#[cfg(not(test))]
+pub(super) fn open_reader(path: &Path) -> Result<Connection> {
+    open_reader_strict(path)
+}
+
+#[cfg(test)]
+pub(super) fn open_reader(path: &Path) -> Result<Connection> {
+    // Path-taking database helpers are migration fixtures in unit tests: they
+    // intentionally open old or not-yet-created schemas. Production query
+    // entry points compile against the strict reader above.
+    open_writer(path)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn open_reader_strict(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open Hel database read-only {}", path.display()))?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA query_only = ON;",
+    )?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    ensure!(
+        version == SCHEMA_VERSION,
+        "Hel database schema {version} is not the supported schema {SCHEMA_VERSION}; start the Hel daemon to migrate it"
+    );
     Ok(connection)
 }
 
@@ -956,4 +997,28 @@ fn ensure_projection_digest_column(connection: &Connection) -> Result<()> {
         ))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    #[test]
+    fn strict_reader_rejects_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hel.sqlite3");
+        drop(open_writer(&path).unwrap());
+
+        let reader = open_reader_strict(&path).unwrap();
+        let error = reader
+            .execute("CREATE TABLE forbidden(value TEXT)", [])
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ReadOnly)
+            ),
+            "unexpected mutation error: {error}"
+        );
+    }
 }

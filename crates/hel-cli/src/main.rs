@@ -37,6 +37,7 @@ use hel::hel_controller::Controller;
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
 use hel::hel_state::{SessionState, TargetLocator};
+#[cfg(test)]
 use hel::hel_targets::ProcessExecutor;
 use hel::hel_worker_runtime::{
     AcpSupervisorSpec, WorkerLaunchConfig, lead_process_group, proxy, run_acp_supervisor,
@@ -451,8 +452,10 @@ async fn run_command(
         }
         Some(Command::Recover(args)) => recover(args).await.map(|()| DashboardExit::Normal),
         Some(Command::Checkpoint(args)) => {
-            let mut controller = Controller::load()?;
-            let checkpoint = controller.checkpoint_session(&args.session).await?;
+            let checkpoint = daemon::connect_or_start()
+                .await?
+                .checkpoint_session(args.session.clone())
+                .await?;
             println!(
                 "saved recovery copy for {} at event {}",
                 args.session, checkpoint.event_frontier
@@ -738,10 +741,10 @@ fn resolve_login_profile(config: &HelConfig, requested: Option<&str>) -> Result<
 }
 
 async fn recover(args: RecoverArgs) -> Result<()> {
-    let mut controller = Controller::load()?;
+    let mut daemon = daemon::connect_or_start().await?;
     match args.command {
         RecoverCommand::Scan { json } => {
-            let scan = controller.scan_orphan_workers(&ProcessExecutor);
+            let scan = daemon.scan_recovery().await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&scan)?);
             } else {
@@ -768,14 +771,8 @@ async fn recover(args: RecoverArgs) -> Result<()> {
             profile,
             bundle,
         } => {
-            controller
-                .adopt_orphan_worker(
-                    &session,
-                    &target,
-                    profile.as_deref(),
-                    bundle.as_deref(),
-                    &ProcessExecutor,
-                )
+            daemon
+                .adopt_recovery(session.clone(), target, profile, bundle)
                 .await?;
             println!("adopted worker {session}");
             Ok(())
@@ -785,7 +782,9 @@ async fn recover(args: RecoverArgs) -> Result<()> {
             target,
             confirm,
         } => {
-            controller.destroy_orphan_worker(&session, &target, &confirm, &ProcessExecutor)?;
+            daemon
+                .destroy_recovery(session.clone(), target, confirm)
+                .await?;
             println!("destroyed orphan worker resource {session}");
             Ok(())
         }

@@ -726,18 +726,12 @@ pub(crate) async fn run_server(
                             let persisted_session_id = session_id.clone();
                             tokio::spawn(async move {
                                 let joined = tokio::task::spawn_blocking(move || {
-                                    hel::hel_database::advance_client_read_frontier(
+                                    hel::hel_database::persist_read_receipt(
                                         &client_id,
                                         &workspace_id,
                                         &persisted_session_id,
                                         through,
                                     )
-                                    .and_then(|_| {
-                                        hel::hel_database::advance_viewed_through_event_ordinal(
-                                            &persisted_session_id,
-                                            through,
-                                        )
-                                    })
                                 })
                                 .await;
                                 let result = match joined {

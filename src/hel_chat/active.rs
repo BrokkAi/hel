@@ -44,6 +44,22 @@ use super::{
     ChatAction, ChatEventOutcome, ChatRegions, ChatState, MOUSE_SCROLL_ROWS, Notices,
     SessionHeaderIdentity, queued_prompt_preview,
 };
+
+/// Durable chat-side state that a host process must ask the daemon to store.
+#[derive(Debug, Clone)]
+pub enum ChatPersistenceRequest {
+    SaveReview {
+        session_id: String,
+        review: crate::hel_database::StoredReview,
+    },
+    ClearReview {
+        session_id: String,
+    },
+    RememberReviewerSelection {
+        workspace_id: String,
+        selection: crate::hel_second_opinion::ReviewerSelection,
+    },
+}
 use crate::hel_second_opinion::{
     ReviewWorkflow, ReviewerDefaults, ReviewerProfileChoice, ReviewerSelection, ReviewerSetup,
     SetupRequest, WorkflowRequest,
@@ -337,7 +353,6 @@ pub struct ActiveChat {
     state: ChatState,
     session: ManagedSessionHandle,
     session_manager: SessionManagerControl,
-    bundle_id: String,
     recovery: Option<RecoveryContext>,
     remote: ChatRemoteSupervisor,
     /// Held so the receiver never reports the feed closed, and so spawned
@@ -367,6 +382,7 @@ pub struct ActiveChat {
     /// workspace has already chosen a reviewer. It short-circuits the
     /// waterfall: the choice is only asked again when this fails.
     resuming_reviewer: Option<ReviewerSelection>,
+    persistence: Option<tokio::sync::mpsc::UnboundedSender<ChatPersistenceRequest>>,
 }
 
 impl ActiveChat {
@@ -393,6 +409,23 @@ impl ActiveChat {
         header: SessionHeaderIdentity,
         draft: String,
         notices: Notices,
+    ) -> Self {
+        Self::open_with_persistence(
+            session, bundle_id, recovery, control, header, draft, notices, None,
+        )
+    }
+
+    /// Open a chat whose mutations are forwarded to its host's daemon client.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_persistence(
+        session: ManagedSessionHandle,
+        bundle_id: &str,
+        recovery: Option<RecoveryContext>,
+        control: SessionManagerControl,
+        header: SessionHeaderIdentity,
+        draft: String,
+        notices: Notices,
+        persistence: Option<tokio::sync::mpsc::UnboundedSender<ChatPersistenceRequest>>,
     ) -> Self {
         let view = session.view();
         let needs_initial_sync = view.snapshot.is_none();
@@ -531,7 +564,6 @@ impl ActiveChat {
             state,
             session,
             session_manager: control,
-            bundle_id: bundle_id.to_owned(),
             recovery,
             remote,
             chat_io_tx,
@@ -548,6 +580,7 @@ impl ActiveChat {
             reconnect_notice_pending_sync: false,
             reviewer_generation,
             resuming_reviewer: None,
+            persistence,
         };
         if chat.state.second_opinion_split() {
             chat.poll_reviewer_events();
@@ -904,12 +937,7 @@ impl ActiveChat {
                 self.state.set_notice("Prompt queued for delivery…");
                 queue_chat_remote_operation(
                     self.remote.operations(),
-                    ChatRemoteOperation::Prompt {
-                        command_id,
-                        text,
-                        session_id: self.session.session_id().to_owned(),
-                        bundle_id: self.bundle_id.clone(),
-                    },
+                    ChatRemoteOperation::Prompt { command_id, text },
                     &mut self.state,
                 );
             }
@@ -981,8 +1009,6 @@ impl ActiveChat {
                         control,
                         requested_active,
                         prompt,
-                        session_id: self.session.session_id().to_owned(),
-                        bundle_id: self.bundle_id.clone(),
                     },
                     &mut self.state,
                 );
@@ -1021,8 +1047,6 @@ impl ActiveChat {
                         request,
                         response,
                         plan_followup,
-                        session_id: self.session.session_id().to_owned(),
-                        bundle_id: self.bundle_id.clone(),
                     },
                     &mut self.state,
                 );
@@ -1206,7 +1230,14 @@ impl ActiveChat {
             native_lost: false,
             reviewer_transcript: review.reviewer.transcript(),
         };
-        if let Err(error) =
+        if let Some(persistence) = &self.persistence {
+            if let Err(error) = persistence.send(ChatPersistenceRequest::SaveReview {
+                session_id: self.session.session_id().to_owned(),
+                review: stored,
+            }) {
+                tracing::warn!(%error, "could not queue the open review for persistence");
+            }
+        } else if let Err(error) =
             crate::hel_database::save_active_review(self.session.session_id(), &stored)
         {
             tracing::debug!(error = %format!("{error:#}"), "could not record the open review");
@@ -1215,7 +1246,15 @@ impl ActiveChat {
 
     /// Forgets a review that has finished, so nothing is restored for it.
     fn forget_review(&self) {
-        if let Err(error) = crate::hel_database::clear_active_review(self.session.session_id()) {
+        if let Some(persistence) = &self.persistence {
+            if let Err(error) = persistence.send(ChatPersistenceRequest::ClearReview {
+                session_id: self.session.session_id().to_owned(),
+            }) {
+                tracing::warn!(%error, "could not queue the finished review for persistence");
+            }
+        } else if let Err(error) =
+            crate::hel_database::clear_active_review(self.session.session_id())
+        {
             tracing::debug!(error = %format!("{error:#}"), "could not clear the finished review");
         }
     }
@@ -1314,7 +1353,16 @@ impl ActiveChat {
                 model,
                 effort,
             };
-            if let Err(error) = crate::hel_database::remember_reviewer_selection(
+            if let Some(persistence) = &self.persistence {
+                if let Err(error) =
+                    persistence.send(ChatPersistenceRequest::RememberReviewerSelection {
+                        workspace_id: recovery.session.workspace_id.clone(),
+                        selection,
+                    })
+                {
+                    tracing::warn!(%error, "could not queue the reviewer choice for persistence");
+                }
+            } else if let Err(error) = crate::hel_database::remember_reviewer_selection(
                 &recovery.session.workspace_id,
                 &selection,
             ) {
@@ -1337,8 +1385,6 @@ impl ActiveChat {
                 request: captured.request.clone(),
                 response: crate::hel_acp::plan_review_keep_planning(),
                 plan_followup: None,
-                session_id: self.session.session_id().to_owned(),
-                bundle_id: self.bundle_id.clone(),
             },
             &mut self.state,
         );
@@ -1355,8 +1401,6 @@ impl ActiveChat {
                     ChatRemoteOperation::Prompt {
                         command_id,
                         text: prompt,
-                        session_id: self.session.session_id().to_owned(),
-                        bundle_id: self.bundle_id.clone(),
                     },
                     &mut self.state,
                 );
