@@ -38,7 +38,7 @@ disallowed_methods = "warn"
 workspace = true
 
 [dependencies]
-agent-client-protocol = { version = "1", features = ["unstable_session_fork", "unstable_end_turn_token_usage", "unstable_elicitation", "unstable_auth_methods", "unstable_cancel_request"] }
+agent-client-protocol = { version = "2", features = ["unstable_session_fork", "unstable_end_turn_token_usage", "unstable_elicitation", "unstable_auth_methods"] }
 anyhow = "1"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 axum = "0.8"
