@@ -2111,7 +2111,6 @@ fn redact_origin_credentials(origin: &str) -> Result<String> {
 
 mod git;
 
-pub(crate) use git::ensure_no_symlink_ancestors;
 pub use git::{
     GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode, GitOutput,
     GitSnapshotProgress, NON_INTERACTIVE_GIT_ENV, NON_INTERACTIVE_GIT_SSH_COMMAND, SystemGit,
@@ -2120,6 +2119,7 @@ pub use git::{
 };
 #[cfg(test)]
 use git::{build_untracked_tar, restore_untracked_tar};
+pub(crate) use git::{ensure_branch_available_for_checkout, ensure_no_symlink_ancestors};
 use git::{validate_untracked_tar, validate_untracked_tar_reader};
 
 #[cfg(test)]

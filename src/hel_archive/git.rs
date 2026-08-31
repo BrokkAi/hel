@@ -464,6 +464,56 @@ pub fn restore_git_snapshot(
     restore_untracked_tar(repository, &snapshot.untracked_tar)
 }
 
+/// Refuse to move a checkout onto a branch owned by another worktree.
+///
+/// `git checkout -B` permits this on some Git versions, leaving one branch
+/// attached to two worktrees. The restore path must detect that before it
+/// fetches or changes the destination checkout.
+pub(crate) fn ensure_branch_available_for_checkout(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    branch: &str,
+) -> Result<()> {
+    let current = run_git(
+        runner,
+        repository,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &[],
+    )?;
+    if current.status == 0 {
+        if trim_output(&current.stdout, "decode current restore branch")? == branch {
+            return Ok(());
+        }
+    } else {
+        ensure!(
+            current.status == 1,
+            "{}",
+            git_failure("read current restore branch", &current)
+        );
+    }
+
+    let worktrees = run_git(
+        runner,
+        repository,
+        ["worktree", "list", "--porcelain", "-z"],
+        &[],
+    )?;
+    ensure!(
+        worktrees.status == 0,
+        "{}",
+        git_failure("list restore worktrees", &worktrees)
+    );
+    let branch_field = format!("branch refs/heads/{branch}");
+    ensure!(
+        !worktrees
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|field| field == branch_field.as_bytes()),
+        "restore committed branch: branch {branch:?} is checked out in another worktree"
+    );
+    Ok(())
+}
+
 /// A snapshot without a bundle relies on origin for its committed history, so
 /// name the missing commit and how to make it reachable again.
 fn checkout_advice(snapshot: &RepositorySnapshot) -> String {
