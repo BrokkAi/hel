@@ -235,6 +235,111 @@ fn github_cli_wrapper_reads_each_live_token_and_clears_stale_environment() {
 }
 
 #[test]
+fn github_cli_wrapper_survives_harness_login_shells_and_git_helpers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let worker = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let real = tempfile::tempdir().unwrap();
+    let real_bin = real.path().join("bin");
+    std::fs::create_dir(&real_bin).unwrap();
+    let real_gh = real_bin.join("gh");
+    std::fs::write(
+        &real_gh,
+        br#"#!/bin/sh
+if [ "${1-}" = auth ] && [ "${2-}" = git-credential ]; then
+    cat >/dev/null
+    if [ "${3-}" = get ]; then
+        printf 'username=x-access-token\npassword=%s\n' "${GH_TOKEN-unset}"
+    fi
+else
+    printf '%s|%s\n' "${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}"
+fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&real_gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let original_bash_env = home.path().join("original-bash-env");
+    std::fs::write(&original_bash_env, b"export ORIGINAL_BASH_ENV=preserved\n").unwrap();
+    std::fs::write(
+        home.path().join(".bash_profile"),
+        format!(
+            "PATH={}:{}\nexport PATH\n",
+            real_bin.display(),
+            "/usr/bin:/bin"
+        ),
+    )
+    .unwrap();
+
+    let mut environment = BTreeMap::from([
+        (
+            "PATH".into(),
+            format!("{}:/usr/bin:/bin", real_bin.display()),
+        ),
+        ("HOME".into(), home.path().to_string_lossy().into_owned()),
+        (
+            "BASH_ENV".into(),
+            original_bash_env.to_string_lossy().into_owned(),
+        ),
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        ("GIT_CONFIG_KEY_0".into(), "user.name".into()),
+        ("GIT_CONFIG_VALUE_0".into(), "Harness User".into()),
+    ]);
+    unix::configure_github_cli(worker.path(), &mut environment).unwrap();
+    let configured_once = environment.clone();
+    unix::configure_github_cli(worker.path(), &mut environment).unwrap();
+    assert_eq!(environment, configured_once);
+    crate::hel_credentials::write_github_token(
+        &worker.path().join("github-token"),
+        b"synchronized-test-token",
+    )
+    .unwrap();
+
+    let mut direct = std::process::Command::new("/bin/bash");
+    direct
+        .args([
+            "-lc",
+            "printf '%s|%s\\n' \"$(command -v gh)\" \"${ORIGINAL_BASH_ENV-unset}\"; gh auth status",
+        ])
+        .env_clear()
+        .envs(&environment);
+    let output = crate::hel_subprocess::run_with_input(&mut direct, &[]).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "{}|preserved\nsynchronized-test-token|unset\n",
+            worker.path().join("bin/gh").display()
+        )
+    );
+
+    let mut git = std::process::Command::new("/bin/bash");
+    git.args([
+        "-lc",
+        "printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill",
+    ])
+    .env_clear()
+    .envs(&environment);
+    let output = crate::hel_subprocess::run_with_input(&mut git, &[]).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("username=x-access-token\n"), "{stdout}");
+    assert!(
+        stdout.contains("password=synchronized-test-token\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn skills_state_reports_an_empty_home_then_a_synced_tree() {
     let home = tempfile::tempdir().unwrap();
     let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
