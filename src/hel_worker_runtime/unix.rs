@@ -776,6 +776,16 @@ pub(super) fn record_runtime_event(
             in_flight.remove(&request_id);
             relay.record_command_completed(&request_id, RelayCommandOutcome::Cancelled)?;
         }
+        RuntimeEvent::SteerApplied {
+            request_id,
+            queued_command_id,
+        } => {
+            in_flight.remove(&request_id);
+            relay.record_command_completed(
+                &request_id,
+                RelayCommandOutcome::Steered { queued_command_id },
+            )?;
+        }
         RuntimeEvent::CloseApplied { request_id } => {
             in_flight.remove(&request_id);
             relay.record_command_completed(&request_id, RelayCommandOutcome::Closed)?;
@@ -1033,7 +1043,10 @@ fn acp_command(claimed: &ClaimedRelayCommand) -> Option<CommandRequest> {
             request_id,
             mode_id: mode_id.clone(),
         }),
-        RelayCommand::Cancel => Some(CommandRequest::Cancel { request_id }),
+        RelayCommand::Cancel => Some(CommandRequest::Cancel {
+            request_id,
+            steering_prompt: claimed.steering_prompt.clone(),
+        }),
         RelayCommand::Close { .. } => Some(CommandRequest::Close { request_id }),
         RelayCommand::BeginCheckpoint { .. }
         | RelayCommand::RunUserShell { .. }

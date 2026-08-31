@@ -559,6 +559,32 @@ fn project_observation(
                         .iter()
                         .any(|command_id| command_id == &queued.command_id)
                 }),
+                crate::hel_worker::RelayCommandOutcome::Steered { queued_command_id } => {
+                    let Some(queue_index) = queue
+                        .iter()
+                        .position(|queued| queued.command_id == *queued_command_id)
+                    else {
+                        bail!("steered prompt is missing from the materialized queue");
+                    };
+                    let entry = queue.remove(queue_index);
+                    if !entry.kind.is_prompt() {
+                        bail!("steered queue entry is not a prompt");
+                    }
+                    close_streams(index, mutation, event.recorded_at_ms);
+                    upsert(
+                        mutation,
+                        TranscriptItem {
+                            stable_id: format!("user:{queued_command_id}"),
+                            position: event.ordinal,
+                            latest_content_event_ordinal: None,
+                            created_at_ms: event.recorded_at_ms,
+                            last_changed_at_ms: event.recorded_at_ms,
+                            body: TranscriptBody::User {
+                                content: entry.content,
+                            },
+                        },
+                    );
+                }
                 crate::hel_worker::RelayCommandOutcome::Configured
                 | crate::hel_worker::RelayCommandOutcome::SessionModeSet
                 | crate::hel_worker::RelayCommandOutcome::Cancelled

@@ -1609,6 +1609,7 @@ async fn a_cancel_is_served_while_a_compaction_is_in_flight() {
     request_tx
         .send(CommandRequest::Cancel {
             request_id: "cancel-1".into(),
+            steering_prompt: None,
         })
         .await
         .unwrap();
@@ -1728,6 +1729,180 @@ where
     }
 }
 
+async fn steering_bridge(
+    stream: tokio::io::DuplexStream,
+    observed: mpsc::UnboundedSender<serde_json::Value>,
+    mut complete: mpsc::Receiver<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    let mut prompt_id = None;
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line.expect("read steering bridge input") else {
+                    break;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
+                let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let _ = observed.send(request.clone());
+                let id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let response = match method {
+                    "initialize" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": 1,
+                            "_meta": {"steering": {"supported": true}},
+                        },
+                    }),
+                    "session/new" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"sessionId": "steering-session"},
+                    }),
+                    "session/prompt" => {
+                        prompt_id = Some(id);
+                        continue;
+                    }
+                    SESSION_STEERING_METHOD => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"outcome": "injected"},
+                    }),
+                    _ => continue,
+                };
+                if write.write_all(format!("{response}\n").as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            complete = complete.recv() => {
+                if complete.is_none() {
+                    break;
+                }
+                let Some(id) = prompt_id.take() else {
+                    continue;
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"stopReason": "end_turn"},
+                });
+                if write.write_all(format!("{response}\n").as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancel_steers_the_queued_prompt_when_the_agent_supports_it() {
+    let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    let (complete_tx, complete_rx) = mpsc::channel(1);
+    let bridge = tokio::spawn(steering_bridge(bridge_stream, observed_tx, complete_rx));
+    let (client_read, client_write) = tokio::io::split(client_stream);
+    let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+    let (request_tx, mut request_rx) = mpsc::channel(4);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let spec = LaunchSpec {
+        command: "scripted".into(),
+        args: Vec::new(),
+        environment: BTreeMap::new(),
+        cwd: std::env::current_dir().unwrap(),
+        additional_directories: Vec::new(),
+        project_memory: None,
+        resume_session: None,
+        harness: HarnessKind::Codex,
+        execution_policy: ExecutionPolicy::ConfiguredApprovals,
+        acp_activity: AcpActivityClock::default(),
+    };
+    let driver = tokio::spawn(async move {
+        drive(
+            transport,
+            spec,
+            &mut request_rx,
+            event_tx,
+            Arc::new(Mutex::new(None)),
+        )
+        .await
+    });
+
+    request_tx
+        .send(CommandRequest::Prompt {
+            request_id: "prompt-1".into(),
+            prompt: vec![ContentBlock::Text(TextContent::new("start"))],
+        })
+        .await
+        .unwrap();
+    loop {
+        let request = observed_rx.recv().await.expect("prompt reaches bridge");
+        if request["method"] == "session/prompt" {
+            break;
+        }
+    }
+    request_tx
+        .send(CommandRequest::Cancel {
+            request_id: "cancel-1".into(),
+            steering_prompt: Some(ClaimedSteeringPrompt {
+                queued_command_id: "queued-1".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("change direction"))],
+            }),
+        })
+        .await
+        .unwrap();
+
+    let steering = loop {
+        let request = observed_rx.recv().await.expect("steer reaches bridge");
+        if request["method"] == SESSION_STEERING_METHOD {
+            break request;
+        }
+        assert_ne!(request["method"], "session/cancel");
+    };
+    assert_eq!(steering["params"]["sessionId"], "steering-session");
+    assert_eq!(steering["params"]["prompt"][0]["text"], "change direction");
+    assert_eq!(
+        steering["params"]["_meta"]["steering"]["idleBehavior"],
+        "promptRequired"
+    );
+    wait_for_runtime_event(&mut event_rx, |event| {
+        matches!(
+            event,
+            RuntimeEvent::SteerApplied {
+                request_id,
+                queued_command_id,
+            } if request_id == "cancel-1" && queued_command_id == "queued-1"
+        )
+    })
+    .await;
+    assert!(
+        observed_rx.try_recv().is_err(),
+        "steering must not send cancel"
+    );
+
+    complete_tx.send(()).await.unwrap();
+    wait_for_runtime_event(&mut event_rx, |event| {
+        matches!(
+            event,
+            RuntimeEvent::PromptFinished { request_id, .. } if request_id == "prompt-1"
+        )
+    })
+    .await;
+    drop(request_tx);
+    tokio::time::timeout(Duration::from_secs(5), driver)
+        .await
+        .expect("runtime exits")
+        .expect("runtime task does not panic")
+        .expect("steering does not fail the runtime");
+    bridge.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn acknowledged_kimi_cancel_reloads_before_the_next_prompt() {
     let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
@@ -1783,6 +1958,10 @@ async fn acknowledged_kimi_cancel_reloads_before_the_next_prompt() {
     request_tx
         .send(CommandRequest::Cancel {
             request_id: "cancel-1".into(),
+            steering_prompt: Some(ClaimedSteeringPrompt {
+                queued_command_id: "queued-1".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("change direction"))],
+            }),
         })
         .await
         .unwrap();
@@ -1871,6 +2050,7 @@ async fn unacked_cancel_restarts_the_harness_after_sixty_seconds() {
     request_tx
         .send(CommandRequest::Cancel {
             request_id: "cancel-1".into(),
+            steering_prompt: None,
         })
         .await
         .unwrap();
@@ -2370,6 +2550,7 @@ mod terminals {
             .requests
             .send(CommandRequest::Cancel {
                 request_id: "cancel-terminals".into(),
+                steering_prompt: None,
             })
             .await
             .unwrap();
@@ -2727,6 +2908,7 @@ while True:
     request_tx
         .send(CommandRequest::Cancel {
             request_id: "cancel-1".into(),
+            steering_prompt: None,
         })
         .await
         .unwrap();
