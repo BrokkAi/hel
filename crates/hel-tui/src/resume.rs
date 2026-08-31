@@ -625,9 +625,9 @@ impl DashboardState {
                 self.rebuild_resume_rows();
                 self.resync_resume_selection();
                 self.notices.set(if shown {
-                    "Showing archived sessions."
+                    "Showing hidden sessions."
                 } else {
-                    "Hiding archived sessions."
+                    "Hiding hidden sessions."
                 });
                 DashboardAction::None
             }
@@ -641,7 +641,7 @@ impl DashboardState {
                 };
                 let Some(session_id) = row.session_id().map(ToOwned::to_owned) else {
                     self.notices.set(
-                        "Hel never destroys a harness's own session. Press a to archive this row.",
+                        "Hel never deletes a harness's own session. Press a to hide this row.",
                     );
                     return DashboardAction::None;
                 };
@@ -651,7 +651,7 @@ impl DashboardState {
                 else {
                     return DashboardAction::None;
                 };
-                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DestroyStopped {
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteSaved {
                     session_id,
                     reopen: Some(Box::new(dialog)),
                 }));
@@ -713,7 +713,7 @@ impl DashboardState {
         };
         if let Some(reason) = row.status.explanation() {
             self.notices.set(format!(
-                "This session was {reason}. Press d to destroy its record."
+                "This session was {reason}. Press d to delete its record."
             ));
             return DashboardAction::None;
         }
@@ -800,9 +800,9 @@ pub(crate) fn render_resume_dialog(
     frame.render_widget(Clear, popup);
     let (scanned, total) = dialog.scan_progress();
     let title = if dialog.is_scanning() {
-        format!(" Resume a session · scanning {scanned}/{total} ")
+        format!(" Saved sessions · scanning {scanned}/{total} ")
     } else {
-        " Resume a session ".to_owned()
+        " Saved sessions ".to_owned()
     };
     let outer = Block::default().borders(Borders::ALL).title(title);
     let inner = outer.inner(popup);
@@ -835,6 +835,35 @@ pub(crate) fn render_resume_dialog(
     } else {
         dialog.search.to_string()
     };
+    let mut stored_bytes = 0_u64;
+    let mut unknown_sizes = 0_usize;
+    for session in dashboard
+        .state
+        .sessions
+        .values()
+        .filter(|session| !session.state.is_active() && session.checkpoint.is_some())
+    {
+        match dashboard
+            .checkpoint_archive_sizes
+            .get(&session.id)
+            .copied()
+            .flatten()
+        {
+            Some(size) => stored_bytes = stored_bytes.saturating_add(size),
+            None => unknown_sizes += 1,
+        }
+    }
+    let storage_summary = if unknown_sizes == 0 {
+        format!(
+            "Saved sessions run no workers · {} stored locally",
+            format_resource_bytes(stored_bytes)
+        )
+    } else {
+        format!(
+            "Saved sessions run no workers · {} loaded locally · storage size loading",
+            format_resource_bytes(stored_bytes)
+        )
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -846,11 +875,14 @@ pub(crate) fn render_resume_dialog(
                 },
             ),
             Line::styled(
-                if dialog.show_archived {
-                    "Archived rows shown."
-                } else {
-                    "Archived rows hidden."
-                },
+                format!(
+                    "{storage_summary} · {}",
+                    if dialog.show_archived {
+                        "Hidden rows shown."
+                    } else {
+                        "Hidden rows hidden."
+                    }
+                ),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -863,7 +895,7 @@ pub(crate) fn render_resume_dialog(
         .borders(Borders::ALL)
         .border_type(focus_border(sessions_focused || search_focused))
         .title(match dialog.tab {
-            ResumeTab::Hel => " Hel sessions · newest first ",
+            ResumeTab::Hel => " Saved Hel sessions · newest first ",
             ResumeTab::Import => " Importable sessions · newest first ",
         });
     let list_area = block.inner(rows[2]);
@@ -889,7 +921,7 @@ pub(crate) fn render_resume_dialog(
         vec![ListItem::new(
             match (dialog.tab, dialog.is_scanning(), dialog.search.is_empty()) {
                 (ResumeTab::Import, true, _) => "Scanning native sessions…",
-                (ResumeTab::Hel, _, true) => "No stopped Hel sessions",
+                (ResumeTab::Hel, _, true) => "No saved Hel sessions",
                 (ResumeTab::Import, _, true) => "No importable sessions",
                 _ => "No matching sessions",
             },
@@ -943,10 +975,10 @@ pub(crate) fn render_resume_dialog(
     footer.push(Line::styled(
         match dialog.tab {
             ResumeTab::Hel => {
-                "Enter resumes · a archives · d destroys · s shows archived · ←/→ tabs · / searches · Tab moves"
+                "Enter resumes · a hides · d deletes · s shows hidden · ←/→ tabs · / searches · Tab moves"
             }
             ResumeTab::Import => {
-                "Enter imports · a archives · s shows archived · ←/→ tabs · / searches · Tab moves"
+                "Enter imports · a hides · s shows hidden · ←/→ tabs · / searches · Tab moves"
             }
         },
         Style::default().fg(Color::DarkGray),
@@ -1032,7 +1064,7 @@ where
     if row.natively_archived {
         marks.push_str("  [archived in harness]");
     } else if row.archived {
-        marks.push_str("  [archived]");
+        marks.push_str("  [hidden]");
     }
     if row.unavailable_reason.is_some() {
         marks.push_str("  [unavailable]");
@@ -1535,14 +1567,14 @@ mod tests {
             assert!(matches!(dashboard.mode, Mode::ResumeDialog(_)));
             let notice = dashboard.notices.current().unwrap_or_default();
             assert!(notice.contains(reason), "{notice}");
-            assert!(notice.contains("destroy its record"), "{notice}");
+            assert!(notice.contains("delete its record"), "{notice}");
 
             dashboard.handle_key(key(KeyCode::Char('d')));
             assert!(matches!(dashboard.mode, Mode::Confirm(_)));
         }
     }
 
-    /// Hel never modifies a harness home, so a native-only row has no destroy action.
+    /// Hel never modifies a harness home, so a native-only row has no delete action.
     #[test]
     fn a_native_only_row_cannot_be_destroyed_from_hel() {
         let mut dashboard = DashboardState::new(config(), state_with(Vec::new()), BTreeMap::new());
@@ -1566,7 +1598,7 @@ mod tests {
                 .notices
                 .current()
                 .unwrap_or_default()
-                .contains("never destroys")
+                .contains("never deletes")
         );
     }
 
@@ -1820,8 +1852,27 @@ mod tests {
             .draw(|frame| crate::render::render(frame, &mut dashboard))
             .expect("draw the dashboard");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(rendered.contains("[S] Resume"), "{rendered}");
+        assert!(rendered.contains("[S]aved"), "{rendered}");
         assert!(!rendered.contains("Import"), "{rendered}");
+    }
+
+    #[test]
+    fn saved_dialog_explains_worker_and_local_storage_retention() {
+        let mut dashboard = dashboard_with_session(stopped_session());
+        dashboard.show_resume_dialog(1, Vec::new());
+        dashboard.apply_checkpoint_archive_sizes(BTreeMap::from([(
+            "session-1".to_owned(),
+            Some(1_342_177_280),
+        )]));
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw Saved sessions");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Saved sessions"), "{rendered}");
+        assert!(rendered.contains("run no workers"), "{rendered}");
+        assert!(rendered.contains("1.2G stored locally"), "{rendered}");
+        assert!(rendered.contains("d deletes"), "{rendered}");
     }
 
     /// The rows are derived state, rebuilt where their inputs change. A state
@@ -2065,9 +2116,9 @@ mod tests {
         for hint in [
             "Hel",
             "Import",
-            "a archives",
-            "d destroys",
-            "s shows archived",
+            "a hides",
+            "d deletes",
+            "s shows hidden",
             "←/→ tabs",
             "/ searches",
         ] {
@@ -2080,6 +2131,6 @@ mod tests {
             .expect("draw the Import tab");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("Enter imports"), "{rendered}");
-        assert!(!rendered.contains("d destroys"), "{rendered}");
+        assert!(!rendered.contains("d deletes"), "{rendered}");
     }
 }

@@ -1502,7 +1502,7 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · [S] Resume · [W]orkspaces · [E]dit · We[b] · mark [A]ll read · [Q]uit · Tab pane"
+            "[N]ew · [S]aved · [F]inish · [W]orkspaces · [E]dit · We[b] · mark [A]ll read · [Q]uit · Tab pane"
         }
         Focus::Capacity => "[W]orkspaces · [E]dit targets · [R]efresh · We[b] · [Q]uit · Tab pane",
         Focus::Quotas => "[W]orkspaces · [E]dit profile · [R]efresh · We[b] · [Q]uit · Tab pane",
@@ -2778,13 +2778,13 @@ mod tests {
     fn a_stage_does_not_rename_a_non_launch_operation() {
         let session = stopped_session();
         let operation = operation(
-            SessionOperationKind::Stopping,
+            SessionOperationKind::Finishing,
             Some(ProvisionStage::Syncing),
         );
 
         let (clock, _, _, _, _) =
             session_values(&session, None, Some(&operation), 1_012, &config());
-        assert_eq!(clock, "Stopping 12s");
+        assert_eq!(clock, "Finishing 12s");
     }
 
     #[test]

@@ -16,7 +16,7 @@ use super::rendering::truncate_to_width;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LocalCommand {
     Help,
-    Detach,
+    Dashboard,
     Model,
     Effort,
     Fast,
@@ -269,8 +269,8 @@ pub(super) fn builtin_command_choices() -> Vec<CommandChoice> {
     [
         ("help", "show available Hel and agent commands", None),
         (
-            "detach",
-            "return to the dashboard without stopping the worker",
+            "dashboard",
+            "return to the dashboard; the worker keeps running",
             None,
         ),
         (
@@ -298,7 +298,7 @@ pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> 
     let (name, args) = parse_slash_command(prompt)?;
     let command = match name {
         "help" => LocalCommand::Help,
-        "detach" => LocalCommand::Detach,
+        "dashboard" | "detach" => LocalCommand::Dashboard,
         "model" => LocalCommand::Model,
         "effort" => LocalCommand::Effort,
         "fast" => LocalCommand::Fast,
@@ -431,6 +431,23 @@ mod tests {
         assert!(prompt_invokes_command("/goal finish it", "goal"));
         assert!(!prompt_invokes_command("/Goal finish it", "goal"));
         assert!(!prompt_invokes_command("/goalkeeper", "goal"));
+    }
+
+    #[test]
+    fn dashboard_is_advertised_and_detach_remains_a_hidden_alias() {
+        let choices = builtin_command_choices();
+        assert!(choices.iter().any(|choice| {
+            choice.name == "dashboard" && choice.description.contains("worker keeps running")
+        }));
+        assert!(!choices.iter().any(|choice| choice.name == "detach"));
+        assert_eq!(
+            parse_local_command("/dashboard"),
+            Some((LocalCommand::Dashboard, ""))
+        );
+        assert_eq!(
+            parse_local_command("/detach"),
+            Some((LocalCommand::Dashboard, ""))
+        );
     }
 
     #[test]

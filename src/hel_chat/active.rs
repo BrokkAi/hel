@@ -902,7 +902,7 @@ impl ActiveChat {
 
     /// Whether a second opinion is open on this session.
     ///
-    /// Stopping the session tears its target down, which takes the reviewer's
+    /// Finishing the session tears its target down, which takes the reviewer's
     /// conversation with it, so the stop confirmation asks about this.
     pub fn has_open_review(&self) -> bool {
         self.state.second_opinion_active()
@@ -2223,21 +2223,32 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState, transcript_selecte
             );
         }
     }
-    let default_footer = if chat.focus == ChatFocus::Conversations {
-        "Ctrl-G dashboard · j/k or ↑/↓ switch conversation · PgUp/PgDn transcript · Enter/Tab prompt"
-    } else if chat.voice_active {
-        "Ctrl-G dashboard · Listening… Alt-V stop · PgUp/PgDn transcript"
-    } else if !chat.queued_prompts.is_empty() {
-        "Ctrl-G dashboard · Up/Ctrl-P edit last queued · PgUp/PgDn transcript · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel"
+    let leave_hint = if footer_area.width >= 72 {
+        "Ctrl-G dashboard · worker keeps running"
     } else {
-        "Ctrl-G dashboard · PgUp/PgDn transcript · Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T rendering · Esc cancel"
+        "Ctrl-G dashboard; worker runs"
+    };
+    let default_footer = if chat.focus == ChatFocus::Conversations {
+        format!(
+            "{leave_hint} · j/k or ↑/↓ switch conversation · PgUp/PgDn transcript · Enter/Tab prompt"
+        )
+    } else if chat.voice_active {
+        format!("{leave_hint} · Listening… Alt-V stop · PgUp/PgDn transcript")
+    } else if !chat.queued_prompts.is_empty() {
+        format!(
+            "{leave_hint} · Up/Ctrl-P edit last queued · PgUp/PgDn transcript · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel"
+        )
+    } else {
+        format!(
+            "{leave_hint} · PgUp/PgDn transcript · Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T rendering · Esc cancel"
+        )
     };
     let search_footer = chat.history_search.as_ref().map(history_search_footer);
     let notice = chat.notices.current();
     let footer = search_footer
         .as_deref()
         .or(notice.as_deref())
-        .unwrap_or(default_footer);
+        .unwrap_or(default_footer.as_str());
     // The shared notice bar is yellow wherever it shows; a search prompt or
     // the default hotkey hints stay the quieter dark gray.
     let footer_color = if search_footer.is_none() && notice.is_some() {
@@ -2906,7 +2917,19 @@ mod tests {
             .map(|x| buffer[(x, footer_row)].symbol())
             .collect::<String>();
         assert!(footer_text.contains("Ctrl-G dashboard"));
+        assert!(footer_text.contains("worker keeps running"));
         assert_eq!(buffer[(buffer.area.x, footer_row)].fg, Color::DarkGray);
+
+        let mut narrow = Terminal::new(TestBackend::new(60, 24)).expect("narrow terminal");
+        narrow
+            .draw(|frame| render(frame, &mut chat, false))
+            .expect("draw narrow chat");
+        let buffer = narrow.backend().buffer();
+        let footer_row = buffer.area.bottom() - 1;
+        let footer_text = (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, footer_row)].symbol())
+            .collect::<String>();
+        assert!(footer_text.contains("Ctrl-G dashboard; worker runs"));
     }
 
     #[test]

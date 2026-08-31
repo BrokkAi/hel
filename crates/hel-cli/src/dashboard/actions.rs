@@ -425,12 +425,20 @@ pub(crate) async fn apply_dashboard_action(
             context.open_chat_session(&session_id);
         }
         action @ DashboardAction::ResumeSession { .. } => start_session_launch(context, action),
-        DashboardAction::Close { session_id } => {
+        DashboardAction::Finish { session_id } => {
+            let effect = hel::hel_controller::session_finish_effect(
+                context
+                    .controller
+                    .state
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?,
+            )?;
             context
                 .dashboard
-                .set_notice(format!("Stopping {}…", short_id(&session_id)));
+                .set_notice(format!("Finishing {}…", short_id(&session_id)));
             let request =
-                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Stopping);
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Finishing);
             let runtime = tokio::runtime::Handle::current();
             spawn_lifecycle_operation(
                 request,
@@ -442,7 +450,7 @@ pub(crate) async fn apply_dashboard_action(
                             .close_session(session_id)
                             .await
                     })?;
-                    Ok(LifecycleSuccess::Closed)
+                    Ok(LifecycleSuccess::Finished { effect })
                 },
             );
         }
@@ -459,7 +467,7 @@ pub(crate) async fn apply_dashboard_action(
         }
         DashboardAction::ForceStop { session_id } => {
             let request =
-                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Stopping);
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Finishing);
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),
@@ -474,9 +482,9 @@ pub(crate) async fn apply_dashboard_action(
                 },
             );
         }
-        DashboardAction::DestroyStopped { session_id } => {
+        DashboardAction::DeleteSaved { session_id } => {
             let request =
-                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Destroying);
+                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Deleting);
             spawn_lifecycle_operation(
                 request,
                 context.critical_operations.clone(),

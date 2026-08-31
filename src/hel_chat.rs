@@ -1230,7 +1230,7 @@ impl ChatState {
                     self.show_help();
                     ChatAction::None
                 }
-                LocalCommand::Detach => {
+                LocalCommand::Dashboard => {
                     self.clear_input();
                     ChatAction::Back
                 }

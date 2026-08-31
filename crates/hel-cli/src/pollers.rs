@@ -1690,7 +1690,9 @@ pub(crate) enum LifecycleSuccess {
         target_id: String,
         materialized: Box<MaterializedSession>,
     },
-    Closed,
+    Finished {
+        effect: hel::hel_controller::SessionFinishEffect,
+    },
     ForceStopped,
     DestroyedStopped,
 }
@@ -1733,21 +1735,29 @@ pub(crate) fn spawn_interrupted_close_recovery(
     tokio::spawn(async move {
         let operation_session_id = session_id.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            (|| -> Result<()> {
+            (|| -> Result<hel::hel_controller::SessionFinishEffect> {
                 let _recovery_reservation = reserve_recovery_or_cancel(
                     &recovery_observer,
                     &operation_session_id,
                     &cancelled,
                 )?;
                 let mut controller = Controller::load()?;
+                let effect = hel::hel_controller::session_finish_effect(
+                    controller
+                        .state
+                        .sessions
+                        .get(&operation_session_id)
+                        .with_context(|| format!("unknown session {operation_session_id}"))?,
+                )?;
                 let executor = CancellableProcessExecutor::new(cancelled);
                 runtime.block_on(controller.recover_interrupted_close_managed(
                     &operation_session_id,
                     &executor,
                     &session_manager,
-                ))
+                ))?;
+                Ok(effect)
             })()
-            .map(|()| LifecycleSuccess::Closed)
+            .map(|effect| LifecycleSuccess::Finished { effect })
             .map_err(|error| format!("{error:#}"))
         })
         .await;

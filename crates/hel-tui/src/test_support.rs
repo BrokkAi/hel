@@ -13,7 +13,7 @@ use hel::hel_config::{
 };
 use hel::hel_state::{
     CheckpointMetadata, HelState, MaterializedExecutionState, MaterializedSession, STATE_VERSION,
-    SessionRecord, SessionState, TranscriptBody, TranscriptItem,
+    SessionRecord, SessionState, TargetLocator, TranscriptBody, TranscriptItem,
 };
 use hel::hel_targets::{DeploymentCapacityKind, DeploymentCapacityTarget, ProvisionStage};
 
@@ -187,10 +187,12 @@ pub(crate) fn stopped_session() -> SessionRecord {
 /// such as rename and the container editor only apply to a session that is
 /// actually on the dashboard.
 pub(crate) fn running_session() -> SessionRecord {
-    SessionRecord {
-        state: SessionState::Running,
-        ..stopped_session()
-    }
+    let mut session = stopped_session();
+    session.state = SessionState::Running;
+    session.target = Some(TargetLocator::LocalPodman {
+        container_id: "hel-session-1".into(),
+    });
+    session
 }
 
 /// Reaches the resume wizard the way the UI does: open the resume dialog with

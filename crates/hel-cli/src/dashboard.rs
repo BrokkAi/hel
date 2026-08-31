@@ -1496,10 +1496,10 @@ impl DashboardContext {
             let kind = match lifecycle.kind {
                 crate::daemon::RuntimeLifecycleKind::Create => SessionOperationKind::Launching,
                 crate::daemon::RuntimeLifecycleKind::Close
-                | crate::daemon::RuntimeLifecycleKind::ForceStop => SessionOperationKind::Stopping,
+                | crate::daemon::RuntimeLifecycleKind::ForceStop => SessionOperationKind::Finishing,
                 crate::daemon::RuntimeLifecycleKind::Resume => SessionOperationKind::Resuming,
                 crate::daemon::RuntimeLifecycleKind::DestroyStopped => {
-                    SessionOperationKind::Destroying
+                    SessionOperationKind::Deleting
                 }
             };
             if !self
@@ -1842,7 +1842,9 @@ impl DashboardContext {
                 // durable write finishes, while unrelated reads remain free
                 // to be abandoned.
                 drop(persist);
-                self.request_shutdown();
+                if self.dashboard.request_quit() == DashboardAction::QuitDetach {
+                    self.request_shutdown();
+                }
             }
         }
     }
@@ -1923,7 +1925,7 @@ fn remote_lifecycle_settled(kind: SessionOperationKind, state: Option<SessionSta
                     | SessionState::DestroyedWithDataLoss
             )
         }),
-        SessionOperationKind::Stopping => state.is_some_and(|state| {
+        SessionOperationKind::Finishing => state.is_some_and(|state| {
             matches!(
                 state,
                 SessionState::Stopped
@@ -1932,7 +1934,7 @@ fn remote_lifecycle_settled(kind: SessionOperationKind, state: Option<SessionSta
                     | SessionState::DestroyedWithDataLoss
             )
         }),
-        SessionOperationKind::Destroying => {
+        SessionOperationKind::Deleting => {
             state.is_none_or(|state| matches!(state, SessionState::DestroyedWithDataLoss))
         }
     }
@@ -2269,11 +2271,11 @@ mod tests {
             Some(SessionState::Running)
         ));
         assert!(!remote_lifecycle_settled(
-            SessionOperationKind::Stopping,
+            SessionOperationKind::Finishing,
             Some(SessionState::Running)
         ));
         assert!(remote_lifecycle_settled(
-            SessionOperationKind::Stopping,
+            SessionOperationKind::Finishing,
             Some(SessionState::Stopped)
         ));
         assert!(remote_lifecycle_settled(
@@ -2285,7 +2287,7 @@ mod tests {
             None
         ));
         assert!(remote_lifecycle_settled(
-            SessionOperationKind::Destroying,
+            SessionOperationKind::Deleting,
             None
         ));
     }

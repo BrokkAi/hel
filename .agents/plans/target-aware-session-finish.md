@@ -17,7 +17,7 @@ The visible proof is a local Podman session whose chat can be left without stopp
 - [x] (2026-08-31 12:51Z) Read the current chat navigation, dashboard lifecycle, checkpoint/close, target teardown, saved-session, phone viewer, documentation, and test paths.
 - [x] (2026-08-31 12:51Z) Resolved the first-version product model: one Finish intent, target-specific consequences derived from ownership already encoded by the target kind, and no new per-session policy choice.
 - [x] (2026-08-31 13:57Z) Implemented the shared finish-effect model and distinguished a finish checkpoint from an ordinary recovery checkpoint. Focused checkpoint tests passed on the container's `aarch64-unknown-linux-gnu` host target.
-- [ ] Replace the terminal UI's hidden Stop workflow with target-aware Finish, Saved, and Delete language, and make leave-running behavior explicit.
+- [x] (2026-08-31 14:34Z) Replaced the terminal UI's hidden Stop workflow with target-aware Finish, Saved, and Delete language, and made leave-running behavior explicit. The complete TUI suite and termination PTY tests pass.
 - [ ] Bring the phone viewer and its controller action schema to the same lifecycle model without exposing private target locators.
 - [ ] Publish the lifecycle guidance, update behavioral and end-to-end tests, run the complete validation suite, and record results here.
 
@@ -43,6 +43,9 @@ The visible proof is a local Podman session whose chat can be left without stopp
 
 - Observation: this disposable container includes an aarch64 Rust toolchain but not the repository's default `x86_64-unknown-linux-musl` standard library.
   Evidence: the default focused test failed with “can't find crate for `core`”; the same tests pass with `--target aarch64-unknown-linux-gnu`, as prescribed for non-x86_64 hosts in `AGENTS.md`.
+
+- Observation: a chat reducer knows only the currently open conversation, while the dashboard reducer owns the workspace-wide live-session count required by the quit warning.
+  Evidence: `src/hel_chat.rs` emits `ChatEventOutcome::QuitDetach` without a workspace snapshot; `crates/hel-cli/src/dashboard.rs` receives that outcome, persists the draft, returns to the dashboard state, and can then call `DashboardState::request_quit` with the full session map.
 
 ## Decision Log
 
@@ -86,11 +89,17 @@ The visible proof is a local Podman session whose chat can be left without stopp
   Rationale: the warning prevents accidental resource leaks. Finishing multiple independent sessions is destructive, slow, and failure-prone, and must remain a set of supervised per-session operations rather than hidden work on the terminal event loop.
   Date/Author: 2026-08-31 / Codex
 
+- Decision: Handle Ctrl+Q from chat at the dashboard driver boundary: first persist the draft and leave chat, then either quit immediately or display the workspace-wide keep-running confirmation.
+  Rationale: this preserves the chat reducer's narrow responsibility and ensures the warning counts every live session rather than only the conversation that happened to be open. No checkpoint or lifecycle operation is started by this navigation path.
+  Date/Author: 2026-08-31 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 established the core contract without changing an existing UI action. All six live target locators now map to a privacy-safe `SessionFinishEffect` and target-specific copy. Relay protocol 7 carries `CheckpointPurpose::Finish`; older durable commands still decode as Recovery, and a close against an older live worker first replaces that worker. A Finish barrier waits for the active effect, preserves previously accepted queued prompts in the canonical archive projection, rejects new work, and resumes the queue if its controller disconnects. A database-backed lifecycle test also proves that failed Finish export leaves the target and Running state intact and never invokes the target teardown command.
 
-The focused checkpoint run passed 120 tests (one ignored), including relay runtime and controller latch coverage. The four named Finish/recovery state-machine tests, archive projection test, target-effect test, backward-serde test, and failed-export lifecycle path pass on `aarch64-unknown-linux-gnu`. The remaining work is the terminal and phone vocabulary/actions, quit warning, documentation, and end-to-end validation.
+The focused checkpoint run passed 120 tests (one ignored), including relay runtime and controller latch coverage. The four named Finish/recovery state-machine tests, archive projection test, target-effect test, backward-serde test, and failed-export lifecycle path pass on `aarch64-unknown-linux-gnu`.
+
+Milestone 2 made Finish a direct Ctrl+F action with a consequence and primary button derived from the exact live target. Stop no longer appears in Edit. Chat advertises `/dashboard` and Ctrl+G as navigation that leaves the worker running, while `/detach` remains a hidden compatibility alias. Quit now starts on Cancel whenever live sessions would remain. Inactive rows live under Saved sessions, which explains that they run no workers and retain local disk; Hide and Delete permanently now describe their actual effects. The complete `hel-tui` suite passed 199 tests (one ignored), the focused CLI dashboard tests passed 16 tests, and both termination PTY tests passed on `aarch64-unknown-linux-gnu`. The remaining work is phone convergence, documentation, browser/end-to-end coverage, and repository-wide validation.
 
 ## Context and Orientation
 
@@ -349,3 +358,5 @@ Revision note (2026-08-31): Initial plan created after tracing the current detac
 Revision note (2026-08-31): Milestone 1 source inspection corrected the queue design. Pending checkpoint barriers already freeze unstarted queue entries; the plan now adds a Finish purpose solely to reject new work and protect the exact checkpoint cut.
 
 Revision note (2026-08-31): Milestone 1 completed with protocol 7, backward-compatible Recovery decoding, automatic worker replacement for old Finish peers, privacy-safe target effects, canonical queue preservation, cancellation recovery, and verify-before-teardown coverage.
+
+Revision note (2026-08-31): Milestone 2 completed with target-aware terminal Finish, explicit leave-running navigation and quit behavior, Saved/Hide/Delete vocabulary, and passing TUI, CLI dashboard, and PTY coverage.

@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 
 use hel::hel_chat::Notices;
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate as HelTargetTemplate};
+use hel::hel_controller::session_finish_effect;
 use hel::hel_quota::ProfileQuota;
 use hel::hel_selection::FrameSurfaces;
 use hel::hel_state::{
@@ -21,7 +22,7 @@ use hel::hel_state::{
 use hel::hel_targets::AdditionalMount;
 
 use crate::dialogs::{
-    ConfigIdEditor, ConfirmDialog, Confirmation, ContainerEditor, FORCE_STOP_CONFIRMATION,
+    ConfigIdEditor, ConfirmDialog, Confirmation, ContainerEditor, FORCE_FINISH_CONFIRMATION,
     ImportBundleConfirmation, ImportProgress, RenameEditor, RenameFocus, RepositoryOriginDialog,
     SessionEditDialog, TargetActionsDialog, WebDialog,
 };
@@ -117,13 +118,13 @@ pub enum DashboardAction {
     CreateBundle {
         source: String,
     },
-    Close {
+    Finish {
         session_id: String,
     },
     ForceStop {
         session_id: String,
     },
-    DestroyStopped {
+    DeleteSaved {
         session_id: String,
     },
     RenameSession {
@@ -203,8 +204,8 @@ pub enum WebViewerAccess {
 pub enum SessionOperationKind {
     Launching,
     Resuming,
-    Stopping,
-    Destroying,
+    Finishing,
+    Deleting,
     Connecting,
     Importing,
 }
@@ -214,8 +215,8 @@ impl SessionOperationKind {
         match self {
             Self::Launching => "Launch",
             Self::Resuming => "Resuming",
-            Self::Stopping => "Stopping",
-            Self::Destroying => "Destroying",
+            Self::Finishing => "Finishing",
+            Self::Deleting => "Deleting",
             Self::Connecting => "Connecting",
             Self::Importing => "Importing",
         }
@@ -303,8 +304,8 @@ pub struct DashboardState {
     /// Sessions whose relay worker the controller currently cannot reach. Their
     /// summary band renders red so an unreachable target is obvious at a glance.
     pub(crate) unreachable_sessions: BTreeSet<String>,
-    /// Sessions with a second opinion in progress. Stopping one destroys its
-    /// target, and the reviewer's conversation goes with it, so the stop
+    /// Sessions with a second opinion in progress. Finishing one releases its
+    /// target, and the reviewer's conversation goes with it, so the Finish
     /// confirmation says so first.
     pub(crate) sessions_with_review: BTreeSet<String>,
     pub(crate) project_sources: BTreeMap<String, ProjectSourceIdentity>,
@@ -413,10 +414,10 @@ impl DashboardState {
             return DashboardAction::None;
         }
         if dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('q') {
-            return DashboardAction::QuitDetach;
+            return self.request_quit();
         }
         if !text_focused && dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('c') {
-            return DashboardAction::QuitDetach;
+            return self.request_quit();
         }
         if !text_focused && dashboard_accelerator(key.modifiers) && key.code == KeyCode::Char('w') {
             return DashboardAction::OpenWorkspacePicker;
@@ -470,7 +471,7 @@ impl DashboardState {
             Mode::New(wizard) => wizard.text_input_focused(),
             Mode::Resume(wizard) => wizard.text_input_focused(),
             Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::ForceStop { .. },
+                confirmation: Confirmation::ForceFinish { .. },
                 ..
             }) => true,
             _ => false,
@@ -508,10 +509,10 @@ impl DashboardState {
                 }
             }
             Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::ForceStop { typed, .. },
+                confirmation: Confirmation::ForceFinish { typed, .. },
                 ..
             }) => {
-                let remaining = FORCE_STOP_CONFIRMATION.len().saturating_sub(typed.len());
+                let remaining = FORCE_FINISH_CONFIRMATION.len().saturating_sub(typed.len());
                 typed.extend(
                     pasted
                         .chars()
@@ -629,7 +630,7 @@ impl DashboardState {
         let command = dashboard_accelerator(key.modifiers);
         match (key.code, command) {
             (KeyCode::Char('q') | KeyCode::Char('c'), true) | (KeyCode::Esc, _) => {
-                DashboardAction::QuitDetach
+                self.request_quit()
             }
             (KeyCode::Tab, _) => {
                 self.cycle_focus(false);
@@ -670,6 +671,10 @@ impl DashboardState {
                 DashboardAction::None
             }
             (KeyCode::Char('n'), true) if self.focus == Focus::Active => self.begin_new(),
+            (KeyCode::Char('f'), true) if self.focus == Focus::Active => {
+                self.begin_finish();
+                DashboardAction::None
+            }
             (KeyCode::Char('x'), true) if self.focus == Focus::Active => {
                 let operation = self.selected_session().and_then(|session| {
                     self.session_operations
@@ -771,6 +776,54 @@ impl DashboardState {
             return None;
         }
         self.ordered_sessions().get(self.session_index).copied()
+    }
+
+    pub fn request_quit(&mut self) -> DashboardAction {
+        let live_sessions = self
+            .state
+            .sessions
+            .values()
+            .filter(|session| session.state.is_active())
+            .count();
+        if live_sessions == 0 {
+            DashboardAction::QuitDetach
+        } else {
+            self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::QuitKeepRunning {
+                live_sessions,
+            }));
+            DashboardAction::None
+        }
+    }
+
+    fn begin_finish(&mut self) {
+        if self.reject_selected_operation() {
+            return;
+        }
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let effect = match session_finish_effect(session) {
+            Ok(effect) => effect,
+            Err(error) => {
+                self.notices
+                    .set(format!("This session cannot be finished: {error:#}"));
+                return;
+            }
+        };
+        let session_id = session.id.clone();
+        let session_title = session.display_title().to_owned();
+        let queued_items = self
+            .session_details
+            .get(&session_id)
+            .map_or(0, |detail| detail.queued_prompts.len());
+        let reviewer_conversation = self.sessions_with_review.contains(&session_id);
+        self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Finish {
+            session_id,
+            session_title,
+            effect,
+            queued_items,
+            reviewer_conversation,
+        }));
     }
 
     /// The sessions the dashboard lists, in creation order. Only live
@@ -1121,9 +1174,7 @@ mod tests {
 
     #[test]
     fn dashboard_actions_require_control_while_navigation_does_not() {
-        let mut session = stopped_session();
-        session.state = SessionState::Running;
-        let mut dashboard = dashboard_with_session(session);
+        let mut dashboard = dashboard_with_session(running_session());
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('n'))),
@@ -1150,10 +1201,19 @@ mod tests {
             dashboard.handle_key(ctrl_key('v')),
             DashboardAction::PasteFromClipboard
         );
+        assert_eq!(dashboard.handle_key(ctrl_key('q')), DashboardAction::None);
+        assert!(matches!(
+            dashboard.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::QuitKeepRunning { live_sessions: 1 },
+                focus: 0,
+            })
+        ));
         assert_eq!(
-            dashboard.handle_key(ctrl_key('q')),
-            DashboardAction::QuitDetach
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
         );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Tab)),
@@ -1268,15 +1328,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_q_quits_without_mutating_any_dashboard_modal() {
+    fn ctrl_q_quits_immediately_without_live_sessions_and_warns_with_one() {
         let mut new_session = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         assert_eq!(new_session.handle_key(ctrl_key('n')), DashboardAction::None);
 
         let mut resume = dashboard_with_session(stopped_session());
         assert_eq!(open_resume_wizard(&mut resume), DashboardAction::None);
 
-        let mut running = stopped_session();
-        running.state = SessionState::Running;
+        let mut running = running_session();
         running.checkpoint = None;
         let mut rename = dashboard_with_session(running);
         assert_eq!(rename.handle_key(ctrl_key('e')), DashboardAction::None);
@@ -1301,7 +1360,6 @@ mod tests {
             ("new session", new_session),
             ("resume", resume),
             ("resume dialog", resume_dialog),
-            ("rename", rename),
             ("import progress", importing),
             ("import confirmation", confirm_import),
             ("confirmation", confirm),
@@ -1316,6 +1374,23 @@ mod tests {
             );
             assert_eq!(dashboard.mode, mode_before_quit, "{label}");
         }
+
+        assert_eq!(rename.handle_key(ctrl_key('q')), DashboardAction::None);
+        assert!(matches!(
+            rename.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::QuitKeepRunning { live_sessions: 1 },
+                focus: 0,
+            })
+        ));
+        assert_eq!(
+            rename.handle_key(key(KeyCode::Right)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            rename.handle_key(key(KeyCode::Enter)),
+            DashboardAction::QuitDetach
+        );
     }
 
     #[test]
@@ -1840,10 +1915,10 @@ mod tests {
         assert_eq!(dashboard.selected_session().unwrap().id, "new-session");
     }
 
-    /// Stopping the last session empties the dashboard rather than moving the
+    /// Finishing the last session empties the dashboard rather than moving the
     /// row to another pane: it belongs to the resume dialog now.
     #[test]
-    fn stopping_the_last_session_empties_the_dashboard_and_panes_still_cycle() {
+    fn finishing_the_last_session_empties_the_dashboard_and_panes_still_cycle() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);

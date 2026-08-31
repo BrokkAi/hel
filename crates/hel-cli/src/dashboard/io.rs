@@ -1030,7 +1030,7 @@ impl DashboardContext {
                 Ok(hidden) => self.dashboard.set_hidden_native_sessions(hidden),
                 Err(error) => self
                     .dashboard
-                    .set_notice(format!("Could not read archived sessions: {error}")),
+                    .set_notice(format!("Could not read hidden sessions: {error}")),
             },
             DashboardIoUpdate::ArchiveWrite {
                 what,
@@ -1039,7 +1039,7 @@ impl DashboardContext {
             } => {
                 if let Err(error) = result {
                     self.dashboard
-                        .set_notice(format!("Could not archive {what}: {error}"));
+                        .set_notice(format!("Could not update hidden state for {what}: {error}"));
                     // The optimistic update no longer matches storage, so the
                     // row it moved goes back where storage still has it.
                     if revert_archive_write(
@@ -1447,24 +1447,27 @@ impl DashboardContext {
                 ));
                 self.request_quota_refresh();
             }
-            Ok(LifecycleSuccess::Closed) => {
-                self.dashboard
-                    .set_notice(format!("Stopped {}", short_id(&session_id)));
+            Ok(LifecycleSuccess::Finished { effect }) => {
+                self.dashboard.set_notice(format!(
+                    "Session saved; {}. Open Saved sessions with Ctrl+S.",
+                    effect.completed_summary()
+                ));
             }
             Ok(LifecycleSuccess::ForceStopped) => self.dashboard.set_notice(format!(
-                "Force-stopped {} at its latest recovery archive",
+                "Force-finished {} at its latest recovery archive",
                 short_id(&session_id)
             )),
             Ok(LifecycleSuccess::DestroyedStopped) => self.dashboard.set_notice(format!(
-                "Permanently destroyed stopped session {}",
+                "Permanently deleted saved session {}",
                 short_id(&session_id)
             )),
             Err(error) => {
                 if operation
                     .as_ref()
-                    .is_some_and(|operation| operation.kind == SessionOperationKind::Stopping)
+                    .is_some_and(|operation| operation.kind == SessionOperationKind::Finishing)
                 {
-                    self.dashboard.show_close_failure(session_id.clone(), error);
+                    self.dashboard
+                        .show_finish_failure(session_id.clone(), error);
                 } else {
                     let label = operation
                         .as_ref()

@@ -65,6 +65,17 @@ impl SessionFinishEffect {
             Self::TerminateAwsEc2Instance => "Terminate instance and save",
         }
     }
+
+    pub const fn completed_summary(self) -> &'static str {
+        match self {
+            Self::StopLocalBareWorker => "local worker stopped",
+            Self::RemoveLocalPodmanContainer => "local Podman container removed",
+            Self::RemoveAppleContainer => "Apple container removed",
+            Self::StopRemoteBareWorker => "remote worker stopped; host preserved",
+            Self::RemoveRemotePodmanContainer => "remote Podman container removed; host preserved",
+            Self::TerminateAwsEc2Instance => "EC2 session instance terminated",
+        }
+    }
 }
 
 /// Classify the exact live resource a successful finish will release.
@@ -603,7 +614,12 @@ mod tests {
             session.target = Some(target);
             let effect = session_finish_effect(&session).unwrap();
             assert_eq!(effect, expected);
-            let rendered = format!("{} {}", effect.consequence(), effect.primary_action());
+            let rendered = format!(
+                "{} {} {}",
+                effect.consequence(),
+                effect.primary_action(),
+                effect.completed_summary()
+            );
             assert!(!rendered.contains("private"), "{rendered}");
         }
 
