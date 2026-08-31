@@ -44,8 +44,13 @@ function expectedManifest(manifest) {
 }
 
 const command = process.argv[2];
+const releaseTag = process.argv[3];
 if (command !== "sync" && command !== "check") {
-  console.error("usage: node scripts/release-version.mjs <sync|check>");
+  console.error("usage: node scripts/release-version.mjs <sync|check> [vX.Y.Z]");
+  process.exit(2);
+}
+if (command === "sync" && releaseTag) {
+  console.error("sync does not accept a release tag");
   process.exit(2);
 }
 
@@ -59,7 +64,22 @@ if (command === "check") {
     );
     process.exit(1);
   }
-  console.log(`workspace release versions match ${version}`);
+  if (releaseTag) {
+    const match = /^v(\d+\.\d+\.\d+)$/.exec(releaseTag);
+    if (!match) {
+      console.error(`release tag must look like vX.Y.Z, got: ${releaseTag}`);
+      process.exit(1);
+    }
+    if (match[1] !== version) {
+      console.error(
+        `release tag ${releaseTag} does not match workspace version v${version}`,
+      );
+      process.exit(1);
+    }
+    console.log(`release tag ${releaseTag} matches workspace release versions`);
+  } else {
+    console.log(`workspace release versions match ${version}`);
+  }
 } else {
   fs.writeFileSync(manifestPath, updated);
   console.log(`synchronized workspace dependency versions to ${version}`);
