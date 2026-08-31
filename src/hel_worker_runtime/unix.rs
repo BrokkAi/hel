@@ -2303,12 +2303,11 @@ where
 }
 
 /// Signal a whole process group. Terminals reuse this so process-group
-/// termination lives in one place.
+/// termination lives in one place. A group that is already gone counts as
+/// success; anything else is reported rather than dropped.
 pub(crate) fn terminate_process_group(pid: i32, signal: i32) {
-    // SAFETY: a negative, validated child PID targets only the process
-    // group created for this supervisor's child.
-    unsafe {
-        libc::kill(-pid, signal);
+    if let Err(error) = crate::hel_subprocess::signal_process_group(pid, signal) {
+        tracing::warn!(pid, signal, %error, "could not signal process group");
     }
 }
 

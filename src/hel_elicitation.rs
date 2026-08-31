@@ -80,6 +80,195 @@ impl ElicitationRequest {
             fields,
         })
     }
+
+    /// Whether a submitted answer satisfies this request's own schema.
+    ///
+    /// Surfaces that answer a form out of band — the phone posts an answer
+    /// over HTTP — can send content for a request the agent has already
+    /// replaced, or content the agent never offered. Checking the answer
+    /// against the fields this request actually published means a stale or
+    /// malformed payload is refused instead of being forwarded as something
+    /// the harness never asked for.
+    pub fn validate_response(&self, response: &ElicitationResponse) -> Result<(), String> {
+        let ElicitationResponse::Accept { content } = response else {
+            return Ok(());
+        };
+        for id in content.keys() {
+            if !self.fields.iter().any(|field| field.id == *id) {
+                return Err(format!("{id:?} is not a field of this request"));
+            }
+        }
+        for field in &self.fields {
+            let Some(value) = content.get(&field.id) else {
+                if field.required && !self.custom_answer_present(field, content) {
+                    return Err(format!("{} is required", field.title));
+                }
+                continue;
+            };
+            if field.required
+                && let ElicitationValue::String(text) = value
+                && text.trim().is_empty()
+            {
+                return Err(format!("{} is required", field.title));
+            }
+            validate_field_value(field, value)?;
+        }
+        Ok(())
+    }
+
+    /// Whether another field carries a custom "Other" answer for `field`.
+    ///
+    /// A custom answer replaces the select it belongs to, so the select's own
+    /// value may then be absent even when the schema marks it required. This
+    /// is the same pairing the chat form applies when it submits.
+    fn custom_answer_present(
+        &self,
+        field: &ElicitationField,
+        content: &BTreeMap<String, ElicitationValue>,
+    ) -> bool {
+        self.fields.iter().any(|candidate| {
+            candidate.custom_answer_for.as_deref() == Some(field.id.as_str())
+                && matches!(
+                    content.get(&candidate.id),
+                    Some(ElicitationValue::String(value)) if !value.trim().is_empty()
+                )
+        })
+    }
+}
+
+/// Whether one answered value satisfies the constraints of the field it
+/// answers. Presence and required-ness are the caller's business: this checks
+/// only that the value the caller does have is one the schema allows.
+pub fn validate_field_value(
+    field: &ElicitationField,
+    value: &ElicitationValue,
+) -> Result<(), String> {
+    match (&field.kind, value) {
+        (
+            ElicitationFieldKind::Text {
+                min_length,
+                max_length,
+                pattern,
+                format,
+                ..
+            },
+            ElicitationValue::String(value),
+        ) => {
+            let length = value.chars().count();
+            if min_length.is_some_and(|minimum| length < minimum) {
+                return Err(format!("{} is too short", field.title));
+            }
+            if max_length.is_some_and(|maximum| length > maximum) {
+                return Err(format!("{} is too long", field.title));
+            }
+            if pattern.as_ref().is_some_and(|pattern| {
+                !regex::Regex::new(pattern)
+                    .expect("validated pattern")
+                    .is_match(value)
+            }) {
+                return Err(format!(
+                    "{} does not match the required format",
+                    field.title
+                ));
+            }
+            if let Some(format) = format {
+                validate_text_format(value, format)
+                    .map_err(|message| format!("{} {message}", field.title))?;
+            }
+            Ok(())
+        }
+        (ElicitationFieldKind::SingleSelect { options, .. }, ElicitationValue::String(value)) => {
+            if options.iter().any(|option| option.value == *value) {
+                Ok(())
+            } else {
+                Err(format!("{} is not one of the offered options", field.title))
+            }
+        }
+        (
+            ElicitationFieldKind::MultiSelect {
+                options,
+                min_items,
+                max_items,
+                ..
+            },
+            ElicitationValue::StringArray(values),
+        ) => {
+            if min_items.is_some_and(|minimum| values.len() < minimum) {
+                return Err(format!("{} needs more selections", field.title));
+            }
+            if max_items.is_some_and(|maximum| values.len() > maximum) {
+                return Err(format!("{} has too many selections", field.title));
+            }
+            if values
+                .iter()
+                .all(|value| options.iter().any(|option| option.value == *value))
+            {
+                Ok(())
+            } else {
+                Err(format!("{} is not one of the offered options", field.title))
+            }
+        }
+        (ElicitationFieldKind::Boolean { .. }, ElicitationValue::Boolean(_)) => Ok(()),
+        (
+            ElicitationFieldKind::Integer {
+                minimum, maximum, ..
+            },
+            ElicitationValue::Integer(value),
+        ) => {
+            if minimum.is_some_and(|minimum| *value < minimum)
+                || maximum.is_some_and(|maximum| *value > maximum)
+            {
+                return Err(format!("{} is outside the allowed range", field.title));
+            }
+            Ok(())
+        }
+        (
+            ElicitationFieldKind::Number {
+                minimum, maximum, ..
+            },
+            value @ (ElicitationValue::Number(_) | ElicitationValue::Integer(_)),
+        ) => {
+            // JSON carries a whole number for a `number` field as an integer,
+            // and an untagged decode reports it as one, so both arrive here.
+            #[allow(clippy::cast_precision_loss)]
+            let value = match value {
+                ElicitationValue::Number(value) => *value,
+                ElicitationValue::Integer(value) => *value as f64,
+                _ => unreachable!("matched number or integer"),
+            };
+            if !value.is_finite()
+                || minimum.is_some_and(|minimum| value < minimum)
+                || maximum.is_some_and(|maximum| value > maximum)
+            {
+                return Err(format!("{} is outside the allowed range", field.title));
+            }
+            Ok(())
+        }
+        _ => Err(format!("{} has an incompatible value", field.title)),
+    }
+}
+
+/// String formats the ACP schema can request. Unknown formats are accepted:
+/// the schema keyword is open-ended and refusing an answer over a format Hel
+/// does not model would block a question the agent can otherwise use.
+fn validate_text_format(value: &str, format: &str) -> Result<(), &'static str> {
+    match format {
+        "email"
+            if !value.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
+            }) =>
+        {
+            Err("must be an email address")
+        }
+        "uri" if url::Url::parse(value).is_err() => Err("must be a URI"),
+        "date" if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err() => {
+            Err("must be a YYYY-MM-DD date")
+        }
+        "date-time" if chrono::DateTime::parse_from_rfc3339(value).is_err() => {
+            Err("must be an RFC 3339 date-time")
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -548,6 +737,128 @@ mod tests {
         assert_eq!(
             request.fields[0].custom_answer_for.as_deref(),
             Some("token")
+        );
+    }
+
+    fn numeric_request() -> ElicitationRequest {
+        ElicitationRequest::from_acp_params(
+            "elicit-3",
+            json!({
+                "sessionId": "session-1",
+                "mode": "form",
+                "message": "Size the run",
+                "requestedSchema": {
+                    "type": "object",
+                    "required": ["workers"],
+                    "properties": {
+                        "workers": {"type": "integer", "minimum": 1, "maximum": 8},
+                        "ratio": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "targets": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 2,
+                            "items": {"enum": ["linux", "macos", "windows"]}
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap()
+    }
+
+    fn accept(pairs: Vec<(&str, ElicitationValue)>) -> ElicitationResponse {
+        ElicitationResponse::Accept {
+            content: pairs
+                .into_iter()
+                .map(|(id, value)| (id.to_owned(), value))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn answers_must_satisfy_the_requested_schema() {
+        let request = numeric_request();
+        assert!(
+            request
+                .validate_response(&accept(vec![("workers", ElicitationValue::Integer(4))]))
+                .is_ok()
+        );
+        // A whole number for a `number` field decodes as an integer, so both
+        // shapes have to reach the range check rather than the type error.
+        assert!(
+            request
+                .validate_response(&accept(vec![
+                    ("workers", ElicitationValue::Integer(4)),
+                    ("ratio", ElicitationValue::Integer(1)),
+                ]))
+                .is_ok()
+        );
+        assert!(
+            request
+                .validate_response(&accept(vec![
+                    ("workers", ElicitationValue::Integer(4)),
+                    ("ratio", ElicitationValue::Number(1.5)),
+                ]))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_response(&accept(vec![("workers", ElicitationValue::Integer(9))]))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_response(&accept(vec![(
+                    "workers",
+                    ElicitationValue::String("four".into())
+                )]))
+                .is_err()
+        );
+        // Required means required; declining and cancelling carry no content.
+        assert!(request.validate_response(&accept(Vec::new())).is_err());
+        assert!(
+            request
+                .validate_response(&ElicitationResponse::Decline)
+                .is_ok()
+        );
+        assert!(
+            request
+                .validate_response(&ElicitationResponse::Cancel)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn multi_select_answers_honour_membership_and_item_counts() {
+        let request = numeric_request();
+        let with_targets = |values: Vec<&str>| {
+            accept(vec![
+                ("workers", ElicitationValue::Integer(2)),
+                (
+                    "targets",
+                    ElicitationValue::StringArray(values.into_iter().map(str::to_owned).collect()),
+                ),
+            ])
+        };
+        assert!(
+            request
+                .validate_response(&with_targets(vec!["linux"]))
+                .is_ok()
+        );
+        assert!(
+            request
+                .validate_response(&with_targets(vec!["linux", "macos", "windows"]))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_response(&with_targets(Vec::new()))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_response(&with_targets(vec!["plan9"]))
+                .is_err()
         );
     }
 

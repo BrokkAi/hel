@@ -379,6 +379,21 @@ struct SessionRowsRendered {
     project_heading_areas: Vec<(String, Rect)>,
 }
 
+fn active_pane_title(width: u16) -> &'static str {
+    const FULL: &str = " Active · P=time since prompt · S=time since agent activity ";
+    const MEDIUM: &str = " Active · P=prompt age · S=agent silence ";
+    const COMPACT: &str = " Active P=prompt S=silence ";
+
+    let available = usize::from(width.saturating_sub(2));
+    if available >= FULL.chars().count() {
+        FULL
+    } else if available >= MEDIUM.chars().count() {
+        MEDIUM
+    } else {
+        COMPACT
+    }
+}
+
 fn session_row_spacing(
     dashboard: &DashboardState,
     active: &[String],
@@ -575,7 +590,7 @@ fn render_sessions(
         Block::default()
             .borders(Borders::ALL)
             .border_type(focus_border(active_focused))
-            .title(" Active "),
+            .title(active_pane_title(active_area.width)),
     );
     let mut active_state = TableState::default()
         .with_selected((dashboard.session_index < active.len()).then_some(dashboard.session_index));
@@ -765,7 +780,7 @@ fn dashboard_agent_prefixes(now_epoch_seconds: u64, detail: Option<&SessionDetai
         .max(turn_started);
     [
         format!(
-            "T {:>DASHBOARD_CLOCK_WIDTH$}",
+            "P {:>DASHBOARD_CLOCK_WIDTH$}",
             compact_dashboard_clock(now_epoch_seconds.saturating_sub(turn_started))
         ),
         format!(
@@ -1585,13 +1600,10 @@ mod tests {
         assert!(!rendered.contains("Turn clock"));
         assert!(!rendered.contains("Session name"));
         assert!(rendered.contains("podman  [Q 1]  codex-1  ACP pretty name"));
-        assert!(!rendered.contains("  Turn "));
-        assert!(!rendered.contains("  Step "));
+        assert!(rendered.contains("Active · P=time since prompt · S=time since agent activity"));
         assert!(rendered.contains("  codex-1  ACP pretty name"));
         assert!(!rendered.contains("queued]"));
         assert!(rendered.contains("You: question 1"));
-        assert!(rendered.contains("T "));
-        assert!(rendered.contains("S "));
         assert!(rendered.contains("answer 1"));
 
         let buffer = terminal.backend().buffer();
@@ -1760,7 +1772,7 @@ mod tests {
 
         assert_eq!(
             dashboard_agent_prefixes(1_330, Some(&detail)),
-            ["T  5m30s", "S    33s"]
+            ["P  5m30s", "S    33s"]
         );
         assert_eq!(compact_dashboard_clock(99 * 60 + 59), "99m59s");
         assert_eq!(compact_dashboard_clock(100 * 60 + 59), "100m");
@@ -2189,7 +2201,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("Terminal too small"));
-        assert!(rendered.contains("Active"));
+        assert!(rendered.contains("Active · P=time since prompt · S=time since agent activity"));
         assert!(rendered.contains("Profile Quotas"));
     }
 
@@ -2223,7 +2235,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("Terminal too small"));
-        assert!(rendered.contains("Active"));
+        assert!(rendered.contains("Active P=prompt S=silence"));
     }
 
     #[test]

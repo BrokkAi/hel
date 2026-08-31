@@ -29,7 +29,7 @@ use hel::hel_session_manager::{
 };
 use hel::hel_state::{
     HelState, ManagedSessionSnapshot, MaterializedSession, SessionRecord,
-    SessionResourceAllocation, SessionState, normalize_session_title,
+    SessionResourceAllocation, SessionState,
 };
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
@@ -1536,11 +1536,7 @@ pub(crate) fn apply_worker_record_update(
     let Some(session) = controller.state.sessions.get(&update.session_id) else {
         return Ok(false);
     };
-    let projected_title = snapshot
-        .materialized
-        .session_title
-        .as_deref()
-        .and_then(normalize_session_title);
+    let projected_title = snapshot.materialized.resolved_title();
     let changed_title =
         (session.acp_session_title != projected_title).then(|| projected_title.clone());
     let mut changed = false;
