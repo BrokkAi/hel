@@ -106,10 +106,9 @@ keyboard in Prompt, so a sweep has to Tab first or the letters land in the
 composer as text. Tab walks Sessions, Quota, Targets, Prompt; Shift+Tab
 reverses it. Ctrl+G is a three-position dial over the panes: every pane open,
 then Targets and Quota collapsed to one row each, then those plus the session
-list down to one line per session, then back to the first. It only moves the
-keyboard when the position it lands on collapses the pane the keyboard was on.
-Tab leaves the dial alone except from the last position, where it opens one
-position and lands on Sessions. F2 is Workspaces, F3 is the web viewer, Ctrl+Q
+list down to one line per session, then back to the first. It always leaves
+the keyboard in Prompt. Tab leaves the dial alone except from the last
+position, where it opens one position and lands on Sessions. F2 is Workspaces, F3 is the web viewer, Ctrl+Q
 detaches.
 
 Escape no longer quits. It cancels a running turn or a shell command and closes

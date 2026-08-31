@@ -166,6 +166,9 @@ room than the last, and it wraps back to the first:
    load, profile names with weekly quota remaining;
 3. those, and the session list down to one line per session.
 
+`Ctrl+G` always leaves the keyboard in Prompt: asking for room around the
+conversation and asking to work in it are the same gesture.
+
 Tab leaves the dial where you set it, with one exception: from the third
 position, asking for another pane is asking for the session list back, so Tab
 opens the dial one position and lands on Sessions.

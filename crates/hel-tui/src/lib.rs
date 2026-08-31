@@ -554,15 +554,13 @@ impl DashboardState {
     /// Turns the dial one position, giving the conversation more room each
     /// time and wrapping back to every pane open.
     ///
-    /// It only moves the keyboard when the position it lands on collapses the
-    /// pane the keyboard was on, because that pane becomes a summary with
-    /// nothing to drive. Focus on Sessions or the composer is left where it
-    /// is: the user asked for room, not for their place to move.
+    /// It always hands the keyboard to the composer. Asking for room around
+    /// the conversation and asking to work in it are the same gesture, so the
+    /// dial takes the user there rather than leaving them on a pane they were
+    /// only passing through.
     pub fn cycle_pane_layout(&mut self) {
         self.layout = self.layout.cycled();
-        if self.layout.support_collapsed() && matches!(self.focus, Focus::Targets | Focus::Quota) {
-            self.focus = Focus::Prompt;
-        }
+        self.focus = Focus::Prompt;
         self.clamp_selections();
     }
 
@@ -1651,28 +1649,19 @@ mod tests {
         }
     }
 
-    /// Turning the dial is about room on the screen, not about where the
-    /// keyboard is. It only moves focus off a pane the new position has just
-    /// turned into a summary.
+    /// Asking for room around the conversation and asking to work in it are
+    /// the same gesture, so the dial always lands in the composer.
     #[test]
-    fn ctrl_g_only_moves_focus_off_a_pane_it_collapses() {
+    fn ctrl_g_always_hands_the_keyboard_to_the_composer() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
 
-        for start in [Focus::Targets, Focus::Quota] {
-            let mut dashboard = dashboard_with_session(session.clone());
-            dashboard.focus = start;
-            dashboard.handle_key(ctrl_key('g'));
-            assert!(dashboard.pane_layout().support_collapsed());
-            assert_eq!(dashboard.focus, Focus::Prompt, "{start:?}");
-        }
-
-        for start in [Focus::Sessions, Focus::Prompt] {
+        for start in [Focus::Sessions, Focus::Prompt, Focus::Targets, Focus::Quota] {
             let mut dashboard = dashboard_with_session(session.clone());
             dashboard.focus = start;
             for _ in 0..3 {
-                dashboard.handle_key(ctrl_key('g'));
-                assert_eq!(dashboard.focus, start, "the dial left {start:?} alone");
+                assert_eq!(dashboard.handle_key(ctrl_key('g')), DashboardAction::None);
+                assert_eq!(dashboard.focus, Focus::Prompt, "from {start:?}");
             }
             assert_eq!(dashboard.pane_layout(), PaneLayout::Expanded);
         }
@@ -1688,9 +1677,9 @@ mod tests {
         let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(ctrl_key('g'));
         assert_eq!(dashboard.pane_layout(), PaneLayout::SupportCollapsed);
-        assert_eq!(dashboard.focus, Focus::Sessions);
+        assert_eq!(dashboard.focus, Focus::Prompt);
 
-        for expected in [Focus::Prompt, Focus::Sessions, Focus::Prompt] {
+        for expected in [Focus::Sessions, Focus::Prompt, Focus::Sessions] {
             dashboard.handle_key(key(KeyCode::Tab));
             assert_eq!(dashboard.focus, expected);
             assert_eq!(
@@ -1699,7 +1688,7 @@ mod tests {
                 "Tab left the dial where the user set it"
             );
         }
-        for expected in [Focus::Sessions, Focus::Prompt] {
+        for expected in [Focus::Prompt, Focus::Sessions] {
             dashboard.handle_key(key(KeyCode::BackTab));
             assert_eq!(dashboard.focus, expected);
             assert_eq!(dashboard.pane_layout(), PaneLayout::SupportCollapsed);
