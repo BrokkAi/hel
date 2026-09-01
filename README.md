@@ -133,8 +133,8 @@ to build your own.
 
 1. Run `hel`. The first run creates a named workspace and opens a plain-terminal setup dialog: it finds your
    local harness homes, checks that credentials look present, detects the
-   current GitHub repository, recommends a container runtime, and writes
-   `config.toml` after you confirm.
+   current GitHub repository, configures each usable local container runtime
+   as its own target, and writes `config.toml` after you confirm.
 2. Run `hel doctor` (or `hel doctor --json`) and fix what it reports, until it
    is clean. Log in to any profile that needs it with
    `hel login --profile <id>`.

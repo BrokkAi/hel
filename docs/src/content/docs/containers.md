@@ -30,7 +30,7 @@ below.
 
 ## Prerequisites
 
-Pick one runtime:
+Install each runtime you want to use as a target:
 
 - **Rootless Podman 4.0 or newer** on Linux or WSL2. See
   [Podman for Hel](/podman/) for installation and verification steps.
@@ -79,12 +79,15 @@ hel setup
 Setup reports the Codex, Claude Code, Kimi Code, Grok Build, and DeepSeek
 Harness homes it found, the
 GitHub origin of the current directory, and which local container runtimes
-are usable. If a usable runtime exists, it prompts you for:
+are usable. If one or more are usable, it prompts you for:
 
-1. Which runtime to use, defaulting to its recommendation.
-2. The container image, defaulting to `ghcr.io/brokkai/hel/agent-dev:latest`
+1. The container image, defaulting to `ghcr.io/brokkai/hel/agent-dev:latest`
    — press Enter to accept it, or enter `localhost/hel/agent-dev:latest` here
    if you built the image yourself above.
+
+It creates one ordinary target for every usable runtime (for example, `podman`
+and `docker`). Those targets appear independently in Hel's normal target
+picker; setup does not choose one on your behalf.
 
 A plain image such as `ubuntu:24.04` still works if you enter it here: hel
 auto-installs Git, GitHub CLI, and Node the first time a session needs them.
