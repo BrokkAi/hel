@@ -35,6 +35,20 @@ const PANE_MINIMUM: u16 = 3;
 /// The one-row form Targets and Quota collapse to.
 const SUMMARY_ROW: u16 = 1;
 
+/// The terminal height at or above which the minimized Sessions grid gets its
+/// taller five-row form; below it the grid falls back to three rows.
+const TALL_TERMINAL_HEIGHT: u16 = 30;
+
+/// How many content rows the minimized Sessions grid draws: five when the
+/// terminal is tall enough to spare them, three otherwise.
+pub(crate) fn minimized_grid_rows(frame_height: u16) -> u16 {
+    if frame_height >= TALL_TERMINAL_HEIGHT {
+        5
+    } else {
+        3
+    }
+}
+
 /// How tall one band wants to be and how short it may get.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneBand {
@@ -189,15 +203,27 @@ pub fn render_combined(
     let layout = dashboard.pane_layout();
     let minimized = layout.support_collapsed();
     let focus = dashboard.focus();
-    let sessions_cap = if focus == Focus::Sessions {
-        area.height / 2
+    let sessions = if layout.sessions_compact() {
+        // Minimized: a fixed-height grid — five content rows in a tall enough
+        // terminal, three otherwise — plus the border. It neither grows nor
+        // shrinks, so minimum, full and cap are the same.
+        let height = minimized_grid_rows(area.height) + 2;
+        PaneBand {
+            minimum: height,
+            full: height,
+            cap: height,
+        }
     } else {
-        area.height / 3
-    };
-    let sessions = PaneBand {
-        minimum: PANE_MINIMUM,
-        full: sessions_content_height(dashboard, area.width).saturating_add(2),
-        cap: sessions_cap.max(PANE_MINIMUM),
+        let sessions_cap = if focus == Focus::Sessions {
+            area.height / 2
+        } else {
+            area.height / 3
+        };
+        PaneBand {
+            minimum: PANE_MINIMUM,
+            full: sessions_content_height(dashboard, area.width).saturating_add(2),
+            cap: sessions_cap.max(PANE_MINIMUM),
+        }
     };
     let targets = support_band(
         table_height(dashboard.capacity_details.len()),
@@ -398,4 +424,17 @@ fn table_height(rows: usize) -> u16 {
     u16::try_from(rows)
         .unwrap_or(u16::MAX)
         .saturating_add(PANE_MINIMUM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimized_grid_takes_five_rows_only_when_the_terminal_is_tall() {
+        assert_eq!(minimized_grid_rows(30), 5);
+        assert_eq!(minimized_grid_rows(100), 5);
+        assert_eq!(minimized_grid_rows(29), 3);
+        assert_eq!(minimized_grid_rows(10), 3);
+    }
 }
