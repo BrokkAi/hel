@@ -53,7 +53,7 @@ pub(crate) fn render_onboarding_surface(frame: &mut Frame, dashboard: &mut Dashb
             Constraint::Length(1),
         ])
         .split(area);
-    render_dashboard_title(frame, layout[0], &dashboard.greeting);
+    render_dashboard_title(frame, layout[0], &dashboard.workspace_name);
 
     render_onboarding(frame, layout[1], dashboard);
     render_capacity(frame, layout[2], dashboard);
@@ -96,10 +96,10 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, dashboard: &mut Dashbo
     dashboard.frame_surfaces = surfaces;
 }
 
-fn render_dashboard_title(frame: &mut Frame, area: Rect, greeting: &str) {
+fn render_dashboard_title(frame: &mut Frame, area: Rect, workspace_name: &str) {
     frame.render_widget(
         Paragraph::new(Span::styled(
-            greeting,
+            workspace_name,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -216,7 +216,7 @@ pub(crate) fn sessions_pane_title(width: u16, expanded: bool) -> &'static str {
 
 /// One table row of the Sessions pane, already laid out.
 struct DrawnSessionRow {
-    /// Index into `ordered_sessions()`, or `None` for the "Others" summary.
+    /// Index into `ordered_sessions()` for the session this row draws.
     session: Option<usize>,
     /// Project key of the heading this row carries, if it opens a group.
     heading: Option<String>,
@@ -239,21 +239,7 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
         .unwrap_or_default()
         .as_secs();
     let sessions = dashboard.ordered_sessions();
-    // A target label repeated inside one project is ambiguous on its own, so
-    // repeats are numbered in the order they were created.
-    let mut target_counts = BTreeMap::<(String, String), usize>::new();
-    for session in &sessions {
-        let key = (
-            dashboard.project_source(session).key,
-            session_target_label(
-                session,
-                dashboard.session_operations.get(&session.id),
-                &dashboard.config,
-            ),
-        );
-        *target_counts.entry(key).or_default() += 1;
-    }
-    let mut target_occurrences = BTreeMap::<(String, String), usize>::new();
+    let targets = session_display_targets(dashboard, &sessions);
     let mut rows: Vec<DrawnSessionRow> = Vec::new();
     let mut pending_heading: Option<(String, Line<'static>)> = None;
     for row in dashboard.sessions_rows() {
@@ -277,7 +263,6 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                 let Some(session) = sessions.get(index) else {
                     continue;
                 };
-                let source = dashboard.project_source(session);
                 let detail = dashboard.session_details.get(&session.id);
                 let unreachable = dashboard.unreachable_sessions.contains(&session.id);
                 let facts = SessionRowFacts {
@@ -287,15 +272,7 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                     now_epoch_seconds,
                 };
                 let operation = dashboard.session_operations.get(&session.id);
-                let base_target = session_target_label(session, operation, &dashboard.config);
-                let target_key = (source.key.clone(), base_target.clone());
-                let occurrence = target_occurrences.entry(target_key.clone()).or_default();
-                *occurrence += 1;
-                let target = if target_counts.get(&target_key).copied().unwrap_or_default() > 1 {
-                    format!("{base_target} [{}]", *occurrence)
-                } else {
-                    base_target
-                };
+                let target = targets.get(index).cloned().unwrap_or_default();
                 let permission = session_permission_badge(session, operation, &dashboard.config);
                 // The selection drives which conversation is on screen, so
                 // the caret marks it in both forms.
@@ -308,7 +285,11 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                 };
                 let mut lines = Vec::new();
                 lines.extend(heading_line);
-                if expanded && !dashboard.pane_layout().sessions_compact() {
+                // The minimized layout draws its own grid (see
+                // `render_sessions_grid`) and never routes through here, so
+                // this laydown only handles the expanded and support-collapsed
+                // positions: four lines per session, or one.
+                if expanded {
                     expanded_session_lines(
                         &mut lines,
                         dashboard,
@@ -321,7 +302,7 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                         permission,
                         width,
                     );
-                } else if !dashboard.pane_layout().sessions_compact() {
+                } else {
                     lines.push(collapsed_session_line(
                         prefix,
                         &target,
@@ -329,32 +310,13 @@ fn drawn_session_rows(dashboard: &DashboardState, width: u16) -> Vec<DrawnSessio
                         usize::from(width.saturating_sub(4)),
                         permission,
                     ));
-                } else {
-                    lines.push(compact_session_line(
-                        prefix,
-                        &source.short,
-                        &target,
-                        facts,
-                        usize::from(width.saturating_sub(4)),
-                    ));
                 }
-                let spacing = u16::from(expanded && !dashboard.pane_layout().sessions_compact());
+                let spacing = u16::from(expanded);
                 rows.push(DrawnSessionRow {
                     session: Some(index),
                     heading: heading_key,
                     lines,
                     spacing,
-                });
-            }
-            SessionsRow::Others { active, idle } => {
-                rows.push(DrawnSessionRow {
-                    session: None,
-                    heading: None,
-                    lines: vec![Line::styled(
-                        format!("  Others: {active} active, {idle} idle"),
-                        Style::default().fg(Color::DarkGray),
-                    )],
-                    spacing: 0,
                 });
             }
         }
@@ -480,25 +442,43 @@ impl SessionRowFacts<'_> {
     }
 }
 
-fn compact_session_line(
-    prefix: &str,
-    project: &str,
-    target: &str,
-    facts: SessionRowFacts<'_>,
-    width: usize,
-) -> Line<'static> {
-    let clock = facts.clock();
-    let fragment = facts.last_agent_line().to_owned();
-    let style = facts.style();
-    let lead = format!("{prefix}{project} · {target} · {clock} ");
-    let lead_width = lead.chars().count();
-    Line::styled(
-        format!(
-            "{lead}{}",
-            crate::widgets::truncate_text(&fragment, width.saturating_sub(lead_width))
-        ),
-        style,
-    )
+/// The target label shown for each session, in `ordered_sessions()` order.
+///
+/// A target repeated inside one project is ambiguous on its own, so repeats
+/// are numbered `[1]`, `[2]`, … in the order they appear. Both the row
+/// laydown and the minimized grid read from this so they agree on labels.
+fn session_display_targets(dashboard: &DashboardState, sessions: &[&SessionRecord]) -> Vec<String> {
+    let mut counts = BTreeMap::<(String, String), usize>::new();
+    for session in sessions {
+        let key = (
+            dashboard.project_source(session).key,
+            session_target_label(
+                session,
+                dashboard.session_operations.get(&session.id),
+                &dashboard.config,
+            ),
+        );
+        *counts.entry(key).or_default() += 1;
+    }
+    let mut occurrences = BTreeMap::<(String, String), usize>::new();
+    sessions
+        .iter()
+        .map(|session| {
+            let base = session_target_label(
+                session,
+                dashboard.session_operations.get(&session.id),
+                &dashboard.config,
+            );
+            let key = (dashboard.project_source(session).key, base.clone());
+            let occurrence = occurrences.entry(key.clone()).or_default();
+            *occurrence += 1;
+            if counts.get(&key).copied().unwrap_or_default() > 1 {
+                format!("{base} [{}]", *occurrence)
+            } else {
+                base
+            }
+        })
+        .collect()
 }
 
 /// Content rows the Sessions pane wants, excluding its border.
@@ -509,26 +489,47 @@ pub(crate) fn sessions_content_height(dashboard: &DashboardState, width: u16) ->
         .fold(0, u16::saturating_add)
 }
 
+/// The Sessions pane's bordered block: the legend as its left title and, at
+/// the right of the bar, the workspace name in dim text — truncated to the
+/// room the legend leaves, and omitted when it does not fit or is empty.
+fn sessions_block<'a>(
+    focused: bool,
+    legend: &'a str,
+    workspace_name: &str,
+    width: u16,
+) -> Block<'a> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(focus_border(focused))
+        .title(Line::from(Span::raw(legend)));
+    let room = usize::from(width).saturating_sub(Span::raw(legend).width() + 4);
+    if room > 8 && !workspace_name.is_empty() {
+        block.title(
+            Line::from(Span::styled(
+                format!(" {} ", crate::widgets::truncate_text(workspace_name, room)),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .right_aligned(),
+        )
+    } else {
+        block
+    }
+}
+
 /// Draws the Sessions pane and reports the per-row mouse hitboxes.
 pub(crate) fn render_sessions(
     frame: &mut Frame,
     area: Rect,
     dashboard: &DashboardState,
 ) -> SessionRowsRendered {
+    if dashboard.pane_layout().sessions_compact() {
+        return render_sessions_grid(frame, area, dashboard);
+    }
     let drawn = drawn_session_rows(dashboard, area.width);
     let focused = dashboard.focus() == Focus::Sessions;
     let expanded = !dashboard.pane_layout().sessions_compact();
-    let mut title = vec![Span::raw(sessions_pane_title(area.width, expanded))];
-    let room = usize::from(area.width).saturating_sub(title[0].width() + 4);
-    if room > 8 && !dashboard.greeting.is_empty() {
-        title.push(Span::styled(
-            format!(
-                "{} ",
-                crate::widgets::truncate_text(&dashboard.greeting, room)
-            ),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+    let legend = sessions_pane_title(area.width, expanded);
+    let block = sessions_block(focused, legend, &dashboard.workspace_name, area.width);
     let table = Table::new(
         drawn.iter().map(|row| {
             Row::new([Cell::from(Text::from(row.lines.clone()))])
@@ -537,18 +538,18 @@ pub(crate) fn render_sessions(
         }),
         [Constraint::Min(1)],
     )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(focus_border(focused))
-            .title(Line::from(title)),
-    );
-    let mut state = TableState::default().with_selected(
-        dashboard
-            .selected_visible_index()
-            .filter(|index| *index < drawn.len()),
-    );
+    .block(block);
+    let mut state = TableState::default()
+        .with_offset(dashboard.sessions_scroll.get())
+        .with_selected(
+            dashboard
+                .selected_visible_index()
+                .filter(|index| *index < drawn.len()),
+        );
     frame.render_stateful_widget(table, area, &mut state);
+    // The table scrolled only as far as it had to; remember where it settled
+    // so the next frame does not scroll back to the top.
+    dashboard.sessions_scroll.set(state.offset());
 
     let offset = state.offset();
     let mut row_y = area.y + 1;
@@ -587,6 +588,160 @@ pub(crate) fn render_sessions(
     SessionRowsRendered {
         session_row_areas,
         project_heading_areas,
+    }
+}
+
+/// One cell of the minimized Sessions grid: a project heading or a session.
+enum GridCell {
+    Heading(String),
+    Session { index: usize },
+}
+
+/// The minimized Sessions pane: a compact grid that shows every session.
+///
+/// Three equal columns, filled column by column (top to bottom, then
+/// rightward), with each project's heading appearing inline above its
+/// sessions. The grid is a viewport over the whole session flow; when the
+/// selection sits past the visible columns the window scrolls to keep it on
+/// screen. Each session cell shows its target — coloured by the same
+/// state-based rule the expanded rows use — and its turn clock, or `[idle]`,
+/// with the target ellipsized so the clock always fits.
+fn render_sessions_grid(
+    frame: &mut Frame,
+    area: Rect,
+    dashboard: &DashboardState,
+) -> SessionRowsRendered {
+    const COLUMNS: usize = 3;
+    const GAP: u16 = 2;
+
+    let now_epoch_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let sessions = dashboard.ordered_sessions();
+    let targets = session_display_targets(dashboard, &sessions);
+    let selected_index = dashboard
+        .selected_session_id()
+        .and_then(|id| sessions.iter().position(|session| session.id == id));
+
+    // The flow of cells the columns are packed from, headings inline.
+    let mut cells: Vec<GridCell> = Vec::new();
+    let mut selected_flow_pos = None;
+    for row in dashboard.sessions_rows() {
+        match row {
+            SessionsRow::ProjectHeading { label, .. } => cells.push(GridCell::Heading(label)),
+            SessionsRow::Session { index, .. } => {
+                if Some(index) == selected_index {
+                    selected_flow_pos = Some(cells.len());
+                }
+                cells.push(GridCell::Session { index });
+            }
+        }
+    }
+
+    // A tiny terminal sheds the pane's title and border so every row goes to
+    // sessions; a taller one keeps them.
+    let block = if crate::combined::minimized_grid_bordered(frame.area().height) {
+        let focused = dashboard.focus() == Focus::Sessions;
+        let legend = sessions_pane_title(area.width, false);
+        sessions_block(focused, legend, &dashboard.workspace_name, area.width)
+    } else {
+        Block::default().borders(Borders::NONE)
+    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut session_row_areas = Vec::new();
+    let grid_rows = inner.height as usize;
+    if grid_rows == 0 || inner.width == 0 {
+        return SessionRowsRendered {
+            session_row_areas,
+            project_heading_areas: Vec::new(),
+        };
+    }
+
+    // Column widths: equal share of what is left after the gaps, remainder
+    // handed to the leftmost columns so the row still spans the full width.
+    let gaps = GAP * (COLUMNS as u16 - 1);
+    let available = inner.width.saturating_sub(gaps);
+    let base = available / COLUMNS as u16;
+    let extra = available % COLUMNS as u16;
+    let column_widths: Vec<u16> = (0..COLUMNS)
+        .map(|column| base + u16::from((column as u16) < extra))
+        .collect();
+
+    // Viewport: scroll so the selected session's column stays visible. The
+    // offset is derived from the selection alone, so it needs no stored state.
+    let total_columns = cells.len().div_ceil(grid_rows).max(1);
+    let max_offset = total_columns.saturating_sub(COLUMNS);
+    let column_offset = selected_flow_pos
+        .map(|position| (position / grid_rows).saturating_sub(COLUMNS - 1))
+        .unwrap_or(0)
+        .min(max_offset);
+
+    let mut column_x = inner.x;
+    for (visible_column, &column_width) in column_widths.iter().enumerate() {
+        if column_width == 0 {
+            continue;
+        }
+        let source_column = column_offset + visible_column;
+        for grid_row in 0..grid_rows {
+            let flow_position = source_column * grid_rows + grid_row;
+            let Some(cell) = cells.get(flow_position) else {
+                continue;
+            };
+            let y = inner.y + grid_row as u16;
+            let rect = Rect::new(column_x, y, column_width, 1);
+            let line = match cell {
+                GridCell::Heading(label) => Line::styled(
+                    crate::widgets::truncate_text(label, column_width as usize),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                GridCell::Session { index } => {
+                    let Some(session) = sessions.get(*index) else {
+                        continue;
+                    };
+                    let detail = dashboard.session_details.get(&session.id);
+                    let facts = SessionRowFacts {
+                        detail,
+                        unreachable: dashboard.unreachable_sessions.contains(&session.id),
+                        state: session.state,
+                        now_epoch_seconds,
+                    };
+                    let clock = facts.clock();
+                    let prefix = if Some(*index) == selected_index {
+                        "› "
+                    } else {
+                        "  "
+                    };
+                    // Reserve the prefix, a separating space, and the clock;
+                    // the target takes whatever room is left and ellipsizes.
+                    let reserved = prefix.chars().count() + 1 + clock.chars().count();
+                    let target_room = (column_width as usize).saturating_sub(reserved);
+                    let target = targets.get(*index).cloned().unwrap_or_default();
+                    let target = crate::widgets::truncate_text(&target, target_room);
+                    session_row_areas.push((*index, rect));
+                    // Right-justify the clock at the column's edge: pad between
+                    // the target and the clock so the clocks line up in a
+                    // column instead of trailing each target.
+                    let used =
+                        prefix.chars().count() + target.chars().count() + clock.chars().count();
+                    let gap = (column_width as usize).saturating_sub(used).max(1);
+                    Line::styled(format!("{prefix}{target}{:gap$}{clock}", ""), facts.style())
+                }
+            };
+            frame.render_widget(Paragraph::new(line), rect);
+        }
+        column_x = column_x.saturating_add(column_width).saturating_add(GAP);
+    }
+
+    SessionRowsRendered {
+        session_row_areas,
+        // The grid has no per-project collapse, so its headings are not
+        // clickable and report no hitboxes.
+        project_heading_areas: Vec::new(),
     }
 }
 
@@ -1123,10 +1278,13 @@ pub(crate) fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut Das
             .border_type(focus_border(focused))
             .title(" Targets "),
     );
-    let mut state = TableState::default().with_selected(
-        (!dashboard.capacity_details.is_empty()).then_some(dashboard.capacity_index),
-    );
+    let mut state = TableState::default()
+        .with_offset(dashboard.targets_scroll.get())
+        .with_selected(
+            (!dashboard.capacity_details.is_empty()).then_some(dashboard.capacity_index),
+        );
     frame.render_stateful_widget(table, area, &mut state);
+    dashboard.targets_scroll.set(state.offset());
     render_session_scrollbar(
         frame,
         area,
@@ -1625,8 +1783,10 @@ pub(crate) fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut Dashb
                 .title(title),
         );
     let mut state = TableState::default()
+        .with_offset(dashboard.quota_scroll.get())
         .with_selected((!dashboard.config.profiles.is_empty()).then_some(dashboard.quota_index));
     frame.render_stateful_widget(table, area, &mut state);
+    dashboard.quota_scroll.set(state.offset());
     render_session_scrollbar(
         frame,
         area,
@@ -1760,7 +1920,7 @@ mod tests {
     #[test]
     fn a_modal_overlays_the_dashboard_instead_of_replacing_it() {
         let mut dashboard = dashboard_with_session(running_session());
-        dashboard.set_greeting("UNDERLYING DASHBOARD SENTINEL".into());
+        dashboard.set_workspace_name("UNDERLYING DASHBOARD SENTINEL".into());
         assert_eq!(
             dashboard.handle_key(crate::test_support::key(KeyCode::Char('e'))),
             DashboardAction::None
@@ -2385,6 +2545,7 @@ mod tests {
     #[test]
     fn the_footer_is_one_row_that_a_notice_takes_over() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_workspace_name("personal".into());
         dashboard.set_notice("Transient dashboard message");
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
         terminal
@@ -2397,14 +2558,14 @@ mod tests {
                 .collect::<String>()
         };
 
-        // The workspace greeting rides in the Sessions title rather than
-        // taking a full row of its own, so the transcript keeps that row.
+        // The workspace name rides at the right of the Sessions title rather
+        // than taking a full row of its own, so the transcript keeps that row.
         assert!(
             line(buffer.area.y).contains("Sessions"),
             "{:?}",
             line(buffer.area.y)
         );
-        assert!(line(buffer.area.y).contains("Welcome to Hel"));
+        assert!(line(buffer.area.y).contains("personal"));
         assert!(!line(buffer.area.y).contains("ACP sessions"));
         // The footer is one row: a notice replaces the hints while one is
         // showing, so the row costs one line whichever surface drew it.
@@ -2503,18 +2664,17 @@ mod tests {
         }
     }
 
-    /// Collapsing gives the transcript exactly the rows the two tables were
-    /// using, so the point of the gesture is measurable rather than merely
-    /// visible.
+    /// Collapsing the support panes hands their freed rows to the transcript,
+    /// and the transcript also absorbs whatever the Sessions pane gives up (or
+    /// gives back) as it moves to its fixed mode-2 third — nothing appears or
+    /// vanishes, so the gesture is measurable rather than merely visible.
     #[test]
     fn collapsing_the_support_panes_gives_their_rows_to_the_transcript() {
         let mut dashboard = dashboard_with_session(running_session());
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
-        // Start on the composer, so the Sessions pane is already compact and
-        // the only thing that changes is the two tables.
         dashboard.focus_prompt();
         /// Rows from the start of one band to the start of the next.
-        fn band(lines: &[String], from: &str, to: &str) -> usize {
+        fn band(lines: &[String], from: &str, to: &str) -> isize {
             let start = lines
                 .iter()
                 .position(|line| line.contains(from))
@@ -2523,20 +2683,23 @@ mod tests {
                 .iter()
                 .position(|line| line.contains(to))
                 .unwrap_or_else(|| panic!("missing {to}: {lines:#?}"));
-            end - start
+            (end - start) as isize
         }
 
         let before = drawn(&mut dashboard, 140, 32);
         dashboard.cycle_pane_layout();
         let after = drawn(&mut dashboard, 140, 32);
 
-        let freed = (band(&before, "Targets", "Quota") - band(&after, "Targets", "Quota"))
+        // Every row the tables and the Sessions pane give up lands in the
+        // transcript; the composer and footer are untouched.
+        let tables_freed = (band(&before, "Targets", "Quota") - band(&after, "Targets", "Quota"))
             + (band(&before, "Quota", "Ctrl-Q quit") - band(&after, "Quota", "Ctrl-Q quit"));
-        assert!(freed > 0, "the tables gave up nothing");
-        assert_eq!(
-            band(&after, "Conversation", "Prompt"),
-            band(&before, "Conversation", "Prompt") + freed
-        );
+        let sessions_freed =
+            band(&before, "Sessions", "Conversation") - band(&after, "Sessions", "Conversation");
+        let transcript_gain =
+            band(&after, "Conversation", "Prompt") - band(&before, "Conversation", "Prompt");
+        assert!(tables_freed > 0, "the tables gave up nothing");
+        assert_eq!(transcript_gain, tables_freed + sessions_freed);
         // Each collapsed pane really is one row.
         assert_eq!(band(&after, "Targets", "Quota"), 1);
         assert_eq!(band(&after, "Quota", "Ctrl-Q quit"), 1);
@@ -2615,22 +2778,384 @@ mod tests {
         );
     }
 
-    /// The compact row is the whole summary in one line, so it has to name
-    /// the project as well: the list spans every project at this width.
-    #[test]
-    fn a_compact_session_row_names_its_project_target_clock_and_last_line() {
-        let mut dashboard = dashboard_with_session(running_session());
+    /// `projects` projects, `per_project` live sessions in each, laid out so
+    /// the minimized grid has real columns and headings to pack. Project
+    /// directories are zero-padded so they sort in the obvious order.
+    fn minimized_grid_dashboard(projects: usize, per_project: usize) -> DashboardState {
+        let mut sessions = BTreeMap::new();
+        let mut index = 0;
+        for project in 0..projects {
+            for _ in 0..per_project {
+                let mut session = running_session();
+                session.id = format!("session-{index:02}");
+                session.created_at = format!("2026-08-{:02}T00:00:00Z", index + 1);
+                session.project_directory = Some(format!("/projects/proj{project:02}").into());
+                sessions.insert(session.id.clone(), session);
+                index += 1;
+            }
+        }
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        // Two turns of the dial reach the minimized grid.
         dashboard.cycle_pane_layout();
         dashboard.cycle_pane_layout();
-        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "the latest word")]);
+        dashboard
+    }
 
-        let lines = drawn(&mut dashboard, 120, 34);
-        let row = lines
+    /// The content rows of the Sessions pane (inside its border) for a
+    /// minimized grid of the given terminal size.
+    fn grid_content_rows(dashboard: &mut DashboardState, width: u16, height: u16) -> Vec<String> {
+        let rows = crate::combined::minimized_grid_rows(height) as usize;
+        let lines = drawn(dashboard, width, height);
+        lines[1..=rows].to_vec()
+    }
+
+    /// The grid packs every project's sessions under a white heading, filling
+    /// column by column, with the turn clock (here `[idle]`) beside each
+    /// target. Two sessions sharing a buffer row proves there is more than one
+    /// column.
+    #[test]
+    fn the_minimized_grid_columns_carry_white_headers_targets_and_clocks() {
+        let mut dashboard = minimized_grid_dashboard(3, 2);
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw the grid");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+
+        // Every project heading shows, in white and bold.
+        for project in ["proj00", "proj01", "proj02"] {
+            let row = lines
+                .iter()
+                .position(|line| line.contains(project))
+                .unwrap_or_else(|| panic!("heading {project} missing: {lines:?}"));
+            let column = cell_column(&lines[row], project);
+            let cell = &buffer[(column, row as u16)];
+            assert_eq!(cell.fg, Color::White, "{project} colour");
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "{project} should be bold"
+            );
+        }
+
+        // Each session shows its target and its idle clock.
+        assert!(
+            lines.iter().any(|line| line.contains("podman")),
+            "a target: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("[idle]")),
+            "an idle clock: {lines:?}"
+        );
+
+        // Column-major fill means some buffer row carries two sessions side by
+        // side.
+        assert!(
+            lines.iter().any(|line| line.matches("podman").count() >= 2),
+            "two columns on one row: {lines:?}"
+        );
+    }
+
+    /// The clock is right-justified at each column's edge, so the clocks line
+    /// up in a column rather than trailing immediately after each target.
+    #[test]
+    fn the_minimized_grid_right_justifies_the_clock() {
+        let mut dashboard = minimized_grid_dashboard(1, 1);
+        let rows = grid_content_rows(&mut dashboard, 120, 34);
+        let session = rows
             .iter()
-            .find(|line| line.contains("podman"))
-            .expect("the session's row");
-        assert!(row.contains("hel · podman · "), "{row:?}");
-        assert!(row.contains("the latest word"), "{row:?}");
+            .find(|line| line.contains("[idle]"))
+            .expect("the session row");
+
+        // Column 0 spans the inner width less two 2-space gaps, split three
+        // ways; the clock ends flush against that column's right edge.
+        let inner = 120u16 - 2;
+        let column0 = (inner - 4) / 3 + u16::from(!(inner - 4).is_multiple_of(3));
+        let expected = 1 + column0 - "[idle]".len() as u16;
+        assert_eq!(cell_column(session, "[idle]"), expected, "{session:?}");
+    }
+
+    /// A session cell is coloured by the same state rule the expanded rows
+    /// use: a healthy running session is yellow, a failed one red.
+    #[test]
+    fn the_minimized_grid_colours_a_session_cell_by_state() {
+        let colour_of = |mut dashboard: DashboardState| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .expect("draw the grid");
+            let buffer = terminal.backend().buffer();
+            let lines = buffer_lines(buffer);
+            let row = lines
+                .iter()
+                .position(|line| line.contains("podman"))
+                .expect("a session cell");
+            buffer[(cell_column(&lines[row], "podman"), row as u16)].fg
+        };
+
+        let healthy = minimized_grid_dashboard(1, 1);
+        assert_eq!(colour_of(healthy), Color::Yellow);
+
+        let mut failed = minimized_grid_dashboard(1, 1);
+        {
+            let session = failed
+                .state
+                .sessions
+                .get_mut("session-00")
+                .expect("the session");
+            session.state = SessionState::Error;
+        }
+        assert_eq!(colour_of(failed), Color::Red);
+    }
+
+    /// The target ellipsizes so the clock always survives, even in a narrow
+    /// column.
+    #[test]
+    fn the_minimized_grid_ellipsizes_the_target_to_keep_the_clock() {
+        let mut dashboard = minimized_grid_dashboard(1, 1);
+        dashboard
+            .state
+            .sessions
+            .get_mut("session-00")
+            .expect("the session")
+            .target_template_id = "extremely-long-target-identifier".into();
+
+        let rows = grid_content_rows(&mut dashboard, 44, 34);
+        assert!(
+            rows.iter().any(|line| line.contains('…')),
+            "the target should ellipsize: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|line| line.contains("[idle]")),
+            "the clock should survive: {rows:?}"
+        );
+    }
+
+    /// The grid is a viewport: selecting a session past the visible columns
+    /// scrolls the window so it shows, and earlier columns leave view.
+    #[test]
+    fn the_minimized_grid_scrolls_to_keep_the_selection_visible() {
+        let mut dashboard = minimized_grid_dashboard(12, 1);
+
+        // Selecting the first session keeps the window at the start.
+        dashboard.selected_session_id = Some("session-00".into());
+        let rows = grid_content_rows(&mut dashboard, 120, 34);
+        assert!(
+            rows.iter().any(|line| line.contains("proj00")),
+            "first project visible: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|line| line.contains("proj11")),
+            "last project not yet visible: {rows:?}"
+        );
+
+        // Selecting the last session scrolls it into view and the first out.
+        dashboard.selected_session_id = Some("session-11".into());
+        let rows = grid_content_rows(&mut dashboard, 120, 34);
+        assert!(
+            rows.iter().any(|line| line.contains("proj11")),
+            "last project scrolled into view: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|line| line.contains("proj00")),
+            "first project scrolled out: {rows:?}"
+        );
+    }
+
+    /// Clicking a grid cell selects that session and opens the panes back up,
+    /// the same promotion the collapsed one-line rows do.
+    #[test]
+    fn clicking_a_minimized_grid_cell_selects_it_and_restores_the_panes() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut dashboard = minimized_grid_dashboard(2, 2);
+        drawn(&mut dashboard, 120, 34);
+
+        let (index, rect) = *dashboard
+            .session_row_areas
+            .first()
+            .expect("a grid cell hitbox");
+        let expected = dashboard.ordered_sessions()[index].id.clone();
+
+        dashboard.handle_mouse(mouse_at_row(
+            MouseEventKind::Down(MouseButton::Left),
+            rect,
+            0,
+        ));
+
+        assert_eq!(dashboard.selected_session_id(), Some(expected.as_str()));
+        assert!(
+            !dashboard.pane_layout().sessions_compact(),
+            "the click should restore the panes"
+        );
+    }
+
+    /// A tiny terminal (under 30 rows) strips the minimized grid down to bare
+    /// sessions: no title, no border, and the Targets and Quota panes gone
+    /// entirely, so every row it has goes to sessions and the conversation.
+    #[test]
+    fn a_tiny_terminal_grid_drops_its_border_and_the_support_panes() {
+        let mut dashboard = minimized_grid_dashboard(2, 2);
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard.apply_quota(weekly_quota("claude-1", 63));
+
+        let lines = drawn(&mut dashboard, 120, 20);
+
+        // The grid has no border or title, so its very first row is already a
+        // session rather than a pane rule — and the sessions still draw.
+        assert!(
+            lines[0].contains("[idle]"),
+            "the grid should start at row 0 with no border/title: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains('┌') && !lines[0].contains("Sessions"),
+            "the title and border should be dropped: {lines:?}"
+        );
+        // Both support panes are gone entirely.
+        for gone in ["Targets", "Quota"] {
+            assert!(
+                !lines.iter().any(|line| line.contains(gone)),
+                "{gone} should be dropped: {lines:?}"
+            );
+        }
+    }
+
+    /// The grid reads the height threshold from the live frame every render,
+    /// so the same dashboard drawn tall then short switches from the bordered
+    /// five-row form to the bare two-row one — the decision is never cached.
+    /// (Checked on row 0 of the Sessions band; "Sessions" also appears in the
+    /// empty-conversation prompt lower down, so the whole buffer is no test.)
+    #[test]
+    fn the_minimized_grid_reevaluates_the_height_threshold_each_frame() {
+        let mut dashboard = minimized_grid_dashboard(2, 2);
+
+        // Tall: the sessions band is bordered and titled on its top row.
+        let tall = drawn(&mut dashboard, 120, 34);
+        assert!(
+            tall[0].contains('┌') && tall[0].contains("Sessions"),
+            "tall keeps the bordered title: {:?}",
+            tall[0]
+        );
+
+        // Same dashboard, now short: no state carried over, so row 0 is a
+        // borderless, title-less session row.
+        let short = drawn(&mut dashboard, 120, 20);
+        assert!(
+            !short[0].contains('┌') && !short[0].contains("Sessions"),
+            "short drops the title/border: {:?}",
+            short[0]
+        );
+
+        // And back to tall restores the bordered form.
+        let tall_again = drawn(&mut dashboard, 120, 34);
+        assert!(
+            tall_again[0].contains('┌') && tall_again[0].contains("Sessions"),
+            "tall again restores the border: {:?}",
+            tall_again[0]
+        );
+    }
+
+    /// Mode 2 on a tiny terminal also drops the collapsed Targets and Quota
+    /// rows, but keeps the Sessions pane and its border.
+    #[test]
+    fn a_tiny_mode_two_drops_the_support_panes_but_keeps_sessions() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard.apply_quota(weekly_quota("claude-1", 63));
+        // One turn of the dial reaches mode 2.
+        dashboard.cycle_pane_layout();
+
+        let lines = drawn(&mut dashboard, 120, 20);
+
+        assert!(
+            lines.iter().any(|line| line.contains("Sessions")),
+            "mode 2 keeps the Sessions title: {lines:?}"
+        );
+        for gone in ["Targets", "Quota"] {
+            assert!(
+                !lines.iter().any(|line| line.contains(gone)),
+                "{gone} should be dropped: {lines:?}"
+            );
+        }
+    }
+
+    /// `count` live one-line sessions in a single project, so the
+    /// support-collapsed pane has more rows than fit and has to scroll.
+    fn scrollable_sessions_dashboard(count: usize) -> DashboardState {
+        let mut sessions = BTreeMap::new();
+        for index in 0..count {
+            let mut session = running_session();
+            session.id = format!("session-{index:02}");
+            session.created_at = format!("2026-08-{:02}T00:00:00Z", index + 1);
+            sessions.insert(session.id.clone(), session);
+        }
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        // One turn of the dial: support panes collapsed, sessions one line each.
+        dashboard.cycle_pane_layout();
+        dashboard.focus_sessions();
+        dashboard
+    }
+
+    /// Navigating the Sessions pane scrolls only as far as it must to keep the
+    /// selection on screen. Once a down-arrow has scrolled to reveal a row, an
+    /// up-arrow that lands on a still-visible row must not scroll back — the
+    /// pane only scrolls up again when the selection would leave the top.
+    #[test]
+    fn the_sessions_pane_scrolls_only_to_keep_the_selection_visible() {
+        let mut dashboard = scrollable_sessions_dashboard(12);
+        // Collapse the project so each session is one line and several show at
+        // once — the case where over-scrolling would be visible.
+        for key in dashboard.project_keys() {
+            dashboard.collapsed_project_keys.insert(key);
+        }
+        dashboard.selected_session_id = Some("session-00".into());
+
+        // At the top, no scroll.
+        drawn(&mut dashboard, 120, 34);
+        assert_eq!(dashboard.sessions_scroll.get(), 0);
+
+        // Arrow down far enough that the pane has to scroll.
+        for _ in 0..9 {
+            dashboard.handle_key(key(KeyCode::Down));
+            drawn(&mut dashboard, 120, 34);
+        }
+        let scrolled = dashboard.sessions_scroll.get();
+        assert!(scrolled > 0, "the pane should have scrolled down");
+
+        // One arrow up lands on a row that is still visible, so the pane holds
+        // its position rather than scrolling back toward the top.
+        dashboard.handle_key(key(KeyCode::Up));
+        drawn(&mut dashboard, 120, 34);
+        assert_eq!(
+            dashboard.sessions_scroll.get(),
+            scrolled,
+            "an up-arrow onto a visible row must not scroll"
+        );
+
+        // Walking all the way back to the first session does scroll up.
+        for _ in 0..11 {
+            dashboard.handle_key(key(KeyCode::Up));
+            drawn(&mut dashboard, 120, 34);
+        }
+        assert_eq!(dashboard.sessions_scroll.get(), 0);
     }
 
     #[test]
@@ -3627,9 +4152,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_config_renders_onboarding_and_exact_welcome() {
+    fn empty_config_renders_onboarding_with_the_workspace_name() {
         let mut dashboard =
             DashboardState::new(HelConfig::default(), HelState::default(), BTreeMap::new());
+        dashboard.set_workspace_name("personal".into());
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -3641,7 +4167,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Welcome to Hel"));
+        assert!(rendered.contains("personal"));
         assert!(rendered.contains("Hel needs a little fuel."));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('e'))),
@@ -3650,9 +4176,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_greeting_does_not_change_with_dashboard_updates() {
+    fn workspace_name_does_not_change_with_dashboard_updates() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        dashboard.set_greeting("A fixed greeting".into());
+        dashboard.set_workspace_name("acme-workspace".into());
         dashboard.set_state(HelState::default());
         dashboard.set_quotas(BTreeMap::new());
 
@@ -3667,7 +4193,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("A fixed greeting"));
+        assert!(rendered.contains("acme-workspace"));
     }
 
     #[test]

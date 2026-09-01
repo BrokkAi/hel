@@ -22,7 +22,6 @@ pub mod hel_diff;
 pub mod hel_doctor;
 pub mod hel_elicitation;
 pub mod hel_git_proxy;
-pub mod hel_greeting;
 pub mod hel_import;
 pub mod hel_local_git;
 pub mod hel_project_memory;
