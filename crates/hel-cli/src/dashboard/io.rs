@@ -46,6 +46,11 @@ pub(crate) enum DashboardIoUpdate {
         session_id: String,
         result: std::result::Result<Box<PreparedMaterializedSessionDetail>, String>,
     },
+    /// A bounded tail of a resumed session's stored transcript, loaded off the
+    /// event loop so the conversation is not blank while the poller catches up.
+    TranscriptTailSeed {
+        materialized: Box<MaterializedSession>,
+    },
     StoredSessionSummary {
         session_id: String,
         result: std::result::Result<PreparedMaterializedSessionSummary, String>,
@@ -1073,6 +1078,15 @@ impl DashboardContext {
             DashboardIoUpdate::MaterializedSessionProjection { session_id, result } => {
                 self.finish_materialized_projection(session_id, result);
             }
+            DashboardIoUpdate::TranscriptTailSeed { materialized } => {
+                let viewed_through_event_ordinal = self
+                    .controller
+                    .state
+                    .sessions
+                    .get(&materialized.session_id)
+                    .map_or(0, |session| session.viewed_through_event_ordinal);
+                self.request_materialized_projection(*materialized, viewed_through_event_ordinal);
+            }
             DashboardIoUpdate::StoredSessionSummary { session_id, result } => {
                 match result {
                     Ok(summary) => {
@@ -1479,15 +1493,13 @@ impl DashboardContext {
             Ok(LifecycleSuccess::Resumed {
                 profile_id,
                 target_id,
-                materialized,
             }) => {
-                let viewed_through_event_ordinal = self
-                    .controller
-                    .state
-                    .sessions
-                    .get(&session_id)
-                    .map_or(0, |session| session.viewed_through_event_ordinal);
-                self.request_materialized_projection(*materialized, viewed_through_event_ordinal);
+                // Seed the conversation from the tail rather than from a
+                // transcript shipped back through the daemon reply. The view
+                // keeps `TAIL_SEED_ITEMS` and discards everything before it,
+                // so reading the whole projection was work proportional to
+                // history for a result that was thrown away.
+                self.request_transcript_tail_seed(&session_id);
                 self.dashboard.select_active_session(&session_id);
                 self.dashboard.set_notice(format!(
                     "Resumed {} with {profile_id} on {target_id}",

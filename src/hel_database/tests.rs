@@ -2159,6 +2159,43 @@ fn queued_prompt_loader_does_not_deserialize_transcript_history() {
     assert!(load_materialized_session_from(&database, "session-1").is_err());
 }
 
+/// Seeding a conversation shows the end of it, so the reader must cost the
+/// rows it returns rather than the rows that exist. Corrupting the head proves
+/// the head is never touched.
+#[test]
+fn the_transcript_tail_reader_returns_the_end_without_reading_the_head() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let materialized = materialized_session("session-1");
+    save_materialized_session_to(&database, &materialized).unwrap();
+    let connection = open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE materialized_transcript_items SET body_json = 'not-json' WHERE position <= 2",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let tail = load_materialized_transcript_tail_from(&database, "session-1", 2).unwrap();
+
+    assert_eq!(
+        tail.iter()
+            .map(|item| (item.stable_id.as_str(), item.position))
+            .collect::<Vec<_>>(),
+        vec![("tool:call-1", 3), ("plan:1", 4)]
+    );
+    // Asking for more than exists returns what exists, and the corrupt head is
+    // what makes that an error rather than a short read.
+    assert!(load_materialized_transcript_tail_from(&database, "session-1", 256).is_err());
+    assert!(
+        load_materialized_transcript_tail_from(&database, "unknown", 256)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// Resume compares frontiers to decide whether to rebuild a projection,
 /// and clears the queue without touching the transcript when it does not.
 #[test]

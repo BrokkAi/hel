@@ -1761,7 +1761,6 @@ pub(crate) enum LifecycleSuccess {
     Resumed {
         profile_id: String,
         target_id: String,
-        materialized: Box<MaterializedSession>,
     },
     Closed,
     ForceStopped,

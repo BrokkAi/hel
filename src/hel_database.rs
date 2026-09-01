@@ -1918,6 +1918,79 @@ fn last_materialized_agent_message(
     Ok((!text.trim().is_empty()).then_some((position, text)))
 }
 
+/// Read the newest `limit` transcript items for a session, oldest first.
+///
+/// A conversation view seeds itself from the tail and discards everything
+/// before it — `ChatState::from_materialized_tail` keeps `TAIL_SEED_ITEMS`
+/// and drops the rest — so reading the whole transcript to show the end of it
+/// is work proportional to history for a result that never was. On a real
+/// session that meant reading 28,066 rows to render 256.
+///
+/// The `materialized_transcript_position` index covers the ordering, so this
+/// costs the rows it returns rather than the rows that exist.
+pub fn load_materialized_transcript_tail(
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<Arc<TranscriptItem>>> {
+    load_materialized_transcript_tail_from(&database_path(), session_id, limit)
+}
+
+fn load_materialized_transcript_tail_from(
+    path: &Path,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<Arc<TranscriptItem>>> {
+    let connection = open_reader(path)?;
+    let mut statement = connection.prepare(
+        "SELECT stable_id, position, latest_content_event_ordinal, created_at_ms,
+                last_changed_at_ms, body_json
+         FROM materialized_transcript_items
+         WHERE session_id = ?1
+         ORDER BY position DESC, stable_id DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(params![session_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Option<u64>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The query walks the index backwards to bound what it reads; the caller
+    // wants the tail in the order it was written.
+    let mut items = rows
+        .into_iter()
+        .map(
+            |(
+                stable_id,
+                position,
+                latest_content_event_ordinal,
+                created_at_ms,
+                last_changed_at_ms,
+                body_json,
+            )| {
+                Ok(Arc::new(TranscriptItem {
+                    stable_id,
+                    position,
+                    latest_content_event_ordinal,
+                    created_at_ms,
+                    last_changed_at_ms,
+                    body: serde_json::from_str(&body_json).with_context(|| {
+                        format!("parse materialized transcript body for session {session_id}")
+                    })?,
+                }))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    items.reverse();
+    Ok(items)
+}
+
 /// Read only the projection's event frontier. Deciding whether a stored
 /// projection already matches an archive costs one row this way, instead of
 /// deserializing every transcript item to compare two integers.

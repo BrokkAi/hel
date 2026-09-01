@@ -298,7 +298,7 @@ fn materialized_chat_entries_with_diffstats(
 /// thread. Several screens of scrollback are ready in the first frame, and the
 /// rest of the history is converted off the event loop; a long session has
 /// thousands of items, and converting them all inline costs seconds.
-pub(super) const TAIL_SEED_ITEMS: usize = 256;
+pub const TAIL_SEED_ITEMS: usize = 256;
 
 /// Entries for the transcript items in `items`, which is a prefix of a
 /// session's transcript. Runs off the event loop, so it takes the items by
