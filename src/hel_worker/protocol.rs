@@ -133,6 +133,13 @@ pub enum RelayRequest {
     /// nested here, so the reviewer's conversation is journaled and replayed
     /// the same way the primary's is.
     Reviewer {
+        /// Which reviewing agent this is for. Absent means the default role,
+        /// which is the one plan review uses; a turn review in the extended
+        /// tier also names its supervisor, its intent analyst, and each
+        /// specialist lane. An older controller sends no role, and an older
+        /// worker ignores one, so the field is additive in both directions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
         request: ReviewerRequest,
     },
 }
@@ -173,6 +180,60 @@ pub enum ReviewerRequest {
     /// Cancel any turn in flight and stop the reviewer's process group,
     /// keeping its staged profile, native session and journal for next time.
     Pause,
+    /// Report what changed in every workspace repository since `baselines`.
+    ///
+    /// A baseline is a Git tree id recorded by an earlier capture, keyed by
+    /// repository root. A repository with no baseline -- or one whose baseline
+    /// tree the repository no longer holds, as after a resume onto a fresh
+    /// target -- reports no changes and takes the capture as its new baseline:
+    /// coverage starts there rather than presenting the whole repository as
+    /// this turn's work. Capture never touches the repository's index or
+    /// working tree.
+    CaptureDelta {
+        baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
+    },
+    /// Record `trees` as the new review baselines, pinning each so a later
+    /// `git gc` cannot collect it.
+    AdvanceBaseline {
+        trees: std::collections::BTreeMap<std::path::PathBuf, String>,
+    },
+    /// Run Bifrost's one-shot semantic diff analysis over captured trees and
+    /// return the changed-callable packet the review prompts embed.
+    AnalyzeDelta {
+        repositories: Vec<AnalyzeDeltaRepository>,
+    },
+    /// Collect the specialist lanes the review supervisor asked for through
+    /// its MCP tool since the last time the controller asked. This request is
+    /// answered by the sidecar itself rather than by any one role.
+    TakeLaneDispatches,
+}
+
+/// One repository's captured endpoints for the Bifrost analysis pre-pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzeDeltaRepository {
+    pub root: std::path::PathBuf,
+    /// Absent for a repository with no recorded baseline, which the worker
+    /// resolves to that repository's empty tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_tree: Option<String>,
+    pub current_tree: String,
+}
+
+/// What one repository contributed to a cumulative review delta.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoDelta {
+    pub root: std::path::PathBuf,
+    pub baseline_tree: Option<String>,
+    pub current_tree: String,
+    /// Unified diff, bounded worker-side; an empty patch means this repository
+    /// has nothing to review.
+    pub patch: String,
+    /// Human-readable file and line totals, computed from the untruncated
+    /// patch so bounding cannot make a change look smaller than it is.
+    pub diffstat: String,
+    pub changed_lines: usize,
 }
 
 impl ReviewerRequest {
@@ -185,6 +246,10 @@ impl ReviewerRequest {
             Self::Status => "reviewer_status",
             Self::RespondElicitation { .. } => "reviewer_respond_elicitation",
             Self::Pause => "reviewer_pause",
+            Self::CaptureDelta { .. } => "reviewer_capture_delta",
+            Self::AdvanceBaseline { .. } => "reviewer_advance_baseline",
+            Self::AnalyzeDelta { .. } => "reviewer_analyze_delta",
+            Self::TakeLaneDispatches => "reviewer_take_lane_dispatches",
         }
     }
 }
@@ -210,7 +275,7 @@ impl RelayRequest {
             Self::RemoveGithubToken => "remove_github_token",
             Self::Compact { .. } => "compact",
             Self::RespondElicitation { .. } => "respond_elicitation",
-            Self::Reviewer { request } => request.action_name(),
+            Self::Reviewer { request, .. } => request.action_name(),
         }
     }
 
@@ -354,6 +419,20 @@ pub enum RelayResponsePayload {
     },
     /// The reviewer's process group has been stopped; its files remain.
     ReviewerPaused,
+    /// What every workspace repository changed since the stored baselines.
+    ReviewDelta {
+        repositories: Vec<RepoDelta>,
+    },
+    /// The review baselines now name the trees the controller sent.
+    ReviewBaselineAdvanced,
+    /// Bifrost's changed-callable packet for the captured trees.
+    ReviewChangedFunctions {
+        packet: String,
+    },
+    /// Specialist lanes the review supervisor asked for.
+    LaneDispatches {
+        requests: Vec<crate::hel_review::lanes::ReviewSubagentRequest>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

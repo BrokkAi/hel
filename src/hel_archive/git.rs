@@ -6,10 +6,14 @@ pub trait GitCommandRunner: Sync {
     fn run(&self, repository: &Path, command: &GitCommand) -> Result<GitOutput>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitCommand {
     pub arguments: Vec<OsString>,
     pub stdin: Vec<u8>,
+    /// Extra environment for this one command. The review capture points Git
+    /// at a scratch index through `GIT_INDEX_FILE`, which is the only way to
+    /// stage a tree without touching the repository's real index.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +45,9 @@ impl GitCommandRunner for SystemGit {
         let mut process = Command::new("git");
         process.args(&command.arguments).current_dir(repository);
         for (name, value) in NON_INTERACTIVE_GIT_ENV {
+            process.env(name, value);
+        }
+        for (name, value) in &command.env {
             process.env(name, value);
         }
         if std::env::var_os("GIT_SSH_COMMAND").is_none() {
@@ -234,6 +241,135 @@ pub fn has_origin_refs(runner: &dyn GitCommandRunner, repository: &Path) -> Resu
     Ok(!refs.is_empty())
 }
 
+/// Ref that keeps the objects of the most recent review capture reachable, so
+/// a `git gc` between two reviews cannot collect the tree a baseline names.
+pub const REVIEW_CAPTURE_REF: &str = "refs/hel/review-capture";
+/// Ref pointing at the tree a completed review advanced its baseline to.
+pub const REVIEW_BASELINE_REF: &str = "refs/hel/review-baseline";
+
+/// Records the working tree, tracked and untracked alike, as a Git tree object
+/// and returns its id.
+///
+/// The staging runs against a scratch index file named by `GIT_INDEX_FILE`, so
+/// the repository's real index, working tree and HEAD are untouched: after this
+/// call `git status` reports exactly what it reported before. Ignored files stay
+/// out, because `git add -A` honours the ignore rules, which is what makes two
+/// captures comparable as "what the agent changed".
+pub fn capture_worktree_tree(runner: &dyn GitCommandRunner, repository: &Path) -> Result<String> {
+    let git_dir = git_text(runner, repository, ["rev-parse", "--absolute-git-dir"])
+        .context("locate the Git directory for a review capture")?;
+    let index = tempfile::Builder::new()
+        .prefix("hel-review-index-")
+        .tempfile_in(&git_dir)
+        .with_context(|| format!("create a scratch Git index in {git_dir}"))?;
+    // Git wants to create the index itself; an existing empty file is read as
+    // a corrupt index.
+    let index_path = index.into_temp_path();
+    std::fs::remove_file(&index_path).ok();
+    let scratch = [(
+        OsString::from("GIT_INDEX_FILE"),
+        index_path.as_os_str().to_os_string(),
+    )];
+    let staged = git_success(
+        runner,
+        repository,
+        GitCommand {
+            arguments: ["add", "-A", "--", "."]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            stdin: Vec::new(),
+            env: scratch.to_vec(),
+        },
+        "stage the working tree into a scratch index",
+    );
+    let tree = staged.and_then(|_| {
+        let output = runner.run(
+            repository,
+            &GitCommand {
+                arguments: vec![OsString::from("write-tree")],
+                stdin: Vec::new(),
+                env: scratch.to_vec(),
+            },
+        )?;
+        ensure!(
+            output.status == 0,
+            "{}",
+            git_failure("write the review capture tree", &output)
+        );
+        trim_output(&output.stdout, "decode the review capture tree id")
+    });
+    // The scratch index is this capture's alone; leaving it behind would grow
+    // the git dir by one file per review.
+    let _ = std::fs::remove_file(&index_path);
+    let tree = tree?;
+    ensure!(!tree.is_empty(), "git write-tree produced no tree id");
+    pin_review_tree(runner, repository, REVIEW_CAPTURE_REF, &tree)?;
+    Ok(tree)
+}
+
+/// Points `reference` at `tree` so the capture survives garbage collection.
+///
+/// A failure here is not fatal to a review -- the objects are still reachable
+/// until the next gc -- so the caller logs it rather than losing the capture.
+pub fn pin_review_tree(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    reference: &str,
+    tree: &str,
+) -> Result<()> {
+    git_bytes(
+        runner,
+        repository,
+        ["update-ref", reference, tree],
+        &[],
+        "pin the review capture tree",
+    )
+    .map(|_| ())
+}
+
+/// The empty tree of this repository's object format, read from Git rather
+/// than hardcoded so a SHA-256 repository works as well as a SHA-1 one.
+pub fn empty_tree_id(runner: &dyn GitCommandRunner, repository: &Path) -> Result<String> {
+    let output = runner.run(
+        repository,
+        &GitCommand {
+            arguments: vec![OsString::from("mktree")],
+            stdin: Vec::new(),
+            env: Vec::new(),
+        },
+    )?;
+    ensure!(
+        output.status == 0,
+        "{}",
+        git_failure("compute the empty tree id", &output)
+    );
+    trim_output(&output.stdout, "decode the empty tree id")
+}
+
+/// Unified diff between two captured trees. `base` of `None` diffs against the
+/// empty tree, which renders the whole capture as additions -- what a review
+/// wants the first time it runs in a repository.
+pub fn diff_between_trees(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    base: Option<&str>,
+    current: &str,
+) -> Result<String> {
+    let base = match base {
+        Some(base) => base.to_owned(),
+        None => empty_tree_id(runner, repository)?,
+    };
+    let patch = git_bytes(
+        runner,
+        repository,
+        ["diff", "--binary", "--no-ext-diff", &base, current],
+        &[],
+        "diff the captured review trees",
+    )?;
+    Ok(String::from_utf8_lossy(&patch).into_owned())
+}
+
 struct GitHistorySelection {
     /// Informational only; an empty string for session deltas.
     base_commit: String,
@@ -408,6 +544,7 @@ pub fn restore_git_snapshot(
             GitCommand {
                 arguments: vec![OsString::from("fetch"), bundle_path, OsString::from("HEAD")],
                 stdin: Vec::new(),
+                env: Vec::new(),
             },
             "fetch committed delta bundle",
         )?;
@@ -538,6 +675,7 @@ fn run_git<const N: usize>(
         &GitCommand {
             arguments: arguments.into_iter().map(OsString::from).collect(),
             stdin: stdin.to_vec(),
+            env: Vec::new(),
         },
     )
 }
@@ -576,6 +714,7 @@ fn git_bytes_owned(
         &GitCommand {
             arguments: arguments.iter().map(OsString::from).collect(),
             stdin: Vec::new(),
+            env: Vec::new(),
         },
     )?;
     ensure!(output.status == 0, "{}", git_failure(action, &output));

@@ -48,6 +48,13 @@ const RELAY_ACKNOWLEDGE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A compaction request runs a full model turn in a scratch ACP session, so it
 /// outlives the deadline that suits the relay's bookkeeping calls.
 const RELAY_COMPACT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Capturing a review delta runs Git over every workspace repository, which is
+/// filesystem work on a possibly large tree rather than relay bookkeeping.
+const REVIEW_CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bifrost's semantic diff analysis has its own 600-second budget inside the
+/// worker; this leaves room for it to report a timeout as an error rather than
+/// having the call time out underneath it.
+const REVIEW_ANALYSIS_TIMEOUT: Duration = Duration::from_secs(660);
 const RELAY_PROXY_DETACH_GRACE: Duration = Duration::from_millis(500);
 const RELAY_PROXY_REAP_POLL: Duration = Duration::from_millis(10);
 
@@ -710,11 +717,15 @@ impl RelayClient {
     /// handshake deadline rather than the bookkeeping one.
     pub async fn start_reviewer(
         &mut self,
+        role: Option<&str>,
         config: ReviewerLaunchConfig,
     ) -> Result<StartedReviewer> {
-        let request = self.reviewer_request(ReviewerRequest::Start {
-            config: Box::new(config),
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::Start {
+                config: Box::new(config),
+            },
+        )?;
         match self
             .call_with_timeout(request, RELAY_HANDSHAKE_TIMEOUT)
             .await?
@@ -738,14 +749,18 @@ impl RelayClient {
     /// does for the primary.
     pub async fn attach_reviewer(
         &mut self,
+        role: Option<&str>,
         after_ordinal: u64,
         after_digest: impl Into<String>,
     ) -> Result<RelayAttachment> {
         let after_digest = after_digest.into();
-        let request = self.reviewer_request(ReviewerRequest::Attach {
-            after_ordinal,
-            after_digest: after_digest.clone(),
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::Attach {
+                after_ordinal,
+                after_digest: after_digest.clone(),
+            },
+        )?;
         let payload = self
             .call_with_timeout(request, RELAY_HISTORY_TIMEOUT)
             .await?;
@@ -785,13 +800,17 @@ impl RelayClient {
     /// pruned once the controller has the events durably.
     pub async fn acknowledge_reviewer(
         &mut self,
+        role: Option<&str>,
         through_ordinal: u64,
         through_digest: impl Into<String>,
     ) -> Result<RelayCursor> {
-        let request = self.reviewer_request(ReviewerRequest::Acknowledge {
-            through_ordinal,
-            through_digest: through_digest.into(),
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::Acknowledge {
+                through_ordinal,
+                through_digest: through_digest.into(),
+            },
+        )?;
         match self
             .call_with_timeout(request, RELAY_ACKNOWLEDGE_TIMEOUT)
             .await?
@@ -810,14 +829,18 @@ impl RelayClient {
     /// Queue one command on the reviewer's own relay.
     pub async fn submit_to_reviewer(
         &mut self,
+        role: Option<&str>,
         command_id: impl Into<String>,
         command: RelayCommand,
     ) -> Result<u64> {
         let command_id = command_id.into();
-        let request = self.reviewer_request(ReviewerRequest::Submit {
-            command_id: command_id.clone(),
-            command,
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::Submit {
+                command_id: command_id.clone(),
+                command,
+            },
+        )?;
         match self.call(request).await? {
             RelayResponsePayload::Accepted {
                 command_id: accepted_id,
@@ -831,8 +854,8 @@ impl RelayClient {
         }
     }
 
-    pub async fn reviewer_status(&mut self) -> Result<RelayOperationalState> {
-        let request = self.reviewer_request(ReviewerRequest::Status)?;
+    pub async fn reviewer_status(&mut self, role: Option<&str>) -> Result<RelayOperationalState> {
+        let request = self.reviewer_request(role, ReviewerRequest::Status)?;
         match self.call(request).await? {
             RelayResponsePayload::Status(status) => Ok(status),
             _ => bail!("relay returned an unexpected reviewer status response"),
@@ -842,13 +865,17 @@ impl RelayClient {
     /// Answer a form the reviewer's harness is waiting on.
     pub async fn respond_to_reviewer(
         &mut self,
+        role: Option<&str>,
         elicitation_id: String,
         response: ElicitationResponse,
     ) -> Result<()> {
-        let request = self.reviewer_request(ReviewerRequest::RespondElicitation {
-            elicitation_id: elicitation_id.clone(),
-            response,
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::RespondElicitation {
+                elicitation_id: elicitation_id.clone(),
+                response,
+            },
+        )?;
         match self.call(request).await? {
             RelayResponsePayload::ElicitationResolved {
                 elicitation_id: resolved,
@@ -862,8 +889,8 @@ impl RelayClient {
 
     /// Cancel any reviewer turn in flight and stop its process group, keeping
     /// its staged profile, native session and journal for the next review.
-    pub async fn pause_reviewer(&mut self) -> Result<()> {
-        let request = self.reviewer_request(ReviewerRequest::Pause)?;
+    pub async fn pause_reviewer(&mut self, role: Option<&str>) -> Result<()> {
+        let request = self.reviewer_request(role, ReviewerRequest::Pause)?;
         match self
             .call_with_timeout(request, RELAY_ACKNOWLEDGE_TIMEOUT)
             .await?
@@ -873,10 +900,81 @@ impl RelayClient {
         }
     }
 
+    /// Report what every workspace repository changed since the review
+    /// baselines the controller holds.
+    pub async fn capture_review_delta(
+        &mut self,
+        role: Option<&str>,
+        baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
+    ) -> Result<Vec<crate::hel_worker::RepoDelta>> {
+        let request = self.reviewer_request(role, ReviewerRequest::CaptureDelta { baselines })?;
+        match self
+            .call_with_timeout(request, REVIEW_CAPTURE_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::ReviewDelta { repositories } => Ok(repositories),
+            _ => bail!("relay returned an unexpected review capture response"),
+        }
+    }
+
+    /// Record the trees a completed review reviewed through, so the next
+    /// review starts from them.
+    pub async fn advance_review_baseline(
+        &mut self,
+        role: Option<&str>,
+        trees: std::collections::BTreeMap<std::path::PathBuf, String>,
+    ) -> Result<()> {
+        let request = self.reviewer_request(role, ReviewerRequest::AdvanceBaseline { trees })?;
+        match self
+            .call_with_timeout(request, REVIEW_CAPTURE_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::ReviewBaselineAdvanced => Ok(()),
+            _ => bail!("relay returned an unexpected review baseline response"),
+        }
+    }
+
+    /// Run Bifrost's semantic diff analysis over the captured trees. It can
+    /// take minutes on a large changeset, so it carries its own budget.
+    pub async fn analyze_review_delta(
+        &mut self,
+        role: Option<&str>,
+        repositories: Vec<crate::hel_worker::AnalyzeDeltaRepository>,
+    ) -> Result<String> {
+        let request =
+            self.reviewer_request(role, ReviewerRequest::AnalyzeDelta { repositories })?;
+        match self
+            .call_with_timeout(request, REVIEW_ANALYSIS_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::ReviewChangedFunctions { packet } => Ok(packet),
+            _ => bail!("relay returned an unexpected review analysis response"),
+        }
+    }
+
+    /// Collect the specialist lanes the review supervisor asked for since the
+    /// last call.
+    pub async fn take_lane_dispatches(
+        &mut self,
+    ) -> Result<Vec<crate::hel_review::lanes::ReviewSubagentRequest>> {
+        let request = self.reviewer_request(None, ReviewerRequest::TakeLaneDispatches)?;
+        match self.call(request).await? {
+            RelayResponsePayload::LaneDispatches { requests } => Ok(requests),
+            _ => bail!("relay returned an unexpected lane dispatch response"),
+        }
+    }
+
     /// Wraps a reviewer action, refusing it on a worker too old to know what a
     /// reviewer is rather than sending a method it would reject as unknown.
-    fn reviewer_request(&self, request: ReviewerRequest) -> Result<RelayRequest> {
-        let request = RelayRequest::Reviewer { request };
+    fn reviewer_request(
+        &self,
+        role: Option<&str>,
+        request: ReviewerRequest,
+    ) -> Result<RelayRequest> {
+        let request = RelayRequest::Reviewer {
+            role: role.map(str::to_owned),
+            request,
+        };
         if !request.supported_at(self.protocol_version) {
             bail!(
                 "a second opinion requires relay protocol {}; this session negotiated {}",

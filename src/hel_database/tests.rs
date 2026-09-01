@@ -685,6 +685,8 @@ fn version_thirteen_restores_checkpointed_lost_sessions_to_recoverable_errors() 
 /// rewind has to undo the table as well as the version marker.
 fn rewind_schema_to(connection: &Connection, version: i64) {
     for table in [
+        "turn_review_state",
+        "turn_review_settings",
         "second_opinion_reviews",
         "second_opinion_defaults",
         "host_container_sizes",
@@ -3037,4 +3039,99 @@ fn detached_drafts_keep_source_pid_and_workspace_without_overwriting_each_other(
             && draft.owner_pid == Some(5678)
             && draft.text == "second unfinished thought"
     }));
+}
+
+#[test]
+fn turn_review_settings_default_to_off_and_persist_per_workspace() {
+    use crate::hel_review::lanes::ReviewTier;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+    // A workspace nobody configured reviews nothing: a review costs a second
+    // agent's turn, so it is opt-in.
+    let defaults = turn_review_settings_in(&database, "workspace-1").unwrap();
+    assert!(!defaults.auto_review);
+    assert_eq!(defaults.tier, ReviewTier::Quick);
+
+    save_turn_review_settings_in(
+        &database,
+        "workspace-1",
+        TurnReviewSettings {
+            auto_review: true,
+            tier: ReviewTier::Extended,
+        },
+    )
+    .unwrap();
+    let stored = turn_review_settings_in(&database, "workspace-1").unwrap();
+    assert!(stored.auto_review);
+    assert_eq!(stored.tier, ReviewTier::Extended);
+    // Writing again replaces the row rather than adding one.
+    save_turn_review_settings_in(
+        &database,
+        "workspace-1",
+        TurnReviewSettings {
+            auto_review: false,
+            tier: ReviewTier::Quick,
+        },
+    )
+    .unwrap();
+    assert!(
+        !turn_review_settings_in(&database, "workspace-1")
+            .unwrap()
+            .auto_review
+    );
+    // Another workspace keeps its own answer.
+    assert!(
+        !turn_review_settings_in(&database, "workspace-2")
+            .unwrap()
+            .auto_review
+    );
+    assert!(
+        save_turn_review_settings_in(&database, "  ", TurnReviewSettings::default()).is_err(),
+        "settings need a workspace to belong to"
+    );
+}
+
+#[test]
+fn review_baselines_survive_a_restart_and_a_restart_clears_a_running_review() {
+    use crate::hel_review::lanes::PriorReviewContext;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+    assert_eq!(
+        turn_review_state_in(&database, "session-1").unwrap(),
+        TurnReviewState::default(),
+        "an unreviewed session starts with no baseline"
+    );
+
+    let state = TurnReviewState {
+        baselines: std::collections::BTreeMap::from([(
+            std::path::PathBuf::from("/workspace/app"),
+            "1234abcd".to_string(),
+        )]),
+        reviewed_through_ordinal: 42,
+        prior_review: Some(PriorReviewContext {
+            synthesis: "[P1] src/a.rs:1 -- broken".to_string(),
+            evidence: Default::default(),
+        }),
+        active: Some("{\"phase\":\"running\"}".to_string()),
+    };
+    save_turn_review_state_in(&database, "session-1", &state).unwrap();
+    assert_eq!(turn_review_state_in(&database, "session-1").unwrap(), state);
+
+    // On recovery the in-flight review is dropped without advancing the
+    // baseline, so the next review still covers the same changes.
+    let recovered = TurnReviewState {
+        active: None,
+        ..state.clone()
+    };
+    save_turn_review_state_in(&database, "session-1", &recovered).unwrap();
+    let restored = turn_review_state_in(&database, "session-1").unwrap();
+    assert_eq!(restored.active, None);
+    assert_eq!(restored.baselines, state.baselines);
+    assert_eq!(restored.reviewed_through_ordinal, 42);
 }

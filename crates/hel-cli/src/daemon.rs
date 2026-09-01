@@ -257,6 +257,14 @@ enum DaemonAction {
         workspace_id: String,
         selection: hel::hel_second_opinion::ReviewerSelection,
     },
+    SaveTurnReviewState {
+        session_id: String,
+        state: hel::hel_database::TurnReviewState,
+    },
+    SaveTurnReviewSettings {
+        workspace_id: String,
+        settings: hel::hel_database::TurnReviewSettings,
+    },
     PersistImportedSession {
         session: Box<SessionRecord>,
     },
@@ -328,6 +336,10 @@ enum DaemonAction {
     /// becoming a session of its own here.
     ReviewerAction {
         session_id: String,
+        /// Which reviewing role the action drives; absent means the default
+        /// one, which is what plan review uses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
         action: hel::hel_session_manager::ReviewerAction,
     },
     CloseSession {
@@ -1672,6 +1684,37 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) async fn save_turn_review_state(
+        &mut self,
+        session_id: String,
+        state: hel::hel_database::TurnReviewState,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SaveTurnReviewState { session_id, state })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected turn-review-state reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn save_turn_review_settings(
+        &mut self,
+        workspace_id: String,
+        settings: hel::hel_database::TurnReviewSettings,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SaveTurnReviewSettings {
+                workspace_id,
+                settings,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected turn-review-settings reply {reply:?}"),
+        }
+    }
+
     pub(crate) async fn remember_reviewer_selection(
         &mut self,
         workspace_id: String,
@@ -1880,10 +1923,15 @@ impl DaemonClient {
     pub(crate) async fn reviewer_action(
         &mut self,
         session_id: String,
+        role: Option<String>,
         action: hel::hel_session_manager::ReviewerAction,
     ) -> Result<hel::hel_session_manager::ReviewerOutcome> {
         match self
-            .request(DaemonAction::ReviewerAction { session_id, action })
+            .request(DaemonAction::ReviewerAction {
+                session_id,
+                role,
+                action,
+            })
             .await?
         {
             DaemonReply::Reviewer(outcome) => Ok(*outcome),
@@ -2476,12 +2524,19 @@ async fn forward_in_process_session_request(
         }
         RemoteSessionRequest::Reviewer {
             session_id,
+            role,
             action,
             reply,
         } => {
-            let result = async { manager.session(session_id).await?.reviewer(action).await }
-                .await
-                .map_err(|error| format!("{error:#}"));
+            let result = async {
+                manager
+                    .session(session_id)
+                    .await?
+                    .reviewer_as(role, action)
+                    .await
+            }
+            .await
+            .map_err(|error| format!("{error:#}"));
             let _ = reply.send(result);
         }
     }
@@ -2744,6 +2799,19 @@ async fn handle_action(
             .await?;
             Ok(DaemonReply::Done)
         }
+        DaemonAction::SaveTurnReviewState { session_id, state } => {
+            blocking(move || hel::hel_database::save_turn_review_state(&session_id, &state))
+                .await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::SaveTurnReviewSettings {
+            workspace_id,
+            settings,
+        } => {
+            blocking(move || hel::hel_database::save_turn_review_settings(&workspace_id, settings))
+                .await?;
+            Ok(DaemonReply::Done)
+        }
         DaemonAction::PersistImportedSession { session } => {
             blocking(move || crate::import::persist_imported_session_locally(&session)).await?;
             refresh_runtime_controller(state).await;
@@ -2918,10 +2986,14 @@ async fn handle_action(
             }
             Ok(DaemonReply::Ordinal(ordinal))
         }
-        DaemonAction::ReviewerAction { session_id, action } => {
+        DaemonAction::ReviewerAction {
+            session_id,
+            role,
+            action,
+        } => {
             let session = state.session_manager.session(session_id).await?;
             Ok(DaemonReply::Reviewer(Box::new(
-                session.reviewer(action).await?,
+                session.reviewer_as(role, action).await?,
             )))
         }
         DaemonAction::SyncSession { session_id } => {

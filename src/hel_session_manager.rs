@@ -354,6 +354,20 @@ pub enum ReviewerAction {
         response: ElicitationResponse,
     },
     Pause,
+    /// Report what the workspace repositories changed since these baselines.
+    CaptureDelta {
+        baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
+    },
+    /// Record the trees a completed review reviewed through.
+    AdvanceBaseline {
+        trees: std::collections::BTreeMap<std::path::PathBuf, String>,
+    },
+    /// Run Bifrost's semantic diff analysis over the captured trees.
+    AnalyzeDelta {
+        repositories: Vec<crate::hel_worker::AnalyzeDeltaRepository>,
+    },
+    /// Collect the specialist lanes the review supervisor asked for.
+    TakeLaneDispatches,
 }
 
 impl ReviewerAction {
@@ -366,6 +380,10 @@ impl ReviewerAction {
             Self::Status => "reviewer_status",
             Self::RespondElicitation { .. } => "reviewer_respond_elicitation",
             Self::Pause => "reviewer_pause",
+            Self::CaptureDelta { .. } => "reviewer_capture_delta",
+            Self::AdvanceBaseline { .. } => "reviewer_advance_baseline",
+            Self::AnalyzeDelta { .. } => "reviewer_analyze_delta",
+            Self::TakeLaneDispatches => "reviewer_take_lane_dispatches",
         }
     }
 }
@@ -375,12 +393,27 @@ impl ReviewerAction {
 #[serde(rename_all = "snake_case")]
 pub enum ReviewerOutcome {
     Started(Box<StartedReviewer>),
-    Accepted { ordinal: u64 },
+    Accepted {
+        ordinal: u64,
+    },
     Attached(Box<RelayAttachment>),
     Acknowledged(RelayCursor),
     Status(Box<RelayOperationalState>),
     ElicitationResolved,
     Paused,
+    /// What every workspace repository changed since the stored baselines.
+    Delta {
+        repositories: Vec<crate::hel_worker::RepoDelta>,
+    },
+    BaselineAdvanced,
+    /// Bifrost's changed-callable packet for the captured trees.
+    ChangedFunctions {
+        packet: String,
+    },
+    /// Specialist lanes the review supervisor asked for.
+    LaneDispatches {
+        requests: Vec<crate::hel_review::lanes::ReviewSubagentRequest>,
+    },
 }
 
 pub enum RemoteSessionRequest {
@@ -402,6 +435,8 @@ pub enum RemoteSessionRequest {
     },
     Reviewer {
         session_id: String,
+        /// Which reviewing role the action drives; `None` is the default one.
+        role: Option<String>,
         action: ReviewerAction,
         reply: oneshot::Sender<std::result::Result<ReviewerOutcome, String>>,
     },
@@ -733,9 +768,24 @@ impl ManagedSessionHandle {
     /// queue behind the session's own and are refused while a lifecycle
     /// operation holds the connection.
     pub async fn reviewer(&self, action: ReviewerAction) -> Result<ReviewerOutcome> {
+        self.reviewer_as(None, action).await
+    }
+
+    /// Drive one reviewing role. `None` is the default role, which is the one
+    /// plan review uses; a turn review in the extended tier names its
+    /// supervisor, its intent analyst, and each specialist lane.
+    pub async fn reviewer_as(
+        &self,
+        role: Option<String>,
+        action: ReviewerAction,
+    ) -> Result<ReviewerOutcome> {
         let (reply, result) = oneshot::channel();
         self.commands
-            .send(ActorCommand::Reviewer { action, reply })
+            .send(ActorCommand::Reviewer {
+                role,
+                action,
+                reply,
+            })
             .await
             .context("session manager stopped")?;
         result
@@ -853,6 +903,7 @@ enum ActorCommand {
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
     Reviewer {
+        role: Option<String>,
         action: ReviewerAction,
         reply: oneshot::Sender<std::result::Result<ReviewerOutcome, String>>,
     },
@@ -1143,8 +1194,13 @@ async fn run_remote_session_actor(
                 response,
                 reply,
             },
-            ActorCommand::Reviewer { action, reply } => RemoteSessionRequest::Reviewer {
+            ActorCommand::Reviewer {
+                role,
+                action,
+                reply,
+            } => RemoteSessionRequest::Reviewer {
                 session_id: session_id.clone(),
+                role,
                 action,
                 reply,
             },
@@ -1734,7 +1790,11 @@ async fn run_session_actor(
                         );
                     }
                     }
-                    ActorCommand::Reviewer { action, reply } => {
+                    ActorCommand::Reviewer {
+                        role,
+                        action,
+                        reply,
+                    } => {
                         if lifecycle.is_leased() {
                             // A lifecycle operation owns the connection, and a
                             // reviewer action is not worth deferring: the user
@@ -1761,7 +1821,7 @@ async fn run_session_actor(
                             sync_actor_connection(&target, &mut connection).await?;
                             let connection =
                                 connection.as_mut().context("relay is disconnected")?;
-                            drive_reviewer(connection, action).await
+                            drive_reviewer(connection, role, action).await
                         }
                         .await;
                         match &result {
@@ -2131,47 +2191,66 @@ async fn submit_actor_command(
 /// primary's: an attach page, an acknowledgement cursor, an accepted command.
 async fn drive_reviewer(
     connection: &mut StandaloneSession,
+    role: Option<String>,
     action: ReviewerAction,
 ) -> Result<ReviewerOutcome> {
     let client = &mut connection.client;
+    let role = role.as_deref();
     Ok(match action {
         ReviewerAction::Start { config } => {
-            ReviewerOutcome::Started(Box::new(client.start_reviewer(*config).await?))
+            ReviewerOutcome::Started(Box::new(client.start_reviewer(role, *config).await?))
         }
         ReviewerAction::Submit {
             command_id,
             command,
         } => ReviewerOutcome::Accepted {
-            ordinal: client.submit_to_reviewer(command_id, command).await?,
+            ordinal: client.submit_to_reviewer(role, command_id, command).await?,
         },
         ReviewerAction::Attach {
             after_ordinal,
             after_digest,
         } => ReviewerOutcome::Attached(Box::new(
-            client.attach_reviewer(after_ordinal, after_digest).await?,
+            client
+                .attach_reviewer(role, after_ordinal, after_digest)
+                .await?,
         )),
         ReviewerAction::Acknowledge {
             through_ordinal,
             through_digest,
         } => ReviewerOutcome::Acknowledged(
             client
-                .acknowledge_reviewer(through_ordinal, through_digest)
+                .acknowledge_reviewer(role, through_ordinal, through_digest)
                 .await?,
         ),
         ReviewerAction::Status => {
-            ReviewerOutcome::Status(Box::new(client.reviewer_status().await?))
+            ReviewerOutcome::Status(Box::new(client.reviewer_status(role).await?))
         }
         ReviewerAction::RespondElicitation {
             elicitation_id,
             response,
         } => {
-            client.respond_to_reviewer(elicitation_id, response).await?;
+            client
+                .respond_to_reviewer(role, elicitation_id, response)
+                .await?;
             ReviewerOutcome::ElicitationResolved
         }
         ReviewerAction::Pause => {
-            client.pause_reviewer().await?;
+            client.pause_reviewer(role).await?;
             ReviewerOutcome::Paused
         }
+        ReviewerAction::CaptureDelta { baselines } => ReviewerOutcome::Delta {
+            repositories: client.capture_review_delta(role, baselines).await?,
+        },
+        ReviewerAction::AdvanceBaseline { trees } => {
+            client.advance_review_baseline(role, trees).await?;
+            ReviewerOutcome::BaselineAdvanced
+        }
+        ReviewerAction::AnalyzeDelta { repositories } => ReviewerOutcome::ChangedFunctions {
+            packet: client.analyze_review_delta(role, repositories).await?,
+        },
+        ReviewerAction::TakeLaneDispatches => ReviewerOutcome::LaneDispatches {
+            requests: client.take_lane_dispatches().await?,
+        },
     })
 }
 
@@ -2957,6 +3036,7 @@ mod tests {
             model: Some("sonnet".into()),
             effort: Some("high".into()),
             generation: 2,
+            mcp_servers: Vec::new(),
         };
         let actions = [
             ReviewerAction::Start {
@@ -2976,6 +3056,19 @@ mod tests {
             },
             ReviewerAction::Status,
             ReviewerAction::Pause,
+            ReviewerAction::CaptureDelta {
+                baselines: BTreeMap::from([(std::path::PathBuf::from("/w/app"), "tree".into())]),
+            },
+            ReviewerAction::AdvanceBaseline {
+                trees: BTreeMap::from([(std::path::PathBuf::from("/w/app"), "tree".into())]),
+            },
+            ReviewerAction::AnalyzeDelta {
+                repositories: vec![crate::hel_worker::AnalyzeDeltaRepository {
+                    root: std::path::PathBuf::from("/w/app"),
+                    baseline_tree: Some("base".into()),
+                    current_tree: "target".into(),
+                }],
+            },
         ];
         for action in actions {
             let encoded = serde_json::to_string(&action).unwrap();
@@ -2993,6 +3086,25 @@ mod tests {
             serde_json::from_str::<ReviewerOutcome>(&paused).unwrap(),
             ReviewerOutcome::Paused
         ));
+
+        let delta = ReviewerOutcome::Delta {
+            repositories: vec![crate::hel_worker::RepoDelta {
+                root: std::path::PathBuf::from("/w/app"),
+                baseline_tree: None,
+                current_tree: "target".into(),
+                patch: "diff --git a/a b/a\n".into(),
+                diffstat: "1 file changed".into(),
+                changed_lines: 1,
+            }],
+        };
+        let encoded = serde_json::to_string(&delta).unwrap();
+        let ReviewerOutcome::Delta { repositories } =
+            serde_json::from_str::<ReviewerOutcome>(&encoded).unwrap()
+        else {
+            panic!("a captured delta must survive the daemon wire");
+        };
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].current_tree, "target");
     }
 
     /// Every reviewer action names itself for the actor's logs and for the

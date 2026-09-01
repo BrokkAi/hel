@@ -1479,6 +1479,7 @@ mod tests {
                     &crate::hel_archive::GitCommand {
                         arguments: arguments.iter().map(std::ffi::OsString::from).collect(),
                         stdin: Vec::new(),
+                        env: Vec::new(),
                     },
                 )
                 .unwrap();

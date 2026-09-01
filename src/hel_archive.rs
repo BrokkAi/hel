@@ -2113,9 +2113,10 @@ mod git;
 
 pub use git::{
     GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode, GitOutput,
-    GitSnapshotProgress, NON_INTERACTIVE_GIT_ENV, NON_INTERACTIVE_GIT_SSH_COMMAND, SystemGit,
+    GitSnapshotProgress, NON_INTERACTIVE_GIT_ENV, NON_INTERACTIVE_GIT_SSH_COMMAND,
+    REVIEW_BASELINE_REF, REVIEW_CAPTURE_REF, SystemGit, capture_worktree_tree,
     collect_git_metadata_snapshot, collect_git_snapshot, collect_git_snapshot_with_progress,
-    has_origin_refs, restore_git_snapshot,
+    diff_between_trees, empty_tree_id, has_origin_refs, pin_review_tree, restore_git_snapshot,
 };
 #[cfg(test)]
 use git::{build_untracked_tar, restore_untracked_tar};

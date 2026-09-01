@@ -27,7 +27,7 @@ use crate::hel_workspace::{
     normalize_workspace_name,
 };
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -2648,6 +2648,172 @@ fn clear_active_review_in(path: &Path, session_id: &str) -> Result<()> {
     connection.execute(
         "DELETE FROM second_opinion_reviews WHERE session_id = ?1",
         [session_id],
+    )?;
+    Ok(())
+}
+
+/// Whether a workspace reviews every completed turn, and how thoroughly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnReviewSettings {
+    pub auto_review: bool,
+    pub tier: crate::hel_review::lanes::ReviewTier,
+}
+
+impl Default for TurnReviewSettings {
+    /// Off, and quick when switched on. A review costs a second agent's turn,
+    /// so a workspace opts in rather than out, and the cheaper tier is the one
+    /// that arrives first.
+    fn default() -> Self {
+        Self {
+            auto_review: false,
+            tier: crate::hel_review::lanes::ReviewTier::Quick,
+        }
+    }
+}
+
+/// How far this session has been reviewed.
+///
+/// `baselines` are Git tree ids by repository root: the working tree as of the
+/// last completed review. They advance only when a review resolves, which is
+/// what makes a cancelled review lossless -- the next one covers both turns.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TurnReviewState {
+    pub baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
+    pub reviewed_through_ordinal: u64,
+    /// The last forwarded verdict, which turns the next review into a
+    /// verification pass. Cleared once that pass consumes it.
+    pub prior_review: Option<crate::hel_review::lanes::PriorReviewContext>,
+    /// A review that was running when the daemon stopped. On recovery it is
+    /// cleared without advancing the baseline.
+    pub active: Option<String>,
+}
+
+/// Turn-review settings for `workspace_id`, or the defaults when the workspace
+/// has never been configured.
+pub fn turn_review_settings(workspace_id: &str) -> Result<TurnReviewSettings> {
+    turn_review_settings_in(&database_path(), workspace_id)
+}
+
+fn turn_review_settings_in(path: &Path, workspace_id: &str) -> Result<TurnReviewSettings> {
+    let connection = open_reader(path)?;
+    let row = connection
+        .query_row(
+            "SELECT auto_review, tier FROM turn_review_settings WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((auto_review, tier)) = row else {
+        return Ok(TurnReviewSettings::default());
+    };
+    Ok(TurnReviewSettings {
+        auto_review: auto_review != 0,
+        tier: crate::hel_review::lanes::ReviewTier::parse(&tier)
+            .unwrap_or(crate::hel_review::lanes::ReviewTier::Quick),
+    })
+}
+
+/// Records a workspace's turn-review settings.
+pub fn save_turn_review_settings(workspace_id: &str, settings: TurnReviewSettings) -> Result<()> {
+    let workspace_id = workspace_id.to_owned();
+    submit_database_write("save_turn_review_settings", move |_| {
+        save_turn_review_settings_in(&database_path(), &workspace_id, settings)
+    })
+}
+
+fn save_turn_review_settings_in(
+    path: &Path,
+    workspace_id: &str,
+    settings: TurnReviewSettings,
+) -> Result<()> {
+    ensure!(
+        !workspace_id.trim().is_empty(),
+        "turn-review settings need a workspace"
+    );
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT INTO turn_review_settings(workspace_id, auto_review, tier)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(workspace_id) DO UPDATE SET
+             auto_review = excluded.auto_review,
+             tier = excluded.tier",
+        params![
+            workspace_id,
+            i64::from(settings.auto_review),
+            settings.tier.label(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// How far `session_id` has been reviewed, or a fresh state when it has never
+/// been reviewed.
+pub fn turn_review_state(session_id: &str) -> Result<TurnReviewState> {
+    turn_review_state_in(&database_path(), session_id)
+}
+
+fn turn_review_state_in(path: &Path, session_id: &str) -> Result<TurnReviewState> {
+    let connection = open_reader(path)?;
+    let row = connection
+        .query_row(
+            "SELECT baselines, reviewed_through_ordinal, prior_review, active
+             FROM turn_review_state WHERE session_id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((baselines, ordinal, prior, active)) = row else {
+        return Ok(TurnReviewState::default());
+    };
+    Ok(TurnReviewState {
+        baselines: serde_json::from_str(&baselines).context("parse the stored review baselines")?,
+        reviewed_through_ordinal: u64::try_from(ordinal).unwrap_or_default(),
+        prior_review: prior
+            .map(|prior| serde_json::from_str(&prior))
+            .transpose()
+            .context("parse the stored prior review")?,
+        active,
+    })
+}
+
+/// Records how far a session has been reviewed.
+pub fn save_turn_review_state(session_id: &str, state: &TurnReviewState) -> Result<()> {
+    let session_id = session_id.to_owned();
+    let state = state.clone();
+    submit_database_write("save_turn_review_state", move |_| {
+        save_turn_review_state_in(&database_path(), &session_id, &state)
+    })
+}
+
+fn save_turn_review_state_in(path: &Path, session_id: &str, state: &TurnReviewState) -> Result<()> {
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT INTO turn_review_state(
+             session_id, baselines, reviewed_through_ordinal, prior_review, active
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_id) DO UPDATE SET
+             baselines = excluded.baselines,
+             reviewed_through_ordinal = excluded.reviewed_through_ordinal,
+             prior_review = excluded.prior_review,
+             active = excluded.active",
+        params![
+            session_id,
+            serde_json::to_string(&state.baselines)?,
+            i64::try_from(state.reviewed_through_ordinal).unwrap_or(i64::MAX),
+            state
+                .prior_review
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            state.active,
+        ],
     )?;
     Ok(())
 }

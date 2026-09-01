@@ -587,12 +587,12 @@ impl super::ChatState {
 pub(super) fn render_setup(
     frame: &mut ratatui::Frame,
     area: Rect,
-    captured: &CapturedProposal,
+    headline: &str,
     setup: &ReviewerSetup,
 ) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Get a second opinion ")
+        .title(" Choose a reviewer ")
         .border_style(Style::default().fg(Color::LightMagenta));
     let inner = block.inner(area);
     frame.render_widget(ratatui::widgets::Clear, area);
@@ -600,10 +600,7 @@ pub(super) fn render_setup(
 
     let mut lines = vec![
         Line::from(Span::styled(
-            format!(
-                "Reviewing a {}-line plan",
-                captured.proposal.lines().count()
-            ),
+            headline.to_owned(),
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -683,12 +680,33 @@ pub(super) fn render_reviewer(
     reviewer: &mut ReviewerPane,
     status: &str,
 ) -> (Rect, usize, usize) {
+    render_reviewer_titled(frame, area, reviewer, status, " Second opinion ", None)
+}
+
+/// The same pane under another title, with an optional one-row strip above the
+/// transcript. Turn review uses the strip to show which reviewing agents are
+/// running and where each has got to.
+pub(super) fn render_reviewer_titled(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    reviewer: &mut ReviewerPane,
+    status: &str,
+    title: &str,
+    strip: Option<Line<'static>>,
+) -> (Rect, usize, usize) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Second opinion ")
+        .title(title.to_owned())
         .border_style(Style::default().fg(Color::LightMagenta));
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     frame.render_widget(block, area);
+    if let Some(strip) = strip
+        && inner.height > 1
+    {
+        let strip_area = Rect::new(inner.x, inner.y, inner.width, 1);
+        frame.render_widget(Paragraph::new(strip), strip_area);
+        inner = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+    }
     reviewer.ensure_rows(inner.width);
     let height = usize::from(inner.height);
     if reviewer.follow {
@@ -769,6 +787,17 @@ pub(super) fn render_split_actions(
 /// session id a reviewer's events are folded under.
 pub(super) fn reviewer_session_id(primary_session_id: &str) -> String {
     format!("{primary_session_id}-reviewer")
+}
+
+/// The same, for one turn-review role. The default role keeps the plan
+/// reviewer's id, which is also the relay session id the worker uses, so a
+/// quick review folds into exactly the journal it reads.
+pub(super) fn review_role_session_id(primary_session_id: &str, role: &str) -> String {
+    if role == crate::hel_review::driver::REVIEWER_ROLE {
+        reviewer_session_id(primary_session_id)
+    } else {
+        format!("{primary_session_id}-review-{role}")
+    }
 }
 
 /// Builds a pane straight from entries, for tests that need a populated
@@ -1160,7 +1189,7 @@ mod tests {
             description: None,
             fields: Vec::new(),
         };
-        assert!(chat.show_reviewer_elicitation(form));
+        assert!(chat.show_review_role_elicitation(None, form));
         assert!(chat.reviewer_elicitation_open());
 
         // The primary's own projection must not take a reviewer's form down.
@@ -1188,7 +1217,7 @@ mod tests {
         };
         // An answer the planning harness is blocked on matters more than one
         // its reviewer is.
-        assert!(!chat.show_reviewer_elicitation(reviewer_form));
+        assert!(!chat.show_review_role_elicitation(None, reviewer_form));
         assert!(!chat.reviewer_elicitation_open());
     }
 

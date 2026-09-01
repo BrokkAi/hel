@@ -1443,13 +1443,14 @@ async fn forward_remote_session_request(request: RemoteSessionRequest) {
         }
         RemoteSessionRequest::Reviewer {
             session_id,
+            role,
             action,
             reply,
         } => {
             let result = async {
                 daemon::connect_or_start()
                     .await?
-                    .reviewer_action(session_id, action)
+                    .reviewer_action(session_id, role, action)
                     .await
             }
             .await

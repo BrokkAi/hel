@@ -177,6 +177,10 @@ pub struct LaunchSpec {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub project_memory: Option<ProjectMemoryLaunchConfig>,
+    /// Extra stdio MCP servers this session gets, beyond project memory. A
+    /// turn review's reviewing agents get Bifrost this way; the primary
+    /// session gets none.
+    pub extra_mcp_servers: Vec<crate::hel_worker_runtime::ReviewMcpServer>,
     pub resume_session: Option<String>,
     pub harness: HarnessKind,
     pub execution_policy: ExecutionPolicy,
@@ -222,14 +226,38 @@ fn session_request_meta(spec: &LaunchSpec) -> Option<serde_json::Map<String, ser
     })
 }
 
+/// The reviewing agents' analyzer servers, for harnesses that accept a server
+/// over ACP. Claude and Kimi read their staged profile instead, which the
+/// controller writes while staging the reviewer.
+fn extra_mcp(spec: &LaunchSpec) -> Vec<McpServer> {
+    if crate::hel_worker_runtime::ReviewMcpDelivery::for_harness(spec.harness)
+        != crate::hel_worker_runtime::ReviewMcpDelivery::Acp
+    {
+        return Vec::new();
+    }
+    spec.extra_mcp_servers
+        .iter()
+        .map(|server| {
+            McpServer::Stdio(
+                McpServerStdio::new(server.name.clone(), server.command.clone())
+                    .args(server.args.clone()),
+            )
+        })
+        .collect()
+}
+
 fn new_session_request(spec: &LaunchSpec, include_project_memory: bool) -> NewSessionRequest {
     let request = NewSessionRequest::new(spec.cwd.clone())
         .additional_directories(spec.additional_directories.clone())
         .meta(session_request_meta(spec));
+    let mut servers = extra_mcp(spec);
     if include_project_memory {
-        request.mcp_servers(project_memory_mcp(spec))
-    } else {
+        servers.extend(project_memory_mcp(spec));
+    }
+    if servers.is_empty() {
         request
+    } else {
+        request.mcp_servers(servers)
     }
 }
 

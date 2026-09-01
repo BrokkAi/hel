@@ -248,6 +248,11 @@ enum WorkerCommand {
         #[arg(long)]
         root: PathBuf,
     },
+    /// Serve the turn review's specialist-dispatch tool over MCP stdio.
+    ReviewMcp {
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Bridge controller Git services to this worker over stdio.
     GitBridge {
         #[arg(long)]
@@ -430,6 +435,7 @@ async fn run_command(
                 hel::hel_resources::install_resource_stream(std::io::stdin(), &destination)
             }
             WorkerCommand::MemoryMcp { root } => hel::hel_project_memory::run_mcp_stdio(&root),
+            WorkerCommand::ReviewMcp { socket } => hel::hel_review::mcp::run_mcp_stdio(&socket),
             WorkerCommand::GitBridge { root } => hel::hel_git_proxy::run_worker_bridge(&root).await,
             WorkerCommand::GitProxy {
                 root,

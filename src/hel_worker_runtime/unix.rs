@@ -49,7 +49,7 @@ impl Default for ProjectMemoryEndpoint {
     }
 }
 
-struct SocketGuard(PathBuf);
+pub(super) struct SocketGuard(PathBuf);
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
@@ -193,15 +193,17 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
     // The reviewer shares this session's target and working directory and
     // nothing else. It stays idle until a controller asks for a second
     // opinion, so constructing it costs nothing.
-    let reviewer = Arc::new(tokio::sync::Mutex::new(ReviewerSidecar::new(
-        ReviewerPlacement {
-            worker_root: root.clone(),
-            session_id: config.session_id.clone(),
-            cwd: config.cwd.clone(),
-            additional_directories: config.additional_directories.clone(),
-            worker_executable: worker_executable.clone(),
-        },
-    )));
+    let reviewer = Arc::new(ReviewerSidecar::new(ReviewerPlacement {
+        worker_root: root.clone(),
+        session_id: config.session_id.clone(),
+        cwd: config.cwd.clone(),
+        additional_directories: config.additional_directories.clone(),
+        worker_executable: worker_executable.clone(),
+    }));
+    // The review supervisor's dispatch tool talks to this worker over its own
+    // socket inside the reviewer directory: an MCP server started by a harness
+    // has no relay connection, and the dispatch is not session history.
+    let dispatch_socket = serve_review_dispatch(&root, reviewer.clone())?;
     // Everything that can start a reviewer runs inside this block, so every
     // way out of it — including an error — passes through the pause below.
     // Stopping the reviewer's process group before this worker exits is what
@@ -218,6 +220,7 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
             environment: Default::default(),
             cwd: config.cwd,
             additional_directories: config.additional_directories,
+            extra_mcp_servers: Vec::new(),
             project_memory: config.project_memory,
             resume_session,
             harness: config.harness,
@@ -341,7 +344,8 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
         .await
     }
     .await;
-    reviewer.lock().await.pause().await;
+    reviewer.pause_all().await;
+    drop(dispatch_socket);
     outcome
 }
 
@@ -1191,7 +1195,7 @@ pub(super) struct ConnectionRuntime {
     pub(super) commands: Option<mpsc::Sender<CommandRequest>>,
     /// The second-opinion reviewer, when this worker has an ACP runtime to run
     /// one beside. A sealed session has none.
-    pub(super) reviewer: Option<Arc<tokio::sync::Mutex<ReviewerSidecar>>>,
+    pub(super) reviewer: Option<Arc<ReviewerSidecar>>,
 }
 
 #[cfg(test)]
@@ -1466,9 +1470,85 @@ async fn compaction_response(
     }
 }
 
+/// Serves the review dispatch socket for as long as the returned guard lives.
+///
+/// One line in, one line out, one connection per call: the supervisor's MCP
+/// server connects, hands over the lanes it wants, and reads the answer. The
+/// socket lives inside the worker root, so nothing outside this container can
+/// reach it, and it is removed when the worker stops.
+pub(super) fn serve_review_dispatch(
+    root: &std::path::Path,
+    reviewer: Arc<ReviewerSidecar>,
+) -> Result<SocketGuard> {
+    let directory = root.join(crate::hel_worker_runtime::REVIEWER_DIR);
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("create the reviewer directory {}", directory.display()))?;
+    let path = directory.join(crate::hel_review::mcp::REVIEW_DISPATCH_SOCKET);
+    // A socket left behind by a previous worker would refuse the bind; the
+    // previous worker is gone, so its socket is stale by definition.
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("bind the review dispatch socket {}", path.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let reviewer = reviewer.clone();
+            tokio::spawn(async move {
+                if let Err(error) = serve_one_review_dispatch(stream, reviewer).await {
+                    // Reported rather than dropped: a supervisor whose
+                    // dispatch was lost would wait for lanes that never run.
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "a review dispatch could not be answered"
+                    );
+                }
+            });
+        }
+    });
+    Ok(SocketGuard(path))
+}
+
+async fn serve_one_review_dispatch(
+    stream: UnixStream,
+    reviewer: Arc<ReviewerSidecar>,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (read, mut write) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(read);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .context("read a review dispatch")?;
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let reply = match serde_json::from_str::<crate::hel_review::lanes::LaneDispatch>(line.trim()) {
+        Ok(dispatch) => reviewer.record_dispatch(dispatch),
+        Err(error) => crate::hel_review::lanes::LaneDispatchReply {
+            started: Vec::new(),
+            error: Some(format!("could not read the dispatch: {error}")),
+        },
+    };
+    let mut body = serde_json::to_vec(&reply)?;
+    body.push(b'\n');
+    write
+        .write_all(&body)
+        .await
+        .context("answer a review dispatch")?;
+    write.flush().await.context("flush a review dispatch")
+}
+
 async fn reviewer_response(
     envelope: RelayRequestEnvelope,
-    reviewer: Option<&Arc<tokio::sync::Mutex<ReviewerSidecar>>>,
+    reviewer: Option<&Arc<ReviewerSidecar>>,
 ) -> RelayResponseEnvelope {
     if !envelope.request.supported_at(envelope.protocol_version) {
         return incompatible_request_protocol_response(
@@ -1486,12 +1566,13 @@ async fn reviewer_response(
             ),
         };
     };
-    let RelayRequest::Reviewer { request } = envelope.request.clone() else {
+    let RelayRequest::Reviewer { role, request } = envelope.request.clone() else {
         unreachable!("reviewer_response only serves reviewer requests");
     };
-    // Reviewer operations are sequential by construction: starting,
-    // configuring and pausing one harness cannot interleave.
-    reviewer.lock().await.handle(envelope, request).await
+    // Operations on one role are sequential by construction; operations on
+    // different roles are not, so a lane launching cannot block the controller
+    // reading the supervisor's journal.
+    reviewer.handle(envelope, role, request).await
 }
 
 fn compaction_error(code: RelayErrorCode, message: &str) -> RelayResponseBody {

@@ -16,7 +16,9 @@ use anyhow::{Context, Result, bail};
 use super::worker_binary::{bridge_launch, stage_profile};
 use super::{Controller, execute_checked, scp_command_spec, ssh_command_spec};
 use crate::hel_targets::{self, CommandExecutor, CommandSpec, ProcessExecutor};
-use crate::hel_worker_runtime::{REVIEWER_DIR, REVIEWER_PROFILE_DIR, ReviewerLaunchConfig};
+use crate::hel_worker_runtime::{
+    REVIEWER_DIR, REVIEWER_PROFILE_DIR, ReviewMcpDelivery, ReviewMcpServer, ReviewerLaunchConfig,
+};
 
 impl Controller {
     /// Copy `profile_id`'s home into the session worker's reviewer directory
@@ -30,7 +32,42 @@ impl Controller {
         profile_id: &str,
         generation: u64,
     ) -> Result<ReviewerLaunchConfig> {
-        self.stage_reviewer_profile_controlled(session_id, profile_id, generation, &ProcessExecutor)
+        self.stage_reviewer_profile_controlled(
+            session_id,
+            profile_id,
+            generation,
+            &[],
+            &ProcessExecutor,
+        )
+    }
+
+    /// Stage a reviewer that also gets `mcp_servers`, which is how a turn
+    /// review attaches its analyzer tools.
+    ///
+    /// `dispatch_tool` adds the review supervisor's own tool, which is this
+    /// worker's binary in another mode. Only the controller knows where that
+    /// binary and its socket sit on the target, so it is built here rather
+    /// than by the caller.
+    pub fn stage_reviewer_profile_with_mcp(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+        generation: u64,
+        mcp_servers: &[ReviewMcpServer],
+        dispatch_tool: bool,
+    ) -> Result<ReviewerLaunchConfig> {
+        let mut servers = mcp_servers.to_vec();
+        if dispatch_tool {
+            let (_, worker_root) = self.worker_placement(session_id)?;
+            servers.push(review_dispatch_server(&worker_root));
+        }
+        self.stage_reviewer_profile_controlled(
+            session_id,
+            profile_id,
+            generation,
+            &servers,
+            &ProcessExecutor,
+        )
     }
 
     pub fn stage_reviewer_profile_controlled(
@@ -38,6 +75,7 @@ impl Controller {
         session_id: &str,
         profile_id: &str,
         generation: u64,
+        mcp_servers: &[ReviewMcpServer],
         executor: &impl CommandExecutor,
     ) -> Result<ReviewerLaunchConfig> {
         let profile = self
@@ -61,6 +99,15 @@ impl Controller {
         let staging = tempfile::tempdir().context("create reviewer staging directory")?;
         let local = staging.path().join("profile");
         stage_profile(profile, &local).with_context(|| format!("stage profile {profile_id:?}"))?;
+        // Harnesses that ignore MCP servers offered over ACP read their own
+        // configuration instead, so the servers are written into the copy
+        // being staged, before it is uploaded.
+        if !mcp_servers.is_empty()
+            && ReviewMcpDelivery::for_harness(profile.kind) == ReviewMcpDelivery::HarnessProfile
+        {
+            configure_staged_review_mcp(profile.kind, &local, mcp_servers)
+                .with_context(|| format!("configure reviewer MCP servers for {profile_id:?}"))?;
+        }
         upload_reviewer_profile(executor, &backend, &worker_root, &local)?;
 
         let (bridge_command, bridge_args) = bridge_launch(
@@ -83,7 +130,105 @@ impl Controller {
             model: None,
             effort: None,
             generation,
+            // A harness that reads its servers from the staged profile must
+            // not also be offered them over ACP: it would either duplicate the
+            // server or reject the request.
+            mcp_servers: match ReviewMcpDelivery::for_harness(profile.kind) {
+                ReviewMcpDelivery::Acp => mcp_servers.to_vec(),
+                ReviewMcpDelivery::HarnessProfile => Vec::new(),
+            },
         })
+    }
+}
+
+/// Writes `servers` into the staged profile of a harness that reads its MCP
+/// configuration from disk.
+///
+/// Claude Code reads `mcpServers` from `.claude.json` in its config directory;
+/// Kimi reads `mcpServers` from `mcp.json` in its home, and needs the runtime
+/// id its own schema carries. Both files are the reviewer's private copy, so
+/// nothing here can reach the user's own configuration.
+fn configure_staged_review_mcp(
+    harness: crate::hel_config::HarnessKind,
+    profile_stage: &Path,
+    servers: &[ReviewMcpServer],
+) -> Result<()> {
+    let (file, kimi) = match harness {
+        crate::hel_config::HarnessKind::Claude => (".claude.json", false),
+        crate::hel_config::HarnessKind::Kimi => ("mcp.json", true),
+        other => bail!("{other:?} does not read MCP servers from its profile"),
+    };
+    let path = profile_stage.join(file);
+    let mut document = match std::fs::read(&path) {
+        Ok(body) => serde_json::from_slice::<serde_json::Value>(&body)
+            .with_context(|| format!("parse staged reviewer configuration {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read staged reviewer configuration {}", path.display()));
+        }
+    };
+    let root = document.as_object_mut().with_context(|| {
+        format!(
+            "staged reviewer configuration {} must contain a JSON object",
+            path.display()
+        )
+    })?;
+    let configured = root
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .with_context(|| {
+            format!(
+                "mcpServers in staged reviewer configuration {} must be a JSON object",
+                path.display()
+            )
+        })?;
+    for server in servers {
+        let mut entry = serde_json::json!({
+            "command": server.command,
+            "args": server.args,
+        });
+        if kimi {
+            let object = entry
+                .as_object_mut()
+                .expect("the server entry is a JSON object");
+            object.insert("transport".into(), "stdio".into());
+            object.insert("runtime_id".into(), "local".into());
+        } else {
+            let object = entry
+                .as_object_mut()
+                .expect("the server entry is a JSON object");
+            object.insert("type".into(), "stdio".into());
+        }
+        configured.insert(server.name.clone(), entry);
+    }
+    let mut body = serde_json::to_vec_pretty(&document)?;
+    body.push(b'\n');
+    crate::hel_config::atomic_write(&path, &body)
+        .with_context(|| format!("write staged reviewer configuration {}", path.display()))
+}
+
+/// The review supervisor's dispatch tool, as it runs inside the container:
+/// this worker's own binary in `review-mcp` mode, talking to the socket the
+/// worker serves in its reviewer directory.
+fn review_dispatch_server(worker_root: &str) -> ReviewMcpServer {
+    let socket = format!(
+        "{worker_root}/{}/{}",
+        REVIEWER_DIR,
+        crate::hel_review::mcp::REVIEW_DISPATCH_SOCKET
+    );
+    ReviewMcpServer {
+        name: crate::hel_review::mcp::REVIEW_MCP_SERVER_NAME.to_owned(),
+        command: Path::new(worker_root).join("hel"),
+        args: vec![
+            "worker".to_owned(),
+            "review-mcp".to_owned(),
+            "--socket".to_owned(),
+            socket,
+        ],
     }
 }
 
@@ -364,7 +509,7 @@ mod tests {
         let executor = RecordingExecutor::new();
 
         let config = controller
-            .stage_reviewer_profile_controlled(&session_id, "claude", 0, &executor)
+            .stage_reviewer_profile_controlled(&session_id, "claude", 0, &[], &executor)
             .unwrap();
 
         assert_eq!(config.profile_id, "claude");
@@ -417,7 +562,7 @@ mod tests {
         let executor = RecordingExecutor::new();
 
         controller
-            .stage_reviewer_profile_controlled(&session_id, "codex", 3, &executor)
+            .stage_reviewer_profile_controlled(&session_id, "codex", 3, &[], &executor)
             .unwrap();
 
         let script = executor.script();
@@ -458,7 +603,7 @@ mod tests {
         let executor = RecordingExecutor::new();
 
         let error = controller
-            .stage_reviewer_profile_controlled(&session_id, "missing", 0, &executor)
+            .stage_reviewer_profile_controlled(&session_id, "missing", 0, &[], &executor)
             .unwrap_err();
 
         assert!(format!("{error:#}").contains("unknown profile"));
@@ -477,10 +622,10 @@ mod tests {
         let executor = RecordingExecutor::new();
 
         let first = controller
-            .stage_reviewer_profile_controlled(&session_id, "codex", 0, &executor)
+            .stage_reviewer_profile_controlled(&session_id, "codex", 0, &[], &executor)
             .unwrap();
         let second = controller
-            .stage_reviewer_profile_controlled(&session_id, "codex", 1, &executor)
+            .stage_reviewer_profile_controlled(&session_id, "codex", 1, &[], &executor)
             .unwrap();
 
         assert!(first.reusable_for(&first));
