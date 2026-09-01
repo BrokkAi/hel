@@ -145,12 +145,20 @@ impl TurnReview {
             .unwrap_or((0, String::new()))
     }
 
-    /// Forms any reviewing role's harness is waiting on.
+    /// Forms any reviewing role's harness is waiting on, each paired with the
+    /// role that asked, because that is where the answer has to go.
     #[must_use]
-    pub(super) fn pending_elicitations(&self) -> Vec<crate::hel_elicitation::ElicitationRequest> {
+    pub(super) fn pending_elicitations(
+        &self,
+    ) -> Vec<(String, crate::hel_elicitation::ElicitationRequest)> {
         self.panes
-            .values()
-            .flat_map(|pane| pane.pending_elicitations().to_vec())
+            .iter()
+            .flat_map(|(role, pane)| {
+                pane.pending_elicitations()
+                    .iter()
+                    .map(|request| (role.clone(), request.clone()))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -626,6 +634,43 @@ mod tests {
         assert_eq!(chat.handle_key(key(KeyCode::Tab)), ChatAction::None);
         assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
         assert!(chat.turn_review_active(), "the review is still up");
+    }
+
+    /// A form is answered back to the harness that asked it. In the extended
+    /// tier several are running at once, so answering the default role would
+    /// leave a lane waiting for ever while the answer went somewhere else.
+    #[test]
+    fn a_lanes_form_is_answered_back_to_that_lane() {
+        let mut chat = chat();
+        chat.open_turn_review(driver());
+        let form = crate::hel_elicitation::ElicitationRequest {
+            id: "lane-form-1".into(),
+            message: "Allow reading /etc?".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+        };
+        assert!(chat.show_review_role_elicitation(Some("tests".to_string()), form));
+        assert!(chat.reviewer_elicitation_open());
+
+        // The dialog takes the key, not the review's action bar: Escape here
+        // answers the harness rather than cancelling the review out from under
+        // it.
+        let action = chat.handle_key(key(KeyCode::Esc));
+        let ChatAction::RespondReviewerElicitation {
+            role,
+            elicitation_id,
+            ..
+        } = action
+        else {
+            panic!("a reviewing harness's answer goes back to it: {action:?}");
+        };
+        assert_eq!(role.as_deref(), Some("tests"));
+        assert_eq!(elicitation_id, "lane-form-1");
+        assert!(
+            chat.turn_review_active(),
+            "answering a form does not end the review"
+        );
     }
 
     #[test]

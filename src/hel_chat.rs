@@ -165,9 +165,11 @@ pub enum ChatAction {
     /// Turn auto-review on or off for this session's workspace, and choose how
     /// thorough each review is.
     SetTurnReviewSettings(crate::hel_database::TurnReviewSettings),
-    /// An answer to a form the reviewer's harness is waiting on. It is routed
-    /// to the reviewer, never to the primary.
+    /// An answer to a form a reviewing harness is waiting on. It is routed to
+    /// the role that asked, never to the primary: a turn review can have
+    /// several harnesses waiting at once.
     RespondReviewerElicitation {
+        role: Option<String>,
         elicitation_id: String,
         response: ElicitationResponse,
     },
@@ -350,6 +352,8 @@ pub struct ChatState {
     /// Whether the dialog on screen belongs to the reviewer rather than the
     /// primary, so its answer is routed to the harness that asked.
     elicitation_is_reviewers: bool,
+    /// Which reviewing role asked the form on screen, when one did.
+    elicitation_role: Option<String>,
     recovery_phase: Option<RecoveryCheckpointPhase>,
     goal_prompt_active: bool,
     acp_surface: AcpSessionSurface,
@@ -432,6 +436,7 @@ impl ChatState {
             turn_review_action_areas: Vec::new(),
             turn_review_settings: crate::hel_database::TurnReviewSettings::default(),
             elicitation_is_reviewers: false,
+            elicitation_role: None,
             recovery_phase: None,
             goal_prompt_active: snapshot
                 .active_prompt
@@ -682,11 +687,22 @@ impl ChatState {
     ///
     /// The primary's own dialog wins the screen: an answer the planning
     /// harness is blocked on matters more than one its reviewer is.
-    pub(super) fn show_reviewer_elicitation(&mut self, request: ElicitationRequest) -> bool {
+    /// Puts a reviewing harness's form on screen, remembering which role asked.
+    ///
+    /// The answer has to go back to that role: in the extended tier several
+    /// harnesses run at once, and answering the wrong one leaves the asker
+    /// waiting for ever. `None` is the plan reviewer, which is the only
+    /// harness the second-opinion split has.
+    pub(super) fn show_review_role_elicitation(
+        &mut self,
+        role: Option<String>,
+        request: ElicitationRequest,
+    ) -> bool {
         if self.elicitation.is_some() {
             return false;
         }
         self.elicitation_is_reviewers = true;
+        self.elicitation_role = role;
         self.elicitation = Some(ElicitationDialog::new(request));
         true
     }
@@ -1539,16 +1555,23 @@ impl ChatState {
             return ChatAction::OpenWebDialog;
         }
 
+        // A reviewing harness that asked a question is blocked until it is
+        // answered, and its dialog is drawn over the split, so the dialog
+        // below takes keys before either review view does. Without this the
+        // review's own actions would swallow the answer and the harness would
+        // wait for ever.
+        let reviewing = !self.reviewer_elicitation_open();
+
         // The second-opinion view owns the frame while it is up: the composer
         // and the plan decision behind it are both part of what it is deciding.
-        if self.second_opinion_active() {
+        if reviewing && self.second_opinion_active() {
             return self.handle_second_opinion_key(code, modifiers);
         }
 
         // A turn review owns the frame on the same terms. Its actions are the
         // only input while it is unresolved, which is what holds the primary
         // agent still until the user has answered the findings.
-        if self.turn_review_active() {
+        if reviewing && self.turn_review_active() {
             return self.handle_turn_review_key(code, modifiers);
         }
 
@@ -1563,6 +1586,7 @@ impl ChatState {
                 self.elicitation = None;
                 if std::mem::take(&mut self.elicitation_is_reviewers) {
                     return ChatAction::RespondReviewerElicitation {
+                        role: self.elicitation_role.take(),
                         elicitation_id: request.id,
                         response,
                     };

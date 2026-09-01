@@ -1189,7 +1189,7 @@ mod tests {
             description: None,
             fields: Vec::new(),
         };
-        assert!(chat.show_reviewer_elicitation(form));
+        assert!(chat.show_review_role_elicitation(None, form));
         assert!(chat.reviewer_elicitation_open());
 
         // The primary's own projection must not take a reviewer's form down.
@@ -1217,7 +1217,7 @@ mod tests {
         };
         // An answer the planning harness is blocked on matters more than one
         // its reviewer is.
-        assert!(!chat.show_reviewer_elicitation(reviewer_form));
+        assert!(!chat.show_review_role_elicitation(None, reviewer_form));
         assert!(!chat.reviewer_elicitation_open());
     }
 

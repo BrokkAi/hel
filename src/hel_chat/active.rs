@@ -1777,9 +1777,10 @@ impl ActiveChat {
             ChatAction::TurnReview(intent) => self.run_turn_review(intent),
             ChatAction::SetTurnReviewSettings(settings) => self.set_turn_review_settings(settings),
             ChatAction::RespondReviewerElicitation {
+                role,
                 elicitation_id,
                 response,
-            } => self.answer_reviewer(elicitation_id, response),
+            } => self.answer_reviewer(role, elicitation_id, response),
             ChatAction::RespondElicitation { request, response } => {
                 let plan_followup = self.state.plan_review_followup(&request, &response);
                 self.state.set_notice("Sending answer…");
@@ -2195,17 +2196,22 @@ impl ActiveChat {
     /// Answers a form the reviewer's harness is waiting on.
     fn answer_reviewer(
         &mut self,
+        role: Option<String>,
         elicitation_id: String,
         response: crate::hel_elicitation::ElicitationResponse,
     ) {
         let session = self.session.clone();
         let updates = self.chat_io_tx.clone();
+        let answered_role = role.clone();
         tokio::spawn(async move {
             let result = session
-                .reviewer(ReviewerAction::RespondElicitation {
-                    elicitation_id,
-                    response,
-                })
+                .reviewer_as(
+                    role,
+                    ReviewerAction::RespondElicitation {
+                        elicitation_id,
+                        response,
+                    },
+                )
                 .await
                 .map(|_| ())
                 .map_err(|error| format!("{error:#}"));
@@ -2213,34 +2219,52 @@ impl ActiveChat {
                 tracing::debug!(%error, "reviewer form answer result dropped");
             }
         });
-        // The answer unblocks the reviewer's turn, so keep reading its journal.
-        self.poll_reviewer_events();
+        // The answer unblocks that harness's turn, so keep reading its journal.
+        match answered_role {
+            Some(role) => self.poll_turn_review_role(&role),
+            None => self.poll_reviewer_events(),
+        }
     }
 
     /// Puts a form the reviewer is waiting on in front of the user, or answers
     /// it for them when it is not theirs to answer.
     fn surface_reviewer_elicitations(&mut self) {
-        let pending = match (self.state.second_opinion(), self.state.turn_review()) {
-            (Some(view), _) => view
-                .reviewer()
-                .map(|reviewer| reviewer.pending_elicitations().to_vec())
-                .unwrap_or_default(),
-            (None, Some(review)) => review.pending_elicitations(),
-            (None, None) => return,
-        };
-        for request in pending {
+        let pending: Vec<(Option<String>, crate::hel_elicitation::ElicitationRequest)> =
+            match (self.state.second_opinion(), self.state.turn_review()) {
+                (Some(view), _) => view
+                    .reviewer()
+                    .map(|reviewer| {
+                        reviewer
+                            .pending_elicitations()
+                            .iter()
+                            .map(|request| (None, request.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                (None, Some(review)) => review
+                    .pending_elicitations()
+                    .into_iter()
+                    .map(|(role, request)| (Some(role), request))
+                    .collect(),
+                (None, None) => return,
+            };
+        for (role, request) in pending {
             // A reviewer's plan decision is the reviewer proposing work, not
             // the plan under review. It is never shown as the primary's
             // decision; the reviewer was asked to critique, not to implement,
             // so it is declined and its critique stands as the answer.
             if crate::hel_acp::is_plan_review_id(&request.id) {
-                self.answer_reviewer(request.id, crate::hel_acp::plan_review_keep_planning());
+                self.answer_reviewer(
+                    role,
+                    request.id,
+                    crate::hel_acp::plan_review_keep_planning(),
+                );
                 continue;
             }
             if self.state.reviewer_elicitation_open() {
                 return;
             }
-            if !self.state.show_reviewer_elicitation(request) {
+            if !self.state.show_review_role_elicitation(role, request) {
                 return;
             }
         }
