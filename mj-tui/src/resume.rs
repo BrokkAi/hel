@@ -1982,7 +1982,7 @@ mod tests {
 
     /// Cost of the merged row list and of one keypress, on a dialog the size a
     /// long-lived harness home produces. Run with
-    /// `cargo test -p hel-tui resume_row_cost -- --ignored --nocapture`.
+    /// `cargo test -p brokk-mj-tui resume_row_cost -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing measurement, not a behavior assertion"]
     fn resume_row_cost_for_a_few_thousand_sessions() {

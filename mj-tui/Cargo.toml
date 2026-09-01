@@ -1,11 +1,11 @@
 [package]
-name = "hel-tui"
+name = "brokk-mj-tui"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
-description = "Terminal UI widgets and views for Hel"
+description = "Terminal UI widgets and views for Mjolnir"
 license = "GPL-3.0-only"
-repository = "https://github.com/BrokkAi/hel"
+repository = "https://github.com/BrokkAi/mjolnir"
 publish = true
 
 [lints]

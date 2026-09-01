@@ -177,7 +177,7 @@ async function sherpaNativePayload(metadata) {
   return {
     component: `sherpa-onnx native static payload ${packageInfo.version}`,
     source: packageUrl(packageInfo),
-    scope: "statically linked into hel-voice-worker on Linux, macOS, and Windows",
+    scope: "statically linked into mj-voice-worker on Linux, macOS, and Windows",
     text: [
       "The sherpa-onnx-sys build downloads a native archive that contains only static libraries, without legal files. The linked payload was audited against these exact upstream revisions:",
       "",

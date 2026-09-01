@@ -1,18 +1,18 @@
 [package]
-name = "hel-cli"
+name = "brokk-mjolnir"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
-description = "Hel: session control plane for ACP coding agents (installs the `hel` binary)"
+description = "Mjolnir: session control plane for ACP coding agents (installs the `mj` binary)"
 license = "GPL-3.0-only"
-repository = "https://github.com/BrokkAi/hel"
+repository = "https://github.com/BrokkAi/mjolnir"
 publish = true
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "hel"
+name = "mj"
 path = "src/main.rs"
 
 [features]

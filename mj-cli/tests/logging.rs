@@ -6,7 +6,7 @@ fn top_level_failure_is_written_to_a_private_per_run_log() {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     let config = root.path().join("config");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hel"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
     command
         .args(["checkpoint", "--session", "definitely-missing"])
         .env("HEL_DATA_DIR", &data)

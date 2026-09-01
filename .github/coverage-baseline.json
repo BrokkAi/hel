@@ -5,43 +5,43 @@
   },
   "production_module_line_target": 70.0,
   "module_exceptions": {
-    "crates/hel-cli/src/daemon.rs": {
+    "mj-cli/src/daemon.rs": {
       "minimum": 37.25,
       "reason": "Daemon process, socket, and lifecycle branches require supervised multi-process runtime scenarios."
     },
-    "crates/hel-cli/src/dashboard.rs": {
+    "mj-cli/src/dashboard.rs": {
       "minimum": 54.0,
       "reason": "Remaining branches cross the real terminal loop, daemon feed, and background operation boundaries."
     },
-    "crates/hel-cli/src/dashboard/actions.rs": {
+    "mj-cli/src/dashboard/actions.rs": {
       "minimum": 2.0,
       "reason": "Dashboard actions provision, resume, stop, and checkpoint real managed resources; the reliability harness will cover them."
     },
-    "crates/hel-cli/src/dashboard/io.rs": {
+    "mj-cli/src/dashboard/io.rs": {
       "minimum": 13.0,
       "reason": "Remaining dashboard I/O branches require filesystem scans, Git repositories, and persistent daemon integration."
     },
-    "crates/hel-cli/src/import.rs": {
+    "mj-cli/src/import.rs": {
       "minimum": 9.5,
       "reason": "One-shot native-session import wrappers are intentionally outside the current runtime reliability priority."
     },
-    "crates/hel-cli/src/main.rs": {
+    "mj-cli/src/main.rs": {
       "minimum": 51.75,
       "reason": "The entry point combines tested runtime startup with lower-priority one-shot command dispatch."
     },
-    "crates/hel-cli/src/pollers.rs": {
+    "mj-cli/src/pollers.rs": {
       "minimum": 60.25,
       "reason": "Remaining poller branches require live quota clients, credentials, targets, and long-running timing cycles."
     },
-    "crates/hel-cli/src/server.rs": {
+    "mj-cli/src/server.rs": {
       "minimum": 34.0,
       "reason": "Remaining phone server branches require a live daemon, TLS listener, browser, and concurrent clients."
     },
-    "crates/hel-cli/src/workspace_selector.rs": {
+    "mj-cli/src/workspace_selector.rs": {
       "minimum": 35.5,
       "reason": "Remaining branches are real terminal setup and interactive workspace selection."
     },
-    "crates/hel-tui/src/wizards/dashboard.rs": {
+    "mj-tui/src/wizards/dashboard.rs": {
       "minimum": 60.75,
       "reason": "Remaining dashboard wizard branches depend on asynchronous target discovery and preflight results."
     },

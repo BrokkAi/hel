@@ -22,7 +22,7 @@ use hel::hel_state::{HelState, MaterializedSession, SessionState, TranscriptBody
 use hel::hel_worker::RelayCommand;
 
 fn hel_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_hel") {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_mj") {
         return PathBuf::from(path);
     }
     let mut path = std::env::current_exe().expect("resolve current test executable");

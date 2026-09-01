@@ -474,6 +474,115 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-mj-core"
+version = "2.0.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "arboard",
+ "axum",
+ "axum-server",
+ "base64",
+ "blake3",
+ "chrono",
+ "crossterm",
+ "dirs",
+ "flate2",
+ "getrandom 0.3.4",
+ "hmac",
+ "http-body-util",
+ "iana-time-zone",
+ "libc",
+ "proptest",
+ "pulldown-cmark",
+ "qrcode",
+ "ratatui",
+ "rayon",
+ "reedline",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "signal-hook",
+ "similar",
+ "sysinfo",
+ "tar",
+ "tempfile",
+ "textwrap",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width",
+ "url",
+ "zip",
+]
+
+[[package]]
+name = "brokk-mj-tui"
+version = "2.0.0"
+dependencies = [
+ "brokk-mj-core",
+ "chrono",
+ "crossterm",
+ "qrcode",
+ "ratatui",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "brokk-mj-voice-worker"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "bzip2 0.6.1",
+ "cpal",
+ "dirs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sherpa-onnx",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
+name = "brokk-mjolnir"
+version = "2.0.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "axum-server",
+ "brokk-mj-core",
+ "brokk-mj-tui",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "getrandom 0.3.4",
+ "libc",
+ "mimalloc",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1421,115 +1530,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "hel-cli"
-version = "0.4.2"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "axum-server",
- "chrono",
- "clap",
- "crossterm",
- "dirs",
- "getrandom 0.3.4",
- "hel-core",
- "hel-tui",
- "libc",
- "mimalloc",
- "ratatui",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "hel-core"
-version = "0.4.2"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "arboard",
- "axum",
- "axum-server",
- "base64",
- "blake3",
- "chrono",
- "crossterm",
- "dirs",
- "flate2",
- "getrandom 0.3.4",
- "hmac",
- "http-body-util",
- "iana-time-zone",
- "libc",
- "proptest",
- "pulldown-cmark",
- "qrcode",
- "ratatui",
- "rayon",
- "reedline",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "signal-hook",
- "similar",
- "sysinfo",
- "tar",
- "tempfile",
- "textwrap",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "toml",
- "tower",
- "tracing",
- "unicode-segmentation",
- "unicode-width",
- "url",
- "zip",
-]
-
-[[package]]
-name = "hel-tui"
-version = "0.4.2"
-dependencies = [
- "chrono",
- "crossterm",
- "hel-core",
- "qrcode",
- "ratatui",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "hel-voice-worker"
-version = "0.4.2"
-dependencies = [
- "anyhow",
- "bzip2 0.6.1",
- "cpal",
- "dirs",
- "reqwest",
- "serde",
- "serde_json",
- "sherpa-onnx",
- "tar",
- "tempfile",
-]
 
 [[package]]
 name = "hermit-abi"

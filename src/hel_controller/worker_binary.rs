@@ -585,7 +585,7 @@ pub enum WorkerBinaryAvailability {
 }
 
 fn packaged_worker_binary_path(directory: &Path, triple: &str) -> PathBuf {
-    directory.join(format!("hel-worker-{triple}"))
+    directory.join(format!("mj-worker-{triple}"))
 }
 
 /// Find a worker source without downloading it.
@@ -675,7 +675,7 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
         });
     }
     bail!(
-        "no Linux worker for {triple}; install hel-worker-{triple} beside Hel, set HEL_WORKER_DIR/HEL_WORKER_BINARY, or configure HEL_WORKER_URL and HEL_WORKER_SHA256"
+        "no Linux worker for {triple}; install mj-worker-{triple} beside mj, set HEL_WORKER_DIR/HEL_WORKER_BINARY, or configure HEL_WORKER_URL and HEL_WORKER_SHA256"
     )
 }
 
@@ -1978,11 +1978,11 @@ mod tests {
         let directory = Path::new("/opt/hel/bin");
         assert_eq!(
             packaged_worker_binary_path(directory, "x86_64-unknown-linux-musl"),
-            directory.join("hel-worker-x86_64-unknown-linux-musl")
+            directory.join("mj-worker-x86_64-unknown-linux-musl")
         );
         assert_eq!(
             packaged_worker_binary_path(directory, "aarch64-unknown-linux-musl"),
-            directory.join("hel-worker-aarch64-unknown-linux-musl")
+            directory.join("mj-worker-aarch64-unknown-linux-musl")
         );
     }
     #[cfg(target_os = "linux")]

@@ -4,7 +4,7 @@ set -eu
 
 SCRIPT_VERSION="1.0.0"
 OWNER="${HEL_GITHUB_OWNER:-BrokkAi}"
-REPOSITORY="${HEL_GITHUB_REPOSITORY:-hel}"
+REPOSITORY="${HEL_GITHUB_REPOSITORY:-mjolnir}"
 : "${HOME:?HOME must be set}"
 PREFIX="${HEL_PREFIX:-$HOME/.local}"
 VERSION="${HEL_VERSION:-}"
@@ -13,11 +13,11 @@ TARGET=""
 BIN_DIR=""
 
 log() {
-  printf 'hel-installer: %s\n' "$*"
+  printf 'mj-installer: %s\n' "$*"
 }
 
 die() {
-  printf 'hel-installer: error: %s\n' "$*" >&2
+  printf 'mj-installer: error: %s\n' "$*" >&2
   exit 1
 }
 
@@ -26,8 +26,8 @@ usage() {
 Install the latest Hel release.
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/BrokkAi/hel/master/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/BrokkAi/hel/master/install.sh | sh -s -- --prefix /usr/local
+  curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | sh -s -- --prefix /usr/local
 
 Options:
   --prefix DIRECTORY  Install binaries in DIRECTORY/bin (default: ~/.local/bin).
@@ -38,7 +38,7 @@ Environment:
   HEL_PREFIX              Same as --prefix.
   HEL_VERSION             Same as --version, for example v0.1.0.
   HEL_GITHUB_OWNER        GitHub owner to download from (default: BrokkAi).
-  HEL_GITHUB_REPOSITORY   GitHub repository to download from (default: hel).
+  HEL_GITHUB_REPOSITORY   GitHub repository to download from (default: mjolnir).
   GITHUB_TOKEN            Optional token for GitHub download rate limits.
 EOF
 }
@@ -142,10 +142,10 @@ path_includes_bin_dir() {
 }
 
 print_next_steps() {
-  hel_command="hel"
+  hel_command="mj"
   if ! path_includes_bin_dir; then
-    hel_command="$BIN_DIR/hel"
-    log "${BIN_DIR} is not on PATH; add it to your shell profile to use hel directly"
+    hel_command="$BIN_DIR/mj"
+    log "${BIN_DIR} is not on PATH; add it to your shell profile to use mj directly"
   fi
 
   printf '\nNext steps:\n'
@@ -206,11 +206,11 @@ main() {
     die "could not create ${BIN_DIR}; choose a writable --prefix"
   fi
 
-  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hel-installer.XXXXXX")" ||
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mj-installer.XXXXXX")" ||
     die "could not create a temporary directory"
   trap cleanup 0 HUP INT TERM
 
-  asset_name="hel-${TARGET}.tar.gz"
+  asset_name="mj-${TARGET}.tar.gz"
   archive_path="$TMP_DIR/$asset_name"
   checksum_path="$TMP_DIR/$asset_name.sha256"
   download_base="$(release_download_base)"
@@ -230,29 +230,29 @@ main() {
   extract_dir="$TMP_DIR/extract"
   mkdir "$extract_dir"
   tar -xzf "$archive_path" -C "$extract_dir"
-  archive_root="$extract_dir/hel-$TARGET"
-  [ -f "$archive_root/hel" ] || die "archive did not contain hel"
+  archive_root="$extract_dir/mj-$TARGET"
+  [ -f "$archive_root/mj" ] || die "archive did not contain mj"
   case "$TARGET" in
     x86_64-unknown-linux-musl)
-      [ -f "$archive_root/hel-worker-aarch64-unknown-linux-musl" ] ||
+      [ -f "$archive_root/mj-worker-aarch64-unknown-linux-musl" ] ||
         die "archive did not contain the aarch64 Linux worker"
       ;;
     aarch64-unknown-linux-musl)
-      [ -f "$archive_root/hel-worker-x86_64-unknown-linux-musl" ] ||
+      [ -f "$archive_root/mj-worker-x86_64-unknown-linux-musl" ] ||
         die "archive did not contain the x86_64 Linux worker"
       ;;
     aarch64-apple-darwin)
-      [ -f "$archive_root/hel-worker-x86_64-unknown-linux-musl" ] ||
+      [ -f "$archive_root/mj-worker-x86_64-unknown-linux-musl" ] ||
         die "archive did not contain the x86_64 Linux worker"
-      [ -f "$archive_root/hel-worker-aarch64-unknown-linux-musl" ] ||
+      [ -f "$archive_root/mj-worker-aarch64-unknown-linux-musl" ] ||
         die "archive did not contain the aarch64 Linux worker"
       ;;
   esac
 
-  install_binary "$archive_root/hel" hel
+  install_binary "$archive_root/mj" mj
   for worker in \
-    hel-worker-x86_64-unknown-linux-musl \
-    hel-worker-aarch64-unknown-linux-musl
+    mj-worker-x86_64-unknown-linux-musl \
+    mj-worker-aarch64-unknown-linux-musl
   do
     if [ -f "$archive_root/$worker" ]; then
       install_binary "$archive_root/$worker" "$worker"

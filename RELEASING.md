@@ -7,11 +7,11 @@ tests, and dependency-license maintenance.
 ## Version contract
 
 All four published crates inherit the release version from
-`[workspace.package]` in the root `Cargo.toml`: `hel-core`, `hel-tui`,
-`hel-cli`, and `hel-voice-worker`.
+`[workspace.package]` in the root `Cargo.toml`: `brokk-mj-core`, `brokk-mj-tui`,
+`brokk-mjolnir`, and `brokk-mj-voice-worker`.
 
 Cargo requires published path dependencies to carry a registry version and
-does not allow that version to inherit. The `hel` and `hel-tui` entries under
+does not allow that version to inherit. The `hel` and `brokk-mj-tui` entries under
 `[workspace.dependencies]` therefore repeat the release version. After changing
 the workspace package version, synchronize those entries with:
 
@@ -28,8 +28,8 @@ product version.
 
 Each published crate must authorize this repository before the workflow can
 exchange GitHub's OIDC identity for a short-lived crates.io token. In the
-crates.io settings for `hel-core`, `hel-tui`, `hel-cli`, and
-`hel-voice-worker`, create a GitHub Trusted Publisher with these exact values:
+crates.io settings for `brokk-mj-core`, `brokk-mj-tui`, `brokk-mjolnir`, and
+`brokk-mj-voice-worker`, create a GitHub Trusted Publisher with these exact values:
 
 - GitHub owner: `BrokkAi`
 - Repository: `hel`
@@ -65,9 +65,9 @@ already public.
    cargo fmt --check
    cargo test
    cargo clippy --all-targets -- -D warnings
-   cargo package --locked -p hel-core
+   cargo package --locked -p brokk-mj-core
    CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
-     cargo package --locked -p hel-voice-worker
+     cargo package --locked -p brokk-mj-voice-worker
    ```
 
    Run `cargo test` outside the restricted sandbox as required by `AGENTS.md`.
@@ -92,8 +92,8 @@ already public.
    and dispatches the crates.io workflow.
 7. Approve the `crates-io` environment when requested. `publish.yml` verifies
    and packages the tagged source, authenticates through each crate's Trusted
-   Publisher configuration, then publishes `hel-core`, `hel-tui`, `hel-cli`,
-   and `hel-voice-worker` in dependency order. An already-published crate
+   Publisher configuration, then publishes `brokk-mj-core`, `brokk-mj-tui`, `brokk-mjolnir`,
+   and `brokk-mj-voice-worker` in dependency order. An already-published crate
    version is skipped, so rerunning the workflow safely resumes a partial
    publication.
 8. Verify the GitHub Release assets and confirm all four crates show `X.Y.Z` on

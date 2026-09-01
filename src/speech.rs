@@ -1,6 +1,6 @@
 //! Prompt dictation support.
 //!
-//! Non-Android platforms run a fully local `hel-voice-worker` sidecar built on
+//! Non-Android platforms run a fully local `mj-voice-worker` sidecar built on
 //! sherpa-onnx. Keeping the native speech stack in its own workspace package
 //! means ordinary `hel` builds never compile or link ONNX Runtime.
 //!
@@ -83,15 +83,15 @@ mod worker {
             return Ok(path);
         }
 
-        let hel = std::env::current_exe().context("locate the hel executable")?;
+        let hel = std::env::current_exe().context("locate the mj executable")?;
         let worker = hel.with_file_name(if cfg!(windows) {
-            "hel-voice-worker.exe"
+            "mj-voice-worker.exe"
         } else {
-            "hel-voice-worker"
+            "mj-voice-worker"
         });
         anyhow::ensure!(
             worker.is_file(),
-            "voice dictation helper is missing: {}; install it beside hel or set HEL_VOICE_WORKER",
+            "voice dictation helper is missing: {}; install it beside mj or set HEL_VOICE_WORKER",
             worker.display()
         );
         Ok(worker)

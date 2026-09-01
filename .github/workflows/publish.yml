@@ -50,13 +50,13 @@ jobs:
         run: |
           # Only crates without in-workspace registry dependencies can be
           # packaged before publishing: cargo package requires a dependency to
-          # exist in the index even with --no-verify, and hel-core is not there
-          # until this same release publishes it. hel-tui and hel-cli are
+          # exist in the index even with --no-verify, and brokk-mj-core is not there
+          # until this same release publishes it. brokk-mj-tui and brokk-mjolnir are
           # packaged (and verify-built) by cargo publish itself, which runs in
-          # dependency order after hel-core is live.
-          cargo package --locked -p hel-core
+          # dependency order after brokk-mj-core is live.
+          cargo package --locked -p brokk-mj-core
           CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
-            cargo package --locked -p hel-voice-worker
+            cargo package --locked -p brokk-mj-voice-worker
 
       - uses: actions/upload-artifact@v7
         with:
@@ -137,12 +137,12 @@ jobs:
           }
           # Dependency order: cargo publish waits for each crate to reach the
           # index before returning, so the next crate in the chain resolves.
-          for crate in hel-core hel-tui hel-cli hel-voice-worker; do
+          for crate in brokk-mj-core brokk-mj-tui brokk-mjolnir brokk-mj-voice-worker; do
             if already_published "$crate"; then
               echo "$crate $version is already on crates.io, skipping"
               continue
             fi
-            if [ "$crate" = hel-voice-worker ]; then
+            if [ "$crate" = brokk-mj-voice-worker ]; then
               CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
                 cargo publish --locked -p "$crate"
             else

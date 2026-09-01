@@ -32,8 +32,8 @@ function projectPath(filename) {
   }
 
   for (const marker of [
-    "crates/hel-cli/src/",
-    "crates/hel-tui/src/",
+    "mj-cli/src/",
+    "mj-tui/src/",
     "voice-worker/src/",
     "src/",
   ]) {

@@ -1827,7 +1827,7 @@ impl ActiveChat {
                     self.state.set_notice("Stopping voice dictation…");
                 } else if !crate::speech::voice_input_supported() {
                     self.state.set_notice(
-                        "Voice helper unavailable; install hel-voice-worker beside hel or set HEL_VOICE_WORKER",
+                        "Voice helper unavailable; install mj-voice-worker beside mj or set HEL_VOICE_WORKER",
                     );
                 } else {
                     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();

@@ -239,7 +239,7 @@ image = "ubuntu:24.04"
         "make PTY master nonblocking"
     );
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hel"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
     command
         .stdin(Stdio::from(duplicate(slave.as_raw_fd())))
         .stdout(Stdio::from(duplicate(slave.as_raw_fd())))
