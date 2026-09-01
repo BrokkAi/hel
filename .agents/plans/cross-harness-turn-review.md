@@ -281,3 +281,13 @@ In `src/hel_review/verdict.rs` (ported): `pub fn synthesis_verdict(text: &str) -
 Revision note (2026-08-31): initial version, authored before any implementation work from paired research passes over hel (`src/hel_second_opinion.rs`, `src/hel_worker_runtime/reviewer.rs`, `src/hel_chat/second_opinion.rs`, `src/hel_worker/*`, `src/hel_database/*`), mjolnir (`mj-agents/src/discrete_review.rs`, `mj-core/src/orchestrator_contract.rs`, `mj-core/src/config.rs`), and bifrost (`crates/bifrost-mcp`, `crates/bifrost-analysis`). All design decisions were fixed in conversation with the maintainer on 2026-08-31 and are recorded in the Decision Log.
 
 Revision note (2026-09-01): closed after first field use. The "First field use" entry in `Outcomes & Retrospective` records the three surface defects (terminal-only driver, composer-mutated workspace config, phone lockout) and names `.agents/plans/turn-review-on-every-surface.md` as the superseding plan for hosting, arming, and surfaces. Nothing else in this document was rewritten: it remains the accurate record of the port itself (lanes, prompts, tiers, verdicts, Bifrost, delta capture), which the follow-up plan does not change.
+
+Closing note (2026-09-01, after the follow-up plan landed): the superseding
+plan is complete. Everything this document describes -- delta capture, the two
+tiers, the specialist lanes, the verdict contract, the panes -- still stands and
+still runs. What changed is only where the driver lives and how it is armed:
+the driver moved from `ActiveChat` into the controller daemon, arming moved
+from the `turn_review_settings` table (dropped in migration 21) to `[review]`
+in `config.toml`, and the terminal became one of two projections rather than
+the host. Read this document for what a review *is*; read
+`.agents/plans/turn-review-on-every-surface.md` for where it runs.

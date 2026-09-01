@@ -43,6 +43,35 @@ The ported unit tests came with the code they cover: verdict classification,
 `RawDiffSummary`, prompt rendering, dispatch validation, and intent-analyst
 gating.
 
+## Where the review runs (converged with mj, 2026-09-01)
+
+mj hosts its review driver in the process that owns the session, for every one
+of its surfaces (`mj-core/src/orchestrator.rs`, spawned by the TUI, by headless,
+and by its web host). Hel first hosted the driver in the terminal's view object,
+which is why a session driven from a phone was never reviewed and a killed
+terminal could strand a session's prompts. Hel now matches mj's shape: the
+driver lives in the controller daemon (`src/hel_review/host.rs`), and the
+terminal and the phone are both projections that render a published view and
+send resolutions back.
+
+Two of mj's hosting rules were ported with it, and are cited at their code:
+
+* Every asynchronous result carries the epoch of the review that asked for it,
+  and results naming another epoch are dropped -- mj's `review_outcome_rx` arm.
+  Without it a cancelled review's late capture lands on its successor.
+* A second start is refused while one is already being prepared -- mj's
+  `discrete_review_started`.
+
+Arming converged too: mj arms review from its global config file, and Hel now
+arms it from `[review]` in `config.toml` rather than from a per-workspace row
+written by a UI.
+
+What still differs deliberately: mj's verdict can start an automatic correction
+round above a configured threshold, and it holds the completed turn with
+`held_completion`. Hel shows the findings to the person and lets them choose,
+and holds the turn by refusing prompts for that session in the daemon's submit
+path.
+
 ## What was deliberately not ported
 
 * mj's host-side spawn kernel -- `ProgrammaticPool`, seats, roster, quota
@@ -54,6 +83,9 @@ gating.
 * `correction_threshold` and `max_correction_rounds`. mj needs them because its
   correction loop is autonomous; Hel shows the findings to the user, who decides
   whether to forward them, so the knobs are user actions instead of settings.
+* mj's per-session runtime override of the global arming (its `review_enabled`
+  atomic). Hel has global arming and a one-off `/review`; a per-session override
+  is noted and not built.
 * `held_completion` and the rest of mj's turn-holding machinery. Hel holds the
   turn by holding the composer: the review view owns the screen, the prompt
   submission paths refuse, and the web surface refuses a prompt whose session has

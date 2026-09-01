@@ -1366,7 +1366,6 @@ async fn action(
     Json(action): Json<ControllerAction>,
 ) -> Result<StatusCode, ApiError> {
     validate_action(&action, &state.snapshot_rx.borrow())?;
-    let action = refuse_prompt_during_turn_review(action).await?;
     let action = decode_prompt_images_off_task(action).await?;
     let (reply, outcome) = tokio::sync::oneshot::channel();
     state
@@ -1669,41 +1668,6 @@ async fn events(State(state): State<ServerState>) -> impl IntoResponse {
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
-/// Hold prompts while a turn review is unresolved.
-///
-/// Review is synchronous: the terminal's composer stands down while a review is
-/// on screen, and this is the same lock for the web surface. Without it a
-/// prompt sent from a phone would start the next turn under a review the user
-/// has not answered, which is exactly the "findings land out of the blue"
-/// behavior the feature exists to avoid. The in-flight review is recorded in
-/// the database, so this reads one row rather than reaching into the terminal.
-async fn refuse_prompt_during_turn_review(
-    action: ControllerAction,
-) -> Result<ControllerAction, ApiError> {
-    let ControllerAction::Prompt { session_id, .. } = &action else {
-        return Ok(action);
-    };
-    let session_id = session_id.clone();
-    let reviewing = tokio::task::spawn_blocking(move || {
-        crate::hel_database::turn_review_state(&session_id)
-            .map(|state| state.active.is_some())
-            .unwrap_or(false)
-    })
-    .await
-    .map_err(|_| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the server could not check whether a review is open",
-        )
-    })?;
-    if reviewing {
-        return Err(ApiError::bad_request(
-            "a review of the last turn is open; forward, dismiss or cancel it first",
-        ));
-    }
-    Ok(action)
-}
-
 /// Check attached images without decoding megabytes of base64 on the task that
 /// serves the request. Everything else about an action is cheap enough to
 /// check inline; a full multi-image prompt is not.
@@ -1948,6 +1912,15 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             if !images.is_empty() && !session.prompt_images_supported {
                 return Err(ApiError::bad_request(
                     "this session does not support image prompts",
+                ));
+            }
+            // Review is synchronous: the turn under review stays where the
+            // review found it. The daemon's own submit path is what makes this
+            // true; refusing here as well is what turns it into an immediate
+            // answer rather than a rejected prompt.
+            if session.turn_review.is_some() {
+                return Err(ApiError::bad_request(
+                    crate::hel_review::host::PROMPT_HELD_MESSAGE,
                 ));
             }
         }
