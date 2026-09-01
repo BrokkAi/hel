@@ -354,6 +354,18 @@ pub enum ReviewerAction {
         response: ElicitationResponse,
     },
     Pause,
+    /// Report what the workspace repositories changed since these baselines.
+    CaptureDelta {
+        baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
+    },
+    /// Record the trees a completed review reviewed through.
+    AdvanceBaseline {
+        trees: std::collections::BTreeMap<std::path::PathBuf, String>,
+    },
+    /// Run Bifrost's semantic diff analysis over the captured trees.
+    AnalyzeDelta {
+        repositories: Vec<crate::hel_worker::AnalyzeDeltaRepository>,
+    },
 }
 
 impl ReviewerAction {
@@ -366,6 +378,9 @@ impl ReviewerAction {
             Self::Status => "reviewer_status",
             Self::RespondElicitation { .. } => "reviewer_respond_elicitation",
             Self::Pause => "reviewer_pause",
+            Self::CaptureDelta { .. } => "reviewer_capture_delta",
+            Self::AdvanceBaseline { .. } => "reviewer_advance_baseline",
+            Self::AnalyzeDelta { .. } => "reviewer_analyze_delta",
         }
     }
 }
@@ -381,6 +396,15 @@ pub enum ReviewerOutcome {
     Status(Box<RelayOperationalState>),
     ElicitationResolved,
     Paused,
+    /// What every workspace repository changed since the stored baselines.
+    Delta {
+        repositories: Vec<crate::hel_worker::RepoDelta>,
+    },
+    BaselineAdvanced,
+    /// Bifrost's changed-callable packet for the captured trees.
+    ChangedFunctions {
+        packet: String,
+    },
 }
 
 pub enum RemoteSessionRequest {
@@ -2172,6 +2196,16 @@ async fn drive_reviewer(
             client.pause_reviewer().await?;
             ReviewerOutcome::Paused
         }
+        ReviewerAction::CaptureDelta { baselines } => ReviewerOutcome::Delta {
+            repositories: client.capture_review_delta(baselines).await?,
+        },
+        ReviewerAction::AdvanceBaseline { trees } => {
+            client.advance_review_baseline(trees).await?;
+            ReviewerOutcome::BaselineAdvanced
+        }
+        ReviewerAction::AnalyzeDelta { repositories } => ReviewerOutcome::ChangedFunctions {
+            packet: client.analyze_review_delta(repositories).await?,
+        },
     })
 }
 
@@ -2976,6 +3010,19 @@ mod tests {
             },
             ReviewerAction::Status,
             ReviewerAction::Pause,
+            ReviewerAction::CaptureDelta {
+                baselines: BTreeMap::from([(std::path::PathBuf::from("/w/app"), "tree".into())]),
+            },
+            ReviewerAction::AdvanceBaseline {
+                trees: BTreeMap::from([(std::path::PathBuf::from("/w/app"), "tree".into())]),
+            },
+            ReviewerAction::AnalyzeDelta {
+                repositories: vec![crate::hel_worker::AnalyzeDeltaRepository {
+                    root: std::path::PathBuf::from("/w/app"),
+                    baseline_tree: Some("base".into()),
+                    current_tree: "target".into(),
+                }],
+            },
         ];
         for action in actions {
             let encoded = serde_json::to_string(&action).unwrap();
@@ -2993,6 +3040,25 @@ mod tests {
             serde_json::from_str::<ReviewerOutcome>(&paused).unwrap(),
             ReviewerOutcome::Paused
         ));
+
+        let delta = ReviewerOutcome::Delta {
+            repositories: vec![crate::hel_worker::RepoDelta {
+                root: std::path::PathBuf::from("/w/app"),
+                baseline_tree: None,
+                current_tree: "target".into(),
+                patch: "diff --git a/a b/a\n".into(),
+                diffstat: "1 file changed".into(),
+                changed_lines: 1,
+            }],
+        };
+        let encoded = serde_json::to_string(&delta).unwrap();
+        let ReviewerOutcome::Delta { repositories } =
+            serde_json::from_str::<ReviewerOutcome>(&encoded).unwrap()
+        else {
+            panic!("a captured delta must survive the daemon wire");
+        };
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].current_tree, "target");
     }
 
     /// Every reviewer action names itself for the actor's logs and for the

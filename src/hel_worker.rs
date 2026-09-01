@@ -20,10 +20,11 @@ mod types;
 
 pub use journal::{RestoredRelaySeed, restored_relay_seed_path};
 pub use protocol::{
-    RelayErrorCode, RelayErrorDetail, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
-    RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload, RelayVersionRange,
-    ReviewerRequest, incompatible_request_protocol_response, invalid_relay_request_response,
-    read_relay_frame, serve_relay_json_lines, unsupported_relay_method_response, write_relay_frame,
+    AnalyzeDeltaRepository, RelayErrorCode, RelayErrorDetail, RelayProtocolError, RelayRequest,
+    RelayRequestEnvelope, RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
+    RelayVersionRange, RepoDelta, ReviewerRequest, incompatible_request_protocol_response,
+    invalid_relay_request_response, read_relay_frame, serve_relay_json_lines,
+    unsupported_relay_method_response, write_relay_frame,
 };
 #[cfg(unix)]
 pub(crate) use snapshot::truncate_start_with_marker;

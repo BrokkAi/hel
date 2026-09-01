@@ -48,6 +48,13 @@ const RELAY_ACKNOWLEDGE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A compaction request runs a full model turn in a scratch ACP session, so it
 /// outlives the deadline that suits the relay's bookkeeping calls.
 const RELAY_COMPACT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Capturing a review delta runs Git over every workspace repository, which is
+/// filesystem work on a possibly large tree rather than relay bookkeeping.
+const REVIEW_CAPTURE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bifrost's semantic diff analysis has its own 600-second budget inside the
+/// worker; this leaves room for it to report a timeout as an error rather than
+/// having the call time out underneath it.
+const REVIEW_ANALYSIS_TIMEOUT: Duration = Duration::from_secs(660);
 const RELAY_PROXY_DETACH_GRACE: Duration = Duration::from_millis(500);
 const RELAY_PROXY_REAP_POLL: Duration = Duration::from_millis(10);
 
@@ -870,6 +877,48 @@ impl RelayClient {
         {
             RelayResponsePayload::ReviewerPaused => Ok(()),
             _ => bail!("relay returned an unexpected reviewer pause response"),
+        }
+    }
+
+    /// Report what every workspace repository changed since the review
+    /// baselines the controller holds.
+    pub async fn capture_review_delta(
+        &mut self,
+        baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
+    ) -> Result<Vec<crate::hel_worker::RepoDelta>> {
+        let request = self.reviewer_request(ReviewerRequest::CaptureDelta { baselines })?;
+        match self.call_with_timeout(request, REVIEW_CAPTURE_TIMEOUT).await? {
+            RelayResponsePayload::ReviewDelta { repositories } => Ok(repositories),
+            _ => bail!("relay returned an unexpected review capture response"),
+        }
+    }
+
+    /// Record the trees a completed review reviewed through, so the next
+    /// review starts from them.
+    pub async fn advance_review_baseline(
+        &mut self,
+        trees: std::collections::BTreeMap<std::path::PathBuf, String>,
+    ) -> Result<()> {
+        let request = self.reviewer_request(ReviewerRequest::AdvanceBaseline { trees })?;
+        match self.call_with_timeout(request, REVIEW_CAPTURE_TIMEOUT).await? {
+            RelayResponsePayload::ReviewBaselineAdvanced => Ok(()),
+            _ => bail!("relay returned an unexpected review baseline response"),
+        }
+    }
+
+    /// Run Bifrost's semantic diff analysis over the captured trees. It can
+    /// take minutes on a large changeset, so it carries its own budget.
+    pub async fn analyze_review_delta(
+        &mut self,
+        repositories: Vec<crate::hel_worker::AnalyzeDeltaRepository>,
+    ) -> Result<String> {
+        let request = self.reviewer_request(ReviewerRequest::AnalyzeDelta { repositories })?;
+        match self
+            .call_with_timeout(request, REVIEW_ANALYSIS_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::ReviewChangedFunctions { packet } => Ok(packet),
+            _ => bail!("relay returned an unexpected review analysis response"),
         }
     }
 

@@ -173,6 +173,53 @@ pub enum ReviewerRequest {
     /// Cancel any turn in flight and stop the reviewer's process group,
     /// keeping its staged profile, native session and journal for next time.
     Pause,
+    /// Report what changed in every workspace repository since `baselines`.
+    ///
+    /// A baseline is a Git tree id recorded by an earlier capture, keyed by
+    /// repository root. A repository with no entry is diffed against the empty
+    /// tree, so its whole content reads as new. Capture never touches the
+    /// repository's index or working tree.
+    CaptureDelta {
+        baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
+    },
+    /// Record `trees` as the new review baselines, pinning each so a later
+    /// `git gc` cannot collect it.
+    AdvanceBaseline {
+        trees: std::collections::BTreeMap<std::path::PathBuf, String>,
+    },
+    /// Run Bifrost's one-shot semantic diff analysis over captured trees and
+    /// return the changed-callable packet the review prompts embed.
+    AnalyzeDelta {
+        repositories: Vec<AnalyzeDeltaRepository>,
+    },
+}
+
+/// One repository's captured endpoints for the Bifrost analysis pre-pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzeDeltaRepository {
+    pub root: std::path::PathBuf,
+    /// Absent for a repository with no recorded baseline, which the worker
+    /// resolves to that repository's empty tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_tree: Option<String>,
+    pub current_tree: String,
+}
+
+/// What one repository contributed to a cumulative review delta.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoDelta {
+    pub root: std::path::PathBuf,
+    pub baseline_tree: Option<String>,
+    pub current_tree: String,
+    /// Unified diff, bounded worker-side; an empty patch means this repository
+    /// has nothing to review.
+    pub patch: String,
+    /// Human-readable file and line totals, computed from the untruncated
+    /// patch so bounding cannot make a change look smaller than it is.
+    pub diffstat: String,
+    pub changed_lines: usize,
 }
 
 impl ReviewerRequest {
@@ -185,6 +232,9 @@ impl ReviewerRequest {
             Self::Status => "reviewer_status",
             Self::RespondElicitation { .. } => "reviewer_respond_elicitation",
             Self::Pause => "reviewer_pause",
+            Self::CaptureDelta { .. } => "reviewer_capture_delta",
+            Self::AdvanceBaseline { .. } => "reviewer_advance_baseline",
+            Self::AnalyzeDelta { .. } => "reviewer_analyze_delta",
         }
     }
 }
@@ -354,6 +404,16 @@ pub enum RelayResponsePayload {
     },
     /// The reviewer's process group has been stopped; its files remain.
     ReviewerPaused,
+    /// What every workspace repository changed since the stored baselines.
+    ReviewDelta {
+        repositories: Vec<RepoDelta>,
+    },
+    /// The review baselines now name the trees the controller sent.
+    ReviewBaselineAdvanced,
+    /// Bifrost's changed-callable packet for the captured trees.
+    ReviewChangedFunctions {
+        packet: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

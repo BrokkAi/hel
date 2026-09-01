@@ -1477,6 +1477,7 @@ fn system_git_children_cannot_stop_on_a_prompt() {
                     .map(OsString::from)
                     .collect(),
                 stdin: Vec::new(),
+                env: Vec::new(),
             },
         )
         .unwrap();
@@ -1889,4 +1890,112 @@ fn system_git_round_trip_restores_commits_index_worktree_and_untracked() {
     assert!(status.contains("A  staged.txt"));
     assert!(status.contains(" M dirty.txt"));
     assert!(status.contains("?? new.txt"));
+}
+
+/// Enough text that the capture's patch crosses the 64 KiB pipe buffer a
+/// child's stdout is drained through, which is where truncation and deadlock
+/// bugs in the Git plumbing would show up.
+fn large_text(marker: &str, lines: usize) -> String {
+    (0..lines)
+        .map(|line| format!("{marker} line {line} with enough text to make the patch large\n"))
+        .collect()
+}
+
+#[test]
+fn review_capture_sees_tracked_modified_and_untracked_changes_without_touching_the_index() {
+    let repository = tempfile::tempdir().unwrap();
+    initialize_repository(repository.path());
+    commit_file(
+        repository.path(),
+        "tracked.txt",
+        large_text("base", 800).as_bytes(),
+        "base",
+    );
+
+    let baseline = capture_worktree_tree(&SystemGit, repository.path()).unwrap();
+    let status_before = git(repository.path(), &["status", "--porcelain"]);
+
+    fs::write(
+        repository.path().join("tracked.txt"),
+        large_text("changed", 800),
+    )
+    .unwrap();
+    fs::write(
+        repository.path().join("untracked.txt"),
+        large_text("added", 800),
+    )
+    .unwrap();
+    fs::write(repository.path().join("staged.txt"), large_text("staged", 800)).unwrap();
+    git(repository.path(), &["add", "staged.txt"]);
+
+    let current = capture_worktree_tree(&SystemGit, repository.path()).unwrap();
+    assert_ne!(baseline, current, "the capture must follow the working tree");
+
+    let patch = diff_between_trees(&SystemGit, repository.path(), Some(&baseline), &current).unwrap();
+    assert!(
+        patch.len() > 64 * 1024,
+        "the fixture must exceed one pipe buffer, got {} bytes",
+        patch.len()
+    );
+    assert!(patch.contains("tracked.txt"), "modified tracked file is in the patch");
+    assert!(patch.contains("untracked.txt"), "untracked file is in the patch");
+    assert!(patch.contains("staged.txt"), "staged file is in the patch");
+    assert!(patch.contains("+changed line 799"), "the patch carries file contents");
+
+    let status_after = git(repository.path(), &["status", "--porcelain"]);
+    assert_eq!(
+        String::from_utf8_lossy(&status_before),
+        "",
+        "the repository starts clean"
+    );
+    assert!(
+        String::from_utf8_lossy(&status_after).contains("A  staged.txt"),
+        "capture leaves the real index exactly as the user left it: {}",
+        String::from_utf8_lossy(&status_after)
+    );
+    assert_eq!(
+        git_line(repository.path(), &["rev-parse", REVIEW_CAPTURE_REF]),
+        current,
+        "the capture ref pins the tree so gc cannot collect it"
+    );
+    assert!(
+        !repository.path().join(".git").read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hel-review-index-")
+        }),
+        "the scratch index is removed after the capture"
+    );
+}
+
+#[test]
+fn review_capture_without_a_baseline_diffs_against_the_empty_tree() {
+    let repository = tempfile::tempdir().unwrap();
+    initialize_repository(repository.path());
+    commit_file(repository.path(), "tracked.txt", b"base\n", "base");
+
+    let current = capture_worktree_tree(&SystemGit, repository.path()).unwrap();
+    let patch = diff_between_trees(&SystemGit, repository.path(), None, &current).unwrap();
+    assert!(
+        patch.contains("new file mode") && patch.contains("+base"),
+        "an absent baseline renders the whole capture as additions: {patch}"
+    );
+}
+
+#[test]
+fn review_capture_ignores_files_git_ignores() {
+    let repository = tempfile::tempdir().unwrap();
+    initialize_repository(repository.path());
+    commit_file(repository.path(), ".gitignore", b"ignored.txt\n", "ignore");
+
+    let baseline = capture_worktree_tree(&SystemGit, repository.path()).unwrap();
+    fs::write(repository.path().join("ignored.txt"), b"build output\n").unwrap();
+    let current = capture_worktree_tree(&SystemGit, repository.path()).unwrap();
+
+    assert_eq!(
+        baseline, current,
+        "ignored build output is not a change a review should see"
+    );
 }

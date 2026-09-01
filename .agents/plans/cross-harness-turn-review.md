@@ -14,14 +14,22 @@ To see it working after full implementation: open a Hel session, enable auto-rev
 
 - [x] (2026-08-31 16:30Z) Research complete: mj porting inventory and hel integration-point map produced; all design decisions below reflect verified code, with file:line citations checked against both repos.
 - [x] (2026-08-31 16:45Z) ExecPlan authored.
-- [ ] Milestone 1: cumulative delta capture in the worker (git tree snapshots, `CaptureDelta` request).
+- [x] (2026-09-01 03:55Z) Milestone 1: cumulative delta capture in the worker (git tree snapshots, `CaptureDelta`/`AdvanceBaseline`/`AnalyzeDelta` requests, Bifrost pinned into the container image).
+- [x] (2026-09-01 03:55Z) Milestone 3 (brought forward): `src/hel_review/{lanes,verdict,delta,bifrost}.rs` carry the full mj port with its tests. Done before Milestone 2 because Milestone 2 needs the same prompts; Milestone 2 is now wiring rather than authoring.
 - [ ] Milestone 2: quick-tier review end-to-end in the split pane (trigger, lock, quick reviewer + validator, Forward/Dismiss/Cancel, baseline advance, workspace toggle, manual trigger).
-- [ ] Milestone 3: ported prompt/lane/verdict module with unit tests.
 - [ ] Milestone 4: extended tier (multi-role sidecar, supervisor with `call_review_subagents` MCP dispatch, intent analyst, lane strip in the pane).
 - [ ] Milestone 5: recovery semantics, docs note in `.agents/docs/`, retrospective.
 
 ## Surprises & Discoveries
 
+- Observation: `GitCommand` (`src/hel_archive/git.rs:10`) had no per-command environment, and a review capture cannot be written without one: staging a tree without touching the real index requires `GIT_INDEX_FILE`, which Git reads only from the environment. The field was added (`env: Vec<(OsString, OsString)>`) and the eight existing construction sites updated; `SystemGit::run` applies it after the non-interactive defaults so a caller cannot accidentally re-enable a credential prompt.
+  Evidence: `capture_worktree_tree` in `src/hel_archive/git.rs`; test `review_capture_sees_tracked_modified_and_untracked_changes_without_touching_the_index` asserts `git status --porcelain` is unchanged by a capture.
+- Observation: `git update-ref` accepts a tree object under `refs/hel/*`. The "trying to write non-commit object to branch" refusal applies to `refs/heads/*` only, so the capture pin works as the plan assumed.
+  Evidence: the same test asserts `git rev-parse refs/hel/review-capture` equals the captured tree id.
+- Observation: Bifrost 0.10.7 (the latest crates.io release of `brokk-bifrost`) pins Rust 1.97.1, while Hel pins 1.96.0. The container image therefore builds it in a separate `FROM rust:1.97.1-trixie AS bifrost` stage and copies only `/usr/local/bin/bifrost` into the final image, which also keeps Bifrost's build inputs out of the shipped layers.
+  Evidence: `/home/jonathan/Projects/bifrost/rust-toolchain.toml` names 1.97.1; `containers/Containerfile.agent-dev` lines 1-25.
+- Observation: mj's `RawDiffSummary::diffstat` ends every line with "(raw Git patch; Bifrost analysis disabled)", which was true in mj because that summary only appeared when analysis was off. In Hel it is the worker's ordinary diffstat for `RepoDelta` metadata and Bifrost always runs, so the suffix was dropped -- the one deliberate wording change in the ported summary.
+  Evidence: `src/hel_review/delta.rs`, test `a_raw_diff_summary_counts_files_and_changed_lines`.
 - Observation: Hel's second-opinion reviewer is a single-slot sidecar. `ReviewerSidecar` (`src/hel_worker_runtime/reviewer.rs:92`) holds `running: Option<RunningReviewer>`; the relay session id is the fixed string `format!("{session_id}-reviewer")` (`reviewer.rs:77`), the staging directory constants are singular (`REVIEWER_DIR = "reviewer"`, `src/hel_worker_runtime.rs:15`), and the DB row is one-per-session (`second_opinion_reviews.session_id` PRIMARY KEY, `src/hel_database/schema.rs:455`). Nothing structurally forbids several concurrent ACP children in one worker, but every identifier must gain a role dimension for multi-lane review.
 - Observation: the relay journal has no bounded range read. `DurableRelay::events_after(after_ordinal, after_digest)` (`src/hel_worker.rs:484`) is cursor-forward only; an X..Y window must be truncated controller-side.
 - Observation: no tree-hash or per-turn-diff helper exists anywhere in hel. Checkpoints capture whole-session archives (`src/hel_checkpoint.rs`); `collect_git_snapshot` (`src/hel_archive/git.rs:311`) captures staged/unstaged/untracked state but never computes a content id of the working tree.

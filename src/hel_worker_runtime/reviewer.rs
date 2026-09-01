@@ -173,7 +173,94 @@ impl ReviewerSidecar {
                 elicitation_id,
                 response,
             } => self.respond_elicitation(elicitation_id, response).await,
+            ReviewerRequest::CaptureDelta { baselines } => self.capture_delta(baselines).await,
+            ReviewerRequest::AdvanceBaseline { trees } => self.advance_baseline(trees).await,
+            ReviewerRequest::AnalyzeDelta { repositories } => {
+                self.analyze_delta(repositories).await
+            }
         }
+    }
+
+    /// The workspace repositories a review covers, discovered from the
+    /// primary's working directory and additional roots.
+    fn review_repositories(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.placement.cwd.clone()];
+        roots.extend(self.placement.additional_directories.iter().cloned());
+        crate::hel_review::delta::discover_repositories(&crate::hel_archive::SystemGit, &roots)
+    }
+
+    /// Reports what every workspace repository changed since `baselines`.
+    ///
+    /// Git work is blocking and can take a moment on a large tree, so it runs
+    /// on the blocking pool rather than on the runtime that also serves the
+    /// primary session's relay.
+    async fn capture_delta(
+        &mut self,
+        baselines: std::collections::BTreeMap<PathBuf, String>,
+    ) -> Result<RelayResponseBody> {
+        let repositories = self.review_repositories();
+        let repositories = tokio::task::spawn_blocking(move || {
+            crate::hel_review::delta::capture_repository_deltas(
+                &crate::hel_archive::SystemGit,
+                &repositories,
+                &baselines,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("the review capture stopped: {error}"))??;
+        Ok(RelayResponseBody::Ok {
+            payload: RelayResponsePayload::ReviewDelta { repositories },
+        })
+    }
+
+    /// Records the trees a completed review reviewed through.
+    async fn advance_baseline(
+        &mut self,
+        trees: std::collections::BTreeMap<PathBuf, String>,
+    ) -> Result<RelayResponseBody> {
+        tokio::task::spawn_blocking(move || {
+            crate::hel_review::delta::advance_baselines(&crate::hel_archive::SystemGit, &trees)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("the review baseline update stopped: {error}"))??;
+        Ok(RelayResponseBody::Ok {
+            payload: RelayResponsePayload::ReviewBaselineAdvanced,
+        })
+    }
+
+    /// Runs Bifrost's semantic diff analysis over the captured trees.
+    ///
+    /// A repository with no recorded baseline is analyzed against its own
+    /// empty tree, which is what "everything here is new" means to Bifrost.
+    async fn analyze_delta(
+        &mut self,
+        repositories: Vec<crate::hel_worker::AnalyzeDeltaRepository>,
+    ) -> Result<RelayResponseBody> {
+        let mut requests = Vec::new();
+        for repository in repositories {
+            let base = match repository.baseline_tree {
+                Some(tree) => tree,
+                None => {
+                    let root = repository.root.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::hel_archive::empty_tree_id(&crate::hel_archive::SystemGit, &root)
+                    })
+                    .await
+                    .map_err(|error| anyhow::anyhow!("reading the empty tree stopped: {error}"))??
+                }
+            };
+            requests.push(crate::hel_review::bifrost::AnalyzeRequest {
+                repository: repository.root,
+                base_tree: base,
+                target_tree: repository.current_tree,
+            });
+        }
+        let packet = crate::hel_review::bifrost::changed_functions_packet(&requests)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(RelayResponseBody::Ok {
+            payload: RelayResponsePayload::ReviewChangedFunctions { packet },
+        })
     }
 
     /// Answers a form the reviewer's harness is waiting on.

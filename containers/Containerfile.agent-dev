@@ -4,8 +4,23 @@ ARG NODE_IMAGE=docker.io/library/node:24-trixie
 # pinned toolchain on the first cargo run without the musl target and
 # components this image adds below. Bump both together.
 ARG RUST_IMAGE=docker.io/library/rust:1.96.0-trixie
+# Bifrost is the semantic-analysis tool every turn review depends on: the
+# review's `analyze_diff` pre-pass and the analyzer/navigation MCP servers the
+# reviewing agents call are both this one binary. Baking a pinned crates.io
+# release into the image means a review never fetches anything at review time,
+# and the version moves only when someone edits this line. Bifrost pins a newer
+# compiler than Hel does (its rust-toolchain.toml names 1.97.1), so it is built
+# in its own stage and only the binary is copied out.
+ARG BIFROST_VERSION=0.10.7
+ARG BIFROST_BUILDER_IMAGE=docker.io/library/rust:1.97.1-trixie
 
 FROM ${NODE_IMAGE} AS node
+
+FROM ${BIFROST_BUILDER_IMAGE} AS bifrost
+ARG BIFROST_VERSION
+RUN cargo install brokk-bifrost@${BIFROST_VERSION} --locked --bin bifrost --root /opt/bifrost \
+    && /opt/bifrost/bin/bifrost --version
+
 FROM ${RUST_IMAGE}
 
 LABEL org.opencontainers.image.title="Hel agent development environment" \
@@ -91,6 +106,10 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && cargo nextest --version \
     && java --version \
     && javac --version
+
+# The turn-review feature requires this binary; a review whose worker cannot
+# run it fails loudly and names an image rebuild as the fix.
+COPY --from=bifrost /opt/bifrost/bin/bifrost /usr/local/bin/bifrost
 
 RUN useradd --create-home --shell /bin/bash hel \
     && mkdir -p /workspace /var/lib/hel \

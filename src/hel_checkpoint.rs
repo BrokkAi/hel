@@ -1476,6 +1476,7 @@ fn repair_origin_refs(git: &dyn GitCommandRunner, path: &Path, id: &str) -> Resu
         &GitCommand {
             arguments: vec!["fetch".into(), "origin".into()],
             stdin: Vec::new(),
+            env: Vec::new(),
         },
     )?;
     if listed()? {
@@ -2090,6 +2091,7 @@ fn reject_dirty_submodules(runner: &dyn GitCommandRunner, repository: &Path) -> 
             .map(Into::into)
             .collect(),
             stdin: Vec::new(),
+            env: Vec::new(),
         },
     )?;
     ensure!(
