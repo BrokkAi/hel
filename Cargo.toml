@@ -40,7 +40,7 @@ default-members = [".", "crates/hel-tui", "crates/hel-cli"]
 # inherits it with `version.workspace = true`, so the four package versions
 # cannot drift apart (RELEASING.md requires them to match).
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 # The real compiler floor is the pinned toolchain in `rust-toolchain.toml`,
 # not just what edition 2024 implies. Declaring it makes `cargo install` on an
 # older compiler fail with a clear version message instead of mid-build
@@ -54,8 +54,8 @@ rust-version = "1.96"
 # `node scripts/release-version.mjs check` (run in CI) fails when these fall
 # behind the workspace version.
 [workspace.dependencies]
-hel = { path = ".", package = "hel-core", version = "0.4.1" }
-hel-tui = { path = "crates/hel-tui", version = "0.4.1" }
+hel = { path = ".", package = "hel-core", version = "0.4.2" }
+hel-tui = { path = "crates/hel-tui", version = "0.4.2" }
 
 [workspace.lints.clippy]
 disallowed_methods = "warn"
