@@ -587,6 +587,38 @@ fn version_fourteen_database_gains_empty_host_container_sizes() {
 }
 
 #[test]
+fn reopening_a_migrated_database_restores_the_client_session_state_table() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    // Simulate a database that reached the current schema version under a
+    // build that predated `client_session_state`: the table is missing even
+    // though nothing else needs migrating.
+    connection
+        .execute_batch("DROP TABLE client_session_state;")
+        .unwrap();
+    drop(connection);
+    forget_verified_schema(&database);
+
+    let connection = open(&database).unwrap();
+    let table_exists: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'client_session_state'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_exists, 1);
+}
+
+#[test]
 fn loading_state_does_not_restore_a_hidden_context_session_name() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("hel.sqlite3");

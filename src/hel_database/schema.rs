@@ -594,6 +594,12 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
             SCHEMA_VERSION
         );
     }
+    // A database that already applied migration 14 with a build older than the
+    // one that added `client_session_state` never got the table, since that
+    // migration only ran `ensure_workspace_schema` once, at version 14. Create
+    // it unconditionally (IF NOT EXISTS) on every writer open so an
+    // already-migrated database converges too.
+    ensure_client_session_state_schema(connection)?;
     Ok(())
 }
 
