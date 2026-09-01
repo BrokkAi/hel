@@ -92,8 +92,6 @@ use schema::{forget_verified_schema, table_has_column};
 use schema::{open, open_reader};
 
 const DATABASE_WRITE_QUEUE_CAPACITY: usize = 256;
-static DATABASE_WRITER_REQUIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 type DatabaseWriteJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
@@ -221,6 +219,22 @@ fn clear_database_writer(id: u64) {
     }
 }
 
+/// Install the process-wide writer for a test that owns its data directory.
+///
+/// Production installs this once, in the daemon, after `ControllerStoreGuard`
+/// establishes exclusivity, and the daemon is then the only process that
+/// writes. A test may do the same only because it re-execs itself with its own
+/// `HEL_DATA_DIR` and is therefore alone in its process — which is exactly why
+/// the tests that need this are shaped that way.
+///
+/// The returned owner has to be held for the rest of the test: dropping it
+/// stops the writer, and the next write fails with the message above.
+#[cfg(test)]
+#[must_use = "the writer stops when this owner is dropped"]
+pub(crate) fn install_isolated_test_writer() -> DatabaseWriterOwner {
+    start_database_writer().expect("install the writer for an isolated test child")
+}
+
 pub(crate) fn start_database_writer() -> Result<DatabaseWriterOwner> {
     start_database_writer_at(&database_path(), true)
 }
@@ -239,7 +253,6 @@ fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<Datab
             .unwrap_or_else(PoisonError::into_inner);
         ensure!(installed.is_none(), "database writer is already running");
         *installed = Some(writer.clone());
-        DATABASE_WRITER_REQUIRED.store(true, Ordering::Release);
     }
     let thread = match thread::Builder::new()
         .name("hel-database-writer".to_owned())
@@ -296,14 +309,15 @@ where
         .clone();
     if let Some(writer) = writer {
         writer.execute(label, operation)
-    } else if DATABASE_WRITER_REQUIRED.load(Ordering::Acquire) {
-        bail!("database writer is not available for operation {label}")
     } else {
-        // Unit tests and isolated library tools use temporary databases
-        // without starting the production daemon. Production callers install
-        // the writer immediately after acquiring ControllerStoreGuard.
-        let mut connection = schema::open_writer(&database_path())?;
-        operation(&mut connection)
+        // There is one way to write, and this is not it. In production the
+        // daemon installs the writer after `ControllerStoreGuard` establishes
+        // exclusivity, and it is the only process that writes; a caller
+        // reaching here has no exclusivity and would be competing with
+        // whatever does. This used to open `database_path()` directly, which
+        // meant any process without a writer silently wrote to — and migrated
+        // — the real user database as a side effect of doing something else.
+        bail!("database writer is not available for operation {label}")
     }
 }
 

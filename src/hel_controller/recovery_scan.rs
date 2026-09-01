@@ -867,6 +867,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         let session_id = "0123456789abcdef0123456789abcdef";
         let workers = tempfile::tempdir().unwrap();

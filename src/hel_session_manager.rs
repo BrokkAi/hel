@@ -4006,6 +4006,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
         register_leased_relay_session();
         let relay_root = tempfile::tempdir().unwrap();
         let SessionManagerChannels {
@@ -4041,6 +4043,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
         register_leased_relay_session();
         let relay_root = tempfile::tempdir().unwrap();
         let canonical = tempfile::tempdir().unwrap();
@@ -4081,6 +4085,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
         register_leased_relay_session();
         let relay_root = tempfile::tempdir().unwrap();
         let mut connection = StandaloneSession::connect(&leased_relay_target(relay_root.path()))
@@ -4120,6 +4126,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
         fail_if_the_actor_stalls("unresponsive live relay worker was never restarted");
         register_leased_relay_session();
         let relay_root = tempfile::tempdir().unwrap();
@@ -4364,6 +4372,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
         fail_if_the_actor_stalls("prompt deferred during a lease was never delivered");
 
         let (actor, lease_id, connection) = lease_a_live_actor().await;
@@ -4397,6 +4407,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
         fail_if_the_actor_stalls("a returned lease never republished its session");
 
         let (actor, lease_id, mut connection) = lease_a_live_actor().await;
@@ -4445,6 +4457,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
         fail_if_the_actor_stalls("prompt deferred during a lease was never answered");
 
         let (actor, lease_id, connection) = lease_a_live_actor().await;
