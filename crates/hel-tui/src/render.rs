@@ -447,10 +447,7 @@ impl SessionRowFacts<'_> {
 /// A target repeated inside one project is ambiguous on its own, so repeats
 /// are numbered `[1]`, `[2]`, … in the order they appear. Both the row
 /// laydown and the minimized grid read from this so they agree on labels.
-fn session_display_targets(
-    dashboard: &DashboardState,
-    sessions: &[&SessionRecord],
-) -> Vec<String> {
+fn session_display_targets(dashboard: &DashboardState, sessions: &[&SessionRecord]) -> Vec<String> {
     let mut counts = BTreeMap::<(String, String), usize>::new();
     for session in sessions {
         let key = (
@@ -629,7 +626,10 @@ fn render_sessions_grid(
     let room = usize::from(area.width).saturating_sub(title[0].width() + 4);
     if room > 8 && !dashboard.greeting.is_empty() {
         title.push(Span::styled(
-            format!("{} ", crate::widgets::truncate_text(&dashboard.greeting, room)),
+            format!(
+                "{} ",
+                crate::widgets::truncate_text(&dashboard.greeting, room)
+            ),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -2641,18 +2641,17 @@ mod tests {
         }
     }
 
-    /// Collapsing gives the transcript exactly the rows the two tables were
-    /// using, so the point of the gesture is measurable rather than merely
-    /// visible.
+    /// Collapsing the support panes hands their freed rows to the transcript,
+    /// and the transcript also absorbs whatever the Sessions pane gives up (or
+    /// gives back) as it moves to its fixed mode-2 third — nothing appears or
+    /// vanishes, so the gesture is measurable rather than merely visible.
     #[test]
     fn collapsing_the_support_panes_gives_their_rows_to_the_transcript() {
         let mut dashboard = dashboard_with_session(running_session());
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
-        // Start on the composer, so the Sessions pane is already compact and
-        // the only thing that changes is the two tables.
         dashboard.focus_prompt();
         /// Rows from the start of one band to the start of the next.
-        fn band(lines: &[String], from: &str, to: &str) -> usize {
+        fn band(lines: &[String], from: &str, to: &str) -> isize {
             let start = lines
                 .iter()
                 .position(|line| line.contains(from))
@@ -2661,20 +2660,23 @@ mod tests {
                 .iter()
                 .position(|line| line.contains(to))
                 .unwrap_or_else(|| panic!("missing {to}: {lines:#?}"));
-            end - start
+            (end - start) as isize
         }
 
         let before = drawn(&mut dashboard, 140, 32);
         dashboard.cycle_pane_layout();
         let after = drawn(&mut dashboard, 140, 32);
 
-        let freed = (band(&before, "Targets", "Quota") - band(&after, "Targets", "Quota"))
+        // Every row the tables and the Sessions pane give up lands in the
+        // transcript; the composer and footer are untouched.
+        let tables_freed = (band(&before, "Targets", "Quota") - band(&after, "Targets", "Quota"))
             + (band(&before, "Quota", "Ctrl-Q quit") - band(&after, "Quota", "Ctrl-Q quit"));
-        assert!(freed > 0, "the tables gave up nothing");
-        assert_eq!(
-            band(&after, "Conversation", "Prompt"),
-            band(&before, "Conversation", "Prompt") + freed
-        );
+        let sessions_freed =
+            band(&before, "Sessions", "Conversation") - band(&after, "Sessions", "Conversation");
+        let transcript_gain =
+            band(&after, "Conversation", "Prompt") - band(&before, "Conversation", "Prompt");
+        assert!(tables_freed > 0, "the tables gave up nothing");
+        assert_eq!(transcript_gain, tables_freed + sessions_freed);
         // Each collapsed pane really is one row.
         assert_eq!(band(&after, "Targets", "Quota"), 1);
         assert_eq!(band(&after, "Quota", "Ctrl-Q quit"), 1);
@@ -2835,9 +2837,7 @@ mod tests {
         // Column-major fill means some buffer row carries two sessions side by
         // side.
         assert!(
-            lines
-                .iter()
-                .any(|line| line.matches("podman").count() >= 2),
+            lines.iter().any(|line| line.matches("podman").count() >= 2),
             "two columns on one row: {lines:?}"
         );
     }

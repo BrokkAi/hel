@@ -49,6 +49,27 @@ pub(crate) fn minimized_grid_rows(frame_height: u16) -> u16 {
     }
 }
 
+/// The height the composer settles at: its desired height, but never below
+/// [`PROMPT_MINIMUM`] and never above a third of the frame. Mirrors the growth
+/// target in [`allocate_combined_heights`] so mode 2 can predict the room the
+/// prompt leaves for the Sessions/conversation split.
+fn prompt_target(desired_prompt: u16, frame_height: u16) -> u16 {
+    let ceiling = (frame_height / 3).max(PROMPT_MINIMUM);
+    desired_prompt.clamp(PROMPT_MINIMUM, ceiling)
+}
+
+/// Mode 2 gives Sessions a fixed third of the room it shares with the
+/// conversation — the frame less the composer, the two collapsed support rows,
+/// and the footer. The conversation takes the other two thirds as the residual
+/// transcript band, so the 1:2 split holds across Tab and any session count.
+fn support_collapsed_sessions_height(frame_height: u16, prompt_height: u16) -> u16 {
+    let shared = frame_height
+        .saturating_sub(prompt_height)
+        .saturating_sub(SUMMARY_ROW * 2)
+        .saturating_sub(FOOTER_HEIGHT);
+    (shared / 3).max(PANE_MINIMUM)
+}
+
 /// How tall one band wants to be and how short it may get.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneBand {
@@ -203,6 +224,12 @@ pub fn render_combined(
     let layout = dashboard.pane_layout();
     let minimized = layout.support_collapsed();
     let focus = dashboard.focus();
+    // With no conversation the prompt band holds the two-line guidance that
+    // stands in for a composer, so it asks for the rows to show both. This is
+    // computed before the Sessions band so mode 2 can carve the leftover room.
+    let desired_prompt = chat.as_ref().map_or(EMPTY_PROMPT_HEIGHT, |chat| {
+        chat.desired_prompt_height(area.width)
+    });
     let sessions = if layout.sessions_compact() {
         // Minimized: a fixed-height grid — five content rows in a tall enough
         // terminal, three otherwise — plus the border. It neither grows nor
@@ -213,7 +240,23 @@ pub fn render_combined(
             full: height,
             cap: height,
         }
+    } else if minimized {
+        // Mode 2 (support panes collapsed): Sessions takes a fixed third of
+        // the room it shares with the conversation, so the split stays 1:2
+        // whatever has the keyboard and however many sessions are live. The
+        // conversation takes the other two thirds as the residual band.
+        let height = support_collapsed_sessions_height(
+            area.height,
+            prompt_target(desired_prompt, area.height),
+        );
+        PaneBand {
+            minimum: height,
+            full: height,
+            cap: height,
+        }
     } else {
+        // Mode 1: content-sized, and free to reach half the height when it has
+        // the keyboard so a focused list has room to work in.
         let sessions_cap = if focus == Focus::Sessions {
             area.height / 2
         } else {
@@ -237,11 +280,6 @@ pub fn render_combined(
         area.height,
         minimized,
     );
-    // With no conversation the prompt band holds the two-line guidance that
-    // stands in for a composer, so it asks for the rows to show both.
-    let desired_prompt = chat.as_ref().map_or(EMPTY_PROMPT_HEIGHT, |chat| {
-        chat.desired_prompt_height(area.width)
-    });
     let allocation =
         allocate_combined_heights(area.height, sessions, targets, quota, desired_prompt, focus);
     let heights = match allocation {
@@ -436,5 +474,61 @@ mod tests {
         assert_eq!(minimized_grid_rows(100), 5);
         assert_eq!(minimized_grid_rows(29), 3);
         assert_eq!(minimized_grid_rows(10), 3);
+    }
+
+    #[test]
+    fn prompt_target_clamps_between_the_minimum_and_a_third() {
+        // Below the minimum is raised to it; within range is kept; above a
+        // third of the frame is capped there.
+        assert_eq!(prompt_target(2, 60), PROMPT_MINIMUM);
+        assert_eq!(prompt_target(5, 60), 5);
+        assert_eq!(prompt_target(50, 60), 20);
+    }
+
+    #[test]
+    fn support_collapsed_sessions_take_a_third_of_the_shared_room() {
+        // 60 tall, composer 3: shared = 60 - 3 - 2 - 1 = 54, a third is 18.
+        assert_eq!(support_collapsed_sessions_height(60, 3), 18);
+        // Never below the pane minimum, even when there is almost no room.
+        assert_eq!(support_collapsed_sessions_height(10, 6), PANE_MINIMUM);
+    }
+
+    /// Mode 2 holds the Sessions/conversation split at 1:2 whether Sessions or
+    /// the composer has the keyboard, so Tab never resizes either pane.
+    #[test]
+    fn mode_two_split_stays_put_across_tab() {
+        let frame = 60;
+        let prompt = prompt_target(3, frame);
+        let height = support_collapsed_sessions_height(frame, prompt);
+        let sessions = PaneBand {
+            minimum: height,
+            full: height,
+            cap: height,
+        };
+        let collapsed = PaneBand {
+            minimum: SUMMARY_ROW,
+            full: SUMMARY_ROW,
+            cap: SUMMARY_ROW,
+        };
+        let heights_for = |focus| match allocate_combined_heights(
+            frame, sessions, collapsed, collapsed, 3, focus,
+        ) {
+            CombinedAllocation::Fits(heights) => heights,
+            CombinedAllocation::TooSmall { .. } => panic!("60 rows should fit"),
+        };
+
+        let focused = heights_for(Focus::Sessions);
+        let unfocused = heights_for(Focus::Prompt);
+        assert_eq!(
+            focused.sessions, unfocused.sessions,
+            "Sessions must not resize on Tab"
+        );
+        assert_eq!(
+            focused.transcript, unfocused.transcript,
+            "the conversation must not resize on Tab"
+        );
+        // A third for Sessions, two thirds for the conversation.
+        assert_eq!(focused.sessions, height);
+        assert_eq!(focused.transcript, 2 * height);
     }
 }
