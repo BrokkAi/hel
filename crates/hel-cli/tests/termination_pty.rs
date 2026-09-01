@@ -13,9 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The Sessions pane's title, which is on screen as soon as the combined
-/// surface has drawn its first frame.
-const READY_MARKER: &[u8] = b"Sessions";
+/// Empty-session text that appears only after the workspace picker has handed
+/// the terminal to the combined dashboard. The Sessions title is also drawn
+/// behind the picker, so using it can send the quit key during the handoff.
+const READY_MARKER: &[u8] = b"Prompt (no live session)";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The DECSET pair crossterm 0.29 writes for `EnableMouseCapture` and
