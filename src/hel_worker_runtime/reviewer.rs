@@ -389,6 +389,7 @@ impl ReviewerSidecar {
             // A reviewer reads the workspace; it never syncs project memory,
             // which belongs to the primary session alone.
             project_memory: None,
+            extra_mcp_servers: config.mcp_servers.clone(),
             resume_session,
             harness: config.harness,
             execution_policy: config.execution_policy,

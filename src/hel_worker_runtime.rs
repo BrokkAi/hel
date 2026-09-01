@@ -181,6 +181,48 @@ pub struct ReviewerLaunchConfig {
     /// resume one.
     #[serde(default)]
     pub generation: u64,
+    /// Analyzer and navigation servers this reviewer gets over MCP. A turn
+    /// review attaches Bifrost here; plan review attaches nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<ReviewMcpServer>,
+}
+
+/// One stdio MCP server a reviewing agent is given.
+///
+/// How it reaches the harness depends on the harness: most accept a server in
+/// the ACP `session/new` request, while Claude and Kimi read their own
+/// configuration files, which the controller patches while staging the
+/// reviewer's profile. [`ReviewMcpDelivery`] is the single place that decides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewMcpServer {
+    pub name: String,
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// How a harness learns about a reviewing agent's MCP servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewMcpDelivery {
+    /// Attached to the ACP `session/new` request.
+    Acp,
+    /// Written into the staged profile the harness reads at startup.
+    HarnessProfile,
+}
+
+impl ReviewMcpDelivery {
+    /// Claude and Kimi both ignore servers offered over ACP -- Claude is not
+    /// given them at all (see `project_memory_mcp` in `src/hel_acp.rs`), and
+    /// Kimi needs runtime metadata its own schema carries -- so both are
+    /// configured through their staged profile instead.
+    #[must_use]
+    pub const fn for_harness(harness: HarnessKind) -> Self {
+        match harness {
+            HarnessKind::Claude | HarnessKind::Kimi => Self::HarnessProfile,
+            _ => Self::Acp,
+        }
+    }
 }
 
 impl ReviewerLaunchConfig {

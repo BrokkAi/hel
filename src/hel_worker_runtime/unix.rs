@@ -218,6 +218,7 @@ pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result
             environment: Default::default(),
             cwd: config.cwd,
             additional_directories: config.additional_directories,
+            extra_mcp_servers: Vec::new(),
             project_memory: config.project_memory,
             resume_session,
             harness: config.harness,

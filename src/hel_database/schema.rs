@@ -481,6 +481,35 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 19 {
+        // Turn review is per workspace (is it on, and at which tier) and per
+        // session (what has already been reviewed). Neither belongs on
+        // `SessionRecord`, which is a compatibility surface with nine
+        // construction sites; `second_opinion_reviews` above is the precedent
+        // for keeping review state in its own table.
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE turn_review_settings (
+                 workspace_id TEXT PRIMARY KEY
+                     CHECK(length(trim(workspace_id)) > 0),
+                 auto_review INTEGER NOT NULL CHECK(auto_review IN (0, 1)),
+                 tier TEXT NOT NULL CHECK(tier IN ('quick', 'extended'))
+             ) STRICT;
+             CREATE TABLE turn_review_state (
+                 session_id TEXT PRIMARY KEY
+                     REFERENCES sessions(session_id) ON DELETE CASCADE,
+                 baselines TEXT NOT NULL,
+                 reviewed_through_ordinal INTEGER NOT NULL
+                     CHECK(reviewed_through_ordinal >= 0),
+                 prior_review TEXT,
+                 active TEXT
+             ) STRICT;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (19, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 19;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)

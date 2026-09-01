@@ -22,6 +22,7 @@ pub(super) enum LocalCommand {
     Fast,
     Plan,
     Implement,
+    Review,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +280,11 @@ pub(super) fn builtin_command_choices() -> Vec<CommandChoice> {
             "change the active reasoning effort, queued while the agent is busy",
             Some("value"),
         ),
+        (
+            "review",
+            "review the finished turn now, or turn automatic review on/off",
+            Some("on|off|quick|extended"),
+        ),
     ]
     .into_iter()
     .map(|(name, description, input_hint)| CommandChoice {
@@ -300,6 +306,7 @@ pub(super) fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> 
         "fast" => LocalCommand::Fast,
         "plan" => LocalCommand::Plan,
         "implement" => LocalCommand::Implement,
+        "review" => LocalCommand::Review,
         _ => return None,
     };
     Some((command, args))
@@ -487,15 +494,27 @@ mod tests {
             &serde_json::json!({
                 "sessionUpdate": "available_commands_update",
                 "availableCommands": [
-                    {"name": "review", "description": "agent review", "input": {"hint": "scope"}},
+                    {"name": "compact", "description": "agent compact", "input": {"hint": "scope"}},
+                    {"name": "review", "description": "agent review"},
                     {"name": "help", "description": "agent help"}
                 ]
             }),
         );
         assert!(
             chat.command_choices.iter().any(|command| {
-                command.name == "review" && command.source == CommandSource::Agent
+                command.name == "compact" && command.source == CommandSource::Agent
             })
+        );
+        // `/review` is Hel's: it opens the turn-review pane rather than
+        // reaching the agent, so an agent command of the same name does not
+        // replace it.
+        assert_eq!(
+            chat.command_choices
+                .iter()
+                .filter(|command| command.name == "review")
+                .map(|command| command.source)
+                .collect::<Vec<_>>(),
+            vec![CommandSource::Hel]
         );
         assert_eq!(
             chat.command_choices

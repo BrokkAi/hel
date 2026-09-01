@@ -1474,6 +1474,14 @@ impl DashboardContext {
                                 .remember_reviewer_selection(workspace_id, selection)
                                 .await
                         }
+                        hel::hel_chat::ChatPersistenceRequest::SaveTurnReviewState {
+                            session_id,
+                            state,
+                        } => daemon.save_turn_review_state(session_id, state).await,
+                        hel::hel_chat::ChatPersistenceRequest::SaveTurnReviewSettings {
+                            workspace_id,
+                            settings,
+                        } => daemon.save_turn_review_settings(workspace_id, settings).await,
                     }
                 }
                 .await;

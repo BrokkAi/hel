@@ -296,6 +296,7 @@ fn config(generation: u64) -> ReviewerLaunchConfig {
         model: None,
         effort: None,
         generation,
+        mcp_servers: Vec::new(),
     }
 }
 

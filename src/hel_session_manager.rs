@@ -2991,6 +2991,7 @@ mod tests {
             model: Some("sonnet".into()),
             effort: Some("high".into()),
             generation: 2,
+            mcp_servers: Vec::new(),
         };
         let actions = [
             ReviewerAction::Start {

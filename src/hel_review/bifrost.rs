@@ -52,6 +52,30 @@ pub fn mcp_server_args(repository: &Path, toolset: &str) -> Vec<String> {
     ]
 }
 
+/// The Bifrost MCP servers one reviewing role gets: one per reviewed
+/// repository, named the way the review prompts name them, so an agent told to
+/// "use the server whose root contains the changed path" can.
+#[must_use]
+pub fn review_mcp_servers(
+    repositories: &[PathBuf],
+    toolset: &str,
+) -> Vec<crate::hel_worker_runtime::ReviewMcpServer> {
+    let binary = bifrost_binary();
+    repositories
+        .iter()
+        .enumerate()
+        .map(|(index, repository)| crate::hel_worker_runtime::ReviewMcpServer {
+            name: if index == 0 {
+                "bifrost".to_string()
+            } else {
+                format!("bifrost_{}", index + 1)
+            },
+            command: binary.clone(),
+            args: mcp_server_args(repository, toolset),
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct AnalyzeDiffEnvelope {
     #[serde(rename = "structuredContent")]
@@ -476,6 +500,22 @@ mod tests {
     fn the_mcp_server_command_names_the_root_and_toolset() {
         let args = mcp_server_args(Path::new("/w/app"), "core|slopcop");
         assert_eq!(args, vec!["--root", "/w/app", "--mcp", "core|slopcop"]);
+    }
+
+    #[test]
+    fn one_bifrost_server_is_attached_per_reviewed_repository() {
+        let servers = review_mcp_servers(
+            &[PathBuf::from("/w/app"), PathBuf::from("/w/lib")],
+            "core",
+        );
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "bifrost");
+        assert_eq!(servers[1].name, "bifrost_2");
+        assert!(servers[1].args.contains(&"/w/lib".to_string()));
+        assert!(
+            review_mcp_servers(&[], "core").is_empty(),
+            "a review with no repositories attaches no analyzer"
+        );
     }
 
     #[tokio::test]

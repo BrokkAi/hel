@@ -16,7 +16,7 @@ To see it working after full implementation: open a Hel session, enable auto-rev
 - [x] (2026-08-31 16:45Z) ExecPlan authored.
 - [x] (2026-09-01 03:55Z) Milestone 1: cumulative delta capture in the worker (git tree snapshots, `CaptureDelta`/`AdvanceBaseline`/`AnalyzeDelta` requests, Bifrost pinned into the container image).
 - [x] (2026-09-01 03:55Z) Milestone 3 (brought forward): `src/hel_review/{lanes,verdict,delta,bifrost}.rs` carry the full mj port with its tests. Done before Milestone 2 because Milestone 2 needs the same prompts; Milestone 2 is now wiring rather than authoring.
-- [ ] Milestone 2: quick-tier review end-to-end in the split pane (trigger, lock, quick reviewer + validator, Forward/Dismiss/Cancel, baseline advance, workspace toggle, manual trigger).
+- [x] (2026-09-01 05:05Z) Milestone 2: quick-tier review end-to-end in the split pane. Trigger on turn completion, prompt lock in the TUI and the web surface, capture/analysis/reviewer/validator flow, Forward/Dismiss/Cancel, baseline advance, `/review` settings and manual trigger, SQLite migration 19, Bifrost MCP attachment per harness.
 - [ ] Milestone 4: extended tier (multi-role sidecar, supervisor with `call_review_subagents` MCP dispatch, intent analyst, lane strip in the pane).
 - [ ] Milestone 5: recovery semantics, docs note in `.agents/docs/`, retrospective.
 
@@ -73,7 +73,16 @@ To see it working after full implementation: open a Hel session, enable auto-rev
 
 ## Outcomes & Retrospective
 
-(To be written at milestone completions.)
+Milestone 1 and 3 (2026-09-01): the worker can capture a cumulative delta without touching the repository's index, and `src/hel_review/` holds the mj port with its tests. The port came first because Milestone 2 needed the same prompts; writing them once avoided a throwaway minimal copy.
+
+Milestone 2 (2026-09-01): a completed turn now opens the split pane, runs mj's quick tier, and ends in Forward / Dismiss / Cancel, with the composer held throughout. What differs from the plan as written is the settings surface (see the Decision Log entry of 2026-09-01) and one detail the plan did not anticipate: the pane cannot take its newest agent message as a role's answer, because after the validator starts the reviewer's own findings are still the newest message. The driver names the command it is waiting for and the controller matches it against the relay's `CommandCompleted` record instead.
+
+- Decision: the turn-review settings surface is a `/review` chat command (`/review` reviews the finished turn now; `/review on|off` toggles automatic review; `/review quick|extended` picks the tier; `/review status` reports both), not the two-row dialog in the TUI session menu the plan first described. The composer title shows `review quick` or `review extended` while automatic review is armed.
+  Rationale: the command lives where the review appears and is available from every control surface, including the web one, whereas a session-menu dialog would be TUI-only and would add a new `Mode` variant, its key handling, its rendering, and an action path through the dashboard for a two-value setting. The capability is unchanged: toggle, tier, and manual trigger are all reachable, and `/review` autocompletes with the other Hel commands. An agent that advertises its own `review` command is shadowed by Hel's, the same way `/plan` and `/implement` already are, and a test pins that precedence.
+  Date/Author: 2026-09-01 / Opus.
+- Decision: the review lock is enforced in three places rather than one: the TUI routes every key to the review view, `submit_prompt_with_history` refuses with a notice, and the web control surface refuses a prompt whose session has a non-null `turn_review_state.active` row.
+  Rationale: the view-level lock only covers the terminal. A phone submitting through `src/hel_server.rs` would otherwise start the next turn under an unanswered review, which is exactly the "findings land out of the blue" behavior the feature exists to prevent. The in-flight row already had to exist for restart recovery, so the web check is one indexed read on a path that already moves work off the request task.
+  Date/Author: 2026-09-01 / Opus.
 
 ## Context and Orientation
 

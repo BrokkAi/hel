@@ -15,6 +15,7 @@ mod input;
 mod remote;
 mod rendering;
 mod second_opinion;
+mod turn_review;
 mod transcript;
 
 #[cfg(test)]
@@ -65,6 +66,7 @@ use history::{HistorySearch, HistorySearchRequest};
 pub use rendering::truncate_line_to_width;
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
 use second_opinion::{SecondOpinion, SecondOpinionIntent};
+use turn_review::{TurnReview, TurnReviewIntent};
 use transcript::{
     TAIL_SEED_ITEMS, ToolDiffstatRequest, TranscriptAnchor, TranscriptRenderCache,
     TranscriptSelectionSpace, content_block_text, materialized_chat_entries_reusing, plan_status,
@@ -75,6 +77,7 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 
 pub use active::{ActiveChat, ChatPersistenceRequest};
 pub use second_opinion::SecondOpinionIntent as SecondOpinionRequest;
+pub use turn_review::{TurnReviewIntent as TurnReviewRequest, resolution_notice};
 pub use transcript::{
     BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, format_event_time,
     materialized_chunks_text, materialized_content_text, materialized_tool_diffstats,
@@ -154,6 +157,14 @@ pub enum ChatAction {
     },
     /// Work the second-opinion view asked the session to perform.
     SecondOpinion(SecondOpinionIntent),
+    /// Review the turn that just finished, on the user's explicit request.
+    /// Auto-review starts the same path without a key press.
+    StartTurnReview,
+    /// Work the turn-review view asked the session to perform.
+    TurnReview(TurnReviewIntent),
+    /// Turn auto-review on or off for this session's workspace, and choose how
+    /// thorough each review is.
+    SetTurnReviewSettings(crate::hel_database::TurnReviewSettings),
     /// An answer to a form the reviewer's harness is waiting on. It is routed
     /// to the reviewer, never to the primary.
     RespondReviewerElicitation {
@@ -169,6 +180,15 @@ pub enum ChatAction {
     CyclePaneLayout,
     OpenWebDialog,
     QuitDetach,
+}
+
+/// What a turn review reads out of the primary conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TurnReviewInputs {
+    pub(super) task: String,
+    pub(super) user_messages: Vec<crate::hel_review::lanes::UserMessage>,
+    pub(super) initial_result: String,
+    pub(super) trajectory: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +338,15 @@ pub struct ChatState {
     split_action_areas: Vec<(second_opinion::SplitAction, Rect)>,
     /// Distinguishes the command ids the review's own steps submit.
     second_opinion_sequence: u64,
+    /// The turn-review view, when one is open. Like the second opinion, it
+    /// owns the frame while it is up, which is what makes review synchronous:
+    /// findings can never land in the middle of the next conversation.
+    turn_review: Option<Box<TurnReview>>,
+    /// Where the turn review's action buttons sat on the last frame.
+    turn_review_action_areas: Vec<(turn_review::ReviewAction, Rect)>,
+    /// This workspace's turn-review settings, mirrored here so `/review` can
+    /// toggle them and the composer can say what is on.
+    turn_review_settings: crate::hel_database::TurnReviewSettings,
     /// Whether the dialog on screen belongs to the reviewer rather than the
     /// primary, so its answer is routed to the harness that asked.
     elicitation_is_reviewers: bool,
@@ -399,6 +428,9 @@ impl ChatState {
             reviewer_area: None,
             split_action_areas: Vec::new(),
             second_opinion_sequence: 0,
+            turn_review: None,
+            turn_review_action_areas: Vec::new(),
+            turn_review_settings: crate::hel_database::TurnReviewSettings::default(),
             elicitation_is_reviewers: false,
             recovery_phase: None,
             goal_prompt_active: snapshot
@@ -837,6 +869,92 @@ impl ChatState {
 
     pub fn latest_seq(&self) -> u64 {
         self.latest_seq
+    }
+
+    /// Mirrors the workspace's review settings into the view, so `/review`
+    /// toggles from the current value rather than from a default.
+    pub(super) fn set_turn_review_settings(
+        &mut self,
+        settings: crate::hel_database::TurnReviewSettings,
+    ) {
+        self.turn_review_settings = settings;
+    }
+
+    #[must_use]
+    pub(super) fn turn_review_settings(&self) -> crate::hel_database::TurnReviewSettings {
+        self.turn_review_settings
+    }
+
+    /// Whether prompts are waiting to be sent. A turn review never starts
+    /// while any are: holding the composer would strand work the user has
+    /// already sent, and the review after the queue drains covers the whole
+    /// batch anyway.
+    pub(super) fn has_queued_prompts(&self) -> bool {
+        !self.queued_prompts.is_empty()
+    }
+
+    /// What a turn review knows about the conversation it is reviewing.
+    pub(super) fn turn_review_inputs(&self, reviewed_through_ordinal: u64) -> TurnReviewInputs {
+        // The session's opening prompt is the turn's stated task, which is
+        // what the review prompts call <original_task>.
+        let task = self
+            .entries
+            .iter()
+            .find(|entry| entry.role == ChatRole::User && !entry.text.trim().is_empty())
+            .map(|entry| entry.text.clone())
+            .unwrap_or_default();
+        let user_messages = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.role == ChatRole::User
+                    && entry.start_seq > reviewed_through_ordinal
+                    && !entry.text.trim().is_empty()
+                    // Hel's own generated prompts -- a forwarded review, a
+                    // plan-review context request -- are not user intent, and
+                    // reading them as intent would let a review grade the
+                    // agent against Hel's words.
+                    && !crate::hel_second_opinion::is_control_origin_prompt(&entry.text)
+            })
+            .map(|entry| crate::hel_review::lanes::UserMessage::prompt(entry.text.clone()))
+            .collect::<Vec<_>>();
+        let initial_result = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
+            .map(|entry| entry.text.clone())
+            .unwrap_or_default();
+        // A compact trajectory: what the agent said and which tools it ran,
+        // without tool output or edit diffs, which the captured patch already
+        // carries in full.
+        let trajectory = self
+            .entries
+            .iter()
+            .filter(|entry| entry.start_seq > reviewed_through_ordinal)
+            .filter_map(|entry| match entry.role {
+                ChatRole::Agent => Some(format!("agent: {}", entry.text.trim())),
+                ChatRole::Tool => Some(format!("tool: {}", entry.text.trim())),
+                ChatRole::User => Some(format!("user: {}", entry.text.trim())),
+                _ => None,
+            })
+            .filter(|line| !line.ends_with(": "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let task = if task.is_empty() {
+            user_messages
+                .first()
+                .map(|message| message.text.clone())
+                .unwrap_or_default()
+        } else {
+            task
+        };
+        TurnReviewInputs {
+            task,
+            user_messages,
+            initial_result,
+            trajectory,
+        }
     }
 
     fn mark_prompt_submitted(&mut self, prompt: &str) {
@@ -1296,6 +1414,47 @@ impl ChatState {
                         prompt: followup,
                     }
                 }
+                LocalCommand::Review => {
+                    self.record_prompt_history(&prompt);
+                    self.clear_input();
+                    let settings = self.turn_review_settings;
+                    return match args.trim().to_ascii_lowercase().as_str() {
+                        // Bare `/review` reviews the turn that just finished,
+                        // whether or not the workspace reviews automatically.
+                        "" => ChatAction::StartTurnReview,
+                        "on" | "off" => ChatAction::SetTurnReviewSettings(
+                            crate::hel_database::TurnReviewSettings {
+                                auto_review: args.trim().eq_ignore_ascii_case("on"),
+                                ..settings
+                            },
+                        ),
+                        "quick" | "extended" => ChatAction::SetTurnReviewSettings(
+                            crate::hel_database::TurnReviewSettings {
+                                tier: crate::hel_review::lanes::ReviewTier::parse(args)
+                                    .unwrap_or(crate::hel_review::lanes::ReviewTier::Quick),
+                                ..settings
+                            },
+                        ),
+                        "status" => {
+                            self.set_notice(if settings.auto_review {
+                                format!(
+                                    "Reviewing every completed turn ({} tier)",
+                                    settings.tier.label()
+                                )
+                            } else {
+                                format!(
+                                    "Turn review is off; /review reviews one turn ({} tier)",
+                                    settings.tier.label()
+                                )
+                            });
+                            ChatAction::None
+                        }
+                        _ => {
+                            self.set_notice("usage: /review [on|off|quick|extended|status]");
+                            ChatAction::None
+                        }
+                    };
+                }
                 LocalCommand::Implement => {
                     if let Err(message) = self.plan_control(false) {
                         self.set_notice(message);
@@ -1345,6 +1504,13 @@ impl ChatState {
             self.set_notice("The worker is closing; this prompt was not sent");
             return ChatAction::None;
         }
+        // Review is synchronous. While one is unresolved the agent it reviewed
+        // stays where the review found it, so findings can never arrive in the
+        // middle of the next turn.
+        if self.turn_review_active() {
+            self.set_notice("A review of the last turn is open; answer it first");
+            return ChatAction::None;
+        }
         self.record_prompt_history(&history);
         self.clear_input();
         ChatAction::Prompt(prompt)
@@ -1377,6 +1543,13 @@ impl ChatState {
         // and the plan decision behind it are both part of what it is deciding.
         if self.second_opinion_active() {
             return self.handle_second_opinion_key(code, modifiers);
+        }
+
+        // A turn review owns the frame on the same terms. Its actions are the
+        // only input while it is unresolved, which is what holds the primary
+        // agent still until the user has answered the findings.
+        if self.turn_review_active() {
+            return self.handle_turn_review_key(code, modifiers);
         }
 
         if let Some(dialog) = self.elicitation.as_mut() {
@@ -1698,22 +1871,35 @@ impl ChatState {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChatAction {
         // Hover decides which transcript scrolls while the split is up, so a
         // reviewer answer never moves the reader's place in the primary.
-        if self.second_opinion_split() {
+        if self.second_opinion_split() || self.turn_review_split() {
+            let turn_review = self.turn_review_split();
             let over_reviewer = self
                 .reviewer_area
                 .is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)));
             let rows = isize::try_from(MOUSE_SCROLL_ROWS).unwrap_or(1);
             match (mouse.kind, over_reviewer) {
                 (MouseEventKind::ScrollUp, true) => {
-                    self.scroll_second_opinion(-rows);
+                    if turn_review {
+                        self.scroll_turn_review(-rows);
+                    } else {
+                        self.scroll_second_opinion(-rows);
+                    }
                 }
                 (MouseEventKind::ScrollDown, true) => {
-                    self.scroll_second_opinion(rows);
+                    if turn_review {
+                        self.scroll_turn_review(rows);
+                    } else {
+                        self.scroll_second_opinion(rows);
+                    }
                 }
                 (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
                 (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
                 (MouseEventKind::Down(MouseButton::Left), _) => {
-                    return self.click_split_action(mouse.column, mouse.row);
+                    return if turn_review {
+                        self.click_turn_review_action(mouse.column, mouse.row)
+                    } else {
+                        self.click_split_action(mouse.column, mouse.row)
+                    };
                 }
                 _ => {}
             }

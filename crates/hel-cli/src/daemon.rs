@@ -257,6 +257,14 @@ enum DaemonAction {
         workspace_id: String,
         selection: hel::hel_second_opinion::ReviewerSelection,
     },
+    SaveTurnReviewState {
+        session_id: String,
+        state: hel::hel_database::TurnReviewState,
+    },
+    SaveTurnReviewSettings {
+        workspace_id: String,
+        settings: hel::hel_database::TurnReviewSettings,
+    },
     PersistImportedSession {
         session: Box<SessionRecord>,
     },
@@ -1643,6 +1651,37 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) async fn save_turn_review_state(
+        &mut self,
+        session_id: String,
+        state: hel::hel_database::TurnReviewState,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SaveTurnReviewState { session_id, state })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected turn-review-state reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn save_turn_review_settings(
+        &mut self,
+        workspace_id: String,
+        settings: hel::hel_database::TurnReviewSettings,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::SaveTurnReviewSettings {
+                workspace_id,
+                settings,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected turn-review-settings reply {reply:?}"),
+        }
+    }
+
     pub(crate) async fn remember_reviewer_selection(
         &mut self,
         workspace_id: String,
@@ -2711,6 +2750,20 @@ async fn handle_action(
         } => {
             blocking(move || {
                 hel::hel_database::remember_reviewer_selection(&workspace_id, &selection)
+            })
+            .await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::SaveTurnReviewState { session_id, state } => {
+            blocking(move || hel::hel_database::save_turn_review_state(&session_id, &state)).await?;
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::SaveTurnReviewSettings {
+            workspace_id,
+            settings,
+        } => {
+            blocking(move || {
+                hel::hel_database::save_turn_review_settings(&workspace_id, settings)
             })
             .await?;
             Ok(DaemonReply::Done)
