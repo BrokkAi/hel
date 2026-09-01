@@ -575,6 +575,9 @@ pub enum TargetLocator {
     LocalPodman {
         container_id: String,
     },
+    LocalDocker {
+        container_id: String,
+    },
     AppleContainer {
         container_id: String,
     },
@@ -726,6 +729,7 @@ impl TargetLocator {
                 }
             }
             Self::LocalPodman { container_id }
+            | Self::LocalDocker { container_id }
             | Self::AppleContainer { container_id }
             | Self::SshPodman { container_id, .. }
                 if container_id.trim().is_empty() =>

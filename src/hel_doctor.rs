@@ -21,7 +21,7 @@ use crate::hel_targets::{
     BoundedProcessExecutor, CommandExecutor, CommandSpec,
     ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor, SshTarget as RuntimeSshTarget,
     TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test, ssh_connectivity_probe,
-    verify_local_podman, verify_ssh_podman,
+    verify_local_docker, verify_local_podman, verify_ssh_podman,
 };
 
 // Only the image for the Apple container smoke test when the config has no
@@ -190,6 +190,7 @@ pub fn run_with_config_path(
     checks.push(harness_discovery_check(config.as_ref(), executor));
     checks.extend(harness_checks(config.as_ref(), executor));
     checks.extend(podman_checks(config.as_ref(), executor, options.smoke));
+    checks.extend(docker_checks(config.as_ref(), executor, options.smoke));
     checks.extend(ssh_bare_checks(config.as_ref(), executor));
     checks.extend(ssh_podman_checks(config.as_ref(), executor, options.smoke));
     checks.extend(aws_checks(config.as_ref(), executor));
@@ -296,8 +297,9 @@ This page is self-contained. Follow this exact loop as the user who will run Hel
    image end to end, and resolve anything it reports as `fixable`.\n\n\
 For a coding-agent handoff, provide this entire instructions page together with\n\
 the latest `hel doctor --json` output.\n\n\
-## Linux Podman postconditions\n\n{}",
-            include_str!("../docs/PODMAN.md")
+## Linux container-runtime postconditions\n\n{}\n\n{}",
+            include_str!("../docs/PODMAN.md"),
+            include_str!("../docs/DOCKER.md")
         ),
         InstructionsPlatform::Macos => format!(
             "# Hel setup instructions for macOS\n\n\
@@ -603,6 +605,125 @@ fn missing_image_remediation(image: &str) -> String {
     format!(
         "Pull it with `podman pull {image}`, build it from containers/Containerfile.agent-dev, or run `hel doctor --json --smoke` to verify the full pull-and-run path."
     )
+}
+
+/// Host Docker prerequisites, then one image check per `local-docker` target.
+fn docker_checks(
+    config: Option<&HelConfig>,
+    executor: &impl CommandExecutor,
+    smoke: bool,
+) -> Vec<DoctorCheck> {
+    let Some(config) = config else {
+        return vec![DoctorCheck::unsupported(
+            "runtime.docker",
+            "Docker",
+            "Docker prerequisites cannot be evaluated until config.toml is valid.",
+        )];
+    };
+    let targets = local_docker_targets(config);
+    if targets.is_empty() {
+        return vec![DoctorCheck::unsupported(
+            "runtime.docker",
+            "Docker",
+            "No local-docker target is configured.",
+        )];
+    }
+    let preflight = local_docker_runtime_check(executor);
+    if preflight.status != CheckStatus::Ready {
+        return vec![preflight];
+    }
+    let mut checks = vec![preflight];
+    checks.extend(
+        targets
+            .into_iter()
+            .map(|(id, container)| docker_image_check(id, &container.image, executor, smoke)),
+    );
+    checks
+}
+
+pub fn local_docker_runtime_check(executor: &impl CommandExecutor) -> DoctorCheck {
+    match verify_local_docker(executor) {
+        Ok(preflight) => DoctorCheck::ready(
+            "runtime.docker",
+            "Docker",
+            format!(
+                "Docker {} is connected to a Linux daemon.",
+                preflight.version
+            ),
+        ),
+        Err(error) => DoctorCheck::fixable(
+            "runtime.docker",
+            "Docker",
+            format!("{error:#}"),
+            "Install and start Docker, then make sure `docker info` succeeds as the user running Hel.",
+        ),
+    }
+}
+
+fn local_docker_targets(config: &HelConfig) -> Vec<(&String, &ContainerTemplate)> {
+    config
+        .targets
+        .iter()
+        .filter_map(|(id, target)| match target {
+            TargetTemplate::LocalDocker { container } => Some((id, container)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn docker_image_check(
+    id: &str,
+    image: &str,
+    executor: &impl CommandExecutor,
+    smoke: bool,
+) -> DoctorCheck {
+    let check_id = format!("runtime.docker.image.{id}");
+    let title = format!("Docker image for target {id}");
+    if smoke {
+        let target = RuntimeTargetTemplate::LocalDocker(RuntimeContainerTemplate {
+            image: image.to_owned(),
+            pull_policy: Default::default(),
+            extra_run_args: vec![],
+        });
+        return match run_setup_smoke_test(&target, &doctor_smoke_id(), executor) {
+            Ok(()) => DoctorCheck::ready(
+                check_id,
+                title,
+                format!(
+                    "Disposable run/exec/remove and OverlayFS attachment smoke test passed for image {image}."
+                ),
+            ),
+            Err(error) => DoctorCheck::fixable(
+                check_id,
+                title,
+                format!(
+                    "Disposable run/exec/remove smoke test failed for image {image}: {error:#}"
+                ),
+                "Fix the configured image or Docker runtime, then run `hel doctor --json --smoke` again.",
+            ),
+        };
+    }
+    let command = CommandSpec::new("docker", ["image", "inspect", image])
+        .purpose("check Docker image presence");
+    match executor.execute(&command) {
+        Ok(output) if output.status == 0 => DoctorCheck::ready(
+            check_id,
+            title,
+            format!("Image {image} is present in Docker storage."),
+        ),
+        Ok(_) => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!("Image {image} is not present in Docker storage."),
+            format!("Pull it with `docker pull {image}`, or run `hel doctor --json --smoke`."),
+        ),
+        Err(error) => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!("Could not inspect Docker image {image}: {error}"),
+            format!("Make sure `docker info` succeeds, then run `docker pull {image}`."),
+        ),
+    }
 }
 
 /// The outcome of the shared SSH connectivity probe.
@@ -1051,6 +1172,7 @@ fn worker_binary_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
         .iter()
         .filter_map(|(id, target)| match target {
             TargetTemplate::LocalPodman { container }
+            | TargetTemplate::LocalDocker { container }
             | TargetTemplate::AppleContainer { container } => Some((id, container, false)),
             TargetTemplate::SshPodman { container, .. } => Some((id, container, true)),
             _ => None,
@@ -1602,6 +1724,68 @@ mod tests {
         );
         assert_eq!(checks[1].status, CheckStatus::Ready);
         assert_eq!(checks[2].status, CheckStatus::Fixable);
+    }
+
+    #[test]
+    fn docker_checks_probe_the_daemon_then_the_configured_image() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"29.0.1 linux\n")),
+            Ok(output(b"image metadata\n")),
+        ]);
+        let config = config_with([(
+            "docker",
+            TargetTemplate::LocalDocker {
+                container: container("ghcr.io/example/dev:1"),
+            },
+        )]);
+
+        let checks = docker_checks(Some(&config), &executor, false);
+
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["runtime.docker", "runtime.docker.image.docker"]
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.status == CheckStatus::Ready)
+        );
+        let commands = executor.commands.borrow();
+        assert_eq!(commands[0].program, "docker");
+        assert_eq!(
+            commands[0].args,
+            ["version", "--format", "{{.Server.Version}} {{.Server.Os}}"]
+        );
+        assert_eq!(
+            commands[1].args,
+            ["image", "inspect", "ghcr.io/example/dev:1"]
+        );
+    }
+
+    #[test]
+    fn docker_image_smoke_uses_managed_overlay_run_exec_and_cleanup() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"created\n")),
+            Ok(output(b"ok\n")),
+            Ok(output(b"removed\n")),
+        ]);
+
+        let check = docker_image_check("docker", "ubuntu:24.04", &executor, true);
+
+        assert_eq!(check.status, CheckStatus::Ready);
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].program, "sh");
+        assert!(commands[0].args[1].contains("docker volume create"));
+        assert!(commands[0].args.contains(&"--pull=missing".to_owned()));
+        assert_eq!(commands[1].program, "docker");
+        assert_eq!(commands[1].args[0], "exec");
+        assert_eq!(commands[2].program, "sh");
+        assert!(commands[2].args[1].contains("docker rm --force"));
+        assert!(commands[2].args[1].contains("docker volume rm --force"));
     }
 
     #[test]
@@ -2237,5 +2421,7 @@ mod tests {
         assert!(instructions.contains("hel doctor --json --smoke"));
         assert!(instructions.contains("podman unshare cat /proc/self/uid_map"));
         assert!(instructions.contains("Podman **4.0.0 or newer**"));
+        assert!(instructions.contains("kind = \"local-docker\""));
+        assert!(instructions.contains("--opt type=overlay"));
     }
 }

@@ -1,6 +1,6 @@
 ---
 title: Custom container images
-description: What a container image must provide to work as a hel local-podman, apple-container, or ssh-podman target.
+description: What a container image must provide to work as a hel Podman, Docker, Apple container, or SSH Podman target.
 ---
 
 hel can run a session in any container image that meets a small contract.
@@ -67,7 +67,7 @@ container — for example `/var/lib/hel/workers/<session-id>` and
 `/var/lib/hel/profiles/<session-id>`.
 
 hel creates these directories itself with `mkdir -p` and writes into them
-with plain file copies; it does not pass any specific user to `podman exec`,
+with plain file copies; it does not pass any specific user to the runtime's `exec`,
 so those commands run as whatever user the image's `USER` (or its absence)
 puts them in. A rootless Podman container defaults to root inside when no
 `USER` is set, which can write anywhere. If your image sets a non-root
@@ -91,7 +91,7 @@ itself depends on cgroup v2 being present.
 
 The container-template configuration exposes exactly five keys: `image`,
 `platform`, `cpus`, `memory`, and `environment`. There's no configuration key
-for arbitrary extra `podman run`/`container run` arguments. hel derives the
+for arbitrary extra container-runtime arguments. hel derives the
 rest of the run command itself — the generated container name and the
 `dev.hel.session` / `dev.hel.managed` ownership labels it uses to find and
 recover its own containers later — and validates that nothing can override
@@ -112,3 +112,6 @@ memory = "32g"
 # Extra container environment variables, merged in at container start.
 RUSTFLAGS = "-D warnings"
 ```
+
+Use `kind = "local-docker"` under a `[targets.docker]` table for the same image
+contract on Docker.

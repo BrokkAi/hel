@@ -272,11 +272,13 @@ fn upload_reviewer_profile(
             }
         }
         hel_targets::TargetLocator::LocalPodman { container_id }
+        | hel_targets::TargetLocator::LocalDocker { container_id }
         | hel_targets::TargetLocator::AppleContainer { container_id } => {
-            let engine = if matches!(locator, hel_targets::TargetLocator::LocalPodman { .. }) {
-                "podman"
-            } else {
-                "container"
+            let engine = match locator {
+                hel_targets::TargetLocator::LocalPodman { .. } => "podman",
+                hel_targets::TargetLocator::LocalDocker { .. } => "docker",
+                hel_targets::TargetLocator::AppleContainer { .. } => "container",
+                _ => unreachable!("matched local container target"),
             };
             for arguments in [
                 vec![

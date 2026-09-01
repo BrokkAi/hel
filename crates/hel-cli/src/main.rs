@@ -842,6 +842,7 @@ pub(crate) fn startup_greeting(controller: &Controller) -> String {
             session.target,
             Some(
                 TargetLocator::LocalPodman { .. }
+                    | TargetLocator::LocalDocker { .. }
                     | TargetLocator::AppleContainer { .. }
                     | TargetLocator::SshPodman { .. }
             )

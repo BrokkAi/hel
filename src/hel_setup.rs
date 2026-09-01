@@ -13,8 +13,8 @@ use crate::hel_config::{
 };
 use crate::hel_doctor::{
     CheckStatus, DoctorCheck, DoctorOptions, all_ready, apple_container_daemon_check,
-    current_apple_platform, local_podman_runtime_check, probe_executor, render_human,
-    run_with_config_path,
+    current_apple_platform, local_docker_runtime_check, local_podman_runtime_check, probe_executor,
+    render_human, run_with_config_path,
 };
 use crate::hel_targets::{
     CancellableProcessExecutor, CommandExecutor, CommandSpec,
@@ -59,6 +59,7 @@ impl GithubRepository {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeKind {
     Podman,
+    Docker,
     AppleContainer,
 }
 
@@ -66,6 +67,7 @@ impl RuntimeKind {
     fn id(self) -> &'static str {
         match self {
             Self::Podman => "podman",
+            Self::Docker => "docker",
             Self::AppleContainer => "apple-container",
         }
     }
@@ -73,6 +75,7 @@ impl RuntimeKind {
     fn label(self) -> &'static str {
         match self {
             Self::Podman => "Podman",
+            Self::Docker => "Docker",
             Self::AppleContainer => "Apple container",
         }
     }
@@ -80,6 +83,7 @@ impl RuntimeKind {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "podman" => Some(Self::Podman),
+            "docker" => Some(Self::Docker),
             "apple-container" | "container" => Some(Self::AppleContainer),
             _ => None,
         }
@@ -442,10 +446,10 @@ fn discover_github_repository(
 /// Probe the container runtimes setup can configure, reusing the doctor checks
 /// so an unavailable runtime carries doctor's detail and remediation.
 pub fn probe_local_runtimes(executor: &impl CommandExecutor, is_macos: bool) -> Vec<RuntimeProbe> {
-    let mut probes = vec![runtime_probe_from_check(
-        RuntimeKind::Podman,
-        local_podman_runtime_check(executor),
-    )];
+    let mut probes = vec![
+        runtime_probe_from_check(RuntimeKind::Podman, local_podman_runtime_check(executor)),
+        runtime_probe_from_check(RuntimeKind::Docker, local_docker_runtime_check(executor)),
+    ];
     if is_macos {
         probes.push(runtime_probe_from_check(
             RuntimeKind::AppleContainer,
@@ -570,6 +574,7 @@ fn build_config_with_runtime(
         };
         let (target_id, target) = match runtime {
             RuntimeKind::Podman => ("podman", TargetTemplate::LocalPodman { container }),
+            RuntimeKind::Docker => ("docker", TargetTemplate::LocalDocker { container }),
             RuntimeKind::AppleContainer => (
                 "apple-container",
                 TargetTemplate::AppleContainer { container },
@@ -1173,6 +1178,7 @@ fn write_summary(
             .expect("selected target exists");
         let image = match target {
             TargetTemplate::LocalPodman { container }
+            | TargetTemplate::LocalDocker { container }
             | TargetTemplate::AppleContainer { container } => &container.image,
             _ => unreachable!("setup runtime target is a local container"),
         };
@@ -1218,6 +1224,7 @@ fn smoke_target(runtime: RuntimeKind, image: &str) -> RuntimeTargetTemplate {
     };
     match runtime {
         RuntimeKind::Podman => RuntimeTargetTemplate::LocalPodman(container),
+        RuntimeKind::Docker => RuntimeTargetTemplate::LocalDocker(container),
         RuntimeKind::AppleContainer => RuntimeTargetTemplate::AppleContainer(container),
     }
 }
@@ -1556,6 +1563,17 @@ mod tests {
             config.targets["localhost"],
             TargetTemplate::LocalBare
         ));
+
+        let docker = build_config(
+            &homes,
+            Some(&repository),
+            RuntimeKind::Docker,
+            "ubuntu:24.04",
+        );
+        assert!(matches!(
+            docker.targets["docker"],
+            TargetTemplate::LocalDocker { .. }
+        ));
     }
 
     #[test]
@@ -1564,12 +1582,13 @@ mod tests {
             ok(b"podman version 5.4.2\n"),
             ok(b"true\n"),
             ok(b"0 1000 1\n1 100000 65536\n"),
+            ok(b"29.0.1 linux\n"),
             ok(b"container version 1\n"),
             ok(b"running\n"),
         ]);
         let runtimes = probe_local_runtimes(&executor, true);
 
-        assert_eq!(runtimes.len(), 2);
+        assert_eq!(runtimes.len(), 3);
         assert_eq!(recommended_runtime(&runtimes), Some(RuntimeKind::Podman));
         assert_eq!(executor.commands.borrow()[0].program, "podman");
         assert_eq!(executor.commands.borrow()[0].args, ["--version"]);
@@ -1581,17 +1600,21 @@ mod tests {
             executor.commands.borrow()[2].args,
             ["unshare", "cat", "/proc/self/uid_map"]
         );
-        assert_eq!(executor.commands.borrow()[3].program, "container");
+        assert_eq!(executor.commands.borrow()[3].program, "docker");
+        assert_eq!(executor.commands.borrow()[4].program, "container");
         assert!(runtimes.iter().all(|runtime| runtime.usable));
     }
 
     #[test]
     fn unusable_podman_carries_the_doctor_remediation_into_the_runtime_list() {
-        let executor = RuntimeProbeExecutor::new([ok(b"podman version 3.4.7\n")]);
+        let executor = RuntimeProbeExecutor::new([
+            ok(b"podman version 3.4.7\n"),
+            failed(b"docker is unavailable"),
+        ]);
 
         let runtimes = probe_local_runtimes(&executor, false);
 
-        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes.len(), 2);
         assert!(!runtimes[0].usable);
         let remediation = runtimes[0].remediation.as_deref().unwrap();
         assert!(remediation.contains("Upgrade Podman"), "{remediation}");
@@ -1600,6 +1623,7 @@ mod tests {
         write_runtimes(&mut output, &runtimes).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Podman: unavailable"), "{output}");
+        assert!(output.contains("Docker: unavailable"), "{output}");
         assert!(output.contains("remediation: Upgrade Podman"), "{output}");
     }
 

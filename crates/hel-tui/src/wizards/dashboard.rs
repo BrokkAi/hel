@@ -733,6 +733,7 @@ impl DashboardState {
                 DashboardAction::None
             }
             TargetTemplate::LocalPodman { .. }
+            | TargetTemplate::LocalDocker { .. }
             | TargetTemplate::AppleContainer { .. }
             | TargetTemplate::SshPodman { .. } => {
                 let limits = self.host_limits(&target_id);

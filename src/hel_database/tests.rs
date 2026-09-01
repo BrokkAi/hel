@@ -370,6 +370,33 @@ fn normalized_state_round_trip_preserves_children_and_order() {
 }
 
 #[test]
+fn local_docker_locator_round_trips_through_the_normalized_target_table() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    let mut record = session("session-1", "project-1");
+    record.target_template_id = "docker".into();
+    record.target = Some(TargetLocator::LocalDocker {
+        container_id: "hel-session-1".into(),
+    });
+
+    save_session_to(&database, &record).unwrap();
+
+    let loaded = load_state_from(&database).unwrap();
+    assert_eq!(loaded.sessions["session-1"], record);
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT kind FROM session_targets WHERE session_id = 'session-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "local-docker"
+    );
+}
+
+#[test]
 fn session_and_host_container_size_commit_together_and_latest_wins() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("hel.sqlite3");

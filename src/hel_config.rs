@@ -586,6 +586,10 @@ pub enum TargetTemplate {
         #[serde(flatten)]
         container: ContainerTemplate,
     },
+    LocalDocker {
+        #[serde(flatten)]
+        container: ContainerTemplate,
+    },
     AppleContainer {
         #[serde(flatten)]
         container: ContainerTemplate,
@@ -640,9 +644,9 @@ impl TargetTemplate {
         validate_id("target template", id)?;
         match self {
             Self::LocalBare => Ok(()),
-            Self::LocalPodman { container } | Self::AppleContainer { container } => {
-                container.validate(id)
-            }
+            Self::LocalPodman { container }
+            | Self::LocalDocker { container }
+            | Self::AppleContainer { container } => container.validate(id),
             Self::AwsEc2 {
                 aws_profile,
                 region,
@@ -707,6 +711,7 @@ pub fn is_bare_project_target(template: &TargetTemplate) -> bool {
 pub fn mount_history_host(template: &TargetTemplate) -> Option<&str> {
     match template {
         TargetTemplate::LocalPodman { .. }
+        | TargetTemplate::LocalDocker { .. }
         | TargetTemplate::AppleContainer { .. }
         | TargetTemplate::AwsEc2 { .. } => Some("local"),
         TargetTemplate::SshPodman { ssh, .. } => Some(&ssh.host),
@@ -717,7 +722,9 @@ pub fn mount_history_host(template: &TargetTemplate) -> Option<&str> {
 /// Stable physical-host key for reusable container CPU and memory defaults.
 pub fn container_size_host(template: &TargetTemplate) -> Option<&str> {
     match template {
-        TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => Some("local"),
+        TargetTemplate::LocalPodman { .. }
+        | TargetTemplate::LocalDocker { .. }
+        | TargetTemplate::AppleContainer { .. } => Some("local"),
         TargetTemplate::SshPodman { ssh, .. } => Some(&ssh.host),
         TargetTemplate::LocalBare
         | TargetTemplate::SshBare { .. }
@@ -1554,6 +1561,26 @@ mod tests {
                         .ends_with(".tmp")
                 })
         );
+    }
+
+    #[test]
+    fn local_docker_target_round_trips_with_its_public_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = sample_config();
+        let container = match config.targets.remove("podman-default").unwrap() {
+            TargetTemplate::LocalPodman { container } => container,
+            _ => unreachable!(),
+        };
+        config
+            .targets
+            .insert("docker".into(), TargetTemplate::LocalDocker { container });
+
+        config.save_to(&path).unwrap();
+
+        let rendered = fs::read_to_string(&path).unwrap();
+        assert!(rendered.contains("kind = \"local-docker\""), "{rendered}");
+        assert_eq!(HelConfig::load_from(&path).unwrap(), config);
     }
 
     #[test]

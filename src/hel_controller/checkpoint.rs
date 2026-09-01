@@ -617,6 +617,7 @@ impl Controller {
                 let bundle = bundle.context("session bundle is missing")?;
                 let workspace_root = match &backend {
                     hel_targets::TargetLocator::LocalPodman { .. }
+                    | hel_targets::TargetLocator::LocalDocker { .. }
                     | hel_targets::TargetLocator::AppleContainer { .. }
                     | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
                     hel_targets::TargetLocator::AwsEc2 { workspace, .. }
@@ -1619,6 +1620,19 @@ pub(super) fn upload_checkpoint_spec(
             executor,
             CommandSpec::new(
                 "podman",
+                [
+                    "cp".into(),
+                    local.to_string_lossy().into_owned(),
+                    format!("{container_id}:{remote}"),
+                ],
+            )
+            .purpose("upload checkpoint specification"),
+        )
+        .map(|_| ()),
+        hel_targets::TargetLocator::LocalDocker { container_id } => execute_checked(
+            executor,
+            CommandSpec::new(
+                "docker",
                 [
                     "cp".into(),
                     local.to_string_lossy().into_owned(),
