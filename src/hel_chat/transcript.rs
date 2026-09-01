@@ -17,7 +17,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use serde::{Deserialize, Serialize};
-use similar::{ChangeTag, TextDiff};
 
 use crate::hel_selection::{ContentPos, SelectionRange, SurfaceFrame, SurfaceId};
 use crate::hel_state::{MaterializedSession, TerminalOutputRecord, TranscriptBody, TranscriptItem};
@@ -1925,19 +1924,16 @@ impl ToolDiffstatRequest {
 }
 
 fn format_diffstat(diff: &agent_client_protocol::schema::v1::Diff) -> String {
-    let old_text = diff.old_text.as_deref().unwrap_or_default();
-    let changes = TextDiff::from_lines(old_text, &diff.new_text);
-    let (insertions, deletions) =
-        changes
-            .iter_all_changes()
-            .fold((0, 0), |(insertions, deletions), change| {
-                match change.tag() {
-                    ChangeTag::Insert => (insertions + 1, deletions),
-                    ChangeTag::Delete => (insertions, deletions + 1),
-                    ChangeTag::Equal => (insertions, deletions),
-                }
-            });
-    format!("{}  +{insertions} −{deletions}", diff.path.display())
+    // A diff recorded since `hel_diff` landed already carries its counts, so
+    // this is a lookup. An older record still holds both file copies and is
+    // diffed here on demand.
+    let patch = crate::hel_diff::patch_of(diff);
+    format!(
+        "{}  +{} −{}",
+        diff.path.display(),
+        patch.insertions,
+        patch.deletions
+    )
 }
 
 pub(super) fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {

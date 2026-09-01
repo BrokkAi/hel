@@ -1968,6 +1968,54 @@ mod tests {
         assert!(serde_json::to_vec(recorded).unwrap().len() <= RELAY_EVENT_BYTE_BUDGET);
     }
 
+    /// The journal is append-only, so what a recorded edit costs is what it
+    /// costs forever. It records the patch, not two copies of the file.
+    #[test]
+    fn a_recorded_edit_journals_a_patch_rather_than_the_whole_file() {
+        use agent_client_protocol::schema::v1::{Diff, ToolCall, ToolCallContent};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let old_text = (0..4_000)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let new_text = old_text.replace("line 2000\n", "line 2000 edited\n");
+        let mut diff = Diff::new("/repo/src/main.rs", new_text);
+        diff.old_text = Some(old_text.clone());
+
+        relay
+            .record_session_update(SessionUpdate::ToolCall(
+                ToolCall::new("call-1", "Edit files").content(vec![ToolCallContent::Diff(diff)]),
+            ))
+            .unwrap();
+
+        let replayed = relay
+            .events_after(0, crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST)
+            .unwrap();
+        let recorded = &replayed[0];
+        let RelayObservation::SessionUpdate { update } = &recorded.observation else {
+            panic!(
+                "expected a session update, found {:?}",
+                recorded.observation
+            );
+        };
+        let SessionUpdate::ToolCall(call) = update.as_ref() else {
+            panic!("expected a tool call");
+        };
+        let [ToolCallContent::Diff(diff)] = call.content.as_slice() else {
+            panic!("expected one diff");
+        };
+        assert_eq!(diff.old_text, None, "the old copy is not journalled");
+        assert_eq!(diff.new_text, "", "the new copy is not journalled");
+        let patch = crate::hel_diff::patch_of(diff);
+        assert_eq!((patch.insertions, patch.deletions), (1, 1));
+        assert!(patch.text.contains("+line 2000 edited\n"));
+        assert!(
+            serde_json::to_vec(recorded).unwrap().len() * 20 < old_text.len(),
+            "a one-line edit still cost a copy of the file"
+        );
+    }
+
     #[test]
     fn operational_state_is_payload_free_and_bounded() {
         let temp = tempfile::tempdir().unwrap();
