@@ -793,18 +793,21 @@ details.block-fold > pre {
 
 /* ---- wizards ---- */
 
-.review {
+.review,
+.readings {
   display: grid;
   grid-template-columns: minmax(0, auto) minmax(0, 1fr);
   gap: 6px 14px;
   margin: 8px 0;
 }
 
-.review dt {
+.review dt,
+.readings dt {
   color: var(--dim);
 }
 
-.review dd {
+.review dd,
+.readings dd {
   margin: 0;
   overflow-wrap: anywhere;
 }
@@ -825,4 +828,54 @@ details.block-fold > pre {
 
 #new-progress {
   margin: 0 0 8px;
+}
+
+/* ---- readings: capacity and quota ---- */
+
+/* The terminal's thresholds, by headroom remaining. A busy machine and an
+ * exhausted limit both read red because both are the same news. */
+.reading-low {
+  color: var(--failed);
+  border-color: var(--failed);
+}
+.reading-mid {
+  color: var(--running);
+  border-color: var(--running);
+}
+.reading-high {
+  color: var(--done);
+  border-color: var(--done);
+}
+
+.quota-window {
+  margin: 12px 0;
+}
+
+.quota-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* The bar repeats the number beside it, so nothing is said by length alone. */
+.meter {
+  height: 6px;
+  margin: 6px 0;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  width: var(--fill, 0%);
+  background: currentColor;
+}
+
+article > h3 {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  justify-content: space-between;
 }

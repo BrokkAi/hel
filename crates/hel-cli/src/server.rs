@@ -474,10 +474,13 @@ pub(crate) async fn run_server(
     let mut prompt_images = std::collections::BTreeSet::new();
     let mut operational = std::collections::BTreeMap::new();
     let mut operations = std::collections::BTreeMap::new();
-    // Populated once the capacity poller is spawned here; until then the
-    // Targets page has nothing to show and says so rather than inventing a
-    // reading.
-    let capacity: Vec<hel::hel_server::ViewerTargetCapacity> = Vec::new();
+    // What the capacity poller last said, per probe target. The projection is
+    // built from this on every publish rather than being accumulated, so a
+    // target that disappears from the configuration disappears from the page.
+    let mut capacity_state: std::collections::BTreeMap<String, PhoneCapacity> =
+        std::collections::BTreeMap::new();
+    let (capacity_targets_tx, capacity_triggers_tx, mut capacity_updates_rx) =
+        crate::pollers::spawn_dashboard_capacity_poller();
     let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
         &controller,
         &phone_workspaces,
@@ -490,7 +493,7 @@ pub(crate) async fn run_server(
             prompt_images: &prompt_images,
             operational: &operational,
             operations: &operations,
-            capacity: &capacity,
+            capacity: &viewer_capacity(&capacity_state),
         },
         revision,
     ));
@@ -505,6 +508,7 @@ pub(crate) async fn run_server(
         shutdown: worker_shutdown,
     } = worker;
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+    publish_capacity_targets(&controller, &capacity_targets_tx, &mut capacity_state);
     let mut credential_sync = CredentialSyncCoordinator::spawn();
     let credential_sync_handle = credential_sync.handle();
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
@@ -604,7 +608,7 @@ pub(crate) async fn run_server(
                         prompt_images: &prompt_images,
                         operational: &operational,
                         operations: &operations,
-                        capacity: &capacity,
+                        capacity: &viewer_capacity(&capacity_state),
                     },
                     $revision,
                 )) {
@@ -639,6 +643,32 @@ pub(crate) async fn run_server(
                         break;
                     }
                     phone_workspaces = workspace_updates.borrow_and_update().clone();
+                    revision = daemon_runtime.allocate_revision();
+                    publish_snapshot!(revision);
+                }
+                update = capacity_updates_rx.recv() => {
+                    let Some(update) = update else {
+                        failure = feed_stopped(termination.is_cancelled(), "the capacity poller stopped while the phone server was running");
+                        break;
+                    };
+                    if let Some(entry) = capacity_state.get_mut(&update.target_id) {
+                        entry.refreshing = false;
+                        entry.sampled_at_epoch_seconds = Some(update.sampled_at_epoch_seconds);
+                        match update.result {
+                            Ok(usage) => {
+                                // A fleet with nothing running reports no
+                                // figures, and that is an answer rather than a
+                                // failure.
+                                entry.on_demand = usage.is_none();
+                                entry.usage = usage;
+                                entry.failed = false;
+                            }
+                            // The last good reading stays on screen beside the
+                            // failure: one failed probe is not a reason to
+                            // forget what the machine was doing.
+                            Err(_) => entry.failed = true,
+                        }
+                    }
                     revision = daemon_runtime.allocate_revision();
                     publish_snapshot!(revision);
                 }
@@ -826,6 +856,56 @@ pub(crate) async fn run_server(
                         failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering actions");
                         break;
                     };
+                    // A refresh nudges a poller this loop owns. It takes no
+                    // session slot and starts no lifecycle work, so it is
+                    // answered here rather than admitted as an action.
+                    match &request.action {
+                        ControllerAction::RefreshCapacity { target_id } => {
+                            let known = capacity_state.contains_key(target_id);
+                            if known {
+                                if let Some(entry) = capacity_state.get_mut(target_id) {
+                                    entry.refreshing = true;
+                                }
+                                // The trigger is a nudge with no payload: it
+                                // asks the poller to sample every target now,
+                                // which is what a person pressing refresh on
+                                // the Targets page means.
+                                capacity_triggers_tx.send(()).await.ok();
+                                revision = daemon_runtime.allocate_revision();
+                                publish_snapshot!(revision);
+                            }
+                            let outcome = if known {
+                                ActionOutcome::Accepted
+                            } else {
+                                ActionOutcome::Failed
+                            };
+                            if request.reply.send(outcome).is_err() {
+                                tracing::debug!(%target_id, "phone capacity refresh reply dropped after client disconnect");
+                            }
+                            continue;
+                        }
+                        ControllerAction::RefreshQuota { profile_id } => {
+                            let known = controller.config.profiles.contains_key(profile_id);
+                            if known {
+                                // The refresher works from a generation-stamped
+                                // batch, so a new generation is how one is asked
+                                // for again rather than a per-profile trigger.
+                                quota_batch.generation = quota_batch.generation.saturating_add(1);
+                                quota_batch.profiles = quota_refresh_profiles(&controller);
+                                quota_profiles_tx.send_replace(quota_batch.clone());
+                            }
+                            let outcome = if known {
+                                ActionOutcome::Accepted
+                            } else {
+                                ActionOutcome::Failed
+                            };
+                            if request.reply.send(outcome).is_err() {
+                                tracing::debug!(%profile_id, "phone quota refresh reply dropped after client disconnect");
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
                     if let ControllerAction::Cancel { session_id } = &request.action {
                         let outcome = if request_phone_action_cancellation(
                             session_id,
@@ -930,7 +1010,7 @@ pub(crate) async fn run_server(
                                 prompt_images: &prompt_images,
                                 operational: &operational,
                                 operations: &operations,
-                                capacity: &capacity,
+                                capacity: &viewer_capacity(&capacity_state),
                             },
                             revision,
                         )) {
@@ -1016,6 +1096,11 @@ pub(crate) async fn run_server(
                             }
                             controller = reloaded;
                             worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                            publish_capacity_targets(
+                                &controller,
+                                &capacity_targets_tx,
+                                &mut capacity_state,
+                            );
                             credential_sync_handle.set_targets(credential_sync_targets(&controller));
                             republish_quota_profiles(
                                 &controller,
@@ -1525,6 +1610,88 @@ struct PhoneSessionViews<'a> {
     operations: &'a std::collections::BTreeMap<String, hel::hel_server::ViewerOperation>,
     /// The most recent capacity reading per probe target.
     capacity: &'a [hel::hel_server::ViewerTargetCapacity],
+}
+
+/// What the phone server remembers about one probe target between readings.
+///
+/// The last good reading is kept beside any failure, because one failed probe
+/// is not a reason to forget what a machine was doing a minute ago; the phone
+/// is told both, and says so.
+#[derive(Debug, Clone)]
+struct PhoneCapacity {
+    target: hel::hel_targets::DeploymentCapacityTarget,
+    usage: Option<hel::hel_targets::DeploymentCapacityUsage>,
+    on_demand: bool,
+    sampled_at_epoch_seconds: Option<u64>,
+    refreshing: bool,
+    failed: bool,
+}
+
+/// How old a reading may be before the page says so.
+const CAPACITY_STALE_AFTER: Duration = Duration::from_secs(120);
+
+/// Tell the poller which targets to probe, and keep the state map in step.
+fn publish_capacity_targets(
+    controller: &Controller,
+    targets_tx: &tokio::sync::watch::Sender<Vec<hel::hel_targets::DeploymentCapacityTarget>>,
+    state: &mut std::collections::BTreeMap<String, PhoneCapacity>,
+) {
+    let targets = controller.deployment_capacity_targets();
+    state.retain(|id, _| targets.iter().any(|target| target.id == *id));
+    for target in &targets {
+        state
+            .entry(target.id.clone())
+            .and_modify(|entry| entry.target = target.clone())
+            .or_insert_with(|| PhoneCapacity {
+                target: target.clone(),
+                usage: None,
+                on_demand: false,
+                sampled_at_epoch_seconds: None,
+                // A target with no reading yet is loading, not idle.
+                refreshing: true,
+                failed: false,
+            });
+    }
+    targets_tx.send_replace(targets);
+}
+
+/// Project the capacity readings for the phone.
+fn viewer_capacity(
+    state: &std::collections::BTreeMap<String, PhoneCapacity>,
+) -> Vec<hel::hel_server::ViewerTargetCapacity> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    state
+        .values()
+        .map(|entry| {
+            let usage = entry.usage.as_ref();
+            hel::hel_server::ViewerTargetCapacity {
+                id: entry.target.id.clone(),
+                label: entry.target.host.clone(),
+                target_ids: entry.target.target_ids.clone(),
+                cpu_percent: usage.and_then(|usage| usage.cpu_percent),
+                memory_used_bytes: usage.map(|usage| usage.memory_used_bytes),
+                memory_total_bytes: usage.map(|usage| usage.memory_total_bytes),
+                logical_cores: usage.map(|usage| usage.logical_cores),
+                disk_total_bytes: usage.and_then(|usage| usage.disk_total_bytes),
+                // A fleet reports how many machines it is running; a plain host
+                // has no such count and says nothing rather than zero.
+                virtual_machines: matches!(
+                    entry.target.kind,
+                    hel::hel_targets::DeploymentCapacityKind::AwsFleet
+                )
+                .then(|| u64::from(!entry.on_demand)),
+                sampled_at_epoch_seconds: entry.sampled_at_epoch_seconds,
+                refreshing: entry.refreshing,
+                stale: entry.sampled_at_epoch_seconds.is_some_and(|sampled| {
+                    now.saturating_sub(sampled) > CAPACITY_STALE_AFTER.as_secs()
+                }),
+                has_error: entry.failed,
+            }
+        })
+        .collect()
 }
 
 /// Turn one lifecycle operation into the projection a phone follows.

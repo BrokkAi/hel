@@ -83,6 +83,26 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await page.getByRole('menuitem', { name: 'Quota' }).click();
     await expect(page).toHaveURL(/#quota$/);
     await expect(page.locator('#quota')).toContainText('fake');
+    // The lab's harness reports no usable quota, so the page has to say that
+    // rather than draw an empty bar and imply a healthy limit.
+    await expect(page.locator('#quota')).toContainText('unavailable');
+    await page.locator('#quota').getByRole('button', { name: 'Refresh' }).first().click();
+
+    // Targets is a page too, and it says what state its readings are in.
+    await page.locator('#menu-button').click();
+    await page.getByRole('menuitem', { name: 'Targets' }).click();
+    await expect(page).toHaveURL(/#targets$/);
+    await expect(page.locator('#targets')).toContainText('localhost');
+    // The keyboard-inset and meter techniques both set a custom property
+    // through the CSSOM. The policy forbids inline style attributes parsed
+    // from markup; this pins that a CSSOM write is still permitted, because
+    // the whole design leans on it.
+    const cssomWorks = await page.evaluate(() => {
+      const probe = document.createElement('div');
+      probe.style.setProperty('--fill', '42%');
+      return probe.style.getPropertyValue('--fill');
+    });
+    expect(cssomWorks).toBe('42%');
     await page.getByRole('button', { name: 'Back' }).click();
     await expect(page).toHaveURL(new RegExp(escapeForRegExp(workspaceHash) + '$'));
 
@@ -149,9 +169,7 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
       }
       page.once('dialog', dialog => dialog.accept());
       await stop.click();
-      await session
-        .waitFor({ state: 'detached', timeout: 45_000 })
-        .catch(() => {});
+      await session.waitFor({ state: 'detached', timeout: 45_000 }).catch(() => {});
     }
     await expect(session).toHaveCount(0);
     // A stop that loses the adoption race fails after it was accepted, so its

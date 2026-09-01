@@ -756,24 +756,96 @@ function resumableCard(session) {
   return card;
 }
 
+/// Bytes as a person reads them.
+function formatBytes(bytes) {
+  if (bytes === undefined || bytes === null) return null;
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = Number(bytes);
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+/// The band a percentage falls in, matching the terminal's thresholds.
+///
+/// The terminal colours quota by headroom remaining and target load by the
+/// inverse, so a busy machine and an exhausted limit both read red.
+function band(percentRemaining) {
+  if (percentRemaining === null || percentRemaining === undefined) return '';
+  if (percentRemaining <= 20) return 'reading-low';
+  if (percentRemaining <= 50) return 'reading-mid';
+  return 'reading-high';
+}
+
+/// The freshness of one reading, as a word.
+///
+/// Four states, and each is said rather than implied: there has never been a
+/// reading, one is being taken now, the last one is older than it should be,
+/// or the last probe failed and the previous reading is what is on screen.
+function freshness(reading) {
+  if (reading.has_error) return { word: 'probe failed', className: 'reading-low' };
+  if (reading.refreshing && reading.sampled_at_epoch_seconds === undefined) {
+    return { word: 'loading', className: '' };
+  }
+  if (reading.refreshing) return { word: 'refreshing', className: '' };
+  if (reading.stale) return { word: 'stale', className: 'reading-mid' };
+  return null;
+}
+
 function renderTargets() {
   const readings = snapshot.capacity || [];
   if (!readings.length) {
-    targetsPanel.replaceChildren(
-      el('p', 'dim', 'No capacity readings yet.'),
-      el(
-        'p',
-        'dim',
-        (snapshot.targets || []).map(target => `${target.id} (${target.kind})`).join(', '),
-      ),
-    );
+    targetsPanel.replaceChildren(el('p', 'dim', 'No hosts or fleets are configured to be probed.'));
     return;
   }
   targetsPanel.replaceChildren(
     ...readings.map(reading => {
       const card = el('article', 'card');
-      card.append(el('h3', '', reading.label));
+      const heading = el('h3');
+      heading.append(el('span', '', reading.label));
+      const state = freshness(reading);
+      if (state) heading.append(el('span', `pill ${state.className}`, state.word));
+      card.append(heading);
       card.append(el('p', 'dim', reading.target_ids.join(', ')));
+
+      const rows = [];
+      if (reading.cpu_percent !== undefined) {
+        // CPU is load, so its band is the inverse of the headroom bands.
+        rows.push(['CPU', `${reading.cpu_percent}%`, band(100 - reading.cpu_percent)]);
+      }
+      if (reading.memory_total_bytes) {
+        const used = reading.memory_used_bytes ?? 0;
+        const percent = Math.min(100, Math.round((used / reading.memory_total_bytes) * 100));
+        rows.push([
+          'Memory',
+          `${percent}% of ${formatBytes(reading.memory_total_bytes)}`,
+          band(100 - percent),
+        ]);
+      }
+      if (reading.logical_cores) rows.push(['Cores', String(reading.logical_cores), '']);
+      if (reading.disk_total_bytes) {
+        rows.push(['Disk', formatBytes(reading.disk_total_bytes), '']);
+      }
+      if (reading.virtual_machines !== undefined) {
+        rows.push([
+          'Machines',
+          `${reading.virtual_machines} VM${reading.virtual_machines === 1 ? '' : 's'}`,
+          '',
+        ]);
+      }
+      if (!rows.length) {
+        card.append(el('p', 'dim', 'No reading yet.'));
+      } else {
+        const list = el('dl', 'readings');
+        for (const [term, value, className] of rows) {
+          list.append(el('dt', '', term), el('dd', className, value));
+        }
+        card.append(list);
+      }
+      card.append(refreshRow('refresh-capacity', { target_id: reading.id }));
       return card;
     }),
   );
@@ -783,32 +855,88 @@ function renderQuota() {
   quotaPanel.replaceChildren(
     ...(snapshot.profiles || []).map(profile => {
       const card = el('article', 'card');
-      card.append(el('h3', '', profile.id));
-      card.append(el('p', 'dim', profile.harness_kind));
+      const heading = el('h3');
+      heading.append(el('span', '', profile.id));
       const quota = profile.quota;
+      if (quota?.has_error) heading.append(el('span', 'pill reading-low', 'unavailable'));
+      else if (quota?.stale) heading.append(el('span', 'pill reading-mid', 'stale'));
+      card.append(heading);
+      card.append(el('p', 'dim', profile.harness_kind));
+
       if (!quota) {
-        card.append(el('p', 'dim', 'quota unavailable'));
+        card.append(el('p', 'dim', 'No reading yet.'));
+        card.append(refreshRow('refresh-quota', { profile_id: profile.id }));
         return card;
       }
-      for (const window of quota.windows || []) {
-        const row = el('p');
-        row.append(el('span', '', `${window.label} `));
-        row.append(
+      const windows = quota.windows || [];
+      if (!windows.length) {
+        card.append(el('p', 'dim', quota.summary || 'No windows reported.'));
+      }
+      for (const window of windows) {
+        const row = el('div', 'quota-window');
+        const label = el('div', 'quota-label');
+        label.append(el('span', '', window.label));
+        const used = window.percent_used;
+        label.append(
           el(
             'span',
-            '',
-            window.percent_used === undefined ? 'unknown' : `${window.percent_used}% used`,
+            band(used === undefined ? undefined : 100 - used),
+            used === undefined ? 'unknown' : `${used}% used`,
           ),
         );
-        if (window.resets_at) row.append(el('span', 'dim', ` · resets ${window.resets_at}`));
+        row.append(label);
+        if (used !== undefined) {
+          // A bar and a number say the same thing, so a reader who cannot see
+          // the bar has not lost anything.
+          const meter = el('div', 'meter');
+          meter.setAttribute('role', 'img');
+          meter.setAttribute('aria-label', `${window.label}: ${used}% used`);
+          const fill = el('div', `meter-fill ${band(100 - used)}`);
+          fill.style.setProperty('--fill', `${used}%`);
+          meter.append(fill);
+          row.append(meter);
+        }
+        const notes = [];
+        if (window.resets_at) notes.push(`resets ${window.resets_at}`);
+        if (window.projects_exhaustion_before_reset) notes.push('on course to run out first');
+        if (notes.length) row.append(el('p', 'dim', notes.join(' · ')));
         card.append(row);
       }
-      if (!(quota.windows || []).length) card.append(el('p', 'dim', quota.summary));
-      if (quota.stale) card.append(el('p', 'dim', 'stale'));
-      if (quota.has_error) card.append(el('p', 'dim', 'unavailable'));
+      if (quota.refreshed_at_epoch_seconds) {
+        card.append(
+          el(
+            'p',
+            'dim',
+            `Last refreshed ${new Date(quota.refreshed_at_epoch_seconds * 1000).toLocaleTimeString()}`,
+          ),
+        );
+      }
+      card.append(refreshRow('refresh-quota', { profile_id: profile.id }));
       return card;
     }),
   );
+}
+
+/// The refresh control both pages carry.
+function refreshRow(actionName, payload) {
+  const row = el('div', 'row');
+  const control = button('Refresh', 'secondary', { refresh: actionName });
+  control.dataset.payload = JSON.stringify(payload);
+  row.append(control);
+  return row;
+}
+
+async function runRefresh(target, errorNode) {
+  const body = { action: target.dataset.refresh, ...JSON.parse(target.dataset.payload) };
+  target.disabled = true;
+  try {
+    await request('/api/actions', { method: 'POST', body: JSON.stringify(body) });
+    await refresh();
+  } catch (err) {
+    if (errorNode) errorNode.textContent = err.message;
+  } finally {
+    target.disabled = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,6 +1708,13 @@ for (const node of document.querySelectorAll(
 }
 
 window.addEventListener('hashchange', applyRoute);
+
+for (const panel of [targetsPanel, quotaPanel]) {
+  panel.onclick = async event => {
+    const target = event.target.closest('button[data-refresh]');
+    if (target) await runRefresh(target);
+  };
+}
 
 newBackButton.onclick = () => {
   if (!newDraft || newDraft.step === 0) return;

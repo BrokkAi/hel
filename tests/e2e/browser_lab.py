@@ -43,7 +43,11 @@ def qr_url(lab: Lab) -> str:
 
 
 def wait_marker_or_exit(marker: pathlib.Path, browser: subprocess.Popen[bytes]) -> None:
-    deadline = time.monotonic() + 60
+    # The browser walks the whole normal operator flow before it goes offline:
+    # the quota and targets pages, the four-step new-session wizard, a real
+    # provision, and a conversation. That is minutes of honest work, not the
+    # single page load this wait was first sized for.
+    deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         if marker.exists():
             return
