@@ -2638,13 +2638,6 @@ impl ActiveChat {
             _ => {}
         }
     }
-
-    /// Whether a clock tick has anything to redraw for: a running turn in the
-    /// header, whose clock counts up once a second, or a live agent terminal.
-    pub fn needs_clock_tick(&self) -> bool {
-        self.state.turn_started_at_epoch_seconds.is_some()
-            || !self.state.active_agent_terminals.is_empty()
-    }
 }
 
 /// The one-session controller a reviewer is staged through. Staging reads only
