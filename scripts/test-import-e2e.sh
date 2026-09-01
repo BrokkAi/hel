@@ -16,7 +16,7 @@ export MJ_IMPORT_E2E_ROOT="$test_root"
 export MJ_IMPORT_E2E_REPOSITORY="${MJ_IMPORT_E2E_REPOSITORY:-BrokkAi/hel}"
 export MJ_IMPORT_E2E_IMAGE="${MJ_IMPORT_E2E_IMAGE:-localhost/hel/agent-dev:latest}"
 # Keep the test's imported state and archive separate from the user's Hel data.
-export MJ_CONFIG_DIR="$test_root/config/hel"
+export MJ_CONFIG_DIR="$test_root/config/mjolnir"
 export MJ_DATA_DIR="$test_root/data/hel"
 export MJ_WORKER_BINARY="${MJ_WORKER_BINARY:-$repo_root/target/x86_64-unknown-linux-musl/debug/hel}"
 

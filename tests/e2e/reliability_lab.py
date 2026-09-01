@@ -421,7 +421,7 @@ for line in sys.stdin:
     elif method == "session/prompt":
         blocks = message.get("params", {}).get("prompt", [])
         text = " ".join(block.get("text", "") for block in blocks if block.get("type") == "text")
-        memory_end = "</hel-project-memory>"
+        memory_end = "</mj-project-memory>"
         if memory_end in text:
             text = text.rsplit(memory_end, 1)[1].strip()
         send({
@@ -729,7 +729,7 @@ kind = "local-bare"
             shutil.rmtree(self.runtime_root)
 
     def integrity(self) -> None:
-        database = self.data / "hel.sqlite3"
+        database = self.data / "mj.sqlite3"
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
         try:
             result = connection.execute("PRAGMA integrity_check").fetchall()
