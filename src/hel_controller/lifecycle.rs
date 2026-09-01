@@ -12,7 +12,7 @@ use crate::hel_worker::{RelayCommand, RelayExecutionState};
 use super::backend::backend_locator;
 use super::checkpoint::{
     CheckpointExportPolicy, LatchExclusivity, prune_replaced_checkpoint,
-    verify_installed_checkpoint_gate, wait_for_relay_closed,
+    release_projection_behind_checkpoint, verify_installed_checkpoint_gate, wait_for_relay_closed,
 };
 use super::provisioning::retire_git_broker;
 use super::worktree::{cleanup_managed_worktree, retire_managed_worktree};
@@ -106,6 +106,9 @@ impl Controller {
             "persist verified checkpoint and closing state before sealing the relay",
         )?;
         prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
+        // A stopping session will not checkpoint again, so this is its last
+        // chance to release what its checkpoint now covers.
+        release_projection_behind_checkpoint(session_id, &artifact.metadata);
 
         let close_command_id = new_command_id("close")?;
         let barrier_command_id = latched.barrier_command_id.clone();

@@ -445,6 +445,7 @@ impl Controller {
                     "checkpoint metadata persisted"
                 );
                 prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
+                release_projection_behind_checkpoint(session_id, &artifact.metadata);
                 if let Err(error) = latched.complete().await {
                     // Only journal retention is at stake. A barrier that is
                     // still open cannot dangle: the actor retries a failed
@@ -550,6 +551,7 @@ impl Controller {
             );
         }
         prune_replaced_checkpoint(previous_checkpoint.as_ref(), &artifact.metadata);
+        release_projection_behind_checkpoint(session_id, &artifact.metadata);
         Ok(artifact)
     }
 
@@ -1808,6 +1810,34 @@ fn verify_checkpoint_artifact(session_id: &str, artifact: &CheckpointArtifact) -
         "completed checkpoint frontier digest changed before persistence"
     );
     Ok(())
+}
+
+/// Release the projection history the new checkpoint covers.
+///
+/// The checkpoint archive holds the complete transcript up to its frontier, so
+/// the tool output stored below that frontier is a second copy of something
+/// already durable. Reclaiming it is housekeeping: a checkpoint that is
+/// verified and persisted stays good whether or not this succeeds, so a
+/// failure is logged rather than returned.
+pub(super) fn release_projection_behind_checkpoint(session_id: &str, current: &CheckpointMetadata) {
+    match crate::hel_database::compact_materialized_transcript_through(
+        session_id,
+        current.event_frontier,
+    ) {
+        Ok(retention) if retention.items == 0 => {}
+        Ok(retention) => tracing::info!(
+            session_id,
+            items = retention.items,
+            bytes = retention.bytes,
+            remaining = retention.remaining,
+            event_frontier = current.event_frontier,
+            "released projection history the checkpoint covers"
+        ),
+        Err(error) => tracing::warn!(
+            session_id,
+            "checkpoint was saved, but the projection history it covers could not be released: {error:#}"
+        ),
+    }
 }
 
 pub(super) fn prune_replaced_checkpoint(

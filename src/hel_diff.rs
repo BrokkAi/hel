@@ -105,6 +105,34 @@ pub fn compact_tool_call_content(content: &mut [ToolCallContent]) -> bool {
         })
 }
 
+/// Reduce a diff to the counts a diffstat reads, dropping the patch text.
+///
+/// This is what a retention pass leaves behind once a checkpoint holds the
+/// whole edit. A diff recorded before patches were stored is compacted first,
+/// so its counts come from the file copies before they go — otherwise the
+/// diffstat the transcript shows would drop to `+0 −0`.
+///
+/// Returns whether anything changed.
+pub fn drop_patch_text(diff: &mut Diff) -> bool {
+    let mut changed = compact_diff(diff);
+    let Some(mut patch) = stored_patch(diff) else {
+        return changed;
+    };
+    if patch.text.is_empty() && patch.truncated {
+        return changed;
+    }
+    patch.text = String::new();
+    patch.truncated = true;
+    let Ok(value) = serde_json::to_value(&patch) else {
+        return changed;
+    };
+    diff.meta
+        .get_or_insert_with(Default::default)
+        .insert(DIFF_PATCH_META_KEY.to_owned(), value);
+    changed = true;
+    changed
+}
+
 /// Read back the stored patch, if this diff has one.
 #[must_use]
 pub fn stored_patch(diff: &Diff) -> Option<DiffPatch> {

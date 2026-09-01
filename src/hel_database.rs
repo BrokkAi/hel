@@ -1983,6 +1983,118 @@ fn load_materialized_transcript_tail_from(
     read_materialized_transcript(&open_reader(path)?, session_id, Some(limit))
 }
 
+/// How many transcript rows one retention pass rewrites.
+///
+/// The daemon is the single database writer, so a pass that rewrote every row
+/// of a long session would stall every other write behind it. A capped pass
+/// leaves the rest for the next checkpoint, which is the next time any of it
+/// becomes redundant anyway.
+const RETENTION_BATCH_ITEMS: usize = 4_096;
+
+/// Rows below this are already small enough that rewriting them would cost
+/// more than it reclaims.
+const RETENTION_BODY_FLOOR_BYTES: usize = 4 * 1024;
+
+/// What one retention pass reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TranscriptRetention {
+    pub items: usize,
+    pub bytes: usize,
+    /// Rows this pass left for the next one, because of
+    /// `RETENTION_BATCH_ITEMS`.
+    pub remaining: bool,
+}
+
+/// Drop tool output that a verified checkpoint already holds.
+///
+/// The projection only ever grew: the only deletes were a per-item remove, a
+/// whole-session wipe, and the `sessions` cascade. One measured session reached
+/// 28,066 items and 635 MiB, of which 561 MB was tool-call content.
+///
+/// A checkpoint archive carries the complete transcript up to its event
+/// frontier, and one checkpoint per session is retained, so every item at or
+/// below `event_frontier` is durably recorded elsewhere. What stays here is
+/// what the transcript still shows: which tool ran, on what, with what result,
+/// and each edit's diffstat. See
+/// [`crate::hel_transcript::compact_tool_call_for_retention`].
+pub fn compact_materialized_transcript_through(
+    session_id: &str,
+    event_frontier: u64,
+) -> Result<TranscriptRetention> {
+    let session_id = session_id.to_owned();
+    submit_database_write("compact_materialized_transcript", move |_| {
+        compact_materialized_transcript_in(&database_path(), &session_id, event_frontier)
+    })
+}
+
+fn compact_materialized_transcript_in(
+    path: &Path,
+    session_id: &str,
+    event_frontier: u64,
+) -> Result<TranscriptRetention> {
+    let mut connection = open(path)?;
+    let candidates = {
+        let mut statement = connection.prepare(
+            "SELECT stable_id, body_json
+             FROM materialized_transcript_items
+             WHERE session_id = ?1
+               AND position <= ?2
+               AND length(body_json) > ?3
+               AND json_extract(
+                   CASE WHEN json_valid(body_json) THEN body_json ELSE '{}' END,
+                   '$.kind'
+               ) = 'tool'
+             ORDER BY position, stable_id
+             LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![
+                    session_id,
+                    event_frontier,
+                    RETENTION_BODY_FLOOR_BYTES as i64,
+                    RETENTION_BATCH_ITEMS as i64 + 1
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let remaining = candidates.len() > RETENTION_BATCH_ITEMS;
+    let mut retention = TranscriptRetention {
+        remaining,
+        ..TranscriptRetention::default()
+    };
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for (stable_id, body_json) in candidates.into_iter().take(RETENTION_BATCH_ITEMS) {
+        let mut body: TranscriptBody = match serde_json::from_str(&body_json) {
+            Ok(body) => body,
+            // A row this cannot read is a row it must not rewrite.
+            Err(error) => {
+                tracing::warn!(%session_id, %stable_id, %error, "skipping unreadable transcript body");
+                continue;
+            }
+        };
+        if !crate::hel_transcript::compact_tool_call_for_retention(&mut body) {
+            continue;
+        }
+        let compacted = serde_json::to_string(&body)
+            .with_context(|| format!("serialize compacted transcript body {stable_id}"))?;
+        if compacted.len() >= body_json.len() {
+            continue;
+        }
+        transaction.execute(
+            "UPDATE materialized_transcript_items SET body_json = ?3
+             WHERE session_id = ?1 AND stable_id = ?2",
+            params![session_id, stable_id, compacted],
+        )?;
+        retention.items += 1;
+        retention.bytes += body_json.len() - compacted.len();
+    }
+    transaction.commit()?;
+    Ok(retention)
+}
+
 /// How many transcript items a polled projection carries.
 ///
 /// Every viewer of a polled projection is bounded already: the conversation

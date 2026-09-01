@@ -2159,6 +2159,196 @@ fn queued_prompt_loader_does_not_deserialize_transcript_history() {
     assert!(load_materialized_session_from(&database, "session-1").is_err());
 }
 
+fn tool_item(position: u64, path: &str, old_text: &str, new_text: &str) -> Arc<TranscriptItem> {
+    let mut diff = agent_client_protocol::schema::v1::Diff::new(path, new_text);
+    diff.old_text = Some(old_text.to_owned());
+    crate::hel_diff::compact_diff(&mut diff);
+    Arc::new(TranscriptItem {
+        stable_id: format!("tool:call-{position}"),
+        position,
+        latest_content_event_ordinal: None,
+        created_at_ms: 1_000,
+        last_changed_at_ms: 1_000,
+        body: TranscriptBody::Tool {
+            call: serde_json::json!({
+                "toolCallId": format!("call-{position}"),
+                "title": "Edit files",
+                "kind": "edit",
+                "status": "completed",
+                "locations": [{"path": path}],
+                "content": [
+                    serde_json::to_value(
+                        agent_client_protocol::schema::v1::ToolCallContent::Diff(diff),
+                    )
+                    .unwrap(),
+                    serde_json::json!({
+                        "type": "content",
+                        "content": {"type": "text", "text": "x".repeat(64 * 1024)}
+                    }),
+                ],
+                "rawInput": {"file_text": "y".repeat(64 * 1024)},
+                "rawOutput": {"formatted_output": "z".repeat(64 * 1024)},
+            }),
+            terminal_outputs: Vec::new(),
+            terminal_refs: Vec::new(),
+        },
+    })
+}
+
+/// The same release, on a record written before diffs were stored as patches:
+/// it holds two full copies of the file and no counts, so the counts have to be
+/// computed before the copies go.
+#[test]
+fn releasing_a_diff_written_before_patches_keeps_its_stat() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let old_text = (0..400)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let new_text = old_text.replace("line 200\n", "line 200 edited\n");
+    let mut materialized = MaterializedSession::empty("session-1");
+    materialized.applied_event_ordinal = 30;
+    materialized.applied_event_digest = event_digest(30);
+    materialized.transcript = vec![Arc::new(TranscriptItem {
+        stable_id: "tool:call-10".into(),
+        position: 10,
+        latest_content_event_ordinal: None,
+        created_at_ms: 1_000,
+        last_changed_at_ms: 1_000,
+        body: TranscriptBody::Tool {
+            call: serde_json::json!({
+                "toolCallId": "call-10",
+                "title": "Edit files",
+                "kind": "edit",
+                "status": "completed",
+                "locations": [{"path": "src/legacy.rs"}],
+                "content": [{
+                    "type": "diff",
+                    "path": "src/legacy.rs",
+                    "oldText": old_text,
+                    "newText": new_text,
+                }],
+            }),
+            terminal_outputs: Vec::new(),
+            terminal_refs: Vec::new(),
+        },
+    })];
+    save_materialized_session_to(&database, &materialized).unwrap();
+    let before = load_materialized_session_from(&database, "session-1")
+        .unwrap()
+        .unwrap();
+    let stat_before = crate::hel_chat::materialized_tool_diffstats(&before.transcript[0]).unwrap();
+    assert_eq!(stat_before, vec!["src/legacy.rs  +1 −1"]);
+
+    let retention = compact_materialized_transcript_in(&database, "session-1", 15).unwrap();
+
+    assert_eq!(retention.items, 1);
+    assert!(retention.bytes > 4 * 1024);
+    let after = load_materialized_session_from(&database, "session-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::hel_chat::materialized_tool_diffstats(&after.transcript[0]).unwrap(),
+        stat_before,
+        "the counts had to be computed from the copies before they were dropped"
+    );
+}
+
+/// The projection only ever grew. A checkpoint archive holds the whole
+/// transcript up to its frontier, so what sits below that frontier is a second
+/// copy — but only the part nobody reads back may go, and the diffstat the
+/// transcript still shows must survive it.
+#[test]
+fn a_checkpoint_releases_the_tool_output_it_covers_and_keeps_the_diffstat() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let old_text = (0..400)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let new_text = old_text.replace("line 200\n", "line 200 edited\n");
+    let mut materialized = MaterializedSession::empty("session-1");
+    materialized.applied_event_ordinal = 30;
+    materialized.applied_event_digest = event_digest(30);
+    materialized.transcript = vec![
+        Arc::new(TranscriptItem {
+            stable_id: "user:1".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1_000,
+            last_changed_at_ms: 1_000,
+            body: TranscriptBody::User {
+                content: vec![serde_json::json!({"type": "text", "text": "edit it"})],
+            },
+        }),
+        tool_item(10, "src/covered.rs", &old_text, &new_text),
+        tool_item(20, "src/live.rs", &old_text, &new_text),
+    ];
+    save_materialized_session_to(&database, &materialized).unwrap();
+    let before = load_materialized_session_from(&database, "session-1")
+        .unwrap()
+        .unwrap();
+    let stats_before = before
+        .transcript
+        .iter()
+        .filter_map(|item| crate::hel_chat::materialized_tool_diffstats(item))
+        .collect::<Vec<_>>();
+
+    // A checkpoint at frontier 15 covers the first tool call, not the second.
+    let retention = compact_materialized_transcript_in(&database, "session-1", 15).unwrap();
+
+    assert_eq!(
+        retention.items, 1,
+        "only the covered tool call was rewritten"
+    );
+    assert!(retention.bytes > 128 * 1024);
+    assert!(!retention.remaining);
+
+    let after = load_materialized_session_from(&database, "session-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after
+            .transcript
+            .iter()
+            .filter_map(|item| crate::hel_chat::materialized_tool_diffstats(item))
+            .collect::<Vec<_>>(),
+        stats_before,
+        "the diffstat the transcript shows must survive the release"
+    );
+    assert_eq!(
+        after.transcript[0], before.transcript[0],
+        "a user message is never released"
+    );
+    assert_eq!(
+        after.transcript[2], before.transcript[2],
+        "a tool call the checkpoint does not cover is never released"
+    );
+    let TranscriptBody::Tool { call, .. } = &after.transcript[1].body else {
+        panic!("expected a tool call");
+    };
+    assert!(call.get("rawInput").is_none());
+    assert!(call.get("rawOutput").is_none());
+    assert_eq!(
+        call["title"], "Edit files",
+        "the call still says what it did"
+    );
+    assert_eq!(call["status"], "completed");
+    assert_eq!(call["locations"][0]["path"], "src/covered.rs");
+    assert_eq!(
+        call["content"].as_array().unwrap().len(),
+        1,
+        "only the diff stays"
+    );
+
+    // Running it again finds nothing left to release.
+    assert_eq!(
+        compact_materialized_transcript_in(&database, "session-1", 15).unwrap(),
+        TranscriptRetention::default()
+    );
+}
+
 /// The steady-state poll loads this on every change, so it must cost the
 /// window rather than the history — including the two facts that live outside
 /// the window, which are read rather than scanned for.

@@ -218,6 +218,85 @@ impl TranscriptItem {
     }
 }
 
+/// Reduce a tool call to what a reader still needs, once a verified checkpoint
+/// holds the whole of it.
+///
+/// Tool output is where a projection's bytes are: on one measured session,
+/// 561 MB of 635 MiB. Behind a checkpoint nothing reads it — the checkpoint
+/// archive carries the complete transcript, and restoring it brings the output
+/// back — so what stays here is what the transcript still shows: which tool
+/// ran, on what, with what result, and how many lines each edit changed.
+///
+/// Returns whether anything changed, so a caller can skip the write.
+pub fn compact_tool_call_for_retention(body: &mut TranscriptBody) -> bool {
+    let TranscriptBody::Tool {
+        call,
+        terminal_outputs,
+        terminal_refs,
+    } = body
+    else {
+        return false;
+    };
+    let Some(object) = call.as_object_mut() else {
+        return false;
+    };
+    let mut changed = !terminal_outputs.is_empty() || !terminal_refs.is_empty();
+    terminal_outputs.clear();
+    terminal_refs.clear();
+    for field in ["rawInput", "rawOutput", "_meta"] {
+        changed |= object.remove(field).is_some();
+    }
+    let Some(content) = object
+        .get_mut("content")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return changed;
+    };
+    let before = content.len();
+    // Diffs stay, because the transcript still shows their stat. Their patch
+    // text does not, and neither do the two file copies an older record holds
+    // instead of a patch: `hel_diff::drop_patch_text` turns those into the
+    // counts `format_diffstat` reads before dropping them.
+    content.retain(|item| item.get("type").and_then(|kind| kind.as_str()) == Some("diff"));
+    changed |= content.len() != before;
+    for item in content.iter_mut() {
+        changed |= drop_diff_body(item);
+    }
+    changed
+}
+
+fn drop_diff_body(item: &mut serde_json::Value) -> bool {
+    use agent_client_protocol::schema::v1::ToolCallContent;
+
+    // Round-trip through `ToolCallContent`, not `Diff`: the variant tag lives
+    // on the enum, and writing back a bare `Diff` would strip it and make the
+    // whole tool call unreadable.
+    let mut content = match serde_json::from_value::<ToolCallContent>(item.clone()) {
+        Ok(content) => content,
+        // Content this cannot read is content it must not rewrite.
+        Err(error) => {
+            tracing::warn!(%error, "skipping unreadable tool content during retention");
+            return false;
+        }
+    };
+    let ToolCallContent::Diff(diff) = &mut content else {
+        return false;
+    };
+    if !crate::hel_diff::drop_patch_text(diff) {
+        return false;
+    }
+    match serde_json::to_value(&content) {
+        Ok(value) => {
+            *item = value;
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not rewrite a diff during retention");
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChatRole {
     User,
