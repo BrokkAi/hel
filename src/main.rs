@@ -1568,6 +1568,20 @@ pub(crate) fn primary_route_matches(
         && active.reasoning_effort == candidate.reasoning_effort
 }
 
+fn keep_active_primary_for_auxiliary_reload(
+    active: &roster::ResolvedAgent,
+    updated: &mut roster::Roster,
+    config: &Config,
+) -> bool {
+    if primary_route_matches(active, &updated.primary) {
+        return false;
+    }
+    updated.primary = active.clone();
+    roster::rebind_auto_review_for_primary(updated, config);
+    roster::rebind_auto_subagents_for_primary(updated, config);
+    true
+}
+
 fn session_import_roster(
     active: &roster::Roster,
     source: &roster::ResolvedAgent,
@@ -2945,14 +2959,15 @@ async fn run_session(
                         continue;
                     }
                 };
-                if !primary_route_matches(&command_primary, &updated_roster.primary) {
+                if keep_active_primary_for_auxiliary_reload(
+                    &command_primary,
+                    &mut updated_roster,
+                    &updated_config,
+                ) {
                     // The primary itself only changes on /new or /clear, but
                     // the reviewer and subagent lanes still follow the saved
                     // config for this session. Auto seats re-pair against the
                     // primary that keeps running.
-                    updated_roster.primary = command_primary.clone();
-                    roster::rebind_auto_review_for_primary(&mut updated_roster, &updated_config);
-                    roster::rebind_auto_subagents_for_primary(&mut updated_roster, &updated_config);
                     let _ = side_ui_event_tx.send(UiEvent::Info(
                         "primary agent changed; start /new or /clear to apply that route"
                             .to_string(),
@@ -3943,6 +3958,25 @@ mod tests {
         assert!(!primary_route_matches(&active, &same_source_new_model));
         assert!(!primary_route_matches(&active, &same_model_new_effort));
         assert!(primary_route_matches(&active, &active));
+    }
+
+    #[test]
+    fn auxiliary_reload_keeps_the_running_primary_when_saved_route_changed() {
+        let active = test_roster_agent("gpt-5-6-terra", "codex-acp");
+        let saved = test_roster_agent("claude-fable-5", "claude-acp");
+        let mut updated = test_roster(saved, vec![active.clone()]);
+
+        assert!(keep_active_primary_for_auxiliary_reload(
+            &active,
+            &mut updated,
+            &Config::default(),
+        ));
+        assert!(primary_route_matches(&updated.primary, &active));
+        assert!(!keep_active_primary_for_auxiliary_reload(
+            &active,
+            &mut updated,
+            &Config::default(),
+        ));
     }
 
     #[test]

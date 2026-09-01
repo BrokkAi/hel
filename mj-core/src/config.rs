@@ -1771,8 +1771,7 @@ impl SavedSessionConfig {
         let Some(origin) = self.origin.as_ref() else {
             return;
         };
-        let mut values =
-            load_saved_session_config(&origin.path, &origin.source_id, origin.seat);
+        let mut values = load_saved_session_config(&origin.path, &origin.source_id, origin.seat);
         for key in &self.excluded {
             values.remove(key);
         }
