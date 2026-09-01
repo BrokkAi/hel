@@ -25,7 +25,7 @@ use hel::hel_session_manager::{
     SessionManagerControl, ViewError, spawn_remote_session_manager, spawn_session_manager,
 };
 use hel::hel_state::{
-    HostContainerSize, MaterializedSession, RecoveryObservation, RecoveryObserver, SessionRecord,
+    HostContainerSize, RecoveryObservation, RecoveryObserver, SessionRecord,
     SessionResourceAllocation, SessionState,
 };
 use hel::hel_targets::{
@@ -44,7 +44,7 @@ use crate::pollers::{
     reserve_recovery_or_cancel, spawn_interrupted_close_recovery,
 };
 
-pub(crate) const PROTOCOL_VERSION: u32 = 4;
+pub(crate) const PROTOCOL_VERSION: u32 = 5;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long a daemon is given to exit after it accepts a stop.
@@ -422,7 +422,6 @@ enum DaemonReply {
     Workspace(WorkspaceRecord),
     Snapshot(WorkspaceSnapshot),
     RuntimeSnapshot(RuntimeSnapshot),
-    MaterializedSession(MaterializedSession),
     RegisteredSession(Box<RegisteredSession>),
     Ordinal(u64),
     Text(String),
@@ -559,7 +558,6 @@ struct ActiveLifecycle {
 #[derive(Debug, Clone)]
 enum DaemonLifecycleResult {
     Done,
-    Materialized(Box<MaterializedSession>),
 }
 
 impl From<LifecycleKind> for RuntimeLifecycleKind {
@@ -1035,9 +1033,6 @@ impl RuntimeState {
         self.remove_completed_lifecycle(&channel);
         match outcome? {
             DaemonLifecycleResult::Done => Ok(()),
-            DaemonLifecycleResult::Materialized(_) => {
-                bail!("daemon create completed with an unexpected projection")
-            }
         }
     }
 
@@ -1091,38 +1086,34 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Resume a session, and return nothing.
+    ///
+    /// This used to answer with the whole `MaterializedSession`. That reply
+    /// travels as one JSON frame against `MAX_FRAME_BYTES`, so a session whose
+    /// projection outgrew 8 MiB could not be resumed at all — it built a
+    /// several-hundred-megabyte buffer and then refused to send it. The
+    /// projection is already durable; a viewer reads it from the store.
     pub(crate) async fn resume_session(
         self: &Arc<Self>,
         request: ResumeSessionRequest,
-    ) -> Result<MaterializedSession> {
+    ) -> Result<()> {
         let session_id = request.session_id.clone();
+        // Whether it is already running is a boolean. Answering it used to
+        // load the entire projection so it could be handed back as the reply.
         let already_running = blocking({
             let session_id = session_id.clone();
             move || {
                 let controller = Controller::load()?;
-                if controller
+                Ok(controller
                     .state
                     .sessions
                     .get(&session_id)
-                    .is_some_and(|session| session.state == SessionState::Running)
-                {
-                    Ok(Some(
-                        hel::hel_database::load_materialized_session(&session_id)?.with_context(
-                            || {
-                                format!(
-                                    "running session {session_id} has no materialized projection"
-                                )
-                            },
-                        )?,
-                    ))
-                } else {
-                    Ok(None)
-                }
+                    .is_some_and(|session| session.state == SessionState::Running))
             }
         })
         .await?;
-        if let Some(materialized) = already_running {
-            return Ok(materialized);
+        if already_running {
+            return Ok(());
         }
         let profile_id = request.profile_id.clone();
         let target_template_id = request.target_template_id.clone();
@@ -1161,7 +1152,11 @@ impl RuntimeState {
                         &executor,
                     )
                     .await?;
-                Ok(DaemonLifecycleResult::Materialized(Box::new(materialized)))
+                // The projection stays where it was written. A viewer reads
+                // it from the store; shipping it back through the daemon
+                // reply put a whole transcript in one IPC frame.
+                let _ = materialized;
+                Ok(DaemonLifecycleResult::Done)
             },
         )?;
         self.set_lifecycle_resume_destination(
@@ -1172,11 +1167,8 @@ impl RuntimeState {
         let channel = result.clone();
         let result = Self::wait_lifecycle_result(result).await;
         self.remove_completed_lifecycle(&channel);
-        let result = result?;
-        match result {
-            DaemonLifecycleResult::Materialized(materialized) => Ok(*materialized),
-            DaemonLifecycleResult::Done => bail!("daemon resume completed without a projection"),
-        }
+        let DaemonLifecycleResult::Done = result?;
+        Ok(())
     }
 
     async fn force_stop_session(self: &Arc<Self>, session_id: String) -> Result<()> {
@@ -2109,12 +2101,9 @@ impl DaemonClient {
         }
     }
 
-    pub(crate) async fn resume_session(
-        &mut self,
-        request: ResumeSessionRequest,
-    ) -> Result<MaterializedSession> {
+    pub(crate) async fn resume_session(&mut self, request: ResumeSessionRequest) -> Result<()> {
         match self.request(DaemonAction::ResumeSession(request)).await? {
-            DaemonReply::MaterializedSession(materialized) => Ok(materialized),
+            DaemonReply::Done => Ok(()),
             reply => bail!("unexpected resume-session reply {reply:?}"),
         }
     }
@@ -3271,9 +3260,10 @@ async fn handle_action(
             state.wait_create_session(&session_id).await?;
             Ok(DaemonReply::Done)
         }
-        DaemonAction::ResumeSession(request) => Ok(DaemonReply::MaterializedSession(
-            state.resume_session(request).await?,
-        )),
+        DaemonAction::ResumeSession(request) => {
+            state.resume_session(request).await?;
+            Ok(DaemonReply::Done)
+        }
         DaemonAction::ForceStopSession { session_id } => {
             state.force_stop_session(session_id).await?;
             Ok(DaemonReply::Done)
@@ -3603,8 +3593,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_four_rejects_a_version_three_client_before_dispatch() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    async fn the_daemon_rejects_a_client_one_protocol_behind_before_dispatch() {
+        assert_eq!(PROTOCOL_VERSION, 5);
         let state = test_runtime_state();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3627,7 +3617,7 @@ mod tests {
         write_frame(
             &mut stream,
             &RequestEnvelope {
-                protocol_version: 3,
+                protocol_version: PROTOCOL_VERSION - 1,
                 request_id: 43,
                 token: metadata.token,
                 action: DaemonAction::PersistReadReceipt {
@@ -3642,12 +3632,10 @@ mod tests {
         .unwrap();
         let response: ResponseEnvelope = read_frame(&mut stream).await.unwrap();
         assert_eq!(response.request_id, 43);
-        assert!(
-            response
-                .result
-                .unwrap_err()
-                .contains("incompatible daemon protocol 3; expected 4")
-        );
+        assert!(response.result.unwrap_err().contains(&format!(
+            "incompatible daemon protocol {}; expected {PROTOCOL_VERSION}",
+            PROTOCOL_VERSION - 1
+        )));
         drop(stream);
         server.await.unwrap();
     }

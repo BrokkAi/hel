@@ -1012,6 +1012,60 @@ impl DashboardContext {
     /// Keeps one projection per session in flight and remembers only the
     /// newest snapshot that arrived behind it. The shared permits bound work
     /// across different sessions as well.
+    /// Fill a freshly resumed conversation from the tail of its stored
+    /// transcript, off the event loop.
+    ///
+    /// The projection is durable the moment the resume completes, so nothing
+    /// has to travel back through the daemon reply to show it. The view keeps
+    /// only the last `TAIL_SEED_ITEMS` entries, so the seed reads exactly that
+    /// many rather than the whole history. The poller delivers the complete
+    /// projection a moment later; this exists so the conversation is not blank
+    /// until it does.
+    pub(super) fn request_transcript_tail_seed(&mut self, session_id: &str) {
+        let session_id = session_id.to_owned();
+        let updates = self.dashboard_io_tx.clone();
+        tokio::spawn(async move {
+            let seeded = tokio::task::spawn_blocking({
+                let session_id = session_id.clone();
+                move || -> anyhow::Result<Option<MaterializedSession>> {
+                    let Some((applied_event_ordinal, applied_event_digest)) =
+                        hel::hel_database::materialized_event_frontier(&session_id)?
+                    else {
+                        return Ok(None);
+                    };
+                    let transcript = hel::hel_database::load_materialized_transcript_tail(
+                        &session_id,
+                        hel::hel_chat::TAIL_SEED_ITEMS,
+                    )?;
+                    let mut materialized = MaterializedSession::empty(session_id);
+                    materialized.applied_event_ordinal = applied_event_ordinal;
+                    materialized.applied_event_digest = applied_event_digest;
+                    materialized.transcript = transcript;
+                    Ok(Some(materialized))
+                }
+            })
+            .await;
+            // A failed seed costs a blank conversation until the next poll,
+            // which is where the full projection comes from anyway. It is not
+            // worth failing a resume that otherwise succeeded.
+            let materialized = match seeded {
+                Ok(Ok(Some(materialized))) => materialized,
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => {
+                    tracing::debug!(%session_id, %error, "transcript tail seed failed");
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(%session_id, %error, "transcript tail seed task failed");
+                    return;
+                }
+            };
+            let _ = updates.send(DashboardIoUpdate::TranscriptTailSeed {
+                materialized: Box::new(materialized),
+            });
+        });
+    }
+
     pub(super) fn request_materialized_projection(
         &mut self,
         materialized: MaterializedSession,
