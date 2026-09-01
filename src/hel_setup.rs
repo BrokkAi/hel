@@ -5,7 +5,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::hel_config::{
     AwsAddressSource, ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, PermissionMode,
@@ -77,15 +77,6 @@ impl RuntimeKind {
             Self::Podman => "Podman",
             Self::Docker => "Docker",
             Self::AppleContainer => "Apple container",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "podman" => Some(Self::Podman),
-            "docker" => Some(Self::Docker),
-            "apple-container" | "container" => Some(Self::AppleContainer),
-            _ => None,
         }
     }
 }
@@ -504,13 +495,6 @@ fn configured_aws_region(executor: &impl CommandExecutor) -> Option<String> {
     (!region.is_empty()).then_some(region)
 }
 
-pub fn recommended_runtime(runtimes: &[RuntimeProbe]) -> Option<RuntimeKind> {
-    runtimes
-        .iter()
-        .find(|runtime| runtime.usable)
-        .map(|runtime| runtime.kind)
-}
-
 pub fn build_config(
     homes: &[DiscoveredHome],
     repository: Option<&GithubRepository>,
@@ -524,6 +508,22 @@ fn build_config_with_runtime(
     homes: &[DiscoveredHome],
     repository: Option<&GithubRepository>,
     runtime: Option<(RuntimeKind, &str)>,
+    aws: Option<&AwsTargetInput>,
+    ssh: Option<&SshTargetInput>,
+) -> HelConfig {
+    build_config_with_runtimes(
+        homes,
+        repository,
+        &runtime.into_iter().collect::<Vec<_>>(),
+        aws,
+        ssh,
+    )
+}
+
+fn build_config_with_runtimes(
+    homes: &[DiscoveredHome],
+    repository: Option<&GithubRepository>,
+    runtimes: &[(RuntimeKind, &str)],
     aws: Option<&AwsTargetInput>,
     ssh: Option<&SshTargetInput>,
 ) -> HelConfig {
@@ -563,7 +563,7 @@ fn build_config_with_runtime(
     config
         .targets
         .insert("localhost".to_owned(), TargetTemplate::LocalBare);
-    if let Some((runtime, image)) = runtime {
+    for (runtime, image) in runtimes {
         let container = ContainerTemplate {
             image: image.trim().to_owned(),
             pull_policy: Default::default(),
@@ -707,8 +707,7 @@ fn run_setup_dialog_inner(
     write_repository(output, discovery.repository.as_ref())?;
     write_runtimes(output, &discovery.runtimes)?;
 
-    let runtime = if let Some(recommended) = recommended_runtime(&discovery.runtimes) {
-        let runtime = select_runtime(input, output, &discovery.runtimes, recommended)?;
+    let runtimes = if discovery.runtimes.iter().any(|runtime| runtime.usable) {
         let image = prompt(
             input,
             output,
@@ -719,44 +718,45 @@ fn run_setup_dialog_inner(
         } else {
             image
         };
-        Some((runtime, image))
+        discovery
+            .runtimes
+            .iter()
+            .filter(|runtime| runtime.usable)
+            .map(|runtime| (runtime.kind, image.clone()))
+            .collect::<Vec<_>>()
     } else {
         writeln!(
             output,
             "No usable container runtime found; raw localhost will still be configured."
         )?;
-        None
+        Vec::new()
     };
     let aws = prompt_aws_target(input, output, discovery.aws.as_ref())?;
-    let runtime_choice = runtime
-        .as_ref()
-        .map(|(runtime, image)| (*runtime, image.as_str()));
+    let runtime_choices = runtimes
+        .iter()
+        .map(|(runtime, image)| (*runtime, image.as_str()))
+        .collect::<Vec<_>>();
     // Build what the earlier answers already claimed, so the SSH step can
     // refuse a target name that would replace one of them.
-    let configured = build_config_with_runtime(
+    let configured = build_config_with_runtimes(
         &discovery.homes,
         discovery.repository.as_ref(),
-        runtime_choice,
+        &runtime_choices,
         aws.as_ref(),
         None,
     );
     let ssh = prompt_ssh_target(input, output, &discovery.ssh_hosts, &configured.targets)?;
-    let config = build_config_with_runtime(
+    let config = build_config_with_runtimes(
         &discovery.homes,
         discovery.repository.as_ref(),
-        runtime_choice,
+        &runtime_choices,
         aws.as_ref(),
         ssh.as_ref(),
     );
     config.validate()?;
 
     writeln!(output)?;
-    write_summary(
-        output,
-        config_path,
-        &config,
-        runtime.as_ref().map(|(kind, _)| *kind),
-    )?;
+    write_summary(output, config_path, &config, &runtimes)?;
     let confirmation = prompt(input, output, "Write this configuration? [y/N]: ")?;
     if !matches!(confirmation.to_ascii_lowercase().as_str(), "y" | "yes") {
         writeln!(output, "Setup cancelled.")?;
@@ -768,13 +768,16 @@ fn run_setup_dialog_inner(
     // A failed smoke test is a fixable prerequisite, not a reason to abandon
     // the run: the configuration is already written, and this is exactly when
     // the closing report's remediations matter most.
-    let smoke_failure = runtime.and_then(|(runtime, image)| {
-        let target = smoke_target(runtime, &image);
-        run_smoke_test(output, &target, smoke_executor)
-            .err()
-            .map(|error| smoke_failure_check(runtime, &image, &error))
-    });
-    write_doctor_report(output, config_path, probe_executor, smoke_failure)?;
+    let smoke_failures = runtimes
+        .iter()
+        .filter_map(|(runtime, image)| {
+            let target = smoke_target(*runtime, image);
+            run_smoke_test(output, &target, smoke_executor)
+                .err()
+                .map(|error| smoke_failure_check(*runtime, image, &error))
+        })
+        .collect();
+    write_doctor_report(output, config_path, probe_executor, smoke_failures)?;
     writeln!(
         output,
         "Advanced users can edit TOML for extra profiles, virtual monorepos, SSH, and AWS."
@@ -847,9 +850,6 @@ fn write_runtimes(output: &mut impl Write, runtimes: &[RuntimeProbe]) -> Result<
         if let Some(remediation) = &runtime.remediation {
             writeln!(output, "    remediation: {remediation}")?;
         }
-    }
-    if let Some(runtime) = recommended_runtime(runtimes) {
-        writeln!(output, "Recommended runtime: {}", runtime.label())?;
     }
     Ok(())
 }
@@ -1067,7 +1067,7 @@ fn write_doctor_report(
     output: &mut impl Write,
     config_path: &Path,
     executor: &impl CommandExecutor,
-    extra: Option<DoctorCheck>,
+    extra: Vec<DoctorCheck>,
 ) -> Result<()> {
     writeln!(output)?;
     writeln!(output, "Running `hel doctor` checks on the new config...")?;
@@ -1088,39 +1088,6 @@ fn write_doctor_report(
         )?;
     }
     Ok(())
-}
-
-fn select_runtime(
-    input: &mut impl SetupPrompter,
-    output: &mut impl Write,
-    runtimes: &[RuntimeProbe],
-    recommended: RuntimeKind,
-) -> Result<RuntimeKind> {
-    let choices = runtimes
-        .iter()
-        .filter(|runtime| runtime.usable)
-        .map(|runtime| runtime.kind.id())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let selected = prompt(
-        input,
-        output,
-        &format!("Runtime ({choices}) [{}]: ", recommended.id()),
-    )?;
-    let selected = if selected.is_empty() {
-        recommended
-    } else {
-        RuntimeKind::parse(&selected).ok_or_else(|| {
-            anyhow::anyhow!("unknown runtime {selected:?}; choose one of: {choices}")
-        })?
-    };
-    if !runtimes
-        .iter()
-        .any(|runtime| runtime.kind == selected && runtime.usable)
-    {
-        bail!("{} is not usable on this machine", selected.label());
-    }
-    Ok(selected)
 }
 
 fn prompt(input: &mut impl SetupPrompter, output: &mut impl Write, label: &str) -> Result<String> {
@@ -1168,7 +1135,7 @@ fn write_summary(
     output: &mut impl Write,
     config_path: &Path,
     config: &HelConfig,
-    runtime: Option<RuntimeKind>,
+    runtimes: &[(RuntimeKind, String)],
 ) -> Result<()> {
     writeln!(output, "Hel will write {} with:", config_path.display())?;
     writeln!(output, "  {} profile(s)", config.profiles.len())?;
@@ -1177,11 +1144,11 @@ fn write_summary(
         output,
         "  raw localhost target using configured harness homes directly"
     )?;
-    if let Some(runtime) = runtime {
+    for (runtime, _) in runtimes {
         let target = config
             .targets
             .get(runtime.id())
-            .expect("selected target exists");
+            .expect("configured runtime target exists");
         let image = match target {
             TargetTemplate::LocalPodman { container }
             | TargetTemplate::LocalDocker { container }
@@ -1307,7 +1274,7 @@ mod tests {
         fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
             self.commands.borrow_mut().push(command.clone());
             if self.outputs.borrow().is_empty() {
-                bail!("no canned output for {}", command.program);
+                anyhow::bail!("no canned output for {}", command.program);
             }
             Ok(self.outputs.borrow_mut().remove(0))
         }
@@ -1577,7 +1544,6 @@ mod tests {
         let runtimes = probe_local_runtimes(&executor, true);
 
         assert_eq!(runtimes.len(), 3);
-        assert_eq!(recommended_runtime(&runtimes), Some(RuntimeKind::Podman));
         assert_eq!(executor.commands.borrow()[0].program, "podman");
         assert_eq!(executor.commands.borrow()[0].args, ["--version"]);
         assert_eq!(
@@ -2021,7 +1987,7 @@ Host builder
     }
 
     #[test]
-    fn dialog_writes_config_runs_smoke_test_and_ends_with_first_session_prompt() {
+    fn dialog_configures_every_usable_runtime_as_a_normal_target() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("config.toml");
         let discovery = SetupDiscovery {
@@ -2034,17 +2000,25 @@ Host builder
                 owner: "BrokkAi".into(),
                 repository: "hel".into(),
             }),
-            runtimes: vec![RuntimeProbe {
-                kind: RuntimeKind::Podman,
-                usable: true,
-                detail: "podman version 5".into(),
-                remediation: None,
-            }],
+            runtimes: vec![
+                RuntimeProbe {
+                    kind: RuntimeKind::Podman,
+                    usable: true,
+                    detail: "podman version 5".into(),
+                    remediation: None,
+                },
+                RuntimeProbe {
+                    kind: RuntimeKind::Docker,
+                    usable: true,
+                    detail: "docker version 29".into(),
+                    remediation: None,
+                },
+            ],
             aws: None,
             ssh_hosts: vec![],
         };
         let executor = FakeExecutor::succeeds();
-        let mut input = b"\n\ny\n".as_slice();
+        let mut input = b"\ny\n".as_slice();
         let mut output = Vec::new();
 
         assert_eq!(
@@ -2060,16 +2034,32 @@ Host builder
             SetupOutcome::Written
         );
         assert!(config_path.exists());
+        let config = HelConfig::load_from(&config_path).unwrap();
+        assert!(matches!(
+            config.targets["podman"],
+            TargetTemplate::LocalPodman { .. }
+        ));
+        assert!(matches!(
+            config.targets["docker"],
+            TargetTemplate::LocalDocker { .. }
+        ));
         let smoke = executor.commands.borrow()[..3]
             .iter()
             .map(|command| command.args[0].clone())
             .collect::<Vec<_>>();
         assert_eq!(smoke, ["run", "exec", "rm"]);
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .ends_with("Press n to start your first session.\n")
-        );
+        let commands = executor.commands.borrow();
+        assert!(commands.len() >= 6);
+        assert_eq!(commands[3].program, "sh");
+        assert_eq!(commands[4].program, "docker");
+        assert_eq!(commands[5].program, "sh");
+        drop(commands);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Podman target using"), "{output}");
+        assert!(output.contains("Docker target using"), "{output}");
+        assert!(!output.contains("Recommended runtime"), "{output}");
+        assert!(!output.contains("Runtime ("), "{output}");
+        assert!(output.ends_with("Press n to start your first session.\n"));
     }
 
     #[test]
@@ -2090,7 +2080,7 @@ Host builder
             commands: RefCell::new(vec![]),
             statuses: vec![0, 1, 0],
         };
-        let mut input = b"\n\ny\n".as_slice();
+        let mut input = b"\ny\n".as_slice();
         let mut output = Vec::new();
 
         let outcome = run_setup_dialog_with(

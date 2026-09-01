@@ -13,16 +13,14 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
+use crate::hel_config::HelConfig;
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_selection::{FrameSurfaces, SelectionRange, SurfaceFrame, SurfaceId};
 use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionView, ReviewerAction, ReviewerOutcome,
     SessionManagerControl, ViewError, new_command_id,
 };
-use crate::hel_state::{
-    MaterializedSession, RecoveryCheckpointPhase, RecoveryContext, TranscriptItem,
-    config_command_text,
-};
+use crate::hel_state::{MaterializedSession, SessionRecord, TranscriptItem, config_command_text};
 use crate::hel_transcript::ChatEntry;
 use crate::hel_worker::WorkerPhase;
 
@@ -41,8 +39,8 @@ use super::second_opinion::{
 };
 use super::transcript::{ToolDiffstatRequest, materialized_prefix_entries, render_transcript};
 use super::{
-    ChatAction, ChatEventOutcome, ChatRegions, ChatState, MOUSE_SCROLL_ROWS, Notices,
-    SessionHeaderIdentity, queued_prompt_preview,
+    ChatAction, ChatEventOutcome, ChatRegions, ChatSessionContext, ChatState, MOUSE_SCROLL_ROWS,
+    Notices, SessionHeaderIdentity, queued_prompt_preview,
 };
 
 /// Durable chat-side state that a host process must ask the daemon to store.
@@ -399,7 +397,7 @@ pub struct ActiveChat {
     state: ChatState,
     session: ManagedSessionHandle,
     session_manager: SessionManagerControl,
-    recovery: Option<RecoveryContext>,
+    context: Option<ChatSessionContext>,
     remote: ChatRemoteSupervisor,
     /// Held so the receiver never reports the feed closed, and so spawned
     /// clipboard and history tasks have somewhere to report.
@@ -460,14 +458,14 @@ impl ActiveChat {
     pub fn open(
         session: ManagedSessionHandle,
         bundle_id: &str,
-        recovery: Option<RecoveryContext>,
+        context: Option<ChatSessionContext>,
         control: SessionManagerControl,
         header: SessionHeaderIdentity,
         draft: String,
         notices: Notices,
     ) -> Self {
         Self::open_with_persistence(
-            session, bundle_id, recovery, control, header, draft, notices, None,
+            session, bundle_id, context, control, header, draft, notices, None,
         )
     }
 
@@ -476,7 +474,7 @@ impl ActiveChat {
     pub fn open_with_persistence(
         session: ManagedSessionHandle,
         bundle_id: &str,
-        recovery: Option<RecoveryContext>,
+        context: Option<ChatSessionContext>,
         control: SessionManagerControl,
         header: SessionHeaderIdentity,
         draft: String,
@@ -503,11 +501,10 @@ impl ActiveChat {
                     .as_ref()
                     .map_or(&[][..], |snapshot| &snapshot.operational.available_commands),
             );
-            if let Some(harness_kind) = header.harness_kind.or_else(|| {
-                recovery
-                    .as_ref()
-                    .map(|recovery| recovery.session.harness_kind)
-            }) {
+            if let Some(harness_kind) = header
+                .harness_kind
+                .or_else(|| context.as_ref().map(|context| context.session.harness_kind))
+            {
                 state.set_harness_kind(harness_kind);
             }
             state.set_session_modes(
@@ -558,12 +555,6 @@ impl ActiveChat {
         if let Some(pending) = pending_prefix {
             spawn_transcript_prefix(pending, 1, chat_io_tx.clone());
         }
-        if let Some(detail) = recovery
-            .as_ref()
-            .and_then(|recovery| recovery.session.last_checkpoint_error.as_deref())
-        {
-            state.set_notice(format!("Recovery copy failed: {detail}"));
-        }
         let (voice_updates_tx, voice_updates_rx) =
             tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
         let remote = ChatRemoteSupervisor::spawn(session.clone(), control.clone());
@@ -571,6 +562,15 @@ impl ActiveChat {
             state.set_transcript_loading(true);
             state.set_notice("Connecting to session relay…");
             queue_chat_remote_operation(remote.operations(), ChatRemoteOperation::Sync, &mut state);
+        }
+        // Raised after the connection notice, because a notice is a single
+        // slot: a cold open would otherwise replace the failure the user has
+        // to see with "Connecting to session relay…".
+        if let Some(detail) = context
+            .as_ref()
+            .and_then(|context| context.session.last_checkpoint_error.as_deref())
+        {
+            state.set_notice(format!("Recovery copy failed: {detail}"));
         }
         let mut diffstats_in_flight = 0;
         dispatch_diffstat_requests(&mut state, &chat_io_tx, &mut diffstats_in_flight);
@@ -617,9 +617,9 @@ impl ActiveChat {
                 );
             }
         }
-        let workspace_id = recovery
+        let workspace_id = context
             .as_ref()
-            .map(|recovery| recovery.session.workspace_id.clone())
+            .map(|context| context.session.workspace_id.clone())
             .unwrap_or_default();
         let turn_review_settings = crate::hel_database::turn_review_settings(&workspace_id)
             .unwrap_or_else(|error| {
@@ -638,7 +638,7 @@ impl ActiveChat {
             state,
             session,
             session_manager: control,
-            recovery,
+            context,
             remote,
             chat_io_tx,
             chat_io_rx,
@@ -706,6 +706,25 @@ impl ActiveChat {
         self.session_feed_expected = expected;
         if expected && !self.session_open {
             self.begin_session_reconnect();
+        }
+    }
+
+    /// Takes the surface's newer view of the config and this session's record,
+    /// so a chat that stays open across a config reload offers the profiles
+    /// that are configured now rather than the ones that were configured when
+    /// it opened.
+    ///
+    /// A record the daemon no longer publishes leaves the open-time copy in
+    /// place: the fields the chat reads from it are fixed for a session's life,
+    /// and a session that disappears from the list is not a reason to lose
+    /// them. A chat opened without a context stays without one.
+    pub fn refresh_context(&mut self, config: &HelConfig, session: Option<&SessionRecord>) {
+        let Some(context) = self.context.as_mut() else {
+            return;
+        };
+        context.config = config.clone();
+        if let Some(session) = session.filter(|session| session.id == context.session.id) {
+            context.session = session.clone();
         }
     }
 
@@ -993,15 +1012,15 @@ impl ActiveChat {
     /// Starts one reviewing role's harness, asking the user which harness
     /// reviews when the workspace has not chosen one yet.
     fn start_review_role(&mut self, role: String, fresh: bool) {
-        let Some(recovery) = self.recovery.as_ref() else {
+        let Some(context) = self.context.as_ref() else {
             self.fail_turn_review("this session cannot start a reviewer");
             return;
         };
-        let workspace_id = recovery.session.workspace_id.clone();
+        let workspace_id = context.session.workspace_id.clone();
         let defaults = crate::hel_database::reviewer_defaults().unwrap_or_default();
         // A remembered profile that is no longer configured is not carried
         // forward; the waterfall asks again instead.
-        let configured = recovery.config.profiles.clone();
+        let configured = context.config.profiles.clone();
         let remembered = defaults
             .profile(&workspace_id)
             .filter(|id| configured.contains_key(*id))
@@ -1055,20 +1074,11 @@ impl ActiveChat {
         effort: Option<String>,
         fresh: bool,
     ) {
-        let Some(recovery) = self.recovery.as_ref() else {
+        let Some(context) = self.context.as_ref() else {
             self.fail_turn_review("this session cannot start a reviewer");
             return;
         };
-        let controller = crate::hel_controller::Controller {
-            config: recovery.config.clone(),
-            state: crate::hel_state::HelState {
-                sessions: std::collections::BTreeMap::from([(
-                    recovery.session.id.clone(),
-                    recovery.session.clone(),
-                )]),
-                ..crate::hel_state::HelState::default()
-            },
-        };
+        let controller = reviewer_staging_controller(context);
         let session_id = self.session.session_id().to_owned();
         let session = self.session.clone();
         let updates = self.chat_io_tx.clone();
@@ -1146,10 +1156,10 @@ impl ActiveChat {
     /// the same list plan review offers, so a workspace's remembered reviewer
     /// serves both.
     fn reviewer_profiles(&self) -> Vec<ReviewerProfileChoice> {
-        let Some(recovery) = self.recovery.as_ref() else {
+        let Some(context) = self.context.as_ref() else {
             return Vec::new();
         };
-        recovery
+        context
             .config
             .profiles
             .iter()
@@ -1249,9 +1259,9 @@ impl ActiveChat {
     /// Turns auto-review on or off for this session's workspace.
     fn set_turn_review_settings(&mut self, settings: crate::hel_database::TurnReviewSettings) {
         let Some(workspace_id) = self
-            .recovery
+            .context
             .as_ref()
-            .map(|recovery| recovery.session.workspace_id.clone())
+            .map(|context| context.session.workspace_id.clone())
         else {
             return;
         };
@@ -1350,14 +1360,14 @@ impl ActiveChat {
                 model,
                 effort,
             } => {
-                if let Some(recovery) = self.recovery.as_ref() {
+                if let Some(context) = self.context.as_ref() {
                     let selection = ReviewerSelection {
                         profile_id: profile_id.clone(),
                         model: model.clone(),
                         effort: effort.clone(),
                     };
                     self.remember_reviewer_selection(
-                        recovery.session.workspace_id.clone(),
+                        context.session.workspace_id.clone(),
                         selection,
                     );
                 }
@@ -1857,21 +1867,13 @@ impl ActiveChat {
         request: crate::hel_elicitation::ElicitationRequest,
         proposal: String,
     ) {
-        let Some(recovery) = self.recovery.as_ref() else {
+        let Some(context) = self.context.as_ref() else {
             self.state
                 .set_notice("A second opinion needs this session's configuration");
             self.state.restore_elicitation(request);
             return;
         };
-        let profiles = recovery
-            .config
-            .profiles
-            .iter()
-            .map(|(id, profile)| ReviewerProfileChoice {
-                id: id.clone(),
-                harness: profile.kind.id().to_owned(),
-            })
-            .collect::<Vec<_>>();
+        let profiles = self.reviewer_profiles();
         if profiles.is_empty() {
             self.state
                 .set_notice("Configure a second profile to review plans with");
@@ -1882,13 +1884,13 @@ impl ActiveChat {
             tracing::debug!(%error, "could not read remembered reviewer choices");
             ReviewerDefaults::default()
         });
-        let workspace_id = recovery.session.workspace_id.clone();
+        let workspace_id = context.session.workspace_id.clone();
         // A workspace that has already chosen a reviewer does not choose
         // again: the same reviewer resumes with its own conversation. The
         // waterfall reopens only when starting it that way fails.
         let remembered = defaults
             .profile(&workspace_id)
-            .filter(|id| recovery.config.profiles.contains_key(*id))
+            .filter(|id| context.config.profiles.contains_key(*id))
             .map(|profile_id| ReviewerSelection {
                 profile_id: profile_id.to_owned(),
                 model: remembered_value(defaults.model(&workspace_id, profile_id)),
@@ -2023,19 +2025,10 @@ impl ActiveChat {
         effort: Option<String>,
         configuring: bool,
     ) {
-        let Some(recovery) = self.recovery.as_ref() else {
+        let Some(context) = self.context.as_ref() else {
             return;
         };
-        let controller = crate::hel_controller::Controller {
-            config: recovery.config.clone(),
-            state: crate::hel_state::HelState {
-                sessions: std::collections::BTreeMap::from([(
-                    recovery.session.id.clone(),
-                    recovery.session.clone(),
-                )]),
-                ..crate::hel_state::HelState::default()
-            },
-        };
+        let controller = reviewer_staging_controller(context);
         let session_id = self.session.session_id().to_owned();
         let session = self.session.clone();
         let updates = self.chat_io_tx.clone();
@@ -2091,7 +2084,7 @@ impl ActiveChat {
             return;
         };
         let captured = view.captured().clone();
-        if let Some(recovery) = self.recovery.as_ref() {
+        if let Some(context) = self.context.as_ref() {
             let selection = ReviewerSelection {
                 profile_id,
                 model,
@@ -2100,14 +2093,14 @@ impl ActiveChat {
             if let Some(persistence) = &self.persistence {
                 if let Err(error) =
                     persistence.send(ChatPersistenceRequest::RememberReviewerSelection {
-                        workspace_id: recovery.session.workspace_id.clone(),
+                        workspace_id: context.session.workspace_id.clone(),
                         selection,
                     })
                 {
                     tracing::warn!(%error, "could not queue the reviewer choice for persistence");
                 }
             } else if let Err(error) = crate::hel_database::remember_reviewer_selection(
-                &recovery.session.workspace_id,
+                &context.session.workspace_id,
                 &selection,
             ) {
                 tracing::debug!(%error, "could not remember the reviewer choice");
@@ -2588,7 +2581,6 @@ impl ActiveChat {
         prompt_focused: bool,
         transcript_selected: bool,
     ) {
-        self.state.recovery_phase = self.recovery_phase();
         render_in(
             frame,
             &mut self.state,
@@ -2646,23 +2638,21 @@ impl ActiveChat {
             _ => {}
         }
     }
+}
 
-    fn recovery_phase(&self) -> Option<RecoveryCheckpointPhase> {
-        self.recovery.as_ref().and_then(RecoveryContext::phase)
-    }
-
-    /// Whether the checkpoint title on screen is stale.
-    pub fn recovery_title_is_stale(&self) -> bool {
-        self.recovery_phase() != self.state.recovery_phase
-    }
-
-    /// Whether a clock tick has anything to redraw for: a running turn in the
-    /// header, whose clock counts up once a second, or a checkpoint title that
-    /// has gone stale.
-    pub fn needs_clock_tick(&self) -> bool {
-        self.recovery_title_is_stale()
-            || self.state.turn_started_at_epoch_seconds.is_some()
-            || !self.state.active_agent_terminals.is_empty()
+/// The one-session controller a reviewer is staged through. Staging reads only
+/// the profiles the reviewer may run under and the record of the session being
+/// reviewed, so the chat builds a controller holding just those.
+fn reviewer_staging_controller(context: &ChatSessionContext) -> crate::hel_controller::Controller {
+    crate::hel_controller::Controller {
+        config: context.config.clone(),
+        state: crate::hel_state::HelState {
+            sessions: std::collections::BTreeMap::from([(
+                context.session.id.clone(),
+                context.session.clone(),
+            )]),
+            ..crate::hel_state::HelState::default()
+        },
     }
 }
 
@@ -3043,43 +3033,28 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
     if chat.fast_mode_active() {
         parts.push("Fast".into());
     }
-    if let Some(recovery_phase) = chat.recovery_phase {
-        parts.push(
-            match recovery_phase {
-                RecoveryCheckpointPhase::Prestaging => "Preparing checkpoint…",
-                RecoveryCheckpointPhase::Snapshotting => "Snapshotting checkpoint…",
-                RecoveryCheckpointPhase::Saving => "Saving checkpoint…",
-            }
-            .into(),
-        );
-        if queued > 0 {
-            parts.push(format!("{queued} queued"));
-        }
+    if chat.plan_mode_active() {
+        parts.push("Prompt — PLAN MODE".into());
     } else {
-        if chat.plan_mode_active() {
-            parts.push("Prompt — PLAN MODE".into());
-        } else {
-            match chat.phase {
-                WorkerPhase::Idle => parts.push("Prompt".into()),
-                WorkerPhase::Running if chat.pursuing_goal() => parts.push("Pursuing goal".into()),
-                WorkerPhase::Running => parts.push("Running".into()),
-                WorkerPhase::Closing => parts.push("Closing".into()),
-                WorkerPhase::Closed => parts.push("Closed".into()),
-            }
+        match chat.phase {
+            WorkerPhase::Idle => parts.push("Prompt".into()),
+            WorkerPhase::Running if chat.pursuing_goal() => parts.push("Pursuing goal".into()),
+            WorkerPhase::Running => parts.push("Running".into()),
+            WorkerPhase::Closing => parts.push("Closing".into()),
+            WorkerPhase::Closed => parts.push("Closed".into()),
         }
-        if queued > 0 {
-            parts.push(format!("{queued} queued"));
-        }
-        if chat.phase == WorkerPhase::Running {
-            parts.push("Esc cancels".into());
-        }
-        // Auto-review changes what happens when this turn ends, so the
-        // composer says it is armed rather than surprising the user with a
-        // pane.
-        let review = chat.turn_review_settings();
-        if review.auto_review {
-            parts.push(format!("review {}", review.tier.label()));
-        }
+    }
+    if queued > 0 {
+        parts.push(format!("{queued} queued"));
+    }
+    if chat.phase == WorkerPhase::Running {
+        parts.push("Esc cancels".into());
+    }
+    // Auto-review changes what happens when this turn ends, so the composer
+    // says it is armed rather than surprising the user with a pane.
+    let review = chat.turn_review_settings();
+    if review.auto_review {
+        parts.push(format!("review {}", review.tier.label()));
     }
     format!(" {} ", parts.join(" · "))
 }
@@ -3470,6 +3445,309 @@ mod tests {
         );
     }
 
+    /// A workspace id no configuration uses, so the per-workspace rows the
+    /// constructor reads are simply absent and it falls back to its defaults —
+    /// the same tolerance the other open tests rely on.
+    const CONTEXT_TEST_WORKSPACE: &str = "workspace-for-chat-session-context-tests";
+
+    fn context_session_record(id: &str, workspace_id: &str) -> SessionRecord {
+        SessionRecord {
+            id: id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            title: "work".into(),
+            harness_kind: crate::hel_config::HarnessKind::Codex,
+            last_profile: "codex-1".into(),
+            bundle_id: "bundle-1".into(),
+            project_directory: None,
+            managed_worktree: None,
+            target_template_id: "podman".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            container_cpus: None,
+            container_memory: None,
+            state: crate::hel_state::SessionState::Running,
+            archived: false,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-08-09T12:00:00Z".into(),
+            updated_at: "2026-08-09T12:01:00Z".into(),
+            viewed_through_event_ordinal: 0,
+            draft_input: String::new(),
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        }
+    }
+
+    fn config_with_profiles(profiles: &[(&str, crate::hel_config::HarnessKind)]) -> HelConfig {
+        HelConfig {
+            profiles: profiles
+                .iter()
+                .map(|(id, kind)| {
+                    (
+                        (*id).to_owned(),
+                        crate::hel_config::HarnessProfile {
+                            kind: *kind,
+                            home: std::path::PathBuf::from("/profiles").join(id),
+                            executable: None,
+                            environment: BTreeMap::new(),
+                            context_window_bytes: None,
+                        },
+                    )
+                })
+                .collect(),
+            ..HelConfig::default()
+        }
+    }
+
+    fn chat_context(
+        session_id: &str,
+        profiles: &[(&str, crate::hel_config::HarnessKind)],
+    ) -> ChatSessionContext {
+        ChatSessionContext {
+            config: config_with_profiles(profiles),
+            session: context_session_record(session_id, CONTEXT_TEST_WORKSPACE),
+        }
+    }
+
+    /// The reviewer waterfall offers what the session's own configuration
+    /// holds. A chat opened without that context offers nothing, which leaves
+    /// `/review` and the second opinion with no harness to run.
+    #[tokio::test]
+    async fn reviewer_profiles_lists_the_context_profiles_for_the_waterfall() {
+        use crate::hel_config::HarnessKind;
+
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-profiles", 80);
+        let chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            Some(chat_context(
+                "session-profiles",
+                &[
+                    ("codex-1", HarnessKind::Codex),
+                    ("claude-1", HarnessKind::Claude),
+                ],
+            )),
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+        );
+
+        let offered = chat
+            .reviewer_profiles()
+            .into_iter()
+            .map(|choice| (choice.id, choice.harness))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            offered,
+            vec![
+                ("claude-1".to_owned(), "claude".to_owned()),
+                ("codex-1".to_owned(), "codex".to_owned()),
+            ]
+        );
+    }
+
+    /// A failed recovery copy is the one thing the user has to see on opening
+    /// the session, so it is raised after the connection notice a cold open
+    /// also sets: a notice is a single slot, and the last write wins.
+    #[tokio::test]
+    async fn a_recorded_checkpoint_error_reaches_the_notice_when_the_chat_opens() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-checkpoint", 81);
+        let mut context = chat_context("session-checkpoint", &[]);
+        context.session.last_checkpoint_error = Some("the target ran out of disk".into());
+
+        let chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            Some(context),
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+        );
+
+        assert_eq!(
+            chat.state.notice().as_deref(),
+            Some("Recovery copy failed: the target ran out of disk")
+        );
+    }
+
+    /// Auto-review is remembered per workspace, and the database refuses an
+    /// empty workspace id, so a chat that does not know its session's record
+    /// saved nothing at all.
+    #[tokio::test]
+    async fn changing_turn_review_settings_persists_under_the_sessions_workspace() {
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-settings", 82);
+        let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut chat = ActiveChat::open_with_persistence(
+            fixture.stopped,
+            "bundle-1",
+            Some(chat_context("session-settings", &[])),
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+            Some(persistence_tx),
+        );
+
+        chat.set_turn_review_settings(crate::hel_database::TurnReviewSettings {
+            auto_review: true,
+            tier: crate::hel_review::lanes::ReviewTier::Quick,
+        });
+
+        match persistence_rx.try_recv() {
+            Ok(ChatPersistenceRequest::SaveTurnReviewSettings {
+                workspace_id,
+                settings,
+            }) => {
+                assert_eq!(workspace_id, CONTEXT_TEST_WORKSPACE);
+                assert!(settings.auto_review);
+            }
+            other => panic!("the settings are saved under the session's workspace, got {other:?}"),
+        }
+    }
+
+    /// A captured plan opens the waterfall over the profiles the context
+    /// holds, and says so plainly when the context holds none.
+    #[tokio::test]
+    async fn a_second_opinion_opens_the_reviewer_waterfall_from_the_context() {
+        use crate::hel_config::HarnessKind;
+
+        let request = ElicitationRequest {
+            id: "plan-1".into(),
+            message: "may I run this plan?".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+        };
+
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-opinion", 83);
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            Some(chat_context(
+                "session-opinion",
+                &[("claude-1", HarnessKind::Claude)],
+            )),
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+        );
+
+        chat.open_second_opinion(request.clone(), "the plan".into());
+
+        let Some(SecondOpinion::Setup { setup, .. }) = chat.state.second_opinion() else {
+            panic!("a captured plan opens the reviewer waterfall");
+        };
+        assert_eq!(
+            setup
+                .profiles()
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude-1"]
+        );
+
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-alone", 84);
+        let mut alone = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            Some(chat_context("session-alone", &[])),
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+        );
+
+        alone.open_second_opinion(request, "the plan".into());
+
+        assert!(alone.state.second_opinion().is_none());
+        assert_eq!(
+            alone.state.notice().as_deref(),
+            Some("Configure a second profile to review plans with")
+        );
+    }
+
+    /// The chat snapshots the configuration when it opens, so a reload has to
+    /// be handed to it; otherwise a long-lived conversation goes on offering
+    /// the profiles that existed when it was opened.
+    #[tokio::test]
+    async fn a_refreshed_config_changes_the_offered_reviewer_profiles() {
+        use crate::hel_config::HarnessKind;
+
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-refresh", 85);
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            Some(chat_context(
+                "session-refresh",
+                &[("codex-1", HarnessKind::Codex)],
+            )),
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+        );
+        assert_eq!(chat.reviewer_profiles().len(), 1);
+
+        let reloaded = config_with_profiles(&[
+            ("codex-1", HarnessKind::Codex),
+            ("claude-1", HarnessKind::Claude),
+        ]);
+        let moved = context_session_record("session-refresh", "workspace-moved");
+        chat.refresh_context(&reloaded, Some(&moved));
+
+        assert_eq!(
+            chat.reviewer_profiles()
+                .into_iter()
+                .map(|choice| choice.id)
+                .collect::<Vec<_>>(),
+            vec!["claude-1".to_owned(), "codex-1".to_owned()]
+        );
+        assert_eq!(
+            chat.context
+                .as_ref()
+                .map(|context| context.session.workspace_id.as_str()),
+            Some("workspace-moved")
+        );
+
+        // Another session's record is not this session's, so it is ignored.
+        let other = context_session_record("session-other", "workspace-other");
+        chat.refresh_context(&reloaded, Some(&other));
+        assert_eq!(
+            chat.context
+                .as_ref()
+                .map(|context| context.session.workspace_id.as_str()),
+            Some("workspace-moved")
+        );
+
+        // A chat opened without a context has nothing to refresh.
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-bare", 86);
+        let mut bare = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            None,
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+        );
+        bare.refresh_context(&reloaded, None);
+        assert!(bare.reviewer_profiles().is_empty());
+    }
+
     #[tokio::test]
     async fn an_active_runtime_record_rearms_a_chat_after_its_handoff_timed_out() {
         let fixture =
@@ -3638,21 +3916,6 @@ mod tests {
         chat.phase = WorkerPhase::Running;
 
         assert!(prompt_title(&chat, 0).contains("Prompt — PLAN MODE"));
-    }
-
-    #[test]
-    fn composer_title_distinguishes_blocking_checkpoint_capture_from_background_save() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.recovery_phase = Some(RecoveryCheckpointPhase::Prestaging);
-        assert!(prompt_title(&chat, 0).contains("Preparing checkpoint…"));
-
-        chat.recovery_phase = Some(RecoveryCheckpointPhase::Snapshotting);
-        assert!(prompt_title(&chat, 2).contains("Snapshotting checkpoint…"));
-        assert!(prompt_title(&chat, 2).contains("2 queued"));
-
-        chat.recovery_phase = Some(RecoveryCheckpointPhase::Saving);
-        assert!(prompt_title(&chat, 0).contains("Saving checkpoint…"));
-        assert!(!prompt_title(&chat, 0).contains("queued"));
     }
 
     #[test]
