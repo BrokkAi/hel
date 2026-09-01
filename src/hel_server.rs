@@ -22,7 +22,7 @@ use axum::http::{HeaderMap, Response, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
@@ -49,6 +49,14 @@ const MAX_PROMPT_CHARS: usize = 64 * 1024;
 /// How many repositories one dirty-worktree acknowledgement may name. A bundle
 /// with more repositories than this than has bigger problems than the phone.
 const MAX_DIRTY_ACKNOWLEDGEMENTS: usize = 32;
+/// The largest draft a phone may store. A composer is for a prompt, and a
+/// prompt this size has other problems; the bound exists so one viewer cannot
+/// fill the daemon's database with text it never sent.
+const MAX_DRAFT_BYTES: usize = 64 * 1024;
+/// How many prompt-history matches one search returns. Public because the
+/// controller loop performs the search and must use the same bound the phone
+/// was promised.
+pub const MAX_HISTORY_MATCHES: usize = 40;
 /// Image prompts need far more room than any other phone request. Browser
 /// uploads are base64-encoded, so two ordinary photographs already exceed the
 /// general body limit even when each one fits it. The larger bound therefore
@@ -59,6 +67,14 @@ const COOKIE_KEY_FILE: &str = "phone-cookie-key";
 
 /// Where the phone cookie signing key lives: beside Hel's other private
 /// controller state, never in the shared config directory.
+/// How long stored viewer state outlives its last use.
+///
+/// It matches the session cookie's own lifetime: state keyed to an identity
+/// that can no longer authenticate has nothing left to belong to.
+pub const fn default_session_ttl() -> Duration {
+    DEFAULT_SESSION_TTL
+}
+
 pub fn cookie_key_path() -> PathBuf {
     crate::hel_config::data_dir().join(COOKIE_KEY_FILE)
 }
@@ -106,6 +122,7 @@ pub struct ServerOptions {
     pub action_tx: mpsc::Sender<ControllerRequest>,
     pub receipt_tx: mpsc::Sender<ReadReceiptRequest>,
     pub preflight_tx: mpsc::Sender<PreflightRequest>,
+    pub client_state_tx: mpsc::Sender<ClientStateRequest>,
     pub shutdown: CancellationToken,
     pub session_ttl: Duration,
     /// Keep this enabled for direct HTTPS or an HTTPS reverse proxy. It may be
@@ -125,6 +142,7 @@ impl ServerOptions {
         action_tx: mpsc::Sender<ControllerRequest>,
         receipt_tx: mpsc::Sender<ReadReceiptRequest>,
         preflight_tx: mpsc::Sender<PreflightRequest>,
+        client_state_tx: mpsc::Sender<ClientStateRequest>,
     ) -> AnyResult<Self> {
         Ok(Self {
             bind,
@@ -133,6 +151,7 @@ impl ServerOptions {
             action_tx,
             receipt_tx,
             preflight_tx,
+            client_state_tx,
             shutdown: CancellationToken::new(),
             session_ttl: DEFAULT_SESSION_TTL,
             secure_cookie: true,
@@ -913,6 +932,54 @@ pub struct PreflightNew {
     pub dirty_repositories: Vec<String>,
 }
 
+/// What a phone asks about, or stores against, its own identity.
+///
+/// These travel on their own channel rather than as actions, for the reason a
+/// read receipt does: they are frequent, they start nothing, and routing them
+/// through the action pipeline would consume the session's single action slot
+/// and reload the controller on every keystroke.
+#[derive(Debug)]
+pub enum ClientStateRequest {
+    Read {
+        client_id: String,
+        session_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<ViewerClientState, String>>,
+    },
+    SaveDraft {
+        client_id: String,
+        session_id: String,
+        draft: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    MarkWorkspaceRead {
+        client_id: String,
+        workspace_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    History {
+        session_id: String,
+        query: String,
+        scope: String,
+        reply: tokio::sync::oneshot::Sender<Result<ViewerPromptHistory, String>>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerClientState {
+    pub draft: String,
+    pub through_event_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerPromptHistory {
+    pub entries: Vec<String>,
+    /// Whether the search stopped before it ran out of history, so a phone can
+    /// say the answer is partial rather than presenting it as complete.
+    pub truncated: bool,
+}
+
 #[derive(Debug)]
 pub struct ReadReceiptRequest {
     pub client_id: String,
@@ -928,6 +995,7 @@ struct ServerState {
     action_tx: mpsc::Sender<ControllerRequest>,
     receipt_tx: mpsc::Sender<ReadReceiptRequest>,
     preflight_tx: mpsc::Sender<PreflightRequest>,
+    client_state_tx: mpsc::Sender<ClientStateRequest>,
     viewer_code: Arc<str>,
     login_token: Arc<str>,
     cookie_key: Arc<[u8]>,
@@ -994,6 +1062,7 @@ fn router(options: ServerOptions) -> Router {
         action_tx: options.action_tx,
         receipt_tx: options.receipt_tx,
         preflight_tx: options.preflight_tx,
+        client_state_tx: options.client_state_tx,
         viewer_code: options.viewer_code.into(),
         login_token: options.login_token.into(),
         cookie_key: options.cookie_key.into(),
@@ -1010,6 +1079,16 @@ fn router(options: ServerOptions) -> Router {
         )
         .route("/api/events", get(events))
         .route("/api/preflight/new", post(preflight_new))
+        .route("/api/sessions/{session_id}/client-state", get(client_state))
+        .route(
+            "/api/sessions/{session_id}/draft",
+            put(save_draft).layer(DefaultBodyLimit::max(MAX_DRAFT_BYTES)),
+        )
+        .route("/api/sessions/{session_id}/history", get(prompt_history))
+        .route(
+            "/api/workspaces/{workspace_id}/read",
+            post(mark_workspace_read),
+        )
         .route(
             "/api/actions",
             post(action).layer(DefaultBodyLimit::max(MAX_PROMPT_BODY_BYTES)),
@@ -1117,6 +1196,9 @@ fn issue_session_cookie(
     };
     let value = signed_cookie_value(
         &state.cookie_key,
+        &generate_viewer_id().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cookie creation failed")
+        })?,
         now_unix().saturating_add(validity.as_secs()),
     );
     let cookie = session_cookie_header(
@@ -1211,15 +1293,11 @@ async fn mark_conversation_read(
     validate_public_id(&session_id)?;
     require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
     let (reply, result) = tokio::sync::oneshot::channel();
-    let cookie = headers
-        .get(COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|header| cookie_value(header, COOKIE_NAME))
-        .ok_or_else(ApiError::unauthorized)?;
+    let client_id = viewer_client_id(&state, &headers).ok_or_else(ApiError::unauthorized)?;
     state
         .receipt_tx
         .send(ReadReceiptRequest {
-            client_id: format!("phone:{cookie}"),
+            client_id,
             session_id,
             through: request.through,
             reply,
@@ -1290,6 +1368,145 @@ async fn preflight_new(
                 "the controller could not check this project",
             )
         })
+}
+
+/// Ask the state channel one thing and wait for its answer.
+async fn ask_client_state<T>(
+    state: &ServerState,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> ClientStateRequest,
+) -> Result<T, ApiError> {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    state
+        .client_state_tx
+        .send(build(reply))
+        .await
+        .map_err(|_| ApiError::controller_unavailable())?;
+    answer
+        .await
+        .map_err(|_| ApiError::controller_unavailable())?
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the controller could not reach stored viewer state",
+            )
+        })
+}
+
+/// This viewer's draft and read frontier for one session.
+async fn client_state(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ViewerClientState>, ApiError> {
+    validate_public_id(&session_id)?;
+    require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
+    // A viewer with a legacy cookie has no identity and so has nothing stored.
+    // Answering with an empty state is the truth, and is what lets an older
+    // phone keep working through a deployment.
+    let Some(client_id) = viewer_client_id(&state, &headers) else {
+        return Ok(Json(ViewerClientState::default()));
+    };
+    ask_client_state(&state, |reply| ClientStateRequest::Read {
+        client_id,
+        session_id,
+        reply,
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftRequest {
+    draft: String,
+}
+
+async fn save_draft(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DraftRequest>,
+) -> Result<StatusCode, ApiError> {
+    validate_public_id(&session_id)?;
+    require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
+    if request.draft.len() > MAX_DRAFT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "draft must be 65536 bytes or fewer",
+        ));
+    }
+    let Some(client_id) = viewer_client_id(&state, &headers) else {
+        // Nothing to key it to. The phone keeps its draft in the composer, and
+        // silently accepting would promise a persistence that is not there.
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "this viewer has no stored identity; unlock again to keep drafts",
+        ));
+    };
+    ask_client_state(&state, |reply| ClientStateRequest::SaveDraft {
+        client_id,
+        session_id,
+        draft: request.draft,
+        reply,
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Mark every session in a workspace read, in one request.
+///
+/// Opening a workspace should not cost one request per session.
+async fn mark_workspace_read(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    validate_public_id(&workspace_id)?;
+    let Some(client_id) = viewer_client_id(&state, &headers) else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    ask_client_state(&state, |reply| ClientStateRequest::MarkWorkspaceRead {
+        client_id,
+        workspace_id,
+        reply,
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// Search this session's or this project's earlier prompts.
+async fn prompt_history(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<ViewerPromptHistory>, ApiError> {
+    validate_public_id(&session_id)?;
+    require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
+    if query.q.chars().count() > MAX_TITLE_CHARS {
+        return Err(ApiError::bad_request("search text is too long"));
+    }
+    let scope = query.scope.unwrap_or_else(|| "project".to_owned());
+    if !matches!(scope.as_str(), "session" | "project" | "all") {
+        return Err(ApiError::bad_request(
+            "scope must be session, project or all",
+        ));
+    }
+    ask_client_state(&state, |reply| ClientStateRequest::History {
+        session_id,
+        query: query.q,
+        scope,
+        reply,
+    })
+    .await
+    .map(Json)
 }
 
 async fn events(State(state): State<ServerState>) -> impl IntoResponse {
@@ -1756,7 +1973,36 @@ fn generate_cookie_key() -> AnyResult<[u8; COOKIE_KEY_BYTES]> {
     Ok(key)
 }
 
-fn signed_cookie_value(key: &[u8], expiry: u64) -> String {
+/// A random name for one viewer, minted at unlock.
+///
+/// The cookie used to sign only an expiry, which meant two phones unlocking in
+/// the same second received byte-identical cookies and one phone's cookie
+/// changed on every login. Nothing keyed to it could mean anything: a draft
+/// would have leaked between phones and vanished on re-login. This is the
+/// identity everything per-viewer hangs from.
+fn generate_viewer_id() -> AnyResult<String> {
+    let mut id = [0_u8; 16];
+    getrandom::fill(&mut id).map_err(|error| anyhow::anyhow!("generate Hel viewer id: {error}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id))
+}
+
+fn signed_cookie_value(key: &[u8], viewer: &str, expiry: u64) -> String {
+    // The signed text separates its parts with a character the parts cannot
+    // contain, so no two different pairs can produce the same signed text.
+    let canonical = format!("{viewer}|{expiry}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
+    mac.update(canonical.as_bytes());
+    let signature =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    format!("{viewer}.{expiry}.{signature}")
+}
+
+/// The cookie value a viewer with no identity used to receive.
+///
+/// Still accepted, so a phone holding one is not signed out by a deployment.
+/// It carries no viewer, so it stores nothing and is replaced by a three-part
+/// cookie at its next unlock.
+fn legacy_signed_cookie_value(key: &[u8], expiry: u64) -> String {
     let canonical = expiry.to_string();
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
     mac.update(canonical.as_bytes());
@@ -1766,17 +2012,38 @@ fn signed_cookie_value(key: &[u8], expiry: u64) -> String {
 }
 
 fn session_cookie_valid(key: &[u8], value: &str, now: u64) -> bool {
-    let Some((expiry, _)) = value.split_once('.') else {
-        return false;
+    cookie_viewer(key, value, now).is_some()
+}
+
+/// The viewer a cookie names, or `None` when the cookie is not valid.
+///
+/// A legacy two-part cookie validates and names no viewer, which is the
+/// difference between "signed out" and "signed in with nothing stored".
+fn cookie_viewer(key: &[u8], value: &str, now: u64) -> Option<Option<String>> {
+    let parts = value.split('.').collect::<Vec<_>>();
+    let (viewer, expiry, expected) = match parts.as_slice() {
+        [viewer, expiry, _] => {
+            let expiry_value = expiry.parse::<u64>().ok()?;
+            (
+                Some((*viewer).to_owned()),
+                expiry_value,
+                signed_cookie_value(key, viewer, expiry_value),
+            )
+        }
+        [expiry, _] => {
+            let expiry_value = expiry.parse::<u64>().ok()?;
+            (
+                None,
+                expiry_value,
+                legacy_signed_cookie_value(key, expiry_value),
+            )
+        }
+        _ => return None,
     };
-    let Ok(expiry_value) = expiry.parse::<u64>() else {
-        return false;
-    };
-    if now >= expiry_value {
-        return false;
+    if now >= expiry {
+        return None;
     }
-    let expected = signed_cookie_value(key, expiry_value);
-    constant_time_eq(expected.as_bytes(), value.as_bytes())
+    constant_time_eq(expected.as_bytes(), value.as_bytes()).then_some(viewer)
 }
 
 fn session_cookie_header(
@@ -1801,6 +2068,22 @@ fn clear_cookie_header(secure: bool) -> HeaderValue {
         "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age=0"
     ))
     .expect("static cookie header is valid")
+}
+
+/// The stored-state key for the viewer making this request.
+///
+/// A viewer with a legacy cookie has no identity, so it has no stored state:
+/// it reads and writes nothing rather than sharing a bucket with every other
+/// phone that unlocked in the same second, which is what the old whole-cookie
+/// key amounted to.
+fn viewer_client_id(state: &ServerState, headers: &HeaderMap) -> Option<String> {
+    let cookie = headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| cookie_value(header, COOKIE_NAME))?;
+    cookie_viewer(&state.cookie_key, cookie, now_unix())
+        .flatten()
+        .map(|viewer| format!("phone:{viewer}"))
 }
 
 fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
@@ -2111,6 +2394,7 @@ mod tests {
         mpsc::Receiver<ControllerRequest>,
         mpsc::Receiver<ReadReceiptRequest>,
         mpsc::Receiver<PreflightRequest>,
+        mpsc::Receiver<ClientStateRequest>,
     );
 
     fn app() -> TestServer {
@@ -2137,15 +2421,23 @@ mod tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let (receipt_tx, receipt_rx) = mpsc::channel(8);
         let (preflight_tx, preflight_rx) = mpsc::channel(8);
+        let (client_state_tx, client_state_rx) = mpsc::channel(8);
         let options = test_options(
             snapshot_rx,
             conversation_rx,
             action_tx,
             receipt_tx,
             preflight_tx,
+            client_state_tx,
         )
         .with_test_credentials("123456", b"01234567890123456789012345678901");
-        (router(options), action_rx, receipt_rx, preflight_rx)
+        (
+            router(options),
+            action_rx,
+            receipt_rx,
+            preflight_rx,
+            client_state_rx,
+        )
     }
 
     fn test_options(
@@ -2154,6 +2446,7 @@ mod tests {
         action_tx: mpsc::Sender<ControllerRequest>,
         receipt_tx: mpsc::Sender<ReadReceiptRequest>,
         preflight_tx: mpsc::Sender<PreflightRequest>,
+        client_state_tx: mpsc::Sender<ClientStateRequest>,
     ) -> ServerOptions {
         ServerOptions::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -2162,6 +2455,7 @@ mod tests {
             action_tx,
             receipt_tx,
             preflight_tx,
+            client_state_tx,
         )
         .unwrap()
     }
@@ -2174,12 +2468,14 @@ mod tests {
         let (action_tx, _action_rx) = mpsc::channel(1);
         let (receipt_tx, _receipt_rx) = mpsc::channel(1);
         let (preflight_tx, _preflight_rx) = mpsc::channel(1);
+        let (client_state_tx, _client_state_rx) = mpsc::channel(1);
         test_options(
             snapshot_rx,
             conversation_rx,
             action_tx,
             receipt_tx,
             preflight_tx,
+            client_state_tx,
         )
     }
 
@@ -2193,6 +2489,7 @@ mod tests {
             "{COOKIE_NAME}={}",
             signed_cookie_value(
                 b"01234567890123456789012345678901",
+                "test-viewer",
                 now_unix().saturating_add(3600)
             )
         )
@@ -2224,7 +2521,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_requires_a_valid_signed_cookie() {
-        let (app, _, _, _) = app();
+        let (app, _, _, _, _) = app();
         let unauthorized = app
             .clone()
             .oneshot(Request::get("/api/snapshot").body(Body::empty()).unwrap())
@@ -2247,7 +2544,7 @@ mod tests {
 
     #[tokio::test]
     async fn qr_login_exchanges_the_secret_for_a_cookie_and_redirects_cleanly() {
-        let (app, _, _, _) = app();
+        let (app, _, _, _, _) = app();
         let rejected = app
             .clone()
             .oneshot(
@@ -2276,7 +2573,7 @@ mod tests {
     #[test]
     fn signed_cookie_rejects_expiry_and_tampering() {
         let key = b"01234567890123456789012345678901";
-        let cookie = signed_cookie_value(key, 200);
+        let cookie = signed_cookie_value(key, "test-viewer", 200);
         assert!(session_cookie_valid(key, &cookie, 100));
         assert!(!session_cookie_valid(key, &cookie, 200));
         assert!(!session_cookie_valid(key, &format!("{cookie}x"), 100));
@@ -2366,7 +2663,7 @@ mod tests {
 
     #[tokio::test]
     async fn elicitation_answer_is_typed_and_forwarded() {
-        let (app, mut actions, _, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let (app, mut actions, _, _, _) = app_with_snapshot(pending_elicitation_snapshot);
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -2398,7 +2695,7 @@ mod tests {
     #[tokio::test]
     async fn elicitation_answer_for_an_unknown_request_is_refused_without_reaching_the_controller()
     {
-        let (app, mut actions, _, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let (app, mut actions, _, _, _) = app_with_snapshot(pending_elicitation_snapshot);
         let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
@@ -2624,7 +2921,7 @@ mod tests {
                 "set_config",
             ),
         ] {
-            let (app, mut actions, _, _) = app();
+            let (app, mut actions, _, _, _) = app();
             let response = post_action(app, cookie(), body.to_owned()).await;
             assert!(
                 response.status().is_client_error(),
@@ -2666,7 +2963,7 @@ mod tests {
                 "an unoffered value",
             ),
         ] {
-            let (app, mut actions, _, _) = app_with_snapshot(capable);
+            let (app, mut actions, _, _, _) = app_with_snapshot(capable);
             let response = post_action(app, cookie(), body.to_owned()).await;
             assert_eq!(
                 response.status(),
@@ -2677,7 +2974,7 @@ mod tests {
         }
 
         // The value the harness did advertise is forwarded unchanged.
-        let (app, mut actions, _, _) = app_with_snapshot(capable);
+        let (app, mut actions, _, _, _) = app_with_snapshot(capable);
         let response = tokio::spawn(post_action(
             app,
             cookie(),
@@ -2712,7 +3009,7 @@ mod tests {
             (oversized.as_str(), "an unbounded acknowledgement"),
             (r#""""#, "an empty repository name"),
         ] {
-            let (app, mut actions, _, _) = app();
+            let (app, mut actions, _, _, _) = app();
             let body = format!(
                 r#"{{"action":"new","workspace_id":"default","profile_id":"codex-1","bundle_id":"hel","target_id":"podman","dirty_ack":[{ack}]}}"#
             );
@@ -2726,7 +3023,7 @@ mod tests {
     /// terminal derives it, so the two surfaces name a session alike.
     #[tokio::test]
     async fn a_new_session_without_a_title_is_accepted() {
-        let (app, mut actions, _, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let response = tokio::spawn(post_action(
             app,
             cookie(),
@@ -2751,6 +3048,143 @@ mod tests {
         assert_eq!(response.await.unwrap().status(), StatusCode::ACCEPTED);
     }
 
+    /// Two phones must not share stored state, and one phone's state must
+    /// survive its own re-login. Neither is true of a cookie that signs only
+    /// an expiry, which is what this replaced.
+    #[test]
+    fn a_cookie_names_one_viewer_and_two_cookies_never_collide() {
+        let key = b"01234567890123456789012345678901";
+        let expiry = now_unix().saturating_add(3600);
+        let first = signed_cookie_value(key, "viewer-a", expiry);
+        let second = signed_cookie_value(key, "viewer-b", expiry);
+        assert_ne!(
+            first, second,
+            "two viewers unlocking in the same second share a cookie"
+        );
+        assert_eq!(
+            cookie_viewer(key, &first, now_unix()),
+            Some(Some("viewer-a".to_owned()))
+        );
+        assert_eq!(
+            cookie_viewer(key, &second, now_unix()),
+            Some(Some("viewer-b".to_owned()))
+        );
+    }
+
+    /// A phone holding the previous cookie keeps working through a deployment.
+    /// It names no viewer, so it stores nothing, which is the difference
+    /// between signed out and signed in with nothing kept.
+    #[test]
+    fn a_legacy_cookie_still_authenticates_and_stores_nothing() {
+        let key = b"01234567890123456789012345678901";
+        let expiry = now_unix().saturating_add(3600);
+        let legacy = legacy_signed_cookie_value(key, expiry);
+        assert_eq!(cookie_viewer(key, &legacy, now_unix()), Some(None));
+        assert!(session_cookie_valid(key, &legacy, now_unix()));
+        assert!(
+            !session_cookie_valid(key, &legacy, expiry),
+            "an expired legacy cookie still authenticated"
+        );
+    }
+
+    /// A forged or tampered cookie names nobody.
+    #[test]
+    fn a_tampered_cookie_is_refused() {
+        let key = b"01234567890123456789012345678901";
+        let expiry = now_unix().saturating_add(3600);
+        let honest = signed_cookie_value(key, "viewer-a", expiry);
+        let swapped = honest.replacen("viewer-a", "viewer-b", 1);
+        assert_eq!(cookie_viewer(key, &swapped, now_unix()), None);
+        assert_eq!(cookie_viewer(key, "nonsense", now_unix()), None);
+        assert_eq!(cookie_viewer(key, &format!("{expiry}."), now_unix()), None);
+    }
+
+    /// A composer is for a prompt. The bound exists so one viewer cannot fill
+    /// the daemon's database with text it never sent.
+    #[tokio::test]
+    async fn an_oversized_draft_is_refused_with_a_stable_code() {
+        let (app, _, _, _, mut stored) = app();
+        let draft = "x".repeat(64 * 1024 + 1);
+        let response = app
+            .oneshot(
+                Request::put("/api/sessions/session-1/draft")
+                    .header(COOKIE, cookie())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "draft": draft }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(stored.try_recv().is_err(), "an oversized draft was stored");
+    }
+
+    /// A viewer with no identity has nothing stored, and is told so rather
+    /// than being promised a persistence that is not there.
+    #[tokio::test]
+    async fn a_legacy_viewer_reads_empty_state_and_cannot_store_a_draft() {
+        let key = b"01234567890123456789012345678901";
+        let legacy = format!(
+            "{COOKIE_NAME}={}",
+            legacy_signed_cookie_value(key, now_unix().saturating_add(3600))
+        );
+
+        let (reader, _, _, _, mut stored) = app();
+        let response = reader
+            .oneshot(
+                Request::get("/api/sessions/session-1/client-state")
+                    .header(COOKIE, legacy.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let state: ViewerClientState = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state, ViewerClientState::default());
+        assert!(
+            stored.try_recv().is_err(),
+            "a legacy viewer read stored state"
+        );
+
+        let (writer, _, _, _, mut stored) = app();
+        let response = writer
+            .oneshot(
+                Request::put("/api/sessions/session-1/draft")
+                    .header(COOKIE, legacy)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"draft":"text"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(stored.try_recv().is_err(), "a legacy viewer stored a draft");
+    }
+
+    /// A search that is not a search is refused before it reaches a database.
+    #[tokio::test]
+    async fn prompt_history_refuses_an_unknown_scope() {
+        let (app, _, _, _, mut stored) = app();
+        let response = app
+            .oneshot(
+                Request::get("/api/sessions/session-1/history?q=ship&scope=everything")
+                    .header(COOKIE, cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            stored.try_recv().is_err(),
+            "the search reached the controller"
+        );
+    }
+
     /// A preflight starts nothing. It answers the questions a person needs
     /// before committing, and it refuses an impossible combination there
     /// rather than after the commit.
@@ -2766,7 +3200,7 @@ mod tests {
                 "a bare target with no directory",
             ),
         ] {
-            let (app, _, _, mut preflights) = app();
+            let (app, _, _, mut preflights, _) = app();
             let response = app
                 .oneshot(
                     Request::post("/api/preflight/new")
@@ -2789,7 +3223,7 @@ mod tests {
     /// whose repositories could be dirty and nothing to ask the controller.
     #[tokio::test]
     async fn a_bare_preflight_answers_without_the_controller() {
-        let (app, _, _, mut preflights) = app();
+        let (app, _, _, mut preflights, _) = app();
         let response = app
             .oneshot(
                 Request::post("/api/preflight/new")
@@ -2813,7 +3247,7 @@ mod tests {
     /// has uncommitted changes is a fact about the disk.
     #[tokio::test]
     async fn a_bundle_preflight_reports_the_repositories_by_leaf_name() {
-        let (app, _, _, mut preflights) = app();
+        let (app, _, _, mut preflights, _) = app();
         let response = tokio::spawn(
             app.oneshot(
                 Request::post("/api/preflight/new")
@@ -3228,7 +3662,7 @@ if (sentElicitations.size !== 0) {
 
     #[tokio::test]
     async fn image_prompt_reaches_the_controller_with_its_images() {
-        let (app, mut actions, _, _) = app_with_snapshot(image_capable);
+        let (app, mut actions, _, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(8);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -3256,7 +3690,7 @@ if (sentElicitations.size !== 0) {
     /// carries prompts, so it is the route that gets the larger bound.
     #[tokio::test]
     async fn multi_image_prompts_are_accepted_over_the_general_body_limit() {
-        let (app, mut actions, _, _) = app_with_snapshot(image_capable);
+        let (app, mut actions, _, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(MAX_BODY_BYTES / 2);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -3275,7 +3709,7 @@ if (sentElicitations.size !== 0) {
 
     #[tokio::test]
     async fn a_body_over_the_prompt_limit_is_still_refused() {
-        let (app, _actions, _, _) = app_with_snapshot(image_capable);
+        let (app, _actions, _, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(MAX_PROMPT_BODY_BYTES);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -3298,7 +3732,7 @@ if (sentElicitations.size !== 0) {
             ("", "image/png", 32, 24),
         ];
         for (data, mime, width, height) in cases {
-            let (app, mut actions, _, _) = app_with_snapshot(image_capable);
+            let (app, mut actions, _, _, _) = app_with_snapshot(image_capable);
             let cookie = login_cookie(&app).await;
             let body = serde_json::to_string(&ControllerAction::Prompt {
                 session_id: "session-1".into(),
@@ -3401,7 +3835,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
     /// to name an icon, and that icon has to be served.
     #[tokio::test]
     async fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
-        let (app, _, _, _) = app();
+        let (app, _, _, _, _) = app();
         let page = fetch_text(app.clone(), "/").await;
         assert!(page.contains(r#"rel="icon""#), "the page declares no icon");
         assert!(page.contains("/icon.svg"), "the page names no icon route");
@@ -3419,7 +3853,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn valid_action_is_typed_and_forwarded() {
-        let (app, mut actions, _, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -3448,7 +3882,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn shell_action_is_typed_and_forwarded() {
-        let (app, mut actions, _, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -3533,7 +3967,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn bare_new_action_forwards_an_explicit_safe_project_directory() {
-        let (app, mut actions, _, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -3610,7 +4044,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn cancel_action_is_typed_and_forwarded() {
-        let (app, mut actions, _, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -3700,7 +4134,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn snapshot_endpoint_returns_only_public_projection() {
-        let (app, _, _, _) = app();
+        let (app, _, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
@@ -3759,7 +4193,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                 },
             ],
         };
-        let (app, _, _, _) =
+        let (app, _, _, _, _) =
             app_with_conversations(BTreeMap::from([("session-1".into(), transcript)]));
         let cookie = login_cookie(&app).await;
         let response = app
@@ -3782,7 +4216,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn conversation_read_receipt_never_contends_with_a_running_action() {
-        let (app, mut actions, mut receipts, _) = app();
+        let (app, mut actions, mut receipts, _, _) = app();
         let cookie = login_cookie(&app).await;
         // A prompt for the same session stays in flight for the whole test, so
         // a receipt that still travelled the action pipeline would either
@@ -3853,7 +4287,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                 "could not start this action",
             ),
         ] {
-            let (app, mut actions, _, _) = app();
+            let (app, mut actions, _, _, _) = app();
             let cookie = login_cookie(&app).await;
             let response = tokio::spawn(
                 app.oneshot(
@@ -3881,7 +4315,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
         // An accepted action reports its outcome only through snapshots, so
         // the application has to react to `has_error` for a late failure to be
         // visible at all.
-        let (app, _, _, _) = app();
+        let (app, _, _, _, _) = app();
         let script = fetch_text(app, "/viewer.js").await;
         assert!(script.contains("has_error"), "viewer ignores has_error");
     }
@@ -3897,7 +4331,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
             "/manifest.webmanifest",
             "/api/snapshot",
         ] {
-            let (app, _, _, _) = app();
+            let (app, _, _, _, _) = app();
             let response = app
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
@@ -3938,7 +4372,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
     /// no Rust test would otherwise notice.
     #[tokio::test]
     async fn the_page_carries_no_inline_script_or_style() {
-        let (app, _, _, _) = app();
+        let (app, _, _, _, _) = app();
         let page = fetch_text(app, "/").await;
         assert!(
             !page.contains("<script>") && !page.contains("<style>"),
@@ -3955,7 +4389,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
     #[tokio::test]
     async fn live_state_and_the_service_worker_are_never_stored() {
         for path in ["/", "/service-worker.js", "/api/snapshot"] {
-            let (app, _, _, _) = app();
+            let (app, _, _, _, _) = app();
             let response = app
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
@@ -3997,7 +4431,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
             ("/apple-touch-icon.png", "image/png"),
             ("/fonts/jetbrains-mono.woff2", "font/woff2"),
         ] {
-            let (app, _, _, _) = app();
+            let (app, _, _, _, _) = app();
             let response = app
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
@@ -4026,7 +4460,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn repeated_wrong_codes_lock_the_login_endpoint() {
-        let (app, _, _, _) = app();
+        let (app, _, _, _, _) = app();
         let attempt = |code: &'static str| {
             let app = app.clone();
             async move {
@@ -4105,7 +4539,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
             .unwrap();
         let mut original = detached_options();
         original.set_cookie_key(first.clone()).unwrap();
-        let cookie = signed_cookie_value(&original.cookie_key, 200);
+        let cookie = signed_cookie_value(&original.cookie_key, "test-viewer", 200);
         assert!(session_cookie_valid(&restarted.cookie_key, &cookie, 100));
         assert!(!session_cookie_valid(
             &detached_options().cookie_key,

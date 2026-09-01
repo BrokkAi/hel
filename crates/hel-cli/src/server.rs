@@ -501,6 +501,7 @@ pub(crate) async fn run_server(
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
     let (receipt_tx, mut receipt_rx) = tokio::sync::mpsc::channel(32);
     let (preflight_tx, mut preflight_rx) = tokio::sync::mpsc::channel(32);
+    let (client_state_tx, mut client_state_rx) = tokio::sync::mpsc::channel(64);
     let SessionManagerChannels {
         targets: worker_targets_tx,
         control: worker_commands_tx,
@@ -514,6 +515,8 @@ pub(crate) async fn run_server(
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
     let mut credential_sync_signals = CredentialSyncSignalTracker::default();
     let mut credential_sync_notices = CredentialSyncNotices::default();
+    // Captured before `options` is moved into the server.
+    let options_session_ttl = hel::hel_server::default_session_ttl();
     let mut options = ServerOptions::new(
         bind,
         snapshot_rx,
@@ -521,6 +524,7 @@ pub(crate) async fn run_server(
         action_tx,
         receipt_tx,
         preflight_tx,
+        client_state_tx,
     )?;
     options.shutdown = termination.clone();
     // Session cookies are stateless, so a per-process key would sign every
@@ -570,6 +574,11 @@ pub(crate) async fn run_server(
     let serve = hel::hel_server::run_server(options);
     let control = async {
         let mut credential_tick = tokio::time::interval(Duration::from_millis(250));
+        // Stored viewer state expires with the authentication that created it.
+        // The sweep is hourly rather than on every request, because it is
+        // housekeeping and nothing waits for it.
+        let mut prune_tick = tokio::time::interval(Duration::from_secs(60 * 60));
+        let client_state_retention = options_session_ttl;
         let (action_done_tx, mut action_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
             u64,
             Option<String>,
@@ -754,6 +763,23 @@ pub(crate) async fn run_server(
                         publish_snapshot!(revision);
                     }
                 }
+                _ = prune_tick.tick() => {
+                    // Only rows whose client id names a phone are considered:
+                    // a terminal client's place in a conversation is not the
+                    // phone's to expire.
+                    tokio::spawn(async move {
+                        let pruned = tokio::task::spawn_blocking(move || {
+                            hel::hel_database::prune_phone_client_state(client_state_retention)
+                        })
+                        .await;
+                        match pruned {
+                            Ok(Ok(0)) => {}
+                            Ok(Ok(rows)) => tracing::debug!(rows, "pruned expired phone viewer state"),
+                            Ok(Err(error)) => tracing::warn!(%error, "could not prune phone viewer state"),
+                            Err(error) => tracing::warn!(%error, "phone viewer state pruning task failed"),
+                        }
+                    });
+                }
                 _ = credential_tick.tick() => {
                     schedule_due_credential_syncs(
                         &mut credential_sync_signals,
@@ -764,6 +790,116 @@ pub(crate) async fn run_server(
                         crate::pollers::log_credential_sync_actions(&result);
                         if let Some(notice) = credential_sync_notices.notice(&result) {
                             eprintln!("Hel: {notice}");
+                        }
+                    }
+                }
+                stored = client_state_rx.recv() => {
+                    let Some(stored) = stored else {
+                        failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering viewer state requests");
+                        break;
+                    };
+                    // Every one of these touches SQLite, so each runs on its
+                    // own task. A composer autosaving on a debounce must never
+                    // be able to stall the loop that follows sessions.
+                    let workspace_of = |session_id: &str| {
+                        controller
+                            .state
+                            .sessions
+                            .get(session_id)
+                            .map(|session| session.workspace_id.clone())
+                    };
+                    let bundle_of = |session_id: &str| {
+                        controller
+                            .state
+                            .sessions
+                            .get(session_id)
+                            .map(|session| session.bundle_id.clone())
+                    };
+                    match stored {
+                        hel::hel_server::ClientStateRequest::Read { client_id, session_id, reply } => {
+                            let workspace = workspace_of(&session_id);
+                            tokio::spawn(async move {
+                                let answer = tokio::task::spawn_blocking(move || {
+                                    let workspace = workspace.context("unknown session")?;
+                                    let state = hel::hel_database::client_session_state(
+                                        &client_id, &workspace, &session_id,
+                                    )?;
+                                    anyhow::Ok(hel::hel_server::ViewerClientState {
+                                        draft: state.draft,
+                                        through_event_ordinal: state.through_event_ordinal,
+                                    })
+                                })
+                                .await;
+                                reply.send(flatten_stored(answer)).ok();
+                            });
+                        }
+                        hel::hel_server::ClientStateRequest::SaveDraft { client_id, session_id, draft, reply } => {
+                            let workspace = workspace_of(&session_id);
+                            tokio::spawn(async move {
+                                let answer = tokio::task::spawn_blocking(move || {
+                                    let workspace = workspace.context("unknown session")?;
+                                    hel::hel_database::persist_client_draft(
+                                        &client_id, &workspace, &session_id, &draft,
+                                    )
+                                })
+                                .await;
+                                reply.send(flatten_stored(answer)).ok();
+                            });
+                        }
+                        hel::hel_server::ClientStateRequest::MarkWorkspaceRead { client_id, workspace_id, reply } => {
+                            let sessions = controller
+                                .state
+                                .sessions
+                                .values()
+                                .filter(|session| session.workspace_id == workspace_id)
+                                .map(|session| (session.id.clone(), session.viewed_through_event_ordinal))
+                                .collect::<Vec<_>>();
+                            tokio::spawn(async move {
+                                let answer = tokio::task::spawn_blocking(move || {
+                                    for (session_id, through) in sessions {
+                                        // A receipt that would move backwards
+                                        // is not an error; it is a session this
+                                        // viewer had already read past.
+                                        hel::hel_database::persist_read_receipt(
+                                            &client_id, &workspace_id, &session_id, through,
+                                        )
+                                        .ok();
+                                    }
+                                    anyhow::Ok(())
+                                })
+                                .await;
+                                reply.send(flatten_stored(answer)).ok();
+                            });
+                        }
+                        hel::hel_server::ClientStateRequest::History { session_id, query, scope, reply } => {
+                            let bundle = bundle_of(&session_id);
+                            tokio::spawn(async move {
+                                let answer = tokio::task::spawn_blocking(move || {
+                                    let bundle = bundle.context("unknown session")?;
+                                    let scope = match scope.as_str() {
+                                        "session" => hel::hel_database::HistoryScope::Session,
+                                        "all" => hel::hel_database::HistoryScope::All,
+                                        _ => hel::hel_database::HistoryScope::Project,
+                                    };
+                                    let found = hel::hel_database::search_prompts_bounded(
+                                        &session_id,
+                                        &bundle,
+                                        scope,
+                                        &query,
+                                        hel::hel_server::MAX_HISTORY_MATCHES,
+                                    )?;
+                                    anyhow::Ok(hel::hel_server::ViewerPromptHistory {
+                                        entries: found
+                                            .entries
+                                            .into_iter()
+                                            .map(|entry| entry.text)
+                                            .collect(),
+                                        truncated: found.truncated,
+                                    })
+                                })
+                                .await;
+                                reply.send(flatten_stored(answer)).ok();
+                            });
                         }
                     }
                 }
@@ -1212,6 +1348,17 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
         // A refresh belongs to a profile or a target rather than a session, so
         // it takes no session slot and cannot be refused as session-busy.
         ControllerAction::RefreshQuota { .. } | ControllerAction::RefreshCapacity { .. } => None,
+    }
+}
+
+/// Flatten a joined blocking result into the answer a phone channel carries.
+fn flatten_stored<T>(
+    joined: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> std::result::Result<T, String> {
+    match joined {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(format!("{error:#}")),
+        Err(error) => Err(format!("viewer state task failed: {error}")),
     }
 }
 

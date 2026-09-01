@@ -1476,9 +1476,17 @@ async function attachImageFiles(files) {
   }
 }
 function renderAttachments() {
+  // The draft the daemon keeps is text. An attachment lives in this browser
+  // only, and a photograph that quietly disappears on reload is worse than one
+  // somebody was told about.
   const session = snapshot?.sessions.find(x => x.id === currentSession);
   attachImage.hidden = !session?.prompt_images_supported;
   attachments.replaceChildren();
+  if (promptImages.length) {
+    attachments.append(
+      el('p', 'dim', 'Images stay on this device until sent; a draft keeps only the text.'),
+    );
+  }
   for (const [index, image] of promptImages.entries()) {
     const chip = document.createElement('div');
     chip.className = 'attachment';
@@ -1500,6 +1508,110 @@ function renderAttachments() {
     attachments.append(chip);
   }
 }
+// ---------------------------------------------------------------------------
+// Drafts and history
+// ---------------------------------------------------------------------------
+//
+// A draft is stored by the daemon against this viewer and this session, so it
+// survives a reload, a closed tab and a new phone. Unsent image attachments are
+// not: they live in this browser's memory only, and the composer says so, since
+// a photograph that quietly disappears is worse than one you were told about.
+
+const DRAFT_DEBOUNCE_MS = 400;
+let draftTimer = null;
+let draftSaving = false;
+
+function scheduleDraftSave() {
+  if (draftTimer) clearTimeout(draftTimer);
+  draftTimer = setTimeout(saveDraft, DRAFT_DEBOUNCE_MS);
+}
+
+async function saveDraft() {
+  draftTimer = null;
+  if (!currentSession || draftSaving) return;
+  const sessionId = currentSession;
+  const draft = composerText();
+  draftSaving = true;
+  try {
+    await request(`/api/sessions/${encodeURIComponent(sessionId)}/draft`, {
+      method: 'PUT',
+      body: JSON.stringify({ draft }),
+    });
+  } catch {
+    // A draft that could not be stored is still in the composer, which is the
+    // copy that matters. Saying so on every keystroke would be noise.
+  } finally {
+    draftSaving = false;
+  }
+}
+
+/// Put back what this viewer last typed here and did not send.
+async function restoreDraft(sessionId, generation) {
+  try {
+    const stored = await request(`/api/sessions/${encodeURIComponent(sessionId)}/client-state`);
+    if (generation !== conversationGeneration) return;
+    // Anything typed while the request was in flight belongs to the person,
+    // not to the server.
+    if (stored.draft && !composerText()) {
+      setComposerText(stored.draft);
+      updateCommandPalette();
+    }
+    if (stored.through_event_ordinal > acknowledged) {
+      acknowledged = stored.through_event_ordinal;
+    }
+  } catch {
+    // An unavailable draft is not worth a message: the composer is empty and
+    // the person can type.
+  }
+}
+
+let historyOpen = false;
+
+/// Search this project's earlier prompts and offer them in the palette.
+async function searchHistory(query) {
+  if (!currentSession) return;
+  const generation = conversationGeneration;
+  try {
+    const found = await request(
+      `/api/sessions/${encodeURIComponent(currentSession)}/history?q=${encodeURIComponent(query)}&scope=project`,
+    );
+    if (generation !== conversationGeneration || !historyOpen) return;
+    paletteMatches = found.entries.map(text => ({
+      insert: text,
+      label: text.length > 80 ? `${text.slice(0, 79)}…` : text,
+      hint: '',
+    }));
+    if (found.truncated) {
+      // Saying the answer is partial is the whole reason the bound reports it.
+      paletteMatches.push({
+        insert: composerText(),
+        label: `More matches than ${paletteMatches.length} — narrow the search`,
+        hint: '',
+      });
+    }
+    paletteSelected = 0;
+    if (!paletteMatches.length) {
+      commandPalette.replaceChildren(el('p', 'dim palette-row', 'No earlier prompts match.'));
+      commandPalette.classList.remove('hidden');
+      return;
+    }
+    commandPalette.replaceChildren(
+      ...paletteMatches.map((match, index) => {
+        const row = el('button', 'palette-row');
+        row.type = 'button';
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', String(index === paletteSelected));
+        row.dataset.insert = match.insert;
+        row.append(el('span', 'palette-name', match.label));
+        return row;
+      }),
+    );
+    commandPalette.classList.remove('hidden');
+  } catch (err) {
+    document.querySelector('#conversation-error').textContent = err.message;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Slash commands
 // ---------------------------------------------------------------------------
@@ -1638,7 +1750,9 @@ function acceptCommandSelection() {
   if (!match) return false;
   setComposerText(match.insert);
   placeComposerCaretAtEnd();
+  historyOpen = false;
   updateCommandPalette();
+  scheduleDraftSave();
   return true;
 }
 
@@ -1808,6 +1922,9 @@ async function submitPrompt() {
     promptImages = [];
     renderAttachments();
     updateCommandPalette();
+    // The stored copy goes with the one on screen, so reopening does not put
+    // back a prompt that has already run.
+    saveDraft();
     error.textContent = '';
     await refresh();
   } catch (err) {
@@ -2000,6 +2117,7 @@ async function openConversation(id) {
   renderConversationHeader(session);
   promptImages = [];
   renderAttachments();
+  restoreDraft(id, conversationGeneration);
   await loadConversation(false);
 }
 
@@ -2215,7 +2333,22 @@ document.querySelector('#prompt-form').onsubmit = e => {
 };
 promptText.addEventListener('input', () => {
   composerInputChanged();
+  if (historyOpen) {
+    searchHistory(composerText());
+    return;
+  }
   updateCommandPalette();
+  scheduleDraftSave();
+});
+
+// Ctrl-R opens the reverse lookup, the way the terminal's history search does.
+promptText.addEventListener('keydown', event => {
+  if ((event.ctrlKey || event.metaKey) && event.key === 'r') {
+    event.preventDefault();
+    historyOpen = !historyOpen;
+    if (historyOpen) searchHistory(composerText());
+    else updateCommandPalette();
+  }
 });
 
 commandPalette.onclick = event => {

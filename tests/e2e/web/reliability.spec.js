@@ -146,6 +146,25 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await page.keyboard.press('Enter');
     await expect(page.locator('#conversation-feed')).toContainText('Available commands');
     await expect(page.locator('#conversation-feed')).toContainText('run a shell command');
+
+    // A draft is stored against this viewer, so it survives a reload — and a
+    // second viewer with its own cookie must not see it.
+    const conversationUrl = page.url();
+    await page.locator('#prompt-text').fill('a draft that should survive');
+    await page.waitForTimeout(900);
+    await page.reload();
+    await expect(page.locator('#prompt-text')).toHaveText('a draft that should survive');
+
+    const otherContext = await browser.newContext({ ignoreHTTPSErrors: true });
+    const otherPage = await otherContext.newPage();
+    await codeLogin(otherPage, baseUrl, code);
+    await otherPage.goto(conversationUrl);
+    await expect(otherPage.locator('#conversation-title')).toHaveText(title);
+    await expect(otherPage.locator('#prompt-text')).toHaveText('');
+    await otherContext.close();
+
+    await page.locator('#prompt-text').fill('');
+    await page.waitForTimeout(900);
     // The browser's own Back button returns to the dashboard rather than
     // leaving the application.
     await page.goBack();

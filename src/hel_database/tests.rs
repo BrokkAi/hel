@@ -7,6 +7,52 @@ use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 use rusqlite::OptionalExtension;
 
 #[test]
+fn a_bounded_prompt_search_reports_that_it_stopped_early() {
+    // Without the flag a caller cannot tell ten matches from the first ten of
+    // many, and will present a partial answer as a whole one.
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    for index in 0..50 {
+        record_prompt_to(
+            &database,
+            "session-1",
+            "bundle-1",
+            index,
+            Some("2026-01-01T00:00:00Z"),
+            &format!("ship it {index}"),
+        )
+        .unwrap();
+    }
+
+    let found = search_prompts_bounded_from(
+        &database,
+        "session-1",
+        "bundle-1",
+        HistoryScope::Session,
+        "ship",
+        10,
+    )
+    .unwrap();
+    assert_eq!(found.entries.len(), 10);
+    assert!(
+        found.truncated,
+        "a search that stopped early reported a complete answer"
+    );
+
+    let all = search_prompts_bounded_from(
+        &database,
+        "session-1",
+        "bundle-1",
+        HistoryScope::Session,
+        "ship",
+        100,
+    )
+    .unwrap();
+    assert_eq!(all.entries.len(), 50);
+    assert!(!all.truncated, "a complete answer reported itself partial");
+}
+
+#[test]
 fn database_writer_orders_jobs_and_survives_an_operation_error() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("hel.sqlite3");

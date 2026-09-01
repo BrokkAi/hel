@@ -572,6 +572,29 @@ fn ensure_workspace_schema(connection: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS detached_drafts_workspace_recent
              ON detached_drafts(workspace_id, saved_at DESC);",
     )?;
+    ensure_client_session_state_schema(connection)?;
+    Ok(())
+}
+
+/// Per-viewer, per-session state a web client keeps between visits.
+///
+/// This is additive and separate from `client_read_frontiers` on purpose. A
+/// frontier is a cursor every client has; a draft is text one viewer typed and
+/// did not send, and it expires. Keeping them apart means the phone's
+/// retention policy cannot reach a terminal client's cursor.
+fn ensure_client_session_state_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS client_session_state (
+             client_id TEXT NOT NULL CHECK(length(trim(client_id)) > 0),
+             workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+             session_id TEXT NOT NULL REFERENCES session_contexts(session_id) ON DELETE CASCADE,
+             draft TEXT NOT NULL DEFAULT '',
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY(client_id, workspace_id, session_id)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS client_session_state_age
+             ON client_session_state(updated_at);",
+    )?;
     Ok(())
 }
 
