@@ -1526,7 +1526,7 @@ fn export_uploaded_spec(
 }
 
 /// When the installed worker cannot execute this export protocol, replace its
-/// `hel` with the controller's current binary and tell the caller to retry. The
+/// `mj` with the controller's current binary and tell the caller to retry. The
 /// live daemon keeps the previous inode; only the next `export-checkpoint`
 /// process changes.
 fn replace_stale_export_worker(
@@ -1572,7 +1572,7 @@ fn export_spec_stdin_unsupported(failure: &str) -> bool {
 /// Whether an export failure says the target's worker cannot deserialize this
 /// spec. `CheckpointExportSpec` and its nested canonical snapshot use
 /// `deny_unknown_fields`, so a controller that gained a field such as
-/// `terminal_refs` cannot pause a session whose installed `hel` predates it.
+/// `terminal_refs` cannot pause a session whose installed `mj` predates it.
 fn export_spec_schema_unsupported(failure: &str) -> bool {
     failure.contains("parse checkpoint")
         && (failure.contains("unknown field") || failure.contains("unknown variant"))

@@ -2,7 +2,7 @@
 //!
 //! Non-Android platforms run a fully local `mj-voice-worker` sidecar built on
 //! sherpa-onnx. Keeping the native speech stack in its own workspace package
-//! means ordinary `hel` builds never compile or link ONNX Runtime.
+//! means ordinary `mj` builds never compile or link ONNX Runtime.
 //!
 //! The native speech stack can raise foreign C++ exceptions across the FFI boundary or
 //! abort outright when system libraries are incompatible or model files are

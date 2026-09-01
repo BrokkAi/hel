@@ -533,7 +533,7 @@ async fn run_workspace_dashboard(
     {
         match workspaces.as_slice() {
             [workspace] => workspace.workspace.id.clone(),
-            [] => bail!("no workspace exists; run `hel` in a terminal to create one"),
+            [] => bail!("no workspace exists; run `mj` in a terminal to create one"),
             _ => bail!("several workspaces exist; pass `--workspace NAME`"),
         }
     } else {
@@ -624,7 +624,7 @@ async fn resolve_store_workspace(requested: Option<&str>) -> Result<String> {
     }
     match workspaces.as_slice() {
         [workspace] => Ok(workspace.workspace.id.clone()),
-        [] => bail!("no workspace exists; run `hel` to create one"),
+        [] => bail!("no workspace exists; run `mj` to create one"),
         _ => bail!("several workspaces exist; pass `--workspace NAME`"),
     }
 }
