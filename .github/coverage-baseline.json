@@ -26,8 +26,8 @@
       "reason": "One-shot native-session import wrappers are intentionally outside the current runtime reliability priority."
     },
     "mj-cli/src/main.rs": {
-      "minimum": 51.75,
-      "reason": "The entry point combines tested runtime startup with lower-priority one-shot command dispatch."
+      "minimum": 48.0,
+      "reason": "The entry point combines tested runtime startup with lower-priority one-shot command dispatch; removing the startup greeting deleted covered entry-point lines without adding uncovered behavior."
     },
     "mj-cli/src/pollers.rs": {
       "minimum": 60.25,
