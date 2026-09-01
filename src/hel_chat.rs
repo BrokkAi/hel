@@ -41,13 +41,13 @@ pub use crate::hel_acp::PlanControl;
 use crate::hel_acp::SessionConfigChoice;
 use crate::hel_acp::surface::{AcpSessionSurface, PlanControlError};
 use crate::hel_acp::{RuntimeEvent, plan_review_carries_native_feedback};
-use crate::hel_config::HarnessKind;
+use crate::hel_config::{HarnessKind, HelConfig};
 use crate::hel_elicitation::ElicitationValue;
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_selection::{FrameSurfaces, SelectionRange};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
-    RecoveryCheckpointPhase, TranscriptBody, TranscriptItem,
+    SessionRecord, TranscriptBody, TranscriptItem,
 };
 use crate::hel_transcript::{
     ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
@@ -234,6 +234,17 @@ pub struct SessionHeaderIdentity {
     pub harness_kind: Option<HarnessKind>,
 }
 
+/// The session facts the chat needs to run reviewers and keep per-workspace
+/// review settings: the config's harness profiles and targets, and this
+/// session's record (workspace, target, identity). Snapshotted when the chat
+/// opens and refreshed by the surface when the daemon publishes newer state;
+/// the recovery observer that used to travel with these stayed in the daemon.
+#[derive(Debug, Clone)]
+pub struct ChatSessionContext {
+    pub config: HelConfig,
+    pub session: SessionRecord,
+}
+
 /// Constructors that need [`sanitize_terminal_text`], which is chat-view
 /// specific and so cannot live with the rest of [`ChatEntry`] in
 /// `hel_transcript`.
@@ -358,7 +369,6 @@ pub struct ChatState {
     elicitation_is_reviewers: bool,
     /// Which reviewing role asked the form on screen, when one did.
     elicitation_role: Option<String>,
-    recovery_phase: Option<RecoveryCheckpointPhase>,
     goal_prompt_active: bool,
     acp_surface: AcpSessionSurface,
     plan_command_pending: bool,
@@ -441,7 +451,6 @@ impl ChatState {
             turn_review_settings: crate::hel_database::TurnReviewSettings::default(),
             elicitation_is_reviewers: false,
             elicitation_role: None,
-            recovery_phase: None,
             goal_prompt_active: snapshot
                 .active_prompt
                 .as_ref()

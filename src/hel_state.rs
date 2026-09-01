@@ -449,34 +449,6 @@ impl RecoveryGate {
     }
 }
 
-/// What a chat view or session lifecycle operation holds to report activity
-/// to, and check busy status with, the recovery coordinator for one session.
-#[derive(Clone)]
-pub struct RecoveryContext {
-    pub observer: RecoveryObserver,
-    pub session: SessionRecord,
-    pub config: HelConfig,
-}
-
-impl RecoveryContext {
-    pub fn observe(&self, materialized: &MaterializedSession) {
-        self.observer.observe(RecoveryObservation {
-            session: self.session.clone(),
-            config: self.config.clone(),
-            latest_completed_turn_ordinal: latest_completed_turn_ordinal(materialized),
-            execution: materialized.execution,
-        });
-    }
-
-    pub fn is_busy(&self) -> bool {
-        self.observer.is_busy(&self.session.id)
-    }
-
-    pub fn phase(&self) -> Option<RecoveryCheckpointPhase> {
-        self.observer.phase(&self.session.id)
-    }
-}
-
 impl RecoveryObserver {
     /// Queues one observation for the coordinator. Returns as soon as the
     /// observation is queued; a stopped coordinator makes this a no-op.
