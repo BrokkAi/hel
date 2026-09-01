@@ -136,6 +136,112 @@ fn release_prompts(session_id: &str) {
 /// last installed.
 pub type ReviewConfigSource = Arc<dyn Fn() -> ReviewConfig + Send + Sync>;
 
+/// Everything a review needs from the controller: whether it can review this
+/// session at all, and a staged reviewer profile to launch a role from.
+///
+/// It is a trait so the host's own tests can drive a whole review without a
+/// container, a harness, or the developer's own `config.toml`. The daemon
+/// installs [`ControllerEnvironment`], which loads the real controller.
+pub trait ReviewEnvironment: Send + Sync {
+    /// Refuses, with a sentence for a person, when this session cannot be
+    /// reviewed under `profile`.
+    fn check(&self, session_id: &str, profile: &str) -> Result<(), String>;
+
+    /// Stages the reviewer profile for one role and describes how to launch
+    /// it. Blocking: it copies a profile onto the session's target.
+    fn stage(
+        &self,
+        session_id: &str,
+        profile: &str,
+        generation: u64,
+        mcp_servers: &[crate::hel_worker_runtime::ReviewMcpServer],
+        dispatch_tool: bool,
+    ) -> Result<crate::hel_worker_runtime::ReviewerLaunchConfig, String>;
+
+    /// How far this session has been reviewed. Blocking: it reads the
+    /// controller's database.
+    fn load_state(&self, session_id: &str) -> Result<TurnReviewState, String>;
+
+    /// Records how far this session has been reviewed. Failure is reported,
+    /// never propagated: a review that reached a verdict has done its work
+    /// even if the bookkeeping could not be written.
+    fn save_state(&self, session_id: &str, state: &TurnReviewState);
+
+    /// Clears the in-flight flag of every review a restart interrupted, and
+    /// reports whose they were. Baselines are deliberately left alone: the
+    /// interrupted review never advanced one, so the next review covers the
+    /// same change and nothing is lost.
+    fn clear_interrupted(&self) -> Result<Vec<String>, String>;
+}
+
+/// The production environment: the controller as it is on disk right now.
+///
+/// It is reloaded per call rather than held, because a review is rare and the
+/// answer must reflect the config as it stands when the review starts -- the
+/// daemon reloads config.toml every 500 ms for the same reason.
+#[derive(Debug, Default)]
+pub struct ControllerEnvironment;
+
+impl ReviewEnvironment for ControllerEnvironment {
+    fn check(&self, session_id: &str, profile: &str) -> Result<(), String> {
+        let controller =
+            crate::hel_controller::Controller::load().map_err(|error| format!("{error:#}"))?;
+        if !controller.config.profiles.contains_key(profile) {
+            return Err(format!(
+                "turn review needs a reviewer: [review] profile {profile:?} is not a profile in config.toml"
+            ));
+        }
+        if controller
+            .state
+            .sessions
+            .get(session_id)
+            .is_some_and(|record| record.archived)
+        {
+            return Err("this session is archived".to_owned());
+        }
+        Ok(())
+    }
+
+    fn stage(
+        &self,
+        session_id: &str,
+        profile: &str,
+        generation: u64,
+        mcp_servers: &[crate::hel_worker_runtime::ReviewMcpServer],
+        dispatch_tool: bool,
+    ) -> Result<crate::hel_worker_runtime::ReviewerLaunchConfig, String> {
+        let controller =
+            crate::hel_controller::Controller::load().map_err(|error| format!("{error:#}"))?;
+        controller
+            .stage_reviewer_profile_with_mcp(
+                session_id,
+                profile,
+                generation,
+                mcp_servers,
+                dispatch_tool,
+            )
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn load_state(&self, session_id: &str) -> Result<TurnReviewState, String> {
+        crate::hel_database::turn_review_state(session_id).map_err(|error| format!("{error:#}"))
+    }
+
+    fn save_state(&self, session_id: &str, state: &TurnReviewState) {
+        if let Err(error) = crate::hel_database::save_turn_review_state(session_id, state) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %format!("{error:#}"),
+                "could not record how far this session has been reviewed"
+            );
+        }
+    }
+
+    fn clear_interrupted(&self) -> Result<Vec<String>, String> {
+        crate::hel_database::clear_interrupted_turn_reviews().map_err(|error| format!("{error:#}"))
+    }
+}
+
 /// A handle on the review host. Cheap to clone; every method is a message.
 #[derive(Clone)]
 pub struct TurnReviewHost {
@@ -156,9 +262,20 @@ impl std::fmt::Debug for TurnReviewHost {
 }
 
 impl TurnReviewHost {
-    /// Starts the host's task. `config` is read at each trigger decision.
+    /// Starts the host's task, reviewing through the real controller.
     #[must_use]
     pub fn spawn(control: SessionManagerControl, config: ReviewConfigSource) -> Self {
+        Self::spawn_in(control, config, Arc::new(ControllerEnvironment))
+    }
+
+    /// The same, against a caller-supplied environment. `config` is read at
+    /// each trigger decision.
+    #[must_use]
+    pub fn spawn_in(
+        control: SessionManagerControl,
+        config: ReviewConfigSource,
+        environment: Arc<dyn ReviewEnvironment>,
+    ) -> Self {
         let (events, receiver) = mpsc::channel(256);
         let shared = Arc::new(HostShared::default());
         let host = Self {
@@ -169,6 +286,7 @@ impl TurnReviewHost {
             HostState {
                 control,
                 config,
+                environment,
                 shared,
                 events,
                 reviews: BTreeMap::new(),
@@ -292,6 +410,9 @@ enum HostEvent {
         resolution: Resolution,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Reviews a daemon restart interrupted, so each session's conversation
+    /// says what happened to it.
+    Interrupted { interrupted: Vec<String> },
 }
 
 /// One asynchronous step's result, belonging to exactly one review.
@@ -394,6 +515,7 @@ impl RoleTranscript {
 struct HostState {
     control: SessionManagerControl,
     config: ReviewConfigSource,
+    environment: Arc<dyn ReviewEnvironment>,
     shared: Arc<HostShared>,
     events: mpsc::Sender<HostEvent>,
     reviews: BTreeMap<String, ReviewSlot>,
@@ -422,12 +544,29 @@ struct SessionWatch {
 async fn host_loop(mut state: HostState, mut events: mpsc::Receiver<HostEvent>) {
     // A review interrupted by a daemon restart is not resumed: the baseline
     // never advanced, so the next review covers the same change, and half a
-    // multi-agent fan-out is not worth rebuilding. Clearing the stored flag
-    // here is also what keeps a stale row from reading as an open review.
-    if let Err(error) =
-        tokio::task::spawn_blocking(crate::hel_database::clear_interrupted_turn_reviews).await
+    // multi-agent fan-out is not worth rebuilding. The sweep runs beside the
+    // loop rather than in front of it, so a slow database cannot delay the
+    // first review of the daemon's life.
     {
-        tracing::warn!(%error, "the interrupted-review sweep did not run");
+        let environment = state.environment.clone();
+        let events = state.events.clone();
+        tokio::spawn(async move {
+            let swept = tokio::task::spawn_blocking(move || environment.clear_interrupted()).await;
+            let interrupted = match swept {
+                Ok(Ok(sessions)) => sessions,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "could not clear interrupted reviews");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "the interrupted-review sweep did not run");
+                    return;
+                }
+            };
+            if !interrupted.is_empty() {
+                let _ = events.send(HostEvent::Interrupted { interrupted }).await;
+            }
+        });
     }
     while let Some(event) = events.recv().await {
         state.handle(event).await;
@@ -465,6 +604,14 @@ impl HostState {
                 epoch,
                 step,
             } => self.step(session_id, epoch, step),
+            HostEvent::Interrupted { interrupted } => {
+                for session_id in interrupted {
+                    self.record_notice(
+                        &session_id,
+                        "Turn review was cancelled when Hel restarted; the next review covers the same changes".to_owned(),
+                    );
+                }
+            }
         }
     }
 
@@ -614,9 +761,10 @@ impl HostState {
         let control = self.control.clone();
         let events = self.events.clone();
         let prepare_session = session_id.clone();
+        let environment = self.environment.clone();
         self.preparing.insert(session_id);
         tokio::spawn(async move {
-            let prepared = prepare(&control, &prepare_session, &reviewer, tier).await;
+            let prepared = prepare(&control, &environment, &prepare_session, &reviewer, tier).await;
             let _ = events
                 .send(HostEvent::Prepared {
                     session_id: prepare_session,
@@ -831,7 +979,7 @@ impl HostState {
                     slot.state.baselines = trees.clone();
                     slot.state.reviewed_through_ordinal = reviewed_through_ordinal;
                     slot.state.active = None;
-                    persist(session_id, &slot.state);
+                    self.environment.save_state(session_id, &slot.state);
                 }
                 let session_id = session_id.to_owned();
                 self.spawn_reviewer(
@@ -856,13 +1004,13 @@ impl HostState {
             ReviewRequest::RecordPriorReview { prior } => {
                 if let Some(slot) = self.reviews.get_mut(session_id) {
                     slot.state.prior_review = Some(prior);
-                    persist(session_id, &slot.state);
+                    self.environment.save_state(session_id, &slot.state);
                 }
             }
             ReviewRequest::ClearPriorReview => {
                 if let Some(slot) = self.reviews.get_mut(session_id) {
                     slot.state.prior_review = None;
-                    persist(session_id, &slot.state);
+                    self.environment.save_state(session_id, &slot.state);
                 }
             }
             ReviewRequest::Close => {
@@ -872,7 +1020,7 @@ impl HostState {
                     .and_then(|slot| resolution_notice(slot.driver.phase()));
                 if let Some(mut slot) = self.reviews.remove(session_id) {
                     slot.state.active = None;
-                    persist(session_id, &slot.state);
+                    self.environment.save_state(session_id, &slot.state);
                 }
                 release_prompts(session_id);
                 if let Some(notice) = notice {
@@ -899,11 +1047,13 @@ impl HostState {
         let reviewer = slot.reviewer.clone();
         let repositories = slot.driver.repository_roots();
         let control = self.control.clone();
+        let environment = self.environment.clone();
         let events = self.events.clone();
         let session_id = session_id.to_owned();
         tokio::spawn(async move {
             let result = launch_role(
                 &control,
+                &environment,
                 &session_id,
                 &role,
                 &reviewer,
@@ -1288,6 +1438,7 @@ async fn reviewer_action(
 /// Stages the configured reviewer profile and starts one role under it.
 async fn launch_role(
     control: &SessionManagerControl,
+    environment: &Arc<dyn ReviewEnvironment>,
     session_id: &str,
     role: &str,
     reviewer: &ReviewerIdentity,
@@ -1316,9 +1467,9 @@ async fn launch_role(
     let staged = {
         let session_id = session_id.to_owned();
         let profile = reviewer.profile.clone();
+        let environment = environment.clone();
         tokio::task::spawn_blocking(move || {
-            let controller = crate::hel_controller::Controller::load()?;
-            controller.stage_reviewer_profile_with_mcp(
+            environment.stage(
                 &session_id,
                 &profile,
                 generation,
@@ -1327,8 +1478,7 @@ async fn launch_role(
             )
         })
         .await
-        .map_err(|error| format!("staging the reviewer stopped: {error}"))?
-        .map_err(|error| format!("{error:#}"))?
+        .map_err(|error| format!("staging the reviewer stopped: {error}"))??
     };
     let mut config = staged;
     config.model = reviewer.model.clone();
@@ -1351,29 +1501,19 @@ async fn launch_role(
 /// Everything a review needs that only the database and the worker can answer.
 async fn prepare(
     control: &SessionManagerControl,
+    environment: &Arc<dyn ReviewEnvironment>,
     session_id: &str,
     reviewer: &ReviewerIdentity,
     tier: ReviewTier,
 ) -> Result<Prepared, StartRefusal> {
     let profile = reviewer.profile.clone();
     let session = session_id.to_owned();
+    let environment = environment.clone();
+    // Both answers come from the controller and its database, so they are
+    // asked together, once, off the host's loop.
     let checked = tokio::task::spawn_blocking(move || -> Result<TurnReviewState, String> {
-        let controller =
-            crate::hel_controller::Controller::load().map_err(|error| format!("{error:#}"))?;
-        if !controller.config.profiles.contains_key(&profile) {
-            return Err(format!(
-                "turn review needs a reviewer: [review] profile {profile:?} is not a profile in config.toml"
-            ));
-        }
-        if controller
-            .state
-            .sessions
-            .get(&session)
-            .is_some_and(|record| record.archived)
-        {
-            return Err("this session is archived".to_owned());
-        }
-        crate::hel_database::turn_review_state(&session).map_err(|error| format!("{error:#}"))
+        environment.check(&session, &profile)?;
+        environment.load_state(&session)
     })
     .await
     .map_err(|error| StartRefusal(format!("preparing the review stopped: {error}")))?;
@@ -1396,16 +1536,6 @@ async fn prepare(
         reviewer: reviewer.clone(),
         tier,
     })
-}
-
-fn persist(session_id: &str, state: &TurnReviewState) {
-    if let Err(error) = crate::hel_database::save_turn_review_state(session_id, state) {
-        tracing::warn!(
-            session_id = %session_id,
-            error = %format!("{error:#}"),
-            "could not record how far this session has been reviewed"
-        );
-    }
 }
 
 /// The transcript line a resolution leaves behind, on every surface.
@@ -1509,5 +1639,695 @@ fn seed_from_session(
         baselines: state.baselines.clone(),
         through_ordinal: session.applied_event_ordinal,
         prior_review: state.prior_review.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hel_session_manager::{
+        RelaySessionTarget, RemoteSessionRequest, RemoteSessionRequests,
+        spawn_remote_session_manager,
+    };
+    use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
+    use crate::hel_worker::{
+        RELAY_EVENT_FORMAT_V1, RelayCommandOutcome, RelayOperationalState, relay_event_digest,
+    };
+
+    /// One session id per test. The prompt lock is process-wide -- there is
+    /// one daemon per machine and one host in it -- so tests that shared a
+    /// session id would release each other's locks.
+    fn session_id(test: &str) -> String {
+        format!("018f9dd2-a3b4-7c8d-9000-{test}")
+    }
+
+    /// An idle reviewer's operational state. Built through serde because the
+    /// struct's own constructor belongs to the relay.
+    fn operational() -> RelayOperationalState {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "reviewer",
+            "execution": "idle",
+            "latest_ordinal": 0,
+            "latest_digest": crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST,
+            "acknowledged_through": 0,
+            "acknowledged_digest": crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST,
+            "recovery_floor_ordinal": 0,
+            "recovery_floor_digest": crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST,
+            "native_session_id": null,
+            "agent_capabilities": null,
+            "agent_info": null,
+            "config_options": [],
+            "available_commands": [],
+            "config": {},
+            "active_prompt": null,
+            "queued_prompts": [],
+            "checkpoint_barrier": null,
+            "checkpoint_ready": null,
+        }))
+        .expect("the operational state fixture matches its schema")
+    }
+
+    /// A session manager whose requests the test answers itself.
+    ///
+    /// This is the production remote-manager plumbing with the daemon end
+    /// replaced by the test: `control` is exactly what the daemon hands the
+    /// host, and every reviewer action the host makes arrives here as a
+    /// request to answer, so the host is exercised through its real interface.
+    struct FakeManager {
+        session: String,
+        control: SessionManagerControl,
+        requests: RemoteSessionRequests,
+        publisher: crate::hel_session_manager::RemoteSessionPublisher,
+        _shutdown: crate::hel_session_manager::SessionManagerShutdown,
+        _targets: tokio::sync::watch::Sender<Vec<RelaySessionTarget>>,
+    }
+
+    impl FakeManager {
+        /// Builds the manager and waits until it is managing the session, so
+        /// the host's first request cannot race the actor's creation.
+        async fn new(session: &str) -> Self {
+            let channels = spawn_remote_session_manager().expect("remote manager");
+            // The target is never dialled: this manager forwards every
+            // request to the test instead of to a worker.
+            channels.targets.send_replace(vec![RelaySessionTarget {
+                session_id: session.to_owned(),
+                spec: crate::hel_targets::CommandSpec::new("true", Vec::<String>::new()),
+                worker_recovery: None,
+                project_memory: None,
+            }]);
+            let manager = Self {
+                session: session.to_owned(),
+                control: channels.control,
+                requests: channels.requests,
+                publisher: channels.publisher,
+                _shutdown: channels.shutdown,
+                _targets: channels.targets,
+            };
+            // The remote manager creates an actor for a session once a view
+            // has been published for it, which is what the daemon does with
+            // every session it owns.
+            manager
+                .publisher
+                .publish(
+                    session.to_owned(),
+                    view(session, crate::hel_state::MaterializedExecutionState::Idle),
+                )
+                .await
+                .expect("publish the first view");
+            manager
+                .control
+                .wait_for_session(session, Duration::from_secs(5))
+                .await
+                .expect("the fake manager manages the session");
+            manager
+        }
+
+        /// The next request the host makes, or a failure if it makes none.
+        async fn next(&mut self) -> RemoteSessionRequest {
+            tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+                .await
+                .expect("the host makes a request")
+                .expect("the manager is still running")
+        }
+
+        /// Answers reviewer actions until one matches `wanted`, which is then
+        /// returned unanswered for the test to answer itself.
+        async fn next_reviewer(
+            &mut self,
+            wanted: impl Fn(&Option<String>, &ReviewerAction) -> bool,
+        ) -> (
+            Option<String>,
+            ReviewerAction,
+            oneshot::Sender<Result<ReviewerOutcome, String>>,
+        ) {
+            loop {
+                match self.next().await {
+                    RemoteSessionRequest::Reviewer {
+                        role,
+                        action,
+                        reply,
+                        ..
+                    } => {
+                        if wanted(&role, &action) {
+                            return (role, action, reply);
+                        }
+                        // Anything else the host asks for on the way is
+                        // answered plausibly so the review keeps moving.
+                        let _ = reply.send(answer_for(&action));
+                    }
+                    RemoteSessionRequest::Submit { reply, .. } => {
+                        let _ = reply.send(Ok(1));
+                    }
+                    other => panic!("unexpected request {}", other.session_id()),
+                }
+            }
+        }
+    }
+
+    /// A plausible answer to any reviewer action, for the steps a test is not
+    /// asserting on.
+    fn answer_for(action: &ReviewerAction) -> Result<ReviewerOutcome, String> {
+        match action {
+            ReviewerAction::Status => Ok(ReviewerOutcome::Status(Box::new(operational()))),
+            ReviewerAction::CaptureDelta { .. } => Ok(ReviewerOutcome::Delta {
+                repositories: Vec::new(),
+            }),
+            ReviewerAction::AnalyzeDelta { .. } => Ok(ReviewerOutcome::ChangedFunctions {
+                packet: "- edited retry()".to_owned(),
+            }),
+            ReviewerAction::AdvanceBaseline { .. } => Ok(ReviewerOutcome::BaselineAdvanced),
+            ReviewerAction::TakeLaneDispatches => Ok(ReviewerOutcome::LaneDispatches {
+                requests: Vec::new(),
+            }),
+            ReviewerAction::Attach { .. } => Ok(ReviewerOutcome::Attached(Box::new(
+                crate::hel_worker_client::RelayAttachment {
+                    state: operational(),
+                    events: Vec::new(),
+                    through_ordinal: 0,
+                    through_digest: crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+                },
+            ))),
+            ReviewerAction::Pause => Ok(ReviewerOutcome::Paused),
+            ReviewerAction::Submit { .. } => Ok(ReviewerOutcome::Accepted { ordinal: 1 }),
+            ReviewerAction::Start { .. } => Err("no harness in this test".to_owned()),
+            ReviewerAction::RespondElicitation { .. } => Ok(ReviewerOutcome::ElicitationResolved),
+            ReviewerAction::Acknowledge { .. } => Ok(ReviewerOutcome::Acknowledged(
+                crate::hel_worker::RelayCursor {
+                    ordinal: 0,
+                    digest: crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+                },
+            )),
+        }
+    }
+
+    fn view(
+        session: &str,
+        execution: crate::hel_state::MaterializedExecutionState,
+    ) -> ManagedSessionView {
+        let mut materialized = MaterializedSession::empty(session);
+        materialized.execution = execution;
+        materialized.applied_event_ordinal = 12;
+        ManagedSessionView {
+            snapshot: Some(ManagedSessionSnapshot {
+                materialized,
+                operational: operational(),
+                latest_credential_sync_signal: None,
+            }),
+            connected: true,
+            error: None,
+        }
+    }
+
+    /// A controller that says yes: the profile exists and the session is
+    /// reviewable. Staging answers with a launch config rather than copying a
+    /// profile onto a target, so a whole review runs without one.
+    struct FakeEnvironment {
+        staged: Mutex<Vec<(String, u64, bool)>>,
+        /// The review bookkeeping, in memory rather than in the developer's
+        /// own database.
+        state: Mutex<TurnReviewState>,
+    }
+
+    impl FakeEnvironment {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                staged: Mutex::new(Vec::new()),
+                state: Mutex::new(TurnReviewState::default()),
+            })
+        }
+
+        fn state(&self) -> TurnReviewState {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn staged_roles(&self) -> Vec<(String, u64, bool)> {
+            self.staged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl ReviewEnvironment for FakeEnvironment {
+        fn check(&self, _session_id: &str, _profile: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stage(
+            &self,
+            _session_id: &str,
+            profile: &str,
+            generation: u64,
+            mcp_servers: &[crate::hel_worker_runtime::ReviewMcpServer],
+            dispatch_tool: bool,
+        ) -> Result<crate::hel_worker_runtime::ReviewerLaunchConfig, String> {
+            self.staged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((profile.to_owned(), generation, dispatch_tool));
+            Ok(crate::hel_worker_runtime::ReviewerLaunchConfig {
+                profile_id: profile.to_owned(),
+                harness: crate::hel_config::HarnessKind::Claude,
+                bridge_command: std::path::PathBuf::from("/bin/false"),
+                bridge_args: Vec::new(),
+                environment: Default::default(),
+                execution_policy: crate::hel_config::ExecutionPolicy::ConfiguredApprovals,
+                model: None,
+                effort: None,
+                generation,
+                mcp_servers: mcp_servers.to_vec(),
+            })
+        }
+
+        fn load_state(&self, _session_id: &str) -> Result<TurnReviewState, String> {
+            Ok(self.state())
+        }
+
+        fn save_state(&self, _session_id: &str, state: &TurnReviewState) {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = state.clone();
+        }
+
+        fn clear_interrupted(&self) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn armed(profile: Option<&str>) -> ReviewConfigSource {
+        let profile = profile.map(str::to_owned);
+        Arc::new(move || ReviewConfig {
+            enabled: true,
+            tier: ReviewTier::Quick,
+            profile: profile.clone(),
+            model: None,
+            effort: None,
+        })
+    }
+
+    /// Drives a session from running to idle, which is the edge that arms an
+    /// automatic review. The daemon observes each view as it publishes it, so
+    /// the fake does both too.
+    async fn finish_a_turn(manager: &FakeManager, host: &TurnReviewHost) {
+        for execution in [
+            crate::hel_state::MaterializedExecutionState::Running { started_at_ms: 0 },
+            crate::hel_state::MaterializedExecutionState::Idle,
+        ] {
+            let published = view(&manager.session, execution);
+            let _ = manager
+                .publisher
+                .publish(manager.session.clone(), published.clone())
+                .await;
+            host.observe(&manager.session, &published);
+        }
+    }
+
+    /// A turn finishing with no reviewer configured says so in the
+    /// conversation -- once, not once a turn -- and reviews nothing.
+    #[tokio::test]
+    async fn an_unconfigured_reviewer_is_reported_once_per_session() {
+        let session = session_id("unreviewable");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let host =
+            TurnReviewHost::spawn_in(manager.control.clone(), armed(None), environment.clone());
+
+        finish_a_turn(&manager, &host).await;
+        let request = manager.next().await;
+        let RemoteSessionRequest::Submit { command, reply, .. } = request else {
+            panic!("the only thing an unreviewable turn does is say so");
+        };
+        let RelayCommand::RecordNotice { text } = command else {
+            panic!("the notice is a controller-authored conversation line");
+        };
+        assert!(
+            text.contains("[review] profile"),
+            "the notice names the key that fixes it: {text}"
+        );
+        let _ = reply.send(Ok(1));
+
+        // A second turn says nothing: one notice per session, not one a turn.
+        finish_a_turn(&manager, &host).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), manager.requests.recv())
+                .await
+                .is_err(),
+            "a second unreviewable turn is silent"
+        );
+        assert!(!host.refuses_prompt(session));
+    }
+
+    /// A session nobody is attached to is reviewed: the daemon sees the turn
+    /// finish, captures, finds nothing changed, records its baseline, and
+    /// releases the lock. This is the headless case the terminal-hosted
+    /// review could never do.
+    #[tokio::test]
+    async fn a_headless_turn_is_reviewed_and_resolves_itself() {
+        let session = session_id("headless000");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let host = TurnReviewHost::spawn_in(
+            manager.control.clone(),
+            armed(Some("reviewer")),
+            environment.clone(),
+        );
+
+        finish_a_turn(&manager, &host).await;
+
+        // The reviewer role is checked for a running second opinion first.
+        let (_, action, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::Status))
+            .await;
+        assert!(matches!(action, ReviewerAction::Status));
+        let _ = reply.send(Ok(ReviewerOutcome::Status(Box::new(operational()))));
+
+        // Then the capture that defines what is under review.
+        let (_, action, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::CaptureDelta { .. }))
+            .await;
+        assert!(matches!(action, ReviewerAction::CaptureDelta { .. }));
+        assert!(
+            host.refuses_prompt(session),
+            "the review holds the session's prompts from the moment it opens"
+        );
+        // Nothing changed, so the review records its baseline and resolves.
+        let _ = reply.send(Ok(ReviewerOutcome::Delta {
+            repositories: vec![crate::hel_worker::RepoDelta {
+                root: std::path::PathBuf::from("/workspace/app"),
+                baseline_tree: None,
+                current_tree: "first-tree".to_owned(),
+                patch: String::new(),
+                diffstat: "0 files changed".to_owned(),
+                changed_lines: 0,
+            }],
+        }));
+
+        let (_, action, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::AdvanceBaseline { .. }))
+            .await;
+        let ReviewerAction::AdvanceBaseline { trees } = action else {
+            unreachable!("matched above");
+        };
+        assert_eq!(
+            trees
+                .get(std::path::Path::new("/workspace/app"))
+                .map(String::as_str),
+            Some("first-tree"),
+            "the capture becomes the baseline the next review measures from"
+        );
+        let _ = reply.send(Ok(ReviewerOutcome::BaselineAdvanced));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.refuses_prompt(session) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a resolved review releases the session's prompts");
+        assert!(host.view(session).is_none(), "the review is over");
+    }
+
+    /// Queued prompts hold the review back: reviewing now would hold work the
+    /// user has already sent, and the review after the queue drains covers the
+    /// whole batch anyway.
+    #[tokio::test]
+    async fn queued_prompts_hold_a_review_back() {
+        let session = session_id("queued00000");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let host = TurnReviewHost::spawn_in(
+            manager.control.clone(),
+            armed(Some("reviewer")),
+            environment.clone(),
+        );
+
+        let mut queued = view(session, crate::hel_state::MaterializedExecutionState::Idle);
+        if let Some(snapshot) = queued.snapshot.as_mut() {
+            snapshot.materialized.queued_prompts =
+                vec![crate::hel_state::MaterializedQueuedPrompt {
+                    command_id: "queued-1".to_owned(),
+                    kind: crate::hel_state::QueuedCommandKind::Prompt,
+                    content: vec![serde_json::json!({"type": "text", "text": "next"})],
+                    queued_at_ms: 0,
+                }];
+        }
+        host.observe(
+            session,
+            &view(
+                session,
+                crate::hel_state::MaterializedExecutionState::Running { started_at_ms: 0 },
+            ),
+        );
+        host.observe(session, &queued);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), manager.requests.recv())
+                .await
+                .is_err(),
+            "no review starts while prompts are queued"
+        );
+        let refusal = host
+            .start(session, true)
+            .await
+            .expect_err("a manual review is refused for the same reason");
+        assert!(refusal.0.contains("queued"), "{refusal}");
+    }
+
+    /// Resolutions are gated on the verdict the review actually reached, in
+    /// the host rather than in any surface, so every surface gets the same
+    /// answer.
+    #[tokio::test]
+    async fn resolving_a_review_that_has_no_verdict_is_refused() {
+        let session = session_id("resolution0");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let host = TurnReviewHost::spawn_in(
+            manager.control.clone(),
+            armed(Some("reviewer")),
+            environment.clone(),
+        );
+
+        let error = host
+            .resolve(session, Resolution::Forwarded)
+            .await
+            .expect_err("there is no review at all");
+        assert!(error.contains("no review is open"), "{error}");
+
+        finish_a_turn(&manager, &host).await;
+        let (_, _, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::CaptureDelta { .. }))
+            .await;
+        let _ = reply.send(Ok(ReviewerOutcome::Delta {
+            repositories: vec![crate::hel_worker::RepoDelta {
+                root: std::path::PathBuf::from("/workspace/app"),
+                baseline_tree: Some("base".to_owned()),
+                current_tree: "new".to_owned(),
+                patch: "diff --git a/a b/a\n@@\n+one\n".to_owned(),
+                diffstat: "1 file changed, 1 insertion(+)".to_owned(),
+                changed_lines: 1,
+            }],
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.view(session).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the review is open");
+
+        let error = host
+            .resolve(session, Resolution::Forwarded)
+            .await
+            .expect_err("nothing has been found yet");
+        assert!(error.contains("no findings"), "{error}");
+        let error = host
+            .resolve(session, Resolution::Dismissed)
+            .await
+            .expect_err("nothing has been decided yet");
+        assert!(error.contains("verdict"), "{error}");
+        // Cancel is always available, which is what keeps a surface from ever
+        // being stuck with an open review it cannot end.
+        host.resolve(session, Resolution::Cancelled)
+            .await
+            .expect("cancel needs no verdict");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.refuses_prompt(session) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling releases the prompts");
+    }
+
+    /// A relay event carrying one agent message, for the answer a role's
+    /// journal reports.
+    fn agent_event(ordinal: u64, previous_digest: &str, text: &str) -> RelayEvent {
+        let mut event = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V1,
+            ordinal,
+            previous_digest: previous_digest.to_owned(),
+            digest: String::new(),
+            recorded_at_ms: i64::try_from(ordinal).unwrap_or_default() * 100,
+            command_id: None,
+            observation: RelayObservation::SessionUpdate {
+                update: Box::new(
+                    agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                        agent_client_protocol::schema::v1::ContentChunk::new(
+                            agent_client_protocol::schema::v1::ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new(text),
+                            ),
+                        ),
+                    ),
+                ),
+            },
+        };
+        event.digest = relay_event_digest(&event).expect("digest");
+        event
+    }
+
+    fn completion_event(ordinal: u64, previous_digest: &str, command_id: &str) -> RelayEvent {
+        let mut event = RelayEvent {
+            format: RELAY_EVENT_FORMAT_V1,
+            ordinal,
+            previous_digest: previous_digest.to_owned(),
+            digest: String::new(),
+            recorded_at_ms: i64::try_from(ordinal).unwrap_or_default() * 100,
+            command_id: Some(command_id.to_owned()),
+            observation: RelayObservation::CommandCompleted {
+                command_id: command_id.to_owned(),
+                outcome: RelayCommandOutcome::Prompt {
+                    stop_reason: "end_turn".to_owned(),
+                },
+            },
+        };
+        event.digest = relay_event_digest(&event).expect("digest");
+        event
+    }
+
+    /// A role's answer is read from its own journal, and it is the completion
+    /// record for the exact command the driver submitted that says the answer
+    /// is final -- not merely the newest message in the journal.
+    #[tokio::test]
+    async fn a_clean_reviewer_report_resolves_the_review() {
+        let session = session_id("cleanreport");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let host = TurnReviewHost::spawn_in(
+            manager.control.clone(),
+            armed(Some("reviewer")),
+            environment.clone(),
+        );
+        finish_a_turn(&manager, &host).await;
+
+        let (_, _, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::CaptureDelta { .. }))
+            .await;
+        let _ = reply.send(Ok(ReviewerOutcome::Delta {
+            repositories: vec![crate::hel_worker::RepoDelta {
+                root: std::path::PathBuf::from("/workspace/app"),
+                baseline_tree: Some("base".to_owned()),
+                current_tree: "new".to_owned(),
+                patch: "diff --git a/a b/a\n@@\n+one\n".to_owned(),
+                diffstat: "1 file changed, 1 insertion(+)".to_owned(),
+                changed_lines: 1,
+            }],
+        }));
+
+        // The reviewer's harness starts, and the host prompts it.
+        let (role, _, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::Start { .. }))
+            .await;
+        assert_eq!(role.as_deref(), Some(super::super::driver::REVIEWER_ROLE));
+        let _ = reply.send(Ok(ReviewerOutcome::Started(Box::new(
+            crate::hel_worker_client::StartedReviewer {
+                native_session_id: None,
+                config_options: Vec::new(),
+                reused: false,
+                state: operational(),
+            },
+        ))));
+
+        let (_, action, reply) = manager
+            .next_reviewer(|role, action| {
+                role.as_deref() == Some(super::super::driver::REVIEWER_ROLE)
+                    && matches!(action, ReviewerAction::Submit { .. })
+            })
+            .await;
+        let ReviewerAction::Submit {
+            command_id,
+            command,
+        } = action
+        else {
+            unreachable!("matched above");
+        };
+        let RelayCommand::Prompt { prompt } = command else {
+            panic!("a reviewing role is prompted");
+        };
+        assert!(
+            format!("{prompt:?}").contains("+one"),
+            "the reviewer is given the captured change"
+        );
+        let _ = reply.send(Ok(ReviewerOutcome::Accepted { ordinal: 1 }));
+
+        // Its journal reports a clean answer, ending the command it was given.
+        let (_, _, reply) = manager
+            .next_reviewer(|role, action| {
+                role.as_deref() == Some(super::super::driver::REVIEWER_ROLE)
+                    && matches!(action, ReviewerAction::Attach { .. })
+            })
+            .await;
+        let answer = agent_event(
+            1,
+            crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST,
+            "No findings.",
+        );
+        let completion = completion_event(2, &answer.digest, &command_id);
+        let through_digest = completion.digest.clone();
+        let _ = reply.send(Ok(ReviewerOutcome::Attached(Box::new(
+            crate::hel_worker_client::RelayAttachment {
+                state: operational(),
+                events: vec![answer, completion],
+                through_ordinal: 2,
+                through_digest,
+            },
+        ))));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.refuses_prompt(session) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a clean review releases the turn by itself");
+        assert!(host.view(session).is_none());
+
+        // The reviewer ran under the configured profile, and only the
+        // supervisor is ever given the tool that launches specialists.
+        assert_eq!(
+            environment.staged_roles(),
+            vec![("reviewer".to_owned(), 1, false)]
+        );
+        // A resolved review records what it reviewed through, so the next one
+        // measures from here.
+        let recorded = environment.state();
+        assert_eq!(
+            recorded
+                .baselines
+                .get(std::path::Path::new("/workspace/app"))
+                .map(String::as_str),
+            Some("new")
+        );
+        assert_eq!(recorded.reviewed_through_ordinal, 12);
+        assert_eq!(recorded.active, None);
     }
 }

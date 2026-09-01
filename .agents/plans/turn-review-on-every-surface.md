@@ -18,12 +18,23 @@ To see it working: set `[review] enabled = true` and `profile = "<a harness prof
 
 ## Progress
 
-- [ ] Milestone 1: the daemon hosts the driver, armed and pointed at its reviewer by the new `[review]` config section (trigger, execution, lock, and state ownership move out of the TUI; the terminal experience is unchanged).
+- [x] (2026-09-01 12:10Z) Milestone 1: the daemon hosts the driver. `src/hel_review/host.rs` owns every review; `[review]` in `config.toml` arms it and names the reviewer; the authoritative prompt lock is in the daemon's submit path; `RuntimeSnapshot.reviews` projects reviews to the TUI, which now renders and resolves rather than hosting. Host tests drive a whole headless review through a hand-written fake session manager.
 - [ ] Milestone 2: the phone surface (review projection on `ViewerSession`, review card with resolution buttons, `/review` and `/review status` on the phone palette). Milestones 1 and 2 must ship in the same release; between them a phone-driven armed session could hit the lock with no buttons.
-- [ ] Milestone 3: the composer command becomes one-off + status only, and the `turn_review_settings` workspace table is dropped.
+- [x] (2026-09-01 12:10Z) Milestone 3 (landed with Milestone 1, because deleting the settings action forced the command reshape): `/review` is one-off plus `status`; `on|off|quick|extended` name the config keys; migration 21 drops `turn_review_settings`.
 - [ ] Milestone 4: recovery under daemon ownership, removal of the superseded TUI code paths, parity-note update, retrospective.
 
 ## Surprises & Discoveries
+
+Findings from implementation (2026-09-01):
+
+- Observation: mjolnir's orchestrator tags every review outcome with an epoch and drops the ones that no longer match (`mj-core/src/orchestrator.rs`, the `review_outcome_rx` arm), and guards a second start with `discrete_review_started`. The host as first written had neither: keyed only by session id, a capture or role-start landing after a cancel would have been applied to whatever review started next, and an automatic trigger racing a manual `/review` would have created two reviews with the second overwriting the first. Both rules are now ported, with the mj citation at the code.
+  Evidence: `HostEvent::Step { epoch, .. }` and `HostState::preparing` in `src/hel_review/host.rs`.
+- Observation: the host's startup sweep of interrupted reviews was awaited *before* its event loop, so a slow or contended database delayed every review; under a loaded test run it stalled the host entirely and three host tests timed out. It now runs beside the loop and reports through an event.
+  Evidence: `host_loop` in `src/hel_review/host.rs`; the three tests pass in the full suite only after the change.
+- Observation: everything the host needs from outside is the controller and its database, so both went behind one `ReviewEnvironment` trait. That is what lets a host test drive a complete review -- capture, role launch, journal read, verdict, baseline advance -- with no container, no harness, and no touching of the developer's real `config.toml` or database. `RuntimeState::new_with_controller_loader` is the same seam one layer up.
+  Evidence: `ReviewEnvironment` and `FakeEnvironment` in `src/hel_review/host.rs`.
+- Observation: the prompt lock is a process-wide map keyed by session id (there is one daemon per machine and one host in it), so two tests sharing a session id release each other's locks. Each host test now uses its own id.
+  Evidence: `session_id(test)` in the host's tests.
 
 Findings from the research pass that shaped this plan (2026-09-01; all citations verified that day):
 
