@@ -494,6 +494,7 @@ pub(crate) async fn run_server(
             operational: &operational,
             operations: &operations,
             capacity: &viewer_capacity(&capacity_state),
+            reviews: &review_views(&daemon_runtime),
         },
         revision,
     ));
@@ -618,6 +619,7 @@ pub(crate) async fn run_server(
                         operational: &operational,
                         operations: &operations,
                         capacity: &viewer_capacity(&capacity_state),
+                        reviews: &review_views(&daemon_runtime),
                     },
                     $revision,
                 )) {
@@ -1147,6 +1149,7 @@ pub(crate) async fn run_server(
                                 operational: &operational,
                                 operations: &operations,
                                 capacity: &viewer_capacity(&capacity_state),
+                                reviews: &review_views(&daemon_runtime),
                             },
                             revision,
                         )) {
@@ -1344,7 +1347,9 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
         | ControllerAction::Rename { session_id, .. }
         | ControllerAction::CancelTurn { session_id }
         | ControllerAction::SetConfig { session_id, .. }
-        | ControllerAction::SetPlanMode { session_id, .. } => Some(session_id.clone()),
+        | ControllerAction::SetPlanMode { session_id, .. }
+        | ControllerAction::StartReview { session_id }
+        | ControllerAction::ResolveReview { session_id, .. } => Some(session_id.clone()),
         // A refresh belongs to a profile or a target rather than a session, so
         // it takes no session slot and cannot be refused as session-busy.
         ControllerAction::RefreshQuota { .. } | ControllerAction::RefreshCapacity { .. } => None,
@@ -1668,6 +1673,32 @@ async fn apply_phone_action(
             controller.rename_session(&session_id, &title)?;
             Ok(())
         }
+        ControllerAction::StartReview { session_id } => {
+            // The refusal is a sentence for the person holding the phone --
+            // "prompts are queued", "set [review] profile in config.toml" --
+            // so it travels as the error text of this action.
+            services
+                .daemon_runtime
+                .review_host()
+                .start(&session_id, true)
+                .await
+                .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+            Ok(())
+        }
+        ControllerAction::ResolveReview {
+            session_id,
+            resolution,
+        } => {
+            let resolution = hel::hel_server::resolution_from_name(&resolution)
+                .context("a review is resolved by forward, dismiss, or cancel")?;
+            services
+                .daemon_runtime
+                .review_host()
+                .resolve(&session_id, resolution)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(())
+        }
         ControllerAction::CancelTurn { session_id } => {
             services
                 .sessions
@@ -1757,6 +1788,9 @@ struct PhoneSessionViews<'a> {
     operations: &'a std::collections::BTreeMap<String, hel::hel_server::ViewerOperation>,
     /// The most recent capacity reading per probe target.
     capacity: &'a [hel::hel_server::ViewerTargetCapacity],
+    /// Reviews the daemon is running, keyed by session. The phone renders the
+    /// same review the terminal does, from the same host.
+    reviews: &'a std::collections::BTreeMap<String, hel::hel_review::host::RuntimeReviewView>,
 }
 
 /// What the phone server remembers about one probe target between readings.
@@ -1966,6 +2000,75 @@ fn phone_prompt_blocks(
     prompt
 }
 
+/// The Hel commands a phone may offer for one session.
+///
+/// The list is built here, from what this session can actually do, and
+/// published: the browser used to keep its own copy, which is how `/review`
+/// was missing from the phone while the terminal had it.
+fn phone_commands(
+    session: &hel::hel_server::ViewerSession,
+) -> Vec<hel::hel_server::ViewerHelCommand> {
+    let command =
+        |name: &str, description: &str, argument: Option<&str>| hel::hel_server::ViewerHelCommand {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            argument: argument.map(str::to_owned),
+        };
+    let mut commands = vec![
+        command("help", "show available Hel and agent commands", None),
+        command(
+            "detach",
+            "leave the conversation without stopping the worker",
+            None,
+        ),
+    ];
+    let option = |key: &str| {
+        session
+            .config_options
+            .iter()
+            .any(|option| option.key == key)
+    };
+    if option("model") {
+        commands.push(command("model", "change the active model", Some("value")));
+        commands.push(command("fast", "toggle Codex Fast mode", None));
+    }
+    if option("effort") {
+        commands.push(command(
+            "effort",
+            "change the active reasoning effort",
+            Some("value"),
+        ));
+    }
+    if session.plan_mode_active.is_some() && session.capabilities.set_plan_mode {
+        commands.push(command("plan", "toggle plan mode", Some("message")));
+        commands.push(command(
+            "implement",
+            "leave plan mode and implement",
+            Some("instruction"),
+        ));
+    }
+    if session.capabilities.prompt || session.turn_review.is_some() {
+        commands.push(command(
+            "review",
+            "review the finished turn now, or report how review is configured",
+            Some("status"),
+        ));
+    }
+    commands
+}
+
+/// The open reviews, keyed by session, for one snapshot.
+fn review_views(
+    daemon_runtime: &Arc<RuntimeState>,
+) -> std::collections::BTreeMap<String, hel::hel_review::host::RuntimeReviewView> {
+    daemon_runtime
+        .review_host()
+        .views()
+        .into_iter()
+        .map(|review| (review.session_id.clone(), review))
+        .collect()
+}
+
 fn viewer_snapshot(
     controller: &Controller,
     workspaces: &[hel::hel_workspace::WorkspaceRecord],
@@ -1975,6 +2078,7 @@ fn viewer_snapshot(
 ) -> ViewerSnapshot {
     let PhoneSessionViews {
         conversations,
+        reviews,
         queued_prompts,
         active_user_shells,
         pending_elicitations,
@@ -2093,6 +2197,10 @@ fn viewer_snapshot(
             .as_ref()
             .filter(|facts| facts.supports_plan_mode())
             .map(hel::hel_acp::AcpSessionFacts::plan_mode_active);
+        session.turn_review = reviews
+            .get(&session.id)
+            .map(hel::hel_server::ViewerTurnReview::from_runtime);
+        session.available_commands = phone_commands(session);
         session.capabilities =
             session_capabilities(session, live, operations.get(&session.id), facts.as_ref());
         if let Some(transcript) = conversations.get(&session.id) {
@@ -2579,6 +2687,7 @@ mod tests {
                     operational: &std::collections::BTreeMap::new(),
                     operations: &std::collections::BTreeMap::new(),
                     capacity: &[],
+                    reviews: &std::collections::BTreeMap::new(),
                 },
                 1,
             )

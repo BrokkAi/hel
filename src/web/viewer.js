@@ -49,6 +49,7 @@ const login = document.querySelector('#login'),
   queue = document.querySelector('#conversation-queue'),
   shells = document.querySelector('#conversation-shells'),
   elicitations = document.querySelector('#elicitations'),
+  reviewHost = document.querySelector('#turn-review'),
   promptText = document.querySelector('#prompt-text'),
   attachments = document.querySelector('#attachments'),
   attachImage = document.querySelector('#attach-image'),
@@ -1005,6 +1006,7 @@ async function refresh() {
       }
       renderQueue(session);
       renderElicitations(session);
+      renderTurnReview(session);
       renderAttachments();
       renderConversationHeader(session);
     }
@@ -1063,6 +1065,8 @@ function renderQueue(session) {
 // user is answering would wipe the half-filled form and steal focus, so each
 // pending request keeps its live DOM until the request itself changes or
 // leaves the snapshot.
+/// The review last drawn, so the card is rebuilt only when it changes.
+let reviewSignature = null;
 const elicitationCards = new Map(),
   sentElicitations = new Set();
 function elicitationKey(sessionId, id) {
@@ -1251,6 +1255,71 @@ function buildElicitationCard(session, request) {
     },
   };
 }
+// ---------------------------------------------------------------------------
+// Turn review
+// ---------------------------------------------------------------------------
+//
+// The review runs in the daemon; this renders what it published and sends the
+// resolution back. Both surfaces show the same review, and either can end it,
+// which is what keeps a review from ever locking a phone out of its session.
+
+/// Draws the review card, or takes it down when no review is open.
+///
+/// Rebuilt only when the published review actually changed, so a thumb resting
+/// on a button does not lose it every two seconds.
+function renderTurnReview(session) {
+  const review = session?.turn_review || null;
+  const signature = JSON.stringify(review);
+  if (reviewSignature === signature) return;
+  reviewSignature = signature;
+  if (!review) {
+    reviewHost.replaceChildren();
+    return;
+  }
+  const card = el('section', 'card turn-review');
+  card.append(el('strong', '', `Reviewing this turn (${review.tier})`));
+  if (review.roles.length) {
+    const strip = el('p', 'dim turn-review-roles');
+    strip.textContent = review.roles
+      .map(role => `${role.label}: ${role.state}`)
+      .join('  ·  ');
+    card.append(strip);
+  }
+  const verdict = review.verdict || null;
+  if (verdict && verdict.text) {
+    const findings = el('pre', 'turn-review-findings');
+    findings.textContent = verdict.text;
+    card.append(findings);
+  }
+  card.append(el('p', 'dim', review.status));
+  const actions = el('div', 'row');
+  for (const [resolution, label, className] of [
+    ['forward', 'Forward findings', ''],
+    ['dismiss', 'Dismiss', 'secondary'],
+    ['cancel', 'Cancel', 'danger'],
+  ]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    if (className) button.className = className;
+    // Cancel always works; the rest wait for the verdict the daemon
+    // published, and the daemon refuses anything else anyway.
+    button.disabled =
+      resolution !== 'cancel' && !(verdict?.allowed || []).includes(resolution);
+    button.addEventListener('click', () => {
+      button.disabled = true;
+      sendAction({
+        action: 'resolve-review',
+        session_id: session.id,
+        resolution,
+      });
+    });
+    actions.append(button);
+  }
+  card.append(actions);
+  reviewHost.replaceChildren(card);
+}
+
 function renderElicitations(session) {
   const pending = (session && session.pending_elicitations) || [];
   if (session)
@@ -1637,16 +1706,6 @@ async function searchHistory(query) {
 // here and a check there ever disagree, the Rust one is right and this one is
 // the bug.
 
-const HEL_COMMANDS = [
-  { name: 'help', description: 'show available Hel and agent commands' },
-  { name: 'detach', description: 'leave the conversation without stopping the worker' },
-  { name: 'model', description: 'change the active model', argument: 'value' },
-  { name: 'effort', description: 'change the active reasoning effort', argument: 'value' },
-  { name: 'fast', description: 'toggle Codex Fast mode' },
-  { name: 'plan', description: 'toggle plan mode', argument: 'message' },
-  { name: 'implement', description: 'leave plan mode and implement', argument: 'instruction' },
-];
-
 function activeSession() {
   return snapshot?.sessions.find(session => session.id === currentSession);
 }
@@ -1657,19 +1716,11 @@ function configOption(key) {
 
 /// The commands offered for what has been typed so far.
 ///
-/// A command whose rule the session cannot satisfy is not offered: `/plan` on a
-/// harness with no plan mode, or `/model` on one that advertised no models.
+/// The list is the daemon's: it knows what this session's harness advertised
+/// and what Hel itself offers, and publishing it is what keeps the phone from
+/// missing a command the terminal has.
 function availableCommands() {
-  const session = activeSession();
-  return HEL_COMMANDS.filter(command => {
-    if (command.name === 'model' || command.name === 'effort')
-      return Boolean(configOption(command.name));
-    if (command.name === 'plan' || command.name === 'implement') {
-      return session?.plan_mode_active !== undefined && session?.capabilities?.set_plan_mode;
-    }
-    if (command.name === 'fast') return Boolean(configOption('model'));
-    return true;
-  });
+  return activeSession()?.available_commands || [];
 }
 
 let paletteMatches = [];
@@ -1848,6 +1899,28 @@ async function runLocalCommand(text) {
         key: 'model',
         value: target,
       });
+      return true;
+    }
+    case 'review': {
+      const scope = argument.trim().toLowerCase();
+      if (scope === 'status') {
+        // What the daemon published about this session is the answer: whether
+        // a review is running now, and what tier it is running at.
+        const review = session?.turn_review;
+        error.textContent = review
+          ? `A review is open now (${review.tier}): ${review.status}`
+          : 'No review is open. /review reviews the finished turn; automatic review is configured in config.toml under [review].';
+        setComposerText('');
+        return true;
+      }
+      if (scope) {
+        // Arming review is configuration, not a session gesture.
+        error.textContent =
+          'automatic review is configured in config.toml: [review] enabled, tier';
+        setComposerText('');
+        return true;
+      }
+      await sendAction({ action: 'start-review', session_id: currentSession });
       return true;
     }
     case 'plan':
@@ -2128,6 +2201,7 @@ async function openConversation(id) {
   document.querySelector('#conversation-state').textContent = session.state;
   renderQueue(session);
   renderElicitations(session);
+  renderTurnReview(session);
   renderConversationHeader(session);
   promptImages = [];
   renderAttachments();
@@ -2153,7 +2227,15 @@ function renderConversationHeader(session) {
     ? 'The agent is working; this will queue'
     : 'Message the agent or use !command';
   sendButton.textContent = running || queued ? 'Queue' : 'Send';
-  const canPrompt = session.capabilities?.prompt !== false;
+  // A review holds the turn it reviewed: the daemon refuses prompts for this
+  // session until it resolves, so the composer says so rather than letting a
+  // person type into a refusal.
+  const reviewing = Boolean(session.turn_review);
+  if (reviewing) {
+    promptText.dataset.placeholder =
+      'A review of the last turn is open \u2014 forward, dismiss or cancel it';
+  }
+  const canPrompt = session.capabilities?.prompt !== false && !reviewing;
   promptText.setAttribute('contenteditable', String(canPrompt));
   sendButton.disabled = !canPrompt || promptInFlight;
   if (session.plan_mode_active) {
@@ -2175,6 +2257,8 @@ function leaveConversation() {
   feed.replaceChildren();
   elicitations.replaceChildren();
   elicitationCards.clear();
+  reviewHost.replaceChildren();
+  reviewSignature = null;
   promptImages = [];
   renderAttachments();
 }

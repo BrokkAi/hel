@@ -19,7 +19,7 @@ To see it working: set `[review] enabled = true` and `profile = "<a harness prof
 ## Progress
 
 - [x] (2026-09-01 12:10Z) Milestone 1: the daemon hosts the driver. `src/hel_review/host.rs` owns every review; `[review]` in `config.toml` arms it and names the reviewer; the authoritative prompt lock is in the daemon's submit path; `RuntimeSnapshot.reviews` projects reviews to the TUI, which now renders and resolves rather than hosting. Host tests drive a whole headless review through a hand-written fake session manager.
-- [ ] Milestone 2: the phone surface (review projection on `ViewerSession`, review card with resolution buttons, `/review` and `/review status` on the phone palette). Milestones 1 and 2 must ship in the same release; between them a phone-driven armed session could hit the lock with no buttons.
+- [x] (2026-09-01 14:05Z) Milestone 2: the phone surface. `ViewerSession.turn_review` and `available_commands` are published from the same host the terminal reads; the viewer draws a review card with the role strip, the findings, and Forward / Dismiss / Cancel; the composer stands down while a review is open; `start-review` and `resolve-review` are validated on both sides; `/review` and `/review status` work from the phone composer.
 - [x] (2026-09-01 12:10Z) Milestone 3 (landed with Milestone 1, because deleting the settings action forced the command reshape): `/review` is one-off plus `status`; `on|off|quick|extended` name the config keys; migration 21 drops `turn_review_settings`.
 - [ ] Milestone 4: recovery under daemon ownership, removal of the superseded TUI code paths, parity-note update, retrospective.
 

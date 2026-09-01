@@ -304,6 +304,8 @@ impl ViewerSnapshot {
                     chat_phase: ViewerChatPhase::default(),
                     config_options: Vec::new(),
                     plan_mode_active: None,
+                    turn_review: None,
+                    available_commands: Vec::new(),
                     // What the durable record alone can justify. The phone server
                     // widens these once it knows whether the session manager holds
                     // the session and what the agent has advertised.
@@ -457,7 +459,124 @@ pub struct ViewerSession {
     /// Whether plan mode is on, or `None` when this harness has no plan mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode_active: Option<bool>,
+    /// The review the daemon is running for this session, if any. A phone
+    /// renders the same review the terminal does and resolves it the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_review: Option<ViewerTurnReview>,
+    /// The Hel commands this session accepts, published rather than hardcoded
+    /// in the browser: a command list kept in two places is a command list that
+    /// drifts, which is how `/review` went missing from the phone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_commands: Vec<ViewerHelCommand>,
     pub capabilities: ViewerSessionCapabilities,
+}
+
+/// One Hel command a phone may offer for this session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerHelCommand {
+    pub name: String,
+    pub description: String,
+    /// What the argument is called, when the command takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument: Option<String>,
+}
+
+/// A turn review as a phone renders it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerTurnReview {
+    /// `quick` or `extended`.
+    pub tier: String,
+    /// What the review is doing, in one line.
+    pub status: String,
+    /// One row per reviewing agent: its label and where it has got to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<ViewerReviewRole>,
+    /// Present once the review has reached a verdict the user must answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<ViewerReviewVerdict>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerReviewRole {
+    pub label: String,
+    /// `pending`, `running`, `clean`, `findings`, or `failed`.
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerReviewVerdict {
+    /// `clean`, `findings`, or `failed`.
+    pub kind: String,
+    /// The findings, or the failure's reason.
+    pub text: String,
+    /// The resolutions this verdict accepts: `forward`, `dismiss`, `cancel`.
+    /// A phone shows the rest disabled rather than hiding them, so the buttons
+    /// do not move under a thumb.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<String>,
+}
+
+impl ViewerTurnReview {
+    /// The phone's view of one review the daemon is running.
+    #[must_use]
+    pub fn from_runtime(review: &crate::hel_review::host::RuntimeReviewView) -> Self {
+        Self {
+            tier: review.tier.label().to_owned(),
+            status: review.status.clone(),
+            roles: review
+                .roles
+                .iter()
+                .map(|role| ViewerReviewRole {
+                    label: role.label.clone(),
+                    state: role.state.label().to_owned(),
+                })
+                .collect(),
+            verdict: review.verdict.as_ref().map(|verdict| ViewerReviewVerdict {
+                kind: match verdict.kind {
+                    crate::hel_review::host::VerdictKind::Clean => "clean",
+                    crate::hel_review::host::VerdictKind::Findings => "findings",
+                    crate::hel_review::host::VerdictKind::Failed => "failed",
+                }
+                .to_owned(),
+                text: verdict.text.clone(),
+                allowed: verdict
+                    .allowed
+                    .iter()
+                    .filter_map(resolution_name)
+                    .map(str::to_owned)
+                    .collect(),
+            }),
+        }
+    }
+}
+
+/// The wire name of one resolution, shared by the projection and the action
+/// that performs it, so a button's name is the name the server accepts.
+#[must_use]
+pub fn resolution_name(resolution: &crate::hel_review::driver::Resolution) -> Option<&'static str> {
+    match resolution {
+        crate::hel_review::driver::Resolution::Forwarded => Some("forward"),
+        crate::hel_review::driver::Resolution::Dismissed => Some("dismiss"),
+        crate::hel_review::driver::Resolution::Cancelled => Some("cancel"),
+        // Not resolutions a surface asks for: the review reaches these itself.
+        crate::hel_review::driver::Resolution::NothingToReview
+        | crate::hel_review::driver::Resolution::CoverageStarted => None,
+    }
+}
+
+/// The resolution a phone's button asked for.
+#[must_use]
+pub fn resolution_from_name(name: &str) -> Option<crate::hel_review::driver::Resolution> {
+    match name {
+        "forward" => Some(crate::hel_review::driver::Resolution::Forwarded),
+        "dismiss" => Some(crate::hel_review::driver::Resolution::Dismissed),
+        "cancel" => Some(crate::hel_review::driver::Resolution::Cancelled),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -813,6 +932,16 @@ pub enum ControllerAction {
     },
     Cancel {
         session_id: String,
+    },
+    /// Review the turn this session just finished.
+    StartReview {
+        session_id: String,
+    },
+    /// Forward the findings, dismiss them, or cancel the open review.
+    ResolveReview {
+        session_id: String,
+        /// `forward`, `dismiss`, or `cancel`.
+        resolution: String,
     },
     RemoveQueuedPrompt {
         session_id: String,
@@ -1700,9 +1829,38 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
         }
         ControllerAction::Open { session_id }
         | ControllerAction::Close { session_id }
-        | ControllerAction::Cancel { session_id } => {
+        | ControllerAction::Cancel { session_id }
+        | ControllerAction::StartReview { session_id } => {
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
+        }
+        ControllerAction::ResolveReview {
+            session_id,
+            resolution,
+        } => {
+            validate_public_id(session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            let Some(resolution) = resolution_from_name(resolution) else {
+                return Err(ApiError::bad_request(
+                    "a review is resolved by forward, dismiss, or cancel",
+                ));
+            };
+            let Some(review) = session.turn_review.as_ref() else {
+                return Err(ApiError::bad_request("no review is open for that session"));
+            };
+            // Cancel is always available; the rest wait for the verdict the
+            // daemon published, which is the same gate the daemon enforces
+            // when it actually resolves.
+            let allowed = resolution == crate::hel_review::driver::Resolution::Cancelled
+                || review.verdict.as_ref().is_some_and(|verdict| {
+                    resolution_name(&resolution)
+                        .is_some_and(|name| verdict.allowed.iter().any(|allowed| allowed == name))
+                });
+            if !allowed {
+                return Err(ApiError::bad_request(
+                    "that review cannot be resolved that way yet",
+                ));
+            }
         }
         ControllerAction::Rename { session_id, title } => {
             validate_public_id(session_id)?;
@@ -4142,6 +4300,141 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
         )
         .unwrap_err();
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    /// A review the daemon is running reaches the phone whole: its tier, what
+    /// each reviewing agent is doing, and the findings to answer.
+    #[test]
+    fn a_running_review_projects_to_the_phone() {
+        use crate::hel_review::driver::{Resolution, RoleState, RoleStatus, TurnReviewPhase};
+        use crate::hel_review::host::{RuntimeReviewView, VerdictKind, VerdictView};
+
+        let review = RuntimeReviewView {
+            session_id: "session-1".into(),
+            tier: crate::hel_review::lanes::ReviewTier::Extended,
+            phase: TurnReviewPhase::Verdict(crate::hel_review::verdict::ReviewVerdict::Findings {
+                synthesis: "[P1] src/lib.rs:1 -- unbounded retry".into(),
+                evidence: Default::default(),
+            }),
+            roles: vec![
+                RoleStatus {
+                    role: "supervisor".into(),
+                    label: "Supervisor".into(),
+                    state: RoleState::Clean,
+                },
+                RoleStatus {
+                    role: "tests".into(),
+                    label: "Tests".into(),
+                    state: RoleState::Findings,
+                },
+            ],
+            status: "Enter to act".into(),
+            verdict: Some(VerdictView {
+                kind: VerdictKind::Findings,
+                text: "[P1] src/lib.rs:1 -- unbounded retry".into(),
+                allowed: vec![
+                    Resolution::Forwarded,
+                    Resolution::Dismissed,
+                    Resolution::Cancelled,
+                ],
+            }),
+            started_at_epoch_seconds: 0,
+        };
+
+        let projected = ViewerTurnReview::from_runtime(&review);
+
+        assert_eq!(projected.tier, "extended");
+        assert_eq!(
+            projected
+                .roles
+                .iter()
+                .map(|role| (role.label.as_str(), role.state.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Supervisor", "clean"), ("Tests", "findings")]
+        );
+        let verdict = projected.verdict.expect("a findings verdict travels");
+        assert_eq!(verdict.kind, "findings");
+        assert!(verdict.text.contains("unbounded retry"));
+        assert_eq!(verdict.allowed, vec!["forward", "dismiss", "cancel"]);
+    }
+
+    /// A phone can always cancel a review, and can only forward or dismiss one
+    /// the daemon says is ready for it. The same gate runs in the daemon; this
+    /// one is what makes the refusal immediate.
+    #[test]
+    fn resolving_a_review_is_gated_on_what_the_daemon_published() {
+        let (config, state) = sample_config_state();
+        let mut snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+
+        let resolve = |resolution: &str| ControllerAction::ResolveReview {
+            session_id: "session-1".into(),
+            resolution: resolution.into(),
+        };
+
+        // No review at all.
+        let error = validate_action(&resolve("cancel"), &snapshot).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        snapshot.sessions[0].turn_review = Some(ViewerTurnReview {
+            tier: "quick".into(),
+            status: "the reviewer is reading the change…".into(),
+            roles: Vec::new(),
+            verdict: None,
+        });
+        // Running: cancel works, the rest do not.
+        validate_action(&resolve("cancel"), &snapshot).unwrap();
+        assert_eq!(
+            validate_action(&resolve("forward"), &snapshot)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+
+        // A failed review can be dismissed but has nothing to forward.
+        snapshot.sessions[0].turn_review = Some(ViewerTurnReview {
+            tier: "quick".into(),
+            status: "the review failed".into(),
+            roles: Vec::new(),
+            verdict: Some(ViewerReviewVerdict {
+                kind: "failed".into(),
+                text: "bifrost exited with 1".into(),
+                allowed: vec!["dismiss".into(), "cancel".into()],
+            }),
+        });
+        validate_action(&resolve("dismiss"), &snapshot).unwrap();
+        assert_eq!(
+            validate_action(&resolve("forward"), &snapshot)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        // A resolution that is not one of the three is refused by name.
+        assert_eq!(
+            validate_action(&resolve("approve"), &snapshot)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Starting a review needs only a session that exists.
+        validate_action(
+            &ControllerAction::StartReview {
+                session_id: "session-1".into(),
+            },
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_action(
+                &ControllerAction::StartReview {
+                    session_id: "not-managed".into(),
+                },
+                &snapshot,
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
