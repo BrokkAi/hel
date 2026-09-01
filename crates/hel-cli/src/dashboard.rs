@@ -1027,21 +1027,11 @@ impl DashboardContext {
         tokio::spawn(async move {
             let seeded = tokio::task::spawn_blocking({
                 let session_id = session_id.clone();
-                move || -> anyhow::Result<Option<MaterializedSession>> {
-                    let Some((applied_event_ordinal, applied_event_digest)) =
-                        hel::hel_database::materialized_event_frontier(&session_id)?
-                    else {
-                        return Ok(None);
-                    };
-                    let transcript = hel::hel_database::load_materialized_transcript_tail(
+                move || {
+                    hel::hel_database::load_materialized_projection_tail(
                         &session_id,
                         hel::hel_chat::TAIL_SEED_ITEMS,
-                    )?;
-                    let mut materialized = MaterializedSession::empty(session_id);
-                    materialized.applied_event_ordinal = applied_event_ordinal;
-                    materialized.applied_event_digest = applied_event_digest;
-                    materialized.transcript = transcript;
-                    Ok(Some(materialized))
+                    )
                 }
             })
             .await;
@@ -1049,7 +1039,7 @@ impl DashboardContext {
             // which is where the full projection comes from anyway. It is not
             // worth failing a resume that otherwise succeeded.
             let materialized = match seeded {
-                Ok(Ok(Some(materialized))) => materialized,
+                Ok(Ok(Some((materialized, _)))) => materialized,
                 Ok(Ok(None)) => return,
                 Ok(Err(error)) => {
                     tracing::debug!(%session_id, %error, "transcript tail seed failed");

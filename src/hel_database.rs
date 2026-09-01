@@ -16,9 +16,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use crate::hel_config::data_dir;
 use crate::hel_state::{
     CheckpointMetadata, HelState, HostContainerSize, ManagedWorktree, MaterializedExecutionState,
-    MaterializedQueuedPrompt, MaterializedSession, MaterializedSessionSummary, SessionRecord,
-    SessionResourceAllocation, SessionState, TargetLocator, TranscriptBody, TranscriptItem,
-    validate_relay_event_digest, validate_relay_event_frontier,
+    MaterializedQueuedPrompt, MaterializedSession, MaterializedSessionSummary, ProjectionWindow,
+    SessionRecord, SessionResourceAllocation, SessionState, TargetLocator, TranscriptBody,
+    TranscriptItem, validate_relay_event_digest, validate_relay_event_frontier,
 };
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
@@ -1731,7 +1731,16 @@ fn delete_session_from(path: &Path, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load_materialized_session(session_id: &str) -> Result<Option<MaterializedSession>> {
+/// Load a session's whole projection, transcript and all.
+///
+/// Crate-private on purpose. The cost of this call is everything that has ever
+/// happened in the conversation, and the callers that made that a visible
+/// problem — the runtime poll and the resume reply — were both outside this
+/// crate. What they wanted was [`load_materialized_projection_tail`]; what
+/// they reached for was this, because it was public and its name did not say
+/// otherwise. The remaining caller owns a live projection and genuinely needs
+/// all of it.
+pub(crate) fn load_materialized_session(session_id: &str) -> Result<Option<MaterializedSession>> {
     load_materialized_session_from(&database_path(), session_id)
 }
 
@@ -1838,11 +1847,29 @@ fn load_materialized_session_summary_from(
     }))
 }
 
+/// The oldest visible user message, which is where a session's provisional
+/// title comes from. It sits at the head of the transcript, so a projection
+/// loaded as a tail cannot find it by scanning; this reads it directly.
+fn first_materialized_user_message(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<(u64, String)>> {
+    materialized_user_message(connection, session_id, true)
+}
+
 fn last_materialized_user_message(
     connection: &Connection,
     session_id: &str,
 ) -> Result<Option<(u64, String)>> {
-    let mut statement = connection.prepare(
+    materialized_user_message(connection, session_id, false)
+}
+
+fn materialized_user_message(
+    connection: &Connection,
+    session_id: &str,
+    oldest_first: bool,
+) -> Result<Option<(u64, String)>> {
+    let mut statement = connection.prepare(if oldest_first {
         "SELECT position, body_json
          FROM materialized_transcript_items
          WHERE session_id = ?1
@@ -1854,8 +1881,21 @@ fn last_materialized_user_message(
                END,
                '$.kind'
            ) = 'user'
-         ORDER BY position DESC, stable_id DESC",
-    )?;
+         ORDER BY position, stable_id"
+    } else {
+        "SELECT position, body_json
+         FROM materialized_transcript_items
+         WHERE session_id = ?1
+           AND json_extract(
+               CASE
+                   WHEN stable_id GLOB 'user:*' OR stable_id GLOB 'user-*'
+                   THEN body_json
+                   ELSE '{}'
+               END,
+               '$.kind'
+           ) = 'user'
+         ORDER BY position DESC, stable_id DESC"
+    })?;
     let rows = statement.query_map([session_id], |row| {
         Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -1940,55 +1980,70 @@ fn load_materialized_transcript_tail_from(
     session_id: &str,
     limit: usize,
 ) -> Result<Vec<Arc<TranscriptItem>>> {
+    read_materialized_transcript(&open_reader(path)?, session_id, Some(limit))
+}
+
+/// How many transcript items a polled projection carries.
+///
+/// Every viewer of a polled projection is bounded already: the conversation
+/// pane keeps `hel_chat::TAIL_SEED_ITEMS` (256) entries, and the browser
+/// transcript keeps 1,000 rendered lines. This is set above both, since an
+/// entry renders to at least one line, so the window is the whole of what any
+/// of them would show.
+pub const PROJECTION_TAIL_ITEMS: usize = 1_024;
+
+/// Load a projection carrying only the end of its transcript.
+///
+/// The steady-state poll reloads a session's projection every time anything
+/// about it moves. Loading the whole transcript to do that is work
+/// proportional to everything that has ever happened in the conversation —
+/// 635 MiB and 28,066 items on one measured session — for a view that shows
+/// the last few hundred entries. This reads the window instead, plus the two
+/// facts that live outside it, each with one indexed query. See
+/// [`ProjectionWindow`].
+pub fn load_materialized_projection_tail(
+    session_id: &str,
+    transcript_limit: usize,
+) -> Result<Option<(MaterializedSession, ProjectionWindow)>> {
+    load_materialized_projection_tail_from(&database_path(), session_id, transcript_limit)
+}
+
+fn load_materialized_projection_tail_from(
+    path: &Path,
+    session_id: &str,
+    transcript_limit: usize,
+) -> Result<Option<(MaterializedSession, ProjectionWindow)>> {
     let connection = open_reader(path)?;
-    let mut statement = connection.prepare(
-        "SELECT stable_id, position, latest_content_event_ordinal, created_at_ms,
-                last_changed_at_ms, body_json
-         FROM materialized_transcript_items
-         WHERE session_id = ?1
-         ORDER BY position DESC, stable_id DESC
-         LIMIT ?2",
+    let Some(fields) = read_materialized_session_fields(&connection, session_id)? else {
+        return Ok(None);
+    };
+    let transcript = read_materialized_transcript(&connection, session_id, Some(transcript_limit))?;
+    let total_items = connection.query_row(
+        "SELECT COUNT(*) FROM materialized_transcript_items WHERE session_id = ?1",
+        [session_id],
+        |row| row.get::<_, usize>(0),
     )?;
-    let rows = statement
-        .query_map(params![session_id, limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, Option<u64>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    // The query walks the index backwards to bound what it reads; the caller
-    // wants the tail in the order it was written.
-    let mut items = rows
-        .into_iter()
-        .map(
-            |(
-                stable_id,
-                position,
-                latest_content_event_ordinal,
-                created_at_ms,
-                last_changed_at_ms,
-                body_json,
-            )| {
-                Ok(Arc::new(TranscriptItem {
-                    stable_id,
-                    position,
-                    latest_content_event_ordinal,
-                    created_at_ms,
-                    last_changed_at_ms,
-                    body: serde_json::from_str(&body_json).with_context(|| {
-                        format!("parse materialized transcript body for session {session_id}")
-                    })?,
-                }))
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
-    items.reverse();
-    Ok(items)
+    let window = ProjectionWindow {
+        omitted_items: total_items.saturating_sub(transcript.len()),
+        provisional_title: first_materialized_user_message(&connection, session_id)?
+            .and_then(|(_, text)| crate::hel_state::provisional_session_title(&text)),
+        latest_user_position: last_materialized_user_message(&connection, session_id)?
+            .map(|(position, _)| position),
+    };
+    let materialized = MaterializedSession {
+        session_id: session_id.to_owned(),
+        applied_event_ordinal: fields.applied_event_ordinal,
+        applied_event_digest: fields.applied_event_digest,
+        last_activity_at_ms: fields.last_activity_at_ms,
+        execution: fields.execution,
+        session_title: fields.session_title,
+        configuration: fields.configuration,
+        transcript,
+        queued_prompts: read_materialized_queued_prompts(&connection, session_id)?,
+        pending_elicitations: fields.pending_elicitations,
+    };
+    materialized.validate()?;
+    Ok(Some((materialized, window)))
 }
 
 /// Read only the projection's event frontier. Deciding whether a stored
@@ -2101,6 +2156,40 @@ fn load_materialized_session_with(
     connection: &Connection,
     session_id: &str,
 ) -> Result<Option<MaterializedSession>> {
+    let Some(fields) = read_materialized_session_fields(connection, session_id)? else {
+        return Ok(None);
+    };
+    let materialized = MaterializedSession {
+        session_id: session_id.to_owned(),
+        applied_event_ordinal: fields.applied_event_ordinal,
+        applied_event_digest: fields.applied_event_digest,
+        last_activity_at_ms: fields.last_activity_at_ms,
+        execution: fields.execution,
+        session_title: fields.session_title,
+        configuration: fields.configuration,
+        transcript: read_materialized_transcript(connection, session_id, None)?,
+        queued_prompts: read_materialized_queued_prompts(connection, session_id)?,
+        pending_elicitations: fields.pending_elicitations,
+    };
+    materialized.validate()?;
+    Ok(Some(materialized))
+}
+
+/// Everything a projection holds apart from its transcript and its queue.
+struct MaterializedSessionFields {
+    applied_event_ordinal: u64,
+    applied_event_digest: String,
+    last_activity_at_ms: Option<i64>,
+    execution: MaterializedExecutionState,
+    session_title: Option<String>,
+    configuration: BTreeMap<String, serde_json::Value>,
+    pending_elicitations: Vec<crate::hel_elicitation::ElicitationRequest>,
+}
+
+fn read_materialized_session_fields(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<MaterializedSessionFields>> {
     let row = connection
         .query_row(
             "SELECT applied_event_ordinal, applied_event_digest, last_activity_at_ms,
@@ -2135,31 +2224,64 @@ fn load_materialized_session_with(
     else {
         return Ok(None);
     };
+    Ok(Some(MaterializedSessionFields {
+        applied_event_ordinal,
+        applied_event_digest,
+        last_activity_at_ms,
+        execution: parse_materialized_execution(&execution, running_started_at_ms)?,
+        session_title,
+        configuration: serde_json::from_str(&configuration_json).with_context(|| {
+            format!("parse materialized configuration for session {session_id}")
+        })?,
+        pending_elicitations: serde_json::from_str(&pending_elicitations_json)
+            .with_context(|| format!("parse pending elicitations for session {session_id}"))?,
+    }))
+}
 
-    let configuration = serde_json::from_str(&configuration_json)
-        .with_context(|| format!("parse materialized configuration for session {session_id}"))?;
-    let pending_elicitations = serde_json::from_str(&pending_elicitations_json)
-        .with_context(|| format!("parse pending elicitations for session {session_id}"))?;
-    let mut transcript_statement = connection.prepare(
-        "SELECT stable_id, position, latest_content_event_ordinal, created_at_ms,
-                last_changed_at_ms, body_json
-         FROM materialized_transcript_items
-         WHERE session_id = ?1
-         ORDER BY position, stable_id",
-    )?;
-    let transcript_rows = transcript_statement
-        .query_map([session_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, Option<u64>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let transcript = transcript_rows
+/// Read a session's transcript, oldest first. `limit` reads only that many
+/// items from the end, walking the `materialized_transcript_position` index
+/// backwards so the read costs the rows it returns.
+fn read_materialized_transcript(
+    connection: &Connection,
+    session_id: &str,
+    limit: Option<usize>,
+) -> Result<Vec<Arc<TranscriptItem>>> {
+    let mut statement = connection.prepare(match limit {
+        Some(_) => {
+            "SELECT stable_id, position, latest_content_event_ordinal, created_at_ms,
+                    last_changed_at_ms, body_json
+             FROM materialized_transcript_items
+             WHERE session_id = ?1
+             ORDER BY position DESC, stable_id DESC
+             LIMIT ?2"
+        }
+        None => {
+            "SELECT stable_id, position, latest_content_event_ordinal, created_at_ms,
+                    last_changed_at_ms, body_json
+             FROM materialized_transcript_items
+             WHERE session_id = ?1
+             ORDER BY position, stable_id"
+        }
+    })?;
+    let read = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, Option<u64>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    };
+    let rows = match limit {
+        Some(limit) => statement
+            .query_map(params![session_id, limit as i64], read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => statement
+            .query_map([session_id], read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    let mut transcript = rows
         .into_iter()
         .map(
             |(
@@ -2183,14 +2305,25 @@ fn load_materialized_session_with(
             },
         )
         .collect::<Result<Vec<_>>>()?;
+    if limit.is_some() {
+        // The bounded query walks the index backwards to bound what it reads;
+        // every caller wants the transcript in the order it was written.
+        transcript.reverse();
+    }
+    Ok(transcript)
+}
 
-    let mut queue_statement = connection.prepare(
+fn read_materialized_queued_prompts(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<MaterializedQueuedPrompt>> {
+    let mut statement = connection.prepare(
         "SELECT command_id, kind_json, content_json, queued_at_ms
          FROM materialized_queued_prompts
          WHERE session_id = ?1
          ORDER BY ordinal",
     )?;
-    let queue_rows = queue_statement
+    let rows = statement
         .query_map([session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -2200,8 +2333,7 @@ fn load_materialized_session_with(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let queued_prompts = queue_rows
-        .into_iter()
+    rows.into_iter()
         .map(|(command_id, kind_json, content_json, queued_at_ms)| {
             Ok(MaterializedQueuedPrompt {
                 command_id,
@@ -2214,22 +2346,7 @@ fn load_materialized_session_with(
                 queued_at_ms,
             })
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    let materialized = MaterializedSession {
-        session_id: session_id.to_owned(),
-        applied_event_ordinal,
-        applied_event_digest,
-        last_activity_at_ms,
-        execution: parse_materialized_execution(&execution, running_started_at_ms)?,
-        session_title,
-        configuration,
-        transcript,
-        queued_prompts,
-        pending_elicitations,
-    };
-    materialized.validate()?;
-    Ok(Some(materialized))
+        .collect()
 }
 
 /// Replace a complete projection, primarily when seeding a restored

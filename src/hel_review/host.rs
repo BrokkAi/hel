@@ -1825,6 +1825,7 @@ mod tests {
         materialized.applied_event_ordinal = 12;
         ManagedSessionView {
             snapshot: Some(ManagedSessionSnapshot {
+                window: crate::hel_state::ProjectionWindow::of(&materialized),
                 materialized,
                 operational: operational(),
                 latest_credential_sync_signal: None,

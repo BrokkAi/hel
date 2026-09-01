@@ -2159,6 +2159,56 @@ fn queued_prompt_loader_does_not_deserialize_transcript_history() {
     assert!(load_materialized_session_from(&database, "session-1").is_err());
 }
 
+/// The steady-state poll loads this on every change, so it must cost the
+/// window rather than the history — including the two facts that live outside
+/// the window, which are read rather than scanned for.
+#[test]
+fn the_bounded_projection_carries_a_window_and_the_facts_outside_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let mut materialized = materialized_session("session-1");
+    materialized.session_title = None;
+    save_materialized_session_to(&database, &materialized).unwrap();
+    let whole = load_materialized_session_from(&database, "session-1")
+        .unwrap()
+        .unwrap();
+
+    let (bounded, window) = load_materialized_projection_tail_from(&database, "session-1", 2)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        bounded.transcript.len(),
+        2,
+        "the window is the size that was asked for"
+    );
+    assert_eq!(window.omitted_items, whole.transcript.len() - 2);
+    // Everything but the transcript is loaded whole: these are all bounded by
+    // the session, not by its history.
+    assert_eq!(bounded.applied_event_ordinal, whole.applied_event_ordinal);
+    assert_eq!(bounded.applied_event_digest, whole.applied_event_digest);
+    assert_eq!(bounded.configuration, whole.configuration);
+    assert_eq!(bounded.queued_prompts, whole.queued_prompts);
+    assert_eq!(bounded.pending_elicitations, whole.pending_elicitations);
+    assert_eq!(bounded.execution, whole.execution);
+
+    // The head is outside the window, and the two facts that live there are
+    // still the ones a complete projection would have found by scanning.
+    let complete = crate::hel_state::ProjectionWindow::of(&whole);
+    assert_eq!(complete.omitted_items, 0);
+    assert_eq!(window.provisional_title, complete.provisional_title);
+    assert_eq!(window.latest_user_position, complete.latest_user_position);
+    assert!(window.provisional_title.is_some());
+    assert!(
+        !bounded
+            .transcript
+            .iter()
+            .any(|item| matches!(item.body, crate::hel_state::TranscriptBody::User { .. })),
+        "the test only proves anything if the window excludes the user message"
+    );
+}
+
 /// Seeding a conversation shows the end of it, so the reader must cost the
 /// rows it returns rather than the rows that exist. Corrupting the head proves
 /// the head is never touched.

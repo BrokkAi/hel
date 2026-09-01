@@ -2433,6 +2433,7 @@ mod tests {
         let latest_digest = session.applied_event_digest.clone();
         ManagedSessionView {
             snapshot: Some(crate::hel_state::ManagedSessionSnapshot {
+                window: crate::hel_state::ProjectionWindow::of(&session),
                 materialized: session,
                 latest_credential_sync_signal: None,
                 operational: crate::hel_worker::RelayOperationalState {

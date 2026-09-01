@@ -263,11 +263,96 @@ impl MaterializedSession {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManagedSessionSnapshot {
     pub materialized: MaterializedSession,
+    /// What `materialized.transcript` leaves out, and the facts that live
+    /// there. See [`ProjectionWindow`].
+    pub window: ProjectionWindow,
     pub operational: RelayOperationalState,
     /// Newest relay event observed by this live actor that asks for immediate
     /// credential reconciliation. This is intentionally ephemeral: it avoids
     /// retaining raw replay pages or rescanning projected history.
     pub latest_credential_sync_signal: Option<CredentialSyncSignal>,
+}
+
+/// What a projection's transcript window leaves out.
+///
+/// A polled projection carries only the end of the transcript, because that is
+/// all any viewer shows and loading the rest is work proportional to history.
+/// Two facts a reader needs live outside that window: the provisional title
+/// comes from the *first* user message, and the newest user message is outside
+/// it whenever a single turn is longer than the window. Both are read
+/// separately, with one indexed query each, rather than found by scanning.
+///
+/// A complete projection answers both by scanning what it already holds, which
+/// is what [`ProjectionWindow::of`] does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionWindow {
+    /// Transcript items before the window. Zero when the projection is whole.
+    pub omitted_items: usize,
+    /// The title derived from the first user message.
+    pub provisional_title: Option<String>,
+    /// Position of the newest user message, whether or not it is in the
+    /// window. `None` when the session has none.
+    pub latest_user_position: Option<u64>,
+}
+
+impl ProjectionWindow {
+    /// The window of a projection that omits nothing.
+    #[must_use]
+    pub fn of(session: &MaterializedSession) -> Self {
+        Self {
+            omitted_items: 0,
+            provisional_title: session.transcript.iter().find_map(|item| {
+                let TranscriptBody::User { content } = &item.body else {
+                    return None;
+                };
+                provisional_session_title(&crate::hel_chat::materialized_content_text(content))
+            }),
+            latest_user_position: session
+                .transcript
+                .iter()
+                .rev()
+                .find(|item| matches!(item.body, TranscriptBody::User { .. }))
+                .map(|item| item.position),
+        }
+    }
+}
+
+impl ManagedSessionSnapshot {
+    /// The session's title, using the same precedence as
+    /// [`MaterializedSession::resolved_title`] but taking the provisional
+    /// title from the window rather than from a transcript head that a polled
+    /// projection does not carry.
+    #[must_use]
+    pub fn resolved_title(&self) -> Option<String> {
+        self.materialized
+            .session_title
+            .as_deref()
+            .and_then(normalize_session_title)
+            .or_else(|| self.window.provisional_title.clone())
+            .or_else(|| {
+                self.materialized
+                    .queued_prompts
+                    .iter()
+                    .filter(|prompt| prompt.kind.is_prompt())
+                    .find_map(|prompt| {
+                        provisional_session_title(&crate::hel_chat::materialized_content_text(
+                            &prompt.content,
+                        ))
+                    })
+            })
+    }
+
+    /// The position of the turn this session most recently finished, or `None`
+    /// while it is still working. Same answer as
+    /// [`latest_completed_turn_ordinal`], from a position the window carries
+    /// rather than a scan back through the transcript.
+    #[must_use]
+    pub fn latest_completed_turn_ordinal(&self) -> Option<u64> {
+        if self.materialized.execution != MaterializedExecutionState::Idle {
+            return None;
+        }
+        self.window.latest_user_position
+    }
 }
 
 /// One session's activity, reported to the recovery coordinator.
@@ -1315,6 +1400,114 @@ mod tests {
         CONFIG_VERSION, ContainerTemplate, HarnessProfile, ProjectBundle, ProjectRepository,
         TargetTemplate,
     };
+
+    fn user_item(position: u64, text: &str) -> Arc<TranscriptItem> {
+        Arc::new(TranscriptItem {
+            stable_id: format!("user:{position}"),
+            position,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1_000,
+            last_changed_at_ms: 1_000,
+            body: TranscriptBody::User {
+                content: vec![serde_json::json!({"type": "text", "text": text})],
+            },
+        })
+    }
+
+    fn agent_item(position: u64) -> Arc<TranscriptItem> {
+        Arc::new(TranscriptItem {
+            stable_id: format!("agent:{position}"),
+            position,
+            latest_content_event_ordinal: Some(position),
+            created_at_ms: 1_000,
+            last_changed_at_ms: 1_000,
+            body: TranscriptBody::Agent {
+                chunks: vec![serde_json::json!({
+                    "content": {"type": "text", "text": "working"},
+                    "messageId": "answer"
+                })],
+                streaming: false,
+            },
+        })
+    }
+
+    fn snapshot(session: MaterializedSession, window: ProjectionWindow) -> ManagedSessionSnapshot {
+        ManagedSessionSnapshot {
+            materialized: session,
+            window,
+            operational: serde_json::from_value(serde_json::json!({
+                "session_id": "session-1",
+                "execution": "idle",
+                "latest_ordinal": 0,
+                "latest_digest": crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST,
+                "acknowledged_through": 0,
+                "acknowledged_digest": crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST,
+                "recovery_floor_ordinal": 0,
+                "recovery_floor_digest": crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST,
+                "native_session_id": null,
+                "agent_capabilities": null,
+                "agent_info": null,
+                "config_options": [],
+                "available_commands": [],
+                "config": {},
+                "active_prompt": null,
+                "queued_prompts": [],
+                "checkpoint_barrier": null,
+                "checkpoint_ready": null,
+            }))
+            .expect("an idle operational state"),
+            latest_credential_sync_signal: None,
+        }
+    }
+
+    /// A polled projection carries only the end of the transcript. The title
+    /// comes from the first user message and the completed turn from the last
+    /// one, so both have to survive the head being outside the window.
+    #[test]
+    fn a_windowed_projection_answers_the_same_title_and_turn_as_a_whole_one() {
+        let mut whole = MaterializedSession::empty("session-1");
+        whole.transcript = vec![
+            user_item(1, "build the relay"),
+            agent_item(2),
+            agent_item(3),
+            user_item(4, "now test it"),
+            agent_item(5),
+        ];
+        let complete = snapshot(whole.clone(), ProjectionWindow::of(&whole));
+
+        // The same session, loaded as a two-item window: the head is gone and
+        // so is the last user message.
+        let mut windowed_session = whole.clone();
+        windowed_session.transcript = whole.transcript[3..].to_vec();
+        let mut windowed = snapshot(windowed_session, ProjectionWindow::of(&whole));
+        windowed.window.omitted_items = 3;
+
+        assert_eq!(
+            complete.resolved_title().as_deref(),
+            Some("build the relay")
+        );
+        assert_eq!(windowed.resolved_title(), complete.resolved_title());
+        assert_eq!(complete.latest_completed_turn_ordinal(), Some(4));
+        assert_eq!(
+            windowed.latest_completed_turn_ordinal(),
+            complete.latest_completed_turn_ordinal()
+        );
+    }
+
+    /// A session still working has not completed a turn, whatever its
+    /// transcript says.
+    #[test]
+    fn a_running_session_reports_no_completed_turn() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.transcript = vec![user_item(1, "build it")];
+        session.execution = MaterializedExecutionState::Running { started_at_ms: 1 };
+        let window = ProjectionWindow::of(&session);
+
+        assert_eq!(
+            snapshot(session, window).latest_completed_turn_ordinal(),
+            None
+        );
+    }
 
     #[test]
     fn fast_mode_configuration_uses_its_user_facing_toggle_command() {

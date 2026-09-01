@@ -1933,6 +1933,7 @@ mod tests {
         materialized.applied_event_ordinal = cursor.ordinal;
         materialized.applied_event_digest = cursor.digest.clone();
         ManagedSessionSnapshot {
+            window: crate::hel_state::ProjectionWindow::of(&materialized),
             materialized,
             latest_credential_sync_signal: None,
             operational: crate::hel_worker::RelayOperationalState {

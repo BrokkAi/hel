@@ -2581,6 +2581,7 @@ impl StandaloneSession {
 
     pub fn snapshot(&self) -> ManagedSessionSnapshot {
         ManagedSessionSnapshot {
+            window: crate::hel_state::ProjectionWindow::of(&self.materialized),
             materialized: self.materialized.clone(),
             operational: self.operational.clone(),
             latest_credential_sync_signal: self.latest_credential_sync_signal.clone(),
@@ -3579,6 +3580,7 @@ mod tests {
             .collect();
         ManagedSessionView {
             snapshot: Some(ManagedSessionSnapshot {
+                window: crate::hel_state::ProjectionWindow::of(&materialized),
                 materialized,
                 operational: RelayOperationalState {
                     session_id: "session-1".into(),

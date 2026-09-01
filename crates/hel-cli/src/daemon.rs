@@ -731,9 +731,7 @@ impl RuntimeState {
                 self.recovery_observer.observe(RecoveryObservation {
                     session,
                     config: controller.config.clone(),
-                    latest_completed_turn_ordinal: hel::hel_state::latest_completed_turn_ordinal(
-                        &snapshot.materialized,
-                    ),
+                    latest_completed_turn_ordinal: snapshot.latest_completed_turn_ordinal(),
                     execution: snapshot.materialized.execution,
                 });
             }

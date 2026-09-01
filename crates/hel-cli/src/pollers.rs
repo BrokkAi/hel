@@ -1327,12 +1327,20 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                 let fingerprint = PublishedView::of(&runtime);
                                 let view = match runtime.operational.clone() {
                                     Some(operational) => {
+                                        // Bounded: the window is everything any
+                                        // viewer shows. Reading the whole
+                                        // transcript here was work proportional
+                                        // to the conversation, on every poll a
+                                        // session moved.
                                         let loaded = tokio::task::spawn_blocking({
                                             let session_id = session_id.clone();
-                                            move || hel::hel_database::load_materialized_session(&session_id)
+                                            move || hel::hel_database::load_materialized_projection_tail(
+                                                &session_id,
+                                                hel::hel_database::PROJECTION_TAIL_ITEMS,
+                                            )
                                         }).await;
                                         match loaded {
-                                            Ok(Ok(Some(materialized)))
+                                            Ok(Ok(Some((materialized, window))))
                                                 if materialized.applied_event_ordinal > runtime.projection_ordinal
                                                     || (materialized.applied_event_ordinal == runtime.projection_ordinal
                                                         && materialized.applied_event_digest == runtime.projection_digest) =>
@@ -1341,6 +1349,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                                 ManagedSessionView {
                                                     snapshot: Some(ManagedSessionSnapshot {
                                                         materialized,
+                                                        window,
                                                         operational,
                                                         latest_credential_sync_signal:
                                                             runtime.latest_credential_sync_signal,
@@ -1349,7 +1358,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                                     error: runtime.error,
                                                 }
                                             }
-                                            Ok(Ok(Some(materialized))) => {
+                                            Ok(Ok(Some((materialized, _)))) => {
                                                 let mismatch = ProjectionMismatch {
                                                     published_ordinal: runtime.projection_ordinal,
                                                     published_digest: runtime.projection_digest.clone(),
@@ -1603,7 +1612,7 @@ pub(crate) fn apply_worker_record_update(
     let Some(session) = controller.state.sessions.get(&update.session_id) else {
         return Ok(false);
     };
-    let projected_title = snapshot.materialized.resolved_title();
+    let projected_title = snapshot.resolved_title();
     let changed_title =
         (session.acp_session_title != projected_title).then(|| projected_title.clone());
     let mut changed = false;
