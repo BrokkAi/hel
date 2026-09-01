@@ -938,3 +938,91 @@ async fn two_review_roles_run_side_by_side_with_their_own_homes_and_journals() {
 
     fixture.sidecar.pause_all().await;
 }
+
+/// The supervisor's dispatch tool runs as a separate process and reaches its
+/// worker over a socket, so the two halves are exercised together here rather
+/// than each against a stand-in for the other.
+#[tokio::test]
+async fn the_dispatch_socket_records_what_the_supervisor_asks_for() {
+    use crate::hel_review::lanes::{LaneDispatch, ReviewSubagentRequest};
+
+    let temp = tempfile::tempdir().unwrap();
+    let worker_root = temp.path().join("worker");
+    std::fs::create_dir_all(&worker_root).unwrap();
+    let sidecar = std::sync::Arc::new(ReviewerSidecar::new(ReviewerPlacement {
+        worker_root: worker_root.clone(),
+        session_id: SESSION_ID.to_owned(),
+        cwd: temp.path().to_path_buf(),
+        additional_directories: Vec::new(),
+        worker_executable: PathBuf::from("/bin/false"),
+    }));
+    let _guard = unix::serve_review_dispatch(&worker_root, sidecar.clone()).unwrap();
+    let socket = worker_root
+        .join("reviewer")
+        .join(crate::hel_review::mcp::REVIEW_DISPATCH_SOCKET);
+
+    let dispatch = LaneDispatch {
+        reviewers: vec![
+            ReviewSubagentRequest {
+                agent_type: "tests".to_owned(),
+                hypothesis: "the new test cannot fail for the reason it claims".to_owned(),
+            },
+            ReviewSubagentRequest {
+                agent_type: "error_handling".to_owned(),
+                hypothesis: "the retry may swallow cancellation".to_owned(),
+            },
+        ],
+    };
+    let socket_for_call = socket.clone();
+    let dispatch_for_call = dispatch.clone();
+    let reply = tokio::task::spawn_blocking(move || {
+        crate::hel_review::mcp::send_dispatch(&socket_for_call, &dispatch_for_call)
+    })
+    .await
+    .unwrap()
+    .expect("the worker answers a dispatch");
+    assert_eq!(reply.started, vec!["tests", "error_handling"]);
+    assert_eq!(reply.error, None);
+
+    // A lane already asked for is not queued twice: its report is still
+    // coming, and a second copy would double the container's load.
+    let socket_for_call = socket.clone();
+    let reply = tokio::task::spawn_blocking(move || {
+        crate::hel_review::mcp::send_dispatch(&socket_for_call, &dispatch)
+    })
+    .await
+    .unwrap()
+    .expect("the worker answers a repeat dispatch");
+    assert!(reply.started.is_empty());
+
+    // The controller collects the queue once, and it is empty afterwards.
+    let collected = sidecar.take_dispatches();
+    assert_eq!(collected.len(), 2);
+    assert_eq!(collected[0].agent_type, "tests");
+    assert!(sidecar.take_dispatches().is_empty());
+
+    // An invalid dispatch is refused with a message the supervisor can act on.
+    let socket_for_call = socket.clone();
+    let reply = tokio::task::spawn_blocking(move || {
+        crate::hel_review::mcp::send_dispatch(
+            &socket_for_call,
+            &LaneDispatch {
+                reviewers: vec![ReviewSubagentRequest {
+                    agent_type: "not_a_lane".to_owned(),
+                    hypothesis: "there is no such specialist".to_owned(),
+                }],
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .expect("the worker answers an invalid dispatch");
+    assert!(reply.started.is_empty());
+    assert!(
+        reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("advertised roster")),
+        "unexpected reply {reply:?}"
+    );
+}

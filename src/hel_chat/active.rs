@@ -2668,6 +2668,25 @@ impl ActiveChat {
 impl Drop for ActiveChat {
     fn drop(&mut self) {
         self.cancel_dictation();
+        // A review lives in this view, so closing the view ends it. The
+        // in-flight row is what the web surface reads to hold its own
+        // prompts, and leaving it behind would hold them for ever; the
+        // baseline stays where it is, so the next review still covers this
+        // turn.
+        if self.state.turn_review_active() || self.turn_review_state.active.is_some() {
+            let requests = self
+                .state
+                .turn_review_mut()
+                .map(|review| review.driver.cancel())
+                .unwrap_or_default();
+            for request in requests {
+                if let crate::hel_review::driver::ReviewRequest::PauseRole { role } = request {
+                    self.pause_review_role(role);
+                }
+            }
+            self.turn_review_state.active = None;
+            self.persist_turn_review_state();
+        }
     }
 }
 

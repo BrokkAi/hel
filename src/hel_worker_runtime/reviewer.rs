@@ -57,8 +57,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// lane that waits a little costs the review nothing: the supervisor may not
 /// conclude until every launched lane has reported anyway.
 const MAX_PARALLEL_LANES: usize = 3;
-/// The role plan review uses, and the one a request without a role means.
-pub const DEFAULT_ROLE: &str = "reviewer";
+/// The role plan review uses, and the one a request without a role means. It
+/// is the turn review's own reviewer role, so the two features name the same
+/// harness the same way.
+pub use crate::hel_review::driver::REVIEWER_ROLE as DEFAULT_ROLE;
 /// File inside a role's home naming the reviewer generation it was copied for.
 const ROLE_GENERATION_MARKER: &str = ".hel-reviewer-generation";
 

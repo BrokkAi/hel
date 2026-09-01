@@ -511,6 +511,9 @@ pub fn resolution_notice(phase: &TurnReviewPhase) -> Option<String> {
         Resolution::Dismissed => "Review dismissed".to_string(),
         Resolution::Cancelled => "Review cancelled".to_string(),
         Resolution::NothingToReview => "Nothing to review: the turn changed no files".to_string(),
+        Resolution::CoverageStarted => {
+            "Review coverage starts here; the next completed turn is reviewed".to_string()
+        }
     })
 }
 

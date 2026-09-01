@@ -20,7 +20,6 @@
 //! `tools/list`, `tools/call` loop.
 
 use std::io::{BufRead, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -124,8 +123,9 @@ fn call_tool(socket: &Path, params: Option<&Value>) -> Result<(Value, bool)> {
 
 /// One request, one line, one reply. The socket lives in the worker root and
 /// is only reachable from inside this container.
-fn send_dispatch(socket: &Path, dispatch: &LaneDispatch) -> Result<LaneDispatchReply> {
-    let mut stream = UnixStream::connect(socket)
+#[cfg(unix)]
+pub(crate) fn send_dispatch(socket: &Path, dispatch: &LaneDispatch) -> Result<LaneDispatchReply> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
         .with_context(|| format!("connect to the review dispatch socket {}", socket.display()))?;
     let mut body = serde_json::to_vec(dispatch)?;
     body.push(b'\n');
@@ -139,6 +139,13 @@ fn send_dispatch(socket: &Path, dispatch: &LaneDispatch) -> Result<LaneDispatchR
         .read_line(&mut line)
         .context("read the review dispatch reply")?;
     serde_json::from_str(line.trim()).context("parse the review dispatch reply")
+}
+
+/// Hel's workers run on Unix; the tool is compiled everywhere so the CLI and
+/// the controller stay one shape, and says plainly where it cannot run.
+#[cfg(not(unix))]
+pub(crate) fn send_dispatch(_socket: &Path, _dispatch: &LaneDispatch) -> Result<LaneDispatchReply> {
+    bail!("the review dispatch socket needs a Unix platform")
 }
 
 fn tool_definition() -> Value {

@@ -49,7 +49,7 @@ impl Default for ProjectMemoryEndpoint {
     }
 }
 
-struct SocketGuard(PathBuf);
+pub(super) struct SocketGuard(PathBuf);
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
@@ -1476,7 +1476,7 @@ async fn compaction_response(
 /// server connects, hands over the lanes it wants, and reads the answer. The
 /// socket lives inside the worker root, so nothing outside this container can
 /// reach it, and it is removed when the worker stops.
-fn serve_review_dispatch(
+pub(super) fn serve_review_dispatch(
     root: &std::path::Path,
     reviewer: Arc<ReviewerSidecar>,
 ) -> Result<SocketGuard> {

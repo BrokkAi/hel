@@ -125,6 +125,9 @@ pub enum Resolution {
     Cancelled,
     /// Nothing changed, so there was nothing to review.
     NothingToReview,
+    /// The workspace had no usable baseline, so this capture becomes one and
+    /// review coverage starts from here.
+    CoverageStarted,
 }
 
 /// Where the review has got to.
@@ -377,8 +380,20 @@ impl TurnReviewDriver {
             // repository that has never been reviewed acquires its first
             // baseline, so the next review starts from here rather than from
             // the beginning of the repository.
-            self.status = "the turn changed no files".to_string();
-            self.phase = TurnReviewPhase::Resolved(Resolution::NothingToReview);
+            let starting = self
+                .deltas
+                .iter()
+                .all(|delta| delta.baseline_tree.is_none());
+            self.status = if starting {
+                "review coverage starts here".to_string()
+            } else {
+                "the turn changed no files".to_string()
+            };
+            self.phase = TurnReviewPhase::Resolved(if starting {
+                Resolution::CoverageStarted
+            } else {
+                Resolution::NothingToReview
+            });
             return vec![
                 ReviewRequest::AdvanceBaseline {
                     trees: self.captured_trees(),
@@ -1084,6 +1099,31 @@ mod tests {
         assert_eq!(
             driver.phase(),
             &TurnReviewPhase::Resolved(Resolution::NothingToReview)
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_no_baseline_starts_coverage_rather_than_reviewing_nothing() {
+        let mut seed = seed();
+        seed.baselines.clear();
+        let (mut driver, _) = TurnReviewDriver::start(seed);
+        let requests = driver.delta_captured(vec![RepoDelta {
+            root: PathBuf::from("/w/app"),
+            baseline_tree: None,
+            current_tree: "first-tree".to_string(),
+            patch: String::new(),
+            diffstat: "0 files changed".to_string(),
+            changed_lines: 0,
+        }]);
+        assert_eq!(
+            driver.phase(),
+            &TurnReviewPhase::Resolved(Resolution::CoverageStarted),
+            "the user is told coverage started, not that their turn changed nothing"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, ReviewRequest::AdvanceBaseline { .. }))
         );
     }
 

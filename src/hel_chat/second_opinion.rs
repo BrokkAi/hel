@@ -793,7 +793,7 @@ pub(super) fn reviewer_session_id(primary_session_id: &str) -> String {
 /// reviewer's id, which is also the relay session id the worker uses, so a
 /// quick review folds into exactly the journal it reads.
 pub(super) fn review_role_session_id(primary_session_id: &str, role: &str) -> String {
-    if role == crate::hel_worker_runtime::reviewer::DEFAULT_ROLE {
+    if role == crate::hel_review::driver::REVIEWER_ROLE {
         reviewer_session_id(primary_session_id)
     } else {
         format!("{primary_session_id}-review-{role}")
