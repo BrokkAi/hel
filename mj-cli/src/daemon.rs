@@ -1504,12 +1504,12 @@ fn epoch_seconds() -> u64 {
 ///
 /// A zombie still answers `kill(pid, 0)`, because its process-table entry
 /// survives until its parent waits for it — so an existence probe alone calls
-/// it alive forever and anything waiting for it to leave waits forever. Mjolnir
-/// spawns its daemon with `spawn_detached`, which drops the `Child` without
-/// waiting, and Rust does not reap on drop; so a daemon spawned by a long-lived
-/// Mjolnir process stays a zombie under it for as long as that process lives.
-/// That is exactly the shape of `mj daemon restart` refusing to restart a daemon
-/// that had already stopped.
+/// it alive forever and anything waiting for it to leave waits forever. That is
+/// exactly the shape of `mj daemon restart` refusing to restart a daemon that
+/// had already stopped: `spawn_detached` used to leave the daemon a child of a
+/// long-lived Mjolnir process that never reaped it. It now double-forks, so the
+/// daemon is init's to reap, but any other unreaped child of this process would
+/// look the same, and the check stays cheap.
 ///
 /// Treating a zombie as gone is also safe in the direction that matters: a
 /// zombie's PID cannot be reused until it is reaped, so nothing else can be

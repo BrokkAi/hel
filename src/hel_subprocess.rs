@@ -25,8 +25,20 @@ use std::process::{Command, Output, Stdio};
 use anyhow::{Context, Result, anyhow};
 
 /// Launch a long-lived background process with no inherited terminal streams.
-/// The child is deliberately not waited here: it owns a singleton lock and
-/// publishes its own endpoint, while callers confirm readiness over IPC.
+///
+/// The process is genuinely detached: on Unix it is a grandchild reparented to
+/// init, not a child of the caller. A double fork is the right shape here
+/// rather than a background reaper thread, because the one caller
+/// (`connect_or_start` in `mj-cli`) starts a daemon that outlives the spawner,
+/// discards the returned PID, and confirms readiness over IPC instead. A reaper
+/// thread would make the spawner hold a `Child` for the whole life of a process
+/// it explicitly wanted to detach from, and would pin that process's
+/// process-table entry under a long-lived spawner until it exits; init reaps a
+/// grandchild straight away.
+///
+/// The returned PID is the real process rather than the intermediate, so
+/// callers can still signal or probe it, and that process still leads its own
+/// process group, so group termination works exactly as before.
 pub fn spawn_detached(command: &mut Command, log_path: &Path) -> Result<u32> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -45,13 +57,104 @@ pub fn spawn_detached(command: &mut Command, log_path: &Path) -> Result<u32> {
         .with_context(|| format!("open detached process log {}", log_path.display()))?;
     let stderr = log.try_clone().context("clone detached process log")?;
     command.stdin(Stdio::null()).stdout(log).stderr(stderr);
+
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        spawn_detached_unix(command)
     }
-    let child = command.spawn().context("spawn detached child process")?;
-    Ok(child.id())
+    #[cfg(not(unix))]
+    {
+        // Windows has no zombie state: dropping the handle releases it while
+        // the process keeps running.
+        let child = command.spawn().context("spawn detached child process")?;
+        Ok(child.id())
+    }
+}
+
+/// Double-fork `command` and report the grandchild's PID.
+///
+/// The intermediate is an ordinary `Command` child that forks once more inside
+/// `pre_exec`: the fork's parent (this process's direct child) reports the
+/// grandchild's PID down a pipe and `_exit`s at once, while the fork's child
+/// takes a session of its own and goes on to exec the real program. The
+/// intermediate is waited for here, which returns immediately, so this process
+/// has nothing left to reap and the grandchild is reparented to init.
+///
+/// Forking inside `pre_exec` rather than forking this process directly keeps
+/// the fork out of a multi-threaded address space: only `fork`, `setsid`,
+/// `write` and `_exit` run between the fork and the exec, and all of those are
+/// async-signal-safe.
+#[cfg(unix)]
+fn spawn_detached_unix(command: &mut Command) -> Result<u32> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let (mut reader, writer) = std::io::pipe().context("create detached spawn pid pipe")?;
+    let report_fd = writer.as_raw_fd();
+
+    // The intermediate leads a group of its own, so it never signals the
+    // caller's group; the grandchild then takes a session, and with it a group,
+    // of its own, which is the group callers terminate by the returned PID.
+    command.process_group(0);
+
+    // SAFETY: the closure runs between fork and exec in the child. It calls
+    // only async-signal-safe functions and touches no state shared with
+    // another thread.
+    unsafe {
+        // `report_fd` is still open in the child: fork does not honour
+        // FD_CLOEXEC, only exec does.
+        command.pre_exec(move || match libc::fork() {
+            -1 => Err(std::io::Error::last_os_error()),
+            0 => {
+                // Grandchild: lead a new session, and so a new process group,
+                // before carrying on to exec.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+            grandchild => {
+                // Intermediate: report the real PID and leave at once. A short
+                // or failed write surfaces as a read failure in the parent, so
+                // no error is swallowed here.
+                let pid = (grandchild as u32).to_ne_bytes();
+                let mut written = 0;
+                while written < pid.len() {
+                    let count = libc::write(
+                        report_fd,
+                        pid.as_ptr().add(written).cast(),
+                        pid.len() - written,
+                    );
+                    if count <= 0 {
+                        break;
+                    }
+                    written += count as usize;
+                }
+                libc::_exit(0)
+            }
+        });
+    }
+
+    let spawned = command.spawn().context("spawn detached child process");
+    // Close this process's write end, so the read below sees EOF instead of
+    // blocking if the intermediate died without reporting a PID.
+    drop(writer);
+    let mut intermediate = spawned?;
+
+    let mut pid_bytes = [0_u8; 4];
+    let reported = reader.read_exact(&mut pid_bytes);
+    let status = intermediate
+        .wait()
+        .context("wait for detached spawn intermediate")?;
+    reported.context("read detached child pid from the spawn intermediate")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "detached spawn intermediate exited with {status}, so the child may not have started"
+        ));
+    }
+
+    Ok(u32::from_ne_bytes(pid_bytes))
 }
 
 /// Run `command` with `input` written to its stdin, returning the captured
@@ -182,6 +285,99 @@ mod tests {
         let mut command = Command::new("true");
         let output = run_with_input(&mut command, &[]).expect("run_with_input should succeed");
         assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_detached_leaves_no_zombie_under_a_spawner_that_keeps_running() {
+        // This test process outlives the child, which is exactly the case that
+        // used to leave a zombie: nothing reaped it, so its process-table entry
+        // survived and every existence probe still called it alive.
+        use std::time::{Duration, Instant};
+
+        let log_dir = tempfile::tempdir().expect("create log directory");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        let pid = spawn_detached(&mut command, &log_dir.path().join("child.log"))
+            .expect("spawn_detached should start the child");
+
+        // The reported PID is the real process, not the intermediate, and it is
+        // not a child of this process, so init reaps it.
+        let raw_pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        let mut status = 0;
+        // SAFETY: `status` is writable and WNOHANG never blocks; waiting on a
+        // non-child fails with ECHILD without changing any process state.
+        let waited = unsafe { libc::waitpid(raw_pid, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1, "the detached child must not be our own child");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match detached_test_process_state(pid) {
+                None => break,
+                Some(state) => assert_ne!(
+                    state, 'Z',
+                    "process {pid} is still a zombie of this process"
+                ),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} never left the process table"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The state letter from `/proc/<pid>/stat`, or `None` once the entry is
+    /// gone. Other Unixes have no `/proc` in this shape, so there the poll ends
+    /// as soon as `kill(pid, 0)` stops finding the process.
+    #[cfg(unix)]
+    fn detached_test_process_state(pid: u32) -> Option<char> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // The comm field can contain spaces and parentheses, so the state
+            // letter is the first non-space character after the last ')'.
+            let after_comm = stat.rsplit_once(')')?.1;
+            after_comm.split_whitespace().next()?.chars().next()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let raw_pid = libc::pid_t::try_from(pid).ok()?;
+            // SAFETY: signal 0 is an existence probe that sends no signal.
+            if unsafe { libc::kill(raw_pid, 0) } == 0 {
+                Some('?')
+            } else {
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_detached_reports_the_real_child_and_leaves_it_leading_its_own_group() {
+        // Callers signal the returned PID's process group to tear the child
+        // down, so the PID has to be the exec'd program rather than the
+        // short-lived intermediate, and it has to lead that group.
+        let log_dir = tempfile::tempdir().expect("create log directory");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+        let pid = spawn_detached(&mut command, &log_dir.path().join("child.log"))
+            .expect("spawn_detached should start the child");
+
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("the reported pid must name a live process");
+        assert_eq!(comm.trim(), "sh");
+
+        let raw_pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // SAFETY: getpgid only reads the group of an existing process.
+        let group = unsafe { libc::getpgid(raw_pid) };
+        assert_eq!(group, raw_pid, "the child must lead its own process group");
+
+        signal_process_group(raw_pid, libc::SIGKILL).expect("terminate the detached child group");
     }
 
     #[cfg(unix)]
