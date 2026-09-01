@@ -679,6 +679,34 @@ fn render_sessions_grid(
         .unwrap_or(0)
         .min(max_offset);
 
+    // When the viewport does not show every session, the last visible cell
+    // becomes a dim "+N more" so it is clear the grid scrolls to reach the
+    // rest. It steps aside if the last cell holds the selection, so the marker
+    // never buries the session the user is on.
+    let total_sessions = cells
+        .iter()
+        .filter(|cell| matches!(cell, GridCell::Session { .. }))
+        .count();
+    let viewport_start = column_offset * grid_rows;
+    let viewport_end = ((column_offset + COLUMNS) * grid_rows).min(cells.len());
+    let sessions_shown = cells
+        .get(viewport_start..viewport_end)
+        .map(|slots| {
+            slots
+                .iter()
+                .filter(|cell| matches!(cell, GridCell::Session { .. }))
+                .count()
+        })
+        .unwrap_or(0);
+    let more_marker = (sessions_shown < total_sessions && viewport_end > viewport_start)
+        .then_some(viewport_end - 1)
+        .filter(|&last| {
+            !matches!(
+                cells.get(last),
+                Some(GridCell::Session { index }) if Some(*index) == selected_index
+            )
+        });
+
     let mut column_x = inner.x;
     for (visible_column, &column_width) in column_widths.iter().enumerate() {
         if column_width == 0 {
@@ -692,6 +720,21 @@ fn render_sessions_grid(
             };
             let y = inner.y + grid_row as u16;
             let rect = Rect::new(column_x, y, column_width, 1);
+            if more_marker == Some(flow_position) {
+                let hidden = total_sessions - sessions_shown
+                    + usize::from(matches!(cell, GridCell::Session { .. }));
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        crate::widgets::truncate_text(
+                            &format!("+{hidden} more"),
+                            column_width as usize,
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    rect,
+                );
+                continue;
+            }
             let line = match cell {
                 GridCell::Heading(label) => Line::styled(
                     crate::widgets::truncate_text(label, column_width as usize),
@@ -2862,6 +2905,31 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.matches("podman").count() >= 2),
             "two columns on one row: {lines:?}"
+        );
+    }
+
+    /// When more sessions exist than the viewport shows, the last cell reads
+    /// "+N more" so it is clear the grid scrolls to reach the rest.
+    #[test]
+    fn the_minimized_grid_marks_how_many_sessions_it_is_not_showing() {
+        // 3 projects x 3 sessions = 12 cells; a tiny 2-row grid shows only 6,
+        // hiding 5 sessions plus the one its marker cell covers.
+        let mut dashboard = minimized_grid_dashboard(3, 3);
+        let lines = drawn(&mut dashboard, 120, 20);
+        assert!(
+            lines.iter().any(|line| line.contains("+6 more")),
+            "expected a +6 more marker: {lines:?}"
+        );
+    }
+
+    /// A grid that shows every session has nothing to mark.
+    #[test]
+    fn the_minimized_grid_omits_the_marker_when_everything_fits() {
+        let mut dashboard = minimized_grid_dashboard(1, 1);
+        let lines = drawn(&mut dashboard, 120, 44);
+        assert!(
+            !lines.iter().any(|line| line.contains("more")),
+            "no marker expected when all sessions fit: {lines:?}"
         );
     }
 
