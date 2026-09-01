@@ -18,6 +18,7 @@ pub(crate) const REVIEWER_PROFILE_DIR: &str = "profile";
 /// Where the worker keeps one directory per reviewing role, inside
 /// [`REVIEWER_DIR`]. Each holds that role's own copy of the staged profile and
 /// its own relay journal.
+#[cfg(unix)]
 pub(crate) const REVIEWER_ROLES_DIR: &str = "roles";
 
 pub(crate) fn github_cli_login_shell_command(command: &str) -> String {
