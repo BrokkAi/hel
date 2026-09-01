@@ -77,6 +77,98 @@ fn store_schema_mismatch_survives_the_controller_load_error_chain() {
     assert_eq!(mismatch.supported, SCHEMA_VERSION);
 }
 
+/// The writer verifies the schema once, when it opens. Issue #24 is what
+/// happens next: another process migrated the store, and this lane kept
+/// writing rows the store's new ladder does not expect. Every queued write is
+/// now refused with the reason.
+#[test]
+fn writer_refuses_a_projection_write_after_the_store_moves() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let owner = start_database_writer_at(&database, false).unwrap();
+    let writer = owner.writer.clone();
+    migrate_store_underneath(&database);
+
+    let mutation = MaterializedSessionMutation {
+        last_activity_at_ms: Some(105),
+        ..MaterializedSessionMutation::default()
+    };
+    let digest = event_digest(1);
+    let failure = writer
+        .execute("apply_projection_event", move |connection| {
+            apply_projection_page_with(connection, "session-1", |page| {
+                page.apply(1, RELAY_EVENT_GENESIS_DIGEST, &digest, &mutation)
+            })
+        })
+        .unwrap_err();
+
+    assert_mismatch(&failure);
+    // Read back on a raw connection: the store is ahead of this build now, so
+    // every reader this crate offers correctly refuses to open it.
+    let applied = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT applied_event_ordinal FROM materialized_sessions WHERE session_id = 'session-1'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        applied,
+        Some(0),
+        "the refused write left the projection where it was"
+    );
+    owner.shutdown().unwrap();
+}
+
+#[test]
+fn writer_refuses_a_read_receipt_after_the_store_moves() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let owner = start_database_writer_at(&database, false).unwrap();
+    let writer = owner.writer.clone();
+    migrate_store_underneath(&database);
+
+    let failure = writer
+        .execute("persist_read_receipt", move |connection| {
+            persist_read_receipt_with(connection, "client-1", DEFAULT_WORKSPACE_ID, "session-1", 0)
+        })
+        .unwrap_err();
+
+    assert_mismatch(&failure);
+    let receipts = Connection::open(&database)
+        .unwrap()
+        .query_row("SELECT count(*) FROM client_read_frontiers", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(receipts, 0, "the refused receipt wrote no row");
+    owner.shutdown().unwrap();
+}
+
+/// Moves the store's recorded schema forward the way another build's ladder
+/// would, under a writer that has already opened it.
+fn migrate_store_underneath(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+        .unwrap();
+    drop(connection);
+    forget_verified_schema(path);
+}
+
+fn assert_mismatch(failure: &anyhow::Error) {
+    let mismatch = failure
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+        .unwrap_or_else(|| panic!("the refusal names the divergence, got {failure:#}"));
+    assert_eq!(mismatch.found, SCHEMA_VERSION + 1);
+    assert_eq!(mismatch.supported, SCHEMA_VERSION);
+}
+
 #[test]
 fn database_writer_orders_jobs_and_survives_an_operation_error() {
     let directory = tempfile::tempdir().unwrap();
