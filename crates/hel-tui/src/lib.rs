@@ -823,9 +823,16 @@ impl DashboardState {
         let Some(hovered) = hovered else {
             return DashboardAction::None;
         };
+        // Over the sessions pane a wheel notch moves the selection by one, the
+        // same as a single Up/Down arrow. The summary panes still page by three.
+        let rows = if hovered == Focus::Sessions {
+            1
+        } else {
+            MOUSE_SCROLL_ROWS
+        };
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_selection_for(hovered, -MOUSE_SCROLL_ROWS),
-            MouseEventKind::ScrollDown => self.scroll_selection_for(hovered, MOUSE_SCROLL_ROWS),
+            MouseEventKind::ScrollUp => self.scroll_selection_for(hovered, -rows),
+            MouseEventKind::ScrollDown => self.scroll_selection_for(hovered, rows),
             // A press on a collapsed Targets or Quota row brings the panes
             // back and hands that pane the keyboard, so one click gets from a
             // summary to the table it summarises.
@@ -2459,8 +2466,9 @@ mod tests {
             .expect("draw pane hitboxes");
         let pane_areas = dashboard.pane_areas.expect("dashboard pane hitboxes");
 
+        // The sessions pane moves one row per wheel notch, like a single arrow.
         dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[0]));
-        assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 3);
+        assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 1);
         dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane_areas[0]));
         assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 0);
 
