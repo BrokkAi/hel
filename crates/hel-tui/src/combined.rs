@@ -37,7 +37,7 @@ const SUMMARY_ROW: u16 = 1;
 
 /// The terminal height at or above which the minimized Sessions grid gets its
 /// taller five-row form; below it the grid falls back to three rows.
-const TALL_TERMINAL_HEIGHT: u16 = 30;
+const TALL_TERMINAL_HEIGHT: u16 = 40;
 
 /// How many content rows the minimized Sessions grid draws: five when the
 /// terminal is tall enough to spare them, two on a tiny terminal (where the
@@ -514,18 +514,18 @@ mod tests {
 
     #[test]
     fn minimized_grid_takes_five_bordered_rows_when_tall_and_two_bare_rows_when_tiny() {
-        assert_eq!(minimized_grid_rows(30), 5);
+        assert_eq!(minimized_grid_rows(40), 5);
         assert_eq!(minimized_grid_rows(100), 5);
-        assert!(minimized_grid_bordered(30));
-        assert_eq!(minimized_grid_rows(29), 2);
+        assert!(minimized_grid_bordered(40));
+        assert_eq!(minimized_grid_rows(39), 2);
         assert_eq!(minimized_grid_rows(10), 2);
-        assert!(!minimized_grid_bordered(29));
+        assert!(!minimized_grid_bordered(39));
     }
 
     #[test]
     fn support_panes_drop_only_once_collapsed_and_only_on_a_tiny_terminal() {
-        assert!(omits_support_panes(true, 29));
-        assert!(!omits_support_panes(true, 30));
+        assert!(omits_support_panes(true, 39));
+        assert!(!omits_support_panes(true, 40));
         // Mode 1 keeps its tables however short the terminal.
         assert!(!omits_support_panes(false, 10));
     }
