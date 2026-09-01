@@ -626,7 +626,7 @@ fn suggested_workspace_name(workspaces: &[daemon::WorkspaceListing]) -> Result<S
 async fn daemon_command(args: DaemonArgs) -> Result<()> {
     match args.command {
         DaemonCommand::Status => {
-            let mut daemon = daemon::connect_existing()
+            let mut daemon = daemon::connect_management()
                 .await
                 .context("Hel daemon is not running")?;
             let status = daemon.status().await?;
@@ -643,24 +643,25 @@ async fn daemon_command(args: DaemonArgs) -> Result<()> {
                 },
                 status.phone_status
             );
+            if daemon.protocol_version() != daemon::PROTOCOL_VERSION {
+                println!(
+                    "The daemon speaks protocol {} while this build speaks {}; \
+                     status/stop/restart work, and other commands will replace it on next use.",
+                    daemon.protocol_version(),
+                    daemon::PROTOCOL_VERSION
+                );
+            }
         }
         DaemonCommand::Stop => {
-            let mut daemon = daemon::connect_existing()
+            let mut daemon = daemon::connect_management()
                 .await
                 .context("Hel daemon is not running")?;
             daemon.stop().await?;
             println!("Hel daemon is stopping; detached workers remain active.");
         }
         DaemonCommand::Restart => {
-            if let Ok(mut daemon) = daemon::connect_existing().await {
-                daemon.stop().await?;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while std::time::Instant::now() < deadline {
-                    if daemon::connect_existing().await.is_err() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                }
+            if let Ok(daemon) = daemon::connect_management().await {
+                daemon.stop_and_wait().await?;
             }
             let mut daemon = daemon::connect_or_start().await?;
             let status = daemon.status().await?;
