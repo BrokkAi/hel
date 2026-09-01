@@ -432,7 +432,8 @@ pub struct DashboardState {
     last_row_click: Option<(Focus, usize, Instant)>,
     pub(crate) mode: Mode,
     pub(crate) notices: Notices,
-    pub(crate) greeting: String,
+    /// The workspace name, shown at the right of the Sessions title bar.
+    pub(crate) workspace_name: String,
 }
 
 impl DashboardState {
@@ -468,7 +469,7 @@ impl DashboardState {
             last_row_click: None,
             mode: Mode::Dashboard,
             notices: Notices::default(),
-            greeting: "Welcome to Hel".into(),
+            workspace_name: String::new(),
         };
         dashboard.session_details = dashboard
             .state

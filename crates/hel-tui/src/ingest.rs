@@ -450,8 +450,8 @@ pub(crate) struct CapacityDetail {
 }
 
 impl DashboardState {
-    pub fn set_greeting(&mut self, greeting: String) {
-        self.greeting = greeting;
+    pub fn set_workspace_name(&mut self, workspace_name: String) {
+        self.workspace_name = workspace_name;
     }
 
     pub fn set_config(&mut self, config: HelConfig) {

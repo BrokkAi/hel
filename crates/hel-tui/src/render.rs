@@ -53,7 +53,7 @@ pub(crate) fn render_onboarding_surface(frame: &mut Frame, dashboard: &mut Dashb
             Constraint::Length(1),
         ])
         .split(area);
-    render_dashboard_title(frame, layout[0], &dashboard.greeting);
+    render_dashboard_title(frame, layout[0], &dashboard.workspace_name);
 
     render_onboarding(frame, layout[1], dashboard);
     render_capacity(frame, layout[2], dashboard);
@@ -96,10 +96,10 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, dashboard: &mut Dashbo
     dashboard.frame_surfaces = surfaces;
 }
 
-fn render_dashboard_title(frame: &mut Frame, area: Rect, greeting: &str) {
+fn render_dashboard_title(frame: &mut Frame, area: Rect, workspace_name: &str) {
     frame.render_widget(
         Paragraph::new(Span::styled(
-            greeting,
+            workspace_name,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -489,6 +489,33 @@ pub(crate) fn sessions_content_height(dashboard: &DashboardState, width: u16) ->
         .fold(0, u16::saturating_add)
 }
 
+/// The Sessions pane's bordered block: the legend as its left title and, at
+/// the right of the bar, the workspace name in dim text — truncated to the
+/// room the legend leaves, and omitted when it does not fit or is empty.
+fn sessions_block<'a>(
+    focused: bool,
+    legend: &'a str,
+    workspace_name: &str,
+    width: u16,
+) -> Block<'a> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(focus_border(focused))
+        .title(Line::from(Span::raw(legend)));
+    let room = usize::from(width).saturating_sub(Span::raw(legend).width() + 4);
+    if room > 8 && !workspace_name.is_empty() {
+        block.title(
+            Line::from(Span::styled(
+                format!(" {} ", crate::widgets::truncate_text(workspace_name, room)),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .right_aligned(),
+        )
+    } else {
+        block
+    }
+}
+
 /// Draws the Sessions pane and reports the per-row mouse hitboxes.
 pub(crate) fn render_sessions(
     frame: &mut Frame,
@@ -501,17 +528,8 @@ pub(crate) fn render_sessions(
     let drawn = drawn_session_rows(dashboard, area.width);
     let focused = dashboard.focus() == Focus::Sessions;
     let expanded = !dashboard.pane_layout().sessions_compact();
-    let mut title = vec![Span::raw(sessions_pane_title(area.width, expanded))];
-    let room = usize::from(area.width).saturating_sub(title[0].width() + 4);
-    if room > 8 && !dashboard.greeting.is_empty() {
-        title.push(Span::styled(
-            format!(
-                "{} ",
-                crate::widgets::truncate_text(&dashboard.greeting, room)
-            ),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+    let legend = sessions_pane_title(area.width, expanded);
+    let block = sessions_block(focused, legend, &dashboard.workspace_name, area.width);
     let table = Table::new(
         drawn.iter().map(|row| {
             Row::new([Cell::from(Text::from(row.lines.clone()))])
@@ -520,12 +538,7 @@ pub(crate) fn render_sessions(
         }),
         [Constraint::Min(1)],
     )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(focus_border(focused))
-            .title(Line::from(title)),
-    );
+    .block(block);
     let mut state = TableState::default().with_selected(
         dashboard
             .selected_visible_index()
@@ -625,21 +638,8 @@ fn render_sessions_grid(
     // sessions; a taller one keeps them.
     let block = if crate::combined::minimized_grid_bordered(frame.area().height) {
         let focused = dashboard.focus() == Focus::Sessions;
-        let mut title = vec![Span::raw(sessions_pane_title(area.width, false))];
-        let room = usize::from(area.width).saturating_sub(title[0].width() + 4);
-        if room > 8 && !dashboard.greeting.is_empty() {
-            title.push(Span::styled(
-                format!(
-                    "{} ",
-                    crate::widgets::truncate_text(&dashboard.greeting, room)
-                ),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(focus_border(focused))
-            .title(Line::from(title))
+        let legend = sessions_pane_title(area.width, false);
+        sessions_block(focused, legend, &dashboard.workspace_name, area.width)
     } else {
         Block::default().borders(Borders::NONE)
     };
@@ -1904,7 +1904,7 @@ mod tests {
     #[test]
     fn a_modal_overlays_the_dashboard_instead_of_replacing_it() {
         let mut dashboard = dashboard_with_session(running_session());
-        dashboard.set_greeting("UNDERLYING DASHBOARD SENTINEL".into());
+        dashboard.set_workspace_name("UNDERLYING DASHBOARD SENTINEL".into());
         assert_eq!(
             dashboard.handle_key(crate::test_support::key(KeyCode::Char('e'))),
             DashboardAction::None
@@ -2529,6 +2529,7 @@ mod tests {
     #[test]
     fn the_footer_is_one_row_that_a_notice_takes_over() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_workspace_name("personal".into());
         dashboard.set_notice("Transient dashboard message");
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
         terminal
@@ -2541,14 +2542,14 @@ mod tests {
                 .collect::<String>()
         };
 
-        // The workspace greeting rides in the Sessions title rather than
-        // taking a full row of its own, so the transcript keeps that row.
+        // The workspace name rides at the right of the Sessions title rather
+        // than taking a full row of its own, so the transcript keeps that row.
         assert!(
             line(buffer.area.y).contains("Sessions"),
             "{:?}",
             line(buffer.area.y)
         );
-        assert!(line(buffer.area.y).contains("Welcome to Hel"));
+        assert!(line(buffer.area.y).contains("personal"));
         assert!(!line(buffer.area.y).contains("ACP sessions"));
         // The footer is one row: a notice replaces the hints while one is
         // showing, so the row costs one line whichever surface drew it.
@@ -4011,9 +4012,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_config_renders_onboarding_and_exact_welcome() {
+    fn empty_config_renders_onboarding_with_the_workspace_name() {
         let mut dashboard =
             DashboardState::new(HelConfig::default(), HelState::default(), BTreeMap::new());
+        dashboard.set_workspace_name("personal".into());
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -4025,7 +4027,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Welcome to Hel"));
+        assert!(rendered.contains("personal"));
         assert!(rendered.contains("Hel needs a little fuel."));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('e'))),
@@ -4034,9 +4036,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_greeting_does_not_change_with_dashboard_updates() {
+    fn workspace_name_does_not_change_with_dashboard_updates() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        dashboard.set_greeting("A fixed greeting".into());
+        dashboard.set_workspace_name("acme-workspace".into());
         dashboard.set_state(HelState::default());
         dashboard.set_quotas(BTreeMap::new());
 
@@ -4051,7 +4053,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("A fixed greeting"));
+        assert!(rendered.contains("acme-workspace"));
     }
 
     #[test]

@@ -63,7 +63,7 @@ use crate::pollers::{
     spawn_dashboard_capacity_poller, spawn_dashboard_resource_poller, spawn_quota_refresher,
     spawn_remote_dashboard_worker_poller, spawn_worker_diagnosis,
 };
-use crate::{TerminalGuard, short_id, startup_greeting};
+use crate::{TerminalGuard, short_id};
 
 /// Redraw cadence for displays that move with the wall clock: turn timers,
 /// countdowns, and elapsed times.
@@ -861,7 +861,6 @@ impl DashboardContext {
             .find(|workspace| workspace.id == workspace_id)
             .with_context(|| format!("unknown workspace {workspace_id:?}"))?
             .name;
-        let greeting = format!("{workspace_name}  ·  {}", startup_greeting(&controller));
         let mut dashboard = DashboardState::new(
             controller.config.clone(),
             controller.state.clone(),
@@ -872,7 +871,7 @@ impl DashboardContext {
         for (session_id, queued) in projected_queued_prompts(&controller)? {
             dashboard.apply_queued_prompts(&session_id, queued);
         }
-        dashboard.set_greeting(greeting);
+        dashboard.set_workspace_name(workspace_name);
         let mut terminal = TerminalGuard::enter()?;
         if configuration_needs_setup(&controller.config) {
             terminal.suspend()?;
