@@ -25,6 +25,7 @@ Running `hel doctor --json --smoke` must verify Docker and the image, and creati
 - [x] (2026-09-01 10:45Z) Passed formatting, `git diff --check`, the full host-target test suite, clippy with warnings denied, and the documentation build; also completed a live Docker OverlayFS isolation smoke test.
 - [x] (2026-09-01 10:55Z) Committed the implementation as `5fc7268`, pushed `local-docker-target`, and opened https://github.com/BrokkAi/hel/pull/18 against `master`.
 - [x] (2026-09-01 11:30Z) Corrected setup's smoke-test call path to use the shared Docker-aware runner, added a setup-level OverlayFS regression test, and passed the focused setup suite, full host-target suite, formatting, diff checks, and clippy.
+- [x] (2026-09-01 12:20Z) Merged current `master` at `678566d`, added behavior coverage for Docker greeting classification, checkpoint upload, clone-cache discovery, and reviewer staging, and passed the repository's LLVM coverage gate locally.
 
 ## Surprises & Discoveries
 
@@ -45,6 +46,9 @@ Running `hel doctor --json --smoke` must verify Docker and the image, and creati
 
 - Observation: The first implementation made doctor call `run_setup_smoke_test`, but setup retained a duplicate generic executor around `setup_smoke_plan`.
   Evidence: `src/hel_setup.rs::run_smoke_test` constructed and executed the plain run/exec/remove plan directly, so its `LocalDocker` target never reached the shared runner's Docker-specific OverlayFS branch. Routing setup through the shared runner removes the divergent call path.
+
+- Observation: Passing the ordinary Rust suite did not imply passing the repository's per-module coverage baseline.
+  Evidence: CI reported aggregate coverage above its regression floor but four touched modules just below their individual requirements. Behavior tests for their Docker paths raised `crates/hel-cli/src/main.rs` to 53.50%, checkpoint to 70.11%, Git cache to 73.44%, and reviewer to 60.63%; `scripts/check-coverage.mjs` then passed without baseline changes.
 
 ## Decision Log
 
@@ -72,11 +76,15 @@ Running `hel doctor --json --smoke` must verify Docker and the image, and creati
   Rationale: Docker needs a materially different smoke plan from other runtimes. Having setup execute `setup_smoke_plan` itself bypassed that dispatch and allowed the two product surfaces to disagree about target readiness.
   Date/Author: 2026-09-01 / Codex
 
+- Decision: Restore coverage with behavior tests, not by lowering module baselines or adding implementation-list assertions.
+  Rationale: The uncovered Docker branches have observable command and classification contracts. Exercising those contracts both satisfies the gate and protects the feature from regressions.
+  Date/Author: 2026-09-01 / Codex
+
 ## Outcomes & Retrospective
 
 The implementation is complete and published for review. It delivers a first-class local Docker target across configuration, durable state, schema migration, provisioning, checkpoint/resume, recovery, metrics, cleanup, setup, doctor, CLI/TUI, and documentation. Writable attachments use owned and labeled Docker local volumes backed by OverlayFS; read-only attachments remain direct binds. Creation rollback and normal cleanup verify exact resource ownership and remove the container before volumes and backing directories.
 
-Validation passed with 1,870 Rust tests passing and 9 ignored across the full host-target suite, `cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`, formatting, diff checks, a documentation build covering 239 internal links, and a live disposable Docker OverlayFS isolation test. The count includes a setup-level regression proving that setup creates the managed OverlayFS volume, probes it through Docker exec, and runs managed cleanup. The implementation commit is `5fc7268`; the pull request is https://github.com/BrokkAi/hel/pull/18.
+Validation passed with 1,873 Rust tests passing and 9 ignored across the full host-target suite, `cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`, formatting, diff checks, a documentation build covering 239 internal links, and a live disposable Docker OverlayFS isolation test. The count includes setup-level coverage of the managed OverlayFS smoke and focused behavior coverage of Docker greeting classification, checkpoint upload, clone-cache discovery, and reviewer staging. The unchanged repository coverage checker passes at 77.13% aggregate coverage with every module above its required floor. The implementation commit is `5fc7268`; the pull request is https://github.com/BrokkAi/hel/pull/18.
 
 ## Context and Orientation
 
@@ -187,4 +195,4 @@ In `src/hel_config.rs`, add `TargetTemplate::LocalDocker { container: ContainerT
 
 In `src/hel_targets.rs`, expose deterministic helpers for Docker overlay volume identity and backing paths if controller cleanup needs them. Helpers must validate the session identifier and use `Path`/`PathBuf` for host paths until command rendering.
 
-Plan revision note (2026-09-01): Initial plan created after repository inspection and confirmation of Docker local-driver mount behavior. It resolves the scope to local Docker with OverlayFS-backed writable attachments and no SSH Docker. Updated after the first compiling implementation to record the host-toolchain constraint, completed runtime work, concrete mount syntax, and independently verifiable milestones. Updated again after validation to reflect the implemented helper structure, Docker pull-policy mapping, real smoke-test contract, and final evidence. Updated after specialist review to record and close the divergent setup smoke-test call path.
+Plan revision note (2026-09-01): Initial plan created after repository inspection and confirmation of Docker local-driver mount behavior. It resolves the scope to local Docker with OverlayFS-backed writable attachments and no SSH Docker. Updated after the first compiling implementation to record the host-toolchain constraint, completed runtime work, concrete mount syntax, and independently verifiable milestones. Updated again after validation to reflect the implemented helper structure, Docker pull-policy mapping, real smoke-test contract, and final evidence. Updated after specialist review to record and close the divergent setup smoke-test call path. Updated after CI coverage review to record the current-master merge, added behavior tests, and passing per-module coverage evidence.

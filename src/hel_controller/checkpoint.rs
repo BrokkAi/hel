@@ -2127,6 +2127,50 @@ mod tests {
         }
     }
     #[test]
+    fn docker_checkpoint_fallback_upload_uses_docker_cp() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+        let locator = hel_targets::TargetLocator::LocalDocker {
+            container_id: "hel-session-12345678".to_owned(),
+        };
+        upload_checkpoint_spec(
+            &executor,
+            &locator,
+            LATCH_RELAY_SESSION,
+            Path::new("checkpoint-spec.json"),
+            "/var/lib/hel/workers/session/checkpoint-spec.json",
+        )
+        .unwrap();
+
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "docker");
+        assert_eq!(
+            commands[0].args,
+            [
+                "cp",
+                "checkpoint-spec.json",
+                "hel-session-12345678:/var/lib/hel/workers/session/checkpoint-spec.json"
+            ]
+        );
+        assert_eq!(commands[0].purpose, "upload checkpoint specification");
+    }
+    #[test]
     fn checkpoint_export_streams_its_spec_instead_of_uploading_it() {
         let locator = hel_targets::TargetLocator::LocalPodman {
             container_id: hel_targets::resource_name(LATCH_RELAY_SESSION).unwrap(),
