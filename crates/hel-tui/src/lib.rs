@@ -77,8 +77,6 @@ pub(crate) enum SessionsRow {
 /// the resume dialog instead of a support pane.
 pub(crate) const DASHBOARD_PANE_COUNT: usize = 3;
 
-pub(crate) const MOUSE_SCROLL_ROWS: isize = 3;
-
 /// Maximum gap between two left clicks on the same session row for the pair
 /// to count as a double click.
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -770,9 +768,10 @@ impl DashboardState {
             if !rect_contains(area, mouse.column, mouse.row) {
                 return DashboardAction::None;
             }
+            // The resume list is a list, so a wheel notch moves by one row.
             let delta = match mouse.kind {
-                MouseEventKind::ScrollUp => -MOUSE_SCROLL_ROWS,
-                MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
+                MouseEventKind::ScrollUp => -1,
+                MouseEventKind::ScrollDown => 1,
                 _ => return DashboardAction::None,
             };
             let len = self.resume_rows().len();
@@ -823,16 +822,11 @@ impl DashboardState {
         let Some(hovered) = hovered else {
             return DashboardAction::None;
         };
-        // Over the sessions pane a wheel notch moves the selection by one, the
-        // same as a single Up/Down arrow. The summary panes still page by three.
-        let rows = if hovered == Focus::Sessions {
-            1
-        } else {
-            MOUSE_SCROLL_ROWS
-        };
+        // These panes are lists, so a wheel notch moves the selection by one,
+        // the same as a single Up/Down arrow.
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_selection_for(hovered, -rows),
-            MouseEventKind::ScrollDown => self.scroll_selection_for(hovered, rows),
+            MouseEventKind::ScrollUp => self.scroll_selection_for(hovered, -1),
+            MouseEventKind::ScrollDown => self.scroll_selection_for(hovered, 1),
             // A press on a collapsed Targets or Quota row brings the panes
             // back and hands that pane the keyboard, so one click gets from a
             // summary to the table it summarises.
@@ -2472,9 +2466,10 @@ mod tests {
         dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane_areas[0]));
         assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 0);
 
+        // The quota pane is also a list: one notch moves its selection by one.
         assert_eq!(dashboard.focus, Focus::Sessions);
         dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[2]));
-        assert_eq!(dashboard.quota_index, 2);
+        assert_eq!(dashboard.quota_index, 1);
         assert_eq!(dashboard.selected_visible_index().unwrap_or(0), 0);
         assert_eq!(dashboard.focus, Focus::Sessions);
     }
