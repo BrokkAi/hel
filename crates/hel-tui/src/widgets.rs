@@ -133,7 +133,57 @@ pub(crate) fn centered_modal(
     popup
 }
 
+/// Empty cells kept between any modal and the screen edge on every side.
+pub(crate) const MODAL_SCREEN_MARGIN: u16 = 2;
+
+/// The region a modal may occupy: `area` inset by [`MODAL_SCREEN_MARGIN`] on
+/// every side, so dialogs never butt against the terminal border. On a terminal
+/// too small to hold the margin it degrades to the full area rather than vanish.
+pub(crate) fn modal_area(area: Rect) -> Rect {
+    let margin = MODAL_SCREEN_MARGIN;
+    if area.width > margin * 2 && area.height > margin * 2 {
+        Rect::new(
+            area.x + margin,
+            area.y + margin,
+            area.width - margin * 2,
+            area.height - margin * 2,
+        )
+    } else {
+        area
+    }
+}
+
+/// Centers a modal of an absolute cell width and registers its body as a
+/// selectable surface. Use when the content has a natural width — a QR code, a
+/// fixed table — that should hug its content instead of scaling with the
+/// terminal. `width` and `height` include the border and are clamped to `area`.
+pub(crate) fn centered_modal_fixed(
+    surfaces: &mut FrameSurfaces,
+    width: u16,
+    height: u16,
+    area: Rect,
+) -> Rect {
+    let popup = centered_rect_fixed(width, height, area);
+    surfaces.push(SurfaceFrame::fixed(
+        SurfaceId::ModalBody,
+        bordered_content(popup),
+    ));
+    popup
+}
+
+/// Centers a rectangle of an absolute cell size within `area`, clamped to fit
+/// inside the [`modal_area`] margin.
+pub(crate) fn centered_rect_fixed(width: u16, height: u16, area: Rect) -> Rect {
+    let area = modal_area(area);
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
 pub(crate) fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
+    let area = modal_area(area);
     let vertical_margin = area.height.saturating_sub(height) / 2;
     let vertical = Layout::default()
         .direction(Direction::Vertical)
