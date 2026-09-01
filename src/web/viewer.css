@@ -1,38 +1,127 @@
+/* Hel's phone viewer, in the terminal surface's visual language.
+ *
+ * The terminal is monospace, flat, and bordered, and it says what state a
+ * thing is in with one colour drawn from a small semantic set. This stylesheet
+ * follows it, so that reading a session on a phone and reading it in `hel`
+ * feel like the same product rather than two products that share a name.
+ *
+ * Two rules the content-security policy imposes, and which no rule here may
+ * work around: there is no inline style anywhere, including `style=` attributes,
+ * so anything dynamic is a class or a custom property set through the CSSOM;
+ * and every font and image comes from this origin.
+ */
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/jetbrains-mono.woff2') format('woff2');
+  font-weight: 100 800;
+  font-display: swap;
+}
+
 :root {
   color-scheme: dark;
-  font: 16px system-ui;
-  background: #08090d;
-  color: #ecf2e5;
+
+  /* Surfaces, from the page ground upward. */
+  --ground: #08090d;
+  --surface: #101319;
+  --surface-raised: #171b23;
+  --border: #262b35;
+  --border-strong: #3b424e;
+
+  /* Text. `--dim` is held above 4.5:1 on `--ground` on purpose: it is the
+   * colour of most secondary text, and secondary text is still text. */
+  --text: #e6ebe0;
+  --dim: #9aa39a;
+
+  /* The semantic set, taken from `fn entry_visual` and the dashboard's
+   * threshold colouring in the terminal surface. Each name means one thing. */
+  --user: #5dd9ff;
+  --agent: #e2b34d;
+  --thinking: #9aa39a;
+  --running: #e2b34d;
+  --done: #91df62;
+  --failed: #ff786f;
+  --plan: #d985ff;
+  --plan-proposal: #e9b3ff;
+  --system: #9aa39a;
+  --accent: #b9ff5a;
+
+  --focus: var(--user);
+
+  /* Restrained radii: the terminal has none, so these only take the hard
+   * edge off a touch target rather than making a card look like a pill. */
+  --radius: 4px;
+  --radius-large: 6px;
+
+  /* The smallest thing a finger can reliably hit. */
+  --touch: 44px;
+
+  /* How much of the viewport the on-screen keyboard is covering. Set through
+   * the CSSOM from the visual viewport; 0 when no keyboard is open. */
+  --keyboard-inset: 0px;
+
+  font-family:
+    'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono',
+    monospace;
+  font-size: 16px;
+  line-height: 1.5;
+  background: var(--ground);
+  color: var(--text);
+}
+
+* {
+  /* A flex or grid child defaults to `min-width: auto` and refuses to shrink
+   * below its content, which is the most common reason a phone page scrolls
+   * sideways. */
+  min-width: 0;
 }
 
 body {
-  margin: 0;
-  padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+  margin: 0 auto;
   max-width: 760px;
-  margin: auto;
+  padding: calc(8px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right))
+    calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+  overflow-x: hidden;
 }
 
 header {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
+  gap: 12px;
 }
 
 h1 {
-  font-size: 42px;
-  letter-spacing: 0.06em;
-  margin: 22px 0 4px;
-  color: #b9ff5a;
+  font-size: 34px;
+  letter-spacing: 0.08em;
+  margin: 18px 0 4px;
+  color: var(--accent);
+}
+
+h2 {
+  font-size: 18px;
+  margin: 0 0 10px;
+}
+
+h3 {
+  font-size: 16px;
+  margin: 0 0 8px;
 }
 
 .dim {
-  color: #899184;
+  color: var(--dim);
 }
 
+.hidden {
+  display: none;
+}
+
+/* ---- surfaces ---- */
+
 .card {
-  background: #13161d;
-  border: 1px solid #292e38;
-  border-radius: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-large);
   margin: 12px 0;
   padding: 14px;
 }
@@ -41,115 +130,278 @@ h1 {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
 }
+
+/* Wide content scrolls inside its own box. The page never scrolls sideways. */
+.scroll-x {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  max-width: 100%;
+}
+
+/* ---- controls ---- */
 
 button,
 input,
 select,
 textarea {
   font: inherit;
+  /* Below 16px, iOS Safari zooms the page on focus and never zooms back. */
+  font-size: 16px;
   color: inherit;
-  background: #1d222b;
-  border: 1px solid #3b424e;
-  border-radius: 9px;
-  padding: 10px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  min-height: var(--touch);
 }
 
 button {
-  background: #b9ff5a;
+  background: var(--accent);
   color: #10140b;
   font-weight: 700;
+  min-width: var(--touch);
+  cursor: pointer;
 }
 
 button:disabled {
   opacity: 0.45;
+  cursor: default;
 }
 
 .danger {
-  background: #ff786f;
+  background: var(--failed);
+  color: #200b09;
 }
 
 .secondary {
-  background: #303743;
-  color: #ecf2e5;
+  background: var(--surface-raised);
+  color: var(--text);
 }
 
-.hidden {
-  display: none;
+/* The browser's own focus ring is invisible against a dark ground on some
+ * phones, so focus is drawn here rather than left to the platform. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
+
+/* ---- status ---- */
 
 .pill {
-  font-size: 12px;
-  border: 1px solid #475043;
+  font-size: 13px;
+  border: 1px solid var(--border-strong);
   border-radius: 99px;
-  padding: 3px 8px;
+  padding: 2px 10px;
+  color: var(--dim);
 }
 
 .pill.alert {
-  border-color: #ff786f;
-  color: #ff786f;
-}
-
-.session h3 {
-  margin: 0 0 8px;
+  border-color: var(--failed);
+  color: var(--failed);
 }
 
 .session p {
-  margin: 5px 0;
+  margin: 6px 0;
 }
 
 .preview {
   white-space: pre-wrap;
-  border-left: 2px solid #475043;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--border-strong);
   padding-left: 10px;
+  color: var(--dim);
 }
 
+/* ---- transcript ---- */
+
 .entry {
-  border-left: 3px solid #475043;
+  --role: var(--system);
+  border-left: 2px solid var(--role);
   padding: 4px 0 4px 12px;
-  margin: 15px 0;
+  margin: 14px 0;
 }
 
 .entry.user {
-  border-color: #5dd9ff;
+  --role: var(--user);
 }
-
 .entry.agent {
-  border-color: #91df62;
+  --role: var(--agent);
 }
-
-.entry.thought,
-.entry.system {
-  border-color: #59616d;
-  color: #aab1a5;
+.entry.thought {
+  --role: var(--thinking);
+  color: var(--dim);
+  font-style: italic;
 }
-
 .entry.tool {
-  border-color: #e2b34d;
+  --role: var(--running);
 }
-
 .entry.plan {
-  border-color: #d985ff;
+  --role: var(--plan);
+}
+.entry.plan-proposal {
+  --role: var(--plan-proposal);
+}
+.entry.system {
+  --role: var(--system);
+  color: var(--dim);
 }
 
-.entry strong {
-  display: block;
-  margin-bottom: 5px;
+.entry > strong {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 6px;
+  color: var(--role);
 }
 
-.entry pre {
+/* The glyph column is fixed width so labels line up down the transcript, the
+ * way they do in the terminal. It is decoration: the label says the same
+ * thing, so it carries aria-hidden and must never be the only signal. */
+.entry-glyph {
+  flex: 0 0 1.2em;
+  text-align: center;
+}
+
+.entry-body {
+  overflow-wrap: anywhere;
+}
+
+.entry-body > pre,
+pre.entry-body {
   font: inherit;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   margin: 0;
 }
 
+/* ---- rendered markdown ---- */
+
+.entry-body h1,
+.entry-body h2,
+.entry-body h3,
+.entry-body h4,
+.entry-body h5,
+.entry-body h6 {
+  font-size: 1em;
+  margin: 12px 0 6px;
+  color: var(--text);
+}
+
+.entry-body p {
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+
+.entry-body ul,
+.entry-body ol {
+  margin: 8px 0;
+  padding-left: 1.6em;
+}
+
+.entry-body li {
+  margin: 3px 0;
+}
+
+.entry-body blockquote {
+  margin: 8px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--dim);
+}
+
+.entry-body hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+
+.entry-body code {
+  background: var(--surface-raised);
+  border-radius: var(--radius);
+  padding: 1px 5px;
+}
+
+.entry-body pre {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin: 8px 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.entry-body pre code {
+  background: none;
+  padding: 0;
+}
+
+.entry-body table {
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.entry-body th,
+.entry-body td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.entry-body th {
+  background: var(--surface-raised);
+}
+
+.align-left {
+  text-align: left;
+}
+.align-center {
+  text-align: center;
+}
+.align-right {
+  text-align: right;
+}
+
+.entry-body a {
+  color: var(--user);
+}
+
+/* ---- diff summaries ---- */
+
+.diffstat {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+}
+
+.diffstat li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.diffstat-path {
+  overflow-wrap: anywhere;
+}
+
+.diffstat-added {
+  color: var(--done);
+}
+
+.diffstat-removed {
+  color: var(--failed);
+}
+
+/* ---- queue, shells, elicitations ---- */
+
 .queue-item {
   display: flex;
   gap: 8px;
   align-items: start;
   justify-content: space-between;
-  border-top: 1px solid #292e38;
+  border-top: 1px solid var(--border);
   padding: 8px 0;
 }
 
@@ -159,7 +411,7 @@ button:disabled {
 }
 
 .elicitation {
-  border-color: #d985ff;
+  border-color: var(--plan);
 }
 
 .elicitation-message {
@@ -167,6 +419,11 @@ button:disabled {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   margin: 0 0 10px;
+  /* No approval is granted over hidden text: a long request scrolls rather
+   * than pushing its own buttons off the screen. */
+  max-height: 30dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .elicitation-field {
@@ -182,9 +439,12 @@ button:disabled {
 
 .elicitation-field input[type='checkbox'] {
   align-self: start;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
 }
+
+/* ---- composer ---- */
 
 #prompt-text {
   display: block;
@@ -193,17 +453,18 @@ button:disabled {
   min-height: 76px;
   max-height: 40vh;
   overflow-y: auto;
+  overscroll-behavior: contain;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  background: #1d222b;
-  border: 1px solid #3b424e;
-  border-radius: 9px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
   padding: 10px;
 }
 
 #prompt-text:empty::before {
   content: attr(data-placeholder);
-  color: #899184;
+  color: var(--dim);
   pointer-events: none;
 }
 
@@ -215,8 +476,8 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
-  border: 1px solid #3b424e;
-  border-radius: 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
   padding: 6px 8px;
 }
 
@@ -224,13 +485,23 @@ button:disabled {
   width: 44px;
   height: 44px;
   object-fit: cover;
-  border-radius: 6px;
+  border-radius: var(--radius);
 }
 
 .attachment button {
   padding: 2px 10px;
+  min-height: var(--touch);
 }
 
 #conversation-feed {
   min-height: 30vh;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

@@ -665,6 +665,7 @@ fn router(options: ServerOptions) -> Router {
         .route("/login", get(viewer))
         .route("/viewer.css", get(viewer_css))
         .route("/viewer.js", get(viewer_js))
+        .route("/markdown.js", get(markdown_js))
         .route("/manifest.webmanifest", get(manifest))
         .route("/service-worker.js", get(service_worker))
         .route("/icon.svg", get(icon))
@@ -1365,6 +1366,12 @@ const fn target_kind_name(target: &TargetTemplate) -> &'static str {
 const VIEWER_HTML: &str = include_str!("web/viewer.html");
 const VIEWER_CSS: &str = include_str!("web/viewer.css");
 const VIEWER_JS: &str = include_str!("web/viewer.js");
+const MARKDOWN_JS: &str = include_str!("web/markdown.js");
+/// A fake DOM for running the shipped renderers under Node. It is deliberately
+/// not served: it exists so `cargo test` can exercise `markdown.js` without a
+/// browser.
+#[cfg(test)]
+const TEST_DOM_JS: &str = include_str!("web/test-dom.js");
 const SERVICE_WORKER: &str = include_str!("web/service-worker.js");
 const MANIFEST: &str = include_str!("web/manifest.webmanifest");
 const ICON_SVG: &str = include_str!("../src/icons/icon.svg");
@@ -1402,6 +1409,10 @@ async fn viewer_css() -> Response<Body> {
 
 async fn viewer_js() -> Response<Body> {
     static_response("text/javascript; charset=utf-8", VIEWER_JS, false)
+}
+
+async fn markdown_js() -> Response<Body> {
+    static_response("text/javascript; charset=utf-8", MARKDOWN_JS, false)
 }
 
 async fn manifest() -> Response<Body> {
@@ -1943,13 +1954,17 @@ mod tests {
 
     /// Run one JavaScript check under Node.
     ///
-    /// The script is written to a real file rather than passed to `--eval`, so
-    /// a failure reports a line number a person can open, and the fake DOM the
-    /// check depends on is visible in the same file as the code under test.
-    fn run_viewer_script(name: &str, script: &str) {
-        let directory = tempfile::tempdir().expect("temporary directory for a viewer check");
+    /// The check and the modules it imports are written to a real directory
+    /// rather than passed to `--eval`, so a failure reports a line number a
+    /// person can open, and so a check can import the shipped module under
+    /// test by its real name instead of against a copy pasted into a string.
+    fn run_web_check(name: &str, check: &str) {
+        let directory = tempfile::tempdir().expect("temporary directory for a web check");
+        for (file, source) in [("test-dom.js", TEST_DOM_JS), ("markdown.js", MARKDOWN_JS)] {
+            std::fs::write(directory.path().join(file), source).expect("write a web module");
+        }
         let path = directory.path().join(format!("{name}.mjs"));
-        std::fs::write(&path, script).expect("write the viewer check");
+        std::fs::write(&path, check).expect("write the web check");
         let output = std::process::Command::new("node")
             .arg(&path)
             .output()
@@ -1960,6 +1975,156 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    /// Run one JavaScript check that supplies its own environment, for the
+    /// checks that slice a function out of `viewer.js` and drive it against a
+    /// hand-written stub rather than importing a module.
+    fn run_viewer_script(name: &str, script: &str) {
+        run_web_check(name, script);
+    }
+
+    /// Everything an agent writes goes through the Markdown renderer, so the
+    /// renderer is where injection is stopped. These checks run the shipped
+    /// module against a fake DOM: structure has to come out as elements, and
+    /// markup an agent typed has to come out as text.
+    #[test]
+    fn the_markdown_renderer_builds_structure_and_refuses_injection() {
+        run_web_check(
+            "markdown",
+            r#"import { installDocument, elements, only, check, checkEqual } from './test-dom.js';
+installDocument();
+const { renderMarkdown, renderDiffSummary, safeHref } = await import('./markdown.js');
+
+const render = source => {
+  const host = document.createElement('section');
+  host.append(renderMarkdown(source));
+  return host;
+};
+
+// Headings
+checkEqual(only(render('# Title'), 'h1').textContent, 'Title', 'h1');
+checkEqual(only(render('### Deep'), 'h3').textContent, 'Deep', 'h3');
+
+// Nested lists
+const nested = render('- one\n  - inner\n- two');
+check(elements(nested, 'ul').length === 2, 'nested list produced ' + elements(nested, 'ul').length + ' lists');
+check(elements(elements(nested, 'ul')[0], 'li').length >= 2, 'outer list lost items');
+
+// Ordered lists
+checkEqual(elements(render('1. a\n2. b'), 'ol').length, 1, 'ordered list');
+
+// Fenced code stays unparsed
+const fenced = render('```rust\nlet x = *y*;\n```');
+checkEqual(only(fenced, 'code').textContent, 'let x = *y*;', 'fenced code');
+checkEqual(elements(fenced, 'em').length, 0, 'fence emphasised its contents');
+checkEqual(only(fenced, 'code').className, 'language-rust', 'fence language');
+
+// Inline code beats emphasis
+checkEqual(only(render('`*not em*`'), 'code').textContent, '*not em*', 'inline code');
+checkEqual(elements(render('`*not em*`'), 'em').length, 0, 'inline code emphasised');
+
+// Emphasis
+checkEqual(only(render('**bold**'), 'strong').textContent, 'bold', 'strong');
+checkEqual(only(render('*it*'), 'em').textContent, 'it', 'em');
+checkEqual(only(render('~~gone~~'), 'del').textContent, 'gone', 'del');
+
+// Tables
+const table = render('| a | b |\n| --- | ---: |\n| 1 | 2 |');
+checkEqual(elements(table, 'table').length, 1, 'table');
+checkEqual(elements(table, 'th').length, 2, 'table header cells');
+checkEqual(elements(table, 'td').length, 2, 'table body cells');
+checkEqual(elements(table, 'th')[1].className, 'align-right', 'table alignment class');
+checkEqual(only(table, 'div').className, 'scroll-x', 'table scroll wrapper');
+
+// Blockquote and rule
+checkEqual(elements(render('> quoted'), 'blockquote').length, 1, 'blockquote');
+checkEqual(elements(render('---'), 'hr').length, 1, 'rule');
+
+// XSS: markup is text, never elements
+const injected = render('<img src=x onerror=alert(1)>');
+checkEqual(elements(injected, 'img').length, 0, 'raw HTML became an element');
+check(injected.textContent.includes('<img src=x onerror=alert(1)>'), 'raw HTML lost its text');
+
+// XSS: refused link schemes
+for (const target of ['javascript:alert(1)', 'JaVaScRiPt:alert(1)', 'java\tscript:alert(1)', 'data:text/html,<script>', 'vbscript:x']) {
+  const out = render(`[click](${target})`);
+  checkEqual(elements(out, 'a').length, 0, `link scheme ${JSON.stringify(target)} was allowed`);
+  check(out.textContent.includes('click'), `link scheme ${JSON.stringify(target)} lost its label`);
+}
+
+// Accepted schemes keep their href and carry safe rel/target
+for (const target of ['https://example.com', 'http://example.com/a', 'mailto:someone@example.com']) {
+  const anchor = only(render(`[click](${target})`), 'a');
+  checkEqual(anchor.getAttribute('href'), target, 'href');
+  checkEqual(anchor.getAttribute('rel'), 'noreferrer noopener', 'rel');
+  checkEqual(anchor.getAttribute('target'), '_blank', 'target');
+}
+
+// safeHref directly
+checkEqual(safeHref('javascript:alert(1)'), null, 'safeHref allowed javascript:');
+checkEqual(safeHref(' https://x.test '), 'https://x.test', 'safeHref cleaned value');
+
+// Inline markup inside a link label
+checkEqual(only(render('[**bold link**](https://x.test)'), 'strong').textContent, 'bold link', 'link label markup');
+
+// An unclosed delimiter is literal, not markup
+checkEqual(render('a * b').textContent, 'a * b', 'unclosed emphasis');
+checkEqual(elements(render('a * b'), 'em').length, 0, 'unclosed emphasis made an element');
+
+// Diff summaries: the real format from format_diffstat, two spaces and U+2212
+const diff = renderDiffSummary(['src/main.rs  +12 −3', 'unparseable line']);
+const items = elements(diff, 'li');
+checkEqual(items.length, 2, 'diffstat rows');
+checkEqual(elements(items[0], 'span')[0].textContent, 'src/main.rs', 'diffstat path');
+checkEqual(elements(items[0], 'span')[1].textContent, '+12', 'diffstat additions');
+checkEqual(elements(items[0], 'span')[2].textContent, '−3', 'diffstat deletions');
+checkEqual(elements(items[1], 'span').length, 1, 'unparseable diffstat produced counts');
+checkEqual(elements(items[1], 'span')[0].textContent, 'unparseable line', 'unparseable diffstat lost its text');
+
+console.log('all markdown checks passed');
+"#,
+        );
+    }
+
+    /// The renderer's guarantee is structural — this code cannot inject markup
+    /// because it never builds markup — and a single stray assignment would
+    /// quietly replace it with no guarantee at all. `escapeHtml` uses
+    /// `innerHTML` on a detached node to escape text, which is safe but is
+    /// also exactly the shape this test exists to stop spreading, so it is
+    /// named rather than pattern-matched.
+    #[test]
+    fn no_web_module_builds_markup_from_a_string() {
+        const SINKS: [&str; 5] = [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "new Function",
+        ];
+        // There is no allowance. Every one of these sinks was removed in
+        // Milestone 2, and the point of the test is that none comes back.
+        const ALLOWED: [(&str, &str); 0] = [];
+        for (name, source) in [("viewer.js", VIEWER_JS), ("markdown.js", MARKDOWN_JS)] {
+            for (number, line) in source.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                for sink in SINKS {
+                    if !trimmed.contains(sink) {
+                        continue;
+                    }
+                    assert!(
+                        ALLOWED
+                            .iter()
+                            .any(|(file, allowed)| *file == name && trimmed == *allowed),
+                        "{name}:{} builds markup from a string: {trimmed}",
+                        number + 1
+                    );
+                }
+            }
+        }
     }
 
     /// The card cache is the fix for answers vanishing under snapshot polls, so

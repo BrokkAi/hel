@@ -1,3 +1,22 @@
+import { renderMarkdown } from './markdown.js';
+
+/// Build one element. Every piece of this application creates nodes and sets
+/// `textContent`; nothing builds markup as a string, which is what makes agent
+/// output structurally unable to inject an element.
+function el(name, className, textContent) {
+  const node = document.createElement(name);
+  if (className) node.className = className;
+  if (textContent !== undefined) node.textContent = textContent;
+  return node;
+}
+
+/// A button carrying the data a click handler reads back off it.
+function button(label, className, data) {
+  const node = el('button', className, label);
+  for (const [key, value] of Object.entries(data || {})) node.dataset[key] = value;
+  return node;
+}
+
 const login = document.querySelector('#login'),
   app = document.querySelector('#app'),
   dashboard = document.querySelector('#dashboard'),
@@ -19,6 +38,9 @@ const login = document.querySelector('#login'),
   attachments = document.querySelector('#attachments'),
   attachImage = document.querySelector('#attach-image'),
   imagePicker = document.querySelector('#image-picker');
+/// Transcript nodes by entry id, so an update patches the row it belongs to
+/// rather than searching the whole document for it.
+const entryNodes = new Map();
 let snapshot,
   currentSession,
   cursor = 0,
@@ -37,14 +59,17 @@ async function request(url, options = {}) {
   if (response.status === 202 || response.status === 204) return null;
   return response.json();
 }
-function options(items, selected) {
-  return items
-    .map(
-      x =>
-        `<option value="${escapeAttr(x.id)}" ${x.id === selected ? 'selected' : ''}>${escapeHtml(x.id)}</option>`,
-    )
-    .join('');
+function fillOptions(select, items, selected) {
+  select.replaceChildren(
+    ...items.map(item => {
+      const option = el('option', '', item.id);
+      option.value = item.id;
+      if (item.id === selected) option.selected = true;
+      return option;
+    }),
+  );
 }
+
 function syncProjectDirectory() {
   const required =
     snapshot?.targets.find(x => x.id === newTarget.value)?.requires_project_directory === true;
@@ -60,32 +85,89 @@ function startEvents() {
     if (currentSession) loadConversation(true);
   });
 }
+/// One session row.
+///
+/// Which actions appear is still read from the session's state string; the
+/// plan replaces that with the daemon's own `ViewerSessionCapabilities` in
+/// Milestone 3, and this is the only place that will have to change.
+function sessionCard(session) {
+  const card = el('article', 'card session');
+  card.append(el('h3', '', session.title));
+
+  const status = el('p');
+  status.append(el('span', 'pill', session.state));
+  if (session.has_error) status.append(el('span', 'pill alert', 'needs attention'));
+  if (session.pending_elicitations?.length) {
+    status.append(el('span', 'pill alert', 'input needed'));
+  }
+  status.append(el('span', '', ` ${session.harness_kind} \u00b7 ${session.profile_id}`));
+  card.append(status);
+
+  const queued = (session.queued_prompts || []).length;
+  card.append(
+    el('p', 'dim', `${session.bundle_id} \u2192 ${session.target_id} \u00b7 ${queued} queued`),
+  );
+
+  if (session.preview?.length) {
+    card.append(el('p', 'preview', session.preview.join('\n')));
+  }
+
+  const actions = el('div', 'row');
+  const open = button('Open', '', { action: 'open', id: session.id });
+  open.disabled = !session.conversation_available;
+  actions.append(open);
+  if (session.state === 'provisioning') {
+    actions.append(button('Cancel', 'danger', { action: 'cancel', id: session.id }));
+  } else {
+    actions.append(
+      button('Resume', '', {
+        action: 'resume',
+        id: session.id,
+        profile: session.profile_id,
+        target: session.target_id,
+      }),
+      button('Stop', 'danger', { action: 'close', id: session.id }),
+    );
+  }
+  card.append(actions);
+  return card;
+}
+
+function profileRow(profile) {
+  const row = el('p');
+  row.append(el('strong', '', profile.id), el('span', '', ` \u00b7 ${profile.harness_kind}`));
+  row.append(el('br'));
+  const quota = profile.quota
+    ? profile.quota.summary +
+      (profile.quota.stale ? ' \u00b7 stale' : '') +
+      (profile.quota.has_error ? ' \u00b7 unavailable' : '')
+    : 'quota unavailable';
+  row.append(el('span', 'dim', quota));
+  return row;
+}
+
 async function refresh() {
   try {
     snapshot = await request('/api/snapshot');
     login.classList.add('hidden');
     app.classList.remove('hidden');
     logout.classList.remove('hidden');
-    if (!newProfile.value) newProfile.innerHTML = options(snapshot.profiles);
-    if (!newBundle.value) newBundle.innerHTML = options(snapshot.bundles);
-    if (!newTarget.value) newTarget.innerHTML = options(snapshot.targets);
+    if (!newProfile.value) fillOptions(newProfile, snapshot.profiles);
+    if (!newBundle.value) fillOptions(newBundle, snapshot.bundles);
+    if (!newTarget.value) fillOptions(newTarget, snapshot.targets);
     syncProjectDirectory();
-    sessions.innerHTML =
-      snapshot.sessions
-        .map(
-          x =>
-            `<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span>${x.has_error ? ' <span class="pill alert">needs attention</span>' : ''}${x.pending_elicitations?.length ? ' <span class="pill alert">input needed</span>' : ''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts || []).length} queued</p>${x.preview?.length ? `<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>` : ''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available ? '' : 'disabled'}>Open</button>${x.state === 'provisioning' ? `<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>` : `<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`,
-        )
-        .join('') || '<p class="dim">No Hel-managed sessions.</p>';
-    const profileRows = snapshot.profiles
-      .map(
-        p =>
-          `<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota ? escapeHtml(p.quota.summary) + (p.quota.stale ? ' · stale' : '') + (p.quota.has_error ? ' · unavailable' : '') : 'quota unavailable'}</span></p>`,
-      )
-      .join('');
-    configured.innerHTML =
-      profileRows +
-      `<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;
+    sessions.replaceChildren(...snapshot.sessions.map(sessionCard));
+    if (!snapshot.sessions.length) {
+      sessions.append(el('p', 'dim', 'No Hel-managed sessions.'));
+    }
+    configured.replaceChildren(
+      ...snapshot.profiles.map(profileRow),
+      el(
+        'p',
+        'dim',
+        `${snapshot.targets.length} targets \u00b7 ${snapshot.bundles.length} bundles`,
+      ),
+    );
     if (currentSession) {
       const session = snapshot.sessions.find(x => x.id === currentSession);
       if (!session?.conversation_available) {
@@ -120,20 +202,28 @@ async function restoreRoute() {
   if (match) await openConversation(match[1]);
 }
 function renderQueue(session) {
-  queue.innerHTML =
-    (session.queued_prompts || [])
-      .map(
-        (x, i) =>
-          `<div class="queue-item"><span>${i + 1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`,
-      )
-      .join('') || '<p class="dim">No queued prompts.</p>';
-  shells.innerHTML =
-    (session.active_user_shells || [])
-      .map(
-        x =>
-          `<div class="queue-item"><span>$ ${escapeHtml(x.command)}</span><button class="danger" data-shell-id="${escapeAttr(x.id)}">Cancel</button></div>`,
-      )
-      .join('') || '<p class="dim">No running shells.</p>';
+  const prompts = session.queued_prompts || [];
+  queue.replaceChildren(
+    ...(prompts.length
+      ? prompts.map((prompt, index) => {
+          const row = el('div', 'queue-item');
+          row.append(el('span', '', `${index + 1}. ${prompt.text}`));
+          row.append(button('Remove', 'danger', { queueId: prompt.id }));
+          return row;
+        })
+      : [el('p', 'dim', 'No queued prompts.')]),
+  );
+  const running = session.active_user_shells || [];
+  shells.replaceChildren(
+    ...(running.length
+      ? running.map(shell => {
+          const row = el('div', 'queue-item');
+          row.append(el('span', '', `$ ${shell.command}`));
+          row.append(button('Cancel', 'danger', { shellId: shell.id }));
+          return row;
+        })
+      : [el('p', 'dim', 'No running shells.')]),
+  );
 }
 // Every snapshot revision re-renders the conversation. Rebuilding a card the
 // user is answering would wipe the half-filled form and steal focus, so each
@@ -629,21 +719,56 @@ async function submitPrompt() {
     error.textContent = err.message;
   }
 }
+/// Roles whose body is prose the agent or the person wrote, and so is rendered
+/// as Markdown. Everything else — tool output, plans, Hel's own notes — is
+/// preformatted text, because Markdown in a tool dump is a coincidence rather
+/// than an intent.
+const PROSE_ROLES = new Set(['user', 'agent', 'thought']);
+
+/// The glyph and label the terminal surface gives each role, so the two read
+/// alike. `fn entry_visual` in `src/hel_chat/transcript.rs` is the original;
+/// Milestone 3 carries the glyph in the projection so this copy can go.
+const ROLE_GLYPH = {
+  user: '\u276f',
+  agent: '\u25cf',
+  thought: '\u25cb',
+  tool: '\u2022',
+  plan: '\u25c7',
+  'plan-proposal': '\u25c8',
+  system: '\u2500',
+};
+
+function entryBody(entry) {
+  const text = entry.lines.join('\n');
+  if (PROSE_ROLES.has(entry.role)) {
+    const body = el('div', 'entry-body');
+    body.append(renderMarkdown(text));
+    return body;
+  }
+  return el('pre', 'entry-body', text);
+}
+
 function renderEntries(entries, replace) {
-  if (replace) feed.innerHTML = '';
+  if (replace) {
+    feed.replaceChildren();
+    entryNodes.clear();
+  }
   for (const entry of entries) {
-    let node = document.querySelector(`[data-entry-id="${entry.id}"]`);
+    let node = entryNodes.get(entry.id);
     if (!node) {
-      node = document.createElement('article');
+      node = el('article');
       node.dataset.entryId = entry.id;
+      entryNodes.set(entry.id, node);
       feed.append(node);
     }
     node.className = `entry ${entry.role}`;
-    const title = document.createElement('strong');
-    title.textContent = entry.label;
-    const body = document.createElement('pre');
-    body.textContent = entry.lines.join('\n');
-    node.replaceChildren(title, body);
+    const heading = el('strong');
+    const glyph = el('span', 'entry-glyph', ROLE_GLYPH[entry.role] || '\u2500');
+    // The glyph repeats what the label already says, so it is decoration to a
+    // screen reader and must not be read out twice.
+    glyph.setAttribute('aria-hidden', 'true');
+    heading.append(glyph, el('span', 'entry-label', entry.label));
+    node.replaceChildren(heading, entryBody(entry));
   }
   window.scrollTo(0, document.body.scrollHeight);
 }
@@ -896,14 +1021,6 @@ shells.onclick = async e => {
     document.querySelector('#conversation-error').textContent = err.message;
   }
 };
-function escapeHtml(value) {
-  const e = document.createElement('span');
-  e.textContent = value;
-  return e.innerHTML;
-}
-function escapeAttr(value) {
-  return escapeHtml(value).replaceAll('"', '&quot;');
-}
 window.addEventListener('online', () => {
   startEvents();
   refresh();
