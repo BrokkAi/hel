@@ -1016,3 +1016,69 @@ article > h3 {
   color: var(--accent);
   white-space: nowrap;
 }
+
+/* ---- connection ----
+ *
+ * The banner is hidden while the link is healthy and says which of the two
+ * unhealthy states this is otherwise. A page that looks current while it is
+ * not is worse than one that admits it.
+ */
+
+.connection {
+  display: none;
+  margin: 0;
+  padding: 8px 12px;
+  background: var(--surface-raised);
+  border-bottom: 1px solid var(--running);
+  color: var(--running);
+}
+
+body[data-connection='offline'] .connection,
+body[data-connection='reconnecting'] .connection {
+  display: block;
+}
+
+body[data-connection='reconnecting'] .connection::before {
+  content: 'Reconnecting…';
+}
+
+body[data-connection='reconnecting'] .connection {
+  font-size: 0;
+}
+
+body[data-connection='reconnecting'] .connection::before {
+  font-size: 16px;
+}
+
+/* ---- narrow phones ----
+ *
+ * Between 320 and 430 CSS pixels nothing may push the page sideways. The
+ * containment rules that do the work are on the components themselves; this
+ * only trims the chrome that has room to spare on a larger screen.
+ */
+
+@media (max-width: 430px) {
+  body {
+    padding-left: calc(10px + env(safe-area-inset-left));
+    padding-right: calc(10px + env(safe-area-inset-right));
+  }
+
+  .card {
+    padding: 10px;
+  }
+
+  #shell-title {
+    font-size: 18px;
+  }
+
+  .review,
+  .readings {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px 0;
+  }
+
+  .review dt,
+  .readings dt {
+    margin-top: 6px;
+  }
+}

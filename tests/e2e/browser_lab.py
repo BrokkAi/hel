@@ -114,6 +114,39 @@ def stop_from_dashboard(client) -> None:
 
 
 
+def run_layout_matrix(lab: Lab, web_root: pathlib.Path, environment: dict[str, str]) -> None:
+    """Drive the layout and accessibility checks at three viewport widths.
+
+    This runs after the reliability scenario against the same live daemon, so
+    it costs one extra browser rather than a second lab, and it sees the real
+    pages with real sessions on them rather than an empty shell.
+    """
+    log = (lab.root / "layout.log").open("wb")
+    matrix_environment = dict(environment)
+    matrix_environment["HEL_BROWSER_SPEC"] = "layout.spec.js"
+    matrix = subprocess.Popen(
+        [str(web_root / "node_modules/.bin/playwright"), "test"],
+        cwd=web_root,
+        env=matrix_environment,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    lab.record_process("started", "playwright-layout", matrix.pid)
+    try:
+        return_code = matrix.wait(timeout=TIMEOUT * 8)
+    except subprocess.TimeoutExpired as error:
+        raise ScenarioFailure("the layout matrix did not finish") from error
+    finally:
+        log.close()
+    if return_code != 0:
+        raise ScenarioFailure(
+            f"the layout matrix failed with exit code {return_code}: "
+            f"{(lab.root / 'layout.log').read_text()[-4000:]}"
+        )
+    lab.record_process("stopped", "playwright-layout", matrix.pid)
+
+
 def run(lab: Lab) -> None:
     port = lab.prepare(phone_tls=True)
     dashboard = start_dashboard(lab)
@@ -182,6 +215,7 @@ def run(lab: Lab) -> None:
         if return_code != 0:
             raise ScenarioFailure(f"Playwright failed with exit code {return_code}")
         lab.record_process("stopped", "playwright", browser.pid)
+        run_layout_matrix(lab, web_root, environment)
         (lab.root / "browser-transcript.json").write_text(
             json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         )

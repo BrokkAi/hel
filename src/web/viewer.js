@@ -86,7 +86,13 @@ async function request(url, options = {}) {
     ...options,
     headers: { 'content-type': 'application/json', ...(options.headers || {}) },
   });
-  if (response.status === 401) throw new Error('unauthorized');
+  if (response.status === 401) {
+    // Authentication expired. Every route has to reach the login swap, not
+    // only the snapshot refresh, or a phone sits on a dead page issuing
+    // requests that will never succeed.
+    showLogin();
+    throw new Error('unauthorized');
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.error || response.statusText);
@@ -951,9 +957,17 @@ async function runRefresh(target, errorNode) {
 function startEvents() {
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/api/events');
+  eventSource.addEventListener('open', () => setConnection('online'));
   eventSource.addEventListener('revision', () => {
+    setConnection('online');
     refresh();
     if (currentSession) loadConversation(true);
+  });
+  // The browser reconnects a stream on its own; saying so is what stops the
+  // page looking current while it is not.
+  eventSource.addEventListener('error', () => {
+    if (navigator.onLine) setConnection('reconnecting');
+    else setConnection('offline');
   });
 }
 
@@ -2535,10 +2549,48 @@ if (window.visualViewport) {
 }
 window.addEventListener('resize', syncKeyboardInset);
 syncKeyboardInset();
+document.body.dataset.connection = navigator.onLine ? 'online' : 'offline';
 
-window.addEventListener('online', () => {
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
+
+/// What the viewer believes about its link to the daemon.
+let connection = 'online';
+
+function setConnection(next) {
+  if (connection === next) return;
+  connection = next;
+  document.body.dataset.connection = next;
+  if (next === 'offline') announce('Offline. Showing the last state received.');
+  if (next === 'reconnecting') announce('Reconnecting.');
+  if (next === 'online') announce('Connected.');
+}
+
+function reconnect() {
+  setConnection('reconnecting');
   startEvents();
-  refresh();
+  // A reconnect reconciles by full snapshot rather than assuming the deltas
+  // missed while offline line up with the cursor.
+  cursor = 0;
+  refresh().then(ok => {
+    if (ok) setConnection('online');
+    if (ok && currentSession) loadConversation(false);
+  });
+}
+
+window.addEventListener('online', reconnect);
+window.addEventListener('offline', () => setConnection('offline'));
+
+// A backgrounded progressive web app gets no `online` event, so the first
+// signal that it is back is somebody unlocking the screen.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && navigator.onLine) reconnect();
 });
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/service-worker.js');
+if ('serviceWorker' in navigator) {
+  // A registration that fails means the application is not installable, and
+  // nothing more. Left uncaught it is an unhandled rejection, which is exactly
+  // the page error the reliability suite refuses to see.
+  navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+}
 restoreRoute();
