@@ -1,6 +1,6 @@
 # SSH targets: `ssh-bare` and `ssh-podman`
 
-Hel has two target kinds that run a session on a remote machine over SSH:
+Mjolnir has two target kinds that run a session on a remote machine over SSH:
 
 - `ssh-bare` — clones the project directly into a workspace directory on the
   remote machine and runs the harness there.
@@ -9,20 +9,20 @@ Hel has two target kinds that run a session on a remote machine over SSH:
   inside it.
 
 Both shell out to the local `ssh` CLI (`src/hel_targets/ssh.rs`, `ssh_command`/
-`ssh_command_owned`); Hel does not use an SSH library or persistent
+`ssh_command_owned`); Mjolnir does not use an SSH library or persistent
 connection multiplexing of its own.
 
 ## Prerequisites you set up by hand
 
-- **Key-based SSH that works non-interactively.** Hel runs `ssh` without a
+- **Key-based SSH that works non-interactively.** Mjolnir runs `ssh` without a
   pseudo-terminal and does not prompt for a password or passphrase, so the
   target user must already accept your key without interaction (an unlocked
   key, `ssh-agent`, or a passphrase-free key).
 - **The host key already trusted.** Add the remote host to `known_hosts` (or
   otherwise satisfy your SSH host-key policy) before pointing a target at it;
-  Hel does not manage `known_hosts` for you.
+  Mjolnir does not manage `known_hosts` for you.
 - For `ssh-podman`: **rootless Podman on the remote host**, meeting the same
-  postconditions Hel expects locally. See [Podman for Hel](PODMAN.md) — the
+  postconditions Mjolnir expects locally. See [Podman for Mjolnir](PODMAN.md) — the
   remote host needs Podman 4.0 or newer and the same rootless
   user-namespace setup as a local `local-podman` host.
 
@@ -63,12 +63,12 @@ also takes the same container keys as `local-podman` (`image`, and optionally
 [targets.builder-podman]
 kind = "ssh-podman"
 host = "builder"
-image = "ghcr.io/brokkai/hel/agent-dev:latest"
+image = "ghcr.io/brokkai/mjolnir/agent-dev:latest"
 ```
 
 ## Verifying a target
 
-`hel doctor` includes a dedicated check per SSH target of either kind. It
+`mj doctor` includes a dedicated check per SSH target of either kind. It
 first probes connectivity with `ssh -o BatchMode=yes <host> true`, and its
 failure messages include the exact command to fix the common causes
 (`ssh-copy-id` for key auth, `ssh-keyscan` for an untrusted host key). For
@@ -81,4 +81,4 @@ reachability by hand before relying on a target:
 ssh <host> true
 ```
 
-If that succeeds non-interactively, Hel's own SSH invocations should too.
+If that succeeds non-interactively, Mjolnir's own SSH invocations should too.

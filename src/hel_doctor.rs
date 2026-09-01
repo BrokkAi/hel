@@ -317,7 +317,7 @@ If the `container` command is absent, install only the official signed package:\
 <https://github.com/apple/container#initial-install>\n\n\
 Hel never downloads or installs that package. If doctor reports a stopped\n\
 daemon, run exactly:\n\n```console\ncontainer system start\n```\n\n\
-Finish with the opt-in disposable runtime test in JSON mode:\n\n```console\nhel doctor --json --smoke\n```\n\n\
+Finish with the opt-in disposable runtime test in JSON mode:\n\n```console\nmj doctor --json --smoke\n```\n\n\
 Apple container is ready only when that smoke test creates a disposable\n\
 container, executes `true` in it, and removes it successfully. Use the image\n\
 configured by an `apple-container` target; without one, doctor uses\n\
@@ -2417,8 +2417,8 @@ mod tests {
     #[test]
     fn linux_instructions_embed_podman_postconditions_and_doctor_loop() {
         let instructions = setup_instructions(InstructionsPlatform::Linux);
-        assert!(instructions.contains("hel doctor --json"));
-        assert!(instructions.contains("hel doctor --json --smoke"));
+        assert!(instructions.contains("mj doctor --json"));
+        assert!(instructions.contains("mj doctor --json --smoke"));
         assert!(instructions.contains("podman unshare cat /proc/self/uid_map"));
         assert!(instructions.contains("Podman **4.0.0 or newer**"));
         assert!(instructions.contains("kind = \"local-docker\""));

@@ -1,18 +1,18 @@
-# Podman for Hel
+# Podman for Mjolnir
 
-This is the operational contract for a host that runs Hel `local-podman`
-targets. For a coding-agent handoff, run `hel setup instructions --platform
-linux` and `hel doctor --json`, then give the instructions page plus the output
-of `hel doctor --json` to the coding agent. The host is ready only when every
+This is the operational contract for a host that runs Mjolnir `local-podman`
+targets. For a coding-agent handoff, run `mj setup instructions --platform
+linux` and `mj doctor --json`, then give the instructions page plus the output
+of `mj doctor --json` to the coding agent. The host is ready only when every
 postcondition in [Verification](#verification) passes for the same unprivileged
-user that will run `hel`.
+user that will run `mj`.
 
-Hel supports Podman **4.0.0 or newer**. Version 4 is the minimum because Hel's
+Mjolnir supports Podman **4.0.0 or newer**. Version 4 is the minimum because Mjolnir's
 local target relies on the mature rootless user-namespace behavior and CLI
-interfaces that Hel probes (`podman info` and `podman unshare`). Podman 3.x is
-not a supported Hel runtime.
+interfaces that Mjolnir probes (`podman info` and `podman unshare`). Podman 3.x is
+not a supported Mjolnir runtime.
 
-## How Hel uses Podman
+## How Mjolnir uses Podman
 
 For a target such as:
 
@@ -22,9 +22,9 @@ kind = "local-podman"
 image = "localhost/hel/agent-dev:latest"
 ```
 
-Hel invokes the local `podman` CLI as the user running Hel; it does not use
+Mjolnir invokes the local `podman` CLI as the user running Mjolnir; it does not use
 `sudo`, a shared Podman socket, or a remote Podman connection. Before each
-`local-podman` session and while `hel setup` evaluates Podman, Hel performs
+`local-podman` session and while `mj setup` evaluates Podman, Mjolnir performs
 these fast runtime checks:
 
 ```console
@@ -33,7 +33,7 @@ podman info --format '{{.Host.Security.Rootless}}'
 podman unshare cat /proc/self/uid_map
 ```
 
-For a session, Hel starts a detached, labeled container from the configured
+For a session, Mjolnir starts a detached, labeled container from the configured
 image, uses `podman exec` for the worker, Git, harness, and clone commands, and
 removes that exact container with `podman rm --force` only after checkpointing.
 The default `pull_policy = "auto"` checks the registry for a changed digest when
@@ -42,13 +42,13 @@ local tags, and refuses to replace a digest-pinned image. Set `pull_policy` to
 `always`, `newer`, `missing`, or `never` to override that inference. Podman's
 `newer` policy retains a cached image when its registry is temporarily
 unavailable.
-`hel setup` additionally creates, executes `true` in, and removes a disposable
+`mj setup` additionally creates, executes `true` in, and removes a disposable
 container from the configured image. The fast runtime probes themselves never
 pull an image; image refresh happens in the supervised provisioning task.
 
 ### Git clone cache
 
-For GitHub-backed bundles, Hel keeps bare object mirrors under
+For GitHub-backed bundles, Mjolnir keeps bare object mirrors under
 `~/.cache/hel/git/mirrors` on the Podman host. A launch refreshes the mirror,
 creates a session-specific local snapshot under `~/.cache/hel/git/sessions`,
 and mounts only that snapshot read-only into the container. The normal clone
@@ -60,16 +60,16 @@ reflink or ZFS permissions are not required.
 The cache is opportunistic. Missing host Git, authentication trouble, or a
 cache preparation failure produces a launch notice and falls back to the
 ordinary in-container clone. A first cache miss still downloads the complete
-mirror; later launches fetch only updates. Hel removes session snapshots after
+mirror; later launches fetch only updates. Mjolnir removes session snapshots after
 their owning container and prunes mirrors unused for 30 days, then applies a
 20 GiB least-recently-used soft cap. Cache directories are private to the
 Podman user because they may retain objects from private repositories. You can
 remove `~/.cache/hel/git/mirrors` while no launch is updating it; do not remove
 the `sessions` directory while managed containers are running.
 
-`hel doctor --json` runs those three checks only when a `local-podman` target
+`mj doctor --json` runs those three checks only when a `local-podman` target
 exists, and then checks `podman image exists` for each configured
-`local-podman` image. `hel doctor --json --smoke` replaces that presence check
+`local-podman` image. `mj doctor --json --smoke` replaces that presence check
 with the full disposable run/exec/remove test, so it automates
 [Verification](#verification) sections 3 and 4 for every configured image.
 
@@ -78,12 +78,12 @@ wrapped in a noninteractive `ssh` call to the configured host. Every
 remediation below then applies on that remote host, as the user that SSH logs
 in as.
 
-Hel's bundled agent-development image is published at
-`ghcr.io/brokkai/hel/agent-dev:latest` (multi-arch: `linux/amd64` and
+Mjolnir's bundled agent-development image is published at
+`ghcr.io/brokkai/mjolnir/agent-dev:latest` (multi-arch: `linux/amd64` and
 `linux/arm64`, public, no authentication needed to pull). Pull it directly:
 
 ```console
-podman pull ghcr.io/brokkai/hel/agent-dev:latest
+podman pull ghcr.io/brokkai/mjolnir/agent-dev:latest
 ```
 
 Building it locally remains a supported alternative, for example to customize
@@ -98,7 +98,7 @@ podman build --pull=always \
 
 ## Install Podman rootlessly
 
-Run all `podman` commands below as the normal Hel user. Do not prefix them with
+Run all `podman` commands below as the normal Mjolnir user. Do not prefix them with
 `sudo`.
 
 ### Debian and Ubuntu
@@ -114,7 +114,7 @@ sudo apt install -y podman uidmap slirp4netns ca-certificates
 Older distribution releases can package Podman 3.x. The verification command
 below is authoritative: if it reports less than 4.0.0, upgrade to a currently
 supported Debian/Ubuntu release or install a distribution-supported Podman 4+
-package before using Hel.
+package before using Mjolnir.
 
 ### Fedora
 
@@ -126,7 +126,7 @@ sudo dnf install -y podman shadow-utils slirp4netns ca-certificates
 
 ### Assign subordinate UID and GID ranges
 
-Rootless containers need a subordinate range for the Hel user in **both**
+Rootless containers need a subordinate range for the Mjolnir user in **both**
 `/etc/subuid` and `/etc/subgid`. First inspect the current entries:
 
 ```console
@@ -152,8 +152,8 @@ podman system migrate
 
 ## Verification
 
-Every command here is a postcondition. Resolve a failure before running Hel.
-Run them by hand to diagnose a host; `hel doctor --json --smoke` checks
+Every command here is a postcondition. Resolve a failure before running Mjolnir.
+Run them by hand to diagnose a host; `mj doctor --json --smoke` checks
 sections 1 through 4 for every configured target and reports the same failures
 with an exact remediation.
 
@@ -190,23 +190,23 @@ Expected:
            1     100000      65536
   ```
 
-Hel runs the UID-map command itself before every local-Podman session. It also
+Mjolnir runs the UID-map command itself before every local-Podman session. It also
 checks that container IDs `0` and `1` are mapped, which catches a login with no
 usable subordinate range.
 
 ### 3. The configured runtime image is available
 
-For Hel's published image, set `IMAGE` to the exact `image` value from the
-Hel target and pull it:
+For Mjolnir's published image, set `IMAGE` to the exact `image` value from the
+Mjolnir target and pull it:
 
 ```console
-IMAGE=ghcr.io/brokkai/hel/agent-dev:latest
+IMAGE=ghcr.io/brokkai/mjolnir/agent-dev:latest
 podman pull "$IMAGE"
 podman image exists "$IMAGE"
 ```
 
 Both commands must exit zero. Replace the example with the configured image
-if it differs. For Hel's locally built `localhost/hel/agent-dev:latest`, build
+if it differs. For Mjolnir's locally built `localhost/hel/agent-dev:latest`, build
 it with the command above and verify it without attempting a registry pull:
 
 ```console
@@ -215,18 +215,18 @@ podman image exists localhost/hel/agent-dev:latest
 
 ### 4. A container can run, execute a command, and be removed
 
-Use the same image as the configured target. The Hel development image supports
+Use the same image as the configured target. The Mjolnir development image supports
 the following verbatim:
 
 ```console
 IMAGE=localhost/hel/agent-dev:latest
 CHECK_NAME="hel-podman-check-$$"
 podman run --init --detach --name "$CHECK_NAME" "$IMAGE" sleep infinity
-podman exec "$CHECK_NAME" /bin/sh -c 'printf "Hel Podman exec works\n"'
+podman exec "$CHECK_NAME" /bin/sh -c 'printf "Mjolnir Podman exec works\n"'
 podman rm --force "$CHECK_NAME"
 ```
 
-Expected: each command exits zero, the `exec` command prints `Hel Podman exec
+Expected: each command exits zero, the `exec` command prints `Mjolnir Podman exec
 works`, and `podman container exists "$CHECK_NAME"` exits nonzero after the
 remove command.
 
@@ -265,7 +265,7 @@ sudo dnf install -y shadow-utils
 
 ### No `/etc/subuid` or `/etc/subgid` entry after the user was created
 
-Create non-overlapping ranges for the Hel user, then log out and log in:
+Create non-overlapping ranges for the Mjolnir user, then log out and log in:
 
 ```console
 sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
@@ -279,7 +279,7 @@ unused range instead. Do not edit mappings for another account.
 
 ### Rootless check prints `false`
 
-Hel must run as an unprivileged user. Start a normal shell, do not invoke Hel
+Mjolnir must run as an unprivileged user. Start a normal shell, do not invoke Mjolnir
 through `sudo`, and remove a remote/rootful Podman override before retrying:
 
 ```console
@@ -296,7 +296,7 @@ First distinguish host DNS/TLS from container networking with the HTTPS command
 above. Install `ca-certificates` and `slirp4netns` using the distro commands if
 they are absent. Corporate proxies must be configured for the rootless Podman
 environment and passed to containers according to the organization's policy;
-never put proxy credentials in Hel's committed configuration.
+never put proxy credentials in Mjolnir's committed configuration.
 
 ### WSL2
 
@@ -312,9 +312,9 @@ wsl --shutdown
 
 Then reopen the Linux distribution, install Podman and `uidmap` inside that
 distribution, configure `/etc/subuid` and `/etc/subgid` there, and rerun every
-verification command. Hel uses the Podman CLI directly and does not require a
+verification command. Mjolnir uses the Podman CLI directly and does not require a
 Podman API socket or a systemd service, but rootless networking still requires
 the WSL2 kernel support and `slirp4netns` (or the distro's `pasta` setup).
-Keep Hel repositories and Podman storage in the Linux filesystem (for example
+Keep Mjolnir repositories and Podman storage in the Linux filesystem (for example
 under `~/`), not `/mnt/c`, for correct Linux permissions and substantially
 better overlay-filesystem performance.

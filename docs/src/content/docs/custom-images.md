@@ -3,15 +3,15 @@ title: Custom container images
 description: What a container image must provide to work as a hel Podman, Docker, Apple container, or SSH Podman target.
 ---
 
-hel can run a session in any container image that meets a small contract.
+mj can run a session in any container image that meets a small contract.
 `containers/Containerfile.agent-dev` is the reference image and satisfies all
 of it; start there if you're building your own. CI publishes this image as
-`ghcr.io/brokkai/hel/agent-dev:latest`, multi-arch for `linux/amd64` and
+`ghcr.io/brokkai/mjolnir/agent-dev:latest`, multi-arch for `linux/amd64` and
 `linux/arm64`.
 
 ## The entrypoint
 
-hel starts a session's container detached, running `sleep infinity` as its
+mj starts a session's container detached, running `sleep infinity` as its
 command, and runs every later command — the worker upload, Git, the harness,
 and the ACP bridge — with `exec` against that running container. Your image
 needs a POSIX shell and a `sleep` binary on `PATH`. It does not need any
@@ -45,13 +45,13 @@ Baking the bridges in, the way the reference image does, avoids that
 per-session install cost and pins the exact bridge version through the image
 instead of through hel's fallback.
 
-Hel-owned worker and bridge commands use non-login shells and do not source
+Mjolnir-owned worker and bridge commands use non-login shells and do not source
 `/etc/profile` or user dotfiles. Images must therefore expose required tools on
 their ordinary process `PATH`; profile-only PATH setup is not part of the
 container contract. Agent-requested shell commands remain `bash -lc` because
 those commands intentionally use the session user's shell environment.
 
-The DeepSeek bridge is the third-party `dsh-acp-server` package. Hel pins both
+The DeepSeek bridge is the third-party `dsh-acp-server` package. Mjolnir pins both
 it and `@deepseek-ai/dsh`, launches its self-managed ACP profile over stdio,
 and stages only `.credentials.yaml`, settings, instructions, skills, and agent
 presets from `DSH_HOME`. DeepSeek's adapter currently accepts one workspace
@@ -66,19 +66,19 @@ relay binary and a staged, allowlisted copy of the harness profile
 container — for example `/var/lib/hel/workers/<session-id>` and
 `/var/lib/hel/profiles/<session-id>`.
 
-hel creates these directories itself with `mkdir -p` and writes into them
+mj creates these directories itself with `mkdir -p` and writes into them
 with plain file copies; it does not pass any specific user to the runtime's `exec`,
 so those commands run as whatever user the image's `USER` (or its absence)
 puts them in. A rootless Podman container defaults to root inside when no
 `USER` is set, which can write anywhere. If your image sets a non-root
-`USER`, as the reference image does with its `hel` user, that user needs
+`USER`, as the reference image does with its `mj` user, that user needs
 write access to `/workspace` and `/var/lib/hel` — the reference image grants
-it by creating both directories and `chown`-ing them to `hel:hel` before
+it by creating both directories and `chown`-ing them to `mj:hel` before
 switching to that user.
 
 ## Resource metrics
 
-hel samples `/sys/fs/cgroup` (`memory.current`, `memory.max`,
+mj samples `/sys/fs/cgroup` (`memory.current`, `memory.max`,
 `memory.swap.current`, `memory.swap.max`, `cpu.stat`, `cpu.max`) inside the
 container to drive the CPU and memory numbers in the resource pane. This
 needs cgroup v2. If those files aren't readable, the sampling command
@@ -103,7 +103,7 @@ those before starting a container.
 [targets.podman]
 kind = "local-podman"
 image = "localhost/hel/agent-dev:latest"
-# Selects the image platform and the matching hel worker architecture.
+# Selects the image platform and the matching mj worker architecture.
 platform = "linux/amd64"
 cpus = "8"
 memory = "32g"
