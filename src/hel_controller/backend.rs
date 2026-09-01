@@ -167,6 +167,7 @@ impl Controller {
             match template {
                 TargetTemplate::LocalBare
                 | TargetTemplate::LocalPodman { .. }
+                | TargetTemplate::LocalDocker { .. }
                 | TargetTemplate::AppleContainer { .. } => {
                     local_ids.push(target_id.clone());
                 }
@@ -257,6 +258,13 @@ pub(super) fn preflight_target(
             .map_err(|error| {
                 anyhow::anyhow!(
                     "local Podman preflight failed; run `hel doctor` for actionable prerequisites: {error:#}"
+                )
+            }),
+        TargetTemplate::LocalDocker { .. } => hel_targets::verify_local_docker(executor)
+            .map(|_| ())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "local Docker preflight failed; run `hel doctor` for actionable prerequisites: {error:#}"
                 )
             }),
         TargetTemplate::SshPodman { ssh, .. } => {
@@ -411,6 +419,9 @@ pub(super) fn backend_target(
         TargetTemplate::LocalPodman { container } => hel_targets::TargetTemplate::LocalPodman(
             backend_container(container, allocation, overrides),
         ),
+        TargetTemplate::LocalDocker { container } => hel_targets::TargetTemplate::LocalDocker(
+            backend_container(container, allocation, overrides),
+        ),
         TargetTemplate::AppleContainer { container } => {
             hel_targets::TargetTemplate::AppleContainer(backend_container(
                 container, allocation, overrides,
@@ -505,6 +516,7 @@ fn usable_github_token(token: &str) -> Option<&str> {
 pub(super) fn configure_github_token_environment(target: &mut hel_targets::TargetTemplate) -> bool {
     let container = match target {
         hel_targets::TargetTemplate::LocalPodman(container)
+        | hel_targets::TargetTemplate::LocalDocker(container)
         | hel_targets::TargetTemplate::AppleContainer(container)
         | hel_targets::TargetTemplate::SshPodman { container, .. } => container,
         hel_targets::TargetTemplate::LocalBare
@@ -574,6 +586,7 @@ pub(super) fn validate_resource_allocation(
         (_, None)
         | (
             TargetTemplate::LocalPodman { .. }
+            | TargetTemplate::LocalDocker { .. }
             | TargetTemplate::AppleContainer { .. }
             | TargetTemplate::SshPodman { .. },
             Some(SessionResourceAllocation::Container { .. }),
@@ -641,6 +654,9 @@ pub(super) fn locator_after_provision(
             worker_root: data_dir().join("workers").join(session_id),
         },
         TargetTemplate::LocalPodman { .. } => TargetLocator::LocalPodman {
+            container_id: generated,
+        },
+        TargetTemplate::LocalDocker { .. } => TargetLocator::LocalDocker {
             container_id: generated,
         },
         TargetTemplate::AppleContainer { .. } => TargetLocator::AppleContainer {
@@ -767,6 +783,9 @@ pub(super) fn backend_locator(
             }
         }
         TargetLocator::LocalPodman { container_id } => hel_targets::TargetLocator::LocalPodman {
+            container_id: container_id.clone(),
+        },
+        TargetLocator::LocalDocker { container_id } => hel_targets::TargetLocator::LocalDocker {
             container_id: container_id.clone(),
         },
         TargetLocator::AppleContainer { container_id } => {

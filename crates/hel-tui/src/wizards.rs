@@ -992,6 +992,9 @@ fn render_mount_wizard(
         TargetTemplate::LocalPodman { .. } | TargetTemplate::SshPodman { .. } => {
             "Podman uses :O copy-on-write overlays; read-only skips the overlay."
         }
+        TargetTemplate::LocalDocker { .. } => {
+            "Docker uses session-owned OverlayFS volumes; read-only skips the overlay."
+        }
         TargetTemplate::AwsEc2 { .. } => {
             "EC2 directories stream as tar.gz through one SSH connection into the destination."
         }
@@ -1327,6 +1330,7 @@ fn target_label(target: &TargetTemplate) -> &'static str {
     match target {
         TargetTemplate::LocalBare => "raw localhost",
         TargetTemplate::LocalPodman { .. } => "local Podman",
+        TargetTemplate::LocalDocker { .. } => "local Docker",
         TargetTemplate::AppleContainer { .. } => "Apple container",
         TargetTemplate::AwsEc2 { .. } => "AWS EC2",
         TargetTemplate::SshBare { .. } => "named SSH machine",

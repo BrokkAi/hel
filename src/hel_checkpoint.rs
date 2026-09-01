@@ -2146,6 +2146,7 @@ fn checkpoint_stdin_command(
             CommandSpec::new(args.remove(0), args)
         }
         TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
+        TargetLocator::LocalDocker { container_id } => container_exec("docker", container_id, args),
         TargetLocator::AppleContainer { container_id } => {
             container_exec("container", container_id, args)
         }
@@ -2186,6 +2187,7 @@ pub fn export_command(
             CommandSpec::new(args.remove(0), args)
         }
         TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
+        TargetLocator::LocalDocker { container_id } => container_exec("docker", container_id, args),
         TargetLocator::AppleContainer { container_id } => {
             container_exec("container", container_id, args)
         }
@@ -2226,6 +2228,7 @@ pub fn restore_command(
             CommandSpec::new(args.remove(0), args)
         }
         TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
+        TargetLocator::LocalDocker { container_id } => container_exec("docker", container_id, args),
         TargetLocator::AppleContainer { container_id } => {
             container_exec("container", container_id, args)
         }
@@ -2374,6 +2377,13 @@ pub fn transfer_plan(
             )
             .purpose("download checkpoint from local Podman"),
         ],
+        TargetLocator::LocalDocker { container_id } => vec![
+            CommandSpec::new(
+                "docker",
+                ["cp", &format!("{container_id}:{remote_archive}"), &local],
+            )
+            .purpose("download checkpoint from local Docker"),
+        ],
         TargetLocator::AppleContainer { container_id } => vec![
             CommandSpec::new(
                 "container",
@@ -2424,6 +2434,11 @@ fn cleanup_plan(locator: &TargetLocator, session_id: &str, remote: &str) -> Resu
         ],
         TargetLocator::LocalPodman { container_id } => vec![container_exec(
             "podman",
+            container_id,
+            ["rm", "-f", "--", remote],
+        )],
+        TargetLocator::LocalDocker { container_id } => vec![container_exec(
+            "docker",
             container_id,
             ["rm", "-f", "--", remote],
         )],

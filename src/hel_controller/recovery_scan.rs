@@ -316,6 +316,20 @@ fn scan_target_workers(
             ],
             executor,
         )?,
+        TargetTemplate::LocalDocker { .. } => scan_container_engine(
+            target_id,
+            template,
+            "docker",
+            vec![
+                "ps".into(),
+                "--all".into(),
+                "--filter".into(),
+                format!("label={}=true", hel_targets::MANAGED_LABEL),
+                "--format".into(),
+                "json".into(),
+            ],
+            executor,
+        )?,
         TargetTemplate::AppleContainer { .. } => scan_container_engine(
             target_id,
             template,
@@ -471,12 +485,7 @@ fn candidates_from_container_json(
     template: &TargetTemplate,
     stdout: &[u8],
 ) -> Result<Vec<RecoveryCandidate>> {
-    let value: serde_json::Value =
-        serde_json::from_slice(stdout).context("parse container list JSON")?;
-    let mut sessions = Vec::new();
-    collect_managed_sessions(&value, &mut sessions);
-    sessions.sort();
-    sessions.dedup();
+    let sessions = managed_sessions_from_container_json(stdout)?;
     Ok(sessions
         .into_iter()
         .filter_map(|session_id| {
@@ -489,6 +498,9 @@ fn candidates_from_container_json(
             };
             let locator = match template {
                 TargetTemplate::LocalPodman { .. } => TargetLocator::LocalPodman {
+                    container_id: generated,
+                },
+                TargetTemplate::LocalDocker { .. } => TargetLocator::LocalDocker {
                     container_id: generated,
                 },
                 TargetTemplate::AppleContainer { .. } => TargetLocator::AppleContainer {
@@ -508,6 +520,20 @@ fn candidates_from_container_json(
             })
         })
         .collect())
+}
+
+pub(super) fn managed_sessions_from_container_json(stdout: &[u8]) -> Result<Vec<String>> {
+    let values = serde_json::Deserializer::from_slice(stdout)
+        .into_iter::<serde_json::Value>()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parse container list JSON")?;
+    let mut sessions = Vec::new();
+    for value in &values {
+        collect_managed_sessions(value, &mut sessions);
+    }
+    sessions.sort();
+    sessions.dedup();
+    Ok(sessions)
 }
 
 pub(super) fn collect_managed_sessions(value: &serde_json::Value, sessions: &mut Vec<String>) {
@@ -749,6 +775,11 @@ fn recovery_backend_locator(
                 container_id: container_id.clone(),
             }
         }
+        (TargetTemplate::LocalDocker { .. }, TargetLocator::LocalDocker { container_id }) => {
+            hel_targets::TargetLocator::LocalDocker {
+                container_id: container_id.clone(),
+            }
+        }
         (TargetTemplate::AppleContainer { .. }, TargetLocator::AppleContainer { container_id }) => {
             hel_targets::TargetLocator::AppleContainer {
                 container_id: container_id.clone(),
@@ -956,6 +987,36 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].session_id, "0123456789abcdef0123456789abcdef");
     }
+
+    #[test]
+    fn recovery_docker_scan_accepts_json_lines_and_builds_a_docker_locator() {
+        let template = TargetTemplate::LocalDocker {
+            container: ConfigContainer {
+                image: "ignored".into(),
+                pull_policy: Default::default(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: BTreeMap::new(),
+            },
+        };
+        let session = "0123456789abcdef0123456789abcdef";
+        let output = format!(
+            "{{\"Labels\":\"dev.hel.managed=true,dev.hel.session={session}\"}}\n{{\"Labels\":\"dev.hel.managed=false,dev.hel.session=ignored\"}}\n"
+        );
+
+        let candidates =
+            candidates_from_container_json("docker", &template, output.as_bytes()).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, session);
+        assert!(matches!(
+            &candidates[0].locator,
+            TargetLocator::LocalDocker { container_id }
+                if container_id == &hel_targets::resource_name(session).unwrap()
+        ));
+    }
+
     #[test]
     fn recovery_aws_scan_uses_exact_tagged_instance_and_address() {
         let json = serde_json::json!({"Reservations": [{"Instances": [{

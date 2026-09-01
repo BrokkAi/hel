@@ -617,6 +617,7 @@ impl Controller {
                 let bundle = bundle.context("session bundle is missing")?;
                 let workspace_root = match &backend {
                     hel_targets::TargetLocator::LocalPodman { .. }
+                    | hel_targets::TargetLocator::LocalDocker { .. }
                     | hel_targets::TargetLocator::AppleContainer { .. }
                     | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
                     hel_targets::TargetLocator::AwsEc2 { workspace, .. }
@@ -1628,6 +1629,19 @@ pub(super) fn upload_checkpoint_spec(
             .purpose("upload checkpoint specification"),
         )
         .map(|_| ()),
+        hel_targets::TargetLocator::LocalDocker { container_id } => execute_checked(
+            executor,
+            CommandSpec::new(
+                "docker",
+                [
+                    "cp".into(),
+                    local.to_string_lossy().into_owned(),
+                    format!("{container_id}:{remote}"),
+                ],
+            )
+            .purpose("upload checkpoint specification"),
+        )
+        .map(|_| ()),
         hel_targets::TargetLocator::AppleContainer { container_id } => execute_checked(
             executor,
             CommandSpec::new(
@@ -2111,6 +2125,50 @@ mod tests {
                 },
             })
         }
+    }
+    #[test]
+    fn docker_checkpoint_fallback_upload_uses_docker_cp() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+        let locator = hel_targets::TargetLocator::LocalDocker {
+            container_id: "hel-session-12345678".to_owned(),
+        };
+        upload_checkpoint_spec(
+            &executor,
+            &locator,
+            LATCH_RELAY_SESSION,
+            Path::new("checkpoint-spec.json"),
+            "/var/lib/hel/workers/session/checkpoint-spec.json",
+        )
+        .unwrap();
+
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "docker");
+        assert_eq!(
+            commands[0].args,
+            [
+                "cp",
+                "checkpoint-spec.json",
+                "hel-session-12345678:/var/lib/hel/workers/session/checkpoint-spec.json"
+            ]
+        );
+        assert_eq!(commands[0].purpose, "upload checkpoint specification");
     }
     #[test]
     fn checkpoint_export_streams_its_spec_instead_of_uploading_it() {

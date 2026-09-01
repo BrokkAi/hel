@@ -212,6 +212,7 @@ pub(super) fn verify_locator(locator: &TargetLocator, session_id: &str) -> Resul
             }
         }
         TargetLocator::LocalPodman { container_id }
+        | TargetLocator::LocalDocker { container_id }
         | TargetLocator::AppleContainer { container_id }
         | TargetLocator::SshPodman { container_id, .. } => {
             if container_id != &expected_name && !is_runtime_container_id(container_id) {

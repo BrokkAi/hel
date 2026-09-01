@@ -171,6 +171,27 @@ fn podman_preflight_requires_supported_rootless_uid_mapped_runtime() {
 }
 
 #[test]
+fn docker_preflight_requires_a_reachable_linux_daemon() {
+    let ready = PodmanPreflightExecutor::with_outputs([podman_output(b"29.0.1 linux\n")]);
+    assert_eq!(
+        verify_local_docker(&ready).unwrap(),
+        DockerPreflight {
+            version: "29.0.1".into(),
+        }
+    );
+    assert_eq!(ready.seen.borrow()[0].program, "docker");
+    assert_eq!(
+        ready.seen.borrow()[0].args,
+        ["version", "--format", "{{.Server.Version}} {{.Server.Os}}"]
+    );
+
+    let desktop = PodmanPreflightExecutor::with_outputs([podman_output(b"29.0.1 windows\n")]);
+    let error = verify_local_docker(&desktop).unwrap_err().to_string();
+    assert!(error.contains("expected a Linux Docker daemon"), "{error}");
+    assert!(error.contains(DOCKER_DOCUMENTATION_PATH), "{error}");
+}
+
+#[test]
 fn podman_preflight_rejects_unsupported_version_with_upgrade_remediation() {
     let executor =
         PodmanPreflightExecutor::with_outputs([podman_output(b"podman version 3.4.7\n")]);
@@ -574,7 +595,10 @@ fn podman_inspect_or_start_failures_stop_recovery() {
     let error = ensure_recovery_target_running(&inspect_failed, Some(&plan))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("inspect Podman session target"), "{error}");
+    assert!(
+        error.contains("inspect container session target"),
+        "{error}"
+    );
     assert_eq!(inspect_failed.seen.borrow().len(), 2);
 
     let start_failed = PodmanPreflightExecutor::with_outputs([
@@ -906,6 +930,31 @@ fn explicit_podman_pull_policy_overrides_image_tag_defaults() {
 }
 
 #[test]
+fn docker_pull_policy_uses_supported_digest_aware_run_modes() {
+    for (policy, expected) in [
+        (ImagePullPolicy::Always, "--pull=always"),
+        (ImagePullPolicy::Newer, "--pull=always"),
+        (ImagePullPolicy::Missing, "--pull=missing"),
+        (ImagePullPolicy::Never, "--pull=never"),
+    ] {
+        let args = container_run_args(
+            "docker",
+            &ContainerTemplate {
+                image: "ghcr.io/example/dev:1.2.3".to_owned(),
+                pull_policy: policy,
+                extra_run_args: vec![],
+            },
+            "container-name",
+            SESSION,
+            &[],
+        )
+        .unwrap();
+        assert!(args.contains(&expected.to_owned()), "{args:?}");
+        assert!(!args.contains(&"--pull=newer".to_owned()), "{args:?}");
+    }
+}
+
+#[test]
 fn podman_additional_mounts_use_copy_on_write_overlay_volumes() {
     let mounts = [
         AdditionalMount {
@@ -943,6 +992,67 @@ fn podman_additional_mounts_use_copy_on_write_overlay_volumes() {
             .windows(2)
             .any(|args| args == ["--volume", "/host/models:/mnt/models:ro"])
     );
+}
+
+#[test]
+fn docker_additional_mounts_use_managed_overlay_and_read_only_bind_volumes() {
+    let mounts = [
+        AdditionalMount {
+            source: PathBuf::from("/host/cache"),
+            destination: PathBuf::from("/mnt/cache"),
+            read_only: false,
+        },
+        AdditionalMount {
+            source: PathBuf::from("/host/models"),
+            destination: PathBuf::from("/mnt/models"),
+            read_only: true,
+        },
+    ];
+    let plan = provision_plan(
+        &TargetTemplate::LocalDocker(ContainerTemplate {
+            image: "ubuntu:24.04".to_owned(),
+            pull_policy: ImagePullPolicy::Auto,
+            extra_run_args: vec![],
+        }),
+        SESSION,
+        &bundle(),
+        &mounts,
+    )
+    .unwrap();
+
+    let create = &plan.commands[0];
+    let name = resource_name(SESSION).unwrap();
+    let volume = format!("{name}-mount-0");
+    assert_eq!(create.program, "sh");
+    assert!(create.creates_target);
+    assert!(create.args[1].contains("docker volume create"));
+    assert!(create.args[1].contains("--opt type=overlay"));
+    assert!(create.args[1].contains("lowerdir=$source,upperdir=$upper,workdir=$work"));
+    assert!(create.args[1].contains("refusing foreign Docker volume"));
+    assert!(create.args.contains(&"/host/cache".to_owned()));
+    assert!(create.args.contains(&volume));
+    assert!(
+        create
+            .args
+            .windows(2)
+            .any(|args| { args == ["--volume", format!("{volume}:/mnt/cache").as_str()] })
+    );
+    assert!(
+        create
+            .args
+            .windows(2)
+            .any(|args| args == ["--volume", "/host/models:/mnt/models:ro"])
+    );
+    assert!(create.args.contains(&"--pull=missing".to_owned()));
+    assert!(create.args.contains(&"--init".to_owned()));
+
+    let clone = plan
+        .commands
+        .iter()
+        .find(|command| command.purpose == "clone app")
+        .unwrap();
+    assert_eq!(clone.program, "docker");
+    assert_eq!(&clone.args[..4], ["exec", "-i", name.as_str(), "git"]);
 }
 
 #[test]
@@ -1155,6 +1265,30 @@ fn apple_cleanup_confirms_absence_by_the_exact_provisioned_container_id() {
         stderr: b"service unavailable".to_vec(),
     }]);
     assert!(cleanup_target_is_confirmed_absent(&locator, SESSION, &failed).is_err());
+}
+
+#[test]
+fn docker_cleanup_confirmation_distinguishes_live_absent_and_unreachable() {
+    let locator = TargetLocator::LocalDocker {
+        container_id: resource_name(SESSION).unwrap(),
+    };
+    let live = PodmanPreflightExecutor::with_outputs([CommandOutput {
+        status: 1,
+        stdout: vec![],
+        stderr: vec![],
+    }]);
+    assert!(!cleanup_target_is_confirmed_absent(&locator, SESSION, &live).unwrap());
+    assert!(live.seen.borrow()[0].args[1].contains("then exit 1"));
+
+    let absent = PodmanPreflightExecutor::with_outputs([podman_output("")]);
+    assert!(cleanup_target_is_confirmed_absent(&locator, SESSION, &absent).unwrap());
+
+    let unreachable = PodmanPreflightExecutor::with_outputs([CommandOutput {
+        status: 2,
+        stdout: vec![],
+        stderr: b"daemon unavailable".to_vec(),
+    }]);
+    assert!(cleanup_target_is_confirmed_absent(&locator, SESSION, &unreachable).is_err());
 }
 
 #[test]
@@ -1564,6 +1698,10 @@ fn every_provisioning_plan_names_the_command_that_creates_its_target() {
     let creating = [
         (
             TargetTemplate::LocalPodman(container.clone()),
+            "start session container",
+        ),
+        (
+            TargetTemplate::LocalDocker(container.clone()),
             "start session container",
         ),
         (
@@ -1988,6 +2126,27 @@ fn podman_cleanup_ignores_an_already_absent_container() {
     let remove_cache = remote.find(".cache/hel/git/sessions").unwrap();
     assert!(remove_container < remove_cache);
     assert!(remote.contains(SESSION));
+}
+
+#[test]
+fn docker_cleanup_removes_container_then_volumes_then_overlay_backing_files() {
+    let name = resource_name(SESSION).unwrap();
+    let close = close_plan(&TargetLocator::LocalDocker { container_id: name }, SESSION).unwrap();
+    let command = &close.commands[0];
+    assert_eq!(command.program, "sh");
+    let script = &command.args[1];
+    let remove_container = script.find("docker rm --force").unwrap();
+    let list_volumes = script.find("docker volume ls").unwrap();
+    let remove_volumes = script.find("docker volume rm --force").unwrap();
+    let remove_overlay = script.find(".cache/hel/docker-overlays").unwrap();
+    assert!(remove_container < list_volumes);
+    assert!(list_volumes < remove_volumes);
+    assert!(remove_volumes < remove_overlay);
+    assert!(script.contains("if [ \"$status\" -eq 0 ]"));
+    assert!(script.contains("label=dev.hel.managed=true"));
+    assert!(script.contains("label=dev.hel.session=$2"));
+    assert!(script.contains("true|$2"));
+    assert!(script.contains("refusing to remove a Docker container Hel does not own"));
 }
 
 #[test]

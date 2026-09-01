@@ -912,6 +912,7 @@ impl Controller {
             } else {
                 match &backend {
                     hel_targets::TargetLocator::LocalPodman { .. }
+                    | hel_targets::TargetLocator::LocalDocker { .. }
                     | hel_targets::TargetLocator::AppleContainer { .. }
                     | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
                     hel_targets::TargetLocator::AwsEc2 { workspace, .. }
