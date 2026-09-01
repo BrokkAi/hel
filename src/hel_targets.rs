@@ -25,6 +25,7 @@ pub const SESSION_TAG: &str = "dev.hel.session";
 pub const MANAGED_TAG: &str = "dev.hel.managed";
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
 pub const PODMAN_DOCUMENTATION_PATH: &str = "docs/PODMAN.md";
+pub const DOCKER_DOCUMENTATION_PATH: &str = "docs/DOCKER.md";
 
 const PODMAN_MINIMUM_MAJOR_VERSION: u32 = 4;
 
@@ -222,16 +223,16 @@ pub struct DeploymentCapacityUsage {
 pub struct AdditionalMount {
     pub source: PathBuf,
     pub destination: PathBuf,
-    /// Attach the source read-only instead of behind Podman's copy-on-write
-    /// overlay. Defaults to false so archives and records written before the
-    /// option existed keep the overlay they were provisioned with.
+    /// Attach the source read-only instead of behind the container runtime's
+    /// copy-on-write overlay. Defaults to false so archives and records written
+    /// before the option existed keep the overlay they were provisioned with.
     #[serde(default)]
     pub read_only: bool,
 }
 
-/// Why a filesystem cannot host Podman's `:O` copy-on-write overlay, or `None`
-/// when it can. Unknown types are allowed: the overlay is the better mount and
-/// only a filesystem known to break it is downgraded.
+/// Why a filesystem cannot host a container target's copy-on-write overlay,
+/// or `None` when it can. Unknown types are allowed: the overlay is the better
+/// mount and only a filesystem known to break it is downgraded.
 ///
 /// The names are those `stat -f -c %T` reports, matched case-insensitively.
 pub fn overlay_unsupported_filesystem(filesystem: &str) -> Option<&'static str> {
@@ -894,6 +895,45 @@ pub fn verify_local_podman(executor: &impl CommandExecutor) -> Result<PodmanPref
     verify_podman(PodmanHost::Local, executor)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerPreflight {
+    pub version: String,
+}
+
+/// Verify that the Docker CLI can reach a Linux Docker daemon.
+///
+/// Image and OverlayFS support are exercised by the setup/doctor smoke test;
+/// this fast probe runs before every launch and never pulls an image.
+pub fn verify_local_docker(executor: &impl CommandExecutor) -> Result<DockerPreflight> {
+    let command = CommandSpec::new(
+        "docker",
+        ["version", "--format", "{{.Server.Version}} {{.Server.Os}}"],
+    )
+    .purpose("check Docker daemon")
+    .stage(ProvisionStage::Provisioning);
+    let output = executor
+        .execute(&command)
+        .context("Docker preflight failed: run `docker info` as the user running Hel")?;
+    ensure!(
+        output.status == 0,
+        "Docker preflight failed: `docker version` exited with status {}: {}. Run `docker info` as the user running Hel. See {DOCKER_DOCUMENTATION_PATH}.",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let mut fields = reported.split_whitespace();
+    let version = fields.next().unwrap_or_default();
+    let os = fields.next().unwrap_or_default();
+    ensure!(
+        !version.is_empty() && os == "linux",
+        "Docker preflight failed: expected a Linux Docker daemon, got {:?}. See {DOCKER_DOCUMENTATION_PATH}.",
+        reported.trim()
+    );
+    Ok(DockerPreflight {
+        version: version.to_owned(),
+    })
+}
+
 /// Verify the same rootless Podman preconditions on an SSH host.
 ///
 /// The probes run through the noninteractive SSH options, so an unreachable
@@ -1166,7 +1206,9 @@ impl CommandPlan {
             .context("provisioning plan has no target creation command")?;
         let read_and_export = format!("IFS= read -r {name} || exit 1; export {name};");
         match target {
-            TargetTemplate::LocalPodman(_) | TargetTemplate::AppleContainer(_) => {
+            TargetTemplate::LocalPodman(_)
+            | TargetTemplate::LocalDocker(_)
+            | TargetTemplate::AppleContainer(_) => {
                 let program = std::mem::replace(&mut command.program, "sh".to_owned());
                 let args = std::mem::take(&mut command.args);
                 command.args = vec![
@@ -1440,6 +1482,7 @@ pub struct AwsTemplate {
 pub enum TargetTemplate {
     LocalBare,
     LocalPodman(ContainerTemplate),
+    LocalDocker(ContainerTemplate),
     AppleContainer(ContainerTemplate),
     AwsEc2(AwsTemplate),
     SshBare {
@@ -1464,6 +1507,9 @@ pub enum TargetLocator {
         worker_root: String,
     },
     LocalPodman {
+        container_id: String,
+    },
+    LocalDocker {
         container_id: String,
     },
     AppleContainer {
@@ -1525,6 +1571,7 @@ pub fn workspace_for(template: &TargetTemplate, session_id: &str) -> Result<Stri
     match template {
         TargetTemplate::LocalBare => bail!("local bare projects use their selected directory"),
         TargetTemplate::LocalPodman(_)
+        | TargetTemplate::LocalDocker(_)
         | TargetTemplate::AppleContainer(_)
         | TargetTemplate::SshPodman { .. } => Ok(CONTAINER_WORKSPACE.to_owned()),
         TargetTemplate::AwsEc2(_) => Ok(format!(".local/share/hel/workspaces/{session_id}")),
@@ -1557,6 +1604,7 @@ pub fn provision_plan(
         && !matches!(
             template,
             TargetTemplate::LocalPodman(_)
+                | TargetTemplate::LocalDocker(_)
                 | TargetTemplate::AppleContainer(_)
                 | TargetTemplate::SshPodman { .. }
         )
@@ -1587,6 +1635,25 @@ pub fn provision_plan(
             );
             commands.extend(clone_commands(bundle, CONTAINER_WORKSPACE, |args| {
                 container_exec("podman", &name, args)
+            }));
+        }
+        TargetTemplate::LocalDocker(container) => {
+            validate_container_template(container)?;
+            commands.push(docker_container_run(
+                container,
+                &name,
+                session_id,
+                additional_mounts,
+            )?);
+            commands.extend(
+                install_git_plan(ExecutionBoundary::Container {
+                    engine: "docker",
+                    container_id: &name,
+                })
+                .commands,
+            );
+            commands.extend(clone_commands(bundle, CONTAINER_WORKSPACE, |args| {
+                container_exec("docker", &name, args)
             }));
         }
         TargetTemplate::AppleContainer(container) => {
@@ -1739,6 +1806,7 @@ pub fn setup_smoke_plan(template: &TargetTemplate, smoke_id: &str) -> Result<Com
     let name = resource_name(smoke_id)?;
     let (engine, container, boundary) = match template {
         TargetTemplate::LocalPodman(container) => ("podman", container, ExecutionBoundary::Direct),
+        TargetTemplate::LocalDocker(container) => ("docker", container, ExecutionBoundary::Direct),
         TargetTemplate::AppleContainer(container) => {
             ("container", container, ExecutionBoundary::Direct)
         }
@@ -1783,12 +1851,69 @@ pub fn run_setup_smoke_test(
     smoke_id: &str,
     executor: &impl CommandExecutor,
 ) -> Result<()> {
+    if let TargetTemplate::LocalDocker(container) = template {
+        return run_docker_overlay_smoke_test(container, smoke_id, executor);
+    }
     let plan = setup_smoke_plan(template, smoke_id)?;
     execute_checked(executor, &plan.commands[0])?;
     let smoke_result = execute_checked(executor, &plan.commands[1]);
     let cleanup_result = execute_checked(executor, &plan.commands[2]);
     smoke_result?;
     cleanup_result
+}
+
+fn run_docker_overlay_smoke_test(
+    container: &ContainerTemplate,
+    smoke_id: &str,
+    executor: &impl CommandExecutor,
+) -> Result<()> {
+    validate_container_template(container)?;
+    let lower = tempfile::Builder::new()
+        .prefix("hel-docker-overlay-smoke-")
+        .tempdir()
+        .context("create Docker OverlayFS smoke directory")?;
+    let original = lower.path().join("original.txt");
+    let added = lower.path().join("container-created.txt");
+    fs::write(&original, b"lower\n").context("write Docker OverlayFS smoke source")?;
+    let name = resource_name(smoke_id)?;
+    let mount = AdditionalMount {
+        source: lower.path().to_path_buf(),
+        destination: PathBuf::from("/mnt/hel-overlay-smoke"),
+        read_only: false,
+    };
+    let create = docker_container_run(container, &name, smoke_id, &[mount])?
+        .purpose("create disposable Docker OverlayFS smoke container");
+    let probe = container_exec(
+        "docker",
+        &name,
+        [
+            "sh",
+            "-c",
+            "test \"$(cat /mnt/hel-overlay-smoke/original.txt)\" = lower && printf 'changed\\n' >/mnt/hel-overlay-smoke/original.txt && printf 'created\\n' >/mnt/hel-overlay-smoke/container-created.txt",
+        ],
+    )
+    .purpose("verify Docker OverlayFS copy-on-write attachment");
+    let cleanup = close_plan(&TargetLocator::LocalDocker { container_id: name }, smoke_id)?
+        .commands
+        .into_iter()
+        .next()
+        .context("Docker OverlayFS smoke cleanup plan is empty")?;
+
+    execute_checked(executor, &create)?;
+    let smoke_result = execute_checked(executor, &probe);
+    let cleanup_result = execute_checked(executor, &cleanup);
+    smoke_result?;
+    cleanup_result?;
+    ensure!(
+        fs::read(&original).context("read Docker OverlayFS smoke source after container write")?
+            == b"lower\n",
+        "Docker OverlayFS smoke test changed its lower source"
+    );
+    ensure!(
+        !added.exists(),
+        "Docker OverlayFS smoke test created a file in its lower source"
+    );
+    Ok(())
 }
 
 fn execute_checked(executor: &impl CommandExecutor, command: &CommandSpec) -> Result<()> {
@@ -1843,6 +1968,11 @@ pub fn reconnect_plan(locator: &TargetLocator, session_id: &str) -> Result<Comma
             container_id,
             [&binary, "worker", "proxy", "--root", &root],
         ),
+        TargetLocator::LocalDocker { container_id } => container_exec(
+            "docker",
+            container_id,
+            [&binary, "worker", "proxy", "--root", &root],
+        ),
         TargetLocator::AppleContainer { container_id } => container_exec(
             "container",
             container_id,
@@ -1874,7 +2004,7 @@ pub fn reconnect_plan(locator: &TargetLocator, session_id: &str) -> Result<Comma
     })
 }
 
-/// Describe safe recovery for a Podman container that belongs to an active
+/// Describe safe recovery for a container that belongs to an active
 /// session. The inspect command is deliberately separate from `exec`: a host
 /// crash can leave the container present but stopped, where `exec` cannot
 /// distinguish that state from other transport failures.
@@ -1891,6 +2021,22 @@ pub fn target_recovery_plan(
                 .purpose("inspect Hel session container"),
             CommandSpec::new("podman", ["start", container_id])
                 .purpose("start stopped Hel session container"),
+        ),
+        TargetLocator::LocalDocker { container_id } => (
+            CommandSpec::new(
+                "sh",
+                [
+                    "-c",
+                    "docker container inspect \"$1\" >/dev/null 2>&1 && exit 0; docker info >/dev/null 2>&1 && exit 1; exit 125",
+                    "hel-docker-exists",
+                    container_id,
+                ],
+            )
+            .purpose("check for Hel Docker session container"),
+            CommandSpec::new("docker", ["container", "inspect", container_id])
+                .purpose("inspect Hel Docker session container"),
+            CommandSpec::new("docker", ["start", container_id])
+                .purpose("start stopped Hel Docker session container"),
         ),
         TargetLocator::SshPodman { ssh, container_id } => (
             ssh_command(ssh, ["podman", "container", "exists", container_id])
@@ -1913,7 +2059,7 @@ pub fn target_recovery_plan(
     }))
 }
 
-/// Start a confirmed stopped Podman target and verify it reached `running`.
+/// Start a confirmed stopped container target and verify it reached `running`.
 /// Missing or foreign containers, transport failures, and transitional states
 /// fail without running the start command.
 pub fn ensure_recovery_target_running(
@@ -1925,7 +2071,7 @@ pub fn ensure_recovery_target_running(
     };
     let existence = executor
         .execute(&plan.exists)
-        .context("check whether Podman session target exists")?;
+        .context("check whether container session target exists")?;
     match existence.status {
         0 => {}
         // `podman container exists` deliberately reserves 1 for absence and
@@ -1934,7 +2080,7 @@ pub fn ensure_recovery_target_running(
         1 => return Ok(TargetRecoveryOutcome::Missing),
         _ => {
             checked_command_output(&plan.exists, existence)
-                .context("check whether Podman session target exists")?;
+                .context("check whether container session target exists")?;
             unreachable!("a successful checked command has status zero");
         }
     }
@@ -1944,19 +2090,19 @@ pub fn ensure_recovery_target_running(
         "created" | "initialized" | "stopped" | "exited" => {
             let output = executor.execute(&plan.start)?;
             checked_command_output(&plan.start, output)
-                .context("start confirmed stopped Podman session target")?;
+                .context("start confirmed stopped container session target")?;
             let after = inspect_recovery_target(executor, plan)
-                .context("verify Podman session target after starting it")?;
+                .context("verify container session target after starting it")?;
             ensure!(
                 after == "running",
-                "Podman session target reported {after:?} after start"
+                "container session target reported {after:?} after start"
             );
             Ok(TargetRecoveryOutcome::Started)
         }
         "paused" | "removing" | "stopping" | "unknown" => {
-            bail!("refusing to start Podman session target in {status:?} state")
+            bail!("refusing to start container session target in {status:?} state")
         }
-        _ => bail!("Podman session target reported unexpected state {status:?}"),
+        _ => bail!("container session target reported unexpected state {status:?}"),
     }
 }
 
@@ -1966,38 +2112,38 @@ fn inspect_recovery_target(
 ) -> Result<String> {
     let output = executor.execute(&plan.inspect)?;
     let output = checked_command_output(&plan.inspect, output)
-        .context("inspect Podman session target for recovery")?;
+        .context("inspect container session target for recovery")?;
     let values: Vec<serde_json::Value> =
-        serde_json::from_slice(&output.stdout).context("parse Podman session target inspection")?;
+        serde_json::from_slice(&output.stdout).context("parse container target inspection")?;
     ensure!(
         values.len() == 1,
-        "Podman inspection returned {} targets instead of one",
+        "container inspection returned {} targets instead of one",
         values.len()
     );
     let target = &values[0];
     let labels = target
         .pointer("/Config/Labels")
         .and_then(serde_json::Value::as_object)
-        .context("Podman session target has no ownership labels")?;
+        .context("container session target has no ownership labels")?;
     ensure!(
         labels
             .get(MANAGED_LABEL)
             .and_then(serde_json::Value::as_str)
             == Some("true"),
-        "refusing to start a Podman target Hel does not own"
+        "refusing to start a container target Hel does not own"
     );
     ensure!(
         labels
             .get(SESSION_LABEL)
             .and_then(serde_json::Value::as_str)
             == Some(plan.session_id.as_str()),
-        "refusing to start a Podman target owned by another session"
+        "refusing to start a container target owned by another session"
     );
     target
         .pointer("/State/Status")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
-        .context("Podman session target inspection has no state")
+        .context("container session target inspection has no state")
 }
 
 /// Run the target-side half of the local Git bridge over the same trusted
@@ -2037,6 +2183,7 @@ pub fn command_on_locator(
             CommandSpec::new(program, args)
         }
         TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
+        TargetLocator::LocalDocker { container_id } => container_exec("docker", container_id, args),
         TargetLocator::AppleContainer { container_id } => {
             container_exec("container", container_id, args)
         }
@@ -2158,6 +2305,28 @@ pub fn resource_probe(locator: &TargetLocator, session_id: &str) -> Result<Sessi
                     ],
                 )
                 .purpose("sample local Podman container writable disk"),
+            ),
+        ),
+        TargetLocator::LocalDocker { container_id } => (
+            container_exec(
+                "docker",
+                container_id,
+                ["sh", "-c", CGROUP_RESOURCE_USAGE_SCRIPT],
+            )
+            .purpose("sample local Docker container resources"),
+            Some(
+                CommandSpec::new(
+                    "docker",
+                    [
+                        "container",
+                        "inspect",
+                        "--size",
+                        "--format",
+                        "{{.SizeRw}}",
+                        container_id,
+                    ],
+                )
+                .purpose("sample local Docker container writable disk"),
             ),
         ),
         TargetLocator::SshPodman { ssh, container_id } => (
@@ -2385,6 +2554,7 @@ pub fn worker_root(locator: &TargetLocator, session_id: &str) -> Result<String> 
     Ok(match locator {
         TargetLocator::LocalBare { worker_root } => worker_root.clone(),
         TargetLocator::LocalPodman { .. }
+        | TargetLocator::LocalDocker { .. }
         | TargetLocator::AppleContainer { .. }
         | TargetLocator::SshPodman { .. } => format!("/var/lib/hel/workers/{session_id}"),
         TargetLocator::AwsEc2 { .. } | TargetLocator::SshBare { .. } => {
@@ -2559,6 +2729,7 @@ pub fn clear_relay_state_plan(
                 .purpose("stop a leaked remote Hel worker and clear its relay state"),
         ),
         TargetLocator::LocalPodman { .. }
+        | TargetLocator::LocalDocker { .. }
         | TargetLocator::AppleContainer { .. }
         | TargetLocator::SshPodman { .. }
         | TargetLocator::AwsEc2 { .. } => None,
@@ -2585,6 +2756,36 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
             let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
             CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
                 .purpose("remove local Podman session container and Git cache snapshot")
+        }
+        TargetLocator::LocalDocker { container_id } => {
+            let script = r#"status=0
+if identity=$(docker container inspect --format '{{index .Config.Labels "dev.hel.managed"}}|{{index .Config.Labels "dev.hel.session"}}' "$1" 2>/dev/null); then
+    if [ "$identity" = "true|$2" ]; then
+        docker rm --force "$1" || status=$?
+    else
+        echo 'refusing to remove a Docker container Hel does not own for this session' >&2
+        status=2
+    fi
+elif ! docker info >/dev/null 2>&1; then
+    echo 'could not determine whether the Docker session container exists' >&2
+    status=1
+fi
+if [ "$status" -eq 0 ]; then
+    volumes=$(docker volume ls --quiet --filter "label=dev.hel.managed=true" --filter "label=dev.hel.session=$2") || status=$?
+    if [ "$status" -eq 0 ]; then
+        for volume in $volumes; do docker volume rm --force "$volume" || status=$?; done
+    fi
+fi
+rm -rf -- "$HOME/.cache/hel/git/sessions/$2"
+if [ "$status" -eq 0 ]; then
+    root="$HOME/.cache/hel/docker-overlays/$1"
+    if [ "$(cat "$root/.hel-session" 2>/dev/null || true)" = "$2" ]; then
+        case $1 in hel-*) rm -rf -- "$root" ;; *) status=2 ;; esac
+    fi
+fi
+exit "$status""#;
+            CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
+                .purpose("remove local Docker session container, overlay volumes, and cache state")
         }
         TargetLocator::AppleContainer { container_id } => {
             let script = "status=0; container rm --force \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
@@ -2643,24 +2844,53 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
     })
 }
 
-/// Confirm that an Apple container is absent after its exact delete command
-/// failed. Other target deletion commands are already idempotent: filesystem
-/// removal uses `rm -rf`, Podman uses `--ignore`, and EC2 termination is an
-/// idempotent API operation. Apple defines the value passed to `run --name` as
-/// the container ID, and `list --quiet` emits those IDs, so this is an exact
-/// identity check rather than a display-name comparison.
+/// Confirm that a container is absent after its exact delete command failed.
+/// Other target deletion commands are already idempotent: filesystem removal
+/// uses `rm -rf`, Podman uses `--ignore`, and EC2 termination is an idempotent
+/// API operation. Apple lists exact container IDs; Docker checks both the exact
+/// container name and exact session-labeled volumes while distinguishing an
+/// unavailable daemon from absence.
 pub fn cleanup_target_is_confirmed_absent(
     locator: &TargetLocator,
     session_id: &str,
     executor: &impl CommandExecutor,
 ) -> Result<bool> {
     verify_locator(locator, session_id)?;
-    let TargetLocator::AppleContainer { container_id } = locator else {
-        return Ok(false);
+    let (command, is_docker) = match locator {
+        TargetLocator::AppleContainer { .. } => (
+            CommandSpec::new("container", ["list", "--all", "--quiet"])
+                .purpose("confirm exact Apple session container is absent"),
+            false,
+        ),
+        TargetLocator::LocalDocker { container_id } => (
+            CommandSpec::new(
+                "sh",
+                [
+                    "-c",
+                    "if docker container inspect \"$1\" >/dev/null 2>&1; then exit 1; fi; docker info >/dev/null 2>&1 || exit 2; test -z \"$(docker volume ls --quiet --filter label=dev.hel.managed=true --filter label=dev.hel.session=$2)\"",
+                    "hel-confirm-absent",
+                    container_id,
+                    session_id,
+                ],
+            )
+            .purpose("confirm exact Docker session resources are absent"),
+            true,
+        ),
+        _ => return Ok(false),
     };
-    let command = CommandSpec::new("container", ["list", "--all", "--quiet"])
-        .purpose("confirm exact Apple session container is absent");
     let output = executor.execute(&command)?;
+    if is_docker {
+        return match output.status {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => bail!(
+                "{} failed with status {}: {}",
+                command.purpose,
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        };
+    }
     if output.status != 0 {
         bail!(
             "{} failed with status {}: {}",
@@ -2670,6 +2900,9 @@ pub fn cleanup_target_is_confirmed_absent(
         );
     }
     let listed = String::from_utf8(output.stdout).context("decode Apple container list")?;
+    let TargetLocator::AppleContainer { container_id } = locator else {
+        unreachable!("engine selected from locator")
+    };
     Ok(!listed.lines().any(|id| id.trim() == container_id))
 }
 
@@ -2819,6 +3052,122 @@ fn container_run(
     .creates_target())
 }
 
+const DOCKER_OVERLAY_RUN_SCRIPT: &str = r#"set -eu
+session=$1
+container=$2
+shift 2
+root="$HOME/.cache/hel/docker-overlays/$container"
+marker="$root/.hel-session"
+volumes=
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$status" -ne 0 ]; then
+        released=true
+        if identity=$(docker container inspect --format '{{index .Config.Labels "dev.hel.managed"}}|{{index .Config.Labels "dev.hel.session"}}' "$container" 2>/dev/null); then
+            if [ "$identity" = "true|$session" ]; then
+                docker rm --force "$container" >/dev/null 2>&1 || released=false
+            else
+                released=false
+            fi
+        elif ! docker info >/dev/null 2>&1; then
+            released=false
+        fi
+        if [ "$released" = true ]; then
+            for volume in $volumes; do
+                docker volume rm --force "$volume" >/dev/null 2>&1 || released=false
+            done
+        fi
+        if [ "$released" = true ] && [ "$(cat "$marker" 2>/dev/null || true)" = "$session" ]; then
+            case $container in hel-*) rm -rf -- "$root" ;; esac
+        fi
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+mkdir -p -- "$root"
+if [ -e "$marker" ]; then
+    [ "$(cat "$marker")" = "$session" ] || {
+        echo "refusing foreign Docker overlay directory $root" >&2
+        exit 1
+    }
+elif [ -n "$(find "$root" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    echo "refusing non-empty Docker overlay directory $root" >&2
+    exit 1
+else
+    printf '%s\n' "$session" >"$marker"
+fi
+while [ "$1" != -- ]; do
+    ordinal=$1
+    source=$2
+    volume=$3
+    shift 3
+    upper="$root/$ordinal/upper"
+    work="$root/$ordinal/work"
+    mkdir -p -- "$upper" "$work"
+    if ! docker volume inspect "$volume" >/dev/null 2>&1; then
+        docker volume create \
+            --driver local \
+            --label "dev.hel.managed=true" \
+            --label "dev.hel.session=$session" \
+            --opt type=overlay \
+            --opt device=overlay \
+            --opt "o=lowerdir=$source,upperdir=$upper,workdir=$work" \
+            "$volume" >/dev/null
+    fi
+    identity=$(docker volume inspect --format '{{index .Labels "dev.hel.managed"}}|{{index .Labels "dev.hel.session"}}' "$volume")
+    [ "$identity" = "true|$session" ] || {
+        echo "refusing foreign Docker volume $volume" >&2
+        exit 1
+    }
+    volumes="$volumes $volume"
+done
+shift
+"$@"
+"#;
+
+fn docker_overlay_volume_name(container_name: &str, ordinal: usize) -> String {
+    format!("{container_name}-mount-{ordinal}")
+}
+
+fn docker_container_run(
+    template: &ContainerTemplate,
+    name: &str,
+    session_id: &str,
+    additional_mounts: &[AdditionalMount],
+) -> Result<CommandSpec> {
+    let run_args = container_run_args("docker", template, name, session_id, additional_mounts)?;
+    let writable = additional_mounts
+        .iter()
+        .enumerate()
+        .filter(|(_, mount)| !mount.read_only)
+        .collect::<Vec<_>>();
+    if writable.is_empty() {
+        return container_run("docker", template, name, session_id, additional_mounts);
+    }
+    let mut args = vec![
+        "-c".to_owned(),
+        DOCKER_OVERLAY_RUN_SCRIPT.to_owned(),
+        "hel-docker-run".to_owned(),
+        session_id.to_owned(),
+        name.to_owned(),
+    ];
+    for (ordinal, mount) in writable {
+        args.extend([
+            ordinal.to_string(),
+            mount.source.to_string_lossy().into_owned(),
+            docker_overlay_volume_name(name, ordinal),
+        ]);
+    }
+    args.extend(["--".to_owned(), "docker".to_owned()]);
+    args.extend(run_args);
+    Ok(CommandSpec::new("sh", args)
+        .purpose("start Docker session container with isolated attachments")
+        .stage(ProvisionStage::Provisioning)
+        .creates_target())
+}
+
 fn container_run_args(
     engine: &str,
     template: &ContainerTemplate,
@@ -2840,6 +3189,15 @@ fn container_run_args(
         // outlives its parent leaves a zombie behind. Apple's `container`
         // engine is left alone: its support for the flag is unverified.
         args.push("--init".to_owned());
+    } else if engine == "docker" {
+        let pull = match template.pull_policy.resolve(&template.image) {
+            ImagePullPolicy::Always | ImagePullPolicy::Newer => "always",
+            ImagePullPolicy::Missing => "missing",
+            ImagePullPolicy::Never => "never",
+            ImagePullPolicy::Auto => unreachable!("auto pull policy must resolve"),
+        };
+        args.push(format!("--pull={pull}"));
+        args.push("--init".to_owned());
     }
     args.extend(["--detach".to_owned(), "--name".to_owned(), name.to_owned()]);
     args.extend(managed_resource_identity_args(
@@ -2847,7 +3205,7 @@ fn container_run_args(
         session_id,
     ));
     args.extend(template.extra_run_args.clone());
-    for mount in additional_mounts {
+    for (ordinal, mount) in additional_mounts.iter().enumerate() {
         let source = mount.source.to_string_lossy();
         let destination = mount.destination.to_string_lossy();
         match engine {
@@ -2856,6 +3214,18 @@ fn container_run_args(
                 args.extend([
                     "--volume".to_owned(),
                     format!("{source}:{destination}:{mode}"),
+                ]);
+            }
+            "docker" => {
+                let source = if mount.read_only {
+                    source.into_owned()
+                } else {
+                    docker_overlay_volume_name(name, ordinal)
+                };
+                let suffix = if mount.read_only { ":ro" } else { "" };
+                args.extend([
+                    "--volume".to_owned(),
+                    format!("{source}:{destination}{suffix}"),
                 ]);
             }
             "container" => args.extend([

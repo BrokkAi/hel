@@ -49,7 +49,7 @@ Hel exists for the second case.
 
 - **Hel is not an agent.** It does not write code, plan, or pick models. It
   manages harnesses that do.
-- **No privileged host setup.** Hel will not install Podman, edit
+- **No privileged host setup.** Hel will not install container runtimes, edit
   `subuid`/`subgid`, create AWS launch templates or security groups, or make
   SSH hosts reachable. You (or your agent, with your credentials) do that;
   `hel doctor` verifies it and prescribes the exact remediation.
@@ -85,6 +85,7 @@ Issues and pull requests for new harnesses are welcome.
 |---|---|---|---|
 | Local Git worktree | `local-bare` | your machine | your configured approvals |
 | Podman container | `local-podman` | Linux, WSL2 | unrestricted |
+| Docker container | `local-docker` | Linux, WSL2 | unrestricted |
 | Apple container | `apple-container` | macOS 26+, Apple silicon | unrestricted |
 | SSH machine | `ssh-bare` | a Linux host you name | guardian or unrestricted |
 | Podman over SSH | `ssh-podman` | a Linux host you name | unrestricted |
@@ -118,6 +119,8 @@ authentication):
 
 ```console
 podman pull ghcr.io/brokkai/hel/agent-dev:latest
+# or
+docker pull ghcr.io/brokkai/hel/agent-dev:latest
 ```
 
 It includes Rust, cargo-nextest, Node, OpenJDK 25, Git, GitHub CLI, the Codex
@@ -222,6 +225,11 @@ image = "ghcr.io/brokkai/hel/agent-dev:latest"
 # Optional: auto (default), always, newer, missing, or never. Auto refreshes
 # remote latest tags, keeps versioned tags cached, and pins digest references.
 # pull_policy = "auto"
+
+# Docker uses the same fields:
+# [targets.docker]
+# kind = "local-docker"
+# image = "ghcr.io/brokkai/hel/agent-dev:latest"
 ```
 
 `version` is the config schema version. A file written by a *newer* Hel still
@@ -243,7 +251,8 @@ environment. If automatic discovery is insufficient, set a target-side ACP
 bridge path with the profile's `executable` key or set an explicit search path
 under `[profiles.<id>.environment]` with `PATH = "..."`.
 Target prerequisites and full option lists are covered in
-[docs/PODMAN.md](docs/PODMAN.md), [docs/SSH.md](docs/SSH.md), and
+[docs/PODMAN.md](docs/PODMAN.md), [docs/DOCKER.md](docs/DOCKER.md),
+[docs/SSH.md](docs/SSH.md), and
 [docs/AWS.md](docs/AWS.md).
 
 ### Web viewer and Tailscale

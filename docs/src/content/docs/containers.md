@@ -6,8 +6,9 @@ description: Set up a disposable container target for hel and start your first i
 ## What container targets give you
 
 Each session on a container target runs in its own disposable, labeled
-container: local Podman on Linux or WSL2, Apple's `container` runtime on macOS
-26 or newer on Apple silicon, or Podman over SSH. Container isolation always
+container: local Podman or Docker on Linux or WSL2, Apple's `container`
+runtime on macOS 26 or newer on Apple silicon, or Podman over SSH. Container
+isolation always
 selects Hel's `unconstrained` execution policy. The `permissions` setting is
 only available for raw `ssh-bare` targets. Hel translates the policy into the
 selected harness's own control: Codex `agent-full-access`, Claude Code
@@ -33,6 +34,8 @@ Pick one runtime:
 
 - **Rootless Podman 4.0 or newer** on Linux or WSL2. See
   [Podman for Hel](/podman/) for installation and verification steps.
+- **Docker with a reachable Linux daemon** on Linux or WSL2. See
+  [Docker for Hel](/docker/) for its OverlayFS and lifecycle contract.
 - **Apple's `container` CLI** on macOS 26 or newer on Apple silicon.
 
 Linux releases are static musl binaries, so the controller itself runs the
@@ -49,12 +52,12 @@ Codex and Claude ACP bridges, and pinned DeepSeek Harness plus
 `dsh-acp-server`. It's published at
 `ghcr.io/brokkai/hel/agent-dev:latest`, public and
 multi-arch for both `linux/amd64` and `linux/arm64`, so the same image name
-works whether hel is running it through Podman, Apple's `container` runtime,
-or an arm64 SSH host.
+works whether hel is running it through Podman, Docker, Apple's `container`
+runtime, or an arm64 SSH host.
 
 You don't need to do anything to get it: `hel setup`'s image prompt already
-defaults to this published image, and `podman run` (and Apple's `container
-run`) pull an image automatically the first time it's needed. Accepting the
+defaults to this published image, and Podman, Docker, and Apple's `container`
+runtime pull an image automatically the first time it's needed. Accepting the
 default when you run `hel setup`, below, is enough.
 
 Building it yourself remains a supported alternative, for example to
@@ -97,7 +100,7 @@ policy. Existing running containers are never replaced in place.
 
 ## Git clone cache
 
-Local Podman, SSH Podman, and Apple container targets cache GitHub repository
+Local Podman, local Docker, SSH Podman, and Apple container targets cache GitHub repository
 objects under the container host user's `~/.cache/hel/git`. Before launch, Hel
 refreshes a bare mirror and creates an isolated session snapshot whose
 immutable objects are shared with ordinary filesystem hardlinks. The snapshot
@@ -136,7 +139,8 @@ authoritative rather than checking for specific check names.
 Once every check passes, run the same command with `--smoke` for an
 end-to-end test: it creates and removes a disposable container the same way
 `hel setup` does, confirming the full path works, not just static
-prerequisites.
+prerequisites. For Docker, this also verifies that a temporary writable
+attachment is copy-on-write and that its managed OverlayFS volume cleans up.
 
 ```console
 hel doctor --json --smoke
@@ -168,8 +172,8 @@ attached directories before launch. On container targets, each attached
 directory is mounted using the runtime's isolated mount mode, so a container
 can't write back into your host filesystem through it.
 
-Each attached directory also has a read-only checkbox. Podman's isolated mode
-is a copy-on-write overlay, which some filesystems cannot host: when hel finds
+Each attached directory also has a read-only checkbox. Podman and Docker use
+copy-on-write OverlayFS mounts, which some filesystems cannot host: when hel finds
 a source on NFS, SMB, FUSE, a FAT-family filesystem, or another overlay, it
 attaches that directory read-only instead and says so while the session
 launches.

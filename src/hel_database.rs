@@ -27,7 +27,7 @@ use crate::hel_workspace::{
     normalize_workspace_name,
 };
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -3493,6 +3493,14 @@ fn insert_target(tx: &Transaction<'_>, session_id: &str, target: &TargetLocator)
             None,
             None,
         ),
+        TargetLocator::LocalDocker { container_id } => (
+            "local-docker",
+            None,
+            Some(container_id.as_str()),
+            None,
+            None,
+            None,
+        ),
         TargetLocator::AppleContainer { container_id } => (
             "apple-container",
             None,
@@ -3559,6 +3567,9 @@ fn load_targets(connection: &Connection, state: &mut HelState) -> Result<()> {
                 worker_root: workspace.unwrap(),
             },
             "local-podman" => TargetLocator::LocalPodman {
+                container_id: resource.unwrap(),
+            },
+            "local-docker" => TargetLocator::LocalDocker {
                 container_id: resource.unwrap(),
             },
             "apple-container" => TargetLocator::AppleContainer {

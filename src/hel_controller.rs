@@ -221,6 +221,7 @@ impl Controller {
             .with_context(|| format!("unknown target template {target_id:?}"))?;
         match target {
             TargetTemplate::LocalPodman { .. }
+            | TargetTemplate::LocalDocker { .. }
             | TargetTemplate::AppleContainer { .. }
             | TargetTemplate::AwsEc2 { .. } => Ok(hel_targets::local_directory_completions(prefix)),
             TargetTemplate::SshPodman { ssh, .. } => {
@@ -251,6 +252,7 @@ impl Controller {
             .with_context(|| format!("unknown target template {target_id:?}"))?;
         let exists = match target {
             TargetTemplate::LocalPodman { .. }
+            | TargetTemplate::LocalDocker { .. }
             | TargetTemplate::AppleContainer { .. }
             | TargetTemplate::AwsEc2 { .. } => std::fs::metadata(source)
                 .map(|metadata| metadata.is_dir())
@@ -277,7 +279,7 @@ impl Controller {
         Ok(self.forced_read_only_reason(target, source, executor))
     }
 
-    /// The `filesystem (reason)` label for a source Podman cannot overlay.
+    /// The `filesystem (reason)` label for a source the runtime cannot overlay.
     fn forced_read_only_reason(
         &self,
         target: &TargetTemplate,
@@ -285,7 +287,7 @@ impl Controller {
         executor: &impl CommandExecutor,
     ) -> Option<String> {
         let ssh = match target {
-            TargetTemplate::LocalPodman { .. } => None,
+            TargetTemplate::LocalPodman { .. } | TargetTemplate::LocalDocker { .. } => None,
             TargetTemplate::SshPodman { ssh, .. } => Some(backend_ssh(ssh)),
             // Apple Container already mounts read-only, and EC2 copies instead
             // of mounting, so neither has an overlay to lose.
@@ -731,6 +733,7 @@ fn target_kind(locator: &hel_targets::TargetLocator) -> &'static str {
     match locator {
         hel_targets::TargetLocator::LocalBare { .. } => "local-bare",
         hel_targets::TargetLocator::LocalPodman { .. } => "local-podman",
+        hel_targets::TargetLocator::LocalDocker { .. } => "local-docker",
         hel_targets::TargetLocator::AppleContainer { .. } => "apple-container",
         hel_targets::TargetLocator::AwsEc2 { .. } => "aws-ec2",
         hel_targets::TargetLocator::SshBare { .. } => "ssh-bare",
@@ -746,6 +749,7 @@ fn target_profile_home(
     match locator {
         hel_targets::TargetLocator::LocalBare { .. } => profile.home.to_string_lossy().into_owned(),
         hel_targets::TargetLocator::LocalPodman { .. }
+        | hel_targets::TargetLocator::LocalDocker { .. }
         | hel_targets::TargetLocator::AppleContainer { .. }
         | hel_targets::TargetLocator::SshPodman { .. } => {
             format!("/var/lib/hel/profiles/{session_id}")

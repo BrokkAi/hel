@@ -13,13 +13,13 @@ use crate::hel_config::{
 };
 use crate::hel_doctor::{
     CheckStatus, DoctorCheck, DoctorOptions, all_ready, apple_container_daemon_check,
-    current_apple_platform, local_podman_runtime_check, probe_executor, render_human,
-    run_with_config_path,
+    current_apple_platform, local_docker_runtime_check, local_podman_runtime_check, probe_executor,
+    render_human, run_with_config_path,
 };
 use crate::hel_targets::{
     CancellableProcessExecutor, CommandExecutor, CommandSpec,
     ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor,
-    TargetTemplate as RuntimeTargetTemplate, setup_smoke_plan,
+    TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test,
 };
 
 /// AWS credential detection must never stall an interactive first run, so the
@@ -59,6 +59,7 @@ impl GithubRepository {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeKind {
     Podman,
+    Docker,
     AppleContainer,
 }
 
@@ -66,6 +67,7 @@ impl RuntimeKind {
     fn id(self) -> &'static str {
         match self {
             Self::Podman => "podman",
+            Self::Docker => "docker",
             Self::AppleContainer => "apple-container",
         }
     }
@@ -73,6 +75,7 @@ impl RuntimeKind {
     fn label(self) -> &'static str {
         match self {
             Self::Podman => "Podman",
+            Self::Docker => "Docker",
             Self::AppleContainer => "Apple container",
         }
     }
@@ -80,6 +83,7 @@ impl RuntimeKind {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "podman" => Some(Self::Podman),
+            "docker" => Some(Self::Docker),
             "apple-container" | "container" => Some(Self::AppleContainer),
             _ => None,
         }
@@ -442,10 +446,10 @@ fn discover_github_repository(
 /// Probe the container runtimes setup can configure, reusing the doctor checks
 /// so an unavailable runtime carries doctor's detail and remediation.
 pub fn probe_local_runtimes(executor: &impl CommandExecutor, is_macos: bool) -> Vec<RuntimeProbe> {
-    let mut probes = vec![runtime_probe_from_check(
-        RuntimeKind::Podman,
-        local_podman_runtime_check(executor),
-    )];
+    let mut probes = vec![
+        runtime_probe_from_check(RuntimeKind::Podman, local_podman_runtime_check(executor)),
+        runtime_probe_from_check(RuntimeKind::Docker, local_docker_runtime_check(executor)),
+    ];
     if is_macos {
         probes.push(runtime_probe_from_check(
             RuntimeKind::AppleContainer,
@@ -570,6 +574,7 @@ fn build_config_with_runtime(
         };
         let (target_id, target) = match runtime {
             RuntimeKind::Podman => ("podman", TargetTemplate::LocalPodman { container }),
+            RuntimeKind::Docker => ("docker", TargetTemplate::LocalDocker { container }),
             RuntimeKind::AppleContainer => (
                 "apple-container",
                 TargetTemplate::AppleContainer { container },
@@ -1036,10 +1041,16 @@ fn prompt_ssh_target_name(
 /// Phrase a failed setup smoke test the way `hel doctor --smoke` phrases the
 /// same failure, so it joins the closing report instead of ending the run.
 fn smoke_failure_check(runtime: RuntimeKind, image: &str, error: &anyhow::Error) -> DoctorCheck {
+    let scope = match runtime {
+        RuntimeKind::Docker => "Disposable run/exec/remove and OverlayFS attachment smoke test",
+        RuntimeKind::Podman | RuntimeKind::AppleContainer => {
+            "Disposable run/exec/remove smoke test"
+        }
+    };
     DoctorCheck::fixable(
         format!("runtime.{}.smoke", runtime.id()),
         format!("{} smoke test", runtime.label()),
-        format!("Disposable run/exec/remove smoke test failed for image {image}: {error:#}"),
+        format!("{scope} failed for image {image}: {error:#}"),
         format!(
             "Fix the configured image or the {} runtime, then run `hel doctor --smoke` again.",
             runtime.label()
@@ -1173,6 +1184,7 @@ fn write_summary(
             .expect("selected target exists");
         let image = match target {
             TargetTemplate::LocalPodman { container }
+            | TargetTemplate::LocalDocker { container }
             | TargetTemplate::AppleContainer { container } => &container.image,
             _ => unreachable!("setup runtime target is a local container"),
         };
@@ -1218,6 +1230,7 @@ fn smoke_target(runtime: RuntimeKind, image: &str) -> RuntimeTargetTemplate {
     };
     match runtime {
         RuntimeKind::Podman => RuntimeTargetTemplate::LocalPodman(container),
+        RuntimeKind::Docker => RuntimeTargetTemplate::LocalDocker(container),
         RuntimeKind::AppleContainer => RuntimeTargetTemplate::AppleContainer(container),
     }
 }
@@ -1232,32 +1245,14 @@ fn run_smoke_test(
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
-    let plan = setup_smoke_plan(target, &smoke_id)?;
-    let create = &plan.commands[0];
-    let execute = &plan.commands[1];
-    let cleanup = &plan.commands[2];
-
-    writeln!(output, "Smoke test: creating a disposable container...")?;
-    execute_smoke_command(executor, create)?;
-    writeln!(output, "Smoke test: executing a trivial command in it...")?;
-    let execution = execute_smoke_command(executor, execute);
-    writeln!(output, "Smoke test: deleting the disposable container...")?;
-    let cleanup_result = execute_smoke_command(executor, cleanup);
-    execution?;
-    cleanup_result
-}
-
-fn execute_smoke_command(executor: &impl CommandExecutor, command: &CommandSpec) -> Result<()> {
-    let output = executor.execute(command)?;
-    if output.status != 0 {
-        bail!(
-            "{} failed with status {}: {}",
-            command.purpose,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
+    let description = match target {
+        RuntimeTargetTemplate::LocalDocker(_) => {
+            "Smoke test: verifying a disposable container and writable OverlayFS attachment..."
+        }
+        _ => "Smoke test: verifying a disposable container...",
+    };
+    writeln!(output, "{description}")?;
+    run_setup_smoke_test(target, &smoke_id, executor)
 }
 
 #[cfg(test)]
@@ -1556,6 +1551,17 @@ mod tests {
             config.targets["localhost"],
             TargetTemplate::LocalBare
         ));
+
+        let docker = build_config(
+            &homes,
+            Some(&repository),
+            RuntimeKind::Docker,
+            "ubuntu:24.04",
+        );
+        assert!(matches!(
+            docker.targets["docker"],
+            TargetTemplate::LocalDocker { .. }
+        ));
     }
 
     #[test]
@@ -1564,12 +1570,13 @@ mod tests {
             ok(b"podman version 5.4.2\n"),
             ok(b"true\n"),
             ok(b"0 1000 1\n1 100000 65536\n"),
+            ok(b"29.0.1 linux\n"),
             ok(b"container version 1\n"),
             ok(b"running\n"),
         ]);
         let runtimes = probe_local_runtimes(&executor, true);
 
-        assert_eq!(runtimes.len(), 2);
+        assert_eq!(runtimes.len(), 3);
         assert_eq!(recommended_runtime(&runtimes), Some(RuntimeKind::Podman));
         assert_eq!(executor.commands.borrow()[0].program, "podman");
         assert_eq!(executor.commands.borrow()[0].args, ["--version"]);
@@ -1581,17 +1588,21 @@ mod tests {
             executor.commands.borrow()[2].args,
             ["unshare", "cat", "/proc/self/uid_map"]
         );
-        assert_eq!(executor.commands.borrow()[3].program, "container");
+        assert_eq!(executor.commands.borrow()[3].program, "docker");
+        assert_eq!(executor.commands.borrow()[4].program, "container");
         assert!(runtimes.iter().all(|runtime| runtime.usable));
     }
 
     #[test]
     fn unusable_podman_carries_the_doctor_remediation_into_the_runtime_list() {
-        let executor = RuntimeProbeExecutor::new([ok(b"podman version 3.4.7\n")]);
+        let executor = RuntimeProbeExecutor::new([
+            ok(b"podman version 3.4.7\n"),
+            failed(b"docker is unavailable"),
+        ]);
 
         let runtimes = probe_local_runtimes(&executor, false);
 
-        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes.len(), 2);
         assert!(!runtimes[0].usable);
         let remediation = runtimes[0].remediation.as_deref().unwrap();
         assert!(remediation.contains("Upgrade Podman"), "{remediation}");
@@ -1600,6 +1611,7 @@ mod tests {
         write_runtimes(&mut output, &runtimes).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Podman: unavailable"), "{output}");
+        assert!(output.contains("Docker: unavailable"), "{output}");
         assert!(output.contains("remediation: Upgrade Podman"), "{output}");
     }
 
@@ -1978,6 +1990,34 @@ Host builder
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 3);
         assert_eq!(commands[2].args[0], "rm");
+    }
+
+    #[test]
+    fn docker_smoke_test_exercises_the_managed_overlay_attachment_path() {
+        let executor = FakeExecutor::succeeds();
+        let mut output = Vec::new();
+
+        run_smoke_test(
+            &mut output,
+            &smoke_target(RuntimeKind::Docker, "ubuntu:24.04"),
+            &executor,
+        )
+        .unwrap();
+
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].program, "sh");
+        assert!(commands[0].args[1].contains("docker volume create"));
+        assert!(commands[0].args[1].contains("type=overlay"));
+        assert_eq!(commands[1].program, "docker");
+        assert_eq!(commands[1].args[0], "exec");
+        assert_eq!(commands[2].program, "sh");
+        assert!(commands[2].args[1].contains("docker volume rm --force"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("writable OverlayFS attachment")
+        );
     }
 
     #[test]

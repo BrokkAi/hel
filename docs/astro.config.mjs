@@ -78,6 +78,7 @@ export default defineConfig({
           items: [
             { label: 'Container targets', slug: 'containers' },
             { label: 'Podman for Hel', slug: 'podman' },
+            { label: 'Docker for Hel', slug: 'docker' },
             { label: 'Custom container images', slug: 'custom-images' },
           ],
         },

@@ -503,10 +503,11 @@ impl ActiveChat {
                     .as_ref()
                     .map_or(&[][..], |snapshot| &snapshot.operational.available_commands),
             );
-            if let Some(harness_kind) = recovery
-                .as_ref()
-                .map(|recovery| recovery.session.harness_kind)
-            {
+            if let Some(harness_kind) = header.harness_kind.or_else(|| {
+                recovery
+                    .as_ref()
+                    .map(|recovery| recovery.session.harness_kind)
+            }) {
                 state.set_harness_kind(harness_kind);
             }
             state.set_session_modes(
@@ -3429,6 +3430,43 @@ mod tests {
         assert_eq!(
             chat.state.notice().as_deref(),
             Some("Reconnected to session relay")
+        );
+    }
+
+    /// A Codex session exposes plan mode through its `collaboration_mode`
+    /// config, which the chat reads only once it knows the harness is Codex.
+    /// That fact reaches the chat through the header now that the daemon owns
+    /// the recovery context the open path used to carry, so a Codex session
+    /// must still list `/plan`.
+    #[tokio::test]
+    async fn a_codex_session_lists_plan_from_the_header_harness() {
+        use crate::hel_chat::test_support::select_config_option;
+        use crate::hel_config::HarnessKind;
+
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-codex", 75);
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            None,
+            fixture.control,
+            SessionHeaderIdentity {
+                harness_kind: Some(HarnessKind::Codex),
+                ..Default::default()
+            },
+            String::new(),
+            Notices::default(),
+        );
+
+        chat.state.set_config_options(&[select_config_option(
+            "collaboration_mode",
+            "default",
+            &["default", "plan"],
+        )]);
+
+        assert!(
+            chat.state.lists_command("plan"),
+            "a Codex session lists /plan once the header names the harness"
         );
     }
 

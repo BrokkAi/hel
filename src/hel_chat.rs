@@ -228,6 +228,10 @@ pub struct SessionHeaderIdentity {
     pub target: String,
     /// Profile column from the session list's live-session summary.
     pub profile: String,
+    /// Harness the session runs, so the chat can answer harness-specific
+    /// questions (like whether Codex exposes plan mode) without a recovery
+    /// context, which the daemon now owns.
+    pub harness_kind: Option<HarnessKind>,
 }
 
 /// Constructors that need [`sanitize_terminal_text`], which is chat-view

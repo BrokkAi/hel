@@ -2853,7 +2853,11 @@ fn default_import_target_id(config: &HelConfig) -> String {
         .map(|(id, _)| id)
         .or_else(|| {
             config.targets.iter().find_map(|(id, target)| {
-                matches!(target, TargetTemplate::LocalPodman { .. }).then_some(id)
+                matches!(
+                    target,
+                    TargetTemplate::LocalPodman { .. } | TargetTemplate::LocalDocker { .. }
+                )
+                .then_some(id)
             })
         })
         .or_else(|| config.targets.keys().next())
