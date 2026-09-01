@@ -12,16 +12,31 @@ jobs:
   verify-version:
     name: Verify release version
     runs-on: ubuntu-22.04
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev musl-tools
 
       - name: Verify tag, manifests, and lockfile agree
         run: |
           node scripts/release-version.mjs check "$GITHUB_REF_NAME"
           cargo metadata --locked --format-version 1 >/dev/null
+
+      - name: Verify publishable source packages
+        run: |
+          cargo package --locked -p hel-core
+          CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
+            cargo package --locked -p hel-voice-worker
 
   build-linux-amd64:
     name: Build hel for x86_64-unknown-linux-musl

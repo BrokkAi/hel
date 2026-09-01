@@ -50,7 +50,7 @@ jobs:
         node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
         diff -u licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
 
-    - name: Check crate package license files
+    - name: Check crate package contents and build
       run: |
         diff -u LICENSE voice-worker/LICENSE
         cargo package --locked --allow-dirty --list -p hel-core > /tmp/hel-package-files.txt
@@ -65,6 +65,7 @@ jobs:
         cargo package --locked --allow-dirty --list -p hel-cli > /tmp/hel-cli-package-files.txt
         grep -Fx LICENSE /tmp/hel-tui-package-files.txt
         grep -Fx LICENSE /tmp/hel-cli-package-files.txt
+        cargo package --locked -p hel-core
 
   hel:
     strategy:
