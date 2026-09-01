@@ -2257,7 +2257,7 @@ mod tests {
                 agent_message(2, "beta answer"),
             ],
         ));
-        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 44)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw first project");
@@ -2335,7 +2335,7 @@ mod tests {
             "session-beta-second",
             vec![agent_message(1, "second tail")],
         ));
-        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 44)).expect("terminal");
         // Collapse the beta project so its sessions draw their one-line form,
         // which is where duplicate targets need their numbering.
         dashboard.handle_key(crate::test_support::key(KeyCode::Char('2')));
@@ -2598,7 +2598,7 @@ mod tests {
             vec![agent_message(1, "reliability reply: summarize the README")],
         );
 
-        let lines = drawn(&mut dashboard, 120, 34);
+        let lines = drawn(&mut dashboard, 120, 44);
         let agent = lines
             .iter()
             .find(|line| line.contains("reliability reply"))
@@ -2617,13 +2617,13 @@ mod tests {
     #[test]
     fn the_empty_prompt_distinguishes_no_session_from_no_conversation() {
         let mut empty = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        let lines = drawn(&mut empty, 120, 34).join("\n");
+        let lines = drawn(&mut empty, 120, 44).join("\n");
         assert!(lines.contains("Prompt (no live session)"), "{lines}");
         assert!(lines.contains("n to create or s to resume"), "{lines}");
 
         // A live session that simply is not open says so instead.
         let mut live = dashboard_with_session(running_session());
-        let lines = drawn(&mut live, 120, 34).join("\n");
+        let lines = drawn(&mut live, 120, 44).join("\n");
         assert!(lines.contains("Prompt (no conversation open)"), "{lines}");
         assert!(lines.contains("Enter on the one to open"), "{lines}");
         assert!(!lines.contains("No live session"), "{lines}");
@@ -2686,9 +2686,9 @@ mod tests {
             (end - start) as isize
         }
 
-        let before = drawn(&mut dashboard, 140, 32);
+        let before = drawn(&mut dashboard, 140, 44);
         dashboard.cycle_pane_layout();
-        let after = drawn(&mut dashboard, 140, 32);
+        let after = drawn(&mut dashboard, 140, 44);
 
         // Every row the tables and the Sessions pane give up lands in the
         // transcript; the composer and footer are untouched.
@@ -2757,7 +2757,7 @@ mod tests {
         let mut dashboard = dashboard_with_session(running_session());
         dashboard.focus_sessions();
 
-        let lines = drawn(&mut dashboard, 120, 34);
+        let lines = drawn(&mut dashboard, 120, 44);
         let first = lines
             .iter()
             .position(|line| line.contains("podman"))
@@ -2825,7 +2825,7 @@ mod tests {
     #[test]
     fn the_minimized_grid_columns_carry_white_headers_targets_and_clocks() {
         let mut dashboard = minimized_grid_dashboard(3, 2);
-        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 44)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw the grid");
@@ -2870,7 +2870,7 @@ mod tests {
     #[test]
     fn the_minimized_grid_right_justifies_the_clock() {
         let mut dashboard = minimized_grid_dashboard(1, 1);
-        let rows = grid_content_rows(&mut dashboard, 120, 34);
+        let rows = grid_content_rows(&mut dashboard, 120, 44);
         let session = rows
             .iter()
             .find(|line| line.contains("[idle]"))
@@ -2889,7 +2889,7 @@ mod tests {
     #[test]
     fn the_minimized_grid_colours_a_session_cell_by_state() {
         let colour_of = |mut dashboard: DashboardState| {
-            let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+            let mut terminal = Terminal::new(TestBackend::new(120, 44)).expect("terminal");
             terminal
                 .draw(|frame| render(frame, &mut dashboard))
                 .expect("draw the grid");
@@ -2929,7 +2929,7 @@ mod tests {
             .expect("the session")
             .target_template_id = "extremely-long-target-identifier".into();
 
-        let rows = grid_content_rows(&mut dashboard, 44, 34);
+        let rows = grid_content_rows(&mut dashboard, 44, 44);
         assert!(
             rows.iter().any(|line| line.contains('…')),
             "the target should ellipsize: {rows:?}"
@@ -2948,7 +2948,7 @@ mod tests {
 
         // Selecting the first session keeps the window at the start.
         dashboard.selected_session_id = Some("session-00".into());
-        let rows = grid_content_rows(&mut dashboard, 120, 34);
+        let rows = grid_content_rows(&mut dashboard, 120, 44);
         assert!(
             rows.iter().any(|line| line.contains("proj00")),
             "first project visible: {rows:?}"
@@ -2960,7 +2960,7 @@ mod tests {
 
         // Selecting the last session scrolls it into view and the first out.
         dashboard.selected_session_id = Some("session-11".into());
-        let rows = grid_content_rows(&mut dashboard, 120, 34);
+        let rows = grid_content_rows(&mut dashboard, 120, 44);
         assert!(
             rows.iter().any(|line| line.contains("proj11")),
             "last project scrolled into view: {rows:?}"
@@ -2978,7 +2978,7 @@ mod tests {
         use crossterm::event::{MouseButton, MouseEventKind};
 
         let mut dashboard = minimized_grid_dashboard(2, 2);
-        drawn(&mut dashboard, 120, 34);
+        drawn(&mut dashboard, 120, 44);
 
         let (index, rect) = *dashboard
             .session_row_areas
@@ -2999,7 +2999,7 @@ mod tests {
         );
     }
 
-    /// A tiny terminal (under 30 rows) strips the minimized grid down to bare
+    /// A tiny terminal (under 40 rows) strips the minimized grid down to bare
     /// sessions: no title, no border, and the Targets and Quota panes gone
     /// entirely, so every row it has goes to sessions and the conversation.
     #[test]
@@ -3039,7 +3039,7 @@ mod tests {
         let mut dashboard = minimized_grid_dashboard(2, 2);
 
         // Tall: the sessions band is bordered and titled on its top row.
-        let tall = drawn(&mut dashboard, 120, 34);
+        let tall = drawn(&mut dashboard, 120, 44);
         assert!(
             tall[0].contains('┌') && tall[0].contains("Sessions"),
             "tall keeps the bordered title: {:?}",
@@ -3056,7 +3056,7 @@ mod tests {
         );
 
         // And back to tall restores the bordered form.
-        let tall_again = drawn(&mut dashboard, 120, 34);
+        let tall_again = drawn(&mut dashboard, 120, 44);
         assert!(
             tall_again[0].contains('┌') && tall_again[0].contains("Sessions"),
             "tall again restores the border: {:?}",
@@ -3129,13 +3129,13 @@ mod tests {
         dashboard.selected_session_id = Some("session-00".into());
 
         // At the top, no scroll.
-        drawn(&mut dashboard, 120, 34);
+        drawn(&mut dashboard, 120, 44);
         assert_eq!(dashboard.sessions_scroll.get(), 0);
 
         // Arrow down far enough that the pane has to scroll.
         for _ in 0..9 {
             dashboard.handle_key(key(KeyCode::Down));
-            drawn(&mut dashboard, 120, 34);
+            drawn(&mut dashboard, 120, 44);
         }
         let scrolled = dashboard.sessions_scroll.get();
         assert!(scrolled > 0, "the pane should have scrolled down");
@@ -3143,7 +3143,7 @@ mod tests {
         // One arrow up lands on a row that is still visible, so the pane holds
         // its position rather than scrolling back toward the top.
         dashboard.handle_key(key(KeyCode::Up));
-        drawn(&mut dashboard, 120, 34);
+        drawn(&mut dashboard, 120, 44);
         assert_eq!(
             dashboard.sessions_scroll.get(),
             scrolled,
@@ -3153,7 +3153,7 @@ mod tests {
         // Walking all the way back to the first session does scroll up.
         for _ in 0..11 {
             dashboard.handle_key(key(KeyCode::Up));
-            drawn(&mut dashboard, 120, 34);
+            drawn(&mut dashboard, 120, 44);
         }
         assert_eq!(dashboard.sessions_scroll.get(), 0);
     }
@@ -3166,7 +3166,7 @@ mod tests {
         dashboard.apply_quota(weekly_quota("claude-1", 63));
         dashboard.cycle_pane_layout();
 
-        let lines = drawn(&mut dashboard, 120, 34);
+        let lines = drawn(&mut dashboard, 120, 44);
         let targets = lines
             .iter()
             .find(|line| line.contains("─ Targets ──"))
@@ -3237,12 +3237,12 @@ mod tests {
                 dashboard.apply_deployment_capacity("aws:ec2", Ok(None), now_seconds());
             }
 
-            let open = drawn(&mut dashboard, 140, 34).join("\n");
+            let open = drawn(&mut dashboard, 140, 44).join("\n");
             assert!(open.contains(expected), "open pane, {count}: {open}");
             assert!(!open.contains("on demand"), "open pane, {count}: {open}");
 
             dashboard.cycle_pane_layout();
-            let collapsed = drawn(&mut dashboard, 140, 34)
+            let collapsed = drawn(&mut dashboard, 140, 44)
                 .into_iter()
                 .find(|line| line.contains("─ Targets ──"))
                 .expect("the collapsed Targets row");
@@ -3263,7 +3263,7 @@ mod tests {
         dashboard.apply_quota(weekly_quota("claude-1", 0));
         dashboard.cycle_pane_layout();
 
-        let quota = drawn(&mut dashboard, 120, 34)
+        let quota = drawn(&mut dashboard, 120, 44)
             .into_iter()
             .find(|line| line.contains("─ Quota ──"))
             .expect("the collapsed Quota row");
@@ -3280,7 +3280,7 @@ mod tests {
         dashboard.cycle_pane_layout();
 
         // No sample at all.
-        let lines = drawn(&mut dashboard, 120, 34);
+        let lines = drawn(&mut dashboard, 120, 44);
         let targets = |lines: &[String]| {
             lines
                 .iter()
@@ -3292,7 +3292,7 @@ mod tests {
 
         // A probe in flight.
         dashboard.begin_capacity_refresh();
-        assert!(targets(&drawn(&mut dashboard, 120, 34)).contains("local refreshing…"));
+        assert!(targets(&drawn(&mut dashboard, 120, 44)).contains("local refreshing…"));
 
         // A sample too old to trust.
         dashboard.apply_deployment_capacity(
@@ -3301,13 +3301,13 @@ mod tests {
             now_seconds() - CAPACITY_SAMPLE_STALE_AFTER_SECONDS - 60,
         );
         assert!(
-            targets(&drawn(&mut dashboard, 120, 34)).contains("local 7% (stale)"),
+            targets(&drawn(&mut dashboard, 120, 44)).contains("local 7% (stale)"),
             "{:?}",
-            targets(&drawn(&mut dashboard, 120, 34))
+            targets(&drawn(&mut dashboard, 120, 44))
         );
 
         // A quota that failed to refresh.
-        let quota = drawn(&mut dashboard, 120, 34)
+        let quota = drawn(&mut dashboard, 120, 44)
             .into_iter()
             .find(|line| line.contains("─ Quota ──"))
             .expect("the collapsed Quota row");
@@ -3332,7 +3332,7 @@ mod tests {
             failed.focus = focus;
 
             let row_colour = |dashboard: &mut DashboardState| {
-                let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+                let mut terminal = Terminal::new(TestBackend::new(120, 44)).expect("terminal");
                 terminal
                     .draw(|frame| render(frame, dashboard))
                     .expect("draw the session list");
@@ -3378,7 +3378,7 @@ mod tests {
         dashboard.apply_quota(weekly_quota("codex-1", 10));
         dashboard.cycle_pane_layout();
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 44)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw the collapsed panes");
@@ -3439,7 +3439,7 @@ mod tests {
         );
         dashboard.cycle_pane_layout();
 
-        let lines = drawn(&mut dashboard, 60, 34);
+        let lines = drawn(&mut dashboard, 60, 44);
         let rows = lines
             .iter()
             .filter(|line| line.contains("─ Targets ──"))
