@@ -2653,6 +2653,78 @@ pub struct SessionConfigChoice {
 /// Empty when the harness advertises no such option or exposes it as
 /// something other than a select, which callers read as "not configurable".
 #[must_use]
+/// What one live session's ACP surface offers, for callers outside the chat.
+///
+/// The phone server and the terminal must agree on which harness drives plan
+/// mode through a session mode and which drives it through a configuration
+/// key, on whether fast mode is available, and on which values a setting
+/// accepts. Those are facts about the harness rather than about the client, so
+/// they are answered here once instead of being decided again in each surface.
+pub struct AcpSessionFacts(crate::hel_acp::surface::AcpSessionSurface);
+
+impl AcpSessionFacts {
+    /// Read the facts out of one relay operational snapshot.
+    pub fn from_operational(
+        harness_kind: HarnessKind,
+        configuration: &std::collections::BTreeMap<String, String>,
+        config_options: &[SessionConfigOption],
+        modes: Option<&agent_client_protocol::schema::v1::SessionModeState>,
+    ) -> Self {
+        let values = configuration
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+            .collect();
+        let mut surface = crate::hel_acp::surface::AcpSessionSurface::from_configuration(&values);
+        surface.set_harness_kind(harness_kind);
+        surface.set_config_options(config_options);
+        surface.set_session_modes(modes.cloned());
+        Self(surface)
+    }
+
+    pub fn supports_plan_mode(&self) -> bool {
+        self.0.supports_plan_mode()
+    }
+
+    pub fn plan_mode_active(&self) -> bool {
+        self.0.plan_mode_active()
+    }
+
+    pub fn supports_fast_mode(&self) -> bool {
+        self.0.supports_fast_mode()
+    }
+
+    pub fn fast_mode_active(&self) -> bool {
+        self.0.fast_mode_active()
+    }
+
+    pub fn current_model(&self) -> Option<&str> {
+        self.0.current_model()
+    }
+
+    pub fn current_effort(&self) -> Option<&str> {
+        self.0.current_effort()
+    }
+
+    /// The ACP call that turns plan mode on or off, or a sentence saying why
+    /// this harness cannot.
+    pub fn plan_control(&self, active: bool) -> Result<PlanControl, &'static str> {
+        self.0.plan_control(active).map_err(|error| match error {
+            crate::hel_acp::surface::PlanControlError::DeepseekUnsupported => {
+                "Plan mode is unsupported in DSH."
+            }
+            crate::hel_acp::surface::PlanControlError::CodexIncompatible => {
+                "This Codex ACP version does not expose collaboration_mode with plan/default values."
+            }
+            crate::hel_acp::surface::PlanControlError::GrokIncompatible => {
+                "This Grok Build version does not expose compatible plan/default modes."
+            }
+            crate::hel_acp::surface::PlanControlError::Incompatible => {
+                "This ACP harness does not expose compatible plan/default modes."
+            }
+        })
+    }
+}
+
 pub fn session_config_choices(
     options: &[SessionConfigOption],
     key: &str,

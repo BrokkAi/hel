@@ -46,6 +46,9 @@ const CODE_LOCKOUT_BASE: Duration = Duration::from_secs(30);
 const CODE_LOCKOUT_CAP: Duration = Duration::from_secs(60 * 60);
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_PROMPT_CHARS: usize = 64 * 1024;
+/// How many repositories one dirty-worktree acknowledgement may name. A bundle
+/// with more repositories than this than has bigger problems than the phone.
+const MAX_DIRTY_ACKNOWLEDGEMENTS: usize = 32;
 /// Image prompts need far more room than any other phone request. Browser
 /// uploads are base64-encoded, so two ordinary photographs already exceed the
 /// general body limit even when each one fits it. The larger bound therefore
@@ -221,6 +224,10 @@ pub struct ViewerSnapshot {
     pub profiles: Vec<ViewerProfile>,
     pub targets: Vec<ViewerTarget>,
     pub bundles: Vec<ViewerBundle>,
+    /// One entry per host or fleet that can be probed. Empty until the phone
+    /// server's capacity poller has published a reading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capacity: Vec<ViewerTargetCapacity>,
 }
 
 impl ViewerSnapshot {
@@ -231,25 +238,8 @@ impl ViewerSnapshot {
         let sessions = state
             .sessions
             .values()
-            .map(|session| ViewerSession {
-                id: session.id.clone(),
-                workspace_id: session.workspace_id.clone(),
-                title: session.display_title().to_owned(),
-                harness_kind: session.harness_kind.id().into(),
-                profile_id: session.last_profile.clone(),
-                bundle_id: session.bundle_id.clone(),
-                target_id: session.target_template_id.clone(),
-                state: session_state_name(session.state).into(),
-                created_at: session.created_at.clone(),
-                updated_at: session.updated_at.clone(),
-                has_error: session.last_error.is_some(),
-                preview: Vec::new(),
-                queued_prompts: Vec::new(),
-                active_user_shells: Vec::new(),
-                pending_elicitations: Vec::new(),
-                conversation_available: false,
-                prompt_images_supported: false,
-                incompatible_resume_targets: config
+            .map(|session| {
+                let incompatible = config
                     .targets
                     .keys()
                     .filter(|target_id| {
@@ -257,7 +247,57 @@ impl ViewerSnapshot {
                             .is_err()
                     })
                     .cloned()
-                    .collect(),
+                    .collect::<Vec<_>>();
+                let lifecycle = ViewerLifecycleCategory::of(session.state);
+                ViewerSession {
+                    id: session.id.clone(),
+                    workspace_id: session.workspace_id.clone(),
+                    title: session.display_title().to_owned(),
+                    harness_kind: session.harness_kind.id().into(),
+                    profile_id: session.last_profile.clone(),
+                    bundle_id: session.bundle_id.clone(),
+                    target_id: session.target_template_id.clone(),
+                    state: session_state_name(session.state).into(),
+                    created_at: session.created_at.clone(),
+                    updated_at: session.updated_at.clone(),
+                    has_error: session.last_error.is_some(),
+                    preview: Vec::new(),
+                    queued_prompts: Vec::new(),
+                    active_user_shells: Vec::new(),
+                    pending_elicitations: Vec::new(),
+                    conversation_available: false,
+                    prompt_images_supported: false,
+                    incompatible_resume_targets: incompatible.clone(),
+                    compatible_resume_targets: config
+                        .targets
+                        .keys()
+                        .filter(|target_id| !incompatible.contains(*target_id))
+                        .cloned()
+                        .collect(),
+                    project_label: session.project_name(config),
+                    project_key: project_key(&session.project_source(config).key),
+                    lifecycle,
+                    latest_event_ordinal: 0,
+                    operation: None,
+                    chat_phase: ViewerChatPhase::default(),
+                    config_options: Vec::new(),
+                    plan_mode_active: None,
+                    // What the durable record alone can justify. The phone server
+                    // widens these once it knows whether the session manager holds
+                    // the session and what the agent has advertised.
+                    capabilities: ViewerSessionCapabilities {
+                        open: false,
+                        prompt: false,
+                        run_shell: false,
+                        cancel_turn: false,
+                        cancel_operation: false,
+                        stop: lifecycle.is_dashboard_visible(),
+                        rename: true,
+                        resume: !lifecycle.is_dashboard_visible(),
+                        set_config: false,
+                        set_plan_mode: false,
+                    },
+                }
             })
             .collect();
         let profiles = config
@@ -306,8 +346,24 @@ impl ViewerSnapshot {
             profiles,
             targets,
             bundles,
+            capacity: Vec::new(),
         }
     }
+}
+
+/// A stable, opaque grouping key for a project.
+///
+/// The controller's own project identity is a filesystem path or a Git remote,
+/// and this projection publishes neither. A digest groups exactly as well and
+/// says nothing: two sessions in the same project share a key, and a key on
+/// its own reveals no path.
+fn project_key(identity: &str) -> String {
+    use sha2::Digest as _;
+    let digest = Sha256::digest(identity.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -345,8 +401,41 @@ pub struct ViewerSession {
     /// Target ids this session cannot resume on. Only the ids travel: the
     /// controller's reasons name project paths and SSH hosts, which this
     /// projection deliberately keeps on the controller.
+    ///
+    /// Retained beside `compatible_resume_targets` so a viewer cached from
+    /// before that field existed keeps working through a deployment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incompatible_resume_targets: Vec<String>,
+    /// Target ids this session can resume on, so the browser never has to
+    /// subtract one set from another to find out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_resume_targets: Vec<String>,
+    /// The project this session works in, as a name a person recognises. This
+    /// is the leaf of a path or a repository name, never the path itself.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_label: String,
+    /// A stable key for grouping sessions by project. The controller's own
+    /// identity for a project is a path or a remote, so what travels is a
+    /// digest of it: enough to group by, and nothing to read.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_key: String,
+    pub lifecycle: ViewerLifecycleCategory,
+    /// How far the controller's projection of this session has advanced. A
+    /// phone compares it against its own read frontier to know what is unread,
+    /// without fetching a transcript to find out.
+    #[serde(default)]
+    pub latest_event_ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<ViewerOperation>,
+    #[serde(default)]
+    pub chat_phase: ViewerChatPhase,
+    /// The settings the harness advertised, with the values it accepts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_options: Vec<ViewerConfigOption>,
+    /// Whether plan mode is on, or `None` when this harness has no plan mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode_active: Option<bool>,
+    pub capabilities: ViewerSessionCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,15 +470,76 @@ pub struct ViewerProfile {
     pub quota: Option<ViewerQuota>,
 }
 
+/// One usage window a harness reports, such as a weekly or five-hour limit.
+///
+/// `percent_used` is the figure a person acts on, so it travels as a number
+/// rather than inside a sentence. The controller computes headroom; this is
+/// its complement, because a bar fills as a limit is consumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerQuotaWindow {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent_used: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+    /// Whether this window is on course to run out before it resets. The
+    /// controller already computes this; a phone should not have to.
+    pub projects_exhaustion_before_reset: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerQuota {
+    /// One-line rendering, kept so a viewer cached from before the structured
+    /// windows existed keeps working. The Quota page renders `windows`.
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<ViewerQuotaWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
     pub stale: bool,
+    /// When the reading was taken. A pulled view delivered by push cannot be
+    /// told from a current one without its age, so this is not optional.
+    #[serde(default)]
+    pub refreshed_at_epoch_seconds: u64,
     /// Error state only. Raw vendor errors may contain paths or account data
     /// and remain on the controller.
+    pub has_error: bool,
+}
+
+/// What one host or fleet has, and how fresh the reading is.
+///
+/// Every field that carries a reading is optional, and `sampled_at_epoch_seconds`
+/// is present whenever any of them is: a reading without its age cannot be
+/// told from a stale one, which is exactly the case where it matters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerTargetCapacity {
+    pub id: String,
+    /// The host or fleet as a person names it. Never a locator, an address or
+    /// a full path.
+    pub label: String,
+    pub target_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_cores: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
+    /// How many machines a fleet is running. Absent for a plain host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_machines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at_epoch_seconds: Option<u64>,
+    pub refreshing: bool,
+    pub stale: bool,
+    /// Whether the last probe failed. The probe's own message names hosts and
+    /// commands, so it stays on the controller.
     pub has_error: bool,
 }
 
@@ -417,6 +567,141 @@ pub struct ViewerRepository {
     pub destination: String,
 }
 
+/// What a phone may do with one session, as the controller sees it.
+///
+/// The viewer renders a control because a flag here is true, and for no other
+/// reason. Deciding legality in the browser means copying controller policy
+/// into JavaScript, where it drifts silently: the browser cannot know that a
+/// session is unmanaged, that a lifecycle operation holds it, or that the
+/// harness never advertised the option a control would change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerSessionCapabilities {
+    pub open: bool,
+    pub prompt: bool,
+    pub run_shell: bool,
+    /// Cancel the turn the agent is working on now, leaving the session alive.
+    pub cancel_turn: bool,
+    /// Cancel the provision, resume or stop currently running.
+    pub cancel_operation: bool,
+    pub stop: bool,
+    pub rename: bool,
+    pub resume: bool,
+    pub set_config: bool,
+    pub set_plan_mode: bool,
+}
+
+/// The small set of states a phone reasons about, alongside the precise state.
+///
+/// A phone groups and filters by this; it shows the precise `state` string as
+/// the word it prints. Collapsing here rather than in the browser keeps one
+/// definition of "live" in the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewerLifecycleCategory {
+    Live,
+    Starting,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+impl ViewerLifecycleCategory {
+    const fn of(state: SessionState) -> Self {
+        match state {
+            SessionState::Provisioning => Self::Starting,
+            SessionState::Running | SessionState::Disconnected | SessionState::Checkpointing => {
+                Self::Live
+            }
+            SessionState::Closing | SessionState::Destroying => Self::Stopping,
+            SessionState::Stopped => Self::Stopped,
+            SessionState::Lost | SessionState::Error | SessionState::DestroyedWithDataLoss => {
+                Self::Failed
+            }
+        }
+    }
+
+    /// Whether this session belongs on the dashboard. Stopped and failed
+    /// sessions belong to the resume flow instead, which is where a person can
+    /// do something about them.
+    pub const fn is_dashboard_visible(self) -> bool {
+        matches!(self, Self::Live | Self::Starting | Self::Stopping)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewerOperationKind {
+    Create,
+    Resume,
+    Stop,
+    Checkpoint,
+}
+
+/// One stage of a running operation, with the clock it started on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerOperationStage {
+    pub label: String,
+    pub started_at_epoch_seconds: u64,
+}
+
+/// A provision, resume, stop or checkpoint the controller is running now.
+///
+/// A phone that asked for one of these got `202 Accepted` and an identifier
+/// rather than a result, because the work outlives the request. This is how it
+/// finds out what happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerOperation {
+    pub id: String,
+    pub session_id: String,
+    pub kind: ViewerOperationKind,
+    pub started_at_epoch_seconds: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<ViewerOperationStage>,
+    /// Controller-authored and already meant for a person to read, unlike the
+    /// error text this projection keeps on the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+    pub cancellable: bool,
+}
+
+/// What the agent is doing, mirroring `RelayExecutionState`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewerChatPhase {
+    #[default]
+    Idle,
+    Running,
+    Closing,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerConfigChoice {
+    pub value: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One setting the harness advertised, with the values it will accept.
+///
+/// The browser completes `/model` and `/effort` from this rather than from a
+/// list of its own, so a harness that offers something new needs no viewer
+/// change, and a viewer can never offer a value the harness would refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerConfigOption {
+    pub key: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    pub choices: Vec<ViewerConfigChoice>,
+}
+
 /// The complete set of operations a phone may ask the controller to perform.
 /// Destructive force-cleanup and secret/config editing are intentionally not
 /// representable here.
@@ -424,14 +709,57 @@ pub struct ViewerRepository {
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControllerAction {
     New {
+        /// Which workspace the session belongs to. Optional on the wire so a
+        /// viewer cached from before workspaces reached the phone still parses,
+        /// but a controller holding more than one workspace refuses an empty
+        /// one rather than guessing.
         #[serde(default)]
         workspace_id: String,
         profile_id: String,
         bundle_id: String,
         target_id: String,
-        title: String,
+        /// Absent means "derive it", which is what the terminal does.
+        #[serde(default)]
+        title: Option<String>,
         #[serde(default)]
         project_directory: Option<PathBuf>,
+        /// The repositories the person was shown as having uncommitted changes
+        /// and chose to launch over anyway.
+        ///
+        /// This names them rather than being a bare yes, so an acknowledgement
+        /// cannot be replayed against a set the person never saw: if a
+        /// different repository has gone dirty since the preflight, the launch
+        /// stops and asks again.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dirty_ack: Vec<String>,
+    },
+    /// Give a session a new title. The terminal calls this a rename.
+    Rename {
+        session_id: String,
+        title: String,
+    },
+    /// Stop the turn the agent is working on, leaving the session alive. This
+    /// is not `Cancel`, which stops a provision, resume or stop.
+    CancelTurn {
+        session_id: String,
+    },
+    /// Change one setting the harness advertised, such as `model` or `effort`.
+    SetConfig {
+        session_id: String,
+        key: String,
+        value: String,
+    },
+    /// Turn plan mode on or off. The harness decides how, which is why this
+    /// carries an intent rather than a mode id.
+    SetPlanMode {
+        session_id: String,
+        active: bool,
+    },
+    RefreshQuota {
+        profile_id: String,
+    },
+    RefreshCapacity {
+        target_id: String,
     },
     Resume {
         session_id: String,
@@ -958,17 +1286,35 @@ fn validate_prompt_images(images: &[ViewerPromptImage]) -> Result<(), ApiError> 
 fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Result<(), ApiError> {
     match action {
         ControllerAction::New {
+            workspace_id,
             profile_id,
             bundle_id,
             target_id,
             title,
             project_directory,
-            ..
+            dirty_ack,
         } => {
+            if !workspace_id.is_empty() {
+                validate_public_id(workspace_id)?;
+            }
             validate_public_id(profile_id)?;
             validate_public_id(bundle_id)?;
             validate_public_id(target_id)?;
-            validate_title(title)?;
+            if let Some(title) = title {
+                validate_title(title)?;
+            }
+            // An acknowledgement names repositories the preflight reported.
+            // Unbounded or malformed entries would travel to the controller
+            // and be compared against a real set, so they are refused here.
+            if dirty_ack.len() > MAX_DIRTY_ACKNOWLEDGEMENTS
+                || dirty_ack
+                    .iter()
+                    .any(|repository| repository.trim().is_empty() || repository.len() > 256)
+            {
+                return Err(ApiError::bad_request(
+                    "dirty acknowledgement must name 0-32 repositories",
+                ));
+            }
             require_profile(snapshot, profile_id)?;
             require_bundle(snapshot, bundle_id)?;
             let target = require_target(snapshot, target_id)?;
@@ -1015,6 +1361,67 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
         | ControllerAction::Cancel { session_id } => {
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
+        }
+        ControllerAction::Rename { session_id, title } => {
+            validate_public_id(session_id)?;
+            validate_title(title)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session.capabilities.rename {
+                return Err(ApiError::bad_request("this session cannot be renamed"));
+            }
+        }
+        ControllerAction::CancelTurn { session_id } => {
+            validate_public_id(session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session.capabilities.cancel_turn {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "this session has no turn to cancel",
+                ));
+            }
+        }
+        ControllerAction::SetConfig {
+            session_id,
+            key,
+            value,
+        } => {
+            validate_public_id(session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session.capabilities.set_config {
+                return Err(ApiError::bad_request(
+                    "this session cannot change configuration now",
+                ));
+            }
+            // The harness decides what it accepts. Forwarding a key it never
+            // advertised, or a value outside the ones it offered, asks it to
+            // refuse something the viewer should not have offered.
+            let option = session
+                .config_options
+                .iter()
+                .find(|option| option.key == *key)
+                .ok_or_else(|| ApiError::bad_request("this agent does not offer that setting"))?;
+            if !option.choices.iter().any(|choice| choice.value == *value) {
+                return Err(ApiError::bad_request(
+                    "this agent does not offer that value for that setting",
+                ));
+            }
+        }
+        ControllerAction::SetPlanMode { session_id, .. } => {
+            validate_public_id(session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session.capabilities.set_plan_mode {
+                return Err(ApiError::bad_request(
+                    "this session cannot change plan mode now",
+                ));
+            }
+        }
+        ControllerAction::RefreshQuota { profile_id } => {
+            validate_public_id(profile_id)?;
+            require_profile(snapshot, profile_id)?;
+        }
+        ControllerAction::RefreshCapacity { target_id } => {
+            validate_public_id(target_id)?;
+            require_target(snapshot, target_id)?;
         }
         ControllerAction::Prompt {
             session_id,
@@ -1670,6 +2077,21 @@ mod tests {
         test_options(snapshot_rx, conversation_rx, action_tx, receipt_tx)
     }
 
+    /// A valid session cookie for the test server's key.
+    ///
+    /// Most checks are about what an authenticated request does rather than
+    /// about how it authenticated, and going through the login route for each
+    /// one buys nothing.
+    fn cookie() -> String {
+        format!(
+            "{COOKIE_NAME}={}",
+            signed_cookie_value(
+                b"01234567890123456789012345678901",
+                now_unix().saturating_add(3600)
+            )
+        )
+    }
+
     async fn login_cookie(app: &Router) -> String {
         let response = app
             .clone()
@@ -1992,6 +2414,235 @@ mod tests {
     /// hand-written stub rather than importing a module.
     fn run_viewer_script(name: &str, script: &str) {
         run_web_check(name, script);
+    }
+
+    /// The projection publishes what the browser needs to group and filter
+    /// without publishing what the redaction contract keeps back. A project
+    /// key groups two sessions in one project together and says nothing about
+    /// where that project lives.
+    #[test]
+    fn the_project_key_groups_without_naming_a_path() {
+        let (config, mut state) = sample_config_state();
+        let first = state.sessions["session-1"].clone();
+        let mut second = first.clone();
+        second.id = "session-2".into();
+        state.sessions.insert(second.id.clone(), second);
+        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+
+        let keys = snapshot
+            .sessions
+            .iter()
+            .map(|session| session.project_key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), 1, "two sessions in one project did not group");
+        let key = keys.into_iter().next().expect("one key");
+        assert!(!key.is_empty(), "the project key is empty");
+        assert!(
+            !key.contains('/') && !key.contains("hel"),
+            "the project key leaks its identity: {key}"
+        );
+        assert_eq!(
+            snapshot.sessions[0].project_label, "hel",
+            "the project label should be a name a person recognises"
+        );
+    }
+
+    /// A phone groups and filters by the lifecycle category, so the mapping
+    /// from the controller's precise state has to be the controller's own.
+    #[test]
+    fn lifecycle_categories_decide_what_the_dashboard_shows() {
+        use ViewerLifecycleCategory::{Failed, Live, Starting, Stopped, Stopping};
+
+        for (state, expected, on_dashboard) in [
+            (SessionState::Provisioning, Starting, true),
+            (SessionState::Running, Live, true),
+            (SessionState::Disconnected, Live, true),
+            (SessionState::Checkpointing, Live, true),
+            (SessionState::Closing, Stopping, true),
+            (SessionState::Destroying, Stopping, true),
+            (SessionState::Stopped, Stopped, false),
+            (SessionState::Lost, Failed, false),
+            (SessionState::Error, Failed, false),
+            (SessionState::DestroyedWithDataLoss, Failed, false),
+        ] {
+            let category = ViewerLifecycleCategory::of(state);
+            assert_eq!(category, expected, "{state:?}");
+            assert_eq!(
+                category.is_dashboard_visible(),
+                on_dashboard,
+                "{state:?} belongs on the dashboard? "
+            );
+        }
+    }
+
+    /// Resume compatibility travels as the set the browser can offer, so it
+    /// never has to subtract one list from another and never offers a target
+    /// the controller would refuse.
+    #[test]
+    fn compatible_resume_targets_are_the_complement_of_the_incompatible_ones() {
+        let (config, state) = sample_config_state();
+        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        let session = &snapshot.sessions[0];
+        let all = config.targets.keys().cloned().collect::<Vec<_>>();
+
+        for target in &all {
+            assert_ne!(
+                session.compatible_resume_targets.contains(target),
+                session.incompatible_resume_targets.contains(target),
+                "target {target} is in both lists or neither"
+            );
+        }
+        assert_eq!(
+            session.compatible_resume_targets.len() + session.incompatible_resume_targets.len(),
+            all.len(),
+            "the two lists do not cover every target"
+        );
+    }
+
+    /// The viewer renders a control because a capability says so. An action
+    /// whose capability is false is refused at the boundary, so a forged
+    /// request gets the same answer a well-behaved viewer would never ask for.
+    #[tokio::test]
+    async fn actions_are_refused_when_their_capability_is_false() {
+        for (body, capability) in [
+            (
+                r#"{"action":"cancel-turn","session_id":"session-1"}"#,
+                "cancel_turn",
+            ),
+            (
+                r#"{"action":"set-plan-mode","session_id":"session-1","active":true}"#,
+                "set_plan_mode",
+            ),
+            (
+                r#"{"action":"set-config","session_id":"session-1","key":"model","value":"x"}"#,
+                "set_config",
+            ),
+        ] {
+            let (app, mut actions, _) = app();
+            let response = post_action(app, cookie(), body.to_owned()).await;
+            assert!(
+                response.status().is_client_error(),
+                "{capability} was accepted while false: {}",
+                response.status()
+            );
+            assert!(
+                actions.try_recv().is_err(),
+                "{capability} reached the controller while false"
+            );
+        }
+    }
+
+    /// A setting the harness never advertised is not a setting. Forwarding one
+    /// asks the agent to refuse something the viewer should never have offered.
+    #[tokio::test]
+    async fn a_config_key_the_harness_never_advertised_is_refused() {
+        let capable = |snapshot: &mut ViewerSnapshot| {
+            snapshot.sessions[0].capabilities.set_config = true;
+            snapshot.sessions[0].config_options = vec![ViewerConfigOption {
+                key: "model".into(),
+                label: "model".into(),
+                current: None,
+                choices: vec![ViewerConfigChoice {
+                    value: "sonnet".into(),
+                    name: "Sonnet".into(),
+                    description: None,
+                }],
+            }];
+        };
+
+        for (body, why) in [
+            (
+                r#"{"action":"set-config","session_id":"session-1","key":"effort","value":"high"}"#,
+                "an unadvertised key",
+            ),
+            (
+                r#"{"action":"set-config","session_id":"session-1","key":"model","value":"gpt-9"}"#,
+                "an unoffered value",
+            ),
+        ] {
+            let (app, mut actions, _) = app_with_snapshot(capable);
+            let response = post_action(app, cookie(), body.to_owned()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{why} was accepted"
+            );
+            assert!(actions.try_recv().is_err(), "{why} reached the controller");
+        }
+
+        // The value the harness did advertise is forwarded unchanged.
+        let (app, mut actions, _) = app_with_snapshot(capable);
+        let response = tokio::spawn(post_action(
+            app,
+            cookie(),
+            r#"{"action":"set-config","session_id":"session-1","key":"model","value":"sonnet"}"#
+                .to_owned(),
+        ));
+        let action = actions
+            .recv()
+            .await
+            .expect("the action reached the controller");
+        assert!(
+            matches!(
+                action.action,
+                ControllerAction::SetConfig { ref key, ref value, .. }
+                    if key == "model" && value == "sonnet"
+            ),
+            "the advertised value was not forwarded unchanged"
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::ACCEPTED);
+    }
+
+    /// A dirty-worktree acknowledgement names the repositories the person was
+    /// shown. A bare yes could be replayed against a set they never saw.
+    #[tokio::test]
+    async fn a_dirty_acknowledgement_is_bounded_and_names_repositories() {
+        let oversized = (0..40)
+            .map(|index| format!(r#""repo-{index}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (ack, why) in [
+            (oversized.as_str(), "an unbounded acknowledgement"),
+            (r#""""#, "an empty repository name"),
+        ] {
+            let (app, mut actions, _) = app();
+            let body = format!(
+                r#"{{"action":"new","workspace_id":"default","profile_id":"codex-1","bundle_id":"hel","target_id":"podman","dirty_ack":[{ack}]}}"#
+            );
+            let response = post_action(app, cookie(), body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{why}");
+            assert!(actions.try_recv().is_err(), "{why} reached the controller");
+        }
+    }
+
+    /// A session created without a title still gets one, derived the way the
+    /// terminal derives it, so the two surfaces name a session alike.
+    #[tokio::test]
+    async fn a_new_session_without_a_title_is_accepted() {
+        let (app, mut actions, _) = app();
+        let response = tokio::spawn(post_action(
+            app,
+            cookie(),
+            r#"{"action":"new","workspace_id":"default","profile_id":"codex-1","bundle_id":"hel","target_id":"podman"}"#
+                .to_owned(),
+        ));
+        // The handler answers only once the controller does, so the reply has
+        // to be sent before the response can be read.
+        let action = actions
+            .recv()
+            .await
+            .expect("the action reached the controller");
+        assert!(
+            matches!(
+                action.action,
+                ControllerAction::New { title: None, ref workspace_id, .. }
+                    if workspace_id == "default"
+            ),
+            "the workspace or the absent title did not survive the boundary"
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::ACCEPTED);
     }
 
     /// Everything an agent writes goes through the Markdown renderer, so the
@@ -2703,8 +3354,9 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
                 target_id: "raw".into(),
-                title: "Raw work".into(),
+                title: Some("Raw work".into()),
                 project_directory: Some(PathBuf::from("/work/project")),
+                dirty_ack: Vec::new(),
             }
         );
         action.reply.send(ActionOutcome::Accepted).unwrap();
@@ -2723,8 +3375,9 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
             profile_id: "codex-1".into(),
             bundle_id: "hel".into(),
             target_id: target_id.into(),
-            title: "New work".into(),
+            title: Some("New work".into()),
             project_directory,
+            dirty_ack: Vec::new(),
         };
 
         assert!(validate_action(&action("podman", None), &snapshot).is_ok());
