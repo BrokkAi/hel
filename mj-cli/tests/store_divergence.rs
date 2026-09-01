@@ -34,8 +34,7 @@ impl Drop for ReapChild {
     }
 }
 
-#[test]
-fn daemon_exits_when_its_store_is_migrated_underneath_it() {
+fn configured_storage() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let storage = tempfile::tempdir().expect("create Mjolnir test storage");
     let config_directory = storage.path().join("config/mjolnir");
     let data_directory = storage.path().join("data/mjolnir");
@@ -59,6 +58,12 @@ image = "ubuntu:24.04"
 "#,
     )
     .expect("write Mjolnir test config");
+    (storage, config_directory, data_directory)
+}
+
+#[test]
+fn daemon_exits_when_its_store_is_migrated_underneath_it() {
+    let (_storage, config_directory, data_directory) = configured_storage();
 
     // No MJ_DAEMON_EXIT_WHEN_IDLE: an idle exit would end this process for a
     // reason that has nothing to do with the store.
@@ -75,8 +80,9 @@ image = "ubuntu:24.04"
             .expect("spawn the Mjolnir daemon"),
     ));
 
-    // The daemon writes its metadata before it listens, so this is the point
-    // where it is fully up and its writer connection has verified the schema.
+    // Metadata is only discovery. Readiness requires a complete management
+    // round trip, which also proves the event loop is accepting requests after
+    // all fallible store and runtime initialization has completed.
     let metadata = data_directory.join("daemon.json");
     let deadline = Instant::now() + METADATA_WAIT;
     while Instant::now() < deadline && !metadata.exists() {
@@ -90,7 +96,45 @@ image = "ubuntu:24.04"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(metadata.exists(), "the daemon never became ready");
+    assert!(metadata.exists(), "the daemon never published its endpoint");
+    let mut readiness = ReapChild(Some(
+        Command::new(env!("CARGO_BIN_EXE_mj"))
+            .args(["daemon", "status"])
+            .env("MJ_CONFIG_DIR", &config_directory)
+            .env("MJ_DATA_DIR", &data_directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("probe Mjolnir daemon readiness"),
+    ));
+    let deadline = Instant::now() + METADATA_WAIT;
+    let readiness_status = loop {
+        if let Some(status) = readiness
+            .child_mut()
+            .try_wait()
+            .expect("poll the daemon readiness probe")
+        {
+            break status;
+        }
+        assert!(
+            daemon
+                .child_mut()
+                .try_wait()
+                .expect("poll the daemon")
+                .is_none(),
+            "the daemon exited before answering its readiness probe"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the daemon published metadata but did not answer within {METADATA_WAIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        readiness_status.success(),
+        "the daemon rejected its readiness probe: {readiness_status:?}"
+    );
 
     // What another Mjolnir build's migration ladder does to a store this daemon
     // has open.
@@ -123,5 +167,47 @@ image = "ubuntu:24.04"
     assert!(
         !metadata.exists(),
         "the daemon left its metadata behind, so clients keep dialing a dead address"
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn post_publication_error_runs_the_daemon_epilogue() {
+    let (storage, config_directory, data_directory) = configured_storage();
+    let invalid_hook_directory = storage.path().join("hook-path-is-a-file");
+    fs::write(&invalid_hook_directory, "not a directory")
+        .expect("create invalid test hook directory");
+    let metadata = data_directory.join("daemon.json");
+    let mut daemon = ReapChild(Some(
+        Command::new(env!("CARGO_BIN_EXE_mj"))
+            .arg("daemon-run")
+            .env("MJ_CONFIG_DIR", &config_directory)
+            .env("MJ_DATA_DIR", &data_directory)
+            .env("MJ_TEST_HOOK", "daemon_metadata_before_listening")
+            .env("MJ_TEST_HOOK_DIR", &invalid_hook_directory)
+            .env("MJ_CHAOS_ISOLATED", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the Mjolnir daemon at its publication hook"),
+    ));
+
+    let deadline = Instant::now() + EXIT_WAIT;
+    let status = loop {
+        if let Some(status) = daemon.child_mut().try_wait().expect("poll the daemon") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not leave after its publication hook failed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(!status.success(), "the failing hook reported success");
+    assert!(
+        !metadata.exists(),
+        "the failing post-publication path left daemon metadata behind"
     );
 }

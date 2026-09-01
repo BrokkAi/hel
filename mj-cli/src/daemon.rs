@@ -421,7 +421,7 @@ enum DaemonReply {
     Workspaces(Vec<WorkspaceListing>),
     Workspace(WorkspaceRecord),
     Snapshot(WorkspaceSnapshot),
-    RuntimeSnapshot(RuntimeSnapshot),
+    RuntimeSnapshot(Box<RuntimeSnapshot>),
     RegisteredSession(Box<RegisteredSession>),
     Ordinal(u64),
     Text(String),
@@ -519,8 +519,7 @@ pub(crate) struct RuntimeState {
     phone_status: Mutex<WebViewerStatus>,
     ever_attached: AtomicBool,
     sessions: Mutex<BTreeMap<String, RuntimeSessionView>>,
-    revision: std::sync::atomic::AtomicU64,
-    revision_tx: tokio::sync::watch::Sender<u64>,
+    revisions: RuntimeRevisions,
     workspaces_tx: tokio::sync::watch::Sender<Vec<WorkspaceRecord>>,
     session_manager: SessionManagerControl,
     lifecycle: Mutex<BTreeMap<String, ActiveLifecycle>>,
@@ -533,6 +532,63 @@ pub(crate) struct RuntimeState {
     /// Turn review runs here, in the process that owns every session, so a
     /// review happens whether the terminal, the phone, or nobody is attached.
     review_host: TurnReviewHost,
+}
+
+/// One monotonic cursor shared by daemon snapshots and their wake-up feed.
+///
+/// Allocations can come from independent UI and daemon tasks. Publishing an
+/// older allocation after a newer one must not move the watch channel
+/// backwards, so publication compares against the last visible cursor.
+#[derive(Clone)]
+struct RuntimeRevisions {
+    allocated: Arc<std::sync::atomic::AtomicU64>,
+    published: tokio::sync::watch::Sender<u64>,
+}
+
+impl RuntimeRevisions {
+    fn new(initial: u64) -> Self {
+        let (published, _) = tokio::sync::watch::channel(initial);
+        Self {
+            allocated: Arc::new(std::sync::atomic::AtomicU64::new(initial)),
+            published,
+        }
+    }
+
+    fn allocate(&self) -> u64 {
+        self.allocated.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn publish(&self) -> u64 {
+        let revision = self.allocate();
+        self.publish_allocated(revision);
+        revision
+    }
+
+    fn publish_allocated(&self, revision: u64) {
+        self.published.send_if_modified(|visible| {
+            if revision > *visible {
+                *visible = revision;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn notifier(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let revisions = self.clone();
+        Arc::new(move || {
+            revisions.publish();
+        })
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.published.subscribe()
+    }
+
+    fn current(&self) -> u64 {
+        self.allocated.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,28 +656,31 @@ impl RuntimeState {
         // never wait on, or render, a cursor from the previous process as if
         // it belonged to the new feed.
         let initial_revision = u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap_or(1);
-        let (revision_tx, _) = tokio::sync::watch::channel(initial_revision);
+        let revisions = RuntimeRevisions::new(initial_revision);
         let (workspaces_tx, _) = tokio::sync::watch::channel(workspaces);
         // The host reads `[review]` at each trigger decision. The target
         // refresher already reloads config.toml every 500 ms and installs the
         // result here, so arming needs no reload machinery of its own.
         let review_config = Arc::new(Mutex::new(controller.config.review.clone()));
-        let review_host = TurnReviewHost::spawn(session_manager.clone(), {
-            let installed = review_config.clone();
-            Arc::new(move || {
-                installed
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone()
-            })
-        });
+        let review_host = TurnReviewHost::spawn_notifying(
+            session_manager.clone(),
+            {
+                let installed = review_config.clone();
+                Arc::new(move || {
+                    installed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone()
+                })
+            },
+            revisions.notifier(),
+        );
         Self {
             attachments: Mutex::new(BTreeMap::new()),
             phone_status: Mutex::new(WebViewerStatus::Starting),
             ever_attached: AtomicBool::new(false),
             sessions: Mutex::new(BTreeMap::new()),
-            revision: std::sync::atomic::AtomicU64::new(initial_revision),
-            revision_tx,
+            revisions,
             workspaces_tx,
             session_manager,
             lifecycle: Mutex::new(BTreeMap::new()),
@@ -640,13 +699,11 @@ impl RuntimeState {
     }
 
     pub(crate) fn allocate_revision(&self) -> u64 {
-        self.revision.fetch_add(1, Ordering::AcqRel) + 1
+        self.revisions.allocate()
     }
 
     fn publish_revision(&self) -> u64 {
-        let revision = self.allocate_revision();
-        self.revision_tx.send_replace(revision);
-        revision
+        self.revisions.publish()
     }
 
     fn attachments(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Attachment>> {
@@ -688,7 +745,7 @@ impl RuntimeState {
     }
 
     pub(crate) fn revisions(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.revision_tx.subscribe()
+        self.revisions.subscribe()
     }
 
     fn publish_workspaces(&self, workspaces: Vec<WorkspaceRecord>) {
@@ -755,11 +812,11 @@ impl RuntimeState {
         workspace_id: &str,
         after_revision: u64,
     ) -> Result<RuntimeSnapshot> {
-        let mut revisions = self.revision_tx.subscribe();
+        let mut revisions = self.revisions.subscribe();
         if *revisions.borrow_and_update() <= after_revision {
             let _ = tokio::time::timeout(Duration::from_secs(30), revisions.changed()).await;
         }
-        let revision = self.revision.load(Ordering::Acquire);
+        let revision = self.revisions.current();
         let session_ids = blocking({
             let workspace_id = workspace_id.to_owned();
             move || hel::hel_database::session_ids_for_workspace(&workspace_id)
@@ -1235,6 +1292,35 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Cancel and join every lifecycle owner before the daemon closes its
+    /// session manager and database writer. The operations already run
+    /// concurrently; awaiting their result feeds sequentially only observes
+    /// completion and never serializes the work itself.
+    async fn cancel_and_wait_lifecycles(&self) -> Result<()> {
+        let pending = {
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            lifecycle
+                .iter()
+                .filter(|(_, active)| active.result.borrow().is_none())
+                .map(|(session_id, active)| {
+                    active.cancelled.store(true, Ordering::Release);
+                    (session_id.clone(), active.result.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for (session_id, mut result) in pending {
+            while result.borrow_and_update().is_none() {
+                result.changed().await.with_context(|| {
+                    format!("lifecycle owner stopped without a result for session {session_id}")
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Every lifecycle operation running now.
     ///
     /// The dashboard receives these through a watch channel built by its own
@@ -1413,7 +1499,7 @@ fn epoch_seconds() -> u64 {
         .as_secs()
 }
 
-/// Whether a process has exited but not yet been reaped.
+/// Whether a non-child process has exited but not yet been reaped.
 ///
 /// A zombie still answers `kill(pid, 0)`, because its process-table entry
 /// survives until its parent waits for it — so an existence probe alone calls
@@ -1444,19 +1530,80 @@ fn process_is_zombie(pid: u32) -> bool {
 /// read very differently to somebody deciding whether to reach for a kill.
 async fn wait_for_exit(pid: u32) -> Result<()> {
     let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline && process_is_alive(pid) {
+    while daemon_process_is_alive(pid) {
+        ensure!(Instant::now() < deadline, "process {pid} is still running");
         tokio::time::sleep(RETRY_DELAY).await;
     }
-    ensure!(!process_is_alive(pid), "process {pid} is still running");
     Ok(())
+}
+
+/// Whether a daemon that Mjolnir launched in its own process group is alive.
+///
+/// Reaping is deliberately confined to this daemon-specific path. Attachment
+/// PIDs are merely observations and may alias unrelated children owned by this
+/// process, so their liveness probe below must never call `waitpid`.
+fn daemon_process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        let mut status = 0;
+        // SAFETY: `status` is writable for the call and WNOHANG never blocks.
+        // A non-child fails with ECHILD without changing any process state.
+        let waited = unsafe { libc::waitpid(raw_pid, &mut status, libc::WNOHANG) };
+        if waited == raw_pid {
+            return false;
+        }
+        if waited == 0 {
+            return true;
+        }
+        let wait_error = std::io::Error::last_os_error();
+        if wait_error.raw_os_error() != Some(libc::ECHILD) {
+            return true;
+        }
+
+        #[cfg(target_os = "macos")]
+        return owned_daemon_group_is_alive(raw_pid);
+
+        #[cfg(not(target_os = "macos"))]
+        process_is_alive(pid)
+    }
+    #[cfg(not(unix))]
+    process_is_alive(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn owned_daemon_group_is_alive(pid: libc::pid_t) -> bool {
+    // `spawn_detached` makes the daemon a process-group leader. Darwin
+    // excludes zombies from group signal probes: ESRCH means the group is gone
+    // and EPERM means only exiting members remain. The latter is safe here
+    // because this is a group we created for our own same-user child, not an
+    // arbitrary process group.
+    // SAFETY: signal 0 is only an existence probe, and the negative PID targets
+    // the daemon-owned group rather than another process.
+    if unsafe { libc::kill(-pid, 0) } == 0 {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    !matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM))
 }
 
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
+        if pid == 0 {
+            return false;
+        }
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
         // SAFETY: kill(pid, 0) sends no signal and is the standard existence
         // probe. EPERM still means the process exists.
-        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        let result = unsafe { libc::kill(raw_pid, 0) };
         let exists =
             result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         exists && !process_is_zombie(pid)
@@ -1964,7 +2111,7 @@ impl DaemonClient {
             })
             .await?
         {
-            DaemonReply::RuntimeSnapshot(snapshot) => Ok(snapshot),
+            DaemonReply::RuntimeSnapshot(snapshot) => Ok(*snapshot),
             reply => bail!("unexpected runtime snapshot reply {reply:?}"),
         }
     }
@@ -2337,6 +2484,22 @@ pub(crate) fn maintain_attachment(
 pub(crate) async fn run_daemon_process() -> Result<()> {
     let guard = ControllerStoreGuard::acquire()?;
     let database_writer = guard.start_database_writer()?;
+    let epilogue_started = AtomicBool::new(false);
+    let mut outcome = run_daemon_runtime(&epilogue_started).await;
+    if !epilogue_started.load(Ordering::Acquire) {
+        // Initialization failed before the runtime-owned epilogue existed.
+        // The same process-level bound still applies to closing the writer.
+        spawn_shutdown_watchdog();
+    }
+    let writer_shutdown = tokio::task::spawn_blocking(move || database_writer.shutdown())
+        .await
+        .context("database writer shutdown task panicked")
+        .and_then(std::convert::identity);
+    record_daemon_cleanup(&mut outcome, "shut down database writer", writer_shutdown);
+    outcome
+}
+
+async fn run_daemon_runtime(epilogue_started: &AtomicBool) -> Result<()> {
     Controller::recover_config_id_rename()?;
     HelConfig::migrate_legacy_localhost_target()?;
     let config = HelConfig::load()?;
@@ -2346,15 +2509,6 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
     hel::hel_controller::reconcile_managed_checkpoint_archives()?;
 
     let controller = Controller::load()?;
-    let manager = spawn_session_manager()?;
-    let manager_targets = manager.targets;
-    manager_targets.send_replace(dashboard_worker_targets(&controller));
-    let mut manager_updates = manager.updates;
-    let manager_control = manager.control.clone();
-    let manager_shutdown = manager.shutdown;
-    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn(manager_control.clone());
-    let recovery_observer = recovery.observer();
-
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .context("bind Mjolnir daemon loopback endpoint")?;
@@ -2366,12 +2520,25 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
         started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         build_version: env!("CARGO_PKG_VERSION").to_owned(),
     };
-    write_metadata(&metadata_path(), &metadata)?;
-    reach_test_hook("daemon_metadata_before_listening").await?;
-
     let workspaces = tokio::task::spawn_blocking(hel::hel_database::list_workspaces)
         .await
         .context("daemon workspace load task panicked")??;
+    let mut remote = if config.phone.enabled {
+        Some(spawn_remote_session_manager()?)
+    } else {
+        None
+    };
+
+    // Start the primary manager last: every remaining fallible operation is
+    // inside `outcome`, so its owner always reaches the awaited epilogue.
+    let manager = spawn_session_manager()?;
+    let manager_targets = manager.targets;
+    manager_targets.send_replace(dashboard_worker_targets(&controller));
+    let mut manager_updates = manager.updates;
+    let manager_control = manager.control.clone();
+    let manager_shutdown = manager.shutdown;
+    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn(manager_control.clone());
+    let recovery_observer = recovery.observer();
     let state = Arc::new(RuntimeState::new(
         manager_control.clone(),
         Controller {
@@ -2393,25 +2560,34 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
     let mut recovery_tick = tokio::time::interval(Duration::from_millis(250));
     recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (interrupted_close_tx, mut interrupted_close_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut interrupted_close_cancellations = Vec::new();
+    let mut interrupted_close_tasks = Vec::new();
     for session_id in interrupted_close_session_ids(&controller) {
-        spawn_interrupted_close_recovery(
+        let interrupted_cancellation = Arc::new(AtomicBool::new(false));
+        let interrupted_close_task = spawn_interrupted_close_recovery(
             session_id,
             manager_control.clone(),
             recovery_observer.clone(),
-            Arc::new(AtomicBool::new(false)),
+            interrupted_cancellation.clone(),
             interrupted_close_tx.clone(),
             None,
         );
+        interrupted_close_cancellations.push(interrupted_cancellation);
+        interrupted_close_tasks.push(interrupted_close_task);
     }
     let mut phone_publisher: Option<RemoteSessionPublisher> = None;
-    if config.phone.enabled {
-        let remote = spawn_remote_session_manager()?;
+    let mut phone_task = None;
+    let mut remote_request_bridge = None;
+    if let Some(remote) = remote.take() {
         remote
             .targets
             .send_replace(dashboard_worker_targets(&controller));
         phone_publisher = Some(remote.publisher.clone());
-        spawn_remote_request_bridge(remote.requests, manager_control.clone());
-        spawn_phone_server(
+        remote_request_bridge = Some(spawn_remote_request_bridge(
+            remote.requests,
+            manager_control.clone(),
+        ));
+        phone_task = Some(spawn_phone_server(
             config.phone,
             cancellation.clone(),
             state.clone(),
@@ -2421,91 +2597,185 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
                 updates: remote.updates,
                 shutdown: remote.shutdown,
             },
-        );
+        ));
     } else {
         state.set_phone_status(WebViewerStatus::Disabled);
     }
-    loop {
-        tokio::select! {
-            _ = cancellation.cancelled() => break,
-            _ = idle_tick.tick(), if exit_when_idle && state.ever_attached.load(Ordering::Acquire) => {
-                state.prune_dead_clients();
-                if state.attachments().is_empty() {
-                    break;
-                }
-            }
-            _ = recovery_tick.tick() => {
-                while let Some(result) = recovery.try_result() {
-                    if let Err(error) = &result.outcome {
-                        tracing::warn!(session_id = %result.session_id, %error, "daemon recovery checkpoint failed");
+    let daemon_metadata_path = metadata_path();
+    let mut client_tasks = tokio::task::JoinSet::new();
+
+    // Everything a client can use is initialized before this atomic
+    // publication. From here on every exit, including an error from the test
+    // hook or the event loop, flows through the same bounded epilogue.
+    let mut outcome = async {
+        write_metadata(&daemon_metadata_path, &metadata)?;
+        reach_test_hook("daemon_metadata_before_listening").await?;
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => break,
+                _ = idle_tick.tick(), if exit_when_idle && state.ever_attached.load(Ordering::Acquire) => {
+                    state.prune_dead_clients();
+                    if state.attachments().is_empty() {
+                        break;
                     }
-                    refresh_runtime_controller(&state).await;
                 }
-            }
-            completed = interrupted_close_rx.recv() => {
-                if let Some(completed) = completed {
-                    if let Err(error) = completed.result {
-                        tracing::warn!(session_id = %completed.session_id, %error, "daemon could not resume interrupted close");
+                _ = recovery_tick.tick() => {
+                    while let Some(result) = recovery.try_result() {
+                        if let Err(error) = &result.outcome {
+                            tracing::warn!(session_id = %result.session_id, %error, "daemon recovery checkpoint failed");
+                        }
+                        refresh_runtime_controller(&state).await;
                     }
-                    refresh_runtime_controller(&state).await;
                 }
-            }
-            accepted = listener.accept() => {
-                let (stream, peer) = accepted.context("accept Mjolnir daemon client")?;
-                if !peer.ip().is_loopback() {
-                    tracing::warn!(%peer, "rejected non-loopback daemon client");
-                    continue;
-                }
-                let metadata = metadata.clone();
-                let state = state.clone();
-                let cancellation = cancellation.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = serve_client(stream, metadata, state, cancellation).await {
-                        tracing::debug!(error = format!("{error:#}"), "daemon client disconnected");
+                completed = interrupted_close_rx.recv() => {
+                    if let Some(completed) = completed {
+                        if let Err(error) = completed.result {
+                            tracing::warn!(session_id = %completed.session_id, %error, "daemon could not resume interrupted close");
+                        }
+                        refresh_runtime_controller(&state).await;
                     }
-                });
-            }
-            update = manager_updates.recv() => {
-                let Some(update) = update else {
-                    bail!("controller daemon session manager stopped");
-                };
-                if let Some(publisher) = phone_publisher.as_ref()
-                    && let Err(error) = publisher.try_publish(
-                        update.session_id.clone(),
-                        update.view.clone(),
-                    )
-                {
-                    tracing::warn!(%error, "phone session view bridge stopped");
-                    phone_publisher = None;
                 }
-                // Every session's view passes here whether or not anything is
-                // attached, which is exactly what an automatic review needs to
-                // see: the turn that just finished.
-                state.review_host().observe(&update.session_id, &update.view);
-                state.publish_session(update.session_id, update.view).await?;
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted.context("accept Mjolnir daemon client")?;
+                    if !peer.ip().is_loopback() {
+                        tracing::warn!(%peer, "rejected non-loopback daemon client");
+                        continue;
+                    }
+                    let metadata = metadata.clone();
+                    let state = state.clone();
+                    let cancellation = cancellation.clone();
+                    client_tasks.spawn(async move {
+                        if let Err(error) = serve_client(stream, metadata, state, cancellation).await {
+                            tracing::debug!(error = format!("{error:#}"), "daemon client disconnected");
+                        }
+                    });
+                }
+                completed = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        tracing::warn!(%error, "daemon client task failed");
+                    }
+                }
+                update = manager_updates.recv() => {
+                    let Some(update) = update else {
+                        bail!("controller daemon session manager stopped");
+                    };
+                    if let Some(publisher) = phone_publisher.as_ref()
+                        && let Err(error) = publisher.try_publish(
+                            update.session_id.clone(),
+                            update.view.clone(),
+                        )
+                    {
+                        tracing::warn!(%error, "phone session view bridge stopped");
+                        phone_publisher = None;
+                    }
+                    // Every session's view passes here whether or not anything is
+                    // attached, which is exactly what an automatic review needs to
+                    // see: the turn that just finished.
+                    state.review_host().observe(&update.session_id, &update.view);
+                    state.publish_session(update.session_id, update.view).await?;
+                }
             }
         }
+        Ok(())
     }
+    .await;
+
+    epilogue_started.store(true, Ordering::Release);
     spawn_shutdown_watchdog();
-    // The idle-exit path does not arrive through the termination coordinator,
-    // so explicitly stop every daemon-owned background task before awaiting it.
+    // Idle exit and fallible loop exits do not arrive through the termination
+    // coordinator. Stop every daemon-owned task before closing the sole writer.
     cancellation.cancel();
-    manager_shutdown
-        .shutdown()
-        .await
-        .context("shut down controller daemon session manager")?;
-    if let Err(error) = target_refresh.await {
-        tracing::warn!(%error, "controller target refresher failed while shutting down");
+    for interrupted_cancellation in interrupted_close_cancellations {
+        interrupted_cancellation.store(true, Ordering::Release);
     }
-    if let Err(error) = fs::remove_file(metadata_path())
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(%error, "could not remove daemon metadata");
+    drop(interrupted_close_tx);
+    record_daemon_cleanup(
+        &mut outcome,
+        "remove daemon metadata",
+        remove_daemon_metadata(&daemon_metadata_path),
+    );
+    record_daemon_cleanup(
+        &mut outcome,
+        "shut down turn review host",
+        state
+            .review_host()
+            .shutdown()
+            .await
+            .map_err(anyhow::Error::msg),
+    );
+    record_daemon_cleanup(
+        &mut outcome,
+        "join controller target refresher",
+        target_refresh.await.map_err(anyhow::Error::new),
+    );
+    if let Some(phone_task) = phone_task {
+        record_daemon_cleanup(
+            &mut outcome,
+            "join phone server",
+            phone_task.await.map_err(anyhow::Error::new),
+        );
     }
-    tokio::task::spawn_blocking(move || database_writer.shutdown())
-        .await
-        .context("database writer shutdown task panicked")??;
-    Ok(())
+    if let Some(remote_request_bridge) = remote_request_bridge {
+        record_daemon_cleanup(
+            &mut outcome,
+            "join phone session request bridge",
+            remote_request_bridge.await.map_err(anyhow::Error::new),
+        );
+    }
+    client_tasks.abort_all();
+    while let Some(result) = client_tasks.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            record_daemon_cleanup(
+                &mut outcome,
+                "join daemon client task",
+                Err(anyhow::Error::new(error)),
+            );
+        }
+    }
+    record_daemon_cleanup(
+        &mut outcome,
+        "cancel daemon lifecycle operations",
+        state.cancel_and_wait_lifecycles().await,
+    );
+    for interrupted_close_task in interrupted_close_tasks {
+        record_daemon_cleanup(
+            &mut outcome,
+            "join interrupted close recovery",
+            interrupted_close_task.await.map_err(anyhow::Error::new),
+        );
+    }
+    drop(recovery);
+    record_daemon_cleanup(
+        &mut outcome,
+        "shut down controller daemon session manager",
+        manager_shutdown.shutdown().await,
+    );
+    outcome
+}
+
+fn remove_daemon_metadata(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+/// Keep the event-loop failure as the primary result while still running and
+/// reporting every cleanup step. If the loop ended normally, the first
+/// cleanup failure becomes the daemon's result.
+fn record_daemon_cleanup(outcome: &mut Result<()>, operation: &'static str, cleanup: Result<()>) {
+    let Err(error) = cleanup else {
+        return;
+    };
+    let error = error.context(operation);
+    if outcome.is_ok() {
+        *outcome = Err(error);
+    } else {
+        tracing::warn!(error = format!("{error:#}"), "daemon cleanup step failed");
+    }
 }
 
 /// Bounds the epilogue below.
@@ -2635,7 +2905,7 @@ fn spawn_phone_server(
     cancellation: CancellationToken,
     state: Arc<RuntimeState>,
     worker: SessionManagerChannels,
-) {
+) -> tokio::task::JoinHandle<()> {
     state.set_phone_status(WebViewerStatus::Starting);
     let workspaces = state.workspaces();
     tokio::spawn(async move {
@@ -2662,13 +2932,13 @@ fn spawn_phone_server(
                 });
             }
         }
-    });
+    })
 }
 
 fn spawn_remote_request_bridge(
     mut requests: hel::hel_session_manager::RemoteSessionRequests,
     manager: SessionManagerControl,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // One session's requests reach its relay actor in the order they were
         // made; different sessions still overlap.
@@ -2679,7 +2949,7 @@ fn spawn_remote_request_bridge(
                 forward_in_process_session_request(request, manager)
             });
         }
-    });
+    })
 }
 
 async fn forward_in_process_session_request(
@@ -3129,11 +3399,11 @@ async fn handle_action(
         DaemonAction::RuntimeSnapshot {
             workspace_id,
             after_revision,
-        } => Ok(DaemonReply::RuntimeSnapshot(
+        } => Ok(DaemonReply::RuntimeSnapshot(Box::new(
             state
                 .runtime_snapshot(&workspace_id, after_revision)
                 .await?,
-        )),
+        ))),
         DaemonAction::RenameProfile { old_id, new_id } => {
             let _config_mutation = state.config_mutation.lock().await;
             ensure_no_active_lifecycle(state)?;
@@ -3369,11 +3639,8 @@ mod tests {
     use super::*;
 
     /// A process that has exited but has not been reaped still answers
-    /// `kill(pid, 0)`. Counting it as alive is what made `mj daemon restart`
-    /// refuse to restart a daemon that had already stopped and logged so:
-    /// Mjolnir spawns the daemon with `spawn_detached`, which drops the `Child`
-    /// without waiting, so a daemon spawned by a long-lived Mjolnir process
-    /// stays a zombie under it and the wait never ends.
+    /// `kill(pid, 0)`. The daemon-specific probe may reap its own child;
+    /// platform process tables do not all expose a reliable Zombie status.
     #[cfg(unix)]
     #[test]
     fn a_process_that_exited_but_was_not_reaped_counts_as_gone() {
@@ -3382,22 +3649,73 @@ mod tests {
             .expect("spawn a process that exits immediately");
         let pid = child.id();
 
-        // Deliberately not reaped: wait for it to become a zombie rather than
-        // calling wait(), which is what the daemon spawner also never does.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline && !process_is_zombie(pid) {
+        let gone = loop {
+            if !daemon_process_is_alive(pid) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
             std::thread::sleep(Duration::from_millis(10));
-        }
+        };
         assert!(
-            process_is_zombie(pid),
-            "the child never became a zombie, so this check proves nothing"
+            gone,
+            "an exited but unreaped process was reported as running"
         );
-        assert!(
-            !process_is_alive(pid),
-            "an exited but unreaped process was reported as still running"
-        );
+        // `daemon_process_is_alive` performed the waitpid reap. This explicit
+        // wait is harmless (ECHILD on Unix) and documents that no Child is
+        // abandoned.
+        let _ = child.wait();
+    }
 
-        child.wait().expect("reap the child");
+    #[cfg(unix)]
+    #[test]
+    fn attachment_liveness_probe_does_not_reap_children() {
+        use std::io::Read;
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new("true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn a process that exits immediately");
+        let pid = child.id();
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("capture child stdout")
+            .read_to_end(&mut output)
+            .expect("observe child exit");
+
+        let _ = process_is_alive(pid);
+        let status = child.wait().expect("attachment probe left child waitable");
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zombie_only_daemon_group_counts_as_gone() {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let mut command = std::process::Command::new("true");
+        command.process_group(0).stdout(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .expect("spawn process-group leader that exits immediately");
+        let pid = libc::pid_t::try_from(child.id()).expect("child PID fits pid_t");
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("capture child stdout")
+            .read_to_end(&mut output)
+            .expect("observe child exit");
+
+        assert!(!owned_daemon_group_is_alive(pid));
+        child.wait().expect("reap process-group leader");
     }
 
     fn test_runtime_state() -> Arc<RuntimeState> {
@@ -3418,6 +3736,35 @@ mod tests {
                 })
             },
         ))
+    }
+
+    #[tokio::test]
+    async fn review_host_notifier_wakes_runtime_revision_subscribers() {
+        let revisions = RuntimeRevisions::new(40);
+        let mut subscriber = revisions.subscribe();
+        // TurnReviewHost's behavior tests prove that view insert/change/remove
+        // invokes this callback. This proves the production callback wired by
+        // RuntimeState wakes the daemon and phone revision feed.
+        let notify_review_publication = revisions.notifier();
+
+        notify_review_publication();
+        tokio::time::timeout(Duration::from_secs(1), subscriber.changed())
+            .await
+            .expect("review publication did not wake runtime subscribers")
+            .expect("runtime revision publisher stopped");
+
+        assert_eq!(*subscriber.borrow_and_update(), 41);
+    }
+
+    #[test]
+    fn late_runtime_revision_publication_cannot_move_cursor_backwards() {
+        let revisions = RuntimeRevisions::new(40);
+        let subscriber = revisions.subscribe();
+
+        revisions.publish_allocated(42);
+        revisions.publish_allocated(41);
+
+        assert_eq!(*subscriber.borrow(), 42);
     }
 
     #[tokio::test]

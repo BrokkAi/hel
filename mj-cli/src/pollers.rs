@@ -1794,7 +1794,7 @@ pub(crate) fn spawn_interrupted_close_recovery(
     cancelled: Arc<AtomicBool>,
     updates: tokio::sync::mpsc::UnboundedSender<LifecycleUpdate>,
     tracker: Option<crate::dashboard::CriticalOperationTracker>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let guard = tracker.map(|tracker| {
         tracker.begin_cancellable(
             format!("recovering session {}", crate::short_id(&session_id)),
@@ -1834,7 +1834,7 @@ pub(crate) fn spawn_interrupted_close_recovery(
             tracing::debug!(%session_id, %error, "interrupted close result dropped after dashboard shutdown");
         }
         drop(guard);
-    });
+    })
 }
 
 pub(crate) fn reserve_recovery_or_cancel(
