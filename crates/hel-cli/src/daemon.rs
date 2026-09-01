@@ -2114,16 +2114,10 @@ async fn stop_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
             sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(metadata.pid)]),
             true,
         );
-        let daemon_executable = system
-            .process(sysinfo::Pid::from_u32(metadata.pid))
-            .and_then(sysinfo::Process::exe)
-            .and_then(|path| fs::canonicalize(path).ok());
-        let current_executable = std::env::current_exe()
-            .ok()
-            .and_then(|path| fs::canonicalize(path).ok());
+        let process = system.process(sysinfo::Pid::from_u32(metadata.pid));
         ensure!(
-            daemon_executable.is_some() && daemon_executable == current_executable,
-            "refusing to signal stale daemon PID {} because it is not this Hel executable",
+            process.is_some_and(looks_like_hel),
+            "refusing to signal stale daemon PID {} because it is not a Hel process",
             metadata.pid
         );
         // SAFETY: the PID comes from owner-only daemon metadata and SIGTERM is
@@ -2151,6 +2145,54 @@ async fn stop_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
         let _ = metadata;
         bail!("stop the incompatible Hel daemon, then retry")
     }
+}
+
+/// Whether a process is a Hel daemon, for the one purpose of deciding it is
+/// safe to signal.
+///
+/// The question this answers is narrow: the PID came from owner-only daemon
+/// metadata, but a daemon that died can have its PID recycled by something
+/// else, and SIGTERM to a stranger is not acceptable. What it must *not* do is
+/// demand that the process be running this exact executable file. A protocol
+/// version differs precisely because the binary was replaced, and on Linux a
+/// replaced binary leaves `/proc/PID/exe` reading `".../hel (deleted)"`, which
+/// canonicalizes to nothing. The stricter check was therefore guaranteed to
+/// fail in the only situation it ever ran in: rebuild, run, and the previous
+/// daemon could never be stopped without killing it by hand.
+///
+/// Matching the program name instead survives the replacement, and a recycled
+/// PID belonging to a shell or an editor still does not match.
+#[cfg(unix)]
+fn looks_like_hel(process: &sysinfo::Process) -> bool {
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    process_is_named_like(
+        process.exe(),
+        &process.name().to_string_lossy(),
+        &current.to_string_lossy(),
+    )
+}
+
+/// The decision behind [`looks_like_hel`], separated from the process it is
+/// asked about so it can be checked without one.
+fn process_is_named_like(exe: Option<&Path>, comm: &str, current_exe: &str) -> bool {
+    let Some(wanted) = Path::new(current_exe).file_name() else {
+        return false;
+    };
+    // The exe link is the better signal where it is readable, with the suffix
+    // Linux adds for an unlinked binary taken off first.
+    if let Some(path) = exe {
+        let shown = path.to_string_lossy();
+        let live = shown.strip_suffix(" (deleted)").unwrap_or(&shown);
+        if Path::new(live).file_name() == Some(wanted) {
+            return true;
+        }
+    }
+    // `comm` survives the binary being replaced and is readable when the exe
+    // link is not, so it is the fallback rather than the first choice: the
+    // kernel truncates it to fifteen bytes.
+    Path::new(comm).file_name() == Some(wanted)
 }
 
 pub(crate) fn maintain_attachment(
@@ -3135,6 +3177,63 @@ fn session_state_label(state: SessionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon whose protocol version differs is by definition running an
+    /// older binary, and rebuilding replaces the file it was started from. On
+    /// Linux that leaves `/proc/PID/exe` reading `".../hel (deleted)"`, which
+    /// canonicalizes to nothing — so the previous check, which demanded the
+    /// canonical paths match, could never pass in the one situation it ran in.
+    /// Every rebuild left the old daemon to be killed by hand.
+    #[test]
+    fn a_rebuilt_daemon_is_still_recognized_as_hel() {
+        let current = "/home/me/hel/target/debug/hel";
+
+        assert!(
+            process_is_named_like(
+                Some(Path::new("/home/me/hel/target/debug/hel (deleted)")),
+                "hel",
+                current,
+            ),
+            "a daemon whose binary was replaced was not recognized"
+        );
+        assert!(
+            process_is_named_like(
+                Some(Path::new("/home/me/hel/target/debug/hel")),
+                "hel",
+                current
+            ),
+            "an unchanged daemon was not recognized"
+        );
+        // Installed elsewhere is still a Hel daemon, and the metadata that
+        // named this PID is what says it is ours.
+        assert!(
+            process_is_named_like(Some(Path::new("/usr/local/bin/hel")), "hel", current),
+            "a daemon from another path was not recognized"
+        );
+        // `comm` is the fallback for a process whose exe link cannot be read.
+        assert!(
+            process_is_named_like(None, "hel", current),
+            "a daemon with an unreadable exe link was not recognized"
+        );
+    }
+
+    /// The check still has a job: a PID belonging to a daemon that died can be
+    /// recycled, and SIGTERM to a stranger is not acceptable.
+    #[test]
+    fn a_recycled_pid_belonging_to_something_else_is_refused() {
+        let current = "/home/me/hel/target/debug/hel";
+        for (exe, comm) in [
+            (Some("/usr/bin/bash"), "bash"),
+            (Some("/usr/bin/helm"), "helm"),
+            (Some("/usr/bin/nvim (deleted)"), "nvim"),
+            (None, "bash"),
+        ] {
+            assert!(
+                !process_is_named_like(exe.map(Path::new), comm, current),
+                "{exe:?}/{comm} was mistaken for a Hel daemon"
+            );
+        }
+    }
 
     fn test_runtime_state() -> Arc<RuntimeState> {
         let remote = spawn_remote_session_manager().unwrap();
