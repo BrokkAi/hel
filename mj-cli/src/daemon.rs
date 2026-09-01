@@ -735,12 +735,15 @@ impl RuntimeState {
         self.workspaces_tx.subscribe()
     }
 
-    fn lifecycle_session_ids(&self) -> BTreeSet<String> {
+    fn worker_poll_exclusion_session_ids(&self) -> BTreeSet<String> {
         self.lifecycle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .cloned()
+            .iter()
+            .filter(|(_, active)| {
+                active.result.borrow().is_none() && active.kind != LifecycleKind::Close
+            })
+            .map(|(session_id, _)| session_id.clone())
             .collect()
     }
 
@@ -2820,11 +2823,14 @@ fn spawn_manager_target_refresher(
                     let _config_mutation = state.config_mutation.lock().await;
                     match tokio::task::spawn_blocking(Controller::load).await {
                         Ok(Ok(controller)) => {
-                            // A lifecycle operation owns worker startup,
-                            // teardown, or relocation. Polling the same target
-                            // concurrently can mistake an incomplete worker
-                            // install for a dead relay and start recovery.
-                            let lifecycle_sessions = state.lifecycle_session_ids();
+                            // Startup, force-stop, and relocation own the worker
+                            // target, so polling them can race an incomplete
+                            // install or teardown. Close is different: it needs
+                            // the manager's existing relay lease to checkpoint,
+                            // and removing that target here makes a fast Stop
+                            // fail with "session is not managed".
+                            let lifecycle_sessions =
+                                state.worker_poll_exclusion_session_ids();
                             let refreshed = dashboard_worker_targets_excluding(
                                 &controller,
                                 &lifecycle_sessions,
@@ -4238,6 +4244,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_keeps_worker_target_available_for_checkpoint_lease() {
+        let state = test_runtime_state();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let result = state
+            .start_or_join_lifecycle("session-1".into(), LifecycleKind::Close, {
+                let release = release.clone();
+                move |_state, _session_id, _cancelled| async move {
+                    release.notified().await;
+                    Ok(DaemonLifecycleResult::Done)
+                }
+            })
+            .unwrap();
+
+        assert!(state.worker_poll_exclusion_session_ids().is_empty());
+
+        release.notify_one();
+        RuntimeState::wait_lifecycle_result(result).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn daemon_lifecycle_reports_balanced_concurrent_stages() {
         struct UnusedExecutor;
 
@@ -4258,6 +4284,10 @@ mod tests {
                 }
             })
             .unwrap();
+        assert_eq!(
+            state.worker_poll_exclusion_session_ids(),
+            BTreeSet::from(["session-1".to_owned()])
+        );
         let executor =
             DaemonStageReportingExecutor::new(UnusedExecutor, state.clone(), "session-1".into());
         executor.stage_started(ProvisionStage::Cloning);
