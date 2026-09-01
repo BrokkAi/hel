@@ -621,22 +621,28 @@ fn render_sessions_grid(
         }
     }
 
-    let focused = dashboard.focus() == Focus::Sessions;
-    let mut title = vec![Span::raw(sessions_pane_title(area.width, false))];
-    let room = usize::from(area.width).saturating_sub(title[0].width() + 4);
-    if room > 8 && !dashboard.greeting.is_empty() {
-        title.push(Span::styled(
-            format!(
-                "{} ",
-                crate::widgets::truncate_text(&dashboard.greeting, room)
-            ),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(focus_border(focused))
-        .title(Line::from(title));
+    // A tiny terminal sheds the pane's title and border so every row goes to
+    // sessions; a taller one keeps them.
+    let block = if crate::combined::minimized_grid_bordered(frame.area().height) {
+        let focused = dashboard.focus() == Focus::Sessions;
+        let mut title = vec![Span::raw(sessions_pane_title(area.width, false))];
+        let room = usize::from(area.width).saturating_sub(title[0].width() + 4);
+        if room > 8 && !dashboard.greeting.is_empty() {
+            title.push(Span::styled(
+                format!(
+                    "{} ",
+                    crate::widgets::truncate_text(&dashboard.greeting, room)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(focus_border(focused))
+            .title(Line::from(title))
+    } else {
+        Block::default().borders(Borders::NONE)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2955,6 +2961,60 @@ mod tests {
             !dashboard.pane_layout().sessions_compact(),
             "the click should restore the panes"
         );
+    }
+
+    /// A tiny terminal (under 30 rows) strips the minimized grid down to bare
+    /// sessions: no title, no border, and the Targets and Quota panes gone
+    /// entirely, so every row it has goes to sessions and the conversation.
+    #[test]
+    fn a_tiny_terminal_grid_drops_its_border_and_the_support_panes() {
+        let mut dashboard = minimized_grid_dashboard(2, 2);
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard.apply_quota(weekly_quota("claude-1", 63));
+
+        let lines = drawn(&mut dashboard, 120, 20);
+
+        // The grid has no border or title, so its very first row is already a
+        // session rather than a pane rule — and the sessions still draw.
+        assert!(
+            lines[0].contains("[idle]"),
+            "the grid should start at row 0 with no border/title: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains('┌') && !lines[0].contains("Sessions"),
+            "the title and border should be dropped: {lines:?}"
+        );
+        // Both support panes are gone entirely.
+        for gone in ["Targets", "Quota"] {
+            assert!(
+                !lines.iter().any(|line| line.contains(gone)),
+                "{gone} should be dropped: {lines:?}"
+            );
+        }
+    }
+
+    /// Mode 2 on a tiny terminal also drops the collapsed Targets and Quota
+    /// rows, but keeps the Sessions pane and its border.
+    #[test]
+    fn a_tiny_mode_two_drops_the_support_panes_but_keeps_sessions() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard.apply_quota(weekly_quota("claude-1", 63));
+        // One turn of the dial reaches mode 2.
+        dashboard.cycle_pane_layout();
+
+        let lines = drawn(&mut dashboard, 120, 20);
+
+        assert!(
+            lines.iter().any(|line| line.contains("Sessions")),
+            "mode 2 keeps the Sessions title: {lines:?}"
+        );
+        for gone in ["Targets", "Quota"] {
+            assert!(
+                !lines.iter().any(|line| line.contains(gone)),
+                "{gone} should be dropped: {lines:?}"
+            );
+        }
     }
 
     #[test]
