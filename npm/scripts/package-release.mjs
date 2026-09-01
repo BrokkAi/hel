@@ -45,16 +45,6 @@ export const PLATFORMS = [
     cpu: ["arm64"],
     libc: ["glibc"],
   },
-  {
-    packageName: "@brokkai/mjolnir-win32-x64",
-    target: "x86_64-pc-windows-msvc",
-    extension: ".zip",
-    binary: "mj.exe",
-    desktop: true,
-    description: "Native Windows x64 bundle for @brokkai/mjolnir",
-    os: ["win32"],
-    cpu: ["x64"],
-  },
 ];
 
 export function versionFromTag(tag) {

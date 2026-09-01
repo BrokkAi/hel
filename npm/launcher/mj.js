@@ -18,9 +18,6 @@ export function platformPackageName(platform = process.platform, arch = process.
   if (platform === "linux" && arch === "arm64") {
     return "@brokkai/mjolnir-linux-arm64-gnu";
   }
-  if (platform === "win32" && arch === "x64") {
-    return "@brokkai/mjolnir-win32-x64";
-  }
   throw new Error(`Mjolnir does not publish an npm bundle for ${platform}/${arch}.`);
 }
 

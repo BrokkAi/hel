@@ -2303,7 +2303,7 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
         cancellation.clone(),
         state.clone(),
     );
-    let exit_when_idle = std::env::var_os("HEL_DAEMON_EXIT_WHEN_IDLE").is_some();
+    let exit_when_idle = hel::hel_config::env_os_compat("DAEMON_EXIT_WHEN_IDLE").is_some();
     let mut idle_tick = tokio::time::interval(Duration::from_millis(100));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut recovery_tick = tokio::time::interval(Duration::from_millis(250));

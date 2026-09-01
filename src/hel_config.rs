@@ -1044,8 +1044,22 @@ fn reject_removed_profile_overrides(contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read a configuration override under its `MJ_` name, falling back to the
+/// historical `HEL_` name for backwards compatibility. New documentation and
+/// messages name only the `MJ_` form.
+pub fn env_os_compat(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("MJ_{name}")).or_else(|| std::env::var_os(format!("HEL_{name}")))
+}
+
+/// String form of [`env_os_compat`] for overrides parsed as UTF-8.
+pub fn env_compat(name: &str) -> Option<String> {
+    std::env::var(format!("MJ_{name}"))
+        .ok()
+        .or_else(|| std::env::var(format!("HEL_{name}")).ok())
+}
+
 pub fn config_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("HEL_CONFIG_DIR") {
+    if let Some(path) = env_os_compat("CONFIG_DIR") {
         return PathBuf::from(path);
     }
     dirs::config_dir()
@@ -1058,7 +1072,7 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn data_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("HEL_DATA_DIR") {
+    if let Some(path) = env_os_compat("DATA_DIR") {
         return PathBuf::from(path);
     }
     dirs::data_local_dir()

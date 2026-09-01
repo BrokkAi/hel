@@ -1230,7 +1230,7 @@ fn worker_binary_check(id: &str, container: &ContainerTemplate) -> DoctorCheck {
             title,
             format!("No usable {triple} worker source: {error:#}"),
             format!(
-                "Build it with `cargo build --release --target {triple}`, install `mj-worker-{triple}` beside `mj`, or set HEL_WORKER_BINARY, HEL_WORKER_DIR, or HEL_WORKER_URL with HEL_WORKER_SHA256."
+                "Build it with `cargo build --release --target {triple}`, install `mj-worker-{triple}` beside `mj`, or set MJ_WORKER_BINARY, MJ_WORKER_DIR, or MJ_WORKER_URL with MJ_WORKER_SHA256."
             ),
         ),
     }

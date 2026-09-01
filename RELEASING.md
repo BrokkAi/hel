@@ -33,12 +33,13 @@ regression both stop the release; tagging a commit whose coverage run was red
 on master fails here rather than shipping.
 
 The gate covers Linux tests and the coverage baseline only. Formatting, Clippy,
-the macOS and Windows test runs, and the dependency-license checks stay pull
-request checks, so a tag still relies on the tagged commit having passed CI on
-master.
+the macOS and Windows compile-and-test runs, and the dependency-license checks
+stay pull request checks, so a tag still relies on the tagged commit having
+passed CI on master.
 
-The builds cover Linux x86-64 and ARM64, Windows x86-64, and a universal macOS
-archive. Every archive contains `mj`, the voice worker, and the two static
+The builds cover Linux x86-64 and ARM64 and a universal macOS archive; the
+controller supports Linux and macOS (Windows stays a CI compile gate only —
+use WSL2). Every archive contains `mj`, the voice worker, and the two static
 musl session workers (`mj-worker-x86_64-unknown-linux-musl` and
 `mj-worker-aarch64-unknown-linux-musl`) that the controller uploads into
 disposable targets. Every archive includes the applicable licenses and notices

@@ -1,32 +1,36 @@
-# Hel
+# Mjolnir
 
-Hel is a terminal control plane for coding agents. It runs many long-lived
+Mjolnir (`mj`) is a terminal control plane for coding agents. It runs many long-lived
 agent sessions — Codex, Claude Code, Kimi Code, Grok Build, and DeepSeek Harness — in disposable
 isolated environments, keeps them working while you are away, and gives you one
 dashboard for their sessions, quotas, and credentials. Agents connect through
 the [Agent Client Protocol](https://agentclientprotocol.com) (ACP).
 
-## Why Hel
+Mjolnir 2.0 is a new product generation: the session control plane replaces
+the 1.x interactive client. The last 1.x release remains available at the
+[v1.17.0 tag](https://github.com/BrokkAi/mjolnir/releases/tag/v1.17.0).
+
+## Why Mjolnir
 
 Running one coding agent in one terminal works. Running six of them across two
 Codex accounts and a Claude account, on three machines, overnight, does not.
-Hel exists for the second case.
+Mjolnir exists for the second case.
 
 - **Sessions survive everything.** Prompts queue durably on the target and keep
   executing in order while your terminal is closed or your laptop is off. Every
   session records a hash-chained event journal. Recovery archives are verified
-  end to end before Hel tears anything down, and crashed or wedged workers are
+  end to end before Mjolnir tears anything down, and crashed or wedged workers are
   detected and restarted automatically.
 - **Full-access mode without fear.** Isolated targets run the agent in its
   unrestricted mode — no permission prompts — because the blast radius is a
   disposable container or instance, not your machine.
 - **Your credentials stay canonical.** Each profile keeps one credential set on
-  your machine. Hel copies a minimal allowlist into each target, reconciles
+  your machine. Mjolnir copies a minimal allowlist into each target, reconciles
   rotating OAuth tokens across every live session within about a minute, and
   structurally excludes credentials from event streams and recovery archives.
 - **One view of capacity.** Sessions, per-profile quota and usage, and host
-  capacity in one dashboard — and on your phone through the persistent Hel daemon.
-- **Agents can operate it.** `hel doctor --json` and `hel setup instructions`
+  capacity in one dashboard — and on your phone through the persistent Mjolnir daemon.
+- **Agents can operate it.** `mj doctor --json` and `mj setup instructions`
   are designed so your coding agent can converge a host to session-ready by
   looping on machine-readable checks.
 
@@ -47,12 +51,12 @@ Hel exists for the second case.
 
 ## Non-goals
 
-- **Hel is not an agent.** It does not write code, plan, or pick models. It
+- **Mjolnir is not an agent.** It does not write code, plan, or pick models. It
   manages harnesses that do.
-- **No privileged host setup.** Hel will not install container runtimes, edit
+- **No privileged host setup.** Mjolnir will not install container runtimes, edit
   `subuid`/`subgid`, create AWS launch templates or security groups, or make
   SSH hosts reachable. You (or your agent, with your credentials) do that;
-  `hel doctor` verifies it and prescribes the exact remediation.
+  `mj doctor` verifies it and prescribes the exact remediation.
 - **No wholesale environment transfer.** SSH and GPG keys, shell dotfiles,
   editor configuration, package-registry credentials, cloud configuration, and
   toolchain state are never copied into targets.
@@ -91,36 +95,40 @@ Issues and pull requests for new harnesses are welcome.
 | Podman over SSH | `ssh-podman` | a Linux host you name | unrestricted |
 | EC2 instance | `aws-ec2` | your AWS account | unrestricted |
 
-The controller (the `hel` binary you run) supports Linux and macOS. Windows is
+The controller (the `mj` binary you run) supports Linux and macOS. Windows is
 not supported; use WSL2.
 
 ## Install
 
 ```console
-curl -fsSL https://raw.githubusercontent.com/BrokkAi/hel/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | sh
 ```
 
 This downloads a verified release into `~/.local/bin` — no Rust toolchain
-needed. Linux releases are static musl binaries. Run `hel doctor` next. The
-installer also supports `--prefix` and `--version`; see `--help`.
+needed. Each release ships `mj`, the voice worker, and the static musl session
+workers that Mjolnir uploads into disposable targets. Run `mj doctor` next.
+The installer also supports `--prefix` and `--version`; see `--help`.
 
-Building from source works too:
+npm works too:
+
+```console
+npm install -g @brokkai/mjolnir
+```
+
+As does building from source:
 
 ```console
 cargo build --release
-./target/x86_64-unknown-linux-musl/release/hel
+./target/release/mj
 ```
-
-On Apple silicon, pass `--target aarch64-apple-darwin` and run the binary from
-that target's release directory.
 
 For container targets, pull the published multi-arch agent image (public, no
 authentication):
 
 ```console
-podman pull ghcr.io/brokkai/hel/agent-dev:latest
+podman pull ghcr.io/brokkai/mjolnir/agent-dev:latest
 # or
-docker pull ghcr.io/brokkai/hel/agent-dev:latest
+docker pull ghcr.io/brokkai/mjolnir/agent-dev:latest
 ```
 
 It includes Rust, cargo-nextest, Node, OpenJDK 25, Git, GitHub CLI, the Codex
@@ -131,29 +139,29 @@ to build your own.
 
 ## Quickstart
 
-1. Run `hel`. The first run creates a named workspace and opens a plain-terminal setup dialog: it finds your
+1. Run `mj`. The first run creates a named workspace and opens a plain-terminal setup dialog: it finds your
    local harness homes, checks that credentials look present, detects the
    current GitHub repository, configures each usable local container runtime
    as its own target, and writes `config.toml` after you confirm.
-2. Run `hel doctor` (or `hel doctor --json`) and fix what it reports, until it
+2. Run `mj doctor` (or `mj doctor --json`) and fix what it reports, until it
    is clean. Log in to any profile that needs it with
-   `hel login --profile <id>`.
+   `mj login --profile <id>`.
 3. Press `Tab` to focus Sessions, then `n` to create a session: pick a
    profile, a repository bundle, and a target. Focus returns to the prompt;
    send your first message.
 4. Detach whenever you like (`Ctrl+Q`). The session keeps running and your
-   queued prompts keep executing. Reattach by running `hel` again, or open the
-   daemon-owned web viewer shown by `hel daemon status`.
+   queued prompts keep executing. Reattach by running `mj` again, or open the
+   daemon-owned web viewer shown by `mj daemon status`.
 
 ## The terminal surface
 
-Hel's TUI is one screen. From top to bottom: **Sessions**, the **transcript**
+Mjolnir's TUI is one screen. From top to bottom: **Sessions**, the **transcript**
 of the conversation you are in, the **Prompt** composer, **Targets**, **Quota**,
 and a footer that names the keys for whatever has focus. Nothing is behind a
 navigation step, so you can read an agent's output while seeing what your other
 agents are doing and how loaded your machines are.
 
-Hel opens on the session whose agent spoke most recently, with the cursor in
+Mjolnir opens on the session whose agent spoke most recently, with the cursor in
 Prompt.
 
 `Tab` moves the keyboard down the layout — Sessions, Prompt, Targets, Quota —
@@ -196,7 +204,8 @@ output is saved in the transcript and included once as hidden context on the
 next prompt submitted after the command finishes. Press Escape in the TUI, or
 use the shell's Cancel button in the viewer, to stop it.
 
-Configuration lives at `~/.config/hel/config.toml` (the platform-equivalent
+Configuration lives at `~/.config/hel/config.toml` — the directory name is
+kept for backwards compatibility with existing state (the platform-equivalent
 directory elsewhere). The first-run dialog writes a working single-target
 setup; everything beyond that is edited in TOML. A minimal example:
 
@@ -221,7 +230,7 @@ destination = "myapp"
 
 [targets.podman]
 kind = "local-podman"
-image = "ghcr.io/brokkai/hel/agent-dev:latest"
+image = "ghcr.io/brokkai/mjolnir/agent-dev:latest"
 # Optional: auto (default), always, newer, missing, or never. Auto refreshes
 # remote latest tags, keeps versioned tags cached, and pins digest references.
 # pull_policy = "auto"
@@ -229,20 +238,20 @@ image = "ghcr.io/brokkai/hel/agent-dev:latest"
 # Docker uses the same fields:
 # [targets.docker]
 # kind = "local-docker"
-# image = "ghcr.io/brokkai/hel/agent-dev:latest"
+# image = "ghcr.io/brokkai/mjolnir/agent-dev:latest"
 ```
 
-`version` is the config schema version. A file written by a *newer* Hel still
+`version` is the config schema version. A file written by a *newer* Mjolnir still
 loads: the settings this build understands keep working, and the config becomes
 read-only, so the older build refuses to save and never downgrades the file.
-`hel doctor` reports that state. Update Hel, or change settings with the newer
+`mj doctor` reports that state. Update Mjolnir, or change settings with the newer
 build, to make it writable again.
 
 Profiles point at harness home directories on your machine — run as many
 profiles per harness as you have accounts. Bundles describe the repositories a
 session checks out (multi-repository bundles give agents a virtual monorepo).
-Hel-owned worker and bridge commands use non-login shells. On raw local, SSH,
-and EC2 targets, Hel makes one bounded login-shell probe when each worker starts
+Mjolnir-owned worker and bridge commands use non-login shells. On raw local, SSH,
+and EC2 targets, Mjolnir makes one bounded login-shell probe when each worker starts
 and carries only its discovered `PATH` into the non-login runtime; an explicit
 `environment.PATH` in the profile takes precedence. Later profile changes take
 effect after the worker restarts or the session resumes. Agent-requested shell
@@ -258,16 +267,16 @@ Target prerequisites and full option lists are covered in
 ### Web viewer and Tailscale
 
 The daemon starts the authenticated web viewer by default. Run
-`hel daemon status` for its URL and six-digit login code. Without Tailscale it
+`mj daemon status` for its URL and six-digit login code. Without Tailscale it
 serves HTTP only on `127.0.0.1:3765`.
 
-When the local Tailscale node has MagicDNS and HTTPS Certificates enabled, Hel
+When the local Tailscale node has MagicDNS and HTTPS Certificates enabled, Mjolnir
 automatically requests the node's trusted `ts.net` certificate and serves HTTPS
 on all interfaces at the same port. Certificate issuance runs in the background
 and may take about 30 seconds the first time; certificates renew daily without a
 daemon restart. If HTTPS Certificates are unavailable, the status output keeps
 the viewer loopback-only and explains how to enable them. After changing the
-tailnet setting, run `hel daemon restart`.
+tailnet setting, run `mj daemon restart`.
 
 The historical configuration section remains `[phone]`. Explicit certificate
 configuration takes precedence over automatic Tailscale detection:
@@ -291,16 +300,16 @@ tailscale_detect = true
   configured approvals or `permissions = "yolo"` for unconstrained execution.
   A local worktree (`local-bare`) also preserves the profile and harness's
   configured approval behavior. Codex, Claude Code, and Grok Build expose
-  guardian modes; Kimi Code and DeepSeek Harness do not, so Hel shows a
+  guardian modes; Kimi Code and DeepSeek Harness do not, so Mjolnir shows a
   prominent warning when guardian permissions cannot be enforced on a target.
 - Harness homes are copied by allowlist, not wholesale. For Claude Code, for
   example: credentials, settings, `CLAUDE.md`, `skills/`, and `plugins/` — no
-  transcripts, history, or caches. Hel sets `CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
+  transcripts, history, or caches. Mjolnir sets `CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
   `KIMI_CODE_HOME`, or `GROK_HOME` in the target. Skill edits on your machine
   propagate to live sessions within about a minute.
 - Credentials travel only between the controller and a session's worker. They
   are never written to the event journal or recovery archives. When the
-  controller's `gh` is authenticated, Hel continuously pushes its active
+  controller's `gh` is authenticated, Mjolnir continuously pushes its active
   GitHub token to every live non-local session, including raw SSH targets.
   The token is not stored in archives.
 - A repository configured with `local` is served to workers through a
@@ -317,21 +326,21 @@ tailscale_detect = true
 
 ## Durability
 
-Hel saves a recovery copy automatically after completed turns when the session
-is idle (at most every ten minutes), and `hel checkpoint --session <id>`
+Mjolnir saves a recovery copy automatically after completed turns when the session
+is idle (at most every ten minutes), and `mj checkpoint --session <id>`
 forces one. Recovery archives are verified end to end; a normal Stop writes
 and verifies the archive before any teardown, and refuses teardown if
 verification fails. Explicit force-destroy is the data-loss escape hatch.
 
 A stopped session resumes by provisioning a fresh target from its archive,
 with its pending prompt queue intact (resume asks whether to keep or discard
-it). A session recorded under one harness can be resumed under another; Hel
+it). A session recorded under one harness can be resumed under another; Mjolnir
 condenses the transcript into a size-bounded handoff for the new harness.
 
-If Hel or its host crashes, workers and their queued prompts keep running.
-`hel recover scan` finds managed containers and instances that are no longer
-tracked; `hel recover adopt` reconnects one as a tracked session.
+If Mjolnir or its host crashes, workers and their queued prompts keep running.
+`mj recover scan` finds managed containers and instances that are no longer
+tracked; `mj recover adopt` reconnects one as a tracked session.
 
 ## License
 
-Hel is licensed under `GPL-3.0-only`.
+Mjolnir is licensed under `GPL-3.0-only`.

@@ -73,11 +73,11 @@ mod worker {
     }
 
     pub(super) fn voice_worker_executable() -> Result<PathBuf> {
-        if let Some(path) = std::env::var_os("HEL_VOICE_WORKER") {
+        if let Some(path) = crate::hel_config::env_os_compat("VOICE_WORKER") {
             let path = PathBuf::from(path);
             anyhow::ensure!(
                 path.is_file(),
-                "HEL_VOICE_WORKER does not exist: {}",
+                "MJ_VOICE_WORKER does not exist: {}",
                 path.display()
             );
             return Ok(path);
@@ -91,7 +91,7 @@ mod worker {
         });
         anyhow::ensure!(
             worker.is_file(),
-            "voice dictation helper is missing: {}; install it beside mj or set HEL_VOICE_WORKER",
+            "voice dictation helper is missing: {}; install it beside mj or set MJ_VOICE_WORKER",
             worker.display()
         );
         Ok(worker)

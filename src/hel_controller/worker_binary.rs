@@ -596,23 +596,23 @@ fn packaged_worker_binary_path(directory: &Path, triple: &str) -> PathBuf {
 /// container or making a network request.
 pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAvailability> {
     let triple = format!("{arch}-unknown-linux-musl");
-    if let Some(path) = std::env::var_os("HEL_WORKER_BINARY").map(PathBuf::from) {
+    if let Some(path) = crate::hel_config::env_os_compat("WORKER_BINARY").map(PathBuf::from) {
         if !path.is_file() {
-            bail!("HEL_WORKER_BINARY is not a file: {}", path.display());
+            bail!("MJ_WORKER_BINARY is not a file: {}", path.display());
         }
         return Ok(WorkerBinaryAvailability::Local {
             path,
-            source: "HEL_WORKER_BINARY".into(),
+            source: "MJ_WORKER_BINARY".into(),
         });
     }
-    let current = std::env::current_exe().context("resolve Hel controller binary")?;
+    let current = std::env::current_exe().context("resolve Mjolnir controller binary")?;
     let mut candidates = Vec::new();
-    if let Some(directory) = std::env::var_os("HEL_WORKER_DIR").map(PathBuf::from) {
+    if let Some(directory) = crate::hel_config::env_os_compat("WORKER_DIR").map(PathBuf::from) {
         candidates.push((
             packaged_worker_binary_path(&directory, &triple),
-            "HEL_WORKER_DIR",
+            "MJ_WORKER_DIR",
         ));
-        candidates.push((directory.join(&triple).join("hel"), "HEL_WORKER_DIR"));
+        candidates.push((directory.join(&triple).join("hel"), "MJ_WORKER_DIR"));
     }
     if let Some((path, source)) = candidates.into_iter().find(|(path, _)| path.is_file()) {
         return Ok(WorkerBinaryAvailability::Local {
@@ -664,9 +664,9 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
             source: "native Linux Hel binary".into(),
         });
     }
-    if let Ok(template) = std::env::var("HEL_WORKER_URL") {
-        let expected = std::env::var("HEL_WORKER_SHA256")
-            .context("HEL_WORKER_URL requires HEL_WORKER_SHA256")?;
+    if let Some(template) = crate::hel_config::env_compat("WORKER_URL") {
+        let expected = crate::hel_config::env_compat("WORKER_SHA256")
+            .context("MJ_WORKER_URL requires MJ_WORKER_SHA256")?;
         validate_worker_sha256(&expected)?;
         return Ok(WorkerBinaryAvailability::Remote {
             url: template.replace("{target}", &triple),
@@ -675,7 +675,7 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
         });
     }
     bail!(
-        "no Linux worker for {triple}; install mj-worker-{triple} beside mj, set HEL_WORKER_DIR/HEL_WORKER_BINARY, or configure HEL_WORKER_URL and HEL_WORKER_SHA256"
+        "no Linux worker for {triple}; install mj-worker-{triple} beside mj, set MJ_WORKER_DIR/MJ_WORKER_BINARY, or configure MJ_WORKER_URL and MJ_WORKER_SHA256"
     )
 }
 
@@ -942,7 +942,7 @@ fn ensure_node_22_script() -> String {
     )
 }
 
-const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel disposable environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories under `/workspace`, including committed work, staged and unstaged changes, and untracked files. Hel then removes the container.\n\nEverything outside `/workspace`, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n";
+const HEL_CONTAINER_ENVIRONMENT: &str = "## Mjolnir disposable environment\n\nThis session runs in a disposable Mjolnir container. When the session closes, Mjolnir checkpoints everything in project workspace directories under `/workspace`, including committed work, staged and unstaged changes, and untracked files. Mjolnir then removes the container.\n\nEverything outside `/workspace`, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n";
 
 pub(super) fn stage_profile(
     profile: &crate::hel_config::HarnessProfile,

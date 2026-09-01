@@ -231,58 +231,6 @@ jobs:
             brokk-mjolnir-*.tar.gz.sha256
           if-no-files-found: error
 
-  build-windows:
-    name: Build x86_64-pc-windows-msvc
-    needs: [build-worker-x64, build-worker-arm64]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Build release binary
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
-
-      - name: Build voice worker
-        run: cargo build --release --locked -p brokk-mj-voice-worker --target x86_64-pc-windows-msvc
-
-      - name: Download session workers
-        uses: actions/download-artifact@v8
-        with:
-          pattern: mj-worker-*
-          path: workers
-
-      - name: Package archive
-        shell: pwsh
-        run: |
-          $name = "brokk-mjolnir-${env:GITHUB_REF_NAME}-x86_64-pc-windows-msvc"
-          New-Item -ItemType Directory -Path $name | Out-Null
-          Copy-Item "target\x86_64-pc-windows-msvc\release\mj.exe" -Destination $name
-          Copy-Item "target\x86_64-pc-windows-msvc\release\mj-voice-worker.exe" -Destination $name
-          Copy-Item "workers\mj-worker-x86_64-unknown-linux-musl\mj" -Destination "$name\mj-worker-x86_64-unknown-linux-musl"
-          Copy-Item "workers\mj-worker-aarch64-unknown-linux-musl\mj" -Destination "$name\mj-worker-aarch64-unknown-linux-musl"
-          Copy-Item "README.md" -Destination $name
-          Copy-Item "LICENSE" -Destination $name
-          New-Item -ItemType Directory -Path "$name\licenses" | Out-Null
-          $legalFiles = @("licenses\SOURCE.md", "licenses\OFL-1.1.md", "licenses\THIRD_PARTY_LICENSES.html", "licenses\SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt")
-          Copy-Item $legalFiles -Destination "$name\licenses"
-          Copy-Item "licenses\native" -Destination "$name\licenses" -Recurse
-          Compress-Archive -Path $name -DestinationPath "$name.zip"
-          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
-          "$hash  $name.zip" | Set-Content -Path "$name.zip.sha256" -NoNewline
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: x86_64-pc-windows-msvc
-          path: |
-            brokk-mjolnir-*.zip
-            brokk-mjolnir-*.zip.sha256
-          if-no-files-found: error
-
   build-macos:
     name: Build macOS universal
     needs: [build-worker-x64, build-worker-arm64]
@@ -354,7 +302,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build-linux, build-linux-arm64, build-windows, build-macos]
+    needs: [build-linux, build-linux-arm64, build-macos]
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -375,8 +323,6 @@ jobs:
           files: |
             artifacts/brokk-mjolnir-*.tar.gz
             artifacts/brokk-mjolnir-*.tar.gz.sha256
-            artifacts/brokk-mjolnir-*.zip
-            artifacts/brokk-mjolnir-*.zip.sha256
 
       # Events created with GITHUB_TOKEN do not start workflows, while crates.io
       # rejects trusted-publishing requests from the workflow_run event. An

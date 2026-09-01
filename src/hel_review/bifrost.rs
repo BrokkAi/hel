@@ -28,13 +28,15 @@ pub const ANALYZE_DIFF_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The binary baked into the container image. An operator or a test can point
 /// this elsewhere, which is also how the worker's own tests drive a fake.
+/// `MJ_BIFROST_BIN` is the documented name; the `HEL_` form stays readable
+/// for backwards compatibility.
 pub const BIFROST_BIN_ENV: &str = "HEL_BIFROST_BIN";
 const DEFAULT_BIFROST_BIN: &str = "bifrost";
 
 /// What a review runs Bifrost as.
 #[must_use]
 pub fn bifrost_binary() -> PathBuf {
-    std::env::var_os(BIFROST_BIN_ENV)
+    crate::hel_config::env_os_compat("BIFROST_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_BIFROST_BIN))
 }
