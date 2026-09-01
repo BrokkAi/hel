@@ -19,7 +19,8 @@ use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_addi
 use hel::hel_text_input::TextInput;
 
 use crate::widgets::{
-    action_buttons, centered_modal, focused_buttons, popup_height, truncate_text,
+    action_buttons, centered_modal, centered_modal_fixed, focused_buttons, modal_area,
+    popup_height, truncate_text,
 };
 use crate::wizards::read_only_marker;
 use crate::{
@@ -912,6 +913,28 @@ pub(crate) fn render_web_dialog(
     dialog: &WebDialog,
     surfaces: &mut FrameSurfaces,
 ) {
+    const FOOTER: &str = "Enter or Esc closes";
+    // Text that names the natural body width. The box hugs the QR, and longer
+    // URLs wrap beneath it rather than stretching the dialog across the screen.
+    const MIN_INNER_WIDTH: usize = FOOTER.len();
+
+    // The QR is the widest single element, so it decides the box width and only
+    // shows when the terminal can hold it plus a border and the footer rows.
+    let qr_lines: Vec<&str> = dialog
+        .qr
+        .as_deref()
+        .map(|qr| qr.lines().collect())
+        .unwrap_or_default();
+    let qr_width = qr_lines.iter().map(|line| line.chars().count()).max();
+    // Size against the region a modal may occupy so the QR fit and the box width
+    // both respect the screen-edge margin that centering will enforce.
+    let inner_area = modal_area(area);
+    let max_inner = usize::from(inner_area.width).saturating_sub(2);
+    let max_qr_height = usize::from(inner_area.height).saturating_sub(6);
+    let show_qr =
+        matches!(qr_width, Some(width) if width <= max_inner) && qr_lines.len() <= max_qr_height;
+
+    let mut inner_width = MIN_INNER_WIDTH;
     let mut lines = Vec::new();
     if dialog.loading {
         lines.push(Line::styled(
@@ -919,36 +942,43 @@ pub(crate) fn render_web_dialog(
             Style::default().fg(Color::Yellow),
         ));
     } else if let Some(message) = &dialog.message {
+        inner_width = inner_width.max(message.chars().count());
         lines.push(Line::styled(
             message.clone(),
             Style::default().fg(Color::Yellow),
         ));
     } else {
-        if let Some(qr) = &dialog.qr {
-            let qr_width = qr
-                .lines()
-                .map(str::chars)
-                .map(Iterator::count)
-                .max()
-                .unwrap_or(0);
-            let qr_height = qr.lines().count();
-            if usize::from(area.width) >= qr_width + 6 && usize::from(area.height) >= qr_height + 10
-            {
-                lines.extend(qr.lines().map(|line| Line::raw(line.to_owned())));
-                lines.push(Line::raw(""));
-            } else {
-                lines.push(Line::styled(
+        if show_qr {
+            inner_width = inner_width.max(qr_width.unwrap_or(0));
+            lines.extend(
+                qr_lines
+                    .iter()
+                    .map(|line| Line::raw((*line).to_owned()).centered()),
+            );
+            lines.push(Line::raw(""));
+        } else if qr_width.is_some() {
+            lines.push(
+                Line::styled(
                     "Terminal is too small for a scannable QR code.",
                     Style::default().fg(Color::Yellow),
-                ));
-                lines.push(Line::raw(""));
-            }
+                )
+                .centered(),
+            );
+            lines.push(Line::raw(""));
         }
         if let Some(url) = &dialog.viewer_url {
-            lines.push(Line::raw(format!("Web: {url}")));
+            // The QR encodes this URL; the text is the fallback for hand entry,
+            // so it wraps within the box instead of widening it.
+            lines.push(Line::from(vec![
+                Span::styled("Web: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(url.clone(), Style::default().fg(Color::Cyan)),
+            ]));
         }
         if let Some(code) = &dialog.viewer_code {
-            lines.push(Line::raw(format!("Viewer code: {code}")));
+            lines.push(Line::from(vec![
+                Span::styled("Viewer code: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(code.clone(), Style::default().fg(Color::Cyan)),
+            ]));
         }
         if let Some(reason) = &dialog.fallback_reason {
             lines.push(Line::styled(
@@ -958,26 +988,17 @@ pub(crate) fn render_web_dialog(
         }
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "Enter or Esc closes",
-        Style::default().fg(Color::DarkGray),
-    ));
+    lines.push(Line::styled(FOOTER, Style::default().fg(Color::DarkGray)).centered());
+
+    let inner_width = inner_width.min(max_inner).max(1);
+    let box_width = u16::try_from(inner_width + 2).unwrap_or(u16::MAX);
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" Web viewer "))
         .wrap(Wrap { trim: false });
-    let width = dialog
-        .qr
-        .as_deref()
-        .and_then(|qr| qr.lines().map(str::chars).map(Iterator::count).max())
-        .and_then(|width| u16::try_from(width + 4).ok())
-        .unwrap_or(72)
-        .max(52);
-    let popup = centered_modal(
-        surfaces,
-        width,
-        popup_height(&paragraph, width, 10, area),
-        area,
-    );
+    let wrapped =
+        u16::try_from(paragraph.line_count(box_width.saturating_sub(2))).unwrap_or(u16::MAX);
+    let box_height = wrapped.saturating_add(2).min(inner_area.height);
+    let popup = centered_modal_fixed(surfaces, box_width, box_height, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
 }
@@ -2084,6 +2105,53 @@ mod tests {
         assert!(lines[1].chars().all(|character| character == ' '));
         assert!(lines.iter().all(|line| line.starts_with("    ")));
         assert!(lines.iter().all(|line| line.ends_with("    ")));
+    }
+
+    fn draw_web_dialog(dialog: &WebDialog, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let mut surfaces = FrameSurfaces::new();
+                render_web_dialog(frame, frame.area(), dialog, &mut surfaces);
+            })
+            .expect("draw web dialog");
+        buffer_lines(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn web_dialog_wraps_a_long_url_without_truncating_it() {
+        // A URL wider than the QR must wrap within the box, not get cut off.
+        let url = "https://a-very-long-machine-name.some-tailnet.ts.net:37650/viewer";
+        let dialog = WebDialog {
+            loading: false,
+            viewer_url: Some(url.to_owned()),
+            viewer_code: Some("022160".to_owned()),
+            fallback_reason: None,
+            message: None,
+            qr: Some(render_qr(url).unwrap()),
+        };
+
+        let rendered = draw_web_dialog(&dialog, 60, 40);
+
+        // Every box row fits the terminal, so the dialog never overflows.
+        assert!(rendered.iter().all(|line| line.chars().count() <= 60));
+        // The URL survives in full once the border padding is stripped away.
+        // Drop whitespace and the box border so the URL's wrapped halves sit
+        // adjacent, then confirm none of its characters were lost.
+        let flat = rendered
+            .join("")
+            .chars()
+            .filter(|character| !character.is_whitespace() && *character != '│')
+            .collect::<String>();
+        assert!(
+            flat.contains(url),
+            "the full URL should appear (wrapped) in the dialog"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Viewer code: 022160"))
+        );
     }
 
     fn dashboard_with_container_session() -> DashboardState {
