@@ -503,8 +503,8 @@ pub(crate) async fn run_dashboard_for_workspace(
     if !std::io::IsTerminal::is_terminal(&std::io::stdin())
         || !std::io::IsTerminal::is_terminal(&std::io::stdout())
     {
-        println!("Welcome to Hel");
-        println!("Run `hel doctor` for non-interactive validation.");
+        println!("Welcome to Mjolnir");
+        println!("Run `mj doctor` for non-interactive validation.");
         return Ok(DashboardExit::Normal);
     }
 
@@ -1958,7 +1958,7 @@ impl DashboardContext {
                         Ok(DashboardImportTaskResult::Cancelled) => {
                             self.dashboard.finish_import();
                             self.dashboard
-                                .set_notice("Import cancelled; no Hel files were changed.");
+                                .set_notice("Import cancelled; no Mjolnir files were changed.");
                         }
                         Err(error) => {
                             self.dashboard.finish_import();

@@ -257,14 +257,14 @@ pub(super) fn preflight_target(
             .map(|_| ())
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "local Podman preflight failed; run `hel doctor` for actionable prerequisites: {error:#}"
+                    "local Podman preflight failed; run `mj doctor` for actionable prerequisites: {error:#}"
                 )
             }),
         TargetTemplate::LocalDocker { .. } => hel_targets::verify_local_docker(executor)
             .map(|_| ())
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "local Docker preflight failed; run `hel doctor` for actionable prerequisites: {error:#}"
+                    "local Docker preflight failed; run `mj doctor` for actionable prerequisites: {error:#}"
                 )
             }),
         TargetTemplate::SshPodman { ssh, .. } => {
@@ -277,7 +277,7 @@ pub(super) fn preflight_target(
                 })
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "remote Podman preflight failed for {}; run `hel doctor` for actionable prerequisites: {error:#}",
+                        "remote Podman preflight failed for {}; run `mj doctor` for actionable prerequisites: {error:#}",
                         ssh.destination
                     )
                 })
@@ -288,12 +288,12 @@ pub(super) fn preflight_target(
                 .stage(ProvisionStage::Provisioning);
             let output = executor.execute(&command).map_err(|error| {
                 anyhow::anyhow!(
-                    "Apple container preflight failed; run `hel doctor` for actionable prerequisites: {error}"
+                    "Apple container preflight failed; run `mj doctor` for actionable prerequisites: {error}"
                 )
             })?;
             if output.status != 0 {
                 bail!(
-                    "Apple container preflight failed; run `hel doctor` for actionable prerequisites: container system status exited {}: {}",
+                    "Apple container preflight failed; run `mj doctor` for actionable prerequisites: container system status exited {}: {}",
                     output.status,
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
@@ -1395,7 +1395,7 @@ mod tests {
         let error = preflight_target(&template, &executor)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("hel doctor"));
+        assert!(error.contains("mj doctor"));
         assert!(error.contains("Podman 4.0.0"));
     }
     #[test]
@@ -1428,7 +1428,7 @@ mod tests {
         let error = preflight_target(&template, &executor)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("hel doctor"));
+        assert!(error.contains("mj doctor"));
         assert!(error.contains("dev@example.test"));
         assert!(error.contains("Podman 4.0.0"));
     }
@@ -1507,7 +1507,7 @@ mod tests {
         let error = preflight_target(&template, &executor)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("hel doctor"));
+        assert!(error.contains("mj doctor"));
         assert!(error.contains("daemon is not running"));
     }
 }

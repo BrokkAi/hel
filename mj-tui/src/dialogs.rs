@@ -350,7 +350,7 @@ pub(crate) fn render_import_bundle_confirmation(
     let mut lines = Vec::new();
     if !confirmation.dirty_git_roots.is_empty() {
         lines.push(Line::raw(
-            "These Git roots have local changes; Hel will archive tracked changes:",
+            "These Git roots have local changes; Mjolnir will archive tracked changes:",
         ));
         lines.extend(
             confirmation
@@ -1133,7 +1133,7 @@ fn confirmation_body(confirmation: &Confirmation) -> (&'static str, Vec<Line<'st
             let mut lines = vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Hel will verify a recovery copy before destroying the target."),
+                Line::raw("Mjolnir will verify a recovery copy before destroying the target."),
             ];
             if *reviewer_conversation {
                 // The reviewer's native session lives on the target, and a v1
@@ -1155,8 +1155,8 @@ fn confirmation_body(confirmation: &Confirmation) -> (&'static str, Vec<Line<'st
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Hel will permanently destroy the recovery archive and session record."),
-                Line::raw("Any Hel-managed worktree and generated branch will also be removed."),
+                Line::raw("Mjolnir will permanently destroy the recovery archive and session record."),
+                Line::raw("Any Mjolnir-managed worktree and generated branch will also be removed."),
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (

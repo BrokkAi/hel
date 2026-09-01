@@ -641,7 +641,7 @@ impl DashboardState {
                 };
                 let Some(session_id) = row.session_id().map(ToOwned::to_owned) else {
                     self.notices.set(
-                        "Hel never destroys a harness's own session. Press a to archive this row.",
+                        "Mjolnir never destroys a harness's own session. Press a to archive this row.",
                     );
                     return DashboardAction::None;
                 };
@@ -680,7 +680,7 @@ impl DashboardState {
         };
         if row.natively_archived {
             self.notices
-                .set("This session is archived in its own harness; Hel never writes that back.");
+                .set("This session is archived in its own harness; Mjolnir never writes that back.");
             return DashboardAction::None;
         }
         let archived = !row.archived;
@@ -818,7 +818,7 @@ pub(crate) fn render_resume_dialog(
         .split(inner);
 
     frame.render_widget(
-        Tabs::new(["Hel", "Import"])
+        Tabs::new(["Mjolnir", "Import"])
             .select(dialog.tab.index())
             .divider(" │ ")
             .highlight_style(
@@ -863,7 +863,7 @@ pub(crate) fn render_resume_dialog(
         .borders(Borders::ALL)
         .border_type(focus_border(sessions_focused || search_focused))
         .title(match dialog.tab {
-            ResumeTab::Hel => " Hel sessions · newest first ",
+            ResumeTab::Hel => " Mjolnir sessions · newest first ",
             ResumeTab::Import => " Importable sessions · newest first ",
         });
     let list_area = block.inner(rows[2]);
@@ -889,7 +889,7 @@ pub(crate) fn render_resume_dialog(
         vec![ListItem::new(
             match (dialog.tab, dialog.is_scanning(), dialog.search.is_empty()) {
                 (ResumeTab::Import, true, _) => "Scanning native sessions…",
-                (ResumeTab::Hel, _, true) => "No stopped Hel sessions",
+                (ResumeTab::Hel, _, true) => "No stopped Mjolnir sessions",
                 (ResumeTab::Import, _, true) => "No importable sessions",
                 _ => "No matching sessions",
             },
@@ -2064,7 +2064,7 @@ mod tests {
             .expect("draw the resume dialog");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         for hint in [
-            "Hel",
+            "Mjolnir",
             "Import",
             "a archives",
             "d destroys",

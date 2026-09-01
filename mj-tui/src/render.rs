@@ -161,7 +161,7 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                "Hel needs a little fuel.",
+                "Mjolnir needs a little fuel.",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::raw(""),
@@ -2404,7 +2404,7 @@ mod tests {
             "{:?}",
             line(buffer.area.y)
         );
-        assert!(line(buffer.area.y).contains("Welcome to Hel"));
+        assert!(line(buffer.area.y).contains("Welcome to Mjolnir"));
         assert!(!line(buffer.area.y).contains("ACP sessions"));
         // The footer is one row: a notice replaces the hints while one is
         // showing, so the row costs one line whichever surface drew it.
@@ -3641,8 +3641,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Welcome to Hel"));
-        assert!(rendered.contains("Hel needs a little fuel."));
+        assert!(rendered.contains("Welcome to Mjolnir"));
+        assert!(rendered.contains("Mjolnir needs a little fuel."));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('e'))),
             DashboardAction::OpenConfig

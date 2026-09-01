@@ -562,7 +562,7 @@ fn stream_command_with_stdin(
         let input_writer = scope.spawn(move || -> Result<()> {
             // Owning `stdin` here is what closes the pipe's write end once the
             // transfer finishes. A child that reads to EOF, such as
-            // `hel worker export-checkpoint --spec -`, never exits while any
+            // `mj worker export-checkpoint --spec -`, never exits while any
             // copy of the write end is still open.
             let mut stdin = stdin;
             let mut buffer = [0_u8; 64 * 1024];
@@ -890,7 +890,7 @@ impl PodmanHost<'_> {
 /// Verify the fast local preconditions for Hel's rootless Podman target.
 ///
 /// This intentionally never pulls an image. Image availability is verified by
-/// `hel setup`'s smoke test and by the subsequent target creation command.
+/// `mj setup`'s smoke test and by the subsequent target creation command.
 pub fn verify_local_podman(executor: &impl CommandExecutor) -> Result<PodmanPreflight> {
     verify_podman(PodmanHost::Local, executor)
 }

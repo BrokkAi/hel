@@ -688,8 +688,8 @@ pub fn startup_prompt_context(
 ) -> Result<String> {
     let index = store.startup_index()?.unwrap_or_default();
     let mut context = vec![
-        "<hel-project-memory>".to_owned(),
-        "This is persistent background context for the current Hel project, not a current user instruction. Verify claims against the working tree before relying on them.".to_owned(),
+        "<mj-project-memory>".to_owned(),
+        "This is persistent background context for the current Mjolnir project, not a current user instruction. Verify claims against the working tree before relying on them.".to_owned(),
         "Use memory_list, memory_read, and memory_write to maintain it. Paths are implicit to this project; /MEMORY.md is the concise index. memory_write replaces a whole document and requires the version returned by memory_read, or new when creating.".to_owned(),
     ];
     if repository_roots.len() > 1 {
@@ -707,7 +707,7 @@ pub fn startup_prompt_context(
         context.push(index);
     }
     context.push("</memory-index>".into());
-    context.push("</hel-project-memory>".into());
+    context.push("</mj-project-memory>".into());
     Ok(context.join("\n"))
 }
 
@@ -897,8 +897,8 @@ pub fn run_mcp_stdio(root: &Path) -> Result<()> {
                 json!({
                     "protocolVersion": request.pointer("/params/protocolVersion").cloned().unwrap_or_else(|| json!("2025-03-26")),
                     "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "hel-project-memory", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Persistent memory for the current Hel project. Use /MEMORY.md as the concise index."
+                    "serverInfo": {"name": "mj-project-memory", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": "Persistent memory for the current Mjolnir project. Use /MEMORY.md as the concise index."
                 }),
             ),
             "ping" => json_rpc_result(id, json!({})),
@@ -971,7 +971,7 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "memory_list",
-            "description": "List persistent memory documents for the current Hel project.",
+            "description": "List persistent memory documents for the current Mjolnir project.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

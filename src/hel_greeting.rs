@@ -241,16 +241,16 @@ const fn greeting(
 }
 
 const GREETINGS: [Greeting; 45] = [
-    greeting("Welcome to Hel, $firstname", Group::Always, yes),
+    greeting("Welcome to Mjolnir, $firstname", Group::Always, yes),
     greeting(
         "Abandon boilerplate, all ye who enter here",
         Group::Always,
         yes,
     ),
-    greeting("We're on a highway to Hel", Group::Always, yes),
-    greeting("To Hel with boilerplate", Group::Always, yes),
+    greeting("Thunderstruck, $firstname", Group::Always, yes),
+    greeting("Take a hammer to the boilerplate", Group::Always, yes),
     greeting("Here be daemons", Group::Always, yes),
-    greeting("Let's raise a little Hel, $firstname", Group::Always, yes),
+    greeting("Time to forge something, $firstname", Group::Always, yes),
     greeting("The devil is in the diff", Group::Always, yes),
     greeting(
         "The code won't write itself, but the agents might",
@@ -271,33 +271,33 @@ const GREETINGS: [Greeting; 45] = [
     greeting("Good afternoon, $firstname", Group::Time, afternoon),
     greeting("Good evening, $firstname", Group::Time, evening),
     greeting(
-        "Raise a little Hel, $firstname",
+        "Bring the thunder, $firstname",
         Group::Time,
         friday_evening,
     ),
-    greeting("Give 'em Hel, $firstname", Group::Time, weekday_morning),
+    greeting("Give 'em the hammer, $firstname", Group::Time, weekday_morning),
     greeting(
-        "Midnight in Hel. Perfect coding weather",
+        "Midnight at the forge. Perfect coding weather",
         Group::Time,
         midnight,
     ),
     greeting(
-        "Welcome back, $firstname. Hel kept the fires burning",
+        "Welcome back, $firstname. The forge kept the fires burning",
         Group::State,
         returning,
     ),
     greeting(
-        "Hel is other people's agents",
+        "Many hands, one hammer",
         Group::State,
         multiple_profiles,
     ),
     greeting("No pitchforks. Just forks", Group::State, multiple_active),
     greeting(
-        "Hel awaits your command, $firstname",
+        "Mjolnir awaits your command, $firstname",
         Group::State,
         no_active,
     ),
-    greeting("Hel is busy on your behalf", Group::State, active_turn),
+    greeting("Mjolnir is busy on your behalf", Group::State, active_turn),
     greeting("The agents are restless, $firstname", Group::State, queued),
     greeting(
         "$stopped_count agents sleep beneath the mountain",
@@ -310,7 +310,7 @@ const GREETINGS: [Greeting; 45] = [
         multiple_sessions,
     ),
     greeting(
-        "$profile_name has entered the underworld",
+        "$profile_name has entered the forge",
         Group::State,
         active_turn,
     ),
@@ -325,16 +325,16 @@ const GREETINGS: [Greeting; 45] = [
         diverged,
     ),
     greeting(
-        "The road to Hel is paved with good intentions",
+        "The road to Valhalla is paved with good intentions",
         Group::Repository,
         clean,
     ),
     greeting(
-        "The road to Hel is paved with uncommitted intentions",
+        "The road to Valhalla is paved with uncommitted intentions",
         Group::Repository,
         dirty,
     ),
-    greeting("It's a cold day in Hel", Group::Repository, ci_passed),
+    greeting("It's a cold day in Niflheim", Group::Repository, ci_passed),
     greeting(
         "The build passed. Miracles do happen",
         Group::Repository,
@@ -346,7 +346,7 @@ const GREETINGS: [Greeting; 45] = [
         build_failed,
     ),
     greeting(
-        "CI is red. Hel has seen worse",
+        "CI is red. The forge has seen worse",
         Group::Repository,
         ci_failed,
     ),
@@ -397,7 +397,7 @@ const GREETINGS: [Greeting; 45] = [
         long_night,
     ),
     greeting(
-        "Mind the quota, $firstname. Even Hel has limits",
+        "Mind the quota, $firstname. Even Mjolnir has limits",
         Group::Usage,
         low_quota,
     ),
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn catalog_has_forty_five_unpunctuated_greetings_and_required_first_entry() {
         assert_eq!(GREETINGS.len(), 45);
-        assert_eq!(GREETINGS[0].text, "Welcome to Hel, $firstname");
+        assert_eq!(GREETINGS[0].text, "Welcome to Mjolnir, $firstname");
         assert!(
             GREETINGS
                 .iter()
@@ -447,7 +447,7 @@ mod tests {
         };
         assert_eq!(
             select_at(&facts, clock, 0),
-            "Mind the quota, Ada. Even Hel has limits"
+            "Mind the quota, Ada. Even Mjolnir has limits"
         );
     }
 

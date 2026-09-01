@@ -3940,7 +3940,7 @@ fn migrate_legacy_state_from(legacy: &Path, database: &Path) -> Result<()> {
     save_state_to(database, &state)?;
     let migrated = legacy.with_file_name("state.json.migrated-v1");
     fs::rename(legacy, &migrated)
-        .with_context(|| format!("retain migrated Hel state as {}", migrated.display()))?;
+        .with_context(|| format!("retain migrated Mjolnir state as {}", migrated.display()))?;
     Ok(())
 }
 

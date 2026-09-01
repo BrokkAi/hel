@@ -749,7 +749,7 @@ pub struct HelConfig {
     /// The version found on disk when it was above this build's
     /// [`CONFIG_VERSION`]. Such a config loads best-effort so its settings
     /// still work, and it is read-only: [`HelConfig::save_to`] refuses, so an
-    /// older Hel never overwrites a file a newer Hel maintains.
+    /// older Hel never overwrites a file a newer Mjolnir maintains.
     #[serde(skip)]
     pub newer_config_version: Option<u32>,
     #[serde(default, skip_serializing_if = "PhoneConfig::is_default")]
@@ -779,7 +779,7 @@ impl HelConfig {
     pub fn validate(&self) -> Result<()> {
         if self.version != CONFIG_VERSION {
             bail!(
-                "unsupported Hel config version {}; expected {CONFIG_VERSION}",
+                "unsupported Mjolnir config version {}; expected {CONFIG_VERSION}",
                 self.version
             );
         }
@@ -811,31 +811,31 @@ impl HelConfig {
             return Ok(Self::default());
         }
         let contents = fs::read_to_string(path)
-            .with_context(|| format!("read Hel config {}", path.display()))?;
+            .with_context(|| format!("read Mjolnir config {}", path.display()))?;
         if contents.trim().is_empty() {
             return Ok(Self::default());
         }
         let document: toml::Value = contents
             .parse()
-            .with_context(|| format!("parse Hel config {}", path.display()))?;
+            .with_context(|| format!("parse Mjolnir config {}", path.display()))?;
         if let Some(found) = newer_version(&document) {
             tracing::warn!(
                 path = %path.display(),
                 found_version = found,
                 supported_version = CONFIG_VERSION,
-                "Hel config was written by a newer build; loading it read-only"
+                "Mjolnir config was written by a newer build; loading it read-only"
             );
             return Ok(Self::load_newer(&contents, &document, found));
         }
         reject_removed_profile_overrides(&contents)?;
         reject_non_bare_permissions(&contents)?;
         let config: Self = toml::from_str(&contents)
-            .with_context(|| format!("parse Hel config {}", path.display()))?;
+            .with_context(|| format!("parse Mjolnir config {}", path.display()))?;
         config.validate()?;
         Ok(config)
     }
 
-    /// Best-effort read of a config a newer Hel maintains. Fields this build
+    /// Best-effort read of a config a newer Mjolnir maintains. Fields this build
     /// does not know drop away, and a section it cannot read falls back on its
     /// own instead of costing the whole file, so the profiles, bundles, and
     /// targets that still parse keep working. The recorded version is what
@@ -870,12 +870,12 @@ impl HelConfig {
     }
 
     /// One line for surfaces that show this config when the file on disk
-    /// belongs to a newer Hel; `None` for a config this build owns.
+    /// belongs to a newer Mjolnir; `None` for a config this build owns.
     pub fn newer_build_notice(&self) -> Option<String> {
         self.newer_config_version.map(|found| {
             format!(
-                "This config was written by a newer Hel (config version {found}; this build \
-                 supports {CONFIG_VERSION}), so it is read-only. Update Hel, or change settings \
+                "This config was written by a newer Mjolnir (config version {found}; this build \
+                 supports {CONFIG_VERSION}), so it is read-only. Update Mjolnir, or change settings \
                  with the newer build."
             )
         })
@@ -885,7 +885,7 @@ impl HelConfig {
         self.save_to(&config_path())
     }
 
-    /// Refuses when the file belongs to a newer Hel -- judged by the marker
+    /// Refuses when the file belongs to a newer Mjolnir -- judged by the marker
     /// this config loaded with *and* a fresh look at the file, since a newer
     /// build may have written it since. Overwriting would silently drop
     /// settings this build cannot represent.
@@ -895,13 +895,13 @@ impl HelConfig {
             .or_else(|| newer_version_on_disk(path))
         {
             bail!(
-                "{} was written by a newer Hel (config version {found}; this build writes \
-                 {CONFIG_VERSION}). Update Hel, or change settings with the newer build",
+                "{} was written by a newer Mjolnir (config version {found}; this build writes \
+                 {CONFIG_VERSION}). Update Mjolnir, or change settings with the newer build",
                 path.display()
             );
         }
         self.validate()?;
-        let body = toml::to_string_pretty(self).context("serialize Hel config")?;
+        let body = toml::to_string_pretty(self).context("serialize Mjolnir config")?;
         atomic_write(path, body.as_bytes())
     }
 
@@ -919,10 +919,10 @@ impl HelConfig {
         }
         let mut config = Self::load_from(path)?;
         if config.newer_config_version.is_some() {
-            // The newer Hel that owns this file renames its own targets.
+            // The newer Mjolnir that owns this file renames its own targets.
             tracing::warn!(
                 path = %path.display(),
-                "skipping the legacy localhost target rename: the config belongs to a newer Hel"
+                "skipping the legacy localhost target rename: the config belongs to a newer Mjolnir"
             );
             return Ok(false);
         }
@@ -950,7 +950,7 @@ impl PhoneConfig {
 }
 
 fn reject_non_bare_permissions(contents: &str) -> Result<()> {
-    let value: toml::Value = contents.parse().context("parse Hel config TOML")?;
+    let value: toml::Value = contents.parse().context("parse Mjolnir config TOML")?;
     let Some(targets) = value.get("targets").and_then(toml::Value::as_table) else {
         return Ok(());
     };
@@ -981,7 +981,7 @@ fn newer_version_on_disk(path: &Path) -> Option<u32> {
 }
 
 /// Deserialize one top-level section, or `None` when this build cannot read
-/// the shape a newer Hel wrote.
+/// the shape a newer Mjolnir wrote.
 fn salvage_section<T: for<'de> Deserialize<'de>>(document: &toml::Value, key: &str) -> Option<T> {
     document
         .get(key)
@@ -1010,14 +1010,14 @@ where
                     section = key,
                     id,
                     %error,
-                    "dropping a newer Hel config entry this build rejects"
+                    "dropping a newer Mjolnir config entry this build rejects"
                 ),
             },
             Err(error) => tracing::warn!(
                 section = key,
                 id,
                 %error,
-                "dropping a newer Hel config entry this build cannot read"
+                "dropping a newer Mjolnir config entry this build cannot read"
             ),
         }
     }
@@ -1025,7 +1025,7 @@ where
 }
 
 fn reject_removed_profile_overrides(contents: &str) -> Result<()> {
-    let value: toml::Value = contents.parse().context("parse Hel config TOML")?;
+    let value: toml::Value = contents.parse().context("parse Mjolnir config TOML")?;
     let Some(profiles) = value.get("profiles").and_then(toml::Value::as_table) else {
         return Ok(());
     };
@@ -1729,7 +1729,7 @@ mod tests {
 
     #[test]
     fn newer_config_loads_read_only_instead_of_blocking_startup() {
-        // Running a newer Hel and then downgrading must not lock the user out
+        // Running a newer Mjolnir and then downgrading must not lock the user out
         // of the older build.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -1751,13 +1751,13 @@ mod tests {
         assert!(
             config
                 .newer_build_notice()
-                .is_some_and(|notice| notice.contains("newer Hel"))
+                .is_some_and(|notice| notice.contains("newer Mjolnir"))
         );
 
         // Saving would downgrade the newer build's file, so it must refuse and
         // leave the file byte for byte as it was.
         let error = config.save_to(&path).unwrap_err().to_string();
-        assert!(error.contains("newer Hel"), "{error}");
+        assert!(error.contains("newer Mjolnir"), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), body);
     }
 
@@ -1802,7 +1802,7 @@ mod tests {
         fs::write(&path, &body).unwrap();
 
         let error = config.save_to(&path).unwrap_err().to_string();
-        assert!(error.contains("newer Hel"), "{error}");
+        assert!(error.contains("newer Mjolnir"), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), body);
     }
 
@@ -1832,7 +1832,7 @@ mod tests {
 
         let error = HelConfig::load_from(&path).unwrap_err().to_string();
         assert!(
-            error.contains("unsupported Hel config version 0"),
+            error.contains("unsupported Mjolnir config version 0"),
             "{error}"
         );
     }
@@ -1844,7 +1844,7 @@ mod tests {
         fs::write(&path, "version = 2\nthis is not toml\n").unwrap();
 
         let error = HelConfig::load_from(&path).unwrap_err().to_string();
-        assert!(error.contains("parse Hel config"), "{error}");
+        assert!(error.contains("parse Mjolnir config"), "{error}");
     }
 
     #[test]

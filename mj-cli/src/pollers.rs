@@ -678,7 +678,7 @@ impl CredentialSyncNotices {
             if let Some(detail) = sync_failure {
                 return Some(match trigger.reason {
                     CredentialSyncReason::AuthenticationFailure => format!(
-                        "Auth failure on profile {} (session {}); credential reconciliation failed: {detail}. Run `hel login --profile {}`.",
+                        "Auth failure on profile {} (session {}); credential reconciliation failed: {detail}. Run `mj login --profile {}`.",
                         result.profile_id,
                         short_id(session_id),
                         result.profile_id
@@ -694,13 +694,13 @@ impl CredentialSyncNotices {
             // scrolls off, so the profile leads and the advice trails.
             return Some(match (trigger.reason, result.pushed_to(session_id)) {
                 (CredentialSyncReason::AuthenticationFailure, true) => format!(
-                    "Auth failure on profile {} (session {}); refreshed credentials were pushed. Retry the prompt, and if it repeats run `hel login --profile {}`.",
+                    "Auth failure on profile {} (session {}); refreshed credentials were pushed. Retry the prompt, and if it repeats run `mj login --profile {}`.",
                     result.profile_id,
                     short_id(session_id),
                     result.profile_id
                 ),
                 (CredentialSyncReason::AuthenticationFailure, false) => format!(
-                    "Auth failure on profile {} (session {}); nothing fresher to push. Run `hel login --profile {}`.",
+                    "Auth failure on profile {} (session {}); nothing fresher to push. Run `mj login --profile {}`.",
                     result.profile_id,
                     short_id(session_id),
                     result.profile_id
@@ -2165,7 +2165,7 @@ mod tests {
         };
         let notice = notices.notice(&pushed).unwrap();
         assert!(notice.contains("were pushed"), "{notice}");
-        assert!(notice.contains("hel login --profile work"), "{notice}");
+        assert!(notice.contains("mj login --profile work"), "{notice}");
 
         let nothing_to_push = CredentialSyncResult {
             trigger: Some(CredentialSyncCause {
@@ -2177,7 +2177,7 @@ mod tests {
         };
         let notice = notices.notice(&nothing_to_push).unwrap();
         assert!(notice.contains("nothing fresher"), "{notice}");
-        assert!(notice.contains("hel login --profile work"), "{notice}");
+        assert!(notice.contains("mj login --profile work"), "{notice}");
         // The per-session cooldown upstream limits these; the dedup must not.
         assert_eq!(notices.notice(&nothing_to_push), Some(notice));
     }

@@ -541,14 +541,14 @@ fn configure_kimi_project_memory_mcp(
             "args": [
                 "-c",
                 "exec \"$HOME/$1\" worker memory-mcp --root \"$HOME/$2\"",
-                "hel-project-memory",
+                "mj-project-memory",
                 worker,
                 memory_root
             ],
             "runtime_id": "local"
         })
     };
-    servers.insert("hel-project-memory".into(), server);
+    servers.insert("mj-project-memory".into(), server);
     let mut body = serde_json::to_vec_pretty(&document)?;
     body.push(b'\n');
     atomic_write(&path, &body)
@@ -1844,7 +1844,7 @@ fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str)
             ],
         ),
     }
-    .purpose("start detached Hel worker")
+    .purpose("start detached Mjolnir worker")
     // Everything before this moves data into the target and reports as Sync.
     // Start begins here, with the daemon launch.
     .stage(ProvisionStage::Starting)
@@ -2762,7 +2762,7 @@ mod tests {
             "user-mcp"
         );
         assert_eq!(
-            configured["mcpServers"]["hel-project-memory"],
+            configured["mcpServers"]["mj-project-memory"],
             serde_json::json!({
                 "transport": "stdio",
                 "command": "/var/lib/hel/workers/session/hel",
@@ -2803,7 +2803,7 @@ mod tests {
         let configured: serde_json::Value =
             serde_json::from_slice(&std::fs::read(staged.path().join("mcp.json")).unwrap())
                 .unwrap();
-        let server = &configured["mcpServers"]["hel-project-memory"];
+        let server = &configured["mcpServers"]["mj-project-memory"];
         assert_eq!(server["command"], "sh");
         assert_eq!(server["runtime_id"], "local");
         assert_eq!(
@@ -2811,7 +2811,7 @@ mod tests {
             serde_json::json!([
                 "-c",
                 "exec \"$HOME/$1\" worker memory-mcp --root \"$HOME/$2\"",
-                "hel-project-memory",
+                "mj-project-memory",
                 ".local/share/hel/workers/session/hel",
                 ".local/share/hel/profiles/session/projects/project/memory"
             ])

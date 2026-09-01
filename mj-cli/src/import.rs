@@ -1,6 +1,6 @@
 //! Adopting a native coding-agent session as a stopped Hel session.
 //!
-//! One implementation serves every harness: the `hel import <harness>`
+//! One implementation serves every harness: the `mj import <harness>`
 //! subcommands differ only in which agent home they read and what they call the
 //! session file, and the dashboard's background import runs the same steps with
 //! progress reporting and cancellation.
@@ -49,7 +49,7 @@ enum ImportCommand {
     Grok(NativeImportArgs),
 }
 
-/// The arguments every `hel import <harness>` subcommand takes. The harness is
+/// The arguments every `mj import <harness>` subcommand takes. The harness is
 /// the subcommand name, so nothing else about the four differs.
 #[derive(Debug, Args)]
 #[command(group(

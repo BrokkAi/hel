@@ -169,7 +169,7 @@ pub struct TargetCheckpoint {
 /// relay spends with ACP dispatch frozen behind the checkpoint barrier.
 pub const EXPORT_SPEC_STDIN: &str = "-";
 
-/// Hidden target CLI entry point: `hel worker export-checkpoint --spec PATH|-`.
+/// Hidden target CLI entry point: `mj worker export-checkpoint --spec PATH|-`.
 pub fn export_from_spec_file(path: &Path) -> Result<TargetCheckpoint> {
     if path == Path::new(EXPORT_SPEC_STDIN) {
         return export_from_spec_reader(&mut std::io::stdin().lock());
@@ -4775,7 +4775,7 @@ mod tests {
             .unwrap_err();
 
             assert!(
-                format!("{error:#}").contains("incompatible Hel archive schema"),
+                format!("{error:#}").contains("incompatible Mjolnir archive schema"),
                 "{error:#}"
             );
             assert_eq!(fs::read(&readme).unwrap(), before);

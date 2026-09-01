@@ -82,7 +82,7 @@ fn project_memory_mcp_honors_harness_delivery_and_claude_native_memory() {
     let [McpServer::Stdio(server)] = servers.as_slice() else {
         panic!("non-Claude sessions receive exactly one memory MCP server");
     };
-    assert_eq!(server.name, "hel-project-memory");
+    assert_eq!(server.name, "mj-project-memory");
     assert_eq!(server.command, Path::new("/worker/hel"));
     assert_eq!(
         server.args,

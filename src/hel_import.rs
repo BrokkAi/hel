@@ -317,7 +317,7 @@ pub struct GrokImportRequest<'a> {
 /// Resolve a harness's configuration home without ever modifying it.
 ///
 /// The environment override wins; otherwise the harness's default directory
-/// beneath the user's home is used, the same pair `hel setup` discovers.
+/// beneath the user's home is used, the same pair `mj setup` discovers.
 pub fn harness_config_home(kind: HarnessKind) -> Result<PathBuf> {
     let name = kind.display_name();
     let home = std::env::var_os(kind.home_env())
@@ -419,7 +419,7 @@ pub fn read_native_transcript(
         HarnessKind::Kimi => read_kimi_transcript(source_path),
         HarnessKind::Grok => read_grok_transcript(source_path),
         HarnessKind::Deepseek => bail!(
-            "DeepSeek Harness sessions resume through ACP and have no Hel native-import projection"
+            "DeepSeek Harness sessions resume through ACP and have no Mjolnir native-import projection"
         ),
     }
 }

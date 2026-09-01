@@ -86,7 +86,7 @@ pub struct RuntimeProbe {
     pub kind: RuntimeKind,
     pub usable: bool,
     pub detail: String,
-    /// The fix `hel doctor` would print for this runtime, carried through so
+    /// The fix `mj doctor` would print for this runtime, carried through so
     /// setup never invents its own remediation wording.
     pub remediation: Option<String>,
 }
@@ -701,7 +701,7 @@ fn run_setup_dialog_inner(
     smoke_executor: &impl CommandExecutor,
     probe_executor: &impl CommandExecutor,
 ) -> Result<SetupOutcome> {
-    writeln!(output, "Welcome to Hel setup.")?;
+    writeln!(output, "Welcome to Mjolnir setup.")?;
     writeln!(output)?;
     write_discovered_homes(output, &discovery.homes)?;
     write_repository(output, discovery.repository.as_ref())?;
@@ -1038,7 +1038,7 @@ fn prompt_ssh_target_name(
     }
 }
 
-/// Phrase a failed setup smoke test the way `hel doctor --smoke` phrases the
+/// Phrase a failed setup smoke test the way `mj doctor --smoke` phrases the
 /// same failure, so it joins the closing report instead of ending the run.
 fn smoke_failure_check(runtime: RuntimeKind, image: &str, error: &anyhow::Error) -> DoctorCheck {
     let scope = match runtime {
@@ -1052,13 +1052,13 @@ fn smoke_failure_check(runtime: RuntimeKind, image: &str, error: &anyhow::Error)
         format!("{} smoke test", runtime.label()),
         format!("{scope} failed for image {image}: {error:#}"),
         format!(
-            "Fix the configured image or the {} runtime, then run `hel doctor --smoke` again.",
+            "Fix the configured image or the {} runtime, then run `mj doctor --smoke` again.",
             runtime.label()
         ),
     )
 }
 
-/// End setup with the same report `hel doctor` prints, so the user gets one
+/// End setup with the same report `mj doctor` prints, so the user gets one
 /// ready/fixable summary with remediations instead of two different signals.
 ///
 /// `extra` carries anything setup itself learned that doctor cannot repeat
@@ -1070,7 +1070,7 @@ fn write_doctor_report(
     extra: Vec<DoctorCheck>,
 ) -> Result<()> {
     writeln!(output)?;
-    writeln!(output, "Running `hel doctor` checks on the new config...")?;
+    writeln!(output, "Running `mj doctor` checks on the new config...")?;
     let mut checks = run_with_config_path(
         config_path,
         executor,
@@ -1084,7 +1084,7 @@ fn write_doctor_report(
     } else {
         writeln!(
             output,
-            "Apply the remediations above, then rerun `hel doctor`."
+            "Apply the remediations above, then rerun `mj doctor`."
         )?;
     }
     Ok(())
@@ -1137,7 +1137,7 @@ fn write_summary(
     config: &HelConfig,
     runtimes: &[(RuntimeKind, String)],
 ) -> Result<()> {
-    writeln!(output, "Hel will write {} with:", config_path.display())?;
+    writeln!(output, "Mjolnir will write {} with:", config_path.display())?;
     writeln!(output, "  {} profile(s)", config.profiles.len())?;
     writeln!(output, "  {} bundle(s)", config.bundles.len())?;
     writeln!(
@@ -2104,11 +2104,11 @@ Host builder
         // The report the user was promised still runs, and still ends with the
         // instruction to apply the remediations it just listed.
         assert!(
-            output.contains("Running `hel doctor` checks on the new config..."),
+            output.contains("Running `mj doctor` checks on the new config..."),
             "{output}"
         );
         assert!(
-            output.contains("Apply the remediations above, then rerun `hel doctor`."),
+            output.contains("Apply the remediations above, then rerun `mj doctor`."),
             "{output}"
         );
         assert!(
@@ -2148,7 +2148,7 @@ Host builder
         // check, plus the remediation doctor would print for the missing home.
         assert!(
             output.contains(&format!(
-                "ready Hel configuration: {} is valid",
+                "ready Mjolnir configuration: {} is valid",
                 config_path.display()
             )),
             "{output}"
@@ -2159,7 +2159,7 @@ Host builder
             "{output}"
         );
         assert!(
-            output.contains("Apply the remediations above, then rerun `hel doctor`."),
+            output.contains("Apply the remediations above, then rerun `mj doctor`."),
             "{output}"
         );
     }

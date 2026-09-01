@@ -40,7 +40,7 @@ const APPLE_CONTAINER_INSTALL_URL: &str = "https://github.com/apple/container#in
 /// or a credential helper waiting on something that will never arrive.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The executor `hel doctor` and `hel setup` run their prerequisite probes
+/// The executor `mj doctor` and `mj setup` run their prerequisite probes
 /// through: one deadline per probe, so a wedged runtime cannot hang the run.
 pub const fn probe_executor() -> BoundedProcessExecutor {
     BoundedProcessExecutor::new(PROBE_TIMEOUT)
@@ -177,8 +177,8 @@ pub fn run_with(
 
 /// The same checks as [`run_with`], against an explicit configuration file.
 ///
-/// `hel setup` uses this to report on the configuration it just wrote, so a
-/// first run ends with exactly the summary and remediations `hel doctor`
+/// `mj setup` uses this to report on the configuration it just wrote, so a
+/// first run ends with exactly the summary and remediations `mj doctor`
 /// would print.
 pub fn run_with_config_path(
     config_path: &Path,
@@ -235,7 +235,7 @@ fn harness_discovery_check_from(
                 "harness.discovery",
                 "Harness home discovery",
                 "No Codex, Claude Code, Kimi Code, or Grok Build home was found in the default or environment-overridden locations.",
-                "Install and sign in to a supported harness, then run `hel setup`.",
+                "Install and sign in to a supported harness, then run `mj setup`.",
             )
         };
     }
@@ -290,13 +290,13 @@ pub fn setup_instructions(platform: InstructionsPlatform) -> String {
         InstructionsPlatform::Linux => format!(
             "# Hel setup instructions for Linux\n\n\
 This page is self-contained. Follow this exact loop as the user who will run Hel:\n\n\
-1. Run `hel doctor --json`.\n\
+1. Run `mj doctor --json`.\n\
 2. Follow every `fixable` remediation from its JSON output.\n\
-3. Run `hel doctor --json` again. Repeat until no check is `fixable`.\n\
-4. Finish with `hel doctor --json --smoke` to verify every configured container\n\
+3. Run `mj doctor --json` again. Repeat until no check is `fixable`.\n\
+4. Finish with `mj doctor --json --smoke` to verify every configured container\n\
    image end to end, and resolve anything it reports as `fixable`.\n\n\
 For a coding-agent handoff, provide this entire instructions page together with\n\
-the latest `hel doctor --json` output.\n\n\
+the latest `mj doctor --json` output.\n\n\
 ## Linux container-runtime postconditions\n\n{}\n\n{}",
             include_str!("../docs/PODMAN.md"),
             include_str!("../docs/DOCKER.md")
@@ -304,11 +304,11 @@ the latest `hel doctor --json` output.\n\n\
         InstructionsPlatform::Macos => format!(
             "# Hel setup instructions for macOS\n\n\
 This page is self-contained. Follow this exact loop as the user who will run Hel:\n\n\
-1. Run `hel doctor --json`.\n\
+1. Run `mj doctor --json`.\n\
 2. Follow every `fixable` remediation from its JSON output.\n\
-3. Run `hel doctor --json` again. Repeat until no check is `fixable`.\n\n\
+3. Run `mj doctor --json` again. Repeat until no check is `fixable`.\n\n\
 For a coding-agent handoff, provide this entire instructions page together with\n\
-the latest `hel doctor --json` output.\n\n\
+the latest `mj doctor --json` output.\n\n\
 ## Apple container runtime\n\n\
 Hel's Apple container target requires Apple silicon and macOS 26 or newer.\n\
 On an Intel Mac or an older macOS release, the target is unsupported; use a\n\
@@ -323,7 +323,7 @@ container, executes `true` in it, and removes it successfully. Use the image\n\
 configured by an `apple-container` target; without one, doctor uses\n\
 `{DEFAULT_CONTAINER_IMAGE}` for the smoke test.\n\n\
 ## Shared Hel prerequisites\n\n\
-`hel doctor --json` also checks the configuration, each configured harness home\n\
+`mj doctor --json` also checks the configuration, each configured harness home\n\
 and authentication marker, selected container worker binaries, and any relevant\n\
 Podman prerequisites. Resolve every `fixable` status before starting a session."
         ),
@@ -336,9 +336,9 @@ fn configuration_checks(path: &Path) -> (Option<HelConfig>, Vec<DoctorCheck>) {
             None,
             vec![DoctorCheck::fixable(
                 "config",
-                "Hel configuration",
+                "Mjolnir configuration",
                 format!("{} does not exist", path.display()),
-                "Run `hel setup` to create config.toml.",
+                "Run `mj setup` to create config.toml.",
             )],
         );
     }
@@ -349,13 +349,13 @@ fn configuration_checks(path: &Path) -> (Option<HelConfig>, Vec<DoctorCheck>) {
                 // save refuses, so say so rather than reporting it as valid.
                 Some(notice) => DoctorCheck::warning(
                     "config",
-                    "Hel configuration",
+                    "Mjolnir configuration",
                     format!("{}: {notice}", path.display()),
-                    "Update Hel, or change settings with the newer build.",
+                    "Update Mjolnir, or change settings with the newer build.",
                 ),
                 None => DoctorCheck::ready(
                     "config",
-                    "Hel configuration",
+                    "Mjolnir configuration",
                     format!("{} is valid", path.display()),
                 ),
             }];
@@ -365,7 +365,7 @@ fn configuration_checks(path: &Path) -> (Option<HelConfig>, Vec<DoctorCheck>) {
                     "config.session-prerequisites",
                     "Session configuration",
                     "At least one profile, bundle, and target are required.",
-                    "Run `hel setup`, or add profiles, bundles, and targets to config.toml.",
+                    "Run `mj setup`, or add profiles, bundles, and targets to config.toml.",
                 ));
             } else {
                 checks.push(DoctorCheck::ready(
@@ -380,9 +380,9 @@ fn configuration_checks(path: &Path) -> (Option<HelConfig>, Vec<DoctorCheck>) {
             None,
             vec![DoctorCheck::fixable(
                 "config",
-                "Hel configuration",
+                "Mjolnir configuration",
                 format!("{} is invalid: {error:#}", path.display()),
-                "Fix the reported TOML error in config.toml, or run `hel setup` to replace it.",
+                "Fix the reported TOML error in config.toml, or run `mj setup` to replace it.",
             )],
         ),
     }
@@ -394,7 +394,7 @@ fn harness_checks(config: Option<&HelConfig>, executor: &impl CommandExecutor) -
             "harness.profiles",
             "Harness profiles",
             "Harness homes cannot be checked until config.toml is valid.",
-            "Fix config.toml, then rerun `hel doctor --json`.",
+            "Fix config.toml, then rerun `mj doctor --json`.",
         )];
     };
     if config.profiles.is_empty() {
@@ -402,7 +402,7 @@ fn harness_checks(config: Option<&HelConfig>, executor: &impl CommandExecutor) -
             "harness.profiles",
             "Harness profiles",
             "No harness profiles are configured.",
-            "Run `hel setup` to discover homes, or add a profile to config.toml.",
+            "Run `mj setup` to discover homes, or add a profile to config.toml.",
         )];
     }
     config
@@ -444,16 +444,16 @@ fn harness_checks(config: Option<&HelConfig>, executor: &impl CommandExecutor) -
         .collect()
 }
 
-/// Point an unauthenticated profile at `hel login`, which already knows how to
+/// Point an unauthenticated profile at `mj login`, which already knows how to
 /// sign each harness in.
 ///
 /// The underlying command is named only for the reader's benefit; it comes from
 /// [`login_command`], the one place that tracks what each harness CLI actually
-/// accepts, so this text cannot drift away from what `hel login` runs.
+/// accepts, so this text cannot drift away from what `mj login` runs.
 fn harness_login_remediation(id: &str, profile: &HarnessProfile) -> String {
     let (program, arguments) = login_command(profile);
     format!(
-        "Run `hel login --profile {id}`; it runs `{program} {}` against {}.",
+        "Run `mj login --profile {id}`; it runs `{program} {}` against {}.",
         arguments.join(" "),
         profile.home.display()
     )
@@ -499,8 +499,8 @@ fn podman_check(config: Option<&HelConfig>, executor: &impl CommandExecutor) -> 
 /// doctor check.
 ///
 /// This is the single source of truth for Podman availability wording and
-/// remediation. `hel setup` calls it directly so its runtime list reports the
-/// same detail and fix that `hel doctor` would.
+/// remediation. `mj setup` calls it directly so its runtime list reports the
+/// same detail and fix that `mj doctor` would.
 pub fn local_podman_runtime_check(executor: &impl CommandExecutor) -> DoctorCheck {
     match verify_local_podman(executor) {
         Ok(preflight) => DoctorCheck::ready(
@@ -571,7 +571,7 @@ fn podman_image_check(
                 format!(
                     "Disposable run/exec/remove smoke test failed for image {image}: {error:#}"
                 ),
-                "Fix the configured image or Podman runtime, then run `hel doctor --json --smoke` again.",
+                "Fix the configured image or Podman runtime, then run `mj doctor --json --smoke` again.",
             ),
         };
     }
@@ -603,7 +603,7 @@ fn podman_image_check(
 
 fn missing_image_remediation(image: &str) -> String {
     format!(
-        "Pull it with `podman pull {image}`, build it from containers/Containerfile.agent-dev, or run `hel doctor --json --smoke` to verify the full pull-and-run path."
+        "Pull it with `podman pull {image}`, build it from containers/Containerfile.agent-dev, or run `mj doctor --json --smoke` to verify the full pull-and-run path."
     )
 }
 
@@ -655,7 +655,7 @@ pub fn local_docker_runtime_check(executor: &impl CommandExecutor) -> DoctorChec
             "runtime.docker",
             "Docker",
             format!("{error:#}"),
-            "Install and start Docker, then make sure `docker info` succeeds as the user running Hel.",
+            "Install and start Docker, then make sure `docker info` succeeds as the user running mj.",
         ),
     }
 }
@@ -699,7 +699,7 @@ fn docker_image_check(
                 format!(
                     "Disposable run/exec/remove smoke test failed for image {image}: {error:#}"
                 ),
-                "Fix the configured image or Docker runtime, then run `hel doctor --json --smoke` again.",
+                "Fix the configured image or Docker runtime, then run `mj doctor --json --smoke` again.",
             ),
         };
     }
@@ -715,7 +715,7 @@ fn docker_image_check(
             check_id,
             title,
             format!("Image {image} is not present in Docker storage."),
-            format!("Pull it with `docker pull {image}`, or run `hel doctor --json --smoke`."),
+            format!("Pull it with `docker pull {image}`, or run `mj doctor --json --smoke`."),
         ),
         Err(error) => DoctorCheck::fixable(
             check_id,
@@ -922,7 +922,7 @@ fn ssh_podman_check(
             check_id,
             title,
             format!(
-                "Remote rootless Podman {} is available via {destination}. Run `hel doctor --json --smoke` to verify the image end to end.",
+                "Remote rootless Podman {} is available via {destination}. Run `mj doctor --json --smoke` to verify the image end to end.",
                 preflight.version
             ),
         );
@@ -962,7 +962,7 @@ fn ssh_podman_check(
                 "Disposable run/exec/remove smoke test failed for image {image} on {destination}: {error:#}"
             ),
             format!(
-                "Fix the configured image or Podman runtime on {destination}, then run `hel doctor --json --smoke` again."
+                "Fix the configured image or Podman runtime on {destination}, then run `mj doctor --json --smoke` again."
             ),
         ),
     }
@@ -998,7 +998,7 @@ fn podman_remediation_match(detail: &str) -> Option<&'static str> {
         )
     } else if detail.contains("Rootless") {
         Some(
-            "Run Hel without `sudo`; unset `CONTAINER_HOST` and select the rootless local Podman connection.",
+            "Run mj without `sudo`; unset `CONTAINER_HOST` and select the rootless local Podman connection.",
         )
     } else {
         None
@@ -1164,7 +1164,7 @@ fn worker_binary_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
             "worker.containers",
             "Container worker binary",
             "Worker availability cannot be checked until config.toml is valid.",
-            "Fix config.toml, then rerun `hel doctor --json`.",
+            "Fix config.toml, then rerun `mj doctor --json`.",
         )];
     };
     let containers = config
@@ -1247,7 +1247,7 @@ fn container_architecture(platform: Option<&str>) -> std::result::Result<&'stati
         "x86_64" | "amd64" => Ok("x86_64"),
         "aarch64" | "arm64" => Ok("aarch64"),
         other => Err(format!(
-            "Container architecture {other:?} is unsupported; Hel supports x86_64 and aarch64 Linux workers."
+            "Container architecture {other:?} is unsupported; Mjolnir supports x86_64 and aarch64 Linux workers."
         )),
     }
 }
@@ -1314,7 +1314,7 @@ pub fn apple_container_check(
             "runtime.apple-container",
             "Apple container runtime",
             "The daemon is running, but the required disposable smoke test was not requested.",
-            "Run `hel doctor --json --smoke`.",
+            "Run `mj doctor --json --smoke`.",
         );
     }
 
@@ -1333,7 +1333,7 @@ pub fn apple_container_check(
             "runtime.apple-container",
             "Apple container runtime",
             format!("Disposable run/exec/remove smoke test failed: {error:#}"),
-            "Fix the configured image or container runtime, then run `hel doctor --json --smoke` again.",
+            "Fix the configured image or container runtime, then run `mj doctor --json --smoke` again.",
         ),
     }
 }
@@ -1341,7 +1341,7 @@ pub fn apple_container_check(
 /// Probe that the Apple `container` command is installed and its daemon is
 /// running, phrased as a doctor check.
 ///
-/// Split out of [`apple_container_check`] so `hel setup` can reuse the same
+/// Split out of [`apple_container_check`] so `mj setup` can reuse the same
 /// probes and remediation text without also demanding the opt-in smoke test.
 /// The caller is responsible for platform gating.
 pub fn apple_container_daemon_check(executor: &impl CommandExecutor) -> DoctorCheck {
@@ -1648,7 +1648,7 @@ mod tests {
         assert_eq!(
             check.remediation.as_deref(),
             Some(
-                "Pull it with `podman pull ghcr.io/example/dev:1`, build it from containers/Containerfile.agent-dev, or run `hel doctor --json --smoke` to verify the full pull-and-run path."
+                "Pull it with `podman pull ghcr.io/example/dev:1`, build it from containers/Containerfile.agent-dev, or run `mj doctor --json --smoke` to verify the full pull-and-run path."
             )
         );
     }
@@ -2101,11 +2101,11 @@ mod tests {
         assert_eq!(checks[0].status, CheckStatus::Fixable);
         let remediation = checks[0].remediation.as_deref().unwrap();
         assert!(
-            remediation.contains("hel login --profile work"),
+            remediation.contains("mj login --profile work"),
             "{remediation}"
         );
         // The underlying command is quoted from the one place that verified it,
-        // so doctor cannot recommend something `hel login` does not run.
+        // so doctor cannot recommend something `mj login` does not run.
         let (program, arguments) = login_command(&profile);
         assert!(
             remediation.contains(&format!("`{program} {}`", arguments.join(" "))),
@@ -2151,7 +2151,7 @@ mod tests {
         assert_eq!(check.status, CheckStatus::Fixable);
         assert_eq!(
             check.remediation.as_deref(),
-            Some("Install and sign in to a supported harness, then run `hel setup`.")
+            Some("Install and sign in to a supported harness, then run `mj setup`.")
         );
     }
 

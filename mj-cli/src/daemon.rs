@@ -1460,7 +1460,7 @@ impl DaemonClient {
         let stream =
             tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(metadata.address))
                 .await
-                .context("time out connecting to Hel daemon")??;
+                .context("time out connecting to Mjolnir daemon")??;
         Ok(Self {
             metadata,
             stream,
@@ -2101,7 +2101,7 @@ impl ManagementClient {
         while Instant::now() < deadline && process_is_alive(pid) {
             tokio::time::sleep(RETRY_DELAY).await;
         }
-        ensure!(!process_is_alive(pid), "Hel daemon {pid} did not stop");
+        ensure!(!process_is_alive(pid), "Mjolnir daemon {pid} did not stop");
         Ok(())
     }
 }
@@ -2127,7 +2127,7 @@ pub(crate) async fn connect_or_start() -> Result<DaemonClient> {
         return Ok(client);
     }
 
-    let executable = std::env::current_exe().context("find current Hel executable")?;
+    let executable = std::env::current_exe().context("find current mj executable")?;
     let mut command = std::process::Command::new(executable);
     command.arg("daemon-run");
     let _pid = hel::hel_subprocess::spawn_detached(&mut command, &data_dir().join("daemon.log"))?;
@@ -2145,10 +2145,10 @@ pub(crate) async fn connect_or_start() -> Result<DaemonClient> {
         }
         tokio::time::sleep(RETRY_DELAY).await;
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("Hel daemon did not become ready"))).with_context(
+    Err(last_error.unwrap_or_else(|| anyhow!("Mjolnir daemon did not become ready"))).with_context(
         || {
             format!(
-                "start Hel daemon; details are in {}",
+                "start Mjolnir daemon; details are in {}",
                 data_dir().join("daemon.log").display()
             )
         },
@@ -2188,7 +2188,7 @@ async fn signal_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
             });
         ensure!(
             is_hel_daemon,
-            "refusing to signal PID {} because it does not look like a Hel daemon (`hel daemon-run`)",
+            "refusing to signal PID {} because it does not look like a Mjolnir daemon (`mj daemon-run`)",
             metadata.pid
         );
         // SAFETY: the PID comes from owner-only daemon metadata and SIGTERM is
@@ -2197,7 +2197,7 @@ async fn signal_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
         if result != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error).context("stop incompatible Hel daemon");
+                return Err(error).context("stop incompatible Mjolnir daemon");
             }
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2206,7 +2206,7 @@ async fn signal_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
         }
         ensure!(
             !process_is_alive(metadata.pid),
-            "incompatible Hel daemon {} did not stop",
+            "incompatible Mjolnir daemon {} did not stop",
             metadata.pid
         );
         Ok(())
@@ -2214,7 +2214,7 @@ async fn signal_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
     #[cfg(not(unix))]
     {
         let _ = metadata;
-        bail!("stop the incompatible Hel daemon, then retry")
+        bail!("stop the incompatible Mjolnir daemon, then retry")
     }
 }
 
@@ -2241,7 +2241,7 @@ pub(crate) fn maintain_attachment(
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(%error, "could not reconnect dashboard to Hel daemon");
+                            tracing::warn!(%error, "could not reconnect dashboard to Mjolnir daemon");
                         }
                     }
                 }
@@ -2273,7 +2273,7 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
 
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
-        .context("bind Hel daemon loopback endpoint")?;
+        .context("bind Mjolnir daemon loopback endpoint")?;
     let metadata = DaemonMetadata {
         protocol_version: PROTOCOL_VERSION,
         pid: std::process::id(),
@@ -2367,7 +2367,7 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
                 }
             }
             accepted = listener.accept() => {
-                let (stream, peer) = accepted.context("accept Hel daemon client")?;
+                let (stream, peer) = accepted.context("accept Mjolnir daemon client")?;
                 if !peer.ip().is_loopback() {
                     tracing::warn!(%peer, "rejected non-loopback daemon client");
                     continue;

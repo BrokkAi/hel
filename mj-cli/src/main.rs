@@ -50,7 +50,7 @@ use crate::dashboard::{DashboardExit, run_dashboard_for_workspace};
 use crate::import::{ImportArgs, import};
 
 #[derive(Debug, Parser)]
-#[command(name = "hel", version, about = "ACP session control plane")]
+#[command(name = "mj", version, about = "ACP session control plane")]
 struct Cli {
     /// Select a workspace by name for workspace-scoped commands.
     #[arg(long, global = true)]
@@ -61,7 +61,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Open the workspace selector even when Hel could auto-attach.
+    /// Open the workspace selector even when Mjolnir could auto-attach.
     Workspaces,
     /// Inspect or control the persistent per-user daemon.
     Daemon(DaemonArgs),
@@ -76,9 +76,9 @@ enum Command {
     Broker(BrokerArgs),
     /// Diagnose platform and configuration prerequisites.
     Doctor(DoctorArgs),
-    /// Discover local agent homes and create an initial Hel configuration.
+    /// Discover local agent homes and create an initial Mjolnir configuration.
     Setup(SetupArgs),
-    /// Adopt a native coding-agent session as a stopped Hel session.
+    /// Adopt a native coding-agent session as a stopped Mjolnir session.
     Import(ImportArgs),
     /// Find, adopt, or explicitly destroy managed workers missing from state.
     Recover(RecoverArgs),
@@ -100,7 +100,7 @@ enum DaemonCommand {
     Status,
     /// Gracefully stop the daemon. Detached workers keep running.
     Stop,
-    /// Gracefully replace the daemon with this Hel build.
+    /// Gracefully replace the daemon with this Mjolnir build.
     Restart,
 }
 
@@ -285,12 +285,12 @@ fn write_worker_exit_record(root: &std::path::Path, reason: &str) {
     let bytes = match serde_json::to_vec_pretty(&record) {
         Ok(bytes) => bytes,
         Err(error) => {
-            eprintln!("Hel: could not serialize worker exit record: {error}");
+            eprintln!("Mjolnir: could not serialize worker exit record: {error}");
             return;
         }
     };
     if let Err(error) = std::fs::write(root.join("worker-exit.json"), bytes) {
-        eprintln!("Hel: could not write worker exit record: {error}");
+        eprintln!("Mjolnir: could not write worker exit record: {error}");
     }
 }
 
@@ -319,10 +319,10 @@ fn main() -> Result<()> {
     install_panic_logging();
     let result = run(cli);
     if let Err(error) = &result {
-        tracing::error!(error = format!("{error:#}"), "Hel exited with an error");
+        tracing::error!(error = format!("{error:#}"), "Mjolnir exited with an error");
     }
     if result.is_ok() {
-        tracing::info!("Hel stopped");
+        tracing::info!("Mjolnir stopped");
     }
     drop(log);
     result
@@ -343,7 +343,7 @@ fn run(cli: Cli) -> Result<()> {
         shutdown_dashboard_runtime(runtime);
         if matches!(result, Ok(DashboardExit::Detached)) {
             println!(
-                "Active sessions will continue working; Hel will reattach to them on your next invocation."
+                "Active sessions will continue working; Mjolnir will reattach to them on your next invocation."
             );
         }
     } else {
@@ -355,7 +355,7 @@ fn run(cli: Cli) -> Result<()> {
 fn install_panic_logging() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        tracing::error!(panic = %info, "Hel panicked");
+        tracing::error!(panic = %info, "Mjolnir panicked");
         default_hook(info);
     }));
 }
@@ -628,10 +628,10 @@ async fn daemon_command(args: DaemonArgs) -> Result<()> {
         DaemonCommand::Status => {
             let mut daemon = daemon::connect_management()
                 .await
-                .context("Hel daemon is not running")?;
+                .context("Mjolnir daemon is not running")?;
             let status = daemon.status().await?;
             println!(
-                "Hel daemon {} (version {}) started {}; {} attached client{}; web viewer {}",
+                "Mjolnir daemon {} (version {}) started {}; {} attached client{}; web viewer {}",
                 status.pid,
                 status.build_version,
                 status.started_at,
@@ -655,9 +655,9 @@ async fn daemon_command(args: DaemonArgs) -> Result<()> {
         DaemonCommand::Stop => {
             let mut daemon = daemon::connect_management()
                 .await
-                .context("Hel daemon is not running")?;
+                .context("Mjolnir daemon is not running")?;
             daemon.stop().await?;
-            println!("Hel daemon is stopping; detached workers remain active.");
+            println!("Mjolnir daemon is stopping; detached workers remain active.");
         }
         DaemonCommand::Restart => {
             if let Ok(daemon) = daemon::connect_management().await {
@@ -665,7 +665,7 @@ async fn daemon_command(args: DaemonArgs) -> Result<()> {
             }
             let mut daemon = daemon::connect_or_start().await?;
             let status = daemon.status().await?;
-            println!("Hel daemon restarted as PID {}.", status.pid);
+            println!("Mjolnir daemon restarted as PID {}.", status.pid);
         }
     }
     Ok(())
@@ -712,7 +712,7 @@ async fn login(args: LoginArgs) -> Result<()> {
     let (after, _) = hel::hel_credentials::read_credential_file(profile.kind, &marker)?;
     if after.present && after.fingerprint != before.fingerprint {
         println!(
-            "Credentials updated for profile {profile_id}. Live sessions pick them up within about a minute while the Hel daemon is running."
+            "Credentials updated for profile {profile_id}. Live sessions pick them up within about a minute while the Mjolnir daemon is running."
         );
     } else {
         println!("Credentials for profile {profile_id} are unchanged.");
@@ -743,7 +743,7 @@ fn resolve_login_profile(config: &HelConfig, requested: Option<&str>) -> Result<
             "several profiles are configured; pass --profile with one of: {}",
             profile_ids(config)
         ),
-        (None, _) => bail!("no harness profiles are configured; run `hel setup` first"),
+        (None, _) => bail!("no harness profiles are configured; run `mj setup` first"),
     }
 }
 
@@ -824,7 +824,7 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     if hel::hel_doctor::all_ready(&checks) {
         Ok(())
     } else {
-        bail!("Hel has fixable prerequisites; run `hel doctor --json` and follow its remediations.")
+        bail!("Hel has fixable prerequisites; run `mj doctor --json` and follow its remediations.")
     }
 }
 
@@ -1161,7 +1161,7 @@ mod tests {
     fn cli_name_and_worker_shape_are_stable() {
         use clap::CommandFactory;
         let command = Cli::command();
-        assert_eq!(command.get_name(), "hel");
+        assert_eq!(command.get_name(), "mj");
         assert!(
             command
                 .get_subcommands()

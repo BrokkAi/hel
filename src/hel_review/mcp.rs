@@ -6,7 +6,7 @@
 //! is the tier's whole economy -- the supervisor keeps investigating while the
 //! lanes it chose run, instead of ending its turn to ask Hel for them.
 //!
-//! The server is this binary in another mode (`hel worker review-mcp`), started
+//! The server is this binary in another mode (`mj worker review-mcp`), started
 //! by the supervisor's harness as an ordinary stdio MCP server. It owns no
 //! review state: each call is validated here, then forwarded as one JSON line
 //! over a Unix socket in the worker root, where the worker records it for the

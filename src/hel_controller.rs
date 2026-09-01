@@ -99,7 +99,7 @@ impl ControllerStoreGuard {
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => bail!(
-                "another Hel controller is already using {}; stop it before starting this command",
+                "another Mjolnir controller is already using {}; stop it before starting this command",
                 directory.display()
             ),
             Err(std::fs::TryLockError::Error(error)) => {
@@ -1095,7 +1095,7 @@ mod tests {
             )
             .expect_err("an unwritable store cannot register a session");
         assert!(
-            format!("{error:#}").contains("Hel database"),
+            format!("{error:#}").contains("Mjolnir database"),
             "unexpected error: {error:#}"
         );
         assert!(
@@ -1261,7 +1261,7 @@ mod tests {
         match expected.as_str() {
             "locked" => {
                 let error = acquired.expect_err("a second process acquired the controller store");
-                assert!(error.to_string().contains("another Hel controller"));
+                assert!(error.to_string().contains("another Mjolnir controller"));
             }
             "available" => {
                 acquired.expect("released controller store stayed locked");

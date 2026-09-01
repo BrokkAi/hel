@@ -789,7 +789,7 @@ pub(crate) async fn run_server(
                     while let Some(result) = credential_sync.try_result() {
                         crate::pollers::log_credential_sync_actions(&result);
                         if let Some(notice) = credential_sync_notices.notice(&result) {
-                            eprintln!("Hel: {notice}");
+                            eprintln!("Mjolnir: {notice}");
                         }
                     }
                 }

@@ -1080,7 +1080,7 @@ impl HelState {
     pub fn validate(&self) -> Result<()> {
         if self.version != STATE_VERSION {
             bail!(
-                "unsupported Hel state version {}; expected {STATE_VERSION}",
+                "unsupported Mjolnir state version {}; expected {STATE_VERSION}",
                 self.version
             );
         }
@@ -1213,9 +1213,9 @@ impl HelState {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let body = fs::read(path).with_context(|| format!("read Hel state {}", path.display()))?;
+        let body = fs::read(path).with_context(|| format!("read Mjolnir state {}", path.display()))?;
         let state: Self = serde_json::from_slice(&body)
-            .with_context(|| format!("parse Hel state {}", path.display()))?;
+            .with_context(|| format!("parse Mjolnir state {}", path.display()))?;
         state.validate()?;
         Ok(state)
     }
@@ -1226,7 +1226,7 @@ impl HelState {
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        let body = serde_json::to_vec_pretty(self).context("serialize Hel state")?;
+        let body = serde_json::to_vec_pretty(self).context("serialize Mjolnir state")?;
         atomic_write(path, &body)
     }
 }
@@ -1243,7 +1243,7 @@ pub fn state_path() -> PathBuf {
 pub fn new_session_id() -> Result<String> {
     let mut random = [0u8; 16];
     getrandom::fill(&mut random)
-        .map_err(|error| anyhow::anyhow!("generate Hel session id: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("generate Mjolnir session id: {error}"))?;
     let mut encoded = String::with_capacity(32);
     for byte in random {
         use std::fmt::Write as _;
@@ -1977,7 +1977,7 @@ mod tests {
     fn provisional_title_is_cleaned_and_bounded() {
         assert_eq!(
             provisional_session_title(concat!(
-                "<hel-project-memory>private</hel-project-memory> ",
+                "<mj-project-memory>private</mj-project-memory> ",
                 "  fix the flaky\nresume test  "
             ))
             .as_deref(),
@@ -2011,14 +2011,14 @@ mod tests {
 
         assert_eq!(
             harness_session_title(&[titled(concat!(
-                "<hel-project-memory>private</hel-project-memory> ",
+                "<mj-project-memory>private</mj-project-memory> ",
                 "Visible session name"
             ))])
             .as_deref(),
             Some("Visible session name")
         );
         assert_eq!(
-            harness_session_title(&[titled("<hel-project-memory>truncated")]),
+            harness_session_title(&[titled("<mj-project-memory>truncated")]),
             None
         );
     }

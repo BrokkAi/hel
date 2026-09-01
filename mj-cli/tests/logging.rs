@@ -33,7 +33,7 @@ fn top_level_failure_is_written_to_a_private_per_run_log() {
     let contents = fs::read_to_string(command_log).unwrap();
     assert!(contents.contains("Hel started"));
     assert!(contents.contains("command=\"checkpoint\""));
-    assert!(contents.contains("Hel exited with an error"));
+    assert!(contents.contains("Mjolnir exited with an error"));
     assert!(contents.contains("unknown session definitely-missing"));
 
     #[cfg(unix)]

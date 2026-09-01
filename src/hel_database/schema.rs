@@ -11,7 +11,7 @@ pub(super) fn open_writer(path: &Path) -> Result<Connection> {
             .with_context(|| format!("create Hel data directory {}", parent.display()))?;
     }
     let connection =
-        Connection::open(path).with_context(|| format!("open Hel database {}", path.display()))?;
+        Connection::open(path).with_context(|| format!("open Mjolnir database {}", path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -48,7 +48,7 @@ fn open_reader_strict(path: &Path) -> Result<Connection> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("open Hel database read-only {}", path.display()))?;
+    .with_context(|| format!("open Mjolnir database read-only {}", path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -57,7 +57,7 @@ fn open_reader_strict(path: &Path) -> Result<Connection> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     ensure!(
         version == SCHEMA_VERSION,
-        "Hel database schema {version} is not the supported schema {SCHEMA_VERSION}; start the Hel daemon to migrate it"
+        "Mjolnir database schema {version} is not the supported schema {SCHEMA_VERSION}; start the Mjolnir daemon to migrate it"
     );
     Ok(connection)
 }
@@ -122,7 +122,7 @@ pub(super) fn forget_verified_schema(path: &Path) {
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
-        bail!("Hel database schema {version} is newer than supported schema {SCHEMA_VERSION}");
+        bail!("Mjolnir database schema {version} is newer than supported schema {SCHEMA_VERSION}");
     }
     if version == 0 {
         connection.execute_batch(
@@ -567,7 +567,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
         })?;
     if recorded != Some(SCHEMA_VERSION) {
         bail!(
-            "Hel database migration ledger {:?} does not match schema {}",
+            "Mjolnir database migration ledger {:?} does not match schema {}",
             recorded,
             SCHEMA_VERSION
         );

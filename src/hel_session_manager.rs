@@ -3918,7 +3918,7 @@ mod tests {
             "unexpected error: {detail}"
         );
         assert!(
-            !detail.contains("Hel database"),
+            !detail.contains("Mjolnir database"),
             "connect read the projection before it reached the relay: {detail}"
         );
     }

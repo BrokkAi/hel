@@ -1942,7 +1942,7 @@ mod tests {
                     Some(ProvisionStage::Syncing)
                 ),
                 (
-                    "start detached Hel worker".to_owned(),
+                    "start detached Mjolnir worker".to_owned(),
                     Some(ProvisionStage::Starting)
                 ),
             ]

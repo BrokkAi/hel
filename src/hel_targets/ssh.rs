@@ -1,6 +1,6 @@
 use super::*;
 
-/// The connectivity probe `hel doctor` runs against an SSH target.
+/// The connectivity probe `mj doctor` runs against an SSH target.
 ///
 /// It reuses the provisioning argument order so the probe fails exactly where
 /// a real session would, with two deliberate overrides prepended. OpenSSH

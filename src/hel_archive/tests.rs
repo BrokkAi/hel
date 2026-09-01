@@ -777,7 +777,7 @@ fn readers_without_part_support_reject_sharded_archives() {
     drop(file);
     let error = format!("{:#}", read_archive_verified(&downgraded).unwrap_err());
     assert!(
-        error.contains("incompatible Hel archive schema 2; this build requires schema 3"),
+        error.contains("incompatible Mjolnir archive schema 2; this build requires schema 3"),
         "{error}"
     );
 
@@ -977,7 +977,7 @@ fn old_and_future_schemas_are_rejected_explicitly() {
         let error = format!("{error:#}");
         assert!(
                 error.contains(&format!(
-                    "incompatible Hel archive schema {schema_version}; this build requires schema {ARCHIVE_SCHEMA_VERSION}"
+                    "incompatible Mjolnir archive schema {schema_version}; this build requires schema {ARCHIVE_SCHEMA_VERSION}"
                 )),
                 "{error}"
             );

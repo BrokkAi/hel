@@ -355,7 +355,7 @@ fn sigterm_restores_real_pty_terminal() {
 #[test]
 fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
     const REATTACH_MESSAGE: &str =
-        "Active sessions will continue working; Hel will reattach to them on your next invocation.";
+        "Active sessions will continue working; Mjolnir will reattach to them on your next invocation.";
     let DashboardPty {
         _storage,
         mut master,

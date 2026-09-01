@@ -474,7 +474,7 @@ impl DashboardState {
             last_row_click: None,
             mode: Mode::Dashboard,
             notices: Notices::default(),
-            greeting: "Welcome to Hel".into(),
+            greeting: "Welcome to Mjolnir".into(),
         };
         dashboard.session_details = dashboard
             .state

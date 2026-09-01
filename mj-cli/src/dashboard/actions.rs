@@ -240,7 +240,7 @@ pub(crate) async fn apply_dashboard_action(
                 context.dashboard.finish_import();
                 context
                     .dashboard
-                    .set_notice("Import cancellation requested; no Hel state will be changed.");
+                    .set_notice("Import cancellation requested; no Mjolnir state will be changed.");
             }
         }
         DashboardAction::ConfirmImportBundle {
@@ -264,7 +264,7 @@ pub(crate) async fn apply_dashboard_action(
                 context.dashboard.finish_import();
                 context
                     .dashboard
-                    .set_notice("Import cancelled; no Hel files were changed.");
+                    .set_notice("Import cancelled; no Mjolnir files were changed.");
             }
         }
         DashboardAction::RenameSession { session_id, title } => {

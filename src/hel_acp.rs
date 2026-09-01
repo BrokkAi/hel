@@ -200,7 +200,7 @@ fn project_memory_mcp(spec: &LaunchSpec) -> Vec<McpServer> {
         return Vec::new();
     };
     vec![McpServer::Stdio(
-        McpServerStdio::new("hel-project-memory", spec.command.clone()).args(vec![
+        McpServerStdio::new("mj-project-memory", spec.command.clone()).args(vec![
             "worker".into(),
             "memory-mcp".into(),
             "--root".into(),
@@ -749,7 +749,7 @@ pub(crate) fn normalized_plan_review(id: String, value: &serde_json::Value) -> E
         id,
         title: Some("Plan review".into()),
         message: format!("{PLAN_REVIEW_MESSAGE_PREFIX}{plan}"),
-        description: Some("Choose what Hel should tell the planning harness.".into()),
+        description: Some("Choose what Mjolnir should tell the planning harness.".into()),
         fields: vec![
             ElicitationField {
                 id: PLAN_REVIEW_ACTION.into(),
@@ -1832,7 +1832,7 @@ async fn serve_session(
             InitializeRequest::new(ProtocolVersion::V1)
                 .client_info(
                     Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-                        .title("Hel"),
+                        .title("Mjolnir"),
                 )
                 .client_capabilities(capabilities),
         )

@@ -83,7 +83,7 @@ impl Drop for ReliableWorkerGuard {
         };
         let mut writer = ReliableWriter { sender };
         if let Err(error) = writer.flush() {
-            eprintln!("Hel log writer failed to drain before exit: {error}");
+            eprintln!("Mjolnir log writer failed to drain before exit: {error}");
         }
         // The global tracing subscriber owns another sender for the rest of
         // the process. Keep its worker valid after this flush so detached
@@ -101,10 +101,10 @@ fn reliable_non_blocking(file: File) -> Result<(ReliableWriter, ReliableWorkerGu
                 write_log_messages(file, receiver);
             }));
             if let Err(error) = result {
-                eprintln!("Hel log writer panicked: {error:?}");
+                eprintln!("Mjolnir log writer panicked: {error:?}");
             }
         })
-        .context("spawn Hel log writer")?;
+        .context("spawn Mjolnir log writer")?;
     let writer = ReliableWriter {
         sender: sender.clone(),
     };
@@ -119,7 +119,7 @@ fn write_log_messages(mut file: File, receiver: mpsc::Receiver<LogMessage>) {
         match message {
             LogMessage::Line(line) => {
                 if let Err(error) = file.write_all(&line) {
-                    eprintln!("Hel log writer failed: {error}");
+                    eprintln!("Mjolnir log writer failed: {error}");
                     break;
                 }
             }
@@ -127,7 +127,7 @@ fn write_log_messages(mut file: File, receiver: mpsc::Receiver<LogMessage>) {
                 let result = file.flush();
                 let failed = result.is_err();
                 if flushed.send(result).is_err() {
-                    eprintln!("Hel log writer flush completion could not be reported");
+                    eprintln!("Mjolnir log writer flush completion could not be reported");
                 }
                 if failed {
                     break;
@@ -136,7 +136,7 @@ fn write_log_messages(mut file: File, receiver: mpsc::Receiver<LogMessage>) {
         }
     }
     if let Err(error) = file.flush() {
-        eprintln!("Hel log writer failed to flush: {error}");
+        eprintln!("Mjolnir log writer failed to flush: {error}");
     }
 }
 
