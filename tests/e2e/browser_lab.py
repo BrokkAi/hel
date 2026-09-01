@@ -54,15 +54,60 @@ def wait_marker_or_exit(marker: pathlib.Path, browser: subprocess.Popen[bytes]) 
     raise ScenarioFailure("Playwright did not reach its offline synchronization point")
 
 
+# The footer names the keys the focused pane owns, so it is the surface's own
+# report of where the keyboard is. Border styles say the same thing, but a
+# partially redrawn frame can show two panes bordered alike for one frame,
+# whereas the footer is one line that is always rewritten whole.
+PANE_RING = ("Sessions", "Prompt", "Targets", "Quota")
+SESSIONS_FOCUSED = "Enter open \u00b7 n new \u00b7 s resume \u00b7 e edit"
+
+
+def focus_sessions(client) -> None:
+    """Put the keyboard on the Sessions pane and prove it landed there.
+
+    Every pane key is a plain letter, so pressing `e` before focus has actually
+    moved types the letter into the composer instead of opening the session
+    editor. Which pane starts with the keyboard depends on the surface's state,
+    so walk the ring and read the footer rather than assuming one keystroke is
+    enough.
+    """
+    for _ in range(len(PANE_RING) * 2):
+        if SESSIONS_FOCUSED in client.text():
+            return
+        client.send(b"\t")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if SESSIONS_FOCUSED in client.text():
+                return
+            time.sleep(0.05)
+    raise ScenarioFailure(
+        f"the keyboard never reached the Sessions pane: {client.text()[-4000:]}"
+    )
+
+
 def stop_from_dashboard(client) -> None:
-    # The surface opens with the keyboard in Prompt, and the pane keys are
-    # plain letters, so Tab has to move focus first or `e` is typed as text.
-    client.send(b"\t")
+    focus_sessions(client)
     client.send(b"e")
     client.wait_for("Edit session")
+    # Edit session offers Rename, Stop, Cancel for a session with no container,
+    # so one step right of the default reaches Stop.
     client.send(b"\x1b[C\r")
     client.wait_for("Stop session?")
     client.send(b"\r")
+    # A stop needs the daemon's session manager to have adopted the session,
+    # and adoption is asynchronous: a session the browser created moments ago
+    # can still be unmanaged when the first stop reaches it. The surface offers
+    # Retry stop for exactly that, so take it rather than failing on a
+    # condition that resolves itself.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if "Stop could not complete" not in client.text():
+            return
+        # Cancel, Force stop, Retry stop: two steps right of the default.
+        client.send(b"\x1b[C\x1b[C\r")
+        time.sleep(2)
+    raise ScenarioFailure(f"the stop never completed: {client.text()[-4000:]}")
+
 
 
 def run(lab: Lab) -> None:

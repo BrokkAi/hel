@@ -32,7 +32,7 @@ The scope is the normal operator workflow. Native session import, force cleanup,
 
 ## Progress
 
-- [ ] (not started) Milestone 1 — Move the viewer's HTML, CSS and JavaScript out of the Rust string constants into `src/web/`, serve them as separate assets, add a content-security policy, and version the service-worker cache.
+- [x] (2026-09-01 01:46Z) Milestone 1 — The browser application now lives in `src/web/` as `viewer.html`, `viewer.css`, `viewer.js`, `service-worker.js` and `manifest.webmanifest`, embedded with `include_str!`. The vendored JetBrains Mono and the four PNG icons are served for the first time. One `axum` layer applies the content-security policy, `X-Content-Type-Options`, `Referrer-Policy` and `no-store` for `/api/` and `/auth/`, so no route can forget them. The service worker is versioned, deletes superseded caches, and declines `/api/` and `/auth/` outright. The two Node-driven JavaScript checks read the real file and run from a temporary directory. Fixing the browser reliability lab, which was red on `master` for three unrelated reasons, was part of the milestone; see `Surprises & Discoveries`.
 - [ ] (not started) Milestone 2 — Adopt the terminal surface's visual language and replace string-built markup with a DOM-based Markdown renderer.
 - [ ] (not started) Milestone 3 — Extend the server-side projections: sanitized project identity, lifecycle category, capabilities, operations, structured capacity and quota, enriched transcript entries, expanded actions.
 - [ ] (not started) Milestone 4 — Workspace dashboard: tabs, URL routing, live-only session rows grouped by project, menu, capability-driven actions.
@@ -61,6 +61,15 @@ Use timestamps in the form `(2026-08-31 14:20Z)` as steps complete, so a later r
 - Observation: `search_prompts` in `src/hel_database.rs` pages through the entire `prompt_history` table without any overall bound; it stops only when a page comes back short. It is acceptable for a terminal that runs it once per keystroke against a local database, but it must not be reachable straight from an HTTP route.
   Evidence: `src/hel_database.rs`, `fn search_prompts_from`, whose `loop` breaks only on `page_len < PAGE_SIZE`.
 
+- Observation: the browser reliability lab was red on `master` before any of this work, for three independent reasons, and had to be repaired before it could serve as acceptance for anything. First, Chromium refuses to register a service worker over the lab's self-signed certificate; Playwright's `ignoreHTTPSErrors` covers page and API requests but not the service-worker script fetch, so the registration rejection surfaced as a page error and failed the suite's very first assertion. Second, `render_terminal` in `tests/e2e/reliability_lab.py` reconstructs the captured screen onto a fixed 32-row, 140-column grid, while `browser_lab.py` resizes the terminal to 40×150 — so the footer row was outside the reconstruction entirely and text past column 140 smeared, which made screen assertions match things that were not on screen. Third, `stop_from_dashboard` pressed one Tab and then `e`, on the assumption that the surface starts with the keyboard in Prompt and that one Tab reaches Sessions; the surface actually starts on Sessions, so the Tab moved focus *away* and `e` was typed into the composer as a letter.
+  Evidence: on unmodified `master`, seed 4243 failed with `Failed to register a ServiceWorker … An SSL certificate error occurred when fetching the script.`; seed 4245, with only the certificate fixed, failed with `tui-1 did not display 'Edit session'` while the reconstructed screen showed the Quota pane's `Rename profile ID` dialog. Instrumenting the pane walk printed `after tab 1 footer ['Ctrl-G panes · Tab pane · PgUp/PgDn transcript …']` — the Prompt footer — proving focus began on Sessions.
+
+- Observation: a stop issued from the terminal surface against a session the browser created moments earlier can fail with `connect to the session worker for checkpoint: session … is not managed`, and then succeed on retry. The daemon's session manager adopts sessions asynchronously, so the first stop can arrive before adoption. The surface already offers `Retry stop` for this, and the lab now takes it.
+  Evidence: seed 4252 failed with that message in a `Stop could not complete` dialog; seed 4253 and seed 4254, with no product change, passed with `browser reliability: passed clients=2 sse_reconnect=1 leaks=0`.
+
+- Observation: reformatting the extracted JavaScript is safe to verify mechanically. Running `prettier` over the original minified source and over the extracted file produces byte-identical output, and the same round-trip on the CSS is identical after whitespace normalisation, so the move provably changed no code.
+  Evidence: `diff -u <(prettier orig.js) src/web/viewer.js` reported no difference; a minify-and-compare of the original `<style>` block against `src/web/viewer.css` reported `identical`.
+
 Add further entries here as work proceeds, each with short evidence.
 
 ## Decision Log
@@ -88,6 +97,18 @@ Add further entries here as work proceeds, each with short evidence.
 - Decision: derive the initial session title on the server from the phone's own request, using the terminal's rule (`"{bundle or project directory} via {profile}"`), and never send an unrequested path back to the phone.
   Rationale: the terminal derives its title in `crates/hel-cli/src/dashboard/io.rs` as `format!("{} via {profile_id}", project_directory_or_bundle)`. For a bare-directory session the phone supplied the directory itself, so echoing it is not a disclosure; for every other session the title contains only a bundle id, which the phone already holds.
   Date/Author: 2026-08-31, plan author.
+
+- Decision: repair the browser reliability lab as part of Milestone 1 rather than working around it or declaring it out of scope.
+  Rationale: the plan uses that suite as the acceptance for six later milestones. A suite that cannot pass proves nothing, and each of the three failures was a defect in the harness rather than in the product: a certificate the browser was never told to trust, a screen reconstruction at the wrong size, and an assumption about which pane starts with the keyboard. All three would have produced misleading failures for every future change.
+  Date/Author: 2026-09-01, plan author.
+
+- Decision: verify the asset move mechanically instead of trusting a careful read.
+  Rationale: moving 28 KB of minified JavaScript by hand is exactly the kind of change where a silent character-level mistake survives review. Formatting the original and the copy with the same tool and diffing them turns "I moved it faithfully" into something the tree can demonstrate.
+  Date/Author: 2026-09-01, plan author.
+
+- Decision: the security-headers layer, not each handler, owns `Cache-Control: no-store` for `/api/` and `/auth/`.
+  Rationale: a rejected request never reaches its handler, so a handler-set header is missing from exactly the responses least worth storing. The first version of the layer left `no-store` in the handlers and a test caught an unauthenticated `/api/snapshot` answering with no cache directive at all.
+  Date/Author: 2026-09-01, plan author.
 
 Record every later decision here in the same shape, including decisions to abandon or reshape a milestone.
 

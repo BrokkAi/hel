@@ -15,7 +15,8 @@ use anyhow::{Context, Result as AnyResult};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_TYPE, COOKIE, HeaderValue, LOCATION, REFERRER_POLICY, SET_COOKIE,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY as CONTENT_SECURITY_POLICY_HEADER, CONTENT_TYPE, COOKIE,
+    HeaderValue, LOCATION, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::middleware::Next;
@@ -662,13 +663,21 @@ fn router(options: ServerOptions) -> Router {
     Router::new()
         .route("/", get(viewer))
         .route("/login", get(viewer))
+        .route("/viewer.css", get(viewer_css))
+        .route("/viewer.js", get(viewer_js))
         .route("/manifest.webmanifest", get(manifest))
         .route("/service-worker.js", get(service_worker))
         .route("/icon.svg", get(icon))
+        .route("/icon-192.png", get(icon_192))
+        .route("/icon-512.png", get(icon_512))
+        .route("/maskable-512.png", get(maskable_512))
+        .route("/apple-touch-icon.png", get(apple_touch_icon))
+        .route("/fonts/jetbrains-mono.woff2", get(mono_font))
         .route("/auth/session", post(create_session).delete(clear_session))
         .route("/auth/login", get(create_session_from_query))
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
 
@@ -715,9 +724,6 @@ async fn create_session_from_query(
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
-        .headers_mut()
-        .insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     Ok(response)
 }
 
@@ -1352,20 +1358,85 @@ const fn target_kind_name(target: &TargetTemplate) -> &'static str {
     }
 }
 
+/// Every asset the browser application is built from. They are real files
+/// under `src/web/` and `src/icons/` rather than string literals, so the
+/// JavaScript can be read, formatted and tested as JavaScript, and so the
+/// content-security policy below can forbid inline script outright.
+const VIEWER_HTML: &str = include_str!("web/viewer.html");
+const VIEWER_CSS: &str = include_str!("web/viewer.css");
+const VIEWER_JS: &str = include_str!("web/viewer.js");
+const SERVICE_WORKER: &str = include_str!("web/service-worker.js");
+const MANIFEST: &str = include_str!("web/manifest.webmanifest");
+const ICON_SVG: &str = include_str!("../src/icons/icon.svg");
+const ICON_192: &[u8] = include_bytes!("../src/icons/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../src/icons/icon-512.png");
+const MASKABLE_512: &[u8] = include_bytes!("../src/icons/maskable-512.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../src/icons/apple-touch-icon.png");
+const MONO_FONT: &[u8] = include_bytes!("../src/fonts/jetbrains-mono.woff2");
+
+/// What the browser is permitted to load and execute.
+///
+/// `default-src 'none'` refuses everything not named below, so a future asset
+/// has to be allowed deliberately. Script and style come only from this
+/// origin, which is why none of either may be inline. `img-src` needs `data:`
+/// because attached images render from data URLs the browser itself just
+/// built from a file the person picked.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; \
+script-src 'self'; \
+style-src 'self'; \
+img-src 'self' data:; \
+font-src 'self'; \
+connect-src 'self'; \
+manifest-src 'self'; \
+base-uri 'none'; \
+form-action 'none'; \
+frame-ancestors 'none'";
+
 async fn viewer() -> Response<Body> {
     static_response("text/html; charset=utf-8", VIEWER_HTML, true)
+}
+
+async fn viewer_css() -> Response<Body> {
+    static_response("text/css; charset=utf-8", VIEWER_CSS, false)
+}
+
+async fn viewer_js() -> Response<Body> {
+    static_response("text/javascript; charset=utf-8", VIEWER_JS, false)
 }
 
 async fn manifest() -> Response<Body> {
     static_response("application/manifest+json", MANIFEST, false)
 }
 
+/// The worker itself is never cached: a stale worker is what keeps a phone on
+/// a superseded application, and it is the one asset that can never be fixed
+/// by a later upgrade.
 async fn service_worker() -> Response<Body> {
     static_response("text/javascript; charset=utf-8", SERVICE_WORKER, true)
 }
 
 async fn icon() -> Response<Body> {
-    static_response("image/svg+xml", ICON, false)
+    static_response("image/svg+xml", ICON_SVG, false)
+}
+
+async fn icon_192() -> Response<Body> {
+    binary_response("image/png", ICON_192)
+}
+
+async fn icon_512() -> Response<Body> {
+    binary_response("image/png", ICON_512)
+}
+
+async fn maskable_512() -> Response<Body> {
+    binary_response("image/png", MASKABLE_512)
+}
+
+async fn apple_touch_icon() -> Response<Body> {
+    binary_response("image/png", APPLE_TOUCH_ICON)
+}
+
+async fn mono_font() -> Response<Body> {
+    binary_response("font/woff2", MONO_FONT)
 }
 
 fn static_response(
@@ -1373,123 +1444,55 @@ fn static_response(
     body: &'static str,
     no_store: bool,
 ) -> Response<Body> {
-    let mut response = Response::new(Body::from(body));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    if no_store {
-        response
-            .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    }
+    finish_static(Response::new(Body::from(body)), content_type, no_store)
+}
+
+fn binary_response(content_type: &'static str, body: &'static [u8]) -> Response<Body> {
+    finish_static(Response::new(Body::from(body)), content_type, false)
+}
+
+/// Cacheable assets still revalidate. `no-cache` means "ask first", not "do
+/// not store", so an upgraded viewer is picked up on the next load while an
+/// unchanged one costs one conditional request.
+fn finish_static(
+    mut response: Response<Body>,
+    content_type: &'static str,
+    no_store: bool,
+) -> Response<Body> {
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(if no_store { "no-store" } else { "no-cache" }),
+    );
     response
 }
 
-const MANIFEST: &str = r##"{
-  "name": "Hel",
-  "short_name": "Hel",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#08090d",
-  "theme_color": "#08090d",
-  "icons": [{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
-}"##;
-
-const SERVICE_WORKER: &str = r#"
-self.addEventListener('install', event => event.waitUntil(caches.open('hel-v1').then(cache => cache.addAll(['/', '/manifest.webmanifest', '/icon.svg']))));
-self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
-self.addEventListener('fetch', event => { if (event.request.method === 'GET' && !new URL(event.request.url).pathname.startsWith('/api/')) event.respondWith(fetch(event.request).catch(() => caches.match(event.request))); });
-"#;
-
-const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="100" fill="#08090d"/><path d="M132 88v336M380 88v336M132 256h248" stroke="#b9ff5a" stroke-width="54" stroke-linecap="round"/></svg>"##;
-
-const VIEWER_HTML: &str = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="icon" href="/icon.svg"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
-<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}.elicitation{border-color:#d985ff}.elicitation-message{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 10px}.elicitation-field{display:flex;flex-direction:column;gap:4px;margin:10px 0}.elicitation-field select[multiple]{min-height:120px}.elicitation-field input[type=checkbox]{align-self:start;width:22px;height:22px}#prompt-text{display:block;width:100%;box-sizing:border-box;min-height:76px;max-height:40vh;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}#prompt-text:empty::before{content:attr(data-placeholder);color:#899184;pointer-events:none}#attachments{margin-top:8px}.attachment{display:flex;align-items:center;gap:8px;border:1px solid #3b424e;border-radius:9px;padding:6px 8px}.attachment img{width:44px;height:44px;object-fit:cover;border-radius:6px}.attachment button{padding:2px 10px}#conversation-feed{min-height:30vh}</style></head>
-<body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
-<main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
-<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><div id="elicitations"></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><div id="prompt-text" class="composer-input" contenteditable="true" role="textbox" aria-multiline="true" enterkeyhint="send" spellcheck="true" aria-label="Message the agent" data-placeholder="Message the agent or use !command"></div><div id="attachments" class="row" aria-label="Attached images"></div><div class="row"><button>Send or queue</button><button type="button" id="attach-image" class="secondary" aria-label="Attach one or more images" hidden>Images</button><input id="image-picker" type="file" accept="image/*" multiple hidden></div><p id="conversation-error"></p></form></section></main>
-<script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells'),elicitations=document.querySelector('#elicitations'),promptText=document.querySelector('#prompt-text'),attachments=document.querySelector('#attachments'),attachImage=document.querySelector('#attach-image'),imagePicker=document.querySelector('#image-picker');let snapshot,currentSession,cursor=0,acknowledged=0,eventSource;
-async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}if(response.status===202||response.status===204)return null;return response.json()}
-function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
-function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
-function startEvents(){if(eventSource)eventSource.close();eventSource=new EventSource('/api/events');eventSource.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}
-async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''}${x.pending_elicitations?.length?' <span class="pill alert">input needed</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);renderElicitations(session);renderAttachments();document.querySelector('#conversation-state').textContent=session.state}}if(!eventSource)startEvents();return true}catch(e){if(e.message==='unauthorized'){snapshot=undefined;currentSession=null;if(eventSource){eventSource.close();eventSource=undefined}login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}return false}}
-async function restoreRoute(){if(!await refresh())return;const match=location.hash.match(/^#conversation\/([A-Za-z0-9_-]+)$/);if(match)await openConversation(match[1])}
-function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>';shells.innerHTML=(session.active_user_shells||[]).map(x=>`<div class="queue-item"><span>$ ${escapeHtml(x.command)}</span><button class="danger" data-shell-id="${escapeAttr(x.id)}">Cancel</button></div>`).join('')||'<p class="dim">No running shells.</p>'}
-// Every snapshot revision re-renders the conversation. Rebuilding a card the
-// user is answering would wipe the half-filled form and steal focus, so each
-// pending request keeps its live DOM until the request itself changes or
-// leaves the snapshot.
-const elicitationCards=new Map(),sentElicitations=new Set();
-function elicitationKey(sessionId,id){return `${sessionId}\u001f${id}`}
-function elicitationOptionLabel(option){return option.description?`${option.title} \u2014 ${option.description}`:option.title}
-function elicitationControl(field){if(field.kind==='single_select'||field.kind==='multi_select'){const select=document.createElement('select');select.multiple=field.kind==='multi_select';if(!select.multiple&&!field.required)select.appendChild(new Option('',''));for(const option of field.options||[])select.appendChild(new Option(elicitationOptionLabel(option),option.value));if(field.kind==='single_select'&&field.default!=null)select.value=field.default;if(select.multiple&&(field.default||[]).length)for(const option of select.options)option.selected=field.default.includes(option.value);return select}const input=document.createElement('input');input.type=field.kind==='boolean'?'checkbox':(field.kind==='integer'||field.kind==='number'?'number':(field.secret?'password':'text'));if(field.kind==='integer')input.step='1';if(field.kind==='number')input.step='any';if(field.minimum!=null)input.min=field.minimum;if(field.maximum!=null)input.max=field.maximum;if(field.min_length!=null)input.minLength=field.min_length;if(field.max_length!=null)input.maxLength=field.max_length;if(field.pattern)input.pattern=field.pattern;if(field.kind==='boolean')input.checked=field.default===true;else if(field.default!=null)input.value=String(field.default);return input}
-function elicitationFieldValue(field,control){if(field.kind==='multi_select'){const values=[...control.selectedOptions].map(option=>option.value);return values.length||field.required?values:undefined}if(field.kind==='boolean')return control.checked;if(control.value==='')return field.required&&(field.kind==='text'||field.kind==='single_select')?'':undefined;if(field.kind==='integer')return Number.parseInt(control.value,10);if(field.kind==='number')return Number(control.value);return control.value}
-// Builds the controls and returns collect(), which reads them back as ACP
-// content. A custom answer replaces the select it belongs to unless the
-// request pairs it with one specific option, which is how Hel's chat form
-// submits the same request.
-function buildElicitationForm(form,request,register){const entries=[];for(const field of request.fields||[]){const wrapper=document.createElement('label');wrapper.className='elicitation-field';const label=document.createElement('span');label.textContent=`${field.title}${field.required?' *':''}`;const control=elicitationControl(field);control.required=Boolean(field.required)&&field.kind!=='boolean';register(control);wrapper.append(label,control);if(field.description){const description=document.createElement('span');description.className='dim';description.textContent=field.description;wrapper.append(description)}if(field.kind==='multi_select'){const check=()=>{const count=control.selectedOptions.length;const few=field.min_items!=null&&(count>0||field.required)&&count<field.min_items;const many=field.max_items!=null&&count>field.max_items;control.setCustomValidity(few?`Select at least ${field.min_items} option(s).`:(many?`Select at most ${field.max_items} option(s).`:''))};control.addEventListener('change',check);check()}form.append(wrapper);entries.push({field,control})}const customByOwner=new Map();for(const entry of entries){const owner=entry.field.custom_answer_for;if(!owner||entry.field.kind!=='text'||customByOwner.has(owner))continue;const target=entries.find(candidate=>candidate.field.id===owner);if(!target||!Array.isArray(target.field.options))continue;customByOwner.set(owner,entry)}return()=>{for(const entry of entries)if(entry.field.kind==='text')entry.control.value=entry.control.value.trim();if(!form.reportValidity())return null;const active=new Map();for(const [owner,entry] of customByOwner)if(entry.control.value!=='')active.set(owner,entry);const content={};for(const entry of entries){const {field,control}=entry;if(customByOwner.get(field.custom_answer_for)===entry){if(active.has(field.custom_answer_for))content[field.id]=control.value;continue}const custom=active.get(field.id);if(custom&&custom.field.custom_answer_option==null)continue;const value=elicitationFieldValue(field,control);if(value!==undefined)content[field.id]=value}return content}}
-function buildElicitationCard(session,request){const card=document.createElement('section');card.className='card elicitation';const heading=document.createElement('strong');heading.textContent=request.title||'Input needed';const message=document.createElement('pre');message.className='elicitation-message';message.textContent=request.message;const form=document.createElement('form');const status=document.createElement('p');status.className='dim';const gated=[],register=control=>{gated.push(control);return control};const collect=buildElicitationForm(form,request,register);const actions=document.createElement('div');actions.className='row';const send=document.createElement('button');send.type='submit';send.textContent='Send answer';register(send);const decline=document.createElement('button');decline.type='button';decline.className='secondary';decline.textContent='Decline';register(decline);const cancel=document.createElement('button');cancel.type='button';cancel.className='danger';cancel.textContent='Cancel';register(cancel);decline.addEventListener('click',()=>{submitElicitation(session.id,request.id,{action:'decline'})});cancel.addEventListener('click',()=>{submitElicitation(session.id,request.id,{action:'cancel'})});actions.append(send,decline,cancel);form.append(actions);form.addEventListener('submit',event=>{event.preventDefault();const content=collect();if(content)submitElicitation(session.id,request.id,{action:'accept',content})});const nodes=[heading];if(request.description){const description=document.createElement('p');description.className='dim';description.textContent=request.description;nodes.push(description)}nodes.push(message,form,status);card.append(...nodes);return{card,setSent(sent){for(const control of gated)control.disabled=sent;status.textContent=sent?'Answer sent \u2014 waiting for the session to apply it.':''}}}
-function renderElicitations(session){const pending=(session&&session.pending_elicitations)||[];if(session)for(const key of [...sentElicitations])if(key.startsWith(`${session.id}\u001f`)&&!pending.some(request=>elicitationKey(session.id,request.id)===key))sentElicitations.delete(key);const live=new Set(),cards=[];for(const request of pending){const key=elicitationKey(session.id,request.id),signature=JSON.stringify(request);live.add(key);let entry=elicitationCards.get(key);if(!entry||entry.signature!==signature){entry=buildElicitationCard(session,request);entry.signature=signature;elicitationCards.set(key,entry)}entry.setSent(sentElicitations.has(key));cards.push(entry.card)}for(const key of [...elicitationCards.keys()])if(!live.has(key))elicitationCards.delete(key);const mounted=[...elicitations.children];if(mounted.length!==cards.length||cards.some((card,index)=>mounted[index]!==card))elicitations.replaceChildren(...cards)}
-async function submitElicitation(sessionId,elicitationId,response){const key=elicitationKey(sessionId,elicitationId);if(sentElicitations.has(key))return;sentElicitations.add(key);const rerender=()=>{const session=snapshot?.sessions.find(x=>x.id===sessionId);if(session&&sessionId===currentSession)renderElicitations(session)};rerender();try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'respond-elicitation',session_id:sessionId,elicitation_id:elicitationId,response})});document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){sentElicitations.delete(key);document.querySelector('#conversation-error').textContent=err.message;rerender()}}
-// The composer is a contenteditable rather than a textarea so a pasted or
-// dropped image can be intercepted where it lands, and so the box grows with
-// its content without a layout read on every keystroke. Rich content is
-// refused at beforeinput, which keeps the box plain text however it arrives.
-const MAX_PROMPT_REQUEST_BYTES=32*1024*1024;
-let composerRevision=0,composerPreserveEmptyBreak=false,promptImages=[];
-function composerText(){let text='';const blocks=new Set(['DIV','P']);const append=node=>{if(node.nodeType===Node.TEXT_NODE){text+=node.nodeValue||'';return}if(node.nodeName==='BR'){if(!node.dataset.composerFiller)text+='\n';return}const block=node!==promptText&&blocks.has(node.nodeName);if(block&&text&&!text.endsWith('\n'))text+='\n';node.childNodes.forEach(append);if(block&&node.nextSibling&&!text.endsWith('\n'))text+='\n'};append(promptText);return text.replace(/\r\n?/g,'\n')}
-function setComposerText(text){promptText.textContent=text}
-function placeComposerCaretAtEnd(){const selection=window.getSelection();if(!selection)return;const range=document.createRange();range.selectNodeContents(promptText);range.collapse(false);selection.removeAllRanges();selection.addRange(range)}
-function placeComposerCaretAtPoint(x,y){let range=document.caretRangeFromPoint?.(x,y)||null;if(!range&&document.caretPositionFromPoint){const position=document.caretPositionFromPoint(x,y);if(position){range=document.createRange();range.setStart(position.offsetNode,position.offset);range.collapse(true)}}if(!range||!promptText.contains(range.startContainer))return;const selection=window.getSelection();if(!selection)return;selection.removeAllRanges();selection.addRange(range)}
-function insertComposerFallback(node,filler=null){const selection=window.getSelection();const range=selection&&selection.rangeCount?selection.getRangeAt(0):null;if(!range||!promptText.contains(range.commonAncestorContainer)){promptText.append(node);if(filler)promptText.append(filler);placeComposerCaretAtEnd();return}range.deleteContents();range.insertNode(node);if(filler)node.after(filler);range.setStartAfter(node);range.collapse(true);selection.removeAllRanges();selection.addRange(range)}
-// execCommand keeps the browser's own undo stack, so it is tried first; the
-// fallback covers engines that refuse it, and the revision check covers those
-// that run it without emitting the input event that keeps state in step.
-function runComposerEdit(command,value,fallback){promptText.focus();const revision=composerRevision;if(document.execCommand(command,false,value)){if(composerRevision===revision)composerInputChanged();return}fallback();composerInputChanged()}
-function insertComposerText(text){const normalized=text.replace(/\r\n?/g,'\n');runComposerEdit('insertText',normalized,()=>{insertComposerFallback(document.createTextNode(normalized))})}
-function insertComposerLineBreak(){composerPreserveEmptyBreak=true;try{runComposerEdit('insertLineBreak',null,()=>{const filler=document.createElement('br');filler.dataset.composerFiller='true';insertComposerFallback(document.createElement('br'),filler)});let last=promptText;while(last.lastChild)last=last.lastChild;if(last.nodeName==='BR'&&last.previousSibling?.nodeName==='BR'){last.dataset.composerFiller='true'}}finally{composerPreserveEmptyBreak=false}}
-// A cleared box can keep a stray break behind it, which leaves the placeholder
-// hidden and the box looking occupied when it holds nothing.
-function composerInputChanged(){composerRevision+=1;if(!composerPreserveEmptyBreak&&!promptText.textContent&&promptText.childNodes.length)promptText.replaceChildren()}
-function readFileAsDataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.addEventListener('load',()=>resolve(String(reader.result||'')),{once:true});reader.addEventListener('error',()=>reject(reader.error||new Error('file read failed')),{once:true});reader.readAsDataURL(file)})}
-function imageDimensions(file){return new Promise((resolve,reject)=>{const url=URL.createObjectURL(file);const image=new Image();image.addEventListener('load',()=>{const size={width:image.naturalWidth,height:image.naturalHeight};URL.revokeObjectURL(url);resolve(size)},{once:true});image.addEventListener('error',()=>{URL.revokeObjectURL(url);reject(new Error('the browser could not decode this image'))},{once:true});image.src=url})}
-async function promptImageFromFile(file){if(!file.type.startsWith('image/'))throw new Error(`${file.name||'That file'} is not an image`);if(file.size>=MAX_PROMPT_REQUEST_BYTES)throw new Error(`${file.name||'That image'} is too large for the 32 MiB request limit`);const [dataUrl,size]=await Promise.all([readFileAsDataUrl(file),imageDimensions(file)]);const comma=dataUrl.indexOf(',');if(comma<0||!dataUrl.slice(comma+1))throw new Error(`Could not read ${file.name||'that image'}`);return{data_base64:dataUrl.slice(comma+1),mime_type:file.type,width:size.width,height:size.height,name:file.name||'Pasted image'}}
-async function attachImageFiles(files){const session=snapshot?.sessions.find(x=>x.id===currentSession);if(!currentSession||!session?.prompt_images_supported||!files.length)return;const sessionId=currentSession;try{const added=[];for(const file of files)added.push(await promptImageFromFile(file));if(currentSession!==sessionId)return;promptImages=promptImages.concat(added);renderAttachments();document.querySelector('#conversation-error').textContent=''}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
-function renderAttachments(){const session=snapshot?.sessions.find(x=>x.id===currentSession);attachImage.hidden=!session?.prompt_images_supported;attachments.replaceChildren();for(const [index,image] of promptImages.entries()){const chip=document.createElement('div');chip.className='attachment';const thumb=document.createElement('img');thumb.alt='';thumb.src=`data:${image.mime_type};base64,${image.data_base64}`;const caption=document.createElement('span');caption.textContent=`${image.name} \u00b7 ${image.width}\u00d7${image.height}`;const remove=document.createElement('button');remove.type='button';remove.className='danger';remove.setAttribute('aria-label',`Remove ${image.name}`);remove.textContent='\u00d7';remove.onclick=()=>{promptImages.splice(index,1);renderAttachments()};chip.append(thumb,caption,remove);attachments.append(chip)}}
-async function submitPrompt(){if(!currentSession)return;const value=composerText(),images=promptImages;if(!value.trim()&&!images.length)return;const error=document.querySelector('#conversation-error');if(value.startsWith('!')&&images.length){error.textContent='Shell commands cannot carry images.';return}const body=value.startsWith('!')?{action:'run-shell',session_id:currentSession,command:value.slice(1)}:{action:'prompt',session_id:currentSession,text:value,images:images.map(image=>({data_base64:image.data_base64,mime_type:image.mime_type,width:image.width,height:image.height}))};const payload=JSON.stringify(body);if(new TextEncoder().encode(payload).byteLength>MAX_PROMPT_REQUEST_BYTES){error.textContent='Prompt attachments exceed the 32 MiB request limit.';return}try{await request('/api/actions',{method:'POST',body:payload});setComposerText('');promptImages=[];renderAttachments();error.textContent='';await refresh()}catch(err){error.textContent=err.message}}
-function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
-async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;if(cursor>acknowledged){const through=cursor;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through})});acknowledged=through}}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
-async function openConversation(id){const session=snapshot?.sessions.find(x=>x.id===id);if(!session?.conversation_available){showDashboard();return}currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');document.querySelector('#conversation-title').textContent=session.title;document.querySelector('#conversation-state').textContent=session.state;renderQueue(session);renderElicitations(session);promptImages=[];renderAttachments();await loadConversation(false)}
-function showDashboard(){currentSession=null;cursor=0;acknowledged=0;location.hash='';elicitations.replaceChildren();elicitationCards.clear();promptImages=[];renderAttachments();conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
-document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';await restoreRoute()}catch(err){document.querySelector('#login-error').textContent=err.message}};
-logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
-newTarget.onchange=syncProjectDirectory;
-newForm.onsubmit=async e=>{e.preventDefault();const target=snapshot.targets.find(x=>x.id===newTarget.value);try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'new',title:document.querySelector('#new-title').value,profile_id:newProfile.value,bundle_id:newBundle.value,target_id:newTarget.value,project_directory:target?.requires_project_directory?newProjectDirectory.value:null})});document.querySelector('#new-title').value='';actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
-sessions.onclick=async e=>{const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='open')return openConversation(button.dataset.id);if(button.dataset.action==='close'&&!confirm('Save a recovery copy, stop, and destroy this session target? Queued prompts will be preserved.'))return;const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target;const session=snapshot.sessions.find(x=>x.id===button.dataset.id);body.queue='start';if(session?.queued_prompts?.length){const choice=prompt(`This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,'start');if(choice===null)return;if(!['start','discard'].includes(choice.toLowerCase()))return alert('Enter start or discard.');body.queue=choice.toLowerCase()}}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
-document.querySelector('#back').onclick=showDashboard;
-document.querySelector('#prompt-form').onsubmit=e=>{e.preventDefault();submitPrompt()};
-promptText.addEventListener('input',composerInputChanged);
-// Rich text, and anything a paste or drop would inject as markup, never
-// belongs in a prompt: refuse it here and re-insert the plain text instead.
-promptText.addEventListener('beforeinput',e=>{const kind=e.inputType||'';if(kind==='insertHTML'||kind.startsWith('insertFromDrop')||kind.startsWith('insertFromPaste')||kind.startsWith('format'))e.preventDefault()});
-promptText.addEventListener('paste',e=>{const files=Array.from(e.clipboardData?.items||[]).filter(item=>item.kind==='file'&&item.type.startsWith('image/')).map(item=>item.getAsFile()).filter(Boolean);if(files.length){e.preventDefault();const session=snapshot?.sessions.find(x=>x.id===currentSession);if(session?.prompt_images_supported)attachImageFiles(files);else document.querySelector('#conversation-error').textContent='This session does not support image prompts.';return}const text=e.clipboardData?.getData('text/plain');if(text===undefined)return;e.preventDefault();insertComposerText(text)});
-promptText.addEventListener('dragover',e=>{e.preventDefault();const types=Array.from(e.dataTransfer?.types||[]);if(e.dataTransfer)e.dataTransfer.dropEffect=types.some(type=>type==='text/plain'||type==='Files')?'copy':'none'});
-promptText.addEventListener('drop',e=>{e.preventDefault();placeComposerCaretAtPoint(e.clientX,e.clientY);const files=Array.from(e.dataTransfer?.files||[]).filter(file=>file.type.startsWith('image/'));if(files.length){const session=snapshot?.sessions.find(x=>x.id===currentSession);if(session?.prompt_images_supported)attachImageFiles(files);else document.querySelector('#conversation-error').textContent='This session does not support image prompts.';return}const text=e.dataTransfer?.getData('text/plain')||'';if(text)insertComposerText(text)});
-// An active IME composition steers its candidate with Enter and the arrows,
-// so the composer must not read those keys until the composition ends.
-promptText.addEventListener('keydown',e=>{if(e.isComposing||e.keyCode===229)return;if(e.key==='Enter'&&!e.shiftKey&&!e.metaKey&&!e.ctrlKey&&!e.altKey){e.preventDefault();submitPrompt();return}if(e.key==='Enter'&&e.shiftKey&&!e.metaKey&&!e.ctrlKey&&!e.altKey){e.preventDefault();insertComposerLineBreak();return}if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();submitPrompt()}});
-attachImage.onclick=()=>imagePicker.click();
-imagePicker.onchange=()=>{const files=Array.from(imagePicker.files||[]);imagePicker.value='';attachImageFiles(files)};
-queue.onclick=async e=>{const button=e.target.closest('button[data-queue-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'remove-queued-prompt',session_id:currentSession,queue_id:button.dataset.queueId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
-shells.onclick=async e=>{const button=e.target.closest('button[data-shell-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'cancel-shell',session_id:currentSession,shell_command_id:button.dataset.shellId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
-function escapeHtml(value){const e=document.createElement('span');e.textContent=value;return e.innerHTML}function escapeAttr(value){return escapeHtml(value).replaceAll('"','&quot;')}
-window.addEventListener('online',()=>{startEvents();refresh()});
-if('serviceWorker'in navigator)navigator.serviceWorker.register('/service-worker.js');restoreRoute();
-</script></body></html>"##;
+/// Headers every response carries, applied once as a layer so no route can
+/// forget them.
+///
+/// The layer also owns `no-store` for live state and authentication, rather
+/// than leaving it to each handler. A rejected request never reaches its
+/// handler, so a handler-set header is missing from exactly the responses that
+/// are least worth storing.
+async fn security_headers(request: Request, next: Next) -> Response<Body> {
+    let live = {
+        let path = request.uri().path();
+        path.starts_with("/api/") || path.starts_with("/auth/")
+    };
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_SECURITY_POLICY_HEADER,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    if live {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
 
 #[cfg(test)]
 mod tests {
@@ -1918,19 +1921,56 @@ mod tests {
         );
     }
 
+    /// One slice of the browser application, named by the two markers that
+    /// bracket it in `src/web/viewer.js`.
+    ///
+    /// Slicing keeps each check to the functions it is about, so an unrelated
+    /// change elsewhere in the application cannot make it fail for the wrong
+    /// reason. The markers are ordinary source text, so a rename that moves
+    /// them fails loudly here rather than silently testing nothing.
+    fn viewer_source(from: &str, to: &str) -> &'static str {
+        let start = VIEWER_JS
+            .find(from)
+            .unwrap_or_else(|| panic!("src/web/viewer.js no longer contains {from:?}"));
+        let end = VIEWER_JS[start..]
+            .find(to)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| {
+                panic!("src/web/viewer.js no longer contains {to:?} after {from:?}")
+            });
+        &VIEWER_JS[start..end]
+    }
+
+    /// Run one JavaScript check under Node.
+    ///
+    /// The script is written to a real file rather than passed to `--eval`, so
+    /// a failure reports a line number a person can open, and the fake DOM the
+    /// check depends on is visible in the same file as the code under test.
+    fn run_viewer_script(name: &str, script: &str) {
+        let directory = tempfile::tempdir().expect("temporary directory for a viewer check");
+        let path = directory.path().join(format!("{name}.mjs"));
+        std::fs::write(&path, script).expect("write the viewer check");
+        let output = std::process::Command::new("node")
+            .arg(&path)
+            .output()
+            .expect("Node.js is required to exercise the web viewer");
+        assert!(
+            output.status.success(),
+            "{name} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     /// The card cache is the fix for answers vanishing under snapshot polls, so
-    /// it is exercised as JavaScript: the render source is lifted out of the
-    /// embedded viewer and run against a stub DOM.
+    /// it is exercised as JavaScript: the render source is lifted out of
+    /// `src/web/viewer.js` and run against a stub DOM.
     #[test]
     fn embedded_viewer_keeps_elicitation_answers_across_snapshot_polls() {
-        let start = VIEWER_HTML
-            .find("const elicitationCards=new Map()")
-            .expect("elicitation card cache");
-        let end = VIEWER_HTML[start..]
-            .find("async function submitElicitation")
-            .map(|offset| start + offset)
-            .expect("elicitation rendering boundary");
-        let source = &VIEWER_HTML[start..end];
+        let source = viewer_source(
+            "const elicitationCards = new Map()",
+            "async function submitElicitation",
+        );
         let dom = r#"
 let replaceCalls = 0;
 class Option {
@@ -2034,17 +2074,9 @@ if (sentElicitations.size !== 0) {
   throw new Error("a resolved request kept its sent marker");
 }
 "#;
-        let script = format!("{dom}\n{source}\n{checks}");
-        let output = std::process::Command::new("node")
-            .args(["--input-type=module", "--eval"])
-            .arg(script)
-            .output()
-            .expect("Node.js is required to exercise the embedded web viewer");
-        assert!(
-            output.status.success(),
-            "embedded viewer elicitation rendering failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+        run_viewer_script(
+            "elicitation-rendering",
+            &format!("{dom}\n{source}\n{checks}"),
         );
     }
 
@@ -2195,14 +2227,7 @@ if (sentElicitations.size !== 0) {
     /// whatever this reader makes of that DOM. Run it as JavaScript.
     #[test]
     fn embedded_viewer_reads_multiline_composer_text_out_of_its_dom() {
-        let start = VIEWER_HTML
-            .find("function composerText()")
-            .expect("composer reader");
-        let end = VIEWER_HTML[start..]
-            .find("function setComposerText(")
-            .map(|offset| start + offset)
-            .expect("composer reader boundary");
-        let source = &VIEWER_HTML[start..end];
+        let source = viewer_source("function composerText()", "function setComposerText(");
         let harness = r##"
 const Node = { TEXT_NODE: 3 };
 function textNode(value) {
@@ -2247,23 +2272,28 @@ if (blocks !== "first\nsecond\nthird") throw new Error(`blocks became ${JSON.str
 const carriage = read([textNode("first\r\nsecond")]);
 if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(carriage)}`);
 "#;
-        let script = format!("{harness}\n{source}\n{checks}");
-        let output = std::process::Command::new("node")
-            .args(["--input-type=module", "--eval"])
-            .arg(script)
-            .output()
-            .expect("Node.js is required to exercise the embedded web viewer");
-        assert!(
-            output.status.success(),
-            "embedded viewer composer reader failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+        run_viewer_script("composer-reader", &format!("{harness}\n{source}\n{checks}"));
     }
 
-    #[test]
-    fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
-        assert!(VIEWER_HTML.contains(r#"<link rel="icon" href="/icon.svg">"#));
+    /// A page that declares no icon makes every browser request
+    /// `/favicon.ico`, which this server does not have. The page therefore has
+    /// to name an icon, and that icon has to be served.
+    #[tokio::test]
+    async fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
+        let (app, _, _) = app();
+        let page = fetch_text(app.clone(), "/").await;
+        assert!(page.contains(r#"rel="icon""#), "the page declares no icon");
+        assert!(page.contains("/icon.svg"), "the page names no icon route");
+        let icon = app
+            .oneshot(Request::get("/icon.svg").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(icon.status(), StatusCode::OK);
+        assert_eq!(
+            icon.headers().get(CONTENT_TYPE).unwrap(),
+            "image/svg+xml",
+            "the icon route does not serve an SVG"
+        );
     }
 
     #[tokio::test]
@@ -2718,20 +2748,149 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
     #[tokio::test]
     async fn the_viewer_shows_a_session_whose_action_failed_after_it_was_accepted() {
         // An accepted action reports its outcome only through snapshots, so
-        // the page has to react to `has_error` for a late failure to be
+        // the application has to react to `has_error` for a late failure to be
         // visible at all.
         let (app, _, _) = app();
-        let page = app
-            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        let script = fetch_text(app, "/viewer.js").await;
+        assert!(script.contains("has_error"), "viewer ignores has_error");
+    }
+
+    /// Every response, not only the page, carries the policy. A header that
+    /// depends on which handler answered is a header somebody will forget.
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers() {
+        for path in [
+            "/",
+            "/viewer.js",
+            "/viewer.css",
+            "/manifest.webmanifest",
+            "/api/snapshot",
+        ] {
+            let (app, _, _) = app();
+            let response = app
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let headers = response.headers();
+            let policy = headers
+                .get(CONTENT_SECURITY_POLICY_HEADER)
+                .unwrap_or_else(|| panic!("{path} carries no content-security policy"))
+                .to_str()
+                .unwrap();
+            assert!(
+                policy.starts_with("default-src 'none';"),
+                "{path} does not refuse unlisted sources: {policy}"
+            );
+            assert!(
+                policy.contains("script-src 'self'") && !policy.contains("unsafe-inline"),
+                "{path} permits inline script: {policy}"
+            );
+            assert!(
+                policy.contains("frame-ancestors 'none'"),
+                "{path} can be framed: {policy}"
+            );
+            assert_eq!(
+                headers.get(X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff",
+                "{path} permits content sniffing"
+            );
+            assert_eq!(
+                headers.get(REFERRER_POLICY).unwrap(),
+                "no-referrer",
+                "{path} leaks a referrer"
+            );
+        }
+    }
+
+    /// The policy forbids inline script and style, so the page must contain
+    /// neither. A page that did would simply fail to run in a browser, which
+    /// no Rust test would otherwise notice.
+    #[tokio::test]
+    async fn the_page_carries_no_inline_script_or_style() {
+        let (app, _, _) = app();
+        let page = fetch_text(app, "/").await;
+        assert!(
+            !page.contains("<script>") && !page.contains("<style>"),
+            "the page inlines script or style, which the policy blocks"
+        );
+        assert!(
+            page.contains(r#"src="/viewer.js""#) && page.contains(r#"href="/viewer.css""#),
+            "the page does not load its script and style as separate assets"
+        );
+    }
+
+    /// A cached API answer is a lie about live session state, and a cached
+    /// service worker is what keeps a phone on a superseded application.
+    #[tokio::test]
+    async fn live_state_and_the_service_worker_are_never_stored() {
+        for path in ["/", "/service-worker.js", "/api/snapshot"] {
+            let (app, _, _) = app();
+            let response = app
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{path} may be stored"
+            );
+        }
+    }
+
+    /// The worker must leave live state alone entirely rather than caching it
+    /// and hoping the cache is fresh.
+    #[test]
+    fn the_service_worker_declines_to_handle_live_state() {
+        assert!(
+            SERVICE_WORKER.contains("url.pathname.startsWith('/api/')"),
+            "the service worker does not exclude the API"
+        );
+        assert!(
+            SERVICE_WORKER.contains("url.pathname.startsWith('/auth/')"),
+            "the service worker does not exclude authentication"
+        );
+        assert!(
+            SERVICE_WORKER.contains("caches.delete"),
+            "the service worker never deletes a superseded cache"
+        );
+    }
+
+    /// The vendored assets have to reach the browser, not merely exist in the
+    /// repository: the manifest names them and a phone installs from it.
+    #[tokio::test]
+    async fn the_installable_assets_are_served() {
+        for (path, content_type) in [
+            ("/icon-192.png", "image/png"),
+            ("/icon-512.png", "image/png"),
+            ("/maskable-512.png", "image/png"),
+            ("/apple-touch-icon.png", "image/png"),
+            ("/fonts/jetbrains-mono.woff2", "font/woff2"),
+        ] {
+            let (app, _, _) = app();
+            let response = app
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path} is not served");
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                content_type,
+                "{path} is served as the wrong type"
+            );
+        }
+    }
+
+    /// Fetch one unauthenticated asset and return it as text. Serving the
+    /// application from several files means a check about the application has
+    /// to name the file it is about.
+    async fn fetch_text(app: Router, path: &str) -> String {
+        let response = app
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
-            .unwrap()
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
-        let page = String::from_utf8(page.to_vec()).unwrap();
-        assert!(page.contains("x.has_error?"), "viewer ignores has_error");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path} is not served");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).expect("assets are UTF-8")
     }
 
     #[tokio::test]
