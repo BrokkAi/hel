@@ -472,6 +472,15 @@ pub(crate) async fn run_server(
     let mut active_user_shells = std::collections::BTreeMap::new();
     let mut pending_elicitations = std::collections::BTreeMap::new();
     let mut prompt_images = std::collections::BTreeSet::new();
+    let mut operational = std::collections::BTreeMap::new();
+    let mut operations = std::collections::BTreeMap::new();
+    // What the capacity poller last said, per probe target. The projection is
+    // built from this on every publish rather than being accumulated, so a
+    // target that disappears from the configuration disappears from the page.
+    let mut capacity_state: std::collections::BTreeMap<String, PhoneCapacity> =
+        std::collections::BTreeMap::new();
+    let (capacity_targets_tx, capacity_triggers_tx, mut capacity_updates_rx) =
+        crate::pollers::spawn_dashboard_capacity_poller();
     let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
         &controller,
         &phone_workspaces,
@@ -482,12 +491,17 @@ pub(crate) async fn run_server(
             active_user_shells: &active_user_shells,
             pending_elicitations: &pending_elicitations,
             prompt_images: &prompt_images,
+            operational: &operational,
+            operations: &operations,
+            capacity: &viewer_capacity(&capacity_state),
         },
         revision,
     ));
     let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
     let (receipt_tx, mut receipt_rx) = tokio::sync::mpsc::channel(32);
+    let (preflight_tx, mut preflight_rx) = tokio::sync::mpsc::channel(32);
+    let (client_state_tx, mut client_state_rx) = tokio::sync::mpsc::channel(64);
     let SessionManagerChannels {
         targets: worker_targets_tx,
         control: worker_commands_tx,
@@ -495,13 +509,23 @@ pub(crate) async fn run_server(
         shutdown: worker_shutdown,
     } = worker;
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+    publish_capacity_targets(&controller, &capacity_targets_tx, &mut capacity_state);
     let mut credential_sync = CredentialSyncCoordinator::spawn();
     let credential_sync_handle = credential_sync.handle();
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
     let mut credential_sync_signals = CredentialSyncSignalTracker::default();
     let mut credential_sync_notices = CredentialSyncNotices::default();
-    let mut options =
-        ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx, receipt_tx)?;
+    // Captured before `options` is moved into the server.
+    let options_session_ttl = hel::hel_server::default_session_ttl();
+    let mut options = ServerOptions::new(
+        bind,
+        snapshot_rx,
+        conversation_rx,
+        action_tx,
+        receipt_tx,
+        preflight_tx,
+        client_state_tx,
+    )?;
     options.shutdown = termination.clone();
     // Session cookies are stateless, so a per-process key would sign every
     // phone out on every restart. Delete the key file to sign them out on
@@ -550,6 +574,11 @@ pub(crate) async fn run_server(
     let serve = hel::hel_server::run_server(options);
     let control = async {
         let mut credential_tick = tokio::time::interval(Duration::from_millis(250));
+        // Stored viewer state expires with the authentication that created it.
+        // The sweep is hourly rather than on every request, because it is
+        // housekeeping and nothing waits for it.
+        let mut prune_tick = tokio::time::interval(Duration::from_secs(60 * 60));
+        let client_state_retention = options_session_ttl;
         let (action_done_tx, mut action_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
             u64,
             Option<String>,
@@ -586,6 +615,9 @@ pub(crate) async fn run_server(
                         active_user_shells: &active_user_shells,
                         pending_elicitations: &pending_elicitations,
                         prompt_images: &prompt_images,
+                        operational: &operational,
+                        operations: &operations,
+                        capacity: &viewer_capacity(&capacity_state),
                     },
                     $revision,
                 )) {
@@ -620,6 +652,32 @@ pub(crate) async fn run_server(
                         break;
                     }
                     phone_workspaces = workspace_updates.borrow_and_update().clone();
+                    revision = daemon_runtime.allocate_revision();
+                    publish_snapshot!(revision);
+                }
+                update = capacity_updates_rx.recv() => {
+                    let Some(update) = update else {
+                        failure = feed_stopped(termination.is_cancelled(), "the capacity poller stopped while the phone server was running");
+                        break;
+                    };
+                    if let Some(entry) = capacity_state.get_mut(&update.target_id) {
+                        entry.refreshing = false;
+                        entry.sampled_at_epoch_seconds = Some(update.sampled_at_epoch_seconds);
+                        match update.result {
+                            Ok(usage) => {
+                                // A fleet with nothing running reports no
+                                // figures, and that is an answer rather than a
+                                // failure.
+                                entry.on_demand = usage.is_none();
+                                entry.usage = usage;
+                                entry.failed = false;
+                            }
+                            // The last good reading stays on screen beside the
+                            // failure: one failed probe is not a reason to
+                            // forget what the machine was doing.
+                            Err(_) => entry.failed = true,
+                        }
+                    }
                     revision = daemon_runtime.allocate_revision();
                     publish_snapshot!(revision);
                 }
@@ -691,10 +749,36 @@ pub(crate) async fn run_server(
                         } else {
                             prompt_images.remove(&update.session_id);
                         }
+                        operational.insert(
+                            update.session_id.clone(),
+                            snapshot.operational.clone(),
+                        );
+                        operations = daemon_runtime
+                            .active_lifecycles()
+                            .iter()
+                            .map(|view| (view.session_id.clone(), viewer_operation(view)))
+                            .collect();
                         revision = daemon_runtime.allocate_revision();
                         conversation_tx.send_replace(conversations.clone());
                         publish_snapshot!(revision);
                     }
+                }
+                _ = prune_tick.tick() => {
+                    // Only rows whose client id names a phone are considered:
+                    // a terminal client's place in a conversation is not the
+                    // phone's to expire.
+                    tokio::spawn(async move {
+                        let pruned = tokio::task::spawn_blocking(move || {
+                            hel::hel_database::prune_phone_client_state(client_state_retention)
+                        })
+                        .await;
+                        match pruned {
+                            Ok(Ok(0)) => {}
+                            Ok(Ok(rows)) => tracing::debug!(rows, "pruned expired phone viewer state"),
+                            Ok(Err(error)) => tracing::warn!(%error, "could not prune phone viewer state"),
+                            Err(error) => tracing::warn!(%error, "phone viewer state pruning task failed"),
+                        }
+                    });
                 }
                 _ = credential_tick.tick() => {
                     schedule_due_credential_syncs(
@@ -708,6 +792,147 @@ pub(crate) async fn run_server(
                             eprintln!("Hel: {notice}");
                         }
                     }
+                }
+                stored = client_state_rx.recv() => {
+                    let Some(stored) = stored else {
+                        failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering viewer state requests");
+                        break;
+                    };
+                    // Every one of these touches SQLite, so each runs on its
+                    // own task. A composer autosaving on a debounce must never
+                    // be able to stall the loop that follows sessions.
+                    let workspace_of = |session_id: &str| {
+                        controller
+                            .state
+                            .sessions
+                            .get(session_id)
+                            .map(|session| session.workspace_id.clone())
+                    };
+                    let bundle_of = |session_id: &str| {
+                        controller
+                            .state
+                            .sessions
+                            .get(session_id)
+                            .map(|session| session.bundle_id.clone())
+                    };
+                    match stored {
+                        hel::hel_server::ClientStateRequest::Read { client_id, session_id, reply } => {
+                            let workspace = workspace_of(&session_id);
+                            tokio::spawn(async move {
+                                let answer = tokio::task::spawn_blocking(move || {
+                                    let workspace = workspace.context("unknown session")?;
+                                    let state = hel::hel_database::client_session_state(
+                                        &client_id, &workspace, &session_id,
+                                    )?;
+                                    anyhow::Ok(hel::hel_server::ViewerClientState {
+                                        draft: state.draft,
+                                        through_event_ordinal: state.through_event_ordinal,
+                                    })
+                                })
+                                .await;
+                                reply.send(flatten_stored(answer)).ok();
+                            });
+                        }
+                        hel::hel_server::ClientStateRequest::SaveDraft { client_id, session_id, draft, reply } => {
+                            let workspace = workspace_of(&session_id);
+                            tokio::spawn(async move {
+                                let answer = tokio::task::spawn_blocking(move || {
+                                    let workspace = workspace.context("unknown session")?;
+                                    hel::hel_database::persist_client_draft(
+                                        &client_id, &workspace, &session_id, &draft,
+                                    )
+                                })
+                                .await;
+                                reply.send(flatten_stored(answer)).ok();
+                            });
+                        }
+                        hel::hel_server::ClientStateRequest::MarkWorkspaceRead { client_id, workspace_id, reply } => {
+                            let sessions = controller
+                                .state
+                                .sessions
+                                .values()
+                                .filter(|session| session.workspace_id == workspace_id)
+                                .map(|session| (session.id.clone(), session.viewed_through_event_ordinal))
+                                .collect::<Vec<_>>();
+                            tokio::spawn(async move {
+                                let answer = tokio::task::spawn_blocking(move || {
+                                    for (session_id, through) in sessions {
+                                        // A receipt that would move backwards
+                                        // is not an error; it is a session this
+                                        // viewer had already read past.
+                                        hel::hel_database::persist_read_receipt(
+                                            &client_id, &workspace_id, &session_id, through,
+                                        )
+                                        .ok();
+                                    }
+                                    anyhow::Ok(())
+                                })
+                                .await;
+                                reply.send(flatten_stored(answer)).ok();
+                            });
+                        }
+                        hel::hel_server::ClientStateRequest::History { session_id, query, scope, reply } => {
+                            let bundle = bundle_of(&session_id);
+                            tokio::spawn(async move {
+                                let answer = tokio::task::spawn_blocking(move || {
+                                    let bundle = bundle.context("unknown session")?;
+                                    let scope = match scope.as_str() {
+                                        "session" => hel::hel_database::HistoryScope::Session,
+                                        "all" => hel::hel_database::HistoryScope::All,
+                                        _ => hel::hel_database::HistoryScope::Project,
+                                    };
+                                    let found = hel::hel_database::search_prompts_bounded(
+                                        &session_id,
+                                        &bundle,
+                                        scope,
+                                        &query,
+                                        hel::hel_server::MAX_HISTORY_MATCHES,
+                                    )?;
+                                    anyhow::Ok(hel::hel_server::ViewerPromptHistory {
+                                        entries: found
+                                            .entries
+                                            .into_iter()
+                                            .map(|entry| entry.text)
+                                            .collect(),
+                                        truncated: found.truncated,
+                                    })
+                                })
+                                .await;
+                                reply.send(flatten_stored(answer)).ok();
+                            });
+                        }
+                    }
+                }
+                preflight = preflight_rx.recv() => {
+                    let Some(hel::hel_server::PreflightRequest { bundle_id, reply }) = preflight else {
+                        failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering preflight requests");
+                        break;
+                    };
+                    // Reading a working tree's status touches the disk, so it
+                    // runs on its own task rather than on the loop that has to
+                    // stay responsive to every other feed.
+                    let bundle = controller.config.bundles.get(&bundle_id).cloned();
+                    tokio::spawn(async move {
+                        let answer = tokio::task::spawn_blocking(move || {
+                            let bundle = bundle.context("unknown bundle")?;
+                            let dirty = hel::hel_local_git::dirty_local_repositories(&bundle)?
+                                .into_iter()
+                                .map(|repository| dirty_repository_label(&repository.path))
+                                .collect();
+                            anyhow::Ok(hel::hel_server::PreflightNew {
+                                dirty_repositories: dirty,
+                            })
+                        })
+                        .await;
+                        let answer = match answer {
+                            Ok(Ok(answer)) => Ok(answer),
+                            Ok(Err(error)) => Err(format!("{error:#}")),
+                            Err(error) => Err(format!("preflight task failed: {error}")),
+                        };
+                        if reply.send(answer).is_err() {
+                            tracing::debug!("phone preflight reply dropped after client disconnect");
+                        }
+                    });
                 }
                 receipt = receipt_rx.recv() => {
                     let Some(ReadReceiptRequest { client_id, session_id, through, reply }) = receipt else {
@@ -767,6 +992,56 @@ pub(crate) async fn run_server(
                         failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering actions");
                         break;
                     };
+                    // A refresh nudges a poller this loop owns. It takes no
+                    // session slot and starts no lifecycle work, so it is
+                    // answered here rather than admitted as an action.
+                    match &request.action {
+                        ControllerAction::RefreshCapacity { target_id } => {
+                            let known = capacity_state.contains_key(target_id);
+                            if known {
+                                if let Some(entry) = capacity_state.get_mut(target_id) {
+                                    entry.refreshing = true;
+                                }
+                                // The trigger is a nudge with no payload: it
+                                // asks the poller to sample every target now,
+                                // which is what a person pressing refresh on
+                                // the Targets page means.
+                                capacity_triggers_tx.send(()).await.ok();
+                                revision = daemon_runtime.allocate_revision();
+                                publish_snapshot!(revision);
+                            }
+                            let outcome = if known {
+                                ActionOutcome::Accepted
+                            } else {
+                                ActionOutcome::Failed
+                            };
+                            if request.reply.send(outcome).is_err() {
+                                tracing::debug!(%target_id, "phone capacity refresh reply dropped after client disconnect");
+                            }
+                            continue;
+                        }
+                        ControllerAction::RefreshQuota { profile_id } => {
+                            let known = controller.config.profiles.contains_key(profile_id);
+                            if known {
+                                // The refresher works from a generation-stamped
+                                // batch, so a new generation is how one is asked
+                                // for again rather than a per-profile trigger.
+                                quota_batch.generation = quota_batch.generation.saturating_add(1);
+                                quota_batch.profiles = quota_refresh_profiles(&controller);
+                                quota_profiles_tx.send_replace(quota_batch.clone());
+                            }
+                            let outcome = if known {
+                                ActionOutcome::Accepted
+                            } else {
+                                ActionOutcome::Failed
+                            };
+                            if request.reply.send(outcome).is_err() {
+                                tracing::debug!(%profile_id, "phone quota refresh reply dropped after client disconnect");
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
                     if let ControllerAction::Cancel { session_id } = &request.action {
                         let outcome = if request_phone_action_cancellation(
                             session_id,
@@ -869,6 +1144,9 @@ pub(crate) async fn run_server(
                                 active_user_shells: &active_user_shells,
                                 pending_elicitations: &pending_elicitations,
                                 prompt_images: &prompt_images,
+                                operational: &operational,
+                                operations: &operations,
+                                capacity: &viewer_capacity(&capacity_state),
                             },
                             revision,
                         )) {
@@ -954,6 +1232,11 @@ pub(crate) async fn run_server(
                             }
                             controller = reloaded;
                             worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                            publish_capacity_targets(
+                                &controller,
+                                &capacity_targets_tx,
+                                &mut capacity_state,
+                            );
                             credential_sync_handle.set_targets(credential_sync_targets(&controller));
                             republish_quota_profiles(
                                 &controller,
@@ -970,6 +1253,17 @@ pub(crate) async fn run_server(
                             prompt_images.retain(|session_id| {
                                 controller.state.sessions.contains_key(session_id)
                             });
+                            operational.retain(|session_id, _| {
+                                controller.state.sessions.contains_key(session_id)
+                            });
+                            // A reload is the moment the controller's own view
+                            // of what is running changes, so the operations the
+                            // phone follows are re-read with it.
+                            operations = daemon_runtime
+                                .active_lifecycles()
+                                .iter()
+                                .map(|view| (view.session_id.clone(), viewer_operation(view)))
+                                .collect();
                             conversations.retain(|id, _| {
                                 controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
                             });
@@ -1046,8 +1340,37 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
         | ControllerAction::Open { session_id }
         | ControllerAction::Cancel { session_id }
         | ControllerAction::RemoveQueuedPrompt { session_id, .. }
-        | ControllerAction::RespondElicitation { session_id, .. } => Some(session_id.clone()),
+        | ControllerAction::RespondElicitation { session_id, .. }
+        | ControllerAction::Rename { session_id, .. }
+        | ControllerAction::CancelTurn { session_id }
+        | ControllerAction::SetConfig { session_id, .. }
+        | ControllerAction::SetPlanMode { session_id, .. } => Some(session_id.clone()),
+        // A refresh belongs to a profile or a target rather than a session, so
+        // it takes no session slot and cannot be refused as session-busy.
+        ControllerAction::RefreshQuota { .. } | ControllerAction::RefreshCapacity { .. } => None,
     }
+}
+
+/// Flatten a joined blocking result into the answer a phone channel carries.
+fn flatten_stored<T>(
+    joined: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> std::result::Result<T, String> {
+    match joined {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(format!("{error:#}")),
+        Err(error) => Err(format!("viewer state task failed: {error}")),
+    }
+}
+
+/// How one dirty repository is named to a phone.
+///
+/// The controller knows it by absolute path; a phone is told the leaf, which is
+/// enough for a person to recognise the repository they are about to launch
+/// over and says nothing about where it lives.
+fn dirty_repository_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 fn phone_action_capacity_available(active_actions: usize) -> bool {
@@ -1135,6 +1458,7 @@ async fn apply_phone_action(
             target_id,
             title,
             project_directory,
+            dirty_ack,
         } => {
             let workspace_id = if workspace_id.is_empty() {
                 let workspaces = hel::hel_database::list_workspaces()?;
@@ -1146,7 +1470,41 @@ async fn apply_phone_action(
             } else {
                 workspace_id
             };
+            // A phone that supplies no title gets the one the terminal would
+            // have derived, so a session started from either surface reads the
+            // same way in both.
+            let title = title.unwrap_or_else(|| {
+                let project = project_directory
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| bundle_id.clone());
+                format!("{project} via {profile_id}")
+            });
             let session_title_override = Some(title.clone());
+            // The acknowledgement has to match the repositories that are dirty
+            // now, not the ones that were dirty when the phone was asked. A
+            // launch over changes nobody saw is the thing this prevents.
+            let allow_dirty_local = if dirty_ack.is_empty() {
+                false
+            } else {
+                let controller_bundle = controller
+                    .config
+                    .bundles
+                    .get(&bundle_id)
+                    .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
+                let dirty = hel::hel_local_git::dirty_local_repositories(controller_bundle)?
+                    .into_iter()
+                    .map(|repository| dirty_repository_label(&repository.path))
+                    .collect::<std::collections::BTreeSet<_>>();
+                let acknowledged = dirty_ack.iter().cloned().collect();
+                if dirty != acknowledged {
+                    bail!(
+                        "the repositories with uncommitted changes are not the ones that were acknowledged; check again"
+                    );
+                }
+                true
+            };
             let session_id = controller.register_session_with_resources(
                 &profile_id,
                 &bundle_id,
@@ -1155,7 +1513,7 @@ async fn apply_phone_action(
                 SessionLaunchOptions {
                     workspace_id,
                     additional_mounts: Vec::new(),
-                    allow_dirty_local: false,
+                    allow_dirty_local,
                     resource_allocation: None,
                     project_directory,
                     session_title_override,
@@ -1306,6 +1664,76 @@ async fn apply_phone_action(
                 .respond_elicitation(elicitation_id, response)
                 .await
         }
+        ControllerAction::Rename { session_id, title } => {
+            controller.rename_session(&session_id, &title)?;
+            Ok(())
+        }
+        ControllerAction::CancelTurn { session_id } => {
+            services
+                .sessions
+                .session(&session_id)
+                .await?
+                .submit(new_command_id("phone-cancel-turn")?, RelayCommand::Cancel)
+                .await?;
+            Ok(())
+        }
+        ControllerAction::SetConfig {
+            session_id,
+            key,
+            value,
+        } => {
+            services
+                .sessions
+                .session(&session_id)
+                .await?
+                .submit(
+                    new_command_id("phone-set-config")?,
+                    RelayCommand::SetConfig { key, value },
+                )
+                .await?;
+            Ok(())
+        }
+        ControllerAction::SetPlanMode { session_id, active } => {
+            // Which call turns plan mode on is a fact about the harness, so it
+            // is asked of the shared decision rather than decided here or, far
+            // worse, in the browser.
+            let harness_kind = controller
+                .state
+                .sessions
+                .get(&session_id)
+                .with_context(|| format!("unknown session {session_id}"))?
+                .harness_kind;
+            let handle = services.sessions.session(&session_id).await?;
+            let operational = handle
+                .view()
+                .snapshot
+                .map(|snapshot| snapshot.operational)
+                .context("the session has not reported what it supports yet")?;
+            let facts = hel::hel_acp::AcpSessionFacts::from_operational(
+                harness_kind,
+                &operational.config,
+                &operational.config_options,
+                operational.modes.as_ref(),
+            );
+            let command = match facts.plan_control(active) {
+                Ok(hel::hel_acp::PlanControl::SetConfig { key, value }) => {
+                    RelayCommand::SetConfig { key, value }
+                }
+                Ok(hel::hel_acp::PlanControl::SetSessionMode { mode_id }) => {
+                    RelayCommand::SetSessionMode { mode_id }
+                }
+                Err(reason) => bail!("{reason}"),
+            };
+            handle
+                .submit(new_command_id("phone-plan-mode")?, command)
+                .await?;
+            Ok(())
+        }
+        // Refreshes are handled by the phone control loop, which owns the
+        // pollers they nudge.
+        ControllerAction::RefreshQuota { .. } | ControllerAction::RefreshCapacity { .. } => {
+            bail!("refresh actions must be handled by the phone control loop")
+        }
     }
 }
 
@@ -1321,6 +1749,201 @@ struct PhoneSessionViews<'a> {
         &'a std::collections::BTreeMap<String, Vec<hel::hel_elicitation::ElicitationRequest>>,
     /// Sessions whose agent advertised image support in prompts.
     prompt_images: &'a std::collections::BTreeSet<String>,
+    /// What each managed session's relay last reported. This is where the
+    /// projection learns what the agent can do, rather than guessing from the
+    /// durable record, which knows only what was configured.
+    operational: &'a std::collections::BTreeMap<String, hel::hel_worker::RelayOperationalState>,
+    /// Lifecycle operations running now, keyed by session.
+    operations: &'a std::collections::BTreeMap<String, hel::hel_server::ViewerOperation>,
+    /// The most recent capacity reading per probe target.
+    capacity: &'a [hel::hel_server::ViewerTargetCapacity],
+}
+
+/// What the phone server remembers about one probe target between readings.
+///
+/// The last good reading is kept beside any failure, because one failed probe
+/// is not a reason to forget what a machine was doing a minute ago; the phone
+/// is told both, and says so.
+#[derive(Debug, Clone)]
+struct PhoneCapacity {
+    target: hel::hel_targets::DeploymentCapacityTarget,
+    usage: Option<hel::hel_targets::DeploymentCapacityUsage>,
+    on_demand: bool,
+    sampled_at_epoch_seconds: Option<u64>,
+    refreshing: bool,
+    failed: bool,
+}
+
+/// How old a reading may be before the page says so.
+const CAPACITY_STALE_AFTER: Duration = Duration::from_secs(120);
+
+/// Tell the poller which targets to probe, and keep the state map in step.
+fn publish_capacity_targets(
+    controller: &Controller,
+    targets_tx: &tokio::sync::watch::Sender<Vec<hel::hel_targets::DeploymentCapacityTarget>>,
+    state: &mut std::collections::BTreeMap<String, PhoneCapacity>,
+) {
+    let targets = controller.deployment_capacity_targets();
+    state.retain(|id, _| targets.iter().any(|target| target.id == *id));
+    for target in &targets {
+        state
+            .entry(target.id.clone())
+            .and_modify(|entry| entry.target = target.clone())
+            .or_insert_with(|| PhoneCapacity {
+                target: target.clone(),
+                usage: None,
+                on_demand: false,
+                sampled_at_epoch_seconds: None,
+                // A target with no reading yet is loading, not idle.
+                refreshing: true,
+                failed: false,
+            });
+    }
+    targets_tx.send_replace(targets);
+}
+
+/// Project the capacity readings for the phone.
+fn viewer_capacity(
+    state: &std::collections::BTreeMap<String, PhoneCapacity>,
+) -> Vec<hel::hel_server::ViewerTargetCapacity> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    state
+        .values()
+        .map(|entry| {
+            let usage = entry.usage.as_ref();
+            hel::hel_server::ViewerTargetCapacity {
+                id: entry.target.id.clone(),
+                label: entry.target.host.clone(),
+                target_ids: entry.target.target_ids.clone(),
+                cpu_percent: usage.and_then(|usage| usage.cpu_percent),
+                memory_used_bytes: usage.map(|usage| usage.memory_used_bytes),
+                memory_total_bytes: usage.map(|usage| usage.memory_total_bytes),
+                logical_cores: usage.map(|usage| usage.logical_cores),
+                disk_total_bytes: usage.and_then(|usage| usage.disk_total_bytes),
+                // A fleet reports how many machines it is running; a plain host
+                // has no such count and says nothing rather than zero.
+                virtual_machines: matches!(
+                    entry.target.kind,
+                    hel::hel_targets::DeploymentCapacityKind::AwsFleet
+                )
+                .then(|| u64::from(!entry.on_demand)),
+                sampled_at_epoch_seconds: entry.sampled_at_epoch_seconds,
+                refreshing: entry.refreshing,
+                stale: entry.sampled_at_epoch_seconds.is_some_and(|sampled| {
+                    now.saturating_sub(sampled) > CAPACITY_STALE_AFTER.as_secs()
+                }),
+                has_error: entry.failed,
+            }
+        })
+        .collect()
+}
+
+/// Turn one lifecycle operation into the projection a phone follows.
+fn viewer_operation(
+    view: &crate::daemon::RuntimeLifecycleView,
+) -> hel::hel_server::ViewerOperation {
+    use hel::hel_server::{ViewerOperationKind, ViewerOperationStage};
+
+    hel::hel_server::ViewerOperation {
+        // The session owns at most one operation at a time, so its id is a
+        // stable name for the operation without inventing a second counter.
+        id: view.session_id.clone(),
+        session_id: view.session_id.clone(),
+        kind: match view.kind {
+            crate::daemon::RuntimeLifecycleKind::Create => ViewerOperationKind::Create,
+            crate::daemon::RuntimeLifecycleKind::Resume => ViewerOperationKind::Resume,
+            // A force stop and a destroy are both stops as far as a phone is
+            // concerned: it watches one thing end, and the difference is in
+            // how much the controller tears down behind it.
+            crate::daemon::RuntimeLifecycleKind::Close
+            | crate::daemon::RuntimeLifecycleKind::ForceStop
+            | crate::daemon::RuntimeLifecycleKind::DestroyStopped => ViewerOperationKind::Stop,
+        },
+        started_at_epoch_seconds: view.started_at_epoch_seconds,
+        stages: view
+            .active_stages
+            .iter()
+            .map(|(stage, started_at)| ViewerOperationStage {
+                label: stage.label().to_owned(),
+                started_at_epoch_seconds: *started_at,
+            })
+            .collect(),
+        notice: view.notice.clone(),
+        cancellable: true,
+    }
+}
+
+/// What the phone may do with one session.
+///
+/// Everything here is a fact the controller holds and the browser cannot:
+/// whether the session manager is driving this session, what the agent said it
+/// supports, and whether a lifecycle operation already owns it.
+fn session_capabilities(
+    session: &hel::hel_server::ViewerSession,
+    operational: Option<&hel::hel_worker::RelayOperationalState>,
+    operation: Option<&hel::hel_server::ViewerOperation>,
+    facts: Option<&hel::hel_acp::AcpSessionFacts>,
+) -> hel::hel_server::ViewerSessionCapabilities {
+    use hel::hel_server::ViewerLifecycleCategory;
+
+    let live = session.lifecycle == ViewerLifecycleCategory::Live;
+    // A session the manager is not driving cannot be talked to, whatever its
+    // durable state says.
+    let attached = operational.is_some();
+    let busy = operation.is_some();
+    let idle = operational
+        .is_some_and(|state| state.execution == hel::hel_worker::RelayExecutionState::Idle);
+    hel::hel_server::ViewerSessionCapabilities {
+        open: session.conversation_available,
+        prompt: live && attached,
+        run_shell: live && attached,
+        cancel_turn: live && operational.is_some_and(|state| state.active_prompt.is_some()),
+        cancel_operation: busy,
+        // Stopping a session that is already stopping asks for something that
+        // is happening; resuming one that is running asks for a second copy.
+        stop: session.lifecycle.is_dashboard_visible() && !busy,
+        rename: true,
+        resume: !session.lifecycle.is_dashboard_visible() && !busy,
+        set_config: live && attached && facts.is_some(),
+        // Plan mode is a turn boundary: the terminal offers it only while the
+        // agent is idle, and the phone must not be looser.
+        set_plan_mode: live
+            && idle
+            && facts.is_some_and(hel::hel_acp::AcpSessionFacts::supports_plan_mode),
+    }
+}
+
+/// The settings this agent advertised, with the values it accepts.
+fn viewer_config_options(
+    operational: &hel::hel_worker::RelayOperationalState,
+) -> Vec<hel::hel_server::ViewerConfigOption> {
+    use hel::hel_server::{ViewerConfigChoice, ViewerConfigOption};
+
+    ["model", "effort"]
+        .into_iter()
+        .filter_map(|key| {
+            let choices = hel::hel_acp::session_config_choices(&operational.config_options, key);
+            if choices.is_empty() {
+                return None;
+            }
+            Some(ViewerConfigOption {
+                key: key.to_owned(),
+                label: key.to_owned(),
+                current: operational.config.get(key).cloned(),
+                choices: choices
+                    .into_iter()
+                    .map(|choice| ViewerConfigChoice {
+                        value: choice.value,
+                        name: choice.name,
+                        description: choice.description,
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// The ACP content blocks one phone prompt becomes: its text, then each
@@ -1356,6 +1979,9 @@ fn viewer_snapshot(
         active_user_shells,
         pending_elicitations,
         prompt_images,
+        operational,
+        operations,
+        capacity,
     } = views;
     let mut snapshot =
         ViewerSnapshot::from_config_state(&controller.config, &controller.state, revision);
@@ -1376,12 +2002,30 @@ fn viewer_snapshot(
         };
         profile.quota = Some(ViewerQuota {
             summary: quota.compact(),
+            windows: quota
+                .windows
+                .iter()
+                .map(|window| hel::hel_server::ViewerQuotaWindow {
+                    label: window.label.clone(),
+                    // The controller reports headroom; a bar fills as a limit
+                    // is consumed, so the phone is given the complement.
+                    percent_used: window
+                        .remaining_percent
+                        .map(|left| 100_u8.saturating_sub(left)),
+                    resets_at: window.resets.clone(),
+                    projects_exhaustion_before_reset: hel::hel_quota::projects_exhaustion(
+                        window,
+                        quota.refreshed_at_epoch_seconds,
+                    ),
+                })
+                .collect(),
             resets_at: quota
                 .windows
                 .iter()
                 .find_map(|window| window.resets.clone()),
             stale: now.saturating_sub(quota.refreshed_at_epoch_seconds)
                 > QUOTA_STALE_AFTER.as_secs(),
+            refreshed_at_epoch_seconds: quota.refreshed_at_epoch_seconds,
             has_error: quota.error.is_some(),
         });
     }
@@ -1411,6 +2055,46 @@ fn viewer_snapshot(
             .cloned()
             .unwrap_or_default();
         session.prompt_images_supported = prompt_images.contains(&session.id);
+        session.operation = operations.get(&session.id).cloned();
+        let live = operational.get(&session.id);
+        let facts = live.map(|state| {
+            hel::hel_acp::AcpSessionFacts::from_operational(
+                controller
+                    .state
+                    .sessions
+                    .get(&session.id)
+                    .map_or(hel::hel_config::HarnessKind::Codex, |record| {
+                        record.harness_kind
+                    }),
+                &state.config,
+                &state.config_options,
+                state.modes.as_ref(),
+            )
+        });
+        if let Some(state) = live {
+            session.latest_event_ordinal = state.latest_ordinal;
+            session.chat_phase = match state.execution {
+                hel::hel_worker::RelayExecutionState::Idle => {
+                    hel::hel_server::ViewerChatPhase::Idle
+                }
+                hel::hel_worker::RelayExecutionState::Running => {
+                    hel::hel_server::ViewerChatPhase::Running
+                }
+                hel::hel_worker::RelayExecutionState::Closing => {
+                    hel::hel_server::ViewerChatPhase::Closing
+                }
+                hel::hel_worker::RelayExecutionState::Closed => {
+                    hel::hel_server::ViewerChatPhase::Closed
+                }
+            };
+            session.config_options = viewer_config_options(state);
+        }
+        session.plan_mode_active = facts
+            .as_ref()
+            .filter(|facts| facts.supports_plan_mode())
+            .map(hel::hel_acp::AcpSessionFacts::plan_mode_active);
+        session.capabilities =
+            session_capabilities(session, live, operations.get(&session.id), facts.as_ref());
         if let Some(transcript) = conversations.get(&session.id) {
             session.conversation_available = true;
             let mut lines = transcript
@@ -1435,7 +2119,11 @@ fn viewer_snapshot(
                 .collect::<Vec<_>>();
             session.preview = lines.split_off(lines.len().saturating_sub(4));
         }
+        // `conversation_available` is only known after the transcript loop
+        // above, so the capability that depends on it is settled here.
+        session.capabilities.open = session.conversation_available;
     }
+    snapshot.capacity = capacity.to_vec();
     snapshot
 }
 
@@ -1623,8 +2311,9 @@ mod tests {
             profile_id: "codex".into(),
             bundle_id: "project".into(),
             target_id: "podman".into(),
-            title: "Phone launch".into(),
+            title: Some("Phone launch".into()),
             project_directory: None,
+            dirty_ack: Vec::new(),
         }
     }
 
@@ -1886,6 +2575,9 @@ mod tests {
                     active_user_shells: &std::collections::BTreeMap::new(),
                     pending_elicitations: &std::collections::BTreeMap::new(),
                     prompt_images: &std::collections::BTreeSet::new(),
+                    operational: &std::collections::BTreeMap::new(),
+                    operations: &std::collections::BTreeMap::new(),
+                    capacity: &[],
                 },
                 1,
             )

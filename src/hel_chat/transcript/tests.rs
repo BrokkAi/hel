@@ -21,6 +21,55 @@ fn wheel(kind: MouseEventKind) -> MouseEvent {
 /// A prompt Hel generated for a review is stored as a User item, because that
 /// is what the harness received, but it must never render as the user's.
 #[test]
+fn a_tool_entry_carries_its_state_and_its_changed_files_as_data() {
+    // The terminal formats a diffstat for a terminal. A browser re-parsing
+    // that formatting is how every diffstat came to render as one unsplit
+    // path, so the projection carries the numbers instead.
+    let mut entry = ChatEntry::plain(1, ChatRole::Tool, "edit src/main.rs".to_owned());
+    entry.tool_status = Some(ToolStatus::Failed);
+    entry.tool_diffstats = vec![
+        format_diffstat_for_test("src/main.rs", 12, 3),
+        "not a diffstat".to_owned(),
+    ];
+    let browser = browser_entry(&entry);
+
+    assert_eq!(browser.tool_status, Some("failed"));
+    assert_eq!(browser.tone, "failed");
+    assert_eq!(browser.glyph, "\u{d7}");
+    assert_eq!(browser.diffstats.len(), 1, "an unparseable line was kept");
+    assert_eq!(browser.diffstats[0].path, "src/main.rs");
+    assert_eq!(browser.diffstats[0].insertions, 12);
+    assert_eq!(browser.diffstats[0].deletions, 3);
+}
+
+/// Build a diffstat the way `format_diffstat` does, including the Unicode
+/// MINUS SIGN, so this check fails if that format ever changes.
+fn format_diffstat_for_test(path: &str, insertions: u32, deletions: u32) -> String {
+    format!("{path}  +{insertions} \u{2212}{deletions}")
+}
+
+#[test]
+fn every_role_publishes_the_glyph_and_tone_the_terminal_draws() {
+    for (role, glyph, tone) in [
+        (ChatRole::User, "\u{276f}", "user"),
+        (ChatRole::Agent, "\u{25cf}", "agent"),
+        (ChatRole::Thought, "\u{25cb}", "thinking"),
+        (ChatRole::Plan, "\u{25c7}", "plan"),
+        (ChatRole::PlanProposal, "\u{25c8}", "plan-proposal"),
+        (ChatRole::System, "\u{2500}", "system"),
+    ] {
+        let entry = ChatEntry::plain(1, role, "text".to_owned());
+        let browser = browser_entry(&entry);
+        assert_eq!(browser.glyph, glyph, "{role:?}");
+        assert_eq!(browser.tone, tone, "{role:?}");
+        assert!(
+            browser.tool_status.is_none(),
+            "{role:?} carries a tool state"
+        );
+    }
+}
+
+#[test]
 fn a_generated_review_prompt_renders_as_hels_own_line() {
     let item = std::sync::Arc::new(TranscriptItem {
         stable_id: "user:1".into(),

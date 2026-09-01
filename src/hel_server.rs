@@ -15,13 +15,14 @@ use anyhow::{Context, Result as AnyResult};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_TYPE, COOKIE, HeaderValue, LOCATION, REFERRER_POLICY, SET_COOKIE,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY as CONTENT_SECURITY_POLICY_HEADER, CONTENT_TYPE, COOKIE,
+    HeaderValue, LOCATION, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
@@ -45,6 +46,17 @@ const CODE_LOCKOUT_BASE: Duration = Duration::from_secs(30);
 const CODE_LOCKOUT_CAP: Duration = Duration::from_secs(60 * 60);
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_PROMPT_CHARS: usize = 64 * 1024;
+/// How many repositories one dirty-worktree acknowledgement may name. A bundle
+/// with more repositories than this than has bigger problems than the phone.
+const MAX_DIRTY_ACKNOWLEDGEMENTS: usize = 32;
+/// The largest draft a phone may store. A composer is for a prompt, and a
+/// prompt this size has other problems; the bound exists so one viewer cannot
+/// fill the daemon's database with text it never sent.
+const MAX_DRAFT_BYTES: usize = 64 * 1024;
+/// How many prompt-history matches one search returns. Public because the
+/// controller loop performs the search and must use the same bound the phone
+/// was promised.
+pub const MAX_HISTORY_MATCHES: usize = 40;
 /// Image prompts need far more room than any other phone request. Browser
 /// uploads are base64-encoded, so two ordinary photographs already exceed the
 /// general body limit even when each one fits it. The larger bound therefore
@@ -55,6 +67,14 @@ const COOKIE_KEY_FILE: &str = "phone-cookie-key";
 
 /// Where the phone cookie signing key lives: beside Hel's other private
 /// controller state, never in the shared config directory.
+/// How long stored viewer state outlives its last use.
+///
+/// It matches the session cookie's own lifetime: state keyed to an identity
+/// that can no longer authenticate has nothing left to belong to.
+pub const fn default_session_ttl() -> Duration {
+    DEFAULT_SESSION_TTL
+}
+
 pub fn cookie_key_path() -> PathBuf {
     crate::hel_config::data_dir().join(COOKIE_KEY_FILE)
 }
@@ -101,6 +121,8 @@ pub struct ServerOptions {
     pub conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
     pub action_tx: mpsc::Sender<ControllerRequest>,
     pub receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+    pub preflight_tx: mpsc::Sender<PreflightRequest>,
+    pub client_state_tx: mpsc::Sender<ClientStateRequest>,
     pub shutdown: CancellationToken,
     pub session_ttl: Duration,
     /// Keep this enabled for direct HTTPS or an HTTPS reverse proxy. It may be
@@ -119,6 +141,8 @@ impl ServerOptions {
         conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
         action_tx: mpsc::Sender<ControllerRequest>,
         receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+        preflight_tx: mpsc::Sender<PreflightRequest>,
+        client_state_tx: mpsc::Sender<ClientStateRequest>,
     ) -> AnyResult<Self> {
         Ok(Self {
             bind,
@@ -126,6 +150,8 @@ impl ServerOptions {
             conversation_rx,
             action_tx,
             receipt_tx,
+            preflight_tx,
+            client_state_tx,
             shutdown: CancellationToken::new(),
             session_ttl: DEFAULT_SESSION_TTL,
             secure_cookie: true,
@@ -220,6 +246,10 @@ pub struct ViewerSnapshot {
     pub profiles: Vec<ViewerProfile>,
     pub targets: Vec<ViewerTarget>,
     pub bundles: Vec<ViewerBundle>,
+    /// One entry per host or fleet that can be probed. Empty until the phone
+    /// server's capacity poller has published a reading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capacity: Vec<ViewerTargetCapacity>,
 }
 
 impl ViewerSnapshot {
@@ -230,25 +260,8 @@ impl ViewerSnapshot {
         let sessions = state
             .sessions
             .values()
-            .map(|session| ViewerSession {
-                id: session.id.clone(),
-                workspace_id: session.workspace_id.clone(),
-                title: session.display_title().to_owned(),
-                harness_kind: session.harness_kind.id().into(),
-                profile_id: session.last_profile.clone(),
-                bundle_id: session.bundle_id.clone(),
-                target_id: session.target_template_id.clone(),
-                state: session_state_name(session.state).into(),
-                created_at: session.created_at.clone(),
-                updated_at: session.updated_at.clone(),
-                has_error: session.last_error.is_some(),
-                preview: Vec::new(),
-                queued_prompts: Vec::new(),
-                active_user_shells: Vec::new(),
-                pending_elicitations: Vec::new(),
-                conversation_available: false,
-                prompt_images_supported: false,
-                incompatible_resume_targets: config
+            .map(|session| {
+                let incompatible = config
                     .targets
                     .keys()
                     .filter(|target_id| {
@@ -256,7 +269,57 @@ impl ViewerSnapshot {
                             .is_err()
                     })
                     .cloned()
-                    .collect(),
+                    .collect::<Vec<_>>();
+                let lifecycle = ViewerLifecycleCategory::of(session.state);
+                ViewerSession {
+                    id: session.id.clone(),
+                    workspace_id: session.workspace_id.clone(),
+                    title: session.display_title().to_owned(),
+                    harness_kind: session.harness_kind.id().into(),
+                    profile_id: session.last_profile.clone(),
+                    bundle_id: session.bundle_id.clone(),
+                    target_id: session.target_template_id.clone(),
+                    state: session_state_name(session.state).into(),
+                    created_at: session.created_at.clone(),
+                    updated_at: session.updated_at.clone(),
+                    has_error: session.last_error.is_some(),
+                    preview: Vec::new(),
+                    queued_prompts: Vec::new(),
+                    active_user_shells: Vec::new(),
+                    pending_elicitations: Vec::new(),
+                    conversation_available: false,
+                    prompt_images_supported: false,
+                    incompatible_resume_targets: incompatible.clone(),
+                    compatible_resume_targets: config
+                        .targets
+                        .keys()
+                        .filter(|target_id| !incompatible.contains(*target_id))
+                        .cloned()
+                        .collect(),
+                    project_label: session.project_name(config),
+                    project_key: project_key(&session.project_source(config).key),
+                    lifecycle,
+                    latest_event_ordinal: 0,
+                    operation: None,
+                    chat_phase: ViewerChatPhase::default(),
+                    config_options: Vec::new(),
+                    plan_mode_active: None,
+                    // What the durable record alone can justify. The phone server
+                    // widens these once it knows whether the session manager holds
+                    // the session and what the agent has advertised.
+                    capabilities: ViewerSessionCapabilities {
+                        open: false,
+                        prompt: false,
+                        run_shell: false,
+                        cancel_turn: false,
+                        cancel_operation: false,
+                        stop: lifecycle.is_dashboard_visible(),
+                        rename: true,
+                        resume: !lifecycle.is_dashboard_visible(),
+                        set_config: false,
+                        set_plan_mode: false,
+                    },
+                }
             })
             .collect();
         let profiles = config
@@ -305,8 +368,24 @@ impl ViewerSnapshot {
             profiles,
             targets,
             bundles,
+            capacity: Vec::new(),
         }
     }
+}
+
+/// A stable, opaque grouping key for a project.
+///
+/// The controller's own project identity is a filesystem path or a Git remote,
+/// and this projection publishes neither. A digest groups exactly as well and
+/// says nothing: two sessions in the same project share a key, and a key on
+/// its own reveals no path.
+fn project_key(identity: &str) -> String {
+    use sha2::Digest as _;
+    let digest = Sha256::digest(identity.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -344,8 +423,41 @@ pub struct ViewerSession {
     /// Target ids this session cannot resume on. Only the ids travel: the
     /// controller's reasons name project paths and SSH hosts, which this
     /// projection deliberately keeps on the controller.
+    ///
+    /// Retained beside `compatible_resume_targets` so a viewer cached from
+    /// before that field existed keeps working through a deployment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incompatible_resume_targets: Vec<String>,
+    /// Target ids this session can resume on, so the browser never has to
+    /// subtract one set from another to find out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_resume_targets: Vec<String>,
+    /// The project this session works in, as a name a person recognises. This
+    /// is the leaf of a path or a repository name, never the path itself.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_label: String,
+    /// A stable key for grouping sessions by project. The controller's own
+    /// identity for a project is a path or a remote, so what travels is a
+    /// digest of it: enough to group by, and nothing to read.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_key: String,
+    pub lifecycle: ViewerLifecycleCategory,
+    /// How far the controller's projection of this session has advanced. A
+    /// phone compares it against its own read frontier to know what is unread,
+    /// without fetching a transcript to find out.
+    #[serde(default)]
+    pub latest_event_ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<ViewerOperation>,
+    #[serde(default)]
+    pub chat_phase: ViewerChatPhase,
+    /// The settings the harness advertised, with the values it accepts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_options: Vec<ViewerConfigOption>,
+    /// Whether plan mode is on, or `None` when this harness has no plan mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode_active: Option<bool>,
+    pub capabilities: ViewerSessionCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,15 +492,76 @@ pub struct ViewerProfile {
     pub quota: Option<ViewerQuota>,
 }
 
+/// One usage window a harness reports, such as a weekly or five-hour limit.
+///
+/// `percent_used` is the figure a person acts on, so it travels as a number
+/// rather than inside a sentence. The controller computes headroom; this is
+/// its complement, because a bar fills as a limit is consumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerQuotaWindow {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent_used: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+    /// Whether this window is on course to run out before it resets. The
+    /// controller already computes this; a phone should not have to.
+    pub projects_exhaustion_before_reset: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerQuota {
+    /// One-line rendering, kept so a viewer cached from before the structured
+    /// windows existed keeps working. The Quota page renders `windows`.
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<ViewerQuotaWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
     pub stale: bool,
+    /// When the reading was taken. A pulled view delivered by push cannot be
+    /// told from a current one without its age, so this is not optional.
+    #[serde(default)]
+    pub refreshed_at_epoch_seconds: u64,
     /// Error state only. Raw vendor errors may contain paths or account data
     /// and remain on the controller.
+    pub has_error: bool,
+}
+
+/// What one host or fleet has, and how fresh the reading is.
+///
+/// Every field that carries a reading is optional, and `sampled_at_epoch_seconds`
+/// is present whenever any of them is: a reading without its age cannot be
+/// told from a stale one, which is exactly the case where it matters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerTargetCapacity {
+    pub id: String,
+    /// The host or fleet as a person names it. Never a locator, an address or
+    /// a full path.
+    pub label: String,
+    pub target_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_cores: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
+    /// How many machines a fleet is running. Absent for a plain host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_machines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at_epoch_seconds: Option<u64>,
+    pub refreshing: bool,
+    pub stale: bool,
+    /// Whether the last probe failed. The probe's own message names hosts and
+    /// commands, so it stays on the controller.
     pub has_error: bool,
 }
 
@@ -416,6 +589,141 @@ pub struct ViewerRepository {
     pub destination: String,
 }
 
+/// What a phone may do with one session, as the controller sees it.
+///
+/// The viewer renders a control because a flag here is true, and for no other
+/// reason. Deciding legality in the browser means copying controller policy
+/// into JavaScript, where it drifts silently: the browser cannot know that a
+/// session is unmanaged, that a lifecycle operation holds it, or that the
+/// harness never advertised the option a control would change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerSessionCapabilities {
+    pub open: bool,
+    pub prompt: bool,
+    pub run_shell: bool,
+    /// Cancel the turn the agent is working on now, leaving the session alive.
+    pub cancel_turn: bool,
+    /// Cancel the provision, resume or stop currently running.
+    pub cancel_operation: bool,
+    pub stop: bool,
+    pub rename: bool,
+    pub resume: bool,
+    pub set_config: bool,
+    pub set_plan_mode: bool,
+}
+
+/// The small set of states a phone reasons about, alongside the precise state.
+///
+/// A phone groups and filters by this; it shows the precise `state` string as
+/// the word it prints. Collapsing here rather than in the browser keeps one
+/// definition of "live" in the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewerLifecycleCategory {
+    Live,
+    Starting,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+impl ViewerLifecycleCategory {
+    const fn of(state: SessionState) -> Self {
+        match state {
+            SessionState::Provisioning => Self::Starting,
+            SessionState::Running | SessionState::Disconnected | SessionState::Checkpointing => {
+                Self::Live
+            }
+            SessionState::Closing | SessionState::Destroying => Self::Stopping,
+            SessionState::Stopped => Self::Stopped,
+            SessionState::Lost | SessionState::Error | SessionState::DestroyedWithDataLoss => {
+                Self::Failed
+            }
+        }
+    }
+
+    /// Whether this session belongs on the dashboard. Stopped and failed
+    /// sessions belong to the resume flow instead, which is where a person can
+    /// do something about them.
+    pub const fn is_dashboard_visible(self) -> bool {
+        matches!(self, Self::Live | Self::Starting | Self::Stopping)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewerOperationKind {
+    Create,
+    Resume,
+    Stop,
+    Checkpoint,
+}
+
+/// One stage of a running operation, with the clock it started on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerOperationStage {
+    pub label: String,
+    pub started_at_epoch_seconds: u64,
+}
+
+/// A provision, resume, stop or checkpoint the controller is running now.
+///
+/// A phone that asked for one of these got `202 Accepted` and an identifier
+/// rather than a result, because the work outlives the request. This is how it
+/// finds out what happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerOperation {
+    pub id: String,
+    pub session_id: String,
+    pub kind: ViewerOperationKind,
+    pub started_at_epoch_seconds: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<ViewerOperationStage>,
+    /// Controller-authored and already meant for a person to read, unlike the
+    /// error text this projection keeps on the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+    pub cancellable: bool,
+}
+
+/// What the agent is doing, mirroring `RelayExecutionState`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewerChatPhase {
+    #[default]
+    Idle,
+    Running,
+    Closing,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerConfigChoice {
+    pub value: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One setting the harness advertised, with the values it will accept.
+///
+/// The browser completes `/model` and `/effort` from this rather than from a
+/// list of its own, so a harness that offers something new needs no viewer
+/// change, and a viewer can never offer a value the harness would refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerConfigOption {
+    pub key: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    pub choices: Vec<ViewerConfigChoice>,
+}
+
 /// The complete set of operations a phone may ask the controller to perform.
 /// Destructive force-cleanup and secret/config editing are intentionally not
 /// representable here.
@@ -423,14 +731,57 @@ pub struct ViewerRepository {
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControllerAction {
     New {
+        /// Which workspace the session belongs to. Optional on the wire so a
+        /// viewer cached from before workspaces reached the phone still parses,
+        /// but a controller holding more than one workspace refuses an empty
+        /// one rather than guessing.
         #[serde(default)]
         workspace_id: String,
         profile_id: String,
         bundle_id: String,
         target_id: String,
-        title: String,
+        /// Absent means "derive it", which is what the terminal does.
+        #[serde(default)]
+        title: Option<String>,
         #[serde(default)]
         project_directory: Option<PathBuf>,
+        /// The repositories the person was shown as having uncommitted changes
+        /// and chose to launch over anyway.
+        ///
+        /// This names them rather than being a bare yes, so an acknowledgement
+        /// cannot be replayed against a set the person never saw: if a
+        /// different repository has gone dirty since the preflight, the launch
+        /// stops and asks again.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dirty_ack: Vec<String>,
+    },
+    /// Give a session a new title. The terminal calls this a rename.
+    Rename {
+        session_id: String,
+        title: String,
+    },
+    /// Stop the turn the agent is working on, leaving the session alive. This
+    /// is not `Cancel`, which stops a provision, resume or stop.
+    CancelTurn {
+        session_id: String,
+    },
+    /// Change one setting the harness advertised, such as `model` or `effort`.
+    SetConfig {
+        session_id: String,
+        key: String,
+        value: String,
+    },
+    /// Turn plan mode on or off. The harness decides how, which is why this
+    /// carries an intent rather than a mode id.
+    SetPlanMode {
+        session_id: String,
+        active: bool,
+    },
+    RefreshQuota {
+        profile_id: String,
+    },
+    RefreshCapacity {
+        target_id: String,
     },
     Resume {
         session_id: String,
@@ -557,6 +908,78 @@ pub struct ControllerRequest {
 /// viewer and controller never went quiet; it also consumed the session's
 /// single action slot, intermittently rejecting real actions. A receipt
 /// therefore travels on its own channel and only persists one cursor field.
+/// A phone asking whether a session it is about to create would launch
+/// cleanly, and what it should be warned about first.
+///
+/// This is not a `ControllerAction`: it starts nothing, it takes no session
+/// slot, and it must answer before the person has decided anything. It also
+/// needs the controller, because whether a repository has uncommitted changes
+/// is a fact about the disk rather than about the projection.
+#[derive(Debug)]
+pub struct PreflightRequest {
+    pub bundle_id: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<PreflightNew, String>>,
+}
+
+/// What a preflight found.
+///
+/// The repositories are leaf names. The controller knows them by absolute
+/// path, and a phone is told just enough to recognise the repository it is
+/// about to launch over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightNew {
+    pub dirty_repositories: Vec<String>,
+}
+
+/// What a phone asks about, or stores against, its own identity.
+///
+/// These travel on their own channel rather than as actions, for the reason a
+/// read receipt does: they are frequent, they start nothing, and routing them
+/// through the action pipeline would consume the session's single action slot
+/// and reload the controller on every keystroke.
+#[derive(Debug)]
+pub enum ClientStateRequest {
+    Read {
+        client_id: String,
+        session_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<ViewerClientState, String>>,
+    },
+    SaveDraft {
+        client_id: String,
+        session_id: String,
+        draft: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    MarkWorkspaceRead {
+        client_id: String,
+        workspace_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    History {
+        session_id: String,
+        query: String,
+        scope: String,
+        reply: tokio::sync::oneshot::Sender<Result<ViewerPromptHistory, String>>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerClientState {
+    pub draft: String,
+    pub through_event_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerPromptHistory {
+    pub entries: Vec<String>,
+    /// Whether the search stopped before it ran out of history, so a phone can
+    /// say the answer is partial rather than presenting it as complete.
+    pub truncated: bool,
+}
+
 #[derive(Debug)]
 pub struct ReadReceiptRequest {
     pub client_id: String,
@@ -571,6 +994,8 @@ struct ServerState {
     conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
     action_tx: mpsc::Sender<ControllerRequest>,
     receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+    preflight_tx: mpsc::Sender<PreflightRequest>,
+    client_state_tx: mpsc::Sender<ClientStateRequest>,
     viewer_code: Arc<str>,
     login_token: Arc<str>,
     cookie_key: Arc<[u8]>,
@@ -636,6 +1061,8 @@ fn router(options: ServerOptions) -> Router {
         conversation_rx: options.conversation_rx,
         action_tx: options.action_tx,
         receipt_tx: options.receipt_tx,
+        preflight_tx: options.preflight_tx,
+        client_state_tx: options.client_state_tx,
         viewer_code: options.viewer_code.into(),
         login_token: options.login_token.into(),
         cookie_key: options.cookie_key.into(),
@@ -651,6 +1078,17 @@ fn router(options: ServerOptions) -> Router {
             post(mark_conversation_read),
         )
         .route("/api/events", get(events))
+        .route("/api/preflight/new", post(preflight_new))
+        .route("/api/sessions/{session_id}/client-state", get(client_state))
+        .route(
+            "/api/sessions/{session_id}/draft",
+            put(save_draft).layer(DefaultBodyLimit::max(MAX_DRAFT_BYTES)),
+        )
+        .route("/api/sessions/{session_id}/history", get(prompt_history))
+        .route(
+            "/api/workspaces/{workspace_id}/read",
+            post(mark_workspace_read),
+        )
         .route(
             "/api/actions",
             post(action).layer(DefaultBodyLimit::max(MAX_PROMPT_BODY_BYTES)),
@@ -662,13 +1100,23 @@ fn router(options: ServerOptions) -> Router {
     Router::new()
         .route("/", get(viewer))
         .route("/login", get(viewer))
+        .route("/viewer.css", get(viewer_css))
+        .route("/viewer.js", get(viewer_js))
+        .route("/markdown.js", get(markdown_js))
+        .route("/tool-output.js", get(tool_output_js))
         .route("/manifest.webmanifest", get(manifest))
         .route("/service-worker.js", get(service_worker))
         .route("/icon.svg", get(icon))
+        .route("/icon-192.png", get(icon_192))
+        .route("/icon-512.png", get(icon_512))
+        .route("/maskable-512.png", get(maskable_512))
+        .route("/apple-touch-icon.png", get(apple_touch_icon))
+        .route("/fonts/jetbrains-mono.woff2", get(mono_font))
         .route("/auth/session", post(create_session).delete(clear_session))
         .route("/auth/login", get(create_session_from_query))
         .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
 
@@ -715,9 +1163,6 @@ async fn create_session_from_query(
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
-        .headers_mut()
-        .insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     Ok(response)
 }
 
@@ -751,6 +1196,9 @@ fn issue_session_cookie(
     };
     let value = signed_cookie_value(
         &state.cookie_key,
+        &generate_viewer_id().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "cookie creation failed")
+        })?,
         now_unix().saturating_add(validity.as_secs()),
     );
     let cookie = session_cookie_header(
@@ -846,15 +1294,11 @@ async fn mark_conversation_read(
     validate_public_id(&session_id)?;
     require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
     let (reply, result) = tokio::sync::oneshot::channel();
-    let cookie = headers
-        .get(COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|header| cookie_value(header, COOKIE_NAME))
-        .ok_or_else(ApiError::unauthorized)?;
+    let client_id = viewer_client_id(&state, &headers).ok_or_else(ApiError::unauthorized)?;
     state
         .receipt_tx
         .send(ReadReceiptRequest {
-            client_id: format!("phone:{cookie}"),
+            client_id,
             session_id,
             through: request.through,
             reply,
@@ -866,6 +1310,204 @@ async fn mark_conversation_read(
         .map_err(|_| ApiError::controller_unavailable())?
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "read receipt failed"))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreflightNewRequest {
+    #[serde(default)]
+    workspace_id: String,
+    profile_id: String,
+    bundle_id: String,
+    target_id: String,
+    #[serde(default)]
+    project_directory: Option<PathBuf>,
+}
+
+/// Answer whether a new session would launch cleanly, and what to warn about.
+///
+/// The same validation the action itself runs happens here, so a phone learns
+/// about an impossible combination while it can still change it rather than
+/// after it has committed.
+async fn preflight_new(
+    State(state): State<ServerState>,
+    Json(request): Json<PreflightNewRequest>,
+) -> Result<Json<PreflightNew>, ApiError> {
+    let action = ControllerAction::New {
+        workspace_id: request.workspace_id,
+        profile_id: request.profile_id,
+        bundle_id: request.bundle_id.clone(),
+        target_id: request.target_id,
+        title: None,
+        project_directory: request.project_directory.clone(),
+        dirty_ack: Vec::new(),
+    };
+    validate_action(&action, &state.snapshot_rx.borrow())?;
+    // A bare target opens a directory the person named; there is no bundle to
+    // have uncommitted changes in.
+    if request.project_directory.is_some() {
+        return Ok(Json(PreflightNew {
+            dirty_repositories: Vec::new(),
+        }));
+    }
+    let (reply, result) = tokio::sync::oneshot::channel();
+    state
+        .preflight_tx
+        .send(PreflightRequest {
+            bundle_id: request.bundle_id,
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::controller_unavailable())?;
+    result
+        .await
+        .map_err(|_| ApiError::controller_unavailable())?
+        .map(Json)
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the controller could not check this project",
+            )
+        })
+}
+
+/// Ask the state channel one thing and wait for its answer.
+async fn ask_client_state<T>(
+    state: &ServerState,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, String>>) -> ClientStateRequest,
+) -> Result<T, ApiError> {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    state
+        .client_state_tx
+        .send(build(reply))
+        .await
+        .map_err(|_| ApiError::controller_unavailable())?;
+    answer
+        .await
+        .map_err(|_| ApiError::controller_unavailable())?
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the controller could not reach stored viewer state",
+            )
+        })
+}
+
+/// This viewer's draft and read frontier for one session.
+async fn client_state(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ViewerClientState>, ApiError> {
+    validate_public_id(&session_id)?;
+    require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
+    // A viewer with a legacy cookie has no identity and so has nothing stored.
+    // Answering with an empty state is the truth, and is what lets an older
+    // phone keep working through a deployment.
+    let Some(client_id) = viewer_client_id(&state, &headers) else {
+        return Ok(Json(ViewerClientState::default()));
+    };
+    ask_client_state(&state, |reply| ClientStateRequest::Read {
+        client_id,
+        session_id,
+        reply,
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftRequest {
+    draft: String,
+}
+
+async fn save_draft(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DraftRequest>,
+) -> Result<StatusCode, ApiError> {
+    validate_public_id(&session_id)?;
+    require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
+    if request.draft.len() > MAX_DRAFT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "draft must be 65536 bytes or fewer",
+        ));
+    }
+    let Some(client_id) = viewer_client_id(&state, &headers) else {
+        // Nothing to key it to. The phone keeps its draft in the composer, and
+        // silently accepting would promise a persistence that is not there.
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "this viewer has no stored identity; unlock again to keep drafts",
+        ));
+    };
+    ask_client_state(&state, |reply| ClientStateRequest::SaveDraft {
+        client_id,
+        session_id,
+        draft: request.draft,
+        reply,
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Mark every session in a workspace read, in one request.
+///
+/// Opening a workspace should not cost one request per session.
+async fn mark_workspace_read(
+    State(state): State<ServerState>,
+    Path(workspace_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    validate_public_id(&workspace_id)?;
+    let Some(client_id) = viewer_client_id(&state, &headers) else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    ask_client_state(&state, |reply| ClientStateRequest::MarkWorkspaceRead {
+        client_id,
+        workspace_id,
+        reply,
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// Search this session's or this project's earlier prompts.
+async fn prompt_history(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<ViewerPromptHistory>, ApiError> {
+    validate_public_id(&session_id)?;
+    require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
+    if query.q.chars().count() > MAX_TITLE_CHARS {
+        return Err(ApiError::bad_request("search text is too long"));
+    }
+    let scope = query.scope.unwrap_or_else(|| "project".to_owned());
+    if !matches!(scope.as_str(), "session" | "project" | "all") {
+        return Err(ApiError::bad_request(
+            "scope must be session, project or all",
+        ));
+    }
+    ask_client_state(&state, |reply| ClientStateRequest::History {
+        session_id,
+        query: query.q,
+        scope,
+        reply,
+    })
+    .await
+    .map(Json)
 }
 
 async fn events(State(state): State<ServerState>) -> impl IntoResponse {
@@ -986,17 +1628,35 @@ fn validate_prompt_images(images: &[ViewerPromptImage]) -> Result<(), ApiError> 
 fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Result<(), ApiError> {
     match action {
         ControllerAction::New {
+            workspace_id,
             profile_id,
             bundle_id,
             target_id,
             title,
             project_directory,
-            ..
+            dirty_ack,
         } => {
+            if !workspace_id.is_empty() {
+                validate_public_id(workspace_id)?;
+            }
             validate_public_id(profile_id)?;
             validate_public_id(bundle_id)?;
             validate_public_id(target_id)?;
-            validate_title(title)?;
+            if let Some(title) = title {
+                validate_title(title)?;
+            }
+            // An acknowledgement names repositories the preflight reported.
+            // Unbounded or malformed entries would travel to the controller
+            // and be compared against a real set, so they are refused here.
+            if dirty_ack.len() > MAX_DIRTY_ACKNOWLEDGEMENTS
+                || dirty_ack
+                    .iter()
+                    .any(|repository| repository.trim().is_empty() || repository.len() > 256)
+            {
+                return Err(ApiError::bad_request(
+                    "dirty acknowledgement must name 0-32 repositories",
+                ));
+            }
             require_profile(snapshot, profile_id)?;
             require_bundle(snapshot, bundle_id)?;
             let target = require_target(snapshot, target_id)?;
@@ -1043,6 +1703,67 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
         | ControllerAction::Cancel { session_id } => {
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
+        }
+        ControllerAction::Rename { session_id, title } => {
+            validate_public_id(session_id)?;
+            validate_title(title)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session.capabilities.rename {
+                return Err(ApiError::bad_request("this session cannot be renamed"));
+            }
+        }
+        ControllerAction::CancelTurn { session_id } => {
+            validate_public_id(session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session.capabilities.cancel_turn {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "this session has no turn to cancel",
+                ));
+            }
+        }
+        ControllerAction::SetConfig {
+            session_id,
+            key,
+            value,
+        } => {
+            validate_public_id(session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session.capabilities.set_config {
+                return Err(ApiError::bad_request(
+                    "this session cannot change configuration now",
+                ));
+            }
+            // The harness decides what it accepts. Forwarding a key it never
+            // advertised, or a value outside the ones it offered, asks it to
+            // refuse something the viewer should not have offered.
+            let option = session
+                .config_options
+                .iter()
+                .find(|option| option.key == *key)
+                .ok_or_else(|| ApiError::bad_request("this agent does not offer that setting"))?;
+            if !option.choices.iter().any(|choice| choice.value == *value) {
+                return Err(ApiError::bad_request(
+                    "this agent does not offer that value for that setting",
+                ));
+            }
+        }
+        ControllerAction::SetPlanMode { session_id, .. } => {
+            validate_public_id(session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
+            if !session.capabilities.set_plan_mode {
+                return Err(ApiError::bad_request(
+                    "this session cannot change plan mode now",
+                ));
+            }
+        }
+        ControllerAction::RefreshQuota { profile_id } => {
+            validate_public_id(profile_id)?;
+            require_profile(snapshot, profile_id)?;
+        }
+        ControllerAction::RefreshCapacity { target_id } => {
+            validate_public_id(target_id)?;
+            require_target(snapshot, target_id)?;
         }
         ControllerAction::Prompt {
             session_id,
@@ -1288,7 +2009,36 @@ fn generate_cookie_key() -> AnyResult<[u8; COOKIE_KEY_BYTES]> {
     Ok(key)
 }
 
-fn signed_cookie_value(key: &[u8], expiry: u64) -> String {
+/// A random name for one viewer, minted at unlock.
+///
+/// The cookie used to sign only an expiry, which meant two phones unlocking in
+/// the same second received byte-identical cookies and one phone's cookie
+/// changed on every login. Nothing keyed to it could mean anything: a draft
+/// would have leaked between phones and vanished on re-login. This is the
+/// identity everything per-viewer hangs from.
+fn generate_viewer_id() -> AnyResult<String> {
+    let mut id = [0_u8; 16];
+    getrandom::fill(&mut id).map_err(|error| anyhow::anyhow!("generate Hel viewer id: {error}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id))
+}
+
+fn signed_cookie_value(key: &[u8], viewer: &str, expiry: u64) -> String {
+    // The signed text separates its parts with a character the parts cannot
+    // contain, so no two different pairs can produce the same signed text.
+    let canonical = format!("{viewer}|{expiry}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
+    mac.update(canonical.as_bytes());
+    let signature =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    format!("{viewer}.{expiry}.{signature}")
+}
+
+/// The cookie value a viewer with no identity used to receive.
+///
+/// Still accepted, so a phone holding one is not signed out by a deployment.
+/// It carries no viewer, so it stores nothing and is replaced by a three-part
+/// cookie at its next unlock.
+fn legacy_signed_cookie_value(key: &[u8], expiry: u64) -> String {
     let canonical = expiry.to_string();
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
     mac.update(canonical.as_bytes());
@@ -1298,17 +2048,38 @@ fn signed_cookie_value(key: &[u8], expiry: u64) -> String {
 }
 
 fn session_cookie_valid(key: &[u8], value: &str, now: u64) -> bool {
-    let Some((expiry, _)) = value.split_once('.') else {
-        return false;
+    cookie_viewer(key, value, now).is_some()
+}
+
+/// The viewer a cookie names, or `None` when the cookie is not valid.
+///
+/// A legacy two-part cookie validates and names no viewer, which is the
+/// difference between "signed out" and "signed in with nothing stored".
+fn cookie_viewer(key: &[u8], value: &str, now: u64) -> Option<Option<String>> {
+    let parts = value.split('.').collect::<Vec<_>>();
+    let (viewer, expiry, expected) = match parts.as_slice() {
+        [viewer, expiry, _] => {
+            let expiry_value = expiry.parse::<u64>().ok()?;
+            (
+                Some((*viewer).to_owned()),
+                expiry_value,
+                signed_cookie_value(key, viewer, expiry_value),
+            )
+        }
+        [expiry, _] => {
+            let expiry_value = expiry.parse::<u64>().ok()?;
+            (
+                None,
+                expiry_value,
+                legacy_signed_cookie_value(key, expiry_value),
+            )
+        }
+        _ => return None,
     };
-    let Ok(expiry_value) = expiry.parse::<u64>() else {
-        return false;
-    };
-    if now >= expiry_value {
-        return false;
+    if now >= expiry {
+        return None;
     }
-    let expected = signed_cookie_value(key, expiry_value);
-    constant_time_eq(expected.as_bytes(), value.as_bytes())
+    constant_time_eq(expected.as_bytes(), value.as_bytes()).then_some(viewer)
 }
 
 fn session_cookie_header(
@@ -1333,6 +2104,22 @@ fn clear_cookie_header(secure: bool) -> HeaderValue {
         "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age=0"
     ))
     .expect("static cookie header is valid")
+}
+
+/// The stored-state key for the viewer making this request.
+///
+/// A viewer with a legacy cookie has no identity, so it has no stored state:
+/// it reads and writes nothing rather than sharing a bucket with every other
+/// phone that unlocked in the same second, which is what the old whole-cookie
+/// key amounted to.
+fn viewer_client_id(state: &ServerState, headers: &HeaderMap) -> Option<String> {
+    let cookie = headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| cookie_value(header, COOKIE_NAME))?;
+    cookie_viewer(&state.cookie_key, cookie, now_unix())
+        .flatten()
+        .map(|viewer| format!("phone:{viewer}"))
 }
 
 fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
@@ -1388,20 +2175,100 @@ const fn target_kind_name(target: &TargetTemplate) -> &'static str {
     }
 }
 
+/// Every asset the browser application is built from. They are real files
+/// under `src/web/` and `src/icons/` rather than string literals, so the
+/// JavaScript can be read, formatted and tested as JavaScript, and so the
+/// content-security policy below can forbid inline script outright.
+const VIEWER_HTML: &str = include_str!("web/viewer.html");
+const VIEWER_CSS: &str = include_str!("web/viewer.css");
+const VIEWER_JS: &str = include_str!("web/viewer.js");
+const MARKDOWN_JS: &str = include_str!("web/markdown.js");
+const TOOL_OUTPUT_JS: &str = include_str!("web/tool-output.js");
+/// A fake DOM for running the shipped renderers under Node. It is deliberately
+/// not served: it exists so `cargo test` can exercise `markdown.js` without a
+/// browser.
+#[cfg(test)]
+const TEST_DOM_JS: &str = include_str!("web/test-dom.js");
+const SERVICE_WORKER: &str = include_str!("web/service-worker.js");
+const MANIFEST: &str = include_str!("web/manifest.webmanifest");
+const ICON_SVG: &str = include_str!("../src/icons/icon.svg");
+const ICON_192: &[u8] = include_bytes!("../src/icons/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../src/icons/icon-512.png");
+const MASKABLE_512: &[u8] = include_bytes!("../src/icons/maskable-512.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../src/icons/apple-touch-icon.png");
+const MONO_FONT: &[u8] = include_bytes!("../src/fonts/jetbrains-mono.woff2");
+
+/// What the browser is permitted to load and execute.
+///
+/// `default-src 'none'` refuses everything not named below, so a future asset
+/// has to be allowed deliberately. Script and style come only from this
+/// origin, which is why none of either may be inline. `img-src` needs `data:`
+/// because attached images render from data URLs the browser itself just
+/// built from a file the person picked.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; \
+script-src 'self'; \
+style-src 'self'; \
+img-src 'self' data:; \
+font-src 'self'; \
+connect-src 'self'; \
+manifest-src 'self'; \
+base-uri 'none'; \
+form-action 'none'; \
+frame-ancestors 'none'";
+
 async fn viewer() -> Response<Body> {
     static_response("text/html; charset=utf-8", VIEWER_HTML, true)
+}
+
+async fn viewer_css() -> Response<Body> {
+    static_response("text/css; charset=utf-8", VIEWER_CSS, false)
+}
+
+async fn viewer_js() -> Response<Body> {
+    static_response("text/javascript; charset=utf-8", VIEWER_JS, false)
+}
+
+async fn markdown_js() -> Response<Body> {
+    static_response("text/javascript; charset=utf-8", MARKDOWN_JS, false)
+}
+
+async fn tool_output_js() -> Response<Body> {
+    static_response("text/javascript; charset=utf-8", TOOL_OUTPUT_JS, false)
 }
 
 async fn manifest() -> Response<Body> {
     static_response("application/manifest+json", MANIFEST, false)
 }
 
+/// The worker itself is never cached: a stale worker is what keeps a phone on
+/// a superseded application, and it is the one asset that can never be fixed
+/// by a later upgrade.
 async fn service_worker() -> Response<Body> {
     static_response("text/javascript; charset=utf-8", SERVICE_WORKER, true)
 }
 
 async fn icon() -> Response<Body> {
-    static_response("image/svg+xml", ICON, false)
+    static_response("image/svg+xml", ICON_SVG, false)
+}
+
+async fn icon_192() -> Response<Body> {
+    binary_response("image/png", ICON_192)
+}
+
+async fn icon_512() -> Response<Body> {
+    binary_response("image/png", ICON_512)
+}
+
+async fn maskable_512() -> Response<Body> {
+    binary_response("image/png", MASKABLE_512)
+}
+
+async fn apple_touch_icon() -> Response<Body> {
+    binary_response("image/png", APPLE_TOUCH_ICON)
+}
+
+async fn mono_font() -> Response<Body> {
+    binary_response("font/woff2", MONO_FONT)
 }
 
 fn static_response(
@@ -1409,123 +2276,55 @@ fn static_response(
     body: &'static str,
     no_store: bool,
 ) -> Response<Body> {
-    let mut response = Response::new(Body::from(body));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    if no_store {
-        response
-            .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    }
+    finish_static(Response::new(Body::from(body)), content_type, no_store)
+}
+
+fn binary_response(content_type: &'static str, body: &'static [u8]) -> Response<Body> {
+    finish_static(Response::new(Body::from(body)), content_type, false)
+}
+
+/// Cacheable assets still revalidate. `no-cache` means "ask first", not "do
+/// not store", so an upgraded viewer is picked up on the next load while an
+/// unchanged one costs one conditional request.
+fn finish_static(
+    mut response: Response<Body>,
+    content_type: &'static str,
+    no_store: bool,
+) -> Response<Body> {
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(if no_store { "no-store" } else { "no-cache" }),
+    );
     response
 }
 
-const MANIFEST: &str = r##"{
-  "name": "Hel",
-  "short_name": "Hel",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#08090d",
-  "theme_color": "#08090d",
-  "icons": [{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
-}"##;
-
-const SERVICE_WORKER: &str = r#"
-self.addEventListener('install', event => event.waitUntil(caches.open('hel-v1').then(cache => cache.addAll(['/', '/manifest.webmanifest', '/icon.svg']))));
-self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
-self.addEventListener('fetch', event => { if (event.request.method === 'GET' && !new URL(event.request.url).pathname.startsWith('/api/')) event.respondWith(fetch(event.request).catch(() => caches.match(event.request))); });
-"#;
-
-const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="100" fill="#08090d"/><path d="M132 88v336M380 88v336M132 256h248" stroke="#b9ff5a" stroke-width="54" stroke-linecap="round"/></svg>"##;
-
-const VIEWER_HTML: &str = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="icon" href="/icon.svg"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
-<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}.elicitation{border-color:#d985ff}.elicitation-message{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 10px}.elicitation-field{display:flex;flex-direction:column;gap:4px;margin:10px 0}.elicitation-field select[multiple]{min-height:120px}.elicitation-field input[type=checkbox]{align-self:start;width:22px;height:22px}#prompt-text{display:block;width:100%;box-sizing:border-box;min-height:76px;max-height:40vh;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}#prompt-text:empty::before{content:attr(data-placeholder);color:#899184;pointer-events:none}#attachments{margin-top:8px}.attachment{display:flex;align-items:center;gap:8px;border:1px solid #3b424e;border-radius:9px;padding:6px 8px}.attachment img{width:44px;height:44px;object-fit:cover;border-radius:6px}.attachment button{padding:2px 10px}#conversation-feed{min-height:30vh}</style></head>
-<body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
-<main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
-<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><div id="elicitations"></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div><h3>Shell commands</h3><div id="conversation-shells"></div></section><form id="prompt-form" class="card"><div id="prompt-text" class="composer-input" contenteditable="true" role="textbox" aria-multiline="true" enterkeyhint="send" spellcheck="true" aria-label="Message the agent" data-placeholder="Message the agent or use !command"></div><div id="attachments" class="row" aria-label="Attached images"></div><div class="row"><button>Send or queue</button><button type="button" id="attach-image" class="secondary" aria-label="Attach one or more images" hidden>Images</button><input id="image-picker" type="file" accept="image/*" multiple hidden></div><p id="conversation-error"></p></form></section></main>
-<script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue'),shells=document.querySelector('#conversation-shells'),elicitations=document.querySelector('#elicitations'),promptText=document.querySelector('#prompt-text'),attachments=document.querySelector('#attachments'),attachImage=document.querySelector('#attach-image'),imagePicker=document.querySelector('#image-picker');let snapshot,currentSession,cursor=0,acknowledged=0,eventSource;
-async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}if(response.status===202||response.status===204)return null;return response.json()}
-function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
-function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
-function startEvents(){if(eventSource)eventSource.close();eventSource=new EventSource('/api/events');eventSource.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}
-async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''}${x.pending_elicitations?.length?' <span class="pill alert">input needed</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);renderElicitations(session);renderAttachments();document.querySelector('#conversation-state').textContent=session.state}}if(!eventSource)startEvents();return true}catch(e){if(e.message==='unauthorized'){snapshot=undefined;currentSession=null;if(eventSource){eventSource.close();eventSource=undefined}login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}return false}}
-async function restoreRoute(){if(!await refresh())return;const match=location.hash.match(/^#conversation\/([A-Za-z0-9_-]+)$/);if(match)await openConversation(match[1])}
-function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>';shells.innerHTML=(session.active_user_shells||[]).map(x=>`<div class="queue-item"><span>$ ${escapeHtml(x.command)}</span><button class="danger" data-shell-id="${escapeAttr(x.id)}">Cancel</button></div>`).join('')||'<p class="dim">No running shells.</p>'}
-// Every snapshot revision re-renders the conversation. Rebuilding a card the
-// user is answering would wipe the half-filled form and steal focus, so each
-// pending request keeps its live DOM until the request itself changes or
-// leaves the snapshot.
-const elicitationCards=new Map(),sentElicitations=new Set();
-function elicitationKey(sessionId,id){return `${sessionId}\u001f${id}`}
-function elicitationOptionLabel(option){return option.description?`${option.title} \u2014 ${option.description}`:option.title}
-function elicitationControl(field){if(field.kind==='single_select'||field.kind==='multi_select'){const select=document.createElement('select');select.multiple=field.kind==='multi_select';if(!select.multiple&&!field.required)select.appendChild(new Option('',''));for(const option of field.options||[])select.appendChild(new Option(elicitationOptionLabel(option),option.value));if(field.kind==='single_select'&&field.default!=null)select.value=field.default;if(select.multiple&&(field.default||[]).length)for(const option of select.options)option.selected=field.default.includes(option.value);return select}const input=document.createElement('input');input.type=field.kind==='boolean'?'checkbox':(field.kind==='integer'||field.kind==='number'?'number':(field.secret?'password':'text'));if(field.kind==='integer')input.step='1';if(field.kind==='number')input.step='any';if(field.minimum!=null)input.min=field.minimum;if(field.maximum!=null)input.max=field.maximum;if(field.min_length!=null)input.minLength=field.min_length;if(field.max_length!=null)input.maxLength=field.max_length;if(field.pattern)input.pattern=field.pattern;if(field.kind==='boolean')input.checked=field.default===true;else if(field.default!=null)input.value=String(field.default);return input}
-function elicitationFieldValue(field,control){if(field.kind==='multi_select'){const values=[...control.selectedOptions].map(option=>option.value);return values.length||field.required?values:undefined}if(field.kind==='boolean')return control.checked;if(control.value==='')return field.required&&(field.kind==='text'||field.kind==='single_select')?'':undefined;if(field.kind==='integer')return Number.parseInt(control.value,10);if(field.kind==='number')return Number(control.value);return control.value}
-// Builds the controls and returns collect(), which reads them back as ACP
-// content. A custom answer replaces the select it belongs to unless the
-// request pairs it with one specific option, which is how Hel's chat form
-// submits the same request.
-function buildElicitationForm(form,request,register){const entries=[];for(const field of request.fields||[]){const wrapper=document.createElement('label');wrapper.className='elicitation-field';const label=document.createElement('span');label.textContent=`${field.title}${field.required?' *':''}`;const control=elicitationControl(field);control.required=Boolean(field.required)&&field.kind!=='boolean';register(control);wrapper.append(label,control);if(field.description){const description=document.createElement('span');description.className='dim';description.textContent=field.description;wrapper.append(description)}if(field.kind==='multi_select'){const check=()=>{const count=control.selectedOptions.length;const few=field.min_items!=null&&(count>0||field.required)&&count<field.min_items;const many=field.max_items!=null&&count>field.max_items;control.setCustomValidity(few?`Select at least ${field.min_items} option(s).`:(many?`Select at most ${field.max_items} option(s).`:''))};control.addEventListener('change',check);check()}form.append(wrapper);entries.push({field,control})}const customByOwner=new Map();for(const entry of entries){const owner=entry.field.custom_answer_for;if(!owner||entry.field.kind!=='text'||customByOwner.has(owner))continue;const target=entries.find(candidate=>candidate.field.id===owner);if(!target||!Array.isArray(target.field.options))continue;customByOwner.set(owner,entry)}return()=>{for(const entry of entries)if(entry.field.kind==='text')entry.control.value=entry.control.value.trim();if(!form.reportValidity())return null;const active=new Map();for(const [owner,entry] of customByOwner)if(entry.control.value!=='')active.set(owner,entry);const content={};for(const entry of entries){const {field,control}=entry;if(customByOwner.get(field.custom_answer_for)===entry){if(active.has(field.custom_answer_for))content[field.id]=control.value;continue}const custom=active.get(field.id);if(custom&&custom.field.custom_answer_option==null)continue;const value=elicitationFieldValue(field,control);if(value!==undefined)content[field.id]=value}return content}}
-function buildElicitationCard(session,request){const card=document.createElement('section');card.className='card elicitation';const heading=document.createElement('strong');heading.textContent=request.title||'Input needed';const message=document.createElement('pre');message.className='elicitation-message';message.textContent=request.message;const form=document.createElement('form');const status=document.createElement('p');status.className='dim';const gated=[],register=control=>{gated.push(control);return control};const collect=buildElicitationForm(form,request,register);const actions=document.createElement('div');actions.className='row';const send=document.createElement('button');send.type='submit';send.textContent='Send answer';register(send);const decline=document.createElement('button');decline.type='button';decline.className='secondary';decline.textContent='Decline';register(decline);const cancel=document.createElement('button');cancel.type='button';cancel.className='danger';cancel.textContent='Cancel';register(cancel);decline.addEventListener('click',()=>{submitElicitation(session.id,request.id,{action:'decline'})});cancel.addEventListener('click',()=>{submitElicitation(session.id,request.id,{action:'cancel'})});actions.append(send,decline,cancel);form.append(actions);form.addEventListener('submit',event=>{event.preventDefault();const content=collect();if(content)submitElicitation(session.id,request.id,{action:'accept',content})});const nodes=[heading];if(request.description){const description=document.createElement('p');description.className='dim';description.textContent=request.description;nodes.push(description)}nodes.push(message,form,status);card.append(...nodes);return{card,setSent(sent){for(const control of gated)control.disabled=sent;status.textContent=sent?'Answer sent \u2014 waiting for the session to apply it.':''}}}
-function renderElicitations(session){const pending=(session&&session.pending_elicitations)||[];if(session)for(const key of [...sentElicitations])if(key.startsWith(`${session.id}\u001f`)&&!pending.some(request=>elicitationKey(session.id,request.id)===key))sentElicitations.delete(key);const live=new Set(),cards=[];for(const request of pending){const key=elicitationKey(session.id,request.id),signature=JSON.stringify(request);live.add(key);let entry=elicitationCards.get(key);if(!entry||entry.signature!==signature){entry=buildElicitationCard(session,request);entry.signature=signature;elicitationCards.set(key,entry)}entry.setSent(sentElicitations.has(key));cards.push(entry.card)}for(const key of [...elicitationCards.keys()])if(!live.has(key))elicitationCards.delete(key);const mounted=[...elicitations.children];if(mounted.length!==cards.length||cards.some((card,index)=>mounted[index]!==card))elicitations.replaceChildren(...cards)}
-async function submitElicitation(sessionId,elicitationId,response){const key=elicitationKey(sessionId,elicitationId);if(sentElicitations.has(key))return;sentElicitations.add(key);const rerender=()=>{const session=snapshot?.sessions.find(x=>x.id===sessionId);if(session&&sessionId===currentSession)renderElicitations(session)};rerender();try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'respond-elicitation',session_id:sessionId,elicitation_id:elicitationId,response})});document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){sentElicitations.delete(key);document.querySelector('#conversation-error').textContent=err.message;rerender()}}
-// The composer is a contenteditable rather than a textarea so a pasted or
-// dropped image can be intercepted where it lands, and so the box grows with
-// its content without a layout read on every keystroke. Rich content is
-// refused at beforeinput, which keeps the box plain text however it arrives.
-const MAX_PROMPT_REQUEST_BYTES=32*1024*1024;
-let composerRevision=0,composerPreserveEmptyBreak=false,promptImages=[];
-function composerText(){let text='';const blocks=new Set(['DIV','P']);const append=node=>{if(node.nodeType===Node.TEXT_NODE){text+=node.nodeValue||'';return}if(node.nodeName==='BR'){if(!node.dataset.composerFiller)text+='\n';return}const block=node!==promptText&&blocks.has(node.nodeName);if(block&&text&&!text.endsWith('\n'))text+='\n';node.childNodes.forEach(append);if(block&&node.nextSibling&&!text.endsWith('\n'))text+='\n'};append(promptText);return text.replace(/\r\n?/g,'\n')}
-function setComposerText(text){promptText.textContent=text}
-function placeComposerCaretAtEnd(){const selection=window.getSelection();if(!selection)return;const range=document.createRange();range.selectNodeContents(promptText);range.collapse(false);selection.removeAllRanges();selection.addRange(range)}
-function placeComposerCaretAtPoint(x,y){let range=document.caretRangeFromPoint?.(x,y)||null;if(!range&&document.caretPositionFromPoint){const position=document.caretPositionFromPoint(x,y);if(position){range=document.createRange();range.setStart(position.offsetNode,position.offset);range.collapse(true)}}if(!range||!promptText.contains(range.startContainer))return;const selection=window.getSelection();if(!selection)return;selection.removeAllRanges();selection.addRange(range)}
-function insertComposerFallback(node,filler=null){const selection=window.getSelection();const range=selection&&selection.rangeCount?selection.getRangeAt(0):null;if(!range||!promptText.contains(range.commonAncestorContainer)){promptText.append(node);if(filler)promptText.append(filler);placeComposerCaretAtEnd();return}range.deleteContents();range.insertNode(node);if(filler)node.after(filler);range.setStartAfter(node);range.collapse(true);selection.removeAllRanges();selection.addRange(range)}
-// execCommand keeps the browser's own undo stack, so it is tried first; the
-// fallback covers engines that refuse it, and the revision check covers those
-// that run it without emitting the input event that keeps state in step.
-function runComposerEdit(command,value,fallback){promptText.focus();const revision=composerRevision;if(document.execCommand(command,false,value)){if(composerRevision===revision)composerInputChanged();return}fallback();composerInputChanged()}
-function insertComposerText(text){const normalized=text.replace(/\r\n?/g,'\n');runComposerEdit('insertText',normalized,()=>{insertComposerFallback(document.createTextNode(normalized))})}
-function insertComposerLineBreak(){composerPreserveEmptyBreak=true;try{runComposerEdit('insertLineBreak',null,()=>{const filler=document.createElement('br');filler.dataset.composerFiller='true';insertComposerFallback(document.createElement('br'),filler)});let last=promptText;while(last.lastChild)last=last.lastChild;if(last.nodeName==='BR'&&last.previousSibling?.nodeName==='BR'){last.dataset.composerFiller='true'}}finally{composerPreserveEmptyBreak=false}}
-// A cleared box can keep a stray break behind it, which leaves the placeholder
-// hidden and the box looking occupied when it holds nothing.
-function composerInputChanged(){composerRevision+=1;if(!composerPreserveEmptyBreak&&!promptText.textContent&&promptText.childNodes.length)promptText.replaceChildren()}
-function readFileAsDataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.addEventListener('load',()=>resolve(String(reader.result||'')),{once:true});reader.addEventListener('error',()=>reject(reader.error||new Error('file read failed')),{once:true});reader.readAsDataURL(file)})}
-function imageDimensions(file){return new Promise((resolve,reject)=>{const url=URL.createObjectURL(file);const image=new Image();image.addEventListener('load',()=>{const size={width:image.naturalWidth,height:image.naturalHeight};URL.revokeObjectURL(url);resolve(size)},{once:true});image.addEventListener('error',()=>{URL.revokeObjectURL(url);reject(new Error('the browser could not decode this image'))},{once:true});image.src=url})}
-async function promptImageFromFile(file){if(!file.type.startsWith('image/'))throw new Error(`${file.name||'That file'} is not an image`);if(file.size>=MAX_PROMPT_REQUEST_BYTES)throw new Error(`${file.name||'That image'} is too large for the 32 MiB request limit`);const [dataUrl,size]=await Promise.all([readFileAsDataUrl(file),imageDimensions(file)]);const comma=dataUrl.indexOf(',');if(comma<0||!dataUrl.slice(comma+1))throw new Error(`Could not read ${file.name||'that image'}`);return{data_base64:dataUrl.slice(comma+1),mime_type:file.type,width:size.width,height:size.height,name:file.name||'Pasted image'}}
-async function attachImageFiles(files){const session=snapshot?.sessions.find(x=>x.id===currentSession);if(!currentSession||!session?.prompt_images_supported||!files.length)return;const sessionId=currentSession;try{const added=[];for(const file of files)added.push(await promptImageFromFile(file));if(currentSession!==sessionId)return;promptImages=promptImages.concat(added);renderAttachments();document.querySelector('#conversation-error').textContent=''}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
-function renderAttachments(){const session=snapshot?.sessions.find(x=>x.id===currentSession);attachImage.hidden=!session?.prompt_images_supported;attachments.replaceChildren();for(const [index,image] of promptImages.entries()){const chip=document.createElement('div');chip.className='attachment';const thumb=document.createElement('img');thumb.alt='';thumb.src=`data:${image.mime_type};base64,${image.data_base64}`;const caption=document.createElement('span');caption.textContent=`${image.name} \u00b7 ${image.width}\u00d7${image.height}`;const remove=document.createElement('button');remove.type='button';remove.className='danger';remove.setAttribute('aria-label',`Remove ${image.name}`);remove.textContent='\u00d7';remove.onclick=()=>{promptImages.splice(index,1);renderAttachments()};chip.append(thumb,caption,remove);attachments.append(chip)}}
-async function submitPrompt(){if(!currentSession)return;const value=composerText(),images=promptImages;if(!value.trim()&&!images.length)return;const error=document.querySelector('#conversation-error');if(value.startsWith('!')&&images.length){error.textContent='Shell commands cannot carry images.';return}const body=value.startsWith('!')?{action:'run-shell',session_id:currentSession,command:value.slice(1)}:{action:'prompt',session_id:currentSession,text:value,images:images.map(image=>({data_base64:image.data_base64,mime_type:image.mime_type,width:image.width,height:image.height}))};const payload=JSON.stringify(body);if(new TextEncoder().encode(payload).byteLength>MAX_PROMPT_REQUEST_BYTES){error.textContent='Prompt attachments exceed the 32 MiB request limit.';return}try{await request('/api/actions',{method:'POST',body:payload});setComposerText('');promptImages=[];renderAttachments();error.textContent='';await refresh()}catch(err){error.textContent=err.message}}
-function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
-async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;if(cursor>acknowledged){const through=cursor;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through})});acknowledged=through}}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
-async function openConversation(id){const session=snapshot?.sessions.find(x=>x.id===id);if(!session?.conversation_available){showDashboard();return}currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');document.querySelector('#conversation-title').textContent=session.title;document.querySelector('#conversation-state').textContent=session.state;renderQueue(session);renderElicitations(session);promptImages=[];renderAttachments();await loadConversation(false)}
-function showDashboard(){currentSession=null;cursor=0;acknowledged=0;location.hash='';elicitations.replaceChildren();elicitationCards.clear();promptImages=[];renderAttachments();conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
-document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';await restoreRoute()}catch(err){document.querySelector('#login-error').textContent=err.message}};
-logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
-newTarget.onchange=syncProjectDirectory;
-newForm.onsubmit=async e=>{e.preventDefault();const target=snapshot.targets.find(x=>x.id===newTarget.value);try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'new',title:document.querySelector('#new-title').value,profile_id:newProfile.value,bundle_id:newBundle.value,target_id:newTarget.value,project_directory:target?.requires_project_directory?newProjectDirectory.value:null})});document.querySelector('#new-title').value='';actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
-sessions.onclick=async e=>{const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='open')return openConversation(button.dataset.id);if(button.dataset.action==='close'&&!confirm('Save a recovery copy, stop, and destroy this session target? Queued prompts will be preserved.'))return;const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target;const session=snapshot.sessions.find(x=>x.id===button.dataset.id);body.queue='start';if(session?.queued_prompts?.length){const choice=prompt(`This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,'start');if(choice===null)return;if(!['start','discard'].includes(choice.toLowerCase()))return alert('Enter start or discard.');body.queue=choice.toLowerCase()}}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
-document.querySelector('#back').onclick=showDashboard;
-document.querySelector('#prompt-form').onsubmit=e=>{e.preventDefault();submitPrompt()};
-promptText.addEventListener('input',composerInputChanged);
-// Rich text, and anything a paste or drop would inject as markup, never
-// belongs in a prompt: refuse it here and re-insert the plain text instead.
-promptText.addEventListener('beforeinput',e=>{const kind=e.inputType||'';if(kind==='insertHTML'||kind.startsWith('insertFromDrop')||kind.startsWith('insertFromPaste')||kind.startsWith('format'))e.preventDefault()});
-promptText.addEventListener('paste',e=>{const files=Array.from(e.clipboardData?.items||[]).filter(item=>item.kind==='file'&&item.type.startsWith('image/')).map(item=>item.getAsFile()).filter(Boolean);if(files.length){e.preventDefault();const session=snapshot?.sessions.find(x=>x.id===currentSession);if(session?.prompt_images_supported)attachImageFiles(files);else document.querySelector('#conversation-error').textContent='This session does not support image prompts.';return}const text=e.clipboardData?.getData('text/plain');if(text===undefined)return;e.preventDefault();insertComposerText(text)});
-promptText.addEventListener('dragover',e=>{e.preventDefault();const types=Array.from(e.dataTransfer?.types||[]);if(e.dataTransfer)e.dataTransfer.dropEffect=types.some(type=>type==='text/plain'||type==='Files')?'copy':'none'});
-promptText.addEventListener('drop',e=>{e.preventDefault();placeComposerCaretAtPoint(e.clientX,e.clientY);const files=Array.from(e.dataTransfer?.files||[]).filter(file=>file.type.startsWith('image/'));if(files.length){const session=snapshot?.sessions.find(x=>x.id===currentSession);if(session?.prompt_images_supported)attachImageFiles(files);else document.querySelector('#conversation-error').textContent='This session does not support image prompts.';return}const text=e.dataTransfer?.getData('text/plain')||'';if(text)insertComposerText(text)});
-// An active IME composition steers its candidate with Enter and the arrows,
-// so the composer must not read those keys until the composition ends.
-promptText.addEventListener('keydown',e=>{if(e.isComposing||e.keyCode===229)return;if(e.key==='Enter'&&!e.shiftKey&&!e.metaKey&&!e.ctrlKey&&!e.altKey){e.preventDefault();submitPrompt();return}if(e.key==='Enter'&&e.shiftKey&&!e.metaKey&&!e.ctrlKey&&!e.altKey){e.preventDefault();insertComposerLineBreak();return}if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();submitPrompt()}});
-attachImage.onclick=()=>imagePicker.click();
-imagePicker.onchange=()=>{const files=Array.from(imagePicker.files||[]);imagePicker.value='';attachImageFiles(files)};
-queue.onclick=async e=>{const button=e.target.closest('button[data-queue-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'remove-queued-prompt',session_id:currentSession,queue_id:button.dataset.queueId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
-shells.onclick=async e=>{const button=e.target.closest('button[data-shell-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'cancel-shell',session_id:currentSession,shell_command_id:button.dataset.shellId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
-function escapeHtml(value){const e=document.createElement('span');e.textContent=value;return e.innerHTML}function escapeAttr(value){return escapeHtml(value).replaceAll('"','&quot;')}
-window.addEventListener('online',()=>{startEvents();refresh()});
-if('serviceWorker'in navigator)navigator.serviceWorker.register('/service-worker.js');restoreRoute();
-</script></body></html>"##;
+/// Headers every response carries, applied once as a layer so no route can
+/// forget them.
+///
+/// The layer also owns `no-store` for live state and authentication, rather
+/// than leaving it to each handler. A rejected request never reaches its
+/// handler, so a handler-set header is missing from exactly the responses that
+/// are least worth storing.
+async fn security_headers(request: Request, next: Next) -> Response<Body> {
+    let live = {
+        let path = request.uri().path();
+        path.starts_with("/api/") || path.starts_with("/auth/")
+    };
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_SECURITY_POLICY_HEADER,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    if live {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
 
 #[cfg(test)]
 mod tests {
@@ -1630,6 +2429,8 @@ mod tests {
         Router,
         mpsc::Receiver<ControllerRequest>,
         mpsc::Receiver<ReadReceiptRequest>,
+        mpsc::Receiver<PreflightRequest>,
+        mpsc::Receiver<ClientStateRequest>,
     );
 
     fn app() -> TestServer {
@@ -1655,9 +2456,24 @@ mod tests {
         let (_conversation_tx, conversation_rx) = watch::channel(conversations);
         let (action_tx, action_rx) = mpsc::channel(8);
         let (receipt_tx, receipt_rx) = mpsc::channel(8);
-        let options = test_options(snapshot_rx, conversation_rx, action_tx, receipt_tx)
-            .with_test_credentials("123456", b"01234567890123456789012345678901");
-        (router(options), action_rx, receipt_rx)
+        let (preflight_tx, preflight_rx) = mpsc::channel(8);
+        let (client_state_tx, client_state_rx) = mpsc::channel(8);
+        let options = test_options(
+            snapshot_rx,
+            conversation_rx,
+            action_tx,
+            receipt_tx,
+            preflight_tx,
+            client_state_tx,
+        )
+        .with_test_credentials("123456", b"01234567890123456789012345678901");
+        (
+            router(options),
+            action_rx,
+            receipt_rx,
+            preflight_rx,
+            client_state_rx,
+        )
     }
 
     fn test_options(
@@ -1665,6 +2481,8 @@ mod tests {
         conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
         action_tx: mpsc::Sender<ControllerRequest>,
         receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+        preflight_tx: mpsc::Sender<PreflightRequest>,
+        client_state_tx: mpsc::Sender<ClientStateRequest>,
     ) -> ServerOptions {
         ServerOptions::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -1672,6 +2490,8 @@ mod tests {
             conversation_rx,
             action_tx,
             receipt_tx,
+            preflight_tx,
+            client_state_tx,
         )
         .unwrap()
     }
@@ -1683,7 +2503,32 @@ mod tests {
         let (_conversation_tx, conversation_rx) = watch::channel(BTreeMap::new());
         let (action_tx, _action_rx) = mpsc::channel(1);
         let (receipt_tx, _receipt_rx) = mpsc::channel(1);
-        test_options(snapshot_rx, conversation_rx, action_tx, receipt_tx)
+        let (preflight_tx, _preflight_rx) = mpsc::channel(1);
+        let (client_state_tx, _client_state_rx) = mpsc::channel(1);
+        test_options(
+            snapshot_rx,
+            conversation_rx,
+            action_tx,
+            receipt_tx,
+            preflight_tx,
+            client_state_tx,
+        )
+    }
+
+    /// A valid session cookie for the test server's key.
+    ///
+    /// Most checks are about what an authenticated request does rather than
+    /// about how it authenticated, and going through the login route for each
+    /// one buys nothing.
+    fn cookie() -> String {
+        format!(
+            "{COOKIE_NAME}={}",
+            signed_cookie_value(
+                b"01234567890123456789012345678901",
+                "test-viewer",
+                now_unix().saturating_add(3600)
+            )
+        )
     }
 
     async fn login_cookie(app: &Router) -> String {
@@ -1712,7 +2557,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_requires_a_valid_signed_cookie() {
-        let (app, _, _) = app();
+        let (app, _, _, _, _) = app();
         let unauthorized = app
             .clone()
             .oneshot(Request::get("/api/snapshot").body(Body::empty()).unwrap())
@@ -1735,7 +2580,7 @@ mod tests {
 
     #[tokio::test]
     async fn qr_login_exchanges_the_secret_for_a_cookie_and_redirects_cleanly() {
-        let (app, _, _) = app();
+        let (app, _, _, _, _) = app();
         let rejected = app
             .clone()
             .oneshot(
@@ -1764,7 +2609,7 @@ mod tests {
     #[test]
     fn signed_cookie_rejects_expiry_and_tampering() {
         let key = b"01234567890123456789012345678901";
-        let cookie = signed_cookie_value(key, 200);
+        let cookie = signed_cookie_value(key, "test-viewer", 200);
         assert!(session_cookie_valid(key, &cookie, 100));
         assert!(!session_cookie_valid(key, &cookie, 200));
         assert!(!session_cookie_valid(key, &format!("{cookie}x"), 100));
@@ -1854,7 +2699,7 @@ mod tests {
 
     #[tokio::test]
     async fn elicitation_answer_is_typed_and_forwarded() {
-        let (app, mut actions, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let (app, mut actions, _, _, _) = app_with_snapshot(pending_elicitation_snapshot);
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -1886,7 +2731,7 @@ mod tests {
     #[tokio::test]
     async fn elicitation_answer_for_an_unknown_request_is_refused_without_reaching_the_controller()
     {
-        let (app, mut actions, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let (app, mut actions, _, _, _) = app_with_snapshot(pending_elicitation_snapshot);
         let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
@@ -1954,19 +2799,769 @@ mod tests {
         );
     }
 
+    /// One slice of the browser application, named by the two markers that
+    /// bracket it in `src/web/viewer.js`.
+    ///
+    /// Slicing keeps each check to the functions it is about, so an unrelated
+    /// change elsewhere in the application cannot make it fail for the wrong
+    /// reason. The markers are ordinary source text, so a rename that moves
+    /// them fails loudly here rather than silently testing nothing.
+    fn viewer_source(from: &str, to: &str) -> &'static str {
+        let start = VIEWER_JS
+            .find(from)
+            .unwrap_or_else(|| panic!("src/web/viewer.js no longer contains {from:?}"));
+        let end = VIEWER_JS[start..]
+            .find(to)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| {
+                panic!("src/web/viewer.js no longer contains {to:?} after {from:?}")
+            });
+        &VIEWER_JS[start..end]
+    }
+
+    /// Run one JavaScript check under Node.
+    ///
+    /// The check and the modules it imports are written to a real directory
+    /// rather than passed to `--eval`, so a failure reports a line number a
+    /// person can open, and so a check can import the shipped module under
+    /// test by its real name instead of against a copy pasted into a string.
+    fn run_web_check(name: &str, check: &str) {
+        let directory = tempfile::tempdir().expect("temporary directory for a web check");
+        for (file, source) in [
+            ("test-dom.js", TEST_DOM_JS),
+            ("markdown.js", MARKDOWN_JS),
+            ("tool-output.js", TOOL_OUTPUT_JS),
+        ] {
+            std::fs::write(directory.path().join(file), source).expect("write a web module");
+        }
+        let path = directory.path().join(format!("{name}.mjs"));
+        std::fs::write(&path, check).expect("write the web check");
+        let output = std::process::Command::new("node")
+            .arg(&path)
+            .output()
+            .expect("Node.js is required to exercise the web viewer");
+        assert!(
+            output.status.success(),
+            "{name} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Run one JavaScript check that supplies its own environment, for the
+    /// checks that slice a function out of `viewer.js` and drive it against a
+    /// hand-written stub rather than importing a module.
+    fn run_viewer_script(name: &str, script: &str) {
+        run_web_check(name, script);
+    }
+
+    /// The projection publishes what the browser needs to group and filter
+    /// without publishing what the redaction contract keeps back. A project
+    /// key groups two sessions in one project together and says nothing about
+    /// where that project lives.
+    #[test]
+    fn the_project_key_groups_without_naming_a_path() {
+        let (config, mut state) = sample_config_state();
+        let first = state.sessions["session-1"].clone();
+        let mut second = first.clone();
+        second.id = "session-2".into();
+        state.sessions.insert(second.id.clone(), second);
+        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+
+        let keys = snapshot
+            .sessions
+            .iter()
+            .map(|session| session.project_key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), 1, "two sessions in one project did not group");
+        let key = keys.into_iter().next().expect("one key");
+        assert!(!key.is_empty(), "the project key is empty");
+        assert!(
+            !key.contains('/') && !key.contains("hel"),
+            "the project key leaks its identity: {key}"
+        );
+        assert_eq!(
+            snapshot.sessions[0].project_label, "hel",
+            "the project label should be a name a person recognises"
+        );
+    }
+
+    /// A phone groups and filters by the lifecycle category, so the mapping
+    /// from the controller's precise state has to be the controller's own.
+    #[test]
+    fn lifecycle_categories_decide_what_the_dashboard_shows() {
+        use ViewerLifecycleCategory::{Failed, Live, Starting, Stopped, Stopping};
+
+        for (state, expected, on_dashboard) in [
+            (SessionState::Provisioning, Starting, true),
+            (SessionState::Running, Live, true),
+            (SessionState::Disconnected, Live, true),
+            (SessionState::Checkpointing, Live, true),
+            (SessionState::Closing, Stopping, true),
+            (SessionState::Destroying, Stopping, true),
+            (SessionState::Stopped, Stopped, false),
+            (SessionState::Lost, Failed, false),
+            (SessionState::Error, Failed, false),
+            (SessionState::DestroyedWithDataLoss, Failed, false),
+        ] {
+            let category = ViewerLifecycleCategory::of(state);
+            assert_eq!(category, expected, "{state:?}");
+            assert_eq!(
+                category.is_dashboard_visible(),
+                on_dashboard,
+                "{state:?} belongs on the dashboard? "
+            );
+        }
+    }
+
+    /// Resume compatibility travels as the set the browser can offer, so it
+    /// never has to subtract one list from another and never offers a target
+    /// the controller would refuse.
+    #[test]
+    fn compatible_resume_targets_are_the_complement_of_the_incompatible_ones() {
+        let (config, state) = sample_config_state();
+        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        let session = &snapshot.sessions[0];
+        let all = config.targets.keys().cloned().collect::<Vec<_>>();
+
+        for target in &all {
+            assert_ne!(
+                session.compatible_resume_targets.contains(target),
+                session.incompatible_resume_targets.contains(target),
+                "target {target} is in both lists or neither"
+            );
+        }
+        assert_eq!(
+            session.compatible_resume_targets.len() + session.incompatible_resume_targets.len(),
+            all.len(),
+            "the two lists do not cover every target"
+        );
+    }
+
+    /// The viewer renders a control because a capability says so. An action
+    /// whose capability is false is refused at the boundary, so a forged
+    /// request gets the same answer a well-behaved viewer would never ask for.
+    #[tokio::test]
+    async fn actions_are_refused_when_their_capability_is_false() {
+        for (body, capability) in [
+            (
+                r#"{"action":"cancel-turn","session_id":"session-1"}"#,
+                "cancel_turn",
+            ),
+            (
+                r#"{"action":"set-plan-mode","session_id":"session-1","active":true}"#,
+                "set_plan_mode",
+            ),
+            (
+                r#"{"action":"set-config","session_id":"session-1","key":"model","value":"x"}"#,
+                "set_config",
+            ),
+        ] {
+            let (app, mut actions, _, _, _) = app();
+            let response = post_action(app, cookie(), body.to_owned()).await;
+            assert!(
+                response.status().is_client_error(),
+                "{capability} was accepted while false: {}",
+                response.status()
+            );
+            assert!(
+                actions.try_recv().is_err(),
+                "{capability} reached the controller while false"
+            );
+        }
+    }
+
+    /// A setting the harness never advertised is not a setting. Forwarding one
+    /// asks the agent to refuse something the viewer should never have offered.
+    #[tokio::test]
+    async fn a_config_key_the_harness_never_advertised_is_refused() {
+        let capable = |snapshot: &mut ViewerSnapshot| {
+            snapshot.sessions[0].capabilities.set_config = true;
+            snapshot.sessions[0].config_options = vec![ViewerConfigOption {
+                key: "model".into(),
+                label: "model".into(),
+                current: None,
+                choices: vec![ViewerConfigChoice {
+                    value: "sonnet".into(),
+                    name: "Sonnet".into(),
+                    description: None,
+                }],
+            }];
+        };
+
+        for (body, why) in [
+            (
+                r#"{"action":"set-config","session_id":"session-1","key":"effort","value":"high"}"#,
+                "an unadvertised key",
+            ),
+            (
+                r#"{"action":"set-config","session_id":"session-1","key":"model","value":"gpt-9"}"#,
+                "an unoffered value",
+            ),
+        ] {
+            let (app, mut actions, _, _, _) = app_with_snapshot(capable);
+            let response = post_action(app, cookie(), body.to_owned()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{why} was accepted"
+            );
+            assert!(actions.try_recv().is_err(), "{why} reached the controller");
+        }
+
+        // The value the harness did advertise is forwarded unchanged.
+        let (app, mut actions, _, _, _) = app_with_snapshot(capable);
+        let response = tokio::spawn(post_action(
+            app,
+            cookie(),
+            r#"{"action":"set-config","session_id":"session-1","key":"model","value":"sonnet"}"#
+                .to_owned(),
+        ));
+        let action = actions
+            .recv()
+            .await
+            .expect("the action reached the controller");
+        assert!(
+            matches!(
+                action.action,
+                ControllerAction::SetConfig { ref key, ref value, .. }
+                    if key == "model" && value == "sonnet"
+            ),
+            "the advertised value was not forwarded unchanged"
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::ACCEPTED);
+    }
+
+    /// A dirty-worktree acknowledgement names the repositories the person was
+    /// shown. A bare yes could be replayed against a set they never saw.
+    #[tokio::test]
+    async fn a_dirty_acknowledgement_is_bounded_and_names_repositories() {
+        let oversized = (0..40)
+            .map(|index| format!(r#""repo-{index}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (ack, why) in [
+            (oversized.as_str(), "an unbounded acknowledgement"),
+            (r#""""#, "an empty repository name"),
+        ] {
+            let (app, mut actions, _, _, _) = app();
+            let body = format!(
+                r#"{{"action":"new","workspace_id":"default","profile_id":"codex-1","bundle_id":"hel","target_id":"podman","dirty_ack":[{ack}]}}"#
+            );
+            let response = post_action(app, cookie(), body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{why}");
+            assert!(actions.try_recv().is_err(), "{why} reached the controller");
+        }
+    }
+
+    /// A session created without a title still gets one, derived the way the
+    /// terminal derives it, so the two surfaces name a session alike.
+    #[tokio::test]
+    async fn a_new_session_without_a_title_is_accepted() {
+        let (app, mut actions, _, _, _) = app();
+        let response = tokio::spawn(post_action(
+            app,
+            cookie(),
+            r#"{"action":"new","workspace_id":"default","profile_id":"codex-1","bundle_id":"hel","target_id":"podman"}"#
+                .to_owned(),
+        ));
+        // The handler answers only once the controller does, so the reply has
+        // to be sent before the response can be read.
+        let action = actions
+            .recv()
+            .await
+            .expect("the action reached the controller");
+        assert!(
+            matches!(
+                action.action,
+                ControllerAction::New { title: None, ref workspace_id, .. }
+                    if workspace_id == "default"
+            ),
+            "the workspace or the absent title did not survive the boundary"
+        );
+        action.reply.send(ActionOutcome::Accepted).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::ACCEPTED);
+    }
+
+    /// Two phones must not share stored state, and one phone's state must
+    /// survive its own re-login. Neither is true of a cookie that signs only
+    /// an expiry, which is what this replaced.
+    #[test]
+    fn a_cookie_names_one_viewer_and_two_cookies_never_collide() {
+        let key = b"01234567890123456789012345678901";
+        let expiry = now_unix().saturating_add(3600);
+        let first = signed_cookie_value(key, "viewer-a", expiry);
+        let second = signed_cookie_value(key, "viewer-b", expiry);
+        assert_ne!(
+            first, second,
+            "two viewers unlocking in the same second share a cookie"
+        );
+        assert_eq!(
+            cookie_viewer(key, &first, now_unix()),
+            Some(Some("viewer-a".to_owned()))
+        );
+        assert_eq!(
+            cookie_viewer(key, &second, now_unix()),
+            Some(Some("viewer-b".to_owned()))
+        );
+    }
+
+    /// A phone holding the previous cookie keeps working through a deployment.
+    /// It names no viewer, so it stores nothing, which is the difference
+    /// between signed out and signed in with nothing kept.
+    #[test]
+    fn a_legacy_cookie_still_authenticates_and_stores_nothing() {
+        let key = b"01234567890123456789012345678901";
+        let expiry = now_unix().saturating_add(3600);
+        let legacy = legacy_signed_cookie_value(key, expiry);
+        assert_eq!(cookie_viewer(key, &legacy, now_unix()), Some(None));
+        assert!(session_cookie_valid(key, &legacy, now_unix()));
+        assert!(
+            !session_cookie_valid(key, &legacy, expiry),
+            "an expired legacy cookie still authenticated"
+        );
+    }
+
+    /// A forged or tampered cookie names nobody.
+    #[test]
+    fn a_tampered_cookie_is_refused() {
+        let key = b"01234567890123456789012345678901";
+        let expiry = now_unix().saturating_add(3600);
+        let honest = signed_cookie_value(key, "viewer-a", expiry);
+        let swapped = honest.replacen("viewer-a", "viewer-b", 1);
+        assert_eq!(cookie_viewer(key, &swapped, now_unix()), None);
+        assert_eq!(cookie_viewer(key, "nonsense", now_unix()), None);
+        assert_eq!(cookie_viewer(key, &format!("{expiry}."), now_unix()), None);
+    }
+
+    /// A composer is for a prompt. The bound exists so one viewer cannot fill
+    /// the daemon's database with text it never sent.
+    #[tokio::test]
+    async fn an_oversized_draft_is_refused_with_a_stable_code() {
+        let (app, _, _, _, mut stored) = app();
+        let draft = "x".repeat(64 * 1024 + 1);
+        let response = app
+            .oneshot(
+                Request::put("/api/sessions/session-1/draft")
+                    .header(COOKIE, cookie())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "draft": draft }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(stored.try_recv().is_err(), "an oversized draft was stored");
+    }
+
+    /// A viewer with no identity has nothing stored, and is told so rather
+    /// than being promised a persistence that is not there.
+    #[tokio::test]
+    async fn a_legacy_viewer_reads_empty_state_and_cannot_store_a_draft() {
+        let key = b"01234567890123456789012345678901";
+        let legacy = format!(
+            "{COOKIE_NAME}={}",
+            legacy_signed_cookie_value(key, now_unix().saturating_add(3600))
+        );
+
+        let (reader, _, _, _, mut stored) = app();
+        let response = reader
+            .oneshot(
+                Request::get("/api/sessions/session-1/client-state")
+                    .header(COOKIE, legacy.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let state: ViewerClientState = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state, ViewerClientState::default());
+        assert!(
+            stored.try_recv().is_err(),
+            "a legacy viewer read stored state"
+        );
+
+        let (writer, _, _, _, mut stored) = app();
+        let response = writer
+            .oneshot(
+                Request::put("/api/sessions/session-1/draft")
+                    .header(COOKIE, legacy)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"draft":"text"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(stored.try_recv().is_err(), "a legacy viewer stored a draft");
+    }
+
+    /// A search that is not a search is refused before it reaches a database.
+    #[tokio::test]
+    async fn prompt_history_refuses_an_unknown_scope() {
+        let (app, _, _, _, mut stored) = app();
+        let response = app
+            .oneshot(
+                Request::get("/api/sessions/session-1/history?q=ship&scope=everything")
+                    .header(COOKIE, cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            stored.try_recv().is_err(),
+            "the search reached the controller"
+        );
+    }
+
+    /// A preflight starts nothing. It answers the questions a person needs
+    /// before committing, and it refuses an impossible combination there
+    /// rather than after the commit.
+    #[tokio::test]
+    async fn a_preflight_validates_before_it_reaches_the_controller() {
+        for (body, why) in [
+            (
+                r#"{"profile_id":"nope","bundle_id":"hel","target_id":"podman"}"#,
+                "an unknown profile",
+            ),
+            (
+                r#"{"profile_id":"codex-1","bundle_id":"hel","target_id":"raw"}"#,
+                "a bare target with no directory",
+            ),
+        ] {
+            let (app, _, _, mut preflights, _) = app();
+            let response = app
+                .oneshot(
+                    Request::post("/api/preflight/new")
+                        .header(COOKIE, cookie())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{why}");
+            assert!(
+                preflights.try_recv().is_err(),
+                "{why} reached the controller"
+            );
+        }
+    }
+
+    /// A bare target opens a directory the person named, so there is no bundle
+    /// whose repositories could be dirty and nothing to ask the controller.
+    #[tokio::test]
+    async fn a_bare_preflight_answers_without_the_controller() {
+        let (app, _, _, mut preflights, _) = app();
+        let response = app
+            .oneshot(
+                Request::post("/api/preflight/new")
+                    .header(COOKIE, cookie())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"profile_id":"codex-1","bundle_id":"hel","target_id":"raw","project_directory":"/work/project"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(preflights.try_recv().is_err(), "the controller was asked");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let answer: PreflightNew = serde_json::from_slice(&body).unwrap();
+        assert!(answer.dirty_repositories.is_empty());
+    }
+
+    /// A bundle preflight asks the controller, because whether a working tree
+    /// has uncommitted changes is a fact about the disk.
+    #[tokio::test]
+    async fn a_bundle_preflight_reports_the_repositories_by_leaf_name() {
+        let (app, _, _, mut preflights, _) = app();
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/preflight/new")
+                    .header(COOKIE, cookie())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"profile_id":"codex-1","bundle_id":"hel","target_id":"podman"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let request = preflights.recv().await.expect("the controller was asked");
+        assert_eq!(request.bundle_id, "hel");
+        request
+            .reply
+            .send(Ok(PreflightNew {
+                dirty_repositories: vec!["hel".into()],
+            }))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let answer: PreflightNew = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer.dirty_repositories, vec!["hel".to_owned()]);
+        assert!(
+            !String::from_utf8_lossy(&body).contains('/'),
+            "the preflight published a path: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// Everything an agent writes goes through the Markdown renderer, so the
+    /// renderer is where injection is stopped. These checks run the shipped
+    /// module against a fake DOM: structure has to come out as elements, and
+    /// markup an agent typed has to come out as text.
+    #[test]
+    fn the_markdown_renderer_builds_structure_and_refuses_injection() {
+        run_web_check(
+            "markdown",
+            r#"import { installDocument, elements, only, check, checkEqual } from './test-dom.js';
+installDocument();
+const { renderMarkdown, renderDiffSummary, safeHref } = await import('./markdown.js');
+
+const render = source => {
+  const host = document.createElement('section');
+  host.append(renderMarkdown(source));
+  return host;
+};
+
+// Headings
+checkEqual(only(render('# Title'), 'h1').textContent, 'Title', 'h1');
+checkEqual(only(render('### Deep'), 'h3').textContent, 'Deep', 'h3');
+
+// Nested lists
+const nested = render('- one\n  - inner\n- two');
+check(elements(nested, 'ul').length === 2, 'nested list produced ' + elements(nested, 'ul').length + ' lists');
+check(elements(elements(nested, 'ul')[0], 'li').length >= 2, 'outer list lost items');
+
+// Ordered lists
+checkEqual(elements(render('1. a\n2. b'), 'ol').length, 1, 'ordered list');
+
+// Fenced code stays unparsed
+const fenced = render('```rust\nlet x = *y*;\n```');
+checkEqual(only(fenced, 'code').textContent, 'let x = *y*;', 'fenced code');
+check(elements(fenced, 'span').some(s => s.className === 'tok-kw'), 'fenced rust untinted');
+checkEqual(elements(fenced, 'em').length, 0, 'fence emphasised its contents');
+checkEqual(only(fenced, 'pre').dataset.lang, 'rust', 'fence language');
+
+// Inline code beats emphasis
+checkEqual(only(render('`*not em*`'), 'code').textContent, '*not em*', 'inline code');
+checkEqual(elements(render('`*not em*`'), 'em').length, 0, 'inline code emphasised');
+
+// Emphasis
+checkEqual(only(render('**bold**'), 'strong').textContent, 'bold', 'strong');
+checkEqual(only(render('*it*'), 'em').textContent, 'it', 'em');
+checkEqual(only(render('~~gone~~'), 'del').textContent, 'gone', 'del');
+
+// Tables
+const table = render('| a | b |\n| --- | ---: |\n| 1 | 2 |');
+checkEqual(elements(table, 'table').length, 1, 'table');
+checkEqual(elements(table, 'th').length, 2, 'table header cells');
+checkEqual(elements(table, 'td').length, 2, 'table body cells');
+checkEqual(elements(table, 'th')[1].className, 'align-right', 'table alignment class');
+checkEqual(only(table, 'div').className, 'scroll-x', 'table scroll wrapper');
+
+// Blockquote and rule
+checkEqual(elements(render('> quoted'), 'blockquote').length, 1, 'blockquote');
+checkEqual(elements(render('---'), 'hr').length, 1, 'rule');
+
+// XSS: markup is text, never elements
+const injected = render('<img src=x onerror=alert(1)>');
+checkEqual(elements(injected, 'img').length, 0, 'raw HTML became an element');
+check(injected.textContent.includes('<img src=x onerror=alert(1)>'), 'raw HTML lost its text');
+
+// XSS: refused link schemes
+for (const target of ['javascript:alert(1)', 'JaVaScRiPt:alert(1)', 'java\tscript:alert(1)', 'data:text/html,<script>', 'vbscript:x']) {
+  const out = render(`[click](${target})`);
+  checkEqual(elements(out, 'a').length, 0, `link scheme ${JSON.stringify(target)} was allowed`);
+  check(out.textContent.includes('click'), `link scheme ${JSON.stringify(target)} lost its label`);
+}
+
+// Accepted schemes keep their href and carry safe rel/target
+for (const target of ['https://example.com', 'http://example.com/a', 'mailto:someone@example.com']) {
+  const anchor = only(render(`[click](${target})`), 'a');
+  checkEqual(anchor.getAttribute('href'), target, 'href');
+  checkEqual(anchor.getAttribute('rel'), 'noreferrer noopener', 'rel');
+  checkEqual(anchor.getAttribute('target'), '_blank', 'target');
+}
+
+// safeHref directly
+checkEqual(safeHref('javascript:alert(1)'), null, 'safeHref allowed javascript:');
+checkEqual(safeHref(' https://x.test '), 'https://x.test', 'safeHref cleaned value');
+
+// Inline markup inside a link label
+checkEqual(only(render('[**bold link**](https://x.test)'), 'strong').textContent, 'bold link', 'link label markup');
+
+// An unclosed delimiter is literal, not markup
+checkEqual(render('a * b').textContent, 'a * b', 'unclosed emphasis');
+checkEqual(elements(render('a * b'), 'em').length, 0, 'unclosed emphasis made an element');
+
+// Diff summaries: the real format from format_diffstat, two spaces and U+2212
+const diff = renderDiffSummary(['src/main.rs  +12 −3', 'unparseable line']);
+const items = elements(diff, 'li');
+checkEqual(items.length, 2, 'diffstat rows');
+checkEqual(elements(items[0], 'span')[0].textContent, 'src/main.rs', 'diffstat path');
+checkEqual(elements(items[0], 'span')[1].textContent, '+12', 'diffstat additions');
+checkEqual(elements(items[0], 'span')[2].textContent, '−3', 'diffstat deletions');
+checkEqual(elements(items[1], 'span').length, 1, 'unparseable diffstat produced counts');
+checkEqual(elements(items[1], 'span')[0].textContent, 'unparseable line', 'unparseable diffstat lost its text');
+
+console.log('all markdown checks passed');
+"#,
+        );
+    }
+
+    /// Tool output is not prose, and rendering it as prose loses the parts
+    /// that matter: which words in a command are the program and which are
+    /// paths, where a JSON payload begins, and whether a five-thousand-line
+    /// dump has to be paid for before anyone asks to see it.
+    #[test]
+    fn tool_output_is_tinted_folded_and_never_read_as_markdown() {
+        run_web_check(
+            "tool-output",
+            r#"import { installDocument, elements, only, check, checkEqual, openFold } from './test-dom.js';
+installDocument();
+const { renderToolOutput, codeBlock, detectLang, appendCommandTokens, isPathLike } = await import(
+  './tool-output.js'
+);
+
+const classes = root => elements(root, 'span').map(s => s.className);
+
+// A shell command is told apart into program, subcommand, flag and path.
+const line = document.createElement('pre');
+appendCommandTokens(line, 'cargo test --workspace src/lib.rs');
+const seen = classes(line);
+check(seen.includes('cmd-program'), 'no program: ' + seen);
+check(seen.includes('cmd-subcommand'), 'no subcommand: ' + seen);
+check(seen.includes('cmd-flag'), 'no flag: ' + seen);
+check(seen.includes('cmd-path'), 'no path: ' + seen);
+checkEqual(line.textContent, 'cargo test --workspace src/lib.rs', 'command text changed');
+
+// An operator starts the program count again, so both programs are found.
+const piped = document.createElement('pre');
+appendCommandTokens(piped, 'git status && cargo build');
+checkEqual(classes(piped).filter(c => c === 'cmd-program').length, 2, 'pipeline reset');
+
+// Prose with a slash is not a path; a real path is.
+check(!isPathLike('and/or'), '"and/or" read as a path');
+check(isPathLike('src/lib/thing.rs'), 'a real path did not');
+check(isPathLike('./x'), 'a relative path did not');
+check(isPathLike('Cargo.toml'), 'a file with an extension did not');
+
+// JSON is pretty-printed and tinted, keys apart from values.
+const json = renderToolOutput('{"name":"hel","count":3,"ok":true}');
+const jsonClasses = classes(json);
+check(jsonClasses.includes('tok-key'), 'no JSON key: ' + jsonClasses);
+check(jsonClasses.includes('tok-str'), 'no JSON string: ' + jsonClasses);
+check(jsonClasses.includes('tok-num'), 'no JSON number: ' + jsonClasses);
+check(jsonClasses.includes('tok-kw'), 'no JSON keyword: ' + jsonClasses);
+check(json.textContent.includes('"name"'), 'JSON lost its content');
+
+// Rust is tinted; an unknown language is not.
+const rust = codeBlock('pub fn main() {\n    let x = 1;\n}', 'rust');
+check(classes(rust).includes('tok-kw'), 'rust keywords untinted');
+checkEqual(only(rust, 'pre').dataset.lang, 'rust', 'rust data-lang');
+const plain = codeBlock('nothing in particular here', 'brainfuck');
+checkEqual(classes(plain).length, 0, 'unknown language was tinted');
+
+// Sniffing is conservative: a log stays plain, real code does not.
+checkEqual(detectLang('12:03 INFO started\n12:04 INFO done\n12:05 INFO stopped'), '', 'a log was sniffed');
+checkEqual(
+  detectLang('fn a() {}\nfn b() {}\nlet mut x = 1;\nuse std::fmt;\nimpl Foo {}\nlet y = x.unwrap();'),
+  'rust',
+  'rust was not sniffed',
+);
+checkEqual(detectLang('--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new'), 'diff', 'diff was not sniffed');
+
+// A long dump is one closed fold that has built nothing yet.
+const long = Array.from({ length: 400 }, (_, i) => `line ${i}`).join('\n');
+const folded = renderToolOutput(long);
+checkEqual(folded.nodeName, 'DETAILS', 'a 400-line dump was not folded');
+checkEqual(elements(folded, 'pre').length, 0, 'a closed fold built its content anyway');
+check(only(folded, 'summary').textContent.includes('400 lines'), 'fold summary: ' + only(folded, 'summary').textContent);
+openFold(folded);
+checkEqual(elements(folded, 'pre').length, 1, 'an opened fold built nothing');
+check(elements(folded, 'pre')[0].textContent.includes('line 399'), 'the fold lost its content');
+
+// Opening twice builds once.
+openFold(folded);
+checkEqual(elements(folded, 'pre').length, 1, 'reopening rebuilt the content');
+
+// A short dump is not folded.
+checkEqual(renderToolOutput('one\ntwo').nodeName, 'PRE', 'a short dump was folded');
+
+// Tool output is never parsed as Markdown, so an underscore is an underscore.
+const literal = renderToolOutput('a _b_ c <img src=x>');
+checkEqual(elements(literal, 'em').length, 0, 'tool output was emphasised');
+checkEqual(elements(literal, 'img').length, 0, 'tool output produced an element');
+check(literal.textContent.includes('<img src=x>'), 'tool output lost its text');
+
+console.log('all tool-output checks passed');
+"#,
+        );
+    }
+
+    /// The renderer's guarantee is structural — this code cannot inject markup
+    /// because it never builds markup — and a single stray assignment would
+    /// quietly replace it with no guarantee at all. `escapeHtml` uses
+    /// `innerHTML` on a detached node to escape text, which is safe but is
+    /// also exactly the shape this test exists to stop spreading, so it is
+    /// named rather than pattern-matched.
+    #[test]
+    fn no_web_module_builds_markup_from_a_string() {
+        const SINKS: [&str; 5] = [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "new Function",
+        ];
+        // There is no allowance. Every one of these sinks was removed in
+        // Milestone 2, and the point of the test is that none comes back.
+        const ALLOWED: [(&str, &str); 0] = [];
+        for (name, source) in [
+            ("viewer.js", VIEWER_JS),
+            ("markdown.js", MARKDOWN_JS),
+            ("tool-output.js", TOOL_OUTPUT_JS),
+        ] {
+            for (number, line) in source.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                    continue;
+                }
+                for sink in SINKS {
+                    if !trimmed.contains(sink) {
+                        continue;
+                    }
+                    assert!(
+                        ALLOWED
+                            .iter()
+                            .any(|(file, allowed)| *file == name && trimmed == *allowed),
+                        "{name}:{} builds markup from a string: {trimmed}",
+                        number + 1
+                    );
+                }
+            }
+        }
+    }
+
     /// The card cache is the fix for answers vanishing under snapshot polls, so
-    /// it is exercised as JavaScript: the render source is lifted out of the
-    /// embedded viewer and run against a stub DOM.
+    /// it is exercised as JavaScript: the render source is lifted out of
+    /// `src/web/viewer.js` and run against a stub DOM.
     #[test]
     fn embedded_viewer_keeps_elicitation_answers_across_snapshot_polls() {
-        let start = VIEWER_HTML
-            .find("const elicitationCards=new Map()")
-            .expect("elicitation card cache");
-        let end = VIEWER_HTML[start..]
-            .find("async function submitElicitation")
-            .map(|offset| start + offset)
-            .expect("elicitation rendering boundary");
-        let source = &VIEWER_HTML[start..end];
+        let source = viewer_source(
+            "const elicitationCards = new Map()",
+            "async function submitElicitation",
+        );
         let dom = r#"
 let replaceCalls = 0;
 class Option {
@@ -2070,17 +3665,9 @@ if (sentElicitations.size !== 0) {
   throw new Error("a resolved request kept its sent marker");
 }
 "#;
-        let script = format!("{dom}\n{source}\n{checks}");
-        let output = std::process::Command::new("node")
-            .args(["--input-type=module", "--eval"])
-            .arg(script)
-            .output()
-            .expect("Node.js is required to exercise the embedded web viewer");
-        assert!(
-            output.status.success(),
-            "embedded viewer elicitation rendering failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+        run_viewer_script(
+            "elicitation-rendering",
+            &format!("{dom}\n{source}\n{checks}"),
         );
     }
 
@@ -2111,7 +3698,7 @@ if (sentElicitations.size !== 0) {
 
     #[tokio::test]
     async fn image_prompt_reaches_the_controller_with_its_images() {
-        let (app, mut actions, _) = app_with_snapshot(image_capable);
+        let (app, mut actions, _, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(8);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -2139,7 +3726,7 @@ if (sentElicitations.size !== 0) {
     /// carries prompts, so it is the route that gets the larger bound.
     #[tokio::test]
     async fn multi_image_prompts_are_accepted_over_the_general_body_limit() {
-        let (app, mut actions, _) = app_with_snapshot(image_capable);
+        let (app, mut actions, _, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(MAX_BODY_BYTES / 2);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -2158,7 +3745,7 @@ if (sentElicitations.size !== 0) {
 
     #[tokio::test]
     async fn a_body_over_the_prompt_limit_is_still_refused() {
-        let (app, _actions, _) = app_with_snapshot(image_capable);
+        let (app, _actions, _, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(MAX_PROMPT_BODY_BYTES);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -2181,7 +3768,7 @@ if (sentElicitations.size !== 0) {
             ("", "image/png", 32, 24),
         ];
         for (data, mime, width, height) in cases {
-            let (app, mut actions, _) = app_with_snapshot(image_capable);
+            let (app, mut actions, _, _, _) = app_with_snapshot(image_capable);
             let cookie = login_cookie(&app).await;
             let body = serde_json::to_string(&ControllerAction::Prompt {
                 session_id: "session-1".into(),
@@ -2231,14 +3818,7 @@ if (sentElicitations.size !== 0) {
     /// whatever this reader makes of that DOM. Run it as JavaScript.
     #[test]
     fn embedded_viewer_reads_multiline_composer_text_out_of_its_dom() {
-        let start = VIEWER_HTML
-            .find("function composerText()")
-            .expect("composer reader");
-        let end = VIEWER_HTML[start..]
-            .find("function setComposerText(")
-            .map(|offset| start + offset)
-            .expect("composer reader boundary");
-        let source = &VIEWER_HTML[start..end];
+        let source = viewer_source("function composerText()", "function setComposerText(");
         let harness = r##"
 const Node = { TEXT_NODE: 3 };
 function textNode(value) {
@@ -2283,28 +3863,33 @@ if (blocks !== "first\nsecond\nthird") throw new Error(`blocks became ${JSON.str
 const carriage = read([textNode("first\r\nsecond")]);
 if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(carriage)}`);
 "#;
-        let script = format!("{harness}\n{source}\n{checks}");
-        let output = std::process::Command::new("node")
-            .args(["--input-type=module", "--eval"])
-            .arg(script)
-            .output()
-            .expect("Node.js is required to exercise the embedded web viewer");
-        assert!(
-            output.status.success(),
-            "embedded viewer composer reader failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+        run_viewer_script("composer-reader", &format!("{harness}\n{source}\n{checks}"));
     }
 
-    #[test]
-    fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
-        assert!(VIEWER_HTML.contains(r#"<link rel="icon" href="/icon.svg">"#));
+    /// A page that declares no icon makes every browser request
+    /// `/favicon.ico`, which this server does not have. The page therefore has
+    /// to name an icon, and that icon has to be served.
+    #[tokio::test]
+    async fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
+        let (app, _, _, _, _) = app();
+        let page = fetch_text(app.clone(), "/").await;
+        assert!(page.contains(r#"rel="icon""#), "the page declares no icon");
+        assert!(page.contains("/icon.svg"), "the page names no icon route");
+        let icon = app
+            .oneshot(Request::get("/icon.svg").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(icon.status(), StatusCode::OK);
+        assert_eq!(
+            icon.headers().get(CONTENT_TYPE).unwrap(),
+            "image/svg+xml",
+            "the icon route does not serve an SVG"
+        );
     }
 
     #[tokio::test]
     async fn valid_action_is_typed_and_forwarded() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -2333,7 +3918,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn shell_action_is_typed_and_forwarded() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -2418,7 +4003,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn bare_new_action_forwards_an_explicit_safe_project_directory() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -2439,8 +4024,9 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
                 target_id: "raw".into(),
-                title: "Raw work".into(),
+                title: Some("Raw work".into()),
                 project_directory: Some(PathBuf::from("/work/project")),
+                dirty_ack: Vec::new(),
             }
         );
         action.reply.send(ActionOutcome::Accepted).unwrap();
@@ -2459,8 +4045,9 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
             profile_id: "codex-1".into(),
             bundle_id: "hel".into(),
             target_id: target_id.into(),
-            title: "New work".into(),
+            title: Some("New work".into()),
             project_directory,
+            dirty_ack: Vec::new(),
         };
 
         assert!(validate_action(&action("podman", None), &snapshot).is_ok());
@@ -2493,7 +4080,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn cancel_action_is_typed_and_forwarded() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -2583,7 +4170,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn snapshot_endpoint_returns_only_public_projection() {
-        let (app, _, _) = app();
+        let (app, _, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
@@ -2623,6 +4210,10 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                     label: "You".into(),
                     recorded_at_ms: None,
                     lines: vec!["begin".into()],
+                    glyph: "\u{276f}",
+                    tone: "user",
+                    tool_status: None,
+                    diffstats: Vec::new(),
                 },
                 crate::hel_chat::BrowserTranscriptEntry {
                     id: 7,
@@ -2631,10 +4222,14 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                     label: "Agent".into(),
                     recorded_at_ms: None,
                     lines: vec!["live".into()],
+                    glyph: "\u{25cf}",
+                    tone: "agent",
+                    tool_status: None,
+                    diffstats: Vec::new(),
                 },
             ],
         };
-        let (app, _, _) =
+        let (app, _, _, _, _) =
             app_with_conversations(BTreeMap::from([("session-1".into(), transcript)]));
         let cookie = login_cookie(&app).await;
         let response = app
@@ -2657,7 +4252,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn conversation_read_receipt_never_contends_with_a_running_action() {
-        let (app, mut actions, mut receipts) = app();
+        let (app, mut actions, mut receipts, _, _) = app();
         let cookie = login_cookie(&app).await;
         // A prompt for the same session stays in flight for the whole test, so
         // a receipt that still travelled the action pipeline would either
@@ -2728,7 +4323,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                 "could not start this action",
             ),
         ] {
-            let (app, mut actions, _) = app();
+            let (app, mut actions, _, _, _) = app();
             let cookie = login_cookie(&app).await;
             let response = tokio::spawn(
                 app.oneshot(
@@ -2754,25 +4349,154 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
     #[tokio::test]
     async fn the_viewer_shows_a_session_whose_action_failed_after_it_was_accepted() {
         // An accepted action reports its outcome only through snapshots, so
-        // the page has to react to `has_error` for a late failure to be
+        // the application has to react to `has_error` for a late failure to be
         // visible at all.
-        let (app, _, _) = app();
-        let page = app
-            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        let (app, _, _, _, _) = app();
+        let script = fetch_text(app, "/viewer.js").await;
+        assert!(script.contains("has_error"), "viewer ignores has_error");
+    }
+
+    /// Every response, not only the page, carries the policy. A header that
+    /// depends on which handler answered is a header somebody will forget.
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers() {
+        for path in [
+            "/",
+            "/viewer.js",
+            "/viewer.css",
+            "/manifest.webmanifest",
+            "/api/snapshot",
+        ] {
+            let (app, _, _, _, _) = app();
+            let response = app
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let headers = response.headers();
+            let policy = headers
+                .get(CONTENT_SECURITY_POLICY_HEADER)
+                .unwrap_or_else(|| panic!("{path} carries no content-security policy"))
+                .to_str()
+                .unwrap();
+            assert!(
+                policy.starts_with("default-src 'none';"),
+                "{path} does not refuse unlisted sources: {policy}"
+            );
+            assert!(
+                policy.contains("script-src 'self'") && !policy.contains("unsafe-inline"),
+                "{path} permits inline script: {policy}"
+            );
+            assert!(
+                policy.contains("frame-ancestors 'none'"),
+                "{path} can be framed: {policy}"
+            );
+            assert_eq!(
+                headers.get(X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff",
+                "{path} permits content sniffing"
+            );
+            assert_eq!(
+                headers.get(REFERRER_POLICY).unwrap(),
+                "no-referrer",
+                "{path} leaks a referrer"
+            );
+        }
+    }
+
+    /// The policy forbids inline script and style, so the page must contain
+    /// neither. A page that did would simply fail to run in a browser, which
+    /// no Rust test would otherwise notice.
+    #[tokio::test]
+    async fn the_page_carries_no_inline_script_or_style() {
+        let (app, _, _, _, _) = app();
+        let page = fetch_text(app, "/").await;
+        assert!(
+            !page.contains("<script>") && !page.contains("<style>"),
+            "the page inlines script or style, which the policy blocks"
+        );
+        assert!(
+            page.contains(r#"src="/viewer.js""#) && page.contains(r#"href="/viewer.css""#),
+            "the page does not load its script and style as separate assets"
+        );
+    }
+
+    /// A cached API answer is a lie about live session state, and a cached
+    /// service worker is what keeps a phone on a superseded application.
+    #[tokio::test]
+    async fn live_state_and_the_service_worker_are_never_stored() {
+        for path in ["/", "/service-worker.js", "/api/snapshot"] {
+            let (app, _, _, _, _) = app();
+            let response = app
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get(CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{path} may be stored"
+            );
+        }
+    }
+
+    /// The worker must leave live state alone entirely rather than caching it
+    /// and hoping the cache is fresh.
+    #[test]
+    fn the_service_worker_declines_to_handle_live_state() {
+        assert!(
+            SERVICE_WORKER.contains("url.pathname.startsWith('/api/')"),
+            "the service worker does not exclude the API"
+        );
+        assert!(
+            SERVICE_WORKER.contains("url.pathname.startsWith('/auth/')"),
+            "the service worker does not exclude authentication"
+        );
+        assert!(
+            SERVICE_WORKER.contains("caches.delete"),
+            "the service worker never deletes a superseded cache"
+        );
+    }
+
+    /// The vendored assets have to reach the browser, not merely exist in the
+    /// repository: the manifest names them and a phone installs from it.
+    #[tokio::test]
+    async fn the_installable_assets_are_served() {
+        for (path, content_type) in [
+            ("/icon-192.png", "image/png"),
+            ("/icon-512.png", "image/png"),
+            ("/maskable-512.png", "image/png"),
+            ("/apple-touch-icon.png", "image/png"),
+            ("/fonts/jetbrains-mono.woff2", "font/woff2"),
+        ] {
+            let (app, _, _, _, _) = app();
+            let response = app
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path} is not served");
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                content_type,
+                "{path} is served as the wrong type"
+            );
+        }
+    }
+
+    /// Fetch one unauthenticated asset and return it as text. Serving the
+    /// application from several files means a check about the application has
+    /// to name the file it is about.
+    async fn fetch_text(app: Router, path: &str) -> String {
+        let response = app
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
-            .unwrap()
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
-        let page = String::from_utf8(page.to_vec()).unwrap();
-        assert!(page.contains("x.has_error?"), "viewer ignores has_error");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path} is not served");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).expect("assets are UTF-8")
     }
 
     #[tokio::test]
     async fn repeated_wrong_codes_lock_the_login_endpoint() {
-        let (app, _, _) = app();
+        let (app, _, _, _, _) = app();
         let attempt = |code: &'static str| {
             let app = app.clone();
             async move {
@@ -2851,7 +4575,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
             .unwrap();
         let mut original = detached_options();
         original.set_cookie_key(first.clone()).unwrap();
-        let cookie = signed_cookie_value(&original.cookie_key, 200);
+        let cookie = signed_cookie_value(&original.cookie_key, "test-viewer", 200);
         assert!(session_cookie_valid(&restarted.cookie_key, &cookie, 100));
         assert!(!session_cookie_valid(
             &detached_options().cookie_key,

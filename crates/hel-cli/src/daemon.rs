@@ -1180,6 +1180,35 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Every lifecycle operation running now.
+    ///
+    /// The dashboard receives these through a watch channel built by its own
+    /// poller, which the phone server does not have; rather than plumb that
+    /// channel through the session-manager handle, the phone loop reads the
+    /// same state directly. The read is a mutex acquisition over a small map,
+    /// and it happens once per published snapshot, so it never blocks the
+    /// loop the way an await on the async snapshot path would.
+    pub(crate) fn active_lifecycles(&self) -> Vec<RuntimeLifecycleView> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, active)| active.result.borrow().is_none())
+            .map(|(session_id, active)| RuntimeLifecycleView {
+                session_id: session_id.clone(),
+                kind: active.kind.into(),
+                started_at_epoch_seconds: active.started_at_epoch_seconds,
+                active_stages: active
+                    .active_stages
+                    .iter()
+                    .map(|(stage, (_, started_at))| (*stage, *started_at))
+                    .collect(),
+                resume_destination: active.resume_destination.clone(),
+                notice: active.notice.clone(),
+            })
+            .collect()
+    }
+
     pub(crate) fn cancel_lifecycle_if_active(&self, session_id: &str) {
         if let Some(active) = self
             .lifecycle

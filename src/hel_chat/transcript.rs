@@ -90,6 +90,30 @@ pub struct BrowserTranscriptEntry {
     pub label: String,
     pub recorded_at_ms: Option<i64>,
     pub lines: Vec<String>,
+    /// The glyph the terminal draws for this role, so both surfaces read alike
+    /// without the browser keeping a second copy of the mapping. Taken from
+    /// the same `entry_visual` the terminal renders from.
+    pub glyph: &'static str,
+    /// The semantic colour name, not a colour. The stylesheet decides what
+    /// `agent` or `failed` looks like; this says which one applies.
+    pub tone: &'static str,
+    /// A tool call's state, for a tool entry. `None` for every other role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_status: Option<&'static str>,
+    /// The changed files a tool reported, as data rather than as extra lines
+    /// appended to `lines`. The terminal formats these for a terminal; a
+    /// browser re-parsing that formatting is how the phone came to render
+    /// every diffstat as one unsplit path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diffstats: Vec<BrowserDiffStat>,
+}
+
+/// One file a tool changed, and by how much.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserDiffStat {
+    pub path: String,
+    pub insertions: u32,
+    pub deletions: u32,
 }
 
 impl TranscriptSnapshot {
@@ -639,6 +663,7 @@ fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
     } else {
         entry.text.lines().map(str::to_owned).collect()
     };
+    let visual = entry_visual(entry);
     BrowserTranscriptEntry {
         id: entry.start_seq,
         updated_seq: entry.seq,
@@ -649,7 +674,57 @@ fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
             .into_iter()
             .map(|line| truncate_browser_line(&line))
             .collect(),
+        glyph: visual.glyph,
+        tone: entry_tone(entry),
+        tool_status: (entry.role == ChatRole::Tool)
+            .then(|| tool_status_name(entry.tool_status.unwrap_or(ToolStatus::Pending))),
+        diffstats: entry
+            .tool_diffstats
+            .iter()
+            .filter_map(|line| parse_diffstat(line))
+            .collect(),
     }
+}
+
+/// The semantic colour name for one entry.
+///
+/// A tool takes its tone from its state, because a failed tool call is the one
+/// thing in a transcript a person most needs to find.
+fn entry_tone(entry: &ChatEntry) -> &'static str {
+    match entry.role {
+        ChatRole::User => "user",
+        ChatRole::Agent => "agent",
+        ChatRole::Thought => "thinking",
+        ChatRole::Tool => match entry.tool_status.unwrap_or(ToolStatus::Pending) {
+            ToolStatus::Pending => "system",
+            ToolStatus::Running => "running",
+            ToolStatus::Completed => "done",
+            ToolStatus::Failed => "failed",
+        },
+        ChatRole::Plan => "plan",
+        ChatRole::PlanProposal => "plan-proposal",
+        ChatRole::System => "system",
+    }
+}
+
+/// Read back what `format_diffstat` wrote.
+///
+/// It emits the path, two spaces, `+{insertions}`, a space, and `-{deletions}`
+/// using a Unicode MINUS SIGN. Parsing it here rather than in the browser
+/// keeps one definition of the format beside the code that produces it, and
+/// means a line that does not match is dropped rather than mangled.
+fn parse_diffstat(line: &str) -> Option<BrowserDiffStat> {
+    let (path, counts) = line.rsplit_once("  ")?;
+    let (added, removed) = counts.split_once(' ')?;
+    Some(BrowserDiffStat {
+        path: path.trim().to_owned(),
+        insertions: added.strip_prefix('+')?.parse().ok()?,
+        deletions: removed
+            .strip_prefix('\u{2212}')
+            .or_else(|| removed.strip_prefix('-'))?
+            .parse()
+            .ok()?,
+    })
 }
 
 fn truncate_browser_line(line: &str) -> String {

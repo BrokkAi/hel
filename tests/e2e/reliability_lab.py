@@ -127,7 +127,14 @@ class PtyClient:
         os.write(slave, b"")
         import fcntl
 
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 140, 0, 0))
+        # The screen reconstruction in `text` has to replay the byte stream at
+        # the size the program was drawing for, so the size travels with the
+        # client rather than being assumed by the renderer.
+        self.rows = 32
+        self.columns = 140
+        fcntl.ioctl(
+            slave, termios.TIOCSWINSZ, struct.pack("HHHH", self.rows, self.columns, 0, 0)
+        )
 
         def own_terminal() -> None:
             os.setsid()
@@ -177,7 +184,7 @@ class PtyClient:
     def text(self) -> str:
         with self.lock:
             raw = bytes(self.output)
-        return render_terminal(raw)
+        return render_terminal(raw, self.rows, self.columns)
 
     def wait_for(self, marker: str, timeout: float = TIMEOUT) -> None:
         deadline = time.monotonic() + timeout
@@ -199,6 +206,8 @@ class PtyClient:
     def resize(self, rows: int, columns: int) -> None:
         import fcntl
 
+        self.rows = rows
+        self.columns = columns
         fcntl.ioctl(
             self.master,
             termios.TIOCSWINSZ,

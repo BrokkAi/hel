@@ -618,6 +618,123 @@ pub fn advance_client_read_frontier(
 
 /// Atomically advance both the per-client and legacy session read frontiers.
 /// Neither value changes when validation or persistence fails.
+/// One viewer's stored state for one session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientSessionState {
+    pub draft: String,
+    pub through_event_ordinal: u64,
+}
+
+/// What this viewer has stored for this session: an unsent draft and how far
+/// it has read.
+pub fn client_session_state(
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<ClientSessionState> {
+    let connection = open_reader(&database_path())?;
+    let draft = connection
+        .query_row(
+            "SELECT draft FROM client_session_state
+              WHERE client_id = ?1 AND workspace_id = ?2 AND session_id = ?3",
+            params![client_id, workspace_id, session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    let through_event_ordinal = connection
+        .query_row(
+            "SELECT through_event_ordinal FROM client_read_frontiers
+              WHERE client_id = ?1 AND workspace_id = ?2 AND session_id = ?3",
+            params![client_id, workspace_id, session_id],
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    Ok(ClientSessionState {
+        draft,
+        through_event_ordinal,
+    })
+}
+
+/// Store one viewer's unsent draft.
+///
+/// An empty draft deletes the row rather than storing emptiness, so a viewer
+/// that cleared its composer stops occupying a row and stops being pruned
+/// later for something it no longer holds.
+pub fn persist_client_draft(
+    client_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+    draft: &str,
+) -> Result<()> {
+    ensure!(!client_id.trim().is_empty(), "client id is empty");
+    let client_id = client_id.to_owned();
+    let workspace_id = workspace_id.to_owned();
+    let session_id = session_id.to_owned();
+    let draft = draft.to_owned();
+    submit_database_write("persist_client_draft", move |connection| {
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if draft.is_empty() {
+            transaction.execute(
+                "DELETE FROM client_session_state
+                  WHERE client_id = ?1 AND workspace_id = ?2 AND session_id = ?3",
+                params![client_id, workspace_id, session_id],
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let changed = transaction.execute(
+            "INSERT INTO client_session_state(
+                 client_id, workspace_id, session_id, draft, updated_at
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5
+              WHERE EXISTS(
+                  SELECT 1 FROM session_contexts
+                   WHERE session_id = ?3 AND workspace_id = ?2
+              )
+             ON CONFLICT(client_id, workspace_id, session_id) DO UPDATE SET
+                 draft = excluded.draft,
+                 updated_at = excluded.updated_at",
+            params![client_id, workspace_id, session_id, draft, now],
+        )?;
+        ensure!(
+            changed == 1,
+            "session {session_id:?} is not in workspace {workspace_id:?}"
+        );
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+/// Forget web-viewer state that has passed its retention.
+///
+/// Only rows whose client id names a phone are considered. A terminal client's
+/// read frontier is not the phone's to expire, and deleting one would lose a
+/// person's place in a conversation they are still reading.
+pub fn prune_phone_client_state(older_than: Duration) -> Result<usize> {
+    let cutoff = (Utc::now() - chrono::Duration::from_std(older_than).unwrap_or_default())
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    submit_database_write("prune_phone_client_state", move |connection| {
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let drafts = transaction.execute(
+            "DELETE FROM client_session_state
+              WHERE client_id LIKE 'phone:%' AND updated_at < ?1",
+            params![cutoff],
+        )?;
+        let frontiers = transaction.execute(
+            "DELETE FROM client_read_frontiers
+              WHERE client_id LIKE 'phone:%' AND updated_at < ?1",
+            params![cutoff],
+        )?;
+        transaction.commit()?;
+        Ok(drafts + frontiers)
+    })
+}
+
 pub fn persist_read_receipt(
     client_id: &str,
     workspace_id: &str,
@@ -3624,6 +3741,102 @@ pub fn search_prompts(
     query: &str,
 ) -> Result<Vec<PromptHistoryEntry>> {
     search_prompts_from(&database_path(), session_id, bundle_id, scope, query)
+}
+
+/// What a bounded prompt search found, and whether it stopped early.
+///
+/// The flag is not decoration. Without it a caller cannot tell twenty matches
+/// from the first twenty of many, and will present a partial answer as a whole
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedPromptHistory {
+    pub entries: Vec<PromptHistoryEntry>,
+    pub truncated: bool,
+}
+
+/// Search prompt history, stopping at `limit` matches.
+///
+/// `search_prompts` pages through the whole table and stops only when a page
+/// comes back short, which is fine for a terminal running it against a local
+/// database and is not something an HTTP route may reach.
+pub fn search_prompts_bounded(
+    session_id: &str,
+    bundle_id: &str,
+    scope: HistoryScope,
+    query: &str,
+    limit: usize,
+) -> Result<BoundedPromptHistory> {
+    search_prompts_bounded_from(&database_path(), session_id, bundle_id, scope, query, limit)
+}
+
+fn search_prompts_bounded_from(
+    path: &Path,
+    session_id: &str,
+    bundle_id: &str,
+    scope: HistoryScope,
+    query: &str,
+    limit: usize,
+) -> Result<BoundedPromptHistory> {
+    const PAGE_SIZE: usize = 256;
+    /// How many rows the search may read before giving up on finding more.
+    /// A query that matches nothing must not walk an unbounded history.
+    const MAX_ROWS_SCANNED: usize = 4_096;
+
+    let connection = open_reader(path)?;
+    let query = query.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut matches = Vec::new();
+    let mut before = i64::MAX;
+    let mut scanned = 0;
+    let mut truncated = false;
+    loop {
+        let page = match scope {
+            HistoryScope::Project => query_history_page(
+                &connection,
+                "SELECT h.history_id, h.session_id, h.text
+                 FROM prompt_history h JOIN session_contexts c USING(session_id)
+                 WHERE c.bundle_id = ?1 AND h.history_id < ?2
+                 ORDER BY h.history_id DESC LIMIT ?3",
+                params![bundle_id, before, PAGE_SIZE as i64],
+            )?,
+            HistoryScope::Session => query_history_page(
+                &connection,
+                "SELECT history_id, session_id, text FROM prompt_history
+                 WHERE session_id = ?1 AND history_id < ?2
+                 ORDER BY history_id DESC LIMIT ?3",
+                params![session_id, before, PAGE_SIZE as i64],
+            )?,
+            HistoryScope::All => query_history_page(
+                &connection,
+                "SELECT history_id, session_id, text FROM prompt_history
+                 WHERE history_id < ?1 ORDER BY history_id DESC LIMIT ?2",
+                params![before, PAGE_SIZE as i64],
+            )?,
+        };
+        let page_len = page.len();
+        for entry in page {
+            before = entry.id;
+            scanned += 1;
+            if entry.text.to_lowercase().contains(&query) && seen.insert(entry.text.clone()) {
+                if matches.len() == limit {
+                    truncated = true;
+                    break;
+                }
+                matches.push(entry);
+            }
+        }
+        if truncated || page_len < PAGE_SIZE {
+            break;
+        }
+        if scanned >= MAX_ROWS_SCANNED {
+            truncated = true;
+            break;
+        }
+    }
+    Ok(BoundedPromptHistory {
+        entries: matches,
+        truncated,
+    })
 }
 
 fn search_prompts_from(

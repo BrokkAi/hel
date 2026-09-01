@@ -1,0 +1,1084 @@
+/* Hel's phone viewer, in the terminal surface's visual language.
+ *
+ * The terminal is monospace, flat, and bordered, and it says what state a
+ * thing is in with one colour drawn from a small semantic set. This stylesheet
+ * follows it, so that reading a session on a phone and reading it in `hel`
+ * feel like the same product rather than two products that share a name.
+ *
+ * Two rules the content-security policy imposes, and which no rule here may
+ * work around: there is no inline style anywhere, including `style=` attributes,
+ * so anything dynamic is a class or a custom property set through the CSSOM;
+ * and every font and image comes from this origin.
+ */
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/jetbrains-mono.woff2') format('woff2');
+  font-weight: 100 800;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces, from the page ground upward. */
+  --ground: #08090d;
+  --surface: #101319;
+  --surface-raised: #171b23;
+  --border: #262b35;
+  --border-strong: #3b424e;
+
+  /* Text. `--dim` is held above 4.5:1 on `--ground` on purpose: it is the
+   * colour of most secondary text, and secondary text is still text. */
+  --text: #e6ebe0;
+  --dim: #9aa39a;
+
+  /* The semantic set, taken from `fn entry_visual` and the dashboard's
+   * threshold colouring in the terminal surface. Each name means one thing. */
+  --user: #5dd9ff;
+  --agent: #e2b34d;
+  --thinking: #9aa39a;
+  --running: #e2b34d;
+  --done: #91df62;
+  --failed: #ff786f;
+  --plan: #d985ff;
+  --plan-proposal: #e9b3ff;
+  --system: #9aa39a;
+  --accent: #b9ff5a;
+
+  --focus: var(--user);
+
+  /* Restrained radii: the terminal has none, so these only take the hard
+   * edge off a touch target rather than making a card look like a pill. */
+  --radius: 4px;
+  --radius-large: 6px;
+
+  /* The smallest thing a finger can reliably hit. */
+  --touch: 44px;
+
+  /* How much of the viewport the on-screen keyboard is covering. Set through
+   * the CSSOM from the visual viewport; 0 when no keyboard is open. */
+  --keyboard-inset: 0px;
+
+  font-family:
+    'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono',
+    monospace;
+  font-size: 16px;
+  line-height: 1.5;
+  background: var(--ground);
+  color: var(--text);
+}
+
+* {
+  /* A flex or grid child defaults to `min-width: auto` and refuses to shrink
+   * below its content, which is the most common reason a phone page scrolls
+   * sideways. */
+  min-width: 0;
+}
+
+body {
+  margin: 0 auto;
+  max-width: 760px;
+  padding: calc(8px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right))
+    calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+  overflow-x: hidden;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h1 {
+  font-size: 34px;
+  letter-spacing: 0.08em;
+  margin: 18px 0 4px;
+  color: var(--accent);
+}
+
+h2 {
+  font-size: 18px;
+  margin: 0 0 10px;
+}
+
+h3 {
+  font-size: 16px;
+  margin: 0 0 8px;
+}
+
+.dim {
+  color: var(--dim);
+}
+
+/* A utility that has to win. It is applied to elements whose own rule sets a
+ * display, and source order would otherwise decide which of the two applies —
+ * which is how a menu that had been told to hide stayed on screen, swallowing
+ * taps meant for the page behind it. */
+.hidden {
+  display: none !important;
+}
+
+/* ---- surfaces ---- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-large);
+  margin: 12px 0;
+  padding: 14px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Wide content scrolls inside its own box. The page never scrolls sideways. */
+.scroll-x {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  max-width: 100%;
+}
+
+/* ---- controls ---- */
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  /* Below 16px, iOS Safari zooms the page on focus and never zooms back. */
+  font-size: 16px;
+  color: inherit;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  min-height: var(--touch);
+}
+
+button {
+  background: var(--accent);
+  color: #10140b;
+  font-weight: 700;
+  min-width: var(--touch);
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.danger {
+  background: var(--failed);
+  color: #200b09;
+}
+
+.secondary {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+/* The browser's own focus ring is invisible against a dark ground on some
+ * phones, so focus is drawn here rather than left to the platform. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* ---- status ---- */
+
+.pill {
+  font-size: 13px;
+  border: 1px solid var(--border-strong);
+  border-radius: 99px;
+  padding: 2px 10px;
+  color: var(--dim);
+}
+
+.pill.alert {
+  border-color: var(--failed);
+  color: var(--failed);
+}
+
+.session p {
+  margin: 6px 0;
+}
+
+.preview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--border-strong);
+  padding-left: 10px;
+  color: var(--dim);
+}
+
+/* ---- transcript ---- */
+
+.entry {
+  --role: var(--system);
+  border-left: 2px solid var(--role);
+  padding: 4px 0 4px 12px;
+  margin: 14px 0;
+}
+
+.entry.user {
+  --role: var(--user);
+}
+.entry.agent {
+  --role: var(--agent);
+}
+.entry.thought {
+  --role: var(--thinking);
+  color: var(--dim);
+  font-style: italic;
+}
+.entry.tool {
+  --role: var(--running);
+}
+.entry.plan {
+  --role: var(--plan);
+}
+.entry.plan-proposal {
+  --role: var(--plan-proposal);
+}
+.entry.system {
+  --role: var(--system);
+  color: var(--dim);
+}
+
+.entry > strong {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 6px;
+  color: var(--role);
+}
+
+/* The glyph column is fixed width so labels line up down the transcript, the
+ * way they do in the terminal. It is decoration: the label says the same
+ * thing, so it carries aria-hidden and must never be the only signal. */
+.entry-glyph {
+  flex: 0 0 1.2em;
+  text-align: center;
+}
+
+.entry-body {
+  overflow-wrap: anywhere;
+}
+
+.entry-body > pre,
+pre.entry-body {
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+
+/* ---- rendered markdown ---- */
+
+.entry-body h1,
+.entry-body h2,
+.entry-body h3,
+.entry-body h4,
+.entry-body h5,
+.entry-body h6 {
+  font-size: 1em;
+  margin: 12px 0 6px;
+  color: var(--text);
+}
+
+.entry-body p {
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+
+.entry-body ul,
+.entry-body ol {
+  margin: 8px 0;
+  padding-left: 1.6em;
+}
+
+.entry-body li {
+  margin: 3px 0;
+}
+
+.entry-body blockquote {
+  margin: 8px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--dim);
+}
+
+.entry-body hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+
+.entry-body code {
+  background: var(--surface-raised);
+  border-radius: var(--radius);
+  padding: 1px 5px;
+}
+
+.entry-body pre {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin: 8px 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.entry-body pre code {
+  background: none;
+  padding: 0;
+}
+
+.entry-body table {
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.entry-body th,
+.entry-body td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.entry-body th {
+  background: var(--surface-raised);
+}
+
+.align-left {
+  text-align: left;
+}
+.align-center {
+  text-align: center;
+}
+.align-right {
+  text-align: right;
+}
+
+.entry-body a {
+  color: var(--user);
+}
+
+/* ---- diff summaries ---- */
+
+.diffstat {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+}
+
+.diffstat li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.diffstat-path {
+  overflow-wrap: anywhere;
+}
+
+.diffstat-added {
+  color: var(--done);
+}
+
+.diffstat-removed {
+  color: var(--failed);
+}
+
+/* ---- queue, shells, elicitations ---- */
+
+.queue-item {
+  display: flex;
+  gap: 8px;
+  align-items: start;
+  justify-content: space-between;
+  border-top: 1px solid var(--border);
+  padding: 8px 0;
+}
+
+.queue-item span {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.elicitation {
+  border-color: var(--plan);
+}
+
+.elicitation-message {
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0 0 10px;
+  /* No approval is granted over hidden text: a long request scrolls rather
+   * than pushing its own buttons off the screen. */
+  max-height: 30dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.elicitation-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0;
+}
+
+.elicitation-field select[multiple] {
+  min-height: 120px;
+}
+
+.elicitation-field input[type='checkbox'] {
+  align-self: start;
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+}
+
+/* ---- composer ---- */
+
+#prompt-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 76px;
+  max-height: 40vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+#prompt-text:empty::before {
+  content: attr(data-placeholder);
+  color: var(--dim);
+  pointer-events: none;
+}
+
+#attachments {
+  margin-top: 8px;
+}
+
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+}
+
+.attachment img {
+  width: 44px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: var(--radius);
+}
+
+.attachment button {
+  padding: 2px 10px;
+  min-height: var(--touch);
+}
+
+#conversation-feed {
+  min-height: 30vh;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---- tool output: code blocks, folds, tinting ----
+ *
+ * Tinting uses one class per token kind rather than a colour per language, so
+ * the palette above stays the only place colours are chosen. Nothing here is
+ * decoration for its own sake: each class exists because telling those tokens
+ * apart is what makes a wall of tool output readable on a phone.
+ */
+
+pre.code-block,
+pre.entry-text,
+pre.command-line {
+  font: inherit;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+/* The language sits in the corner of its own block, so a reader can tell at a
+ * glance what was sniffed and whether the sniff was right. */
+pre.code-block[data-lang]::before {
+  content: attr(data-lang);
+  display: block;
+  font-size: 12px;
+  color: var(--dim);
+  margin-bottom: 6px;
+}
+
+details.block-fold {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 8px 0;
+  background: var(--surface);
+}
+
+details.block-fold > summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  min-height: var(--touch);
+  display: flex;
+  align-items: center;
+  color: var(--dim);
+}
+
+details.block-fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.block-fold > summary::before {
+  content: '\25b8';
+  margin-right: 8px;
+  transition: transform 120ms ease;
+}
+
+details.block-fold[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+details.block-fold > pre {
+  margin: 0 10px 10px;
+}
+
+/* Code tokens. */
+.tok-cmt {
+  color: var(--dim);
+  font-style: italic;
+}
+.tok-str {
+  color: var(--done);
+}
+.tok-kw {
+  color: var(--plan);
+}
+.tok-mac {
+  color: var(--plan-proposal);
+}
+.tok-type {
+  color: var(--user);
+}
+.tok-fn {
+  color: var(--agent);
+}
+.tok-key {
+  color: var(--user);
+}
+.tok-num {
+  color: var(--agent);
+}
+.tok-add {
+  color: var(--done);
+}
+.tok-del {
+  color: var(--failed);
+}
+
+/* Shell command tokens. */
+.cmd-prompt {
+  color: var(--dim);
+}
+.cmd-program {
+  color: var(--accent);
+}
+.cmd-subcommand {
+  color: var(--user);
+}
+.cmd-flag {
+  color: var(--agent);
+}
+.cmd-path {
+  color: var(--done);
+}
+.cmd-string {
+  color: var(--done);
+}
+.cmd-env {
+  color: var(--plan);
+}
+.cmd-op {
+  color: var(--dim);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  details.block-fold > summary::before {
+    transition: none;
+  }
+}
+
+/* ---- application shell ---- */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+#shell-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#shell-title {
+  flex: 1;
+  font-size: 22px;
+  letter-spacing: 0.08em;
+  margin: 12px 0;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.icon-button {
+  background: var(--surface-raised);
+  color: var(--text);
+  font-weight: 400;
+  padding: 0;
+  width: var(--touch);
+  height: var(--touch);
+  flex: 0 0 var(--touch);
+}
+
+.menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  min-width: 180px;
+}
+
+.menu button {
+  background: none;
+  color: var(--text);
+  font-weight: 400;
+  text-align: left;
+  border: 1px solid transparent;
+}
+
+/* ---- workspace tabs ---- */
+
+.tabstrip {
+  display: flex;
+  gap: 6px;
+  padding: 4px 0 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  background: none;
+  color: var(--dim);
+  font-weight: 400;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+/* Selection is a border and a word, never colour alone. */
+.tab[aria-current='page'] {
+  color: var(--text);
+  border-color: var(--focus);
+}
+
+/* ---- pages ---- */
+
+.page:focus {
+  outline: none;
+}
+
+.page-actions {
+  margin: 12px 0;
+}
+
+.project-heading {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 14px;
+  margin: 16px 0 4px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.session-status {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.state-glyph {
+  margin-right: 4px;
+}
+
+.pill.state-live {
+  color: var(--done);
+  border-color: var(--done);
+}
+.pill.state-starting,
+.pill.state-stopping {
+  color: var(--running);
+  border-color: var(--running);
+}
+.pill.state-failed {
+  color: var(--failed);
+  border-color: var(--failed);
+}
+
+.session-operation {
+  color: var(--running);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 12px 0;
+}
+
+.field > span {
+  color: var(--dim);
+  font-size: 14px;
+}
+
+/* ---- wizards ---- */
+
+.review,
+.readings {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  gap: 6px 14px;
+  margin: 8px 0;
+}
+
+.review dt,
+.readings dt {
+  color: var(--dim);
+}
+
+.review dd,
+.readings dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.field-inline {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 0;
+  min-height: var(--touch);
+}
+
+.field-inline input[type='checkbox'] {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+}
+
+#new-progress {
+  margin: 0 0 8px;
+}
+
+/* ---- readings: capacity and quota ---- */
+
+/* The terminal's thresholds, by headroom remaining. A busy machine and an
+ * exhausted limit both read red because both are the same news. */
+.reading-low {
+  color: var(--failed);
+  border-color: var(--failed);
+}
+.reading-mid {
+  color: var(--running);
+  border-color: var(--running);
+}
+.reading-high {
+  color: var(--done);
+  border-color: var(--done);
+}
+
+.quota-window {
+  margin: 12px 0;
+}
+
+.quota-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* The bar repeats the number beside it, so nothing is said by length alone. */
+.meter {
+  height: 6px;
+  margin: 6px 0;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  width: var(--fill, 0%);
+  background: currentColor;
+}
+
+article > h3 {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+/* ---- the conversation screen ----
+ *
+ * A full-height column: header, a transcript that scrolls inside itself, and a
+ * composer pinned to the bottom above the keyboard. The page itself never
+ * scrolls, so the composer cannot wander off and the header cannot slide away
+ * while somebody is reading.
+ */
+
+.conversation {
+  display: flex;
+  flex-direction: column;
+  /* The visible viewport minus whatever the keyboard is covering. */
+  height: calc(100dvh - var(--keyboard-inset) - 90px);
+  min-height: 320px;
+}
+
+.conversation-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.conversation-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.jump-to-latest {
+  align-self: center;
+  margin: 6px 0;
+}
+
+#conversation-side {
+  margin: 8px 0;
+}
+
+#conversation-side > summary {
+  cursor: pointer;
+  min-height: var(--touch);
+  display: flex;
+  align-items: center;
+  color: var(--dim);
+}
+
+.composer {
+  position: relative;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.entry-time {
+  margin-left: auto;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+/* Tone names come from the projection; what they look like is decided here. */
+.entry.tone-user {
+  --role: var(--user);
+}
+.entry.tone-agent {
+  --role: var(--agent);
+}
+.entry.tone-thinking {
+  --role: var(--thinking);
+  color: var(--dim);
+}
+.entry.tone-running {
+  --role: var(--running);
+}
+.entry.tone-done {
+  --role: var(--done);
+}
+.entry.tone-failed {
+  --role: var(--failed);
+}
+.entry.tone-plan {
+  --role: var(--plan);
+}
+.entry.tone-plan-proposal {
+  --role: var(--plan-proposal);
+}
+.entry.tone-system {
+  --role: var(--system);
+  color: var(--dim);
+}
+
+/* ---- command palette ---- */
+
+.palette {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  max-height: 40dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+}
+
+.palette-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  width: 100%;
+  background: none;
+  color: var(--text);
+  font-weight: 400;
+  text-align: left;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.palette-row[aria-selected='true'] {
+  background: var(--surface);
+  box-shadow: inset 2px 0 0 var(--focus);
+}
+
+.palette-name {
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+/* ---- connection ----
+ *
+ * The banner is hidden while the link is healthy and says which of the two
+ * unhealthy states this is otherwise. A page that looks current while it is
+ * not is worse than one that admits it.
+ */
+
+.connection {
+  display: none;
+  margin: 0;
+  padding: 8px 12px;
+  background: var(--surface-raised);
+  border-bottom: 1px solid var(--running);
+  color: var(--running);
+}
+
+body[data-connection='offline'] .connection,
+body[data-connection='reconnecting'] .connection {
+  display: block;
+}
+
+body[data-connection='reconnecting'] .connection::before {
+  content: 'Reconnecting…';
+}
+
+body[data-connection='reconnecting'] .connection {
+  font-size: 0;
+}
+
+body[data-connection='reconnecting'] .connection::before {
+  font-size: 16px;
+}
+
+/* ---- narrow phones ----
+ *
+ * Between 320 and 430 CSS pixels nothing may push the page sideways. The
+ * containment rules that do the work are on the components themselves; this
+ * only trims the chrome that has room to spare on a larger screen.
+ */
+
+@media (max-width: 430px) {
+  body {
+    padding-left: calc(10px + env(safe-area-inset-left));
+    padding-right: calc(10px + env(safe-area-inset-right));
+  }
+
+  .card {
+    padding: 10px;
+  }
+
+  #shell-title {
+    font-size: 18px;
+  }
+
+  .review,
+  .readings {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px 0;
+  }
+
+  .review dt,
+  .readings dt {
+    margin-top: 6px;
+  }
+}

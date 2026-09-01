@@ -143,6 +143,14 @@ fn is_short_quota_window(label: &str) -> bool {
     )
 }
 
+/// Whether this window is on course to run out before it resets.
+///
+/// Published so the phone can show the warning without recomputing a rule that
+/// belongs here, beside the data it reads.
+pub fn projects_exhaustion(window: &QuotaWindow, now: u64) -> bool {
+    projects_exhaustion_before_reset(window, now)
+}
+
 fn projects_exhaustion_before_reset(window: &QuotaWindow, now: u64) -> bool {
     const FIVE_HOURS_SECONDS: i64 = 5 * 60 * 60;
     let Some(reset) = window.resets_at_epoch_seconds else {

@@ -43,7 +43,11 @@ def qr_url(lab: Lab) -> str:
 
 
 def wait_marker_or_exit(marker: pathlib.Path, browser: subprocess.Popen[bytes]) -> None:
-    deadline = time.monotonic() + 60
+    # The browser walks the whole normal operator flow before it goes offline:
+    # the quota and targets pages, the four-step new-session wizard, a real
+    # provision, and a conversation. That is minutes of honest work, not the
+    # single page load this wait was first sized for.
+    deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         if marker.exists():
             return
@@ -54,15 +58,93 @@ def wait_marker_or_exit(marker: pathlib.Path, browser: subprocess.Popen[bytes]) 
     raise ScenarioFailure("Playwright did not reach its offline synchronization point")
 
 
+# The footer names the keys the focused pane owns, so it is the surface's own
+# report of where the keyboard is. Border styles say the same thing, but a
+# partially redrawn frame can show two panes bordered alike for one frame,
+# whereas the footer is one line that is always rewritten whole.
+PANE_RING = ("Sessions", "Prompt", "Targets", "Quota")
+SESSIONS_FOCUSED = "Enter open \u00b7 n new \u00b7 s resume \u00b7 e edit"
+
+
+def focus_sessions(client) -> None:
+    """Put the keyboard on the Sessions pane and prove it landed there.
+
+    Every pane key is a plain letter, so pressing `e` before focus has actually
+    moved types the letter into the composer instead of opening the session
+    editor. Which pane starts with the keyboard depends on the surface's state,
+    so walk the ring and read the footer rather than assuming one keystroke is
+    enough.
+    """
+    for _ in range(len(PANE_RING) * 2):
+        if SESSIONS_FOCUSED in client.text():
+            return
+        client.send(b"\t")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if SESSIONS_FOCUSED in client.text():
+                return
+            time.sleep(0.05)
+    raise ScenarioFailure(
+        f"the keyboard never reached the Sessions pane: {client.text()[-4000:]}"
+    )
+
+
 def stop_from_dashboard(client) -> None:
-    # The surface opens with the keyboard in Prompt, and the pane keys are
-    # plain letters, so Tab has to move focus first or `e` is typed as text.
-    client.send(b"\t")
+    focus_sessions(client)
     client.send(b"e")
     client.wait_for("Edit session")
+    # Edit session offers Rename, Stop, Cancel for a session with no container,
+    # so one step right of the default reaches Stop.
     client.send(b"\x1b[C\r")
     client.wait_for("Stop session?")
     client.send(b"\r")
+    # A stop needs the daemon's session manager to have adopted the session,
+    # and adoption is asynchronous: a session the browser created moments ago
+    # can still be unmanaged when the first stop reaches it. The surface offers
+    # Retry stop for exactly that, so take it rather than failing on a
+    # condition that resolves itself.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if "Stop could not complete" not in client.text():
+            return
+        # Cancel, Force stop, Retry stop: two steps right of the default.
+        client.send(b"\x1b[C\x1b[C\r")
+        time.sleep(2)
+    raise ScenarioFailure(f"the stop never completed: {client.text()[-4000:]}")
+
+
+
+def run_layout_matrix(lab: Lab, web_root: pathlib.Path, environment: dict[str, str]) -> None:
+    """Drive the layout and accessibility checks at three viewport widths.
+
+    This runs after the reliability scenario against the same live daemon, so
+    it costs one extra browser rather than a second lab, and it sees the real
+    pages with real sessions on them rather than an empty shell.
+    """
+    log = (lab.root / "layout.log").open("wb")
+    matrix_environment = dict(environment)
+    matrix_environment["HEL_BROWSER_SPEC"] = "layout.spec.js"
+    matrix = subprocess.Popen(
+        [str(web_root / "node_modules/.bin/playwright"), "test"],
+        cwd=web_root,
+        env=matrix_environment,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    lab.record_process("started", "playwright-layout", matrix.pid)
+    try:
+        return_code = matrix.wait(timeout=TIMEOUT * 8)
+    except subprocess.TimeoutExpired as error:
+        raise ScenarioFailure("the layout matrix did not finish") from error
+    finally:
+        log.close()
+    if return_code != 0:
+        raise ScenarioFailure(
+            f"the layout matrix failed with exit code {return_code}: "
+            f"{(lab.root / 'layout.log').read_text()[-4000:]}"
+        )
+    lab.record_process("stopped", "playwright-layout", matrix.pid)
 
 
 def run(lab: Lab) -> None:
@@ -123,12 +205,17 @@ def run(lab: Lab) -> None:
         changed_marker.write_text("TUI stop reached durable state\n")
         lab.record_action("tui-stopped-session", session_id=session["id"])
         try:
-            return_code = browser.wait(timeout=TIMEOUT * 2)
+            # The browser drives a full resume after the TUI stop — navigate to
+            # the resume page, resume the session, wait for it to provision,
+            # then stop it again — so it needs materially longer here than the
+            # single reconnect this wait was originally sized for.
+            return_code = browser.wait(timeout=TIMEOUT * 8)
         except subprocess.TimeoutExpired as error:
             raise ScenarioFailure("Playwright did not finish after SSE reconnection") from error
         if return_code != 0:
             raise ScenarioFailure(f"Playwright failed with exit code {return_code}")
         lab.record_process("stopped", "playwright", browser.pid)
+        run_layout_matrix(lab, web_root, environment)
         (lab.root / "browser-transcript.json").write_text(
             json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         )
