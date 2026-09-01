@@ -65,6 +65,9 @@ already public.
    cargo fmt --check
    cargo test
    cargo clippy --all-targets -- -D warnings
+   cargo package --locked -p hel-core
+   CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
+     cargo package --locked -p hel-voice-worker
    ```
 
    Run `cargo test` outside the restricted sandbox as required by `AGENTS.md`.
@@ -72,8 +75,9 @@ already public.
    the changes in the release.
 
 4. Commit the version bump and generated files. Push that commit and wait for
-   the branch CI checks to pass. Re-run the version checks on the clean commit
-   that will be tagged.
+   both the branch CI and Coverage workflows to pass on that exact commit. Do
+   not tag a candidate with a skipped, cancelled, stale, or failing check.
+   Re-run the version checks on the clean commit that will be tagged.
 5. Create and push an annotated tag on that exact commit:
 
    ```bash
@@ -82,9 +86,10 @@ already public.
    ```
 
 6. Watch the `Release Hel` workflow. It checks the tag against the workspace
-   version and lockfile before any build. It then packages x86-64 Linux musl,
-   ARM64 Linux musl, and ARM64 macOS archives, publishes the GitHub Release and
-   checksums, and dispatches the crates.io workflow.
+   version and lockfile and verify-builds the publishable source packages
+   before any release build. It then packages x86-64 Linux musl, ARM64 Linux
+   musl, and ARM64 macOS archives, publishes the GitHub Release and checksums,
+   and dispatches the crates.io workflow.
 7. Approve the `crates-io` environment when requested. `publish.yml` verifies
    and packages the tagged source, authenticates through each crate's Trusted
    Publisher configuration, then publishes `hel-core`, `hel-tui`, `hel-cli`,
