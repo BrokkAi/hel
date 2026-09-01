@@ -37,6 +37,7 @@ use super::remote::{
 use super::rendering::{display_width, truncate_to_width};
 use super::second_opinion::{
     CapturedProposal, SecondOpinion, SecondOpinionIntent, render_reviewer, render_setup,
+    review_role_session_id,
     render_split_actions, reviewer_session_id,
 };
 use super::transcript::{ToolDiffstatRequest, materialized_prefix_entries, render_transcript};
@@ -75,6 +76,10 @@ use crate::hel_second_opinion::{
 use agent_client_protocol::schema::v1::SessionConfigOption;
 
 const MAX_DIFFSTAT_TASKS: usize = 2;
+/// How long an idle reviewing role waits before reading its journal again. An
+/// attach answers immediately even when nothing has been journaled, so without
+/// this a review with several roles would spin on empty pages.
+const REVIEW_POLL_IDLE_INTERVAL: Duration = Duration::from_millis(200);
 const SESSION_ACTOR_RECONNECT_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -127,6 +132,18 @@ enum ChatIoUpdate {
     TurnReviewRoleStarted {
         role: String,
         result: std::result::Result<(), String>,
+    },
+    /// A page of one reviewing role's own relay events.
+    TurnReviewEvents {
+        role: String,
+        result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
+    },
+    /// Specialist lanes the review supervisor asked for through its MCP tool.
+    TurnReviewDispatches {
+        result: std::result::Result<
+            Vec<crate::hel_review::lanes::ReviewSubagentRequest>,
+            String,
+        >,
     },
     /// The review baselines a workspace acquires when auto-review is switched
     /// on, so the first review covers what happens next rather than every
@@ -303,6 +320,8 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
         | ChatIoUpdate::TurnReviewDelta { .. }
         | ChatIoUpdate::TurnReviewAnalysis { .. }
         | ChatIoUpdate::TurnReviewRoleStarted { .. }
+        | ChatIoUpdate::TurnReviewEvents { .. }
+        | ChatIoUpdate::TurnReviewDispatches { .. }
         | ChatIoUpdate::TurnReviewBaselines { .. } => {}
         ChatIoUpdate::SessionReconnected(_) => {
             unreachable!("session reconnects are applied by ActiveChat")
@@ -913,9 +932,13 @@ impl ActiveChat {
                 });
             }
             ReviewRequest::StartRole { role, fresh } => self.start_review_role(role, fresh),
-            ReviewRequest::PromptReviewer { command_id, prompt } => {
-                self.submit_to_reviewer(command_id, prompt);
-                self.poll_reviewer_events();
+            ReviewRequest::PromptRole {
+                role,
+                command_id,
+                prompt,
+            } => {
+                self.submit_to_review_role(role.clone(), command_id, prompt);
+                self.poll_turn_review_role(&role);
             }
             ReviewRequest::PromptPrimary { command_id, prompt } => {
                 queue_chat_remote_operation(
@@ -927,7 +950,7 @@ impl ActiveChat {
                     &mut self.state,
                 );
             }
-            ReviewRequest::PauseReviewer => self.pause_reviewer(),
+            ReviewRequest::PauseRole { role } => self.pause_review_role(role),
             ReviewRequest::AdvanceBaseline {
                 trees,
                 reviewed_through_ordinal,
@@ -1060,12 +1083,26 @@ impl ActiveChat {
             .turn_review()
             .map(|review| review.driver.repository_roots())
             .unwrap_or_default();
-        // Every reviewing role in the quick tier navigates rather than runs
-        // analyzers, so it gets the `core` toolset; lanes get the analyzers.
-        let mcp_servers = crate::hel_review::bifrost::review_mcp_servers(
-            &repositories,
-            crate::hel_review::lanes::QUICK_BIFROST_TOOLSET,
-        );
+        // A specialist lane's analyzers are its identity, so it gets the
+        // `slopcop` set as well as navigation; every other role navigates and
+        // reads rather than running analyzers. The intent analyst gets no
+        // tools at all: it reads the user's messages, not the code.
+        let lane = crate::hel_review::lanes::lane_by_id(&role).is_some();
+        let intent = role == crate::hel_review::driver::INTENT_ROLE;
+        let mcp_servers = if intent {
+            Vec::new()
+        } else {
+            crate::hel_review::bifrost::review_mcp_servers(
+                &repositories,
+                if lane {
+                    crate::hel_review::lanes::LANE_BIFROST_TOOLSET
+                } else {
+                    crate::hel_review::lanes::SUPERVISOR_BIFROST_TOOLSET
+                },
+            )
+        };
+        // Only the supervisor may launch specialists.
+        let dispatch_tool = role == crate::hel_review::driver::SUPERVISOR_ROLE;
         // A fresh role must not reuse the running harness session: the
         // validator judges the reviewer's claims against source, so it must
         // not inherit them. Bumping the generation is what the sidecar reads
@@ -1081,6 +1118,7 @@ impl ActiveChat {
                     &profile_id,
                     generation,
                     &mcp_servers,
+                    dispatch_tool,
                 )
             })
             .await;
@@ -1130,25 +1168,41 @@ impl ActiveChat {
             .collect()
     }
 
-    /// Sends one prompt to the reviewer sidecar.
-    fn submit_to_reviewer(&mut self, command_id: String, prompt: String) {
+    /// Sends one prompt to one reviewing role.
+    fn submit_to_review_role(&mut self, role: String, command_id: String, prompt: String) {
         let session = self.session.clone();
         let updates = self.chat_io_tx.clone();
         tokio::spawn(async move {
             let result = session
-                .reviewer(ReviewerAction::Submit {
-                    command_id,
-                    command: crate::hel_worker::RelayCommand::Prompt {
-                        prompt: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
-                            agent_client_protocol::schema::v1::TextContent::new(prompt),
-                        )],
+                .reviewer_as(
+                    Some(role),
+                    ReviewerAction::Submit {
+                        command_id,
+                        command: crate::hel_worker::RelayCommand::Prompt {
+                            prompt: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new(prompt),
+                            )],
+                        },
                     },
-                })
+                )
                 .await
                 .map(|_| ())
                 .map_err(|error| format!("{error:#}"));
             if let Err(error) = updates.send(ChatIoUpdate::ReviewerStarted(result)) {
                 tracing::debug!(%error, "reviewer prompt result dropped");
+            }
+        });
+    }
+
+    /// Stops one reviewing role's harness, keeping its staged profile.
+    fn pause_review_role(&self, role: String) {
+        let session = self.session.clone();
+        tokio::spawn(async move {
+            if let Err(error) = session
+                .reviewer_as(Some(role), ReviewerAction::Pause)
+                .await
+            {
+                tracing::debug!(error = %format!("{error:#}"), "pausing a review role failed");
             }
         });
     }
@@ -1414,9 +1468,45 @@ impl ActiveChat {
                         };
                         let requests = review.driver.role_started(&role);
                         self.run_review_requests(requests);
-                        self.poll_reviewer_events();
+                        self.poll_turn_review_role(&role);
                     }
-                    Err(error) => self.fail_turn_review(error),
+                    // A lane that cannot start is a coverage gap the
+                    // supervisor is told about; any other role failing to
+                    // start fails the review.
+                    Err(error) => {
+                        let lane = crate::hel_review::lanes::lane_by_id(&role).is_some();
+                        let Some(review) = self.state.turn_review_mut() else {
+                            return;
+                        };
+                        let requests = if lane {
+                            review.driver.lane_failed(&role, error)
+                        } else {
+                            review.driver.request_failed(error)
+                        };
+                        self.run_review_requests(requests);
+                    }
+                }
+                return;
+            }
+            ChatIoUpdate::TurnReviewEvents { role, result } => {
+                self.apply_turn_review_role_events(role, result);
+                return;
+            }
+            ChatIoUpdate::TurnReviewDispatches { result } => {
+                match result {
+                    Ok(requests) => {
+                        let Some(review) = self.state.turn_review_mut() else {
+                            return;
+                        };
+                        let requests = review.driver.lanes_dispatched(requests);
+                        self.run_review_requests(requests);
+                    }
+                    // A dropped dispatch would leave the supervisor waiting for
+                    // lanes that never run, so it fails the review rather than
+                    // stalling it.
+                    Err(error) => self.fail_turn_review(format!(
+                        "the review could not collect the supervisor's specialists: {error}"
+                    )),
                 }
                 return;
             }
@@ -2145,14 +2235,13 @@ impl ActiveChat {
     /// Puts a form the reviewer is waiting on in front of the user, or answers
     /// it for them when it is not theirs to answer.
     fn surface_reviewer_elicitations(&mut self) {
-        let Some(pending) = self
-            .state
-            .second_opinion()
-            .and_then(SecondOpinion::reviewer)
-            .or_else(|| self.state.turn_review().map(|review| &review.reviewer))
-            .map(|reviewer| reviewer.pending_elicitations().to_vec())
-        else {
-            return;
+        let pending = match (self.state.second_opinion(), self.state.turn_review()) {
+            (Some(view), _) => view
+                .reviewer()
+                .map(|reviewer| reviewer.pending_elicitations().to_vec())
+                .unwrap_or_default(),
+            (None, Some(review)) => review.pending_elicitations(),
+            (None, None) => return,
         };
         for request in pending {
             // A reviewer's plan decision is the reviewer proposing work, not
@@ -2177,26 +2266,18 @@ impl ActiveChat {
     /// One sidecar serves both review views, so whichever is open supplies the
     /// cursor; they are mutually exclusive by construction.
     fn poll_reviewer_events(&self) {
-        let cursor = self
+        let Some(reviewer) = self
             .state
             .second_opinion()
             .and_then(SecondOpinion::reviewer)
-            .map(|reviewer| (reviewer.cursor_ordinal, reviewer.cursor_digest.clone()))
-            .or_else(|| {
-                self.state.turn_review().map(|review| {
-                    (
-                        review.reviewer.cursor_ordinal,
-                        review.reviewer.cursor_digest.clone(),
-                    )
-                })
-            });
-        let Some((after_ordinal, cursor_digest)) = cursor else {
+        else {
             return;
         };
-        let after_digest = if cursor_digest.is_empty() {
+        let after_ordinal = reviewer.cursor_ordinal;
+        let after_digest = if reviewer.cursor_digest.is_empty() {
             crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned()
         } else {
-            cursor_digest
+            reviewer.cursor_digest.clone()
         };
         let session = self.session.clone();
         let updates = self.chat_io_tx.clone();
@@ -2214,6 +2295,79 @@ impl ActiveChat {
             };
             if let Err(error) = updates.send(ChatIoUpdate::ReviewerEvents { result }) {
                 tracing::debug!(%error, "reviewer events dropped because the chat closed");
+            }
+        });
+    }
+
+    /// Reads one reviewing role's journal from where its pane left off.
+    ///
+    /// Each role has its own relay, so each is polled on its own cursor; a
+    /// lane's transcript never arrives in the supervisor's pane.
+    fn poll_turn_review_role(&self, role: &str) {
+        self.poll_turn_review_role_after(role, Duration::ZERO);
+    }
+
+    /// The same, after `delay`.
+    ///
+    /// An attach answers at once even when the journal has not moved, so a
+    /// loop that re-attaches on every empty page is a spin. A review runs
+    /// several roles at once, so each idle role waits a beat before asking
+    /// again; a page that did carry events is followed up immediately, which
+    /// is what keeps a streaming answer smooth.
+    fn poll_turn_review_role_after(&self, role: &str, delay: Duration) {
+        let Some(review) = self.state.turn_review() else {
+            return;
+        };
+        let (after_ordinal, cursor_digest) = review.cursor(role);
+        let after_digest = if cursor_digest.is_empty() {
+            crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned()
+        } else {
+            cursor_digest
+        };
+        let session = self.session.clone();
+        let updates = self.chat_io_tx.clone();
+        let role = role.to_owned();
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let result = match session
+                .reviewer_as(
+                    Some(role.clone()),
+                    ReviewerAction::Attach {
+                        after_ordinal,
+                        after_digest,
+                    },
+                )
+                .await
+            {
+                Ok(ReviewerOutcome::Attached(attachment)) => Ok(attachment.events),
+                Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            if let Err(error) = updates.send(ChatIoUpdate::TurnReviewEvents { role, result }) {
+                tracing::debug!(%error, "review events dropped because the chat closed");
+            }
+        });
+    }
+
+    /// Collects the specialist lanes the supervisor asked for through its MCP
+    /// tool. The tool answers the supervisor at once and leaves the request in
+    /// the worker; this is where the controller picks it up and launches them.
+    fn poll_lane_dispatches(&self) {
+        let session = self.session.clone();
+        let updates = self.chat_io_tx.clone();
+        tokio::spawn(async move {
+            let result = match session
+                .reviewer(ReviewerAction::TakeLaneDispatches)
+                .await
+            {
+                Ok(ReviewerOutcome::LaneDispatches { requests }) => Ok(requests),
+                Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            if let Err(error) = updates.send(ChatIoUpdate::TurnReviewDispatches { result }) {
+                tracing::debug!(%error, "review dispatches dropped because the chat closed");
             }
         });
     }
@@ -2275,16 +2429,23 @@ impl ActiveChat {
     /// the exact command that was submitted is what settles it.
     fn apply_turn_review_events(
         &mut self,
+        role: &str,
         events: &[crate::hel_worker::RelayEvent],
     ) {
-        let session_id = reviewer_session_id(self.session.session_id());
+        let session_id = review_role_session_id(self.session.session_id(), role);
         let Some(review) = self.state.turn_review_mut() else {
             return;
         };
         if !events.is_empty() {
-            review.reviewer.apply_events(&session_id, events);
+            review.pane(role).apply_events(&session_id, events);
         }
-        let Some(awaited) = review.driver.awaited_command().map(str::to_owned) else {
+        let Some(awaited) = review
+            .driver
+            .awaited_commands()
+            .into_iter()
+            .find(|(awaited_role, _)| awaited_role == role)
+            .map(|(_, command_id)| command_id)
+        else {
             return;
         };
         let completed = events.iter().any(|event| {
@@ -2301,9 +2462,47 @@ impl ActiveChat {
         if !completed {
             return;
         }
-        let answer = review.reviewer.latest_answer().unwrap_or_default();
+        let answer = review.pane(role).latest_answer().unwrap_or_default();
         let requests = review.driver.role_turn_completed(&awaited, &answer);
         self.run_review_requests(requests);
+    }
+
+    /// Folds one role's events in, then keeps reading that role and, while the
+    /// supervisor is running, collects any lanes it dispatched.
+    fn apply_turn_review_role_events(
+        &mut self,
+        role: String,
+        result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
+    ) {
+        let events = match result {
+            Ok(events) => events,
+            Err(error) => {
+                self.fail_turn_review(error);
+                return;
+            }
+        };
+        let idle = events.is_empty();
+        self.apply_turn_review_events(&role, &events);
+        self.surface_reviewer_elicitations();
+        let Some(review) = self.state.turn_review() else {
+            return;
+        };
+        if review.driver.finished() {
+            return;
+        }
+        if review.driver.active_roles().contains(&role) {
+            self.poll_turn_review_role_after(
+                &role,
+                if idle {
+                    REVIEW_POLL_IDLE_INTERVAL
+                } else {
+                    Duration::ZERO
+                },
+            );
+        }
+        if role == crate::hel_review::driver::SUPERVISOR_ROLE && review.driver.supervisor_running() {
+            self.poll_lane_dispatches();
+        }
     }
 
     /// Folds a page of reviewer events into the pane and keeps reading.
@@ -2311,25 +2510,6 @@ impl ActiveChat {
         &mut self,
         result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
     ) {
-        if self.state.turn_review_active() {
-            let events = match result {
-                Ok(events) => events,
-                Err(error) => {
-                    self.fail_turn_review(error);
-                    return;
-                }
-            };
-            self.apply_turn_review_events(&events);
-            self.surface_reviewer_elicitations();
-            if self
-                .state
-                .turn_review()
-                .is_some_and(|review| !review.driver.finished())
-            {
-                self.poll_reviewer_events();
-            }
-            return;
-        }
         let session_id = reviewer_session_id(self.session.session_id());
         let events = match result {
             Ok(events) => events,
@@ -2585,7 +2765,7 @@ pub(super) fn render_in(
                 let (inner, top, total) = super::second_opinion::render_reviewer_titled(
                     frame,
                     area,
-                    &mut review.reviewer,
+                    review.selected_pane(),
                     &status,
                     &title,
                     strip,

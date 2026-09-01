@@ -705,10 +705,35 @@ pub fn format_report_injection(reports: &[LaneReport], outstanding: usize) -> St
 }
 
 /// What the supervisor asked for in one `call_review_subagents` call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// This is also the wire form: the tool sends it to the worker, the worker
+/// hands it to the controller, and the controller renders the lane's prompt
+/// from it, so one shape crosses all three.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewSubagentRequest {
     pub agent_type: String,
     pub hypothesis: String,
+}
+
+/// One `call_review_subagents` call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneDispatch {
+    pub reviewers: Vec<ReviewSubagentRequest>,
+}
+
+/// What the worker answers a dispatch with. The lanes it names are recorded,
+/// not yet running: the controller starts them, and a lane that fails to start
+/// reaches the supervisor as a failed report rather than as a tool error, the
+/// same way a lane that fails mid-run does.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneDispatchReply {
+    #[serde(default)]
+    pub started: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Validates one dispatch. Ported rules: nonempty, known lane ids, concrete

@@ -133,6 +133,13 @@ pub enum RelayRequest {
     /// nested here, so the reviewer's conversation is journaled and replayed
     /// the same way the primary's is.
     Reviewer {
+        /// Which reviewing agent this is for. Absent means the default role,
+        /// which is the one plan review uses; a turn review in the extended
+        /// tier also names its supervisor, its intent analyst, and each
+        /// specialist lane. An older controller sends no role, and an older
+        /// worker ignores one, so the field is additive in both directions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
         request: ReviewerRequest,
     },
 }
@@ -192,6 +199,10 @@ pub enum ReviewerRequest {
     AnalyzeDelta {
         repositories: Vec<AnalyzeDeltaRepository>,
     },
+    /// Collect the specialist lanes the review supervisor asked for through
+    /// its MCP tool since the last time the controller asked. This request is
+    /// answered by the sidecar itself rather than by any one role.
+    TakeLaneDispatches,
 }
 
 /// One repository's captured endpoints for the Bifrost analysis pre-pass.
@@ -235,6 +246,7 @@ impl ReviewerRequest {
             Self::CaptureDelta { .. } => "reviewer_capture_delta",
             Self::AdvanceBaseline { .. } => "reviewer_advance_baseline",
             Self::AnalyzeDelta { .. } => "reviewer_analyze_delta",
+            Self::TakeLaneDispatches => "reviewer_take_lane_dispatches",
         }
     }
 }
@@ -260,7 +272,7 @@ impl RelayRequest {
             Self::RemoveGithubToken => "remove_github_token",
             Self::Compact { .. } => "compact",
             Self::RespondElicitation { .. } => "respond_elicitation",
-            Self::Reviewer { request } => request.action_name(),
+            Self::Reviewer { request, .. } => request.action_name(),
         }
     }
 
@@ -413,6 +425,10 @@ pub enum RelayResponsePayload {
     /// Bifrost's changed-callable packet for the captured trees.
     ReviewChangedFunctions {
         packet: String,
+    },
+    /// Specialist lanes the review supervisor asked for.
+    LaneDispatches {
+        requests: Vec<crate::hel_review::lanes::ReviewSubagentRequest>,
     },
 }
 

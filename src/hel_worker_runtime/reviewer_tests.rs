@@ -227,14 +227,28 @@ impl Fixture {
     }
 
     async fn request(&mut self, request: ReviewerRequest) -> RelayResponseBody {
+        self.request_as(None, request).await
+    }
+
+    /// Drives one named reviewing role, which is how the extended review tier
+    /// runs its supervisor and lanes beside the default reviewer.
+    async fn request_as(
+        &mut self,
+        role: Option<&str>,
+        request: ReviewerRequest,
+    ) -> RelayResponseBody {
         let envelope = RelayRequestEnvelope {
             request_id: "test".to_owned(),
             protocol_version: RELAY_PROTOCOL_VERSION,
             request: RelayRequest::Reviewer {
+                role: role.map(str::to_owned),
                 request: request.clone(),
             },
         };
-        self.sidecar.handle(envelope, request).await.body
+        self.sidecar
+            .handle(envelope, role.map(str::to_owned), request)
+            .await
+            .body
     }
 
     async fn start(&mut self, config: ReviewerLaunchConfig) -> RelayResponseBody {
@@ -358,7 +372,7 @@ async fn starting_opens_a_native_session_and_reports_what_the_harness_advertises
     let (_, reused) = started_options(&body);
     assert!(reused, "the same configuration reuses the running reviewer");
 
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 }
 
 #[tokio::test]
@@ -373,7 +387,7 @@ async fn a_harness_that_advertises_nothing_still_starts() {
         "a harness with no selectors advertises none"
     );
 
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 }
 
 #[tokio::test]
@@ -413,7 +427,7 @@ async fn applying_a_model_refreshes_the_advertised_efforts() {
         "model=deep\n"
     );
 
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 }
 
 #[tokio::test]
@@ -438,7 +452,7 @@ async fn a_new_generation_replaces_the_running_reviewer() {
         "the replacement is a different process"
     );
 
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 }
 
 #[tokio::test]
@@ -487,7 +501,7 @@ async fn a_review_turn_streams_through_the_reviewers_own_relay() {
         "critique this plan"
     );
 
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 }
 
 #[tokio::test]
@@ -528,7 +542,7 @@ async fn a_review_survives_payloads_larger_than_a_pipe_buffer() {
         plan
     );
 
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 }
 
 #[tokio::test]
@@ -594,7 +608,7 @@ async fn a_reviewer_form_is_answered_on_the_connection() {
         })
         .await;
 
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 }
 
 #[tokio::test]
@@ -651,7 +665,7 @@ async fn a_resumed_reviewer_reloads_its_native_session() {
     write_options(&fixture.script_directory(), "options.json", &[]);
 
     fixture.start(config(0)).await;
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
     fixture.start(config(0)).await;
 
     let resumes = fixture
@@ -667,7 +681,7 @@ async fn a_resumed_reviewer_reloads_its_native_session() {
         .count();
     assert_eq!(resumes, 1, "the second start reloads rather than restarts");
 
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 }
 
 #[tokio::test]
@@ -690,7 +704,7 @@ async fn the_reviewer_keeps_its_files_inside_the_primary_worker_root() {
     let mut fixture = Fixture::new(true);
     write_options(&fixture.script_directory(), "options.json", &[]);
     fixture.start(config(0)).await;
-    fixture.sidecar.pause().await;
+    fixture.sidecar.pause_all().await;
 
     let reviewer_root = fixture.worker_root.join("reviewer");
     assert!(reviewer_root.join("relay-state.json").exists());
@@ -704,6 +718,7 @@ async fn the_reviewer_keeps_its_files_inside_the_primary_worker_root() {
 #[test]
 fn a_reviewer_request_needs_the_protocol_that_introduced_it() {
     let request = RelayRequest::Reviewer {
+        role: None,
         request: ReviewerRequest::Status,
     };
     assert_eq!(request.minimum_protocol(), 6);
@@ -721,6 +736,7 @@ fn the_plain_relay_refuses_reviewer_requests() {
         request_id: "req-1".to_owned(),
         protocol_version: RELAY_PROTOCOL_VERSION,
         request: RelayRequest::Reviewer {
+            role: None,
             request: ReviewerRequest::Status,
         },
     });
@@ -783,4 +799,136 @@ fn collected_agent_text(events: &[RelayEvent]) -> String {
 #[test]
 fn the_sidecar_uses_the_worker_relay_coordinator() {
     let _ = unix::ACP_EVENT_CHANNEL_CAPACITY;
+}
+
+#[tokio::test]
+async fn two_review_roles_run_side_by_side_with_their_own_homes_and_journals() {
+    let mut fixture = Fixture::new(true);
+    // A file in the staged profile proves each role gets a copy rather than a
+    // shared directory: a second harness writing its session files into the
+    // first one's home would corrupt both.
+    std::fs::write(fixture.profile_home.join("credentials"), b"token\n").unwrap();
+
+    let body = fixture.start(config(0)).await;
+    let (_, reused) = started_options(&body);
+    assert!(!reused, "the default role starts its own harness");
+
+    let body = fixture
+        .request_as(
+            Some("tests"),
+            ReviewerRequest::Start {
+                config: Box::new(config(0)),
+            },
+        )
+        .await;
+    let (_, reused) = started_options(&body);
+    assert!(!reused, "a lane is a different harness, not a reused one");
+
+    let lane_home = fixture
+        .worker_root
+        .join("reviewer")
+        .join("roles")
+        .join("tests")
+        .join("profile");
+    assert!(
+        lane_home.join("credentials").exists(),
+        "a lane runs from its own copy of the staged profile"
+    );
+    assert_ne!(
+        lane_home, fixture.profile_home,
+        "the lane's home is not the staged profile itself"
+    );
+    assert!(
+        fixture
+            .worker_root
+            .join("reviewer")
+            .join("roles")
+            .join("tests")
+            .join("relay-journal")
+            .exists()
+            || fixture
+                .worker_root
+                .join("reviewer")
+                .join("roles")
+                .join("tests")
+                .join("relay-state.json")
+                .exists(),
+        "the lane journals into its own directory: {:?}",
+        std::fs::read_dir(fixture.worker_root.join("reviewer").join("roles").join("tests"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+
+    // Each role answers its own prompts, and one role's transcript never
+    // appears in another's journal.
+    let accepted = fixture
+        .request(ReviewerRequest::Submit {
+            command_id: "review-default".to_owned(),
+            command: RelayCommand::Prompt {
+                prompt: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("default role"),
+                )],
+            },
+        })
+        .await;
+    assert!(matches!(accepted, RelayResponseBody::Ok { .. }));
+    let accepted = fixture
+        .request_as(
+            Some("tests"),
+            ReviewerRequest::Submit {
+                command_id: "review-lane".to_owned(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                        agent_client_protocol::schema::v1::TextContent::new("lane role"),
+                    )],
+                },
+            },
+        )
+        .await;
+    assert!(matches!(accepted, RelayResponseBody::Ok { .. }));
+
+    let lane_events = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let body = fixture
+                .request_as(
+                    Some("tests"),
+                    ReviewerRequest::Attach {
+                        after_ordinal: 0,
+                        after_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+                    },
+                )
+                .await;
+            let RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Attached { events, .. },
+            } = body
+            else {
+                panic!("attach answers with a page of events");
+            };
+            if events.iter().any(|event| {
+                matches!(
+                    &event.observation,
+                    RelayObservation::CommandCompleted { command_id, .. }
+                        if command_id == "review-lane"
+                )
+            }) {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the lane answers its own prompt");
+    assert!(
+        !lane_events.iter().any(|event| {
+            matches!(
+                &event.observation,
+                RelayObservation::CommandCompleted { command_id, .. }
+                    if command_id == "review-default"
+            )
+        }),
+        "the default role's turn stays out of the lane's journal"
+    );
+
+    fixture.sidecar.pause_all().await;
 }

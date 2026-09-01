@@ -43,18 +43,29 @@ impl Controller {
 
     /// Stage a reviewer that also gets `mcp_servers`, which is how a turn
     /// review attaches its analyzer tools.
+    ///
+    /// `dispatch_tool` adds the review supervisor's own tool, which is this
+    /// worker's binary in another mode. Only the controller knows where that
+    /// binary and its socket sit on the target, so it is built here rather
+    /// than by the caller.
     pub fn stage_reviewer_profile_with_mcp(
         &self,
         session_id: &str,
         profile_id: &str,
         generation: u64,
         mcp_servers: &[ReviewMcpServer],
+        dispatch_tool: bool,
     ) -> Result<ReviewerLaunchConfig> {
+        let mut servers = mcp_servers.to_vec();
+        if dispatch_tool {
+            let (_, worker_root) = self.worker_placement(session_id)?;
+            servers.push(review_dispatch_server(&worker_root));
+        }
         self.stage_reviewer_profile_controlled(
             session_id,
             profile_id,
             generation,
-            mcp_servers,
+            &servers,
             &ProcessExecutor,
         )
     }
@@ -199,6 +210,27 @@ fn configure_staged_review_mcp(
     body.push(b'\n');
     crate::hel_config::atomic_write(&path, &body)
         .with_context(|| format!("write staged reviewer configuration {}", path.display()))
+}
+
+/// The review supervisor's dispatch tool, as it runs inside the container:
+/// this worker's own binary in `review-mcp` mode, talking to the socket the
+/// worker serves in its reviewer directory.
+fn review_dispatch_server(worker_root: &str) -> ReviewMcpServer {
+    let socket = format!(
+        "{worker_root}/{}/{}",
+        REVIEWER_DIR,
+        crate::hel_review::mcp::REVIEW_DISPATCH_SOCKET
+    );
+    ReviewMcpServer {
+        name: crate::hel_review::mcp::REVIEW_MCP_SERVER_NAME.to_owned(),
+        command: Path::new(worker_root).join("hel"),
+        args: vec![
+            "worker".to_owned(),
+            "review-mcp".to_owned(),
+            "--socket".to_owned(),
+            socket,
+        ],
+    }
 }
 
 /// Where the reviewer's staged profile lives on the target.

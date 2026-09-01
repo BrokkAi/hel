@@ -17,7 +17,7 @@ To see it working after full implementation: open a Hel session, enable auto-rev
 - [x] (2026-09-01 03:55Z) Milestone 1: cumulative delta capture in the worker (git tree snapshots, `CaptureDelta`/`AdvanceBaseline`/`AnalyzeDelta` requests, Bifrost pinned into the container image).
 - [x] (2026-09-01 03:55Z) Milestone 3 (brought forward): `src/hel_review/{lanes,verdict,delta,bifrost}.rs` carry the full mj port with its tests. Done before Milestone 2 because Milestone 2 needs the same prompts; Milestone 2 is now wiring rather than authoring.
 - [x] (2026-09-01 05:05Z) Milestone 2: quick-tier review end-to-end in the split pane. Trigger on turn completion, prompt lock in the TUI and the web surface, capture/analysis/reviewer/validator flow, Forward/Dismiss/Cancel, baseline advance, `/review` settings and manual trigger, SQLite migration 19, Bifrost MCP attachment per harness.
-- [ ] Milestone 4: extended tier (multi-role sidecar, supervisor with `call_review_subagents` MCP dispatch, intent analyst, lane strip in the pane).
+- [x] (2026-09-01 07:20Z) Milestone 4: extended tier. Multi-role sidecar (per-role relay, profile copy and lock, `MAX_PARALLEL_LANES = 3`), `hel worker review-mcp` serving `call_review_subagents` over a worker socket, intent analyst concurrent with the analysis, supervisor with lane dispatch and report injection, per-role panes with Tab.
 - [ ] Milestone 5: recovery semantics, docs note in `.agents/docs/`, retrospective.
 
 ## Surprises & Discoveries
@@ -30,6 +30,10 @@ To see it working after full implementation: open a Hel session, enable auto-rev
   Evidence: `/home/jonathan/Projects/bifrost/rust-toolchain.toml` names 1.97.1; `containers/Containerfile.agent-dev` lines 1-25.
 - Observation: mj's `RawDiffSummary::diffstat` ends every line with "(raw Git patch; Bifrost analysis disabled)", which was true in mj because that summary only appeared when analysis was off. In Hel it is the worker's ordinary diffstat for `RepoDelta` metadata and Bifrost always runs, so the suffix was dropped -- the one deliberate wording change in the ported summary.
   Evidence: `src/hel_review/delta.rs`, test `a_raw_diff_summary_counts_files_and_changed_lines`.
+- Observation: a relay attach answers immediately even when the journal has not moved, so the plan-review poll loop (`apply_reviewer_events` re-calls `poll_reviewer_events` on every page, `src/hel_chat/active.rs`) spins on empty pages. One loop is cheap enough that nobody noticed; a review running five roles at once would be five. The turn review therefore waits `REVIEW_POLL_IDLE_INTERVAL` (200 ms) after an empty page and re-attaches immediately after a page that carried events, which keeps a streaming answer smooth without the spin. The plan-review loop was left as it is: changing it is not this plan's work.
+  Evidence: `DurableRelay::attach` (`src/hel_worker.rs:1784`) returns a page without waiting; `poll_turn_review_role_after` in `src/hel_chat/active.rs`.
+- Observation: the quick tier's reviewer and validator are separate roles, and the controller re-stages the reviewer profile on every role launch. Staging removes and re-copies `<worker_root>/reviewer/profile`, which the default role runs from directly, so the driver now reaps the reviewer before the validator is staged over it. It has already reported by then, so nothing is lost.
+  Evidence: `start_validation` in `src/hel_review/driver.rs` emits `PauseRole { reviewer }` before `StartRole { validator }`; `upload_reviewer_profile` in `src/hel_controller/reviewer.rs` clears the directory first.
 - Observation: Hel's second-opinion reviewer is a single-slot sidecar. `ReviewerSidecar` (`src/hel_worker_runtime/reviewer.rs:92`) holds `running: Option<RunningReviewer>`; the relay session id is the fixed string `format!("{session_id}-reviewer")` (`reviewer.rs:77`), the staging directory constants are singular (`REVIEWER_DIR = "reviewer"`, `src/hel_worker_runtime.rs:15`), and the DB row is one-per-session (`second_opinion_reviews.session_id` PRIMARY KEY, `src/hel_database/schema.rs:455`). Nothing structurally forbids several concurrent ACP children in one worker, but every identifier must gain a role dimension for multi-lane review.
 - Observation: the relay journal has no bounded range read. `DurableRelay::events_after(after_ordinal, after_digest)` (`src/hel_worker.rs:484`) is cursor-forward only; an X..Y window must be truncated controller-side.
 - Observation: no tree-hash or per-turn-diff helper exists anywhere in hel. Checkpoints capture whole-session archives (`src/hel_checkpoint.rs`); `collect_git_snapshot` (`src/hel_archive/git.rs:311`) captures staged/unstaged/untracked state but never computes a content id of the working tree.
@@ -82,6 +86,13 @@ Milestone 2 (2026-09-01): a completed turn now opens the split pane, runs mj's q
   Date/Author: 2026-09-01 / Opus.
 - Decision: the review lock is enforced in three places rather than one: the TUI routes every key to the review view, `submit_prompt_with_history` refuses with a notice, and the web control surface refuses a prompt whose session has a non-null `turn_review_state.active` row.
   Rationale: the view-level lock only covers the terminal. A phone submitting through `src/hel_server.rs` would otherwise start the next turn under an unanswered review, which is exactly the "findings land out of the blue" behavior the feature exists to prevent. The in-flight row already had to exist for restart recovery, so the web check is one indexed read on a path that already moves work off the request task.
+  Date/Author: 2026-09-01 / Opus.
+
+- Decision: the supervisor's lane dispatch is recorded by the worker and executed by the controller, rather than executed by the worker.
+  Rationale: the worker would have to hold the rendered lane prompts, the captured diff and the job to start a lane, which is controller state; keeping the worker a conduit leaves one owner for the review's rules. The tool answers "started" as soon as the request is recorded, because a supervisor that blocks inside a tool call cannot read the reports it is waiting for. A lane the controller then cannot launch reaches the supervisor as a failed report -- an explicit coverage gap -- which is what mj does with a launch failure too.
+  Date/Author: 2026-09-01 / Opus.
+- Decision: roles are locked one at a time (`ReviewerSidecar` holds `Arc<Mutex<ReviewerRole>>` values behind a map, not one lock over everything).
+  Rationale: launching a lane takes seconds while the controller polls other roles' journals throughout. A single sidecar lock would serialize the fan-out behind each launch and stall the pane.
   Date/Author: 2026-09-01 / Opus.
 
 ## Context and Orientation

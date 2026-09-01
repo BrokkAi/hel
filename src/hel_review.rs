@@ -32,6 +32,8 @@ pub mod bifrost;
 pub mod delta;
 pub mod driver;
 pub mod lanes;
+#[cfg(unix)]
+pub mod mcp;
 pub mod verdict;
 
 /// How much of a lane report the next prompt may quote.

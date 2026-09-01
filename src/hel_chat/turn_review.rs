@@ -63,7 +63,11 @@ impl ReviewAction {
 /// One turn review on screen.
 pub(super) struct TurnReview {
     pub(super) driver: TurnReviewDriver,
-    pub(super) reviewer: ReviewerPane,
+    /// One pane per reviewing role: the extended tier runs a supervisor, an
+    /// intent analyst and several lanes at once, and each has its own journal.
+    panes: std::collections::BTreeMap<String, ReviewerPane>,
+    /// Which role's transcript the pane is showing. Tab cycles it.
+    selected: String,
     pub(super) action: ReviewAction,
     /// The reviewer waterfall, while the user is choosing which harness
     /// reviews. It is skipped whenever the workspace already remembers one.
@@ -91,12 +95,63 @@ impl TurnReview {
     pub(super) fn new(driver: TurnReviewDriver) -> Self {
         Self {
             driver,
-            reviewer: ReviewerPane::default(),
+            panes: std::collections::BTreeMap::new(),
+            selected: crate::hel_review::driver::REVIEWER_ROLE.to_string(),
             action: ReviewAction::Forward,
             setup: None,
             pending_role: None,
             failure: None,
         }
+    }
+
+    /// One role's pane, created on first use.
+    pub(super) fn pane(&mut self, role: &str) -> &mut ReviewerPane {
+        self.panes.entry(role.to_string()).or_default()
+    }
+
+    /// The pane on screen. A review that has not produced a transcript yet
+    /// still needs somewhere to render its status line.
+    pub(super) fn selected_pane(&mut self) -> &mut ReviewerPane {
+        let selected = self.selected.clone();
+        self.panes.entry(selected).or_default()
+    }
+
+    #[must_use]
+    pub(super) fn selected_role(&self) -> &str {
+        &self.selected
+    }
+
+    /// Moves the transcript to the next role that has one, so a reader can
+    /// follow a lane without losing the supervisor.
+    pub(super) fn cycle_selection(&mut self) {
+        let roles = self.driver.active_roles();
+        if roles.is_empty() {
+            return;
+        }
+        let next = roles
+            .iter()
+            .position(|role| *role == self.selected)
+            .map(|position| (position + 1) % roles.len())
+            .unwrap_or(0);
+        self.selected = roles[next].clone();
+    }
+
+    /// Where a role's journal has been read to.
+    #[must_use]
+    pub(super) fn cursor(&self, role: &str) -> (u64, String) {
+        self.panes
+            .get(role)
+            .map(|pane| (pane.cursor_ordinal, pane.cursor_digest.clone()))
+            .unwrap_or((0, String::new()))
+    }
+
+    /// Forms any reviewing role's harness is waiting on.
+    #[must_use]
+    pub(super) fn pending_elicitations(&self) -> Vec<crate::hel_elicitation::ElicitationRequest> {
+        self.panes
+            .values()
+            .flat_map(|pane| pane.pending_elicitations().to_vec())
+            .collect()
     }
 
     /// What the pane's status line says right now.
@@ -220,7 +275,14 @@ impl super::ChatState {
             return self.apply_turn_review_setup_outcome(outcome);
         }
         match code {
-            KeyCode::Tab | KeyCode::Right => {
+            // Tab moves between the reviewing agents; the arrows move between
+            // the actions, so a fan-out stays readable without giving up the
+            // one-key Forward.
+            KeyCode::Tab => {
+                review.cycle_selection();
+                super::ChatAction::None
+            }
+            KeyCode::Right => {
                 review.action = review.action.next(1);
                 super::ChatAction::None
             }
@@ -230,12 +292,12 @@ impl super::ChatState {
             }
             KeyCode::PageUp => {
                 let page = self.last_viewport_height.max(1);
-                review.reviewer.scroll_by(-(page as isize), page);
+                review.selected_pane().scroll_by(-(page as isize), page);
                 super::ChatAction::None
             }
             KeyCode::PageDown => {
                 let page = self.last_viewport_height.max(1);
-                review.reviewer.scroll_by(page as isize, page);
+                review.selected_pane().scroll_by(page as isize, page);
                 super::ChatAction::None
             }
             KeyCode::Enter => self.activate_turn_review_action(),
@@ -281,7 +343,9 @@ impl super::ChatState {
                 self.close_turn_review();
                 for request in requests {
                     if let SetupRequest::CancelProbe { .. } = request {
-                        steps.push(ReviewRequest::PauseReviewer);
+                        steps.push(ReviewRequest::PauseRole {
+                            role: crate::hel_review::driver::REVIEWER_ROLE.to_string(),
+                        });
                     }
                 }
                 super::ChatAction::TurnReview(TurnReviewIntent::Requests(steps))
@@ -344,7 +408,7 @@ impl super::ChatState {
         let Some(review) = self.turn_review.as_mut() else {
             return false;
         };
-        review.reviewer.scroll_by(rows, height);
+        review.selected_pane().scroll_by(rows, height);
         true
     }
 }
@@ -414,9 +478,15 @@ pub(super) fn role_strip(review: &TurnReview) -> Option<Line<'static>> {
             RoleState::Findings => Color::LightMagenta,
             RoleState::Failed => Color::Red,
         };
+        let mut style = Style::default().fg(color);
+        if role.role == review.selected_role() {
+            // The strip is also the tab bar: the highlighted row is the
+            // transcript below it.
+            style = style.add_modifier(Modifier::REVERSED);
+        }
         spans.push(Span::styled(
             format!("{} {}", role.label, role.state.label()),
-            Style::default().fg(color),
+            style,
         ));
     }
     Some(Line::from(spans))
@@ -534,10 +604,15 @@ mod tests {
         let ChatAction::TurnReview(TurnReviewIntent::Requests(requests)) = action else {
             panic!("escape cancels the review, got {action:?}");
         };
-        assert_eq!(
-            requests,
-            vec![ReviewRequest::PauseReviewer, ReviewRequest::Close],
-            "cancelling stops the reviewer and never advances the baseline"
+        // This review was cancelled before its capture landed, so no role had
+        // started and there is nothing to reap -- but the baseline still must
+        // not move, which is what makes cancelling lossless.
+        assert_eq!(requests, vec![ReviewRequest::Close]);
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, ReviewRequest::AdvanceBaseline { .. })),
+            "cancelling never advances the baseline"
         );
     }
 
