@@ -626,7 +626,7 @@ fn suggested_workspace_name(workspaces: &[daemon::WorkspaceListing]) -> Result<S
 async fn daemon_command(args: DaemonArgs) -> Result<()> {
     match args.command {
         DaemonCommand::Status => {
-            let mut daemon = daemon::connect_existing()
+            let mut daemon = daemon::connect_management()
                 .await
                 .context("Hel daemon is not running")?;
             let status = daemon.status().await?;
@@ -643,24 +643,25 @@ async fn daemon_command(args: DaemonArgs) -> Result<()> {
                 },
                 status.phone_status
             );
+            if daemon.protocol_version() != daemon::PROTOCOL_VERSION {
+                println!(
+                    "The daemon speaks protocol {} while this build speaks {}; \
+                     status/stop/restart work, and other commands will replace it on next use.",
+                    daemon.protocol_version(),
+                    daemon::PROTOCOL_VERSION
+                );
+            }
         }
         DaemonCommand::Stop => {
-            let mut daemon = daemon::connect_existing()
+            let mut daemon = daemon::connect_management()
                 .await
                 .context("Hel daemon is not running")?;
             daemon.stop().await?;
             println!("Hel daemon is stopping; detached workers remain active.");
         }
         DaemonCommand::Restart => {
-            if let Ok(mut daemon) = daemon::connect_existing().await {
-                daemon.stop().await?;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while std::time::Instant::now() < deadline {
-                    if daemon::connect_existing().await.is_err() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                }
+            if let Ok(daemon) = daemon::connect_management().await {
+                daemon.stop_and_wait().await?;
             }
             let mut daemon = daemon::connect_or_start().await?;
             let status = daemon.status().await?;
@@ -827,6 +828,16 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     }
 }
 
+fn target_uses_container(target: &TargetLocator) -> bool {
+    matches!(
+        target,
+        TargetLocator::LocalPodman { .. }
+            | TargetLocator::LocalDocker { .. }
+            | TargetLocator::AppleContainer { .. }
+            | TargetLocator::SshPodman { .. }
+    )
+}
+
 pub(crate) fn startup_greeting(controller: &Controller) -> String {
     let active = controller
         .state
@@ -837,16 +848,9 @@ pub(crate) fn startup_greeting(controller: &Controller) -> String {
     let raw_localhost_active = active
         .iter()
         .any(|session| matches!(session.target, Some(TargetLocator::LocalBare { .. })));
-    let container_active = active.iter().any(|session| {
-        matches!(
-            session.target,
-            Some(
-                TargetLocator::LocalPodman { .. }
-                    | TargetLocator::AppleContainer { .. }
-                    | TargetLocator::SshPodman { .. }
-            )
-        )
-    });
+    let container_active = active
+        .iter()
+        .any(|session| session.target.as_ref().is_some_and(target_uses_container));
     let remote_active = active.iter().any(|session| {
         matches!(
             session.target,
@@ -1141,6 +1145,16 @@ mod tests {
     fn short_session_ids_are_safe() {
         assert_eq!(short_id("0123456789"), "01234567");
         assert_eq!(short_id("tiny"), "tiny");
+    }
+
+    #[test]
+    fn docker_sessions_are_classified_as_container_backed_for_the_greeting() {
+        assert!(target_uses_container(&TargetLocator::LocalDocker {
+            container_id: "hel-session-12345678".into(),
+        }));
+        assert!(!target_uses_container(&TargetLocator::LocalBare {
+            worker_root: PathBuf::from("hel-worker"),
+        }));
     }
 
     #[test]

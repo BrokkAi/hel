@@ -1331,6 +1331,7 @@ impl DashboardState {
         matches!(
             self.config.targets.get(&session.target_template_id)?,
             HelTargetTemplate::LocalPodman { .. }
+                | HelTargetTemplate::LocalDocker { .. }
                 | HelTargetTemplate::AppleContainer { .. }
                 | HelTargetTemplate::SshPodman { .. }
         )

@@ -2168,6 +2168,7 @@ const fn target_kind_name(target: &TargetTemplate) -> &'static str {
     match target {
         TargetTemplate::LocalBare => "local-bare",
         TargetTemplate::LocalPodman { .. } => "local-podman",
+        TargetTemplate::LocalDocker { .. } => "local-docker",
         TargetTemplate::AppleContainer { .. } => "apple-container",
         TargetTemplate::AwsEc2 { .. } => "aws-ec2",
         TargetTemplate::SshBare { .. } => "ssh-bare",

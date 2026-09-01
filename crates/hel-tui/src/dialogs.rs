@@ -900,6 +900,7 @@ fn target_kind_label(target: &hel::hel_config::TargetTemplate) -> &'static str {
     match target {
         hel::hel_config::TargetTemplate::LocalBare => "local bare",
         hel::hel_config::TargetTemplate::LocalPodman { .. } => "local Podman",
+        hel::hel_config::TargetTemplate::LocalDocker { .. } => "local Docker",
         hel::hel_config::TargetTemplate::AppleContainer { .. } => "Apple container",
         hel::hel_config::TargetTemplate::AwsEc2 { .. } => "AWS EC2",
         hel::hel_config::TargetTemplate::SshBare { .. } => "SSH bare",

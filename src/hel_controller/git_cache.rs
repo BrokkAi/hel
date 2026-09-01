@@ -18,6 +18,7 @@ const CACHE_MAX_KIB: u64 = 20 * 1024 * 1024;
 #[derive(Debug, Clone)]
 enum CacheHost {
     LocalPodman,
+    LocalDocker,
     Apple,
     SshPodman(SshTarget),
 }
@@ -26,6 +27,7 @@ impl CacheHost {
     fn for_target(target: &hel_targets::TargetTemplate) -> Option<Self> {
         match target {
             hel_targets::TargetTemplate::LocalPodman(_) => Some(Self::LocalPodman),
+            hel_targets::TargetTemplate::LocalDocker(_) => Some(Self::LocalDocker),
             hel_targets::TargetTemplate::AppleContainer(_) => Some(Self::Apple),
             hel_targets::TargetTemplate::SshPodman { ssh, .. } => {
                 Some(Self::SshPodman(ssh.clone()))
@@ -38,7 +40,7 @@ impl CacheHost {
 
     fn command(&self, remote: Vec<String>, purpose: impl Into<String>) -> CommandSpec {
         let command = match self {
-            Self::LocalPodman | Self::Apple => {
+            Self::LocalPodman | Self::LocalDocker | Self::Apple => {
                 CommandSpec::new(remote[0].clone(), remote[1..].iter().cloned())
             }
             Self::SshPodman(ssh) => {
@@ -78,6 +80,15 @@ impl CacheHost {
                 "--format".to_owned(),
                 "json".to_owned(),
             ],
+            Self::LocalDocker => vec![
+                "docker".to_owned(),
+                "ps".to_owned(),
+                "--all".to_owned(),
+                "--filter".to_owned(),
+                format!("label={}=true", hel_targets::MANAGED_LABEL),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
             Self::Apple => vec![
                 "container".to_owned(),
                 "list".to_owned(),
@@ -88,13 +99,7 @@ impl CacheHost {
         };
         let command = self.command(remote, "find live container Git cache snapshots");
         let output = checked(executor.execute(&command)?, &command)?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&output.stdout).context("parse managed container list JSON")?;
-        let mut sessions = Vec::new();
-        super::recovery_scan::collect_managed_sessions(&value, &mut sessions);
-        sessions.sort();
-        sessions.dedup();
-        Ok(sessions)
+        super::recovery_scan::managed_sessions_from_container_json(&output.stdout)
     }
 }
 
@@ -503,6 +508,7 @@ mod tests {
         commands: Mutex<Vec<CommandSpec>>,
         notices: Mutex<Vec<String>>,
         status: i32,
+        stdout: Vec<u8>,
     }
 
     impl CommandExecutor for RecordingExecutor {
@@ -510,7 +516,7 @@ mod tests {
             self.commands.lock().unwrap().push(command.clone());
             Ok(CommandOutput {
                 status: self.status,
-                stdout: Vec::new(),
+                stdout: self.stdout.clone(),
                 stderr: b"unavailable".to_vec(),
             })
         }
@@ -595,6 +601,46 @@ mod tests {
         .shell_command("true", [], "probe");
         assert_eq!(ssh.program, "ssh");
         assert!(ssh.args.last().unwrap().contains("'sh' '-c' 'true'"));
+    }
+
+    #[test]
+    fn docker_cache_discovers_managed_sessions_through_docker_json_lines() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let executor = RecordingExecutor {
+            stdout: format!(
+                "{{\"Labels\":\"{}=true,{}={session_id}\"}}\n",
+                hel_targets::MANAGED_LABEL,
+                hel_targets::SESSION_LABEL
+            )
+            .into_bytes(),
+            ..Default::default()
+        };
+        let target = TargetTemplate::LocalDocker(ContainerTemplate {
+            image: "ubuntu:24.04".to_owned(),
+            pull_policy: ImagePullPolicy::Auto,
+            extra_run_args: Vec::new(),
+        });
+
+        let host = CacheHost::for_target(&target).expect("Docker has a clone-cache host");
+        assert_eq!(
+            host.managed_sessions(&executor).unwrap(),
+            [session_id.to_owned()]
+        );
+
+        let commands = executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "docker");
+        assert_eq!(
+            commands[0].args,
+            [
+                "ps",
+                "--all",
+                "--filter",
+                "label=dev.hel.managed=true",
+                "--format",
+                "json"
+            ]
+        );
     }
 
     #[cfg(unix)]

@@ -753,6 +753,9 @@ fn target_architecture(
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, "uname", "-m"])
         }
+        hel_targets::TargetLocator::LocalDocker { container_id } => {
+            CommandSpec::new("docker", ["exec", container_id, "uname", "-m"])
+        }
         hel_targets::TargetLocator::AppleContainer { container_id } => {
             CommandSpec::new("container", ["exec", container_id, "uname", "-m"])
         }
@@ -828,6 +831,7 @@ fn workspace_paths(
             bail!("local bare projects use their selected directory")
         }
         hel_targets::TargetLocator::LocalPodman { .. }
+        | hel_targets::TargetLocator::LocalDocker { .. }
         | hel_targets::TargetLocator::AppleContainer { .. }
         | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
         hel_targets::TargetLocator::AwsEc2 { workspace, .. }
@@ -1012,6 +1016,7 @@ fn append_hel_target_environment(
 ) -> Result<()> {
     let environment = match target {
         hel_targets::TargetLocator::LocalPodman { .. }
+        | hel_targets::TargetLocator::LocalDocker { .. }
         | hel_targets::TargetLocator::AppleContainer { .. }
         | hel_targets::TargetLocator::SshPodman { .. } => HEL_CONTAINER_ENVIRONMENT.to_owned(),
         hel_targets::TargetLocator::AwsEc2 { workspace, .. } => format!(
@@ -1144,11 +1149,13 @@ fn install_worker_files(
             }
         }
         hel_targets::TargetLocator::LocalPodman { container_id }
+        | hel_targets::TargetLocator::LocalDocker { container_id }
         | hel_targets::TargetLocator::AppleContainer { container_id } => {
-            let engine = if matches!(locator, hel_targets::TargetLocator::LocalPodman { .. }) {
-                "podman"
-            } else {
-                "container"
+            let engine = match locator {
+                hel_targets::TargetLocator::LocalPodman { .. } => "podman",
+                hel_targets::TargetLocator::LocalDocker { .. } => "docker",
+                hel_targets::TargetLocator::AppleContainer { .. } => "container",
+                _ => unreachable!("matched local container target"),
             };
             for command in [
                 CommandSpec::new(
@@ -1471,11 +1478,13 @@ fn installed_worker_binary_replacement_plan(
                 .purpose("make replaced Hel worker executable"),
         ],
         hel_targets::TargetLocator::LocalPodman { container_id }
+        | hel_targets::TargetLocator::LocalDocker { container_id }
         | hel_targets::TargetLocator::AppleContainer { container_id } => {
-            let engine = if matches!(locator, hel_targets::TargetLocator::LocalPodman { .. }) {
-                "podman"
-            } else {
-                "container"
+            let engine = match locator {
+                hel_targets::TargetLocator::LocalPodman { .. } => "podman",
+                hel_targets::TargetLocator::LocalDocker { .. } => "docker",
+                hel_targets::TargetLocator::AppleContainer { .. } => "container",
+                _ => unreachable!("matched local container target"),
             };
             vec![
                 CommandSpec::new(
@@ -1573,6 +1582,9 @@ fn installed_file_digest_command(
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, "sha256sum", path])
         }
+        hel_targets::TargetLocator::LocalDocker { container_id } => {
+            CommandSpec::new("docker", ["exec", container_id, "sha256sum", path])
+        }
         hel_targets::TargetLocator::AppleContainer { container_id } => {
             CommandSpec::new("container", ["exec", container_id, "sha256sum", path])
         }
@@ -1604,6 +1616,9 @@ fn worker_launch_refresh_plan(
         hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", "-i", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::LocalDocker { container_id } => {
+            CommandSpec::new("docker", ["exec", "-i", container_id, "sh", "-c", &script])
         }
         hel_targets::TargetLocator::AppleContainer { container_id } => CommandSpec::new(
             "container",
@@ -1706,6 +1721,9 @@ fn stop_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) 
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, "sh", "-c", &script])
         }
+        hel_targets::TargetLocator::LocalDocker { container_id } => {
+            CommandSpec::new("docker", ["exec", container_id, "sh", "-c", &script])
+        }
         hel_targets::TargetLocator::AppleContainer { container_id } => {
             CommandSpec::new("container", ["exec", container_id, "sh", "-c", &script])
         }
@@ -1726,6 +1744,9 @@ fn worker_liveness_command(locator: &hel_targets::TargetLocator, worker_root: &s
         hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::LocalDocker { container_id } => {
+            CommandSpec::new("docker", ["exec", container_id, "sh", "-c", &script])
         }
         hel_targets::TargetLocator::AppleContainer { container_id } => {
             CommandSpec::new("container", ["exec", container_id, "sh", "-c", &script])
@@ -1798,6 +1819,10 @@ fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str)
             "podman",
             ["exec", "--detach", container_id, "sh", "-c", &exec_script],
         ),
+        hel_targets::TargetLocator::LocalDocker { container_id } => CommandSpec::new(
+            "docker",
+            ["exec", "--detach", container_id, "sh", "-c", &exec_script],
+        ),
         hel_targets::TargetLocator::AppleContainer { container_id } => CommandSpec::new(
             "container",
             ["exec", "--detach", container_id, "sh", "-c", &exec_script],
@@ -1842,6 +1867,9 @@ pub(super) fn worker_probe_diagnosis(
         }
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, &binary, "--version"])
+        }
+        hel_targets::TargetLocator::LocalDocker { container_id } => {
+            CommandSpec::new("docker", ["exec", container_id, &binary, "--version"])
         }
         hel_targets::TargetLocator::AppleContainer { container_id } => {
             CommandSpec::new("container", ["exec", container_id, &binary, "--version"])
@@ -1891,6 +1919,9 @@ pub(super) fn worker_last_words(
         hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::LocalDocker { container_id } => {
+            CommandSpec::new("docker", ["exec", container_id, "sh", "-c", &script])
         }
         hel_targets::TargetLocator::AppleContainer { container_id } => {
             CommandSpec::new("container", ["exec", container_id, "sh", "-c", &script])

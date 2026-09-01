@@ -1445,6 +1445,7 @@ impl DashboardContext {
             target: session_record
                 .project_target(&self.controller.config, &session_record.target_template_id),
             profile: session_record.last_profile.clone(),
+            harness_kind: Some(session_record.harness_kind),
         };
         let sessions = self.worker_commands_tx.clone();
         let notices = self.notices.clone();

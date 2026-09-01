@@ -41,7 +41,7 @@ use crate::pollers::{
     reserve_recovery_or_cancel, spawn_interrupted_close_recovery,
 };
 
-const PROTOCOL_VERSION: u32 = 4;
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const RETRY_DELAY: Duration = Duration::from_millis(40);
@@ -199,6 +199,12 @@ pub(crate) struct DraftPreview {
     pub saved_at: String,
 }
 
+/// `Ping`, `Status`, and `Stop` form the frozen management subset: their wire
+/// encoding — together with `RequestEnvelope`, `ResponseEnvelope`,
+/// `DaemonStatus`, and `WebViewerStatus` — must never change shape, because
+/// clients and daemons of *any* protocol version rely on them to identify,
+/// stop, and replace each other. Every other action may change freely behind a
+/// `PROTOCOL_VERSION` bump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "action", content = "arguments")]
 enum DaemonAction {
@@ -1462,13 +1468,17 @@ impl DaemonClient {
         })
     }
 
+    /// Speak the daemon's advertised dialect, not this build's: management
+    /// requests must reach daemons of any protocol version, and the frozen
+    /// subset encodes identically across all of them.
     async fn request(&mut self, action: DaemonAction) -> Result<DaemonReply> {
+        let protocol_version = self.metadata.protocol_version;
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         write_frame(
             &mut self.stream,
             &RequestEnvelope {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version,
                 request_id,
                 token: self.metadata.token.clone(),
                 action,
@@ -1477,7 +1487,7 @@ impl DaemonClient {
         .await?;
         let response: ResponseEnvelope = read_frame(&mut self.stream).await?;
         ensure!(
-            response.protocol_version == PROTOCOL_VERSION,
+            response.protocol_version == protocol_version,
             "daemon changed protocol"
         );
         ensure!(
@@ -2063,11 +2073,50 @@ pub(crate) async fn connect_existing() -> Result<DaemonClient> {
     DaemonClient::connect(read_metadata()?).await
 }
 
+/// A handle to whatever daemon the metadata file advertises, regardless of its
+/// protocol version. It only exposes the frozen management subset (`Ping`,
+/// `Status`, `Stop`), which encodes identically in every protocol version.
+pub(crate) struct ManagementClient {
+    inner: DaemonClient,
+}
+
+impl ManagementClient {
+    pub(crate) fn protocol_version(&self) -> u32 {
+        self.inner.metadata.protocol_version
+    }
+
+    pub(crate) async fn status(&mut self) -> Result<DaemonStatus> {
+        self.inner.status().await
+    }
+
+    pub(crate) async fn stop(&mut self) -> Result<()> {
+        self.inner.stop().await
+    }
+
+    /// Ask the daemon to stop and wait for its process to actually exit.
+    pub(crate) async fn stop_and_wait(mut self) -> Result<()> {
+        let pid = self.inner.metadata.pid;
+        self.inner.stop().await?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_is_alive(pid) {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+        ensure!(!process_is_alive(pid), "Hel daemon {pid} did not stop");
+        Ok(())
+    }
+}
+
+pub(crate) async fn connect_management() -> Result<ManagementClient> {
+    Ok(ManagementClient {
+        inner: DaemonClient::connect(read_metadata_any()?).await?,
+    })
+}
+
 pub(crate) async fn connect_or_start() -> Result<DaemonClient> {
     if let Ok(metadata) = read_metadata_any()
         && metadata.protocol_version != PROTOCOL_VERSION
     {
-        stop_incompatible_daemon(&metadata).await?;
+        replace_incompatible_daemon(&metadata).await?;
     }
     if let Ok(mut client) = connect_existing().await
         && matches!(
@@ -2106,7 +2155,19 @@ pub(crate) async fn connect_or_start() -> Result<DaemonClient> {
     )
 }
 
-async fn stop_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
+/// Clear the way for a daemon speaking this build's protocol. Ask the running
+/// daemon to stop over the frozen management subset first — graceful for every
+/// protocol version — and only signal it when the wire is unreachable.
+async fn replace_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
+    if let Ok(inner) = DaemonClient::connect(metadata.clone()).await
+        && (ManagementClient { inner }).stop_and_wait().await.is_ok()
+    {
+        return Ok(());
+    }
+    signal_incompatible_daemon(metadata).await
+}
+
+async fn signal_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
     #[cfg(unix)]
     {
         let mut system = sysinfo::System::new();
@@ -2114,10 +2175,20 @@ async fn stop_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
             sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(metadata.pid)]),
             true,
         );
-        let process = system.process(sysinfo::Pid::from_u32(metadata.pid));
+        // The PID comes from the owner-only metadata file; the argv check
+        // guards against PID recycling, not against other Hel builds — old
+        // daemons are exactly what this function exists to retire.
+        let is_hel_daemon = system
+            .process(sysinfo::Pid::from_u32(metadata.pid))
+            .is_some_and(|process| {
+                process
+                    .cmd()
+                    .get(1)
+                    .is_some_and(|argument| argument.to_str() == Some("daemon-run"))
+            });
         ensure!(
-            process.is_some_and(looks_like_hel),
-            "refusing to signal stale daemon PID {} because it is not a Hel process",
+            is_hel_daemon,
+            "refusing to signal PID {} because it does not look like a Hel daemon (`hel daemon-run`)",
             metadata.pid
         );
         // SAFETY: the PID comes from owner-only daemon metadata and SIGTERM is
@@ -2145,54 +2216,6 @@ async fn stop_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
         let _ = metadata;
         bail!("stop the incompatible Hel daemon, then retry")
     }
-}
-
-/// Whether a process is a Hel daemon, for the one purpose of deciding it is
-/// safe to signal.
-///
-/// The question this answers is narrow: the PID came from owner-only daemon
-/// metadata, but a daemon that died can have its PID recycled by something
-/// else, and SIGTERM to a stranger is not acceptable. What it must *not* do is
-/// demand that the process be running this exact executable file. A protocol
-/// version differs precisely because the binary was replaced, and on Linux a
-/// replaced binary leaves `/proc/PID/exe` reading `".../hel (deleted)"`, which
-/// canonicalizes to nothing. The stricter check was therefore guaranteed to
-/// fail in the only situation it ever ran in: rebuild, run, and the previous
-/// daemon could never be stopped without killing it by hand.
-///
-/// Matching the program name instead survives the replacement, and a recycled
-/// PID belonging to a shell or an editor still does not match.
-#[cfg(unix)]
-fn looks_like_hel(process: &sysinfo::Process) -> bool {
-    let Ok(current) = std::env::current_exe() else {
-        return false;
-    };
-    process_is_named_like(
-        process.exe(),
-        &process.name().to_string_lossy(),
-        &current.to_string_lossy(),
-    )
-}
-
-/// The decision behind [`looks_like_hel`], separated from the process it is
-/// asked about so it can be checked without one.
-fn process_is_named_like(exe: Option<&Path>, comm: &str, current_exe: &str) -> bool {
-    let Some(wanted) = Path::new(current_exe).file_name() else {
-        return false;
-    };
-    // The exe link is the better signal where it is readable, with the suffix
-    // Linux adds for an unlinked binary taken off first.
-    if let Some(path) = exe {
-        let shown = path.to_string_lossy();
-        let live = shown.strip_suffix(" (deleted)").unwrap_or(&shown);
-        if Path::new(live).file_name() == Some(wanted) {
-            return true;
-        }
-    }
-    // `comm` survives the binary being replaced and is readable when the exe
-    // link is not, so it is the fallback rather than the first choice: the
-    // kernel truncates it to fifteen bytes.
-    Path::new(comm).file_name() == Some(wanted)
 }
 
 pub(crate) fn maintain_attachment(
@@ -2608,22 +2631,31 @@ async fn serve_client(
             Err(error) => return Err(error),
         };
         let request_id = request.request_id;
-        let result = if request.protocol_version != PROTOCOL_VERSION {
+        // The frozen management subset is served for every protocol version so
+        // any Hel build can inspect, stop, or replace this daemon; everything
+        // else requires an exact protocol match.
+        let is_management = matches!(
+            request.action,
+            DaemonAction::Ping | DaemonAction::Status | DaemonAction::Stop
+        );
+        let result = if request.token != metadata.token {
+            Err("daemon authentication failed".to_owned())
+        } else if request.protocol_version != PROTOCOL_VERSION && !is_management {
             Err(format!(
                 "incompatible daemon protocol {}; expected {}",
                 request.protocol_version, PROTOCOL_VERSION
             ))
-        } else if request.token != metadata.token {
-            Err("daemon authentication failed".to_owned())
         } else {
             handle_action(request.action, &metadata, &state, &cancellation)
                 .await
                 .map_err(|error| format!("{error:#}"))
         };
+        // Echo the caller's protocol version: replies must stay readable in the
+        // client's own dialect, and the shapes it can receive here are frozen.
         write_frame(
             &mut stream,
             &ResponseEnvelope {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: request.protocol_version,
                 request_id,
                 result,
             },
@@ -3178,63 +3210,6 @@ fn session_state_label(state: SessionState) -> &'static str {
 mod tests {
     use super::*;
 
-    /// A daemon whose protocol version differs is by definition running an
-    /// older binary, and rebuilding replaces the file it was started from. On
-    /// Linux that leaves `/proc/PID/exe` reading `".../hel (deleted)"`, which
-    /// canonicalizes to nothing — so the previous check, which demanded the
-    /// canonical paths match, could never pass in the one situation it ran in.
-    /// Every rebuild left the old daemon to be killed by hand.
-    #[test]
-    fn a_rebuilt_daemon_is_still_recognized_as_hel() {
-        let current = "/home/me/hel/target/debug/hel";
-
-        assert!(
-            process_is_named_like(
-                Some(Path::new("/home/me/hel/target/debug/hel (deleted)")),
-                "hel",
-                current,
-            ),
-            "a daemon whose binary was replaced was not recognized"
-        );
-        assert!(
-            process_is_named_like(
-                Some(Path::new("/home/me/hel/target/debug/hel")),
-                "hel",
-                current
-            ),
-            "an unchanged daemon was not recognized"
-        );
-        // Installed elsewhere is still a Hel daemon, and the metadata that
-        // named this PID is what says it is ours.
-        assert!(
-            process_is_named_like(Some(Path::new("/usr/local/bin/hel")), "hel", current),
-            "a daemon from another path was not recognized"
-        );
-        // `comm` is the fallback for a process whose exe link cannot be read.
-        assert!(
-            process_is_named_like(None, "hel", current),
-            "a daemon with an unreadable exe link was not recognized"
-        );
-    }
-
-    /// The check still has a job: a PID belonging to a daemon that died can be
-    /// recycled, and SIGTERM to a stranger is not acceptable.
-    #[test]
-    fn a_recycled_pid_belonging_to_something_else_is_refused() {
-        let current = "/home/me/hel/target/debug/hel";
-        for (exe, comm) in [
-            (Some("/usr/bin/bash"), "bash"),
-            (Some("/usr/bin/helm"), "helm"),
-            (Some("/usr/bin/nvim (deleted)"), "nvim"),
-            (None, "bash"),
-        ] {
-            assert!(
-                !process_is_named_like(exe.map(Path::new), comm, current),
-                "{exe:?}/{comm} was mistaken for a Hel daemon"
-            );
-        }
-    }
-
     fn test_runtime_state() -> Arc<RuntimeState> {
         let remote = spawn_remote_session_manager().unwrap();
         let recovery = hel::hel_recovery::RecoveryCoordinator::spawn(remote.control.clone());
@@ -3395,6 +3370,207 @@ mod tests {
         );
         drop(stream);
         server.await.unwrap();
+    }
+
+    /// Pins the frozen management subset to its literal protocol-3 wire form.
+    /// If this test fails, the change breaks cross-version daemon management;
+    /// version the new behavior some other way.
+    #[test]
+    fn management_wire_shapes_stay_frozen_across_protocol_versions() {
+        for (action, expected) in [
+            (DaemonAction::Ping, serde_json::json!({"action": "ping"})),
+            (
+                DaemonAction::Status,
+                serde_json::json!({"action": "status"}),
+            ),
+            (DaemonAction::Stop, serde_json::json!({"action": "stop"})),
+        ] {
+            let request = RequestEnvelope {
+                protocol_version: 3,
+                request_id: 7,
+                token: "tok".into(),
+                action,
+            };
+            assert_eq!(
+                serde_json::to_value(&request).unwrap(),
+                serde_json::json!({
+                    "protocol_version": 3,
+                    "request_id": 7,
+                    "token": "tok",
+                    "action": expected,
+                })
+            );
+        }
+
+        let response: ResponseEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol_version": 3,
+            "request_id": 7,
+            "result": {"Ok": {"reply": "status", "value": {
+                "pid": 4242,
+                "started_at": "2026-09-01T07:48:14Z",
+                "build_version": "0.3.1",
+                "attached_clients": 1,
+                "phone_status": {"state": "disabled"},
+            }}}
+        }))
+        .unwrap();
+        match response.result.unwrap() {
+            DaemonReply::Status(status) => {
+                assert_eq!(status.pid, 4242);
+                assert_eq!(status.build_version, "0.3.1");
+            }
+            reply => panic!("unexpected reply {reply:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_serves_management_actions_for_any_protocol_version() {
+        // 3 is an older shipped client; 5 stands in for a future one. Both
+        // directions must stay manageable.
+        for version in [3_u32, 5] {
+            let state = test_runtime_state();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let metadata = DaemonMetadata {
+                protocol_version: PROTOCOL_VERSION,
+                pid: 1,
+                address,
+                token: "right-token".into(),
+                started_at: "now".into(),
+                build_version: "test".into(),
+            };
+            let server_metadata = metadata.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_client(stream, server_metadata, state, CancellationToken::new())
+                    .await
+                    .unwrap();
+            });
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            write_frame(
+                &mut stream,
+                &RequestEnvelope {
+                    protocol_version: version,
+                    request_id: 44,
+                    token: "right-token".into(),
+                    action: DaemonAction::Status,
+                },
+            )
+            .await
+            .unwrap();
+            let response: ResponseEnvelope = read_frame(&mut stream).await.unwrap();
+            assert_eq!(
+                response.protocol_version, version,
+                "reply must use the caller's dialect"
+            );
+            assert_eq!(response.request_id, 44);
+            match response.result.unwrap() {
+                DaemonReply::Status(status) => assert_eq!(status.build_version, "test"),
+                reply => panic!("unexpected reply {reply:?}"),
+            }
+            drop(stream);
+            server.await.unwrap();
+        }
+    }
+
+    struct ProtocolTranscript {
+        protocol_version: u32,
+        daemon_build: &'static str,
+        /// The exact frames the client must emit, in order (status, then stop).
+        expected_requests: [serde_json::Value; 2],
+        /// The exact frame bodies that version's daemon replies with, as raw
+        /// JSON so the fixture cannot drift along with this build's types.
+        responses: [&'static str; 2],
+    }
+
+    /// One transcript per released daemon protocol version, transcribed from
+    /// the release tags (v0.3.x speaks 3, v0.4.x speaks 4; v0.1/v0.2 predate
+    /// the daemon). When `PROTOCOL_VERSION` bumps, add the new version here —
+    /// the frozen management subset means the entry differs only in its
+    /// version number and build string. Do not edit existing entries: they are
+    /// what shipped.
+    fn released_protocol_transcripts() -> Vec<ProtocolTranscript> {
+        let requests = |version: u32| {
+            [
+                serde_json::json!({
+                    "protocol_version": version,
+                    "request_id": 1,
+                    "token": "tok",
+                    "action": {"action": "status"},
+                }),
+                serde_json::json!({
+                    "protocol_version": version,
+                    "request_id": 2,
+                    "token": "tok",
+                    "action": {"action": "stop"},
+                }),
+            ]
+        };
+        vec![
+            ProtocolTranscript {
+                protocol_version: 3,
+                daemon_build: "0.3.1",
+                expected_requests: requests(3),
+                responses: [
+                    r#"{"protocol_version":3,"request_id":1,"result":{"Ok":{"reply":"status","value":{"pid":4242,"started_at":"2026-09-01T07:48:14Z","build_version":"0.3.1","attached_clients":1,"phone_status":{"state":"ready","viewer_url":"https://example.test:1","viewer_code":"690451","qr_login_url":null,"fallback_reason":null}}}}}"#,
+                    r#"{"protocol_version":3,"request_id":2,"result":{"Ok":{"reply":"done"}}}"#,
+                ],
+            },
+            ProtocolTranscript {
+                protocol_version: 4,
+                daemon_build: "0.4.1",
+                expected_requests: requests(4),
+                responses: [
+                    r#"{"protocol_version":4,"request_id":1,"result":{"Ok":{"reply":"status","value":{"pid":4242,"started_at":"2026-09-01T07:48:14Z","build_version":"0.4.1","attached_clients":1,"phone_status":{"state":"disabled"}}}}}"#,
+                    r#"{"protocol_version":4,"request_id":2,"result":{"Ok":{"reply":"done"}}}"#,
+                ],
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn management_client_talks_to_every_released_protocol_version() {
+        for transcript in released_protocol_transcripts() {
+            let protocol_version = transcript.protocol_version;
+            let daemon_build = transcript.daemon_build;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                for (expected, response) in transcript
+                    .expected_requests
+                    .iter()
+                    .zip(transcript.responses)
+                {
+                    let request: serde_json::Value = read_frame(&mut stream).await.unwrap();
+                    assert_eq!(
+                        &request, expected,
+                        "protocol {} daemon would reject this frame",
+                        transcript.protocol_version
+                    );
+                    stream.write_u32(response.len() as u32).await.unwrap();
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+            });
+            let metadata = DaemonMetadata {
+                protocol_version,
+                pid: 4242,
+                address,
+                token: "tok".into(),
+                started_at: "2026-09-01T07:48:14Z".into(),
+                build_version: daemon_build.into(),
+            };
+            let mut client = ManagementClient {
+                inner: DaemonClient::connect(metadata).await.unwrap(),
+            };
+            let status = client.status().await.unwrap();
+            assert_eq!(status.build_version, daemon_build);
+            assert_eq!(status.attached_clients, 1);
+            assert_eq!(client.protocol_version(), protocol_version);
+            client.stop().await.unwrap();
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

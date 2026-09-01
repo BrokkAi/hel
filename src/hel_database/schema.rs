@@ -510,6 +510,57 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 20 {
+        let target_table_exists: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_targets'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        let rebuild = if target_table_exists {
+            "ALTER TABLE session_targets RENAME TO session_targets_v19;"
+        } else {
+            ""
+        };
+        let copy = if target_table_exists {
+            "INSERT INTO session_targets SELECT * FROM session_targets_v19;
+             DROP TABLE session_targets_v19;"
+        } else {
+            ""
+        };
+        connection.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             {rebuild}
+             CREATE TABLE session_targets (
+                 session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                 kind TEXT NOT NULL CHECK(kind IN ('local-bare','local-podman','local-docker','apple-container','aws-ec2','ssh-bare','ssh-podman')),
+                 host TEXT,
+                 resource_id TEXT,
+                 address TEXT,
+                 workspace BLOB,
+                 worker_id TEXT,
+                 CHECK(
+                     (kind = 'local-bare' AND workspace IS NOT NULL
+                      AND host IS NULL AND resource_id IS NULL AND address IS NULL AND worker_id IS NULL)
+                  OR (kind IN ('local-podman','local-docker','apple-container') AND resource_id IS NOT NULL
+                      AND host IS NULL AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
+                  OR (kind = 'aws-ec2' AND resource_id IS NOT NULL
+                      AND host IS NULL AND workspace IS NULL AND worker_id IS NULL)
+                  OR (kind = 'ssh-bare' AND host IS NOT NULL AND workspace IS NOT NULL
+                      AND resource_id IS NULL AND address IS NULL)
+                  OR (kind = 'ssh-podman' AND host IS NOT NULL AND resource_id IS NOT NULL
+                      AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
+                 )
+             ) STRICT;
+             {copy}
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (20, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 20;
+             COMMIT;"
+        ))?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)

@@ -578,6 +578,7 @@ impl Controller {
 
         let workspace_root = match backend {
             hel_targets::TargetLocator::LocalPodman { .. }
+            | hel_targets::TargetLocator::LocalDocker { .. }
             | hel_targets::TargetLocator::AppleContainer { .. }
             | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_owned(),
             hel_targets::TargetLocator::AwsEc2 { workspace, .. }
@@ -1028,6 +1029,9 @@ fn provisioned_locator(
         // nothing that a failure could leak.
         hel_targets::TargetTemplate::LocalBare => return None,
         hel_targets::TargetTemplate::LocalPodman(_) => hel_targets::TargetLocator::LocalPodman {
+            container_id: container_id()?,
+        },
+        hel_targets::TargetTemplate::LocalDocker(_) => hel_targets::TargetLocator::LocalDocker {
             container_id: container_id()?,
         },
         hel_targets::TargetTemplate::AppleContainer(_) => {
@@ -1538,7 +1542,8 @@ fn supervise_broker_restarts(
     }
 }
 
-/// Attach read-only whatever Podman's `:O` overlay cannot hold, and say so.
+/// Attach read-only whatever the selected container overlay cannot hold, and
+/// say so.
 ///
 /// The filesystem is probed on the host that runs the container, because that
 /// is where the overlay would be built. A probe that cannot answer leaves the
@@ -1553,7 +1558,8 @@ pub(super) fn enforce_overlay_capable_mounts(
     executor: &impl CommandExecutor,
 ) -> Vec<String> {
     let ssh = match target {
-        hel_targets::TargetTemplate::LocalPodman(_) => None,
+        hel_targets::TargetTemplate::LocalPodman(_)
+        | hel_targets::TargetTemplate::LocalDocker(_) => None,
         hel_targets::TargetTemplate::SshPodman { ssh, .. } => Some(ssh),
         _ => return Vec::new(),
     };

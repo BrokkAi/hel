@@ -98,6 +98,13 @@ impl ChatState {
         true
     }
 
+    #[cfg(test)]
+    pub(super) fn lists_command(&self, name: &str) -> bool {
+        self.command_choices
+            .iter()
+            .any(|command| command.name == name)
+    }
+
     pub(super) fn update_autocomplete(&mut self) {
         if self.history_search.is_some() || self.input_cursor != self.input.len() {
             self.autocomplete = None;

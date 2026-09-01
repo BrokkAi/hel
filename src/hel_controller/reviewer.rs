@@ -272,11 +272,13 @@ fn upload_reviewer_profile(
             }
         }
         hel_targets::TargetLocator::LocalPodman { container_id }
+        | hel_targets::TargetLocator::LocalDocker { container_id }
         | hel_targets::TargetLocator::AppleContainer { container_id } => {
-            let engine = if matches!(locator, hel_targets::TargetLocator::LocalPodman { .. }) {
-                "podman"
-            } else {
-                "container"
+            let engine = match locator {
+                hel_targets::TargetLocator::LocalPodman { .. } => "podman",
+                hel_targets::TargetLocator::LocalDocker { .. } => "docker",
+                hel_targets::TargetLocator::AppleContainer { .. } => "container",
+                _ => unreachable!("matched local container target"),
             };
             for arguments in [
                 vec![
@@ -551,44 +553,57 @@ mod tests {
     }
 
     #[test]
-    fn a_container_target_stages_the_reviewer_inside_its_worker_root() {
+    fn local_container_targets_stage_the_reviewer_through_their_engine() {
         let directory = tempfile::tempdir().unwrap();
-        let (controller, session_id) = fixture(
-            directory.path(),
-            crate::hel_state::TargetLocator::LocalPodman {
-                container_id: crate::hel_targets::resource_name(SESSION_ID).unwrap(),
-            },
-        );
-        let executor = RecordingExecutor::new();
+        let container_id = crate::hel_targets::resource_name(SESSION_ID).unwrap();
+        for (locator, engine) in [
+            (
+                crate::hel_state::TargetLocator::LocalPodman {
+                    container_id: container_id.clone(),
+                },
+                "podman",
+            ),
+            (
+                crate::hel_state::TargetLocator::LocalDocker {
+                    container_id: container_id.clone(),
+                },
+                "docker",
+            ),
+        ] {
+            let (controller, session_id) = fixture(directory.path(), locator);
+            let executor = RecordingExecutor::new();
 
-        controller
-            .stage_reviewer_profile_controlled(&session_id, "codex", 3, &[], &executor)
-            .unwrap();
+            controller
+                .stage_reviewer_profile_controlled(&session_id, "codex", 3, &[], &executor)
+                .unwrap();
 
-        let script = executor.script();
-        assert!(
-            script.iter().all(|line| line.starts_with("podman ")),
-            "a container target is reached only through its engine: {script:?}"
-        );
-        let home = script
-            .iter()
-            .find_map(|line| {
-                line.split(' ')
-                    .find(|word| word.contains("/reviewer/profile"))
-            })
-            .expect("the reviewer profile is placed")
-            .to_owned();
-        assert!(
-            home.contains(&format!("/{session_id}")),
-            "the reviewer lives under this session's worker root: {home}"
-        );
-        // Nothing here provisions a target, a checkout, or another session.
-        assert!(
-            !script.iter().any(|line| {
-                line.contains("run") || line.contains("git") || line.contains("create")
-            }),
-            "staging a reviewer provisions nothing: {script:?}"
-        );
+            let script = executor.script();
+            assert!(
+                script
+                    .iter()
+                    .all(|line| line.starts_with(&format!("{engine} "))),
+                "a container target is reached only through its engine: {script:?}"
+            );
+            let home = script
+                .iter()
+                .find_map(|line| {
+                    line.split(' ')
+                        .find(|word| word.contains("/reviewer/profile"))
+                })
+                .expect("the reviewer profile is placed")
+                .to_owned();
+            assert!(
+                home.contains(&format!("/{session_id}")),
+                "the reviewer lives under this session's worker root: {home}"
+            );
+            // Nothing here provisions a target, a checkout, or another session.
+            assert!(
+                !script.iter().any(|line| {
+                    line.contains("run") || line.contains("git") || line.contains("create")
+                }),
+                "staging a reviewer provisions nothing: {script:?}"
+            );
+        }
     }
 
     #[test]
