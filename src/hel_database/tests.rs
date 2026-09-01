@@ -52,6 +52,31 @@ fn a_bounded_prompt_search_reports_that_it_stopped_early() {
     assert!(!all.truncated, "a complete answer reported itself partial");
 }
 
+/// The eviction the daemon performs depends on the typed cause reaching the
+/// refresher through `Controller::load`, which is three `anyhow` hops away.
+/// Nothing plumbs it; this pins that nothing has to.
+#[test]
+fn store_schema_mismatch_survives_the_controller_load_error_chain() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    drop(schema::open_writer(&database).unwrap());
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+        .unwrap();
+    drop(connection);
+    forget_verified_schema(&database);
+
+    let error = load_state_from(&database).unwrap_err();
+
+    let mismatch = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+        .expect("the mismatch survives every hop to the caller");
+    assert_eq!(mismatch.found, SCHEMA_VERSION + 1);
+    assert_eq!(mismatch.supported, SCHEMA_VERSION);
+}
+
 #[test]
 fn database_writer_orders_jobs_and_survives_an_operation_error() {
     let directory = tempfile::tempdir().unwrap();

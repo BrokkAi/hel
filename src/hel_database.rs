@@ -42,6 +42,39 @@ impl std::fmt::Display for ProjectionIntegrityError {
 
 impl std::error::Error for ProjectionIntegrityError {}
 
+/// A store whose schema is not the one this build supports.
+///
+/// Carried as a typed cause rather than a message so the daemon can tell a
+/// store that moved underneath it from a transport failure. It survives every
+/// `anyhow` hop to the caller, which finds it with `error.chain()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreSchemaMismatch {
+    pub found: i64,
+    pub supported: i64,
+}
+
+impl std::fmt::Display for StoreSchemaMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { found, supported } = self;
+        // Direction decides the advice. A store ahead of this build cannot be
+        // migrated by starting a daemon of this build -- that is what the old
+        // single message told the user to do, for an hour.
+        if found > supported {
+            write!(
+                formatter,
+                "Hel database schema {found} is newer than this Hel build supports ({supported}); upgrade Hel"
+            )
+        } else {
+            write!(
+                formatter,
+                "Hel database schema {found} is not the supported schema {supported}; start the Hel daemon to migrate it"
+            )
+        }
+    }
+}
+
+impl std::error::Error for StoreSchemaMismatch {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
     Project,

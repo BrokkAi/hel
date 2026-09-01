@@ -55,10 +55,13 @@ fn open_reader_strict(path: &Path) -> Result<Connection> {
          PRAGMA query_only = ON;",
     )?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    ensure!(
-        version == SCHEMA_VERSION,
-        "Hel database schema {version} is not the supported schema {SCHEMA_VERSION}; start the Hel daemon to migrate it"
-    );
+    if version != SCHEMA_VERSION {
+        return Err(StoreSchemaMismatch {
+            found: version,
+            supported: SCHEMA_VERSION,
+        }
+        .into());
+    }
     Ok(connection)
 }
 
@@ -122,7 +125,11 @@ pub(super) fn forget_verified_schema(path: &Path) {
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
-        bail!("Hel database schema {version} is newer than supported schema {SCHEMA_VERSION}");
+        return Err(StoreSchemaMismatch {
+            found: version,
+            supported: SCHEMA_VERSION,
+        }
+        .into());
     }
     if version == 0 {
         connection.execute_batch(
@@ -1120,6 +1127,65 @@ fn ensure_projection_digest_column(connection: &Connection) -> Result<()> {
 #[cfg(test)]
 mod reader_tests {
     use super::*;
+
+    /// Rewrites a store's recorded schema version the way another build's
+    /// migration ladder would, and forgets that this process verified it.
+    fn stamp_schema_version(path: &Path, version: i64) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {version};"))
+            .unwrap();
+        drop(connection);
+        forget_verified_schema(path);
+    }
+
+    /// A store ahead of this build cannot be fixed by starting a daemon of
+    /// this build, so the reader must not say so. This is the message the
+    /// incident in #24 printed twice a second for an hour.
+    #[test]
+    fn strict_reader_reports_a_newer_store_without_blaming_the_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hel.sqlite3");
+        drop(open_writer(&path).unwrap());
+        stamp_schema_version(&path, SCHEMA_VERSION + 1);
+
+        let error = open_reader_strict(&path).unwrap_err();
+
+        let mismatch = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+            .expect("the reader reports the mismatch as a typed cause");
+        assert_eq!(mismatch.found, SCHEMA_VERSION + 1);
+        assert_eq!(mismatch.supported, SCHEMA_VERSION);
+        let message = mismatch.to_string();
+        assert!(message.contains("upgrade Hel"), "got {message}");
+        assert!(!message.contains("start the Hel daemon"), "got {message}");
+    }
+
+    /// A store behind this build keeps the advice that works, verbatim, so
+    /// existing log greps and runbooks keep matching.
+    #[test]
+    fn strict_reader_keeps_the_migrate_advice_when_the_store_is_behind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hel.sqlite3");
+        drop(open_writer(&path).unwrap());
+        stamp_schema_version(&path, SCHEMA_VERSION - 1);
+
+        let error = open_reader_strict(&path).unwrap_err();
+
+        let mismatch = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+            .expect("the reader reports the mismatch as a typed cause");
+        assert_eq!(
+            mismatch.to_string(),
+            format!(
+                "Hel database schema {} is not the supported schema {SCHEMA_VERSION}; \
+                 start the Hel daemon to migrate it",
+                SCHEMA_VERSION - 1
+            )
+        );
+    }
 
     #[test]
     fn strict_reader_rejects_mutation() {
