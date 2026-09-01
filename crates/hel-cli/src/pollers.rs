@@ -802,8 +802,22 @@ fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget
 /// by a live target. A recoverable error stays visible so the user can resume
 /// its checkpoint, but its failed target must not keep reconnecting or being
 /// sampled.
+///
+/// `Provisioning` is excluded for the same reason `credential_sync_targets`
+/// excludes it, and for a sharper one: a session gets its `target` as soon as
+/// the target itself exists, which is *before* its worker binary has been
+/// copied into place. Polling that window means running `execve` on a file
+/// `cp` still holds open for writing, which fails with `ETXTBSY` and leaves
+/// the session recorded as unreachable. Provisioning connects to its own
+/// worker when it is ready and then marks the session `Running`, which is when
+/// there is something here to poll.
 pub(crate) fn session_target_is_pollable(session: &hel::hel_state::SessionRecord) -> bool {
-    session.state.is_active() && session.state != SessionState::Error && session.target.is_some()
+    session.state.is_active()
+        && !matches!(
+            session.state,
+            SessionState::Error | SessionState::Provisioning
+        )
+        && session.target.is_some()
 }
 
 pub(crate) fn refresh_dashboard_poll_targets(
@@ -1991,9 +2005,35 @@ mod tests {
         assert!(dashboard_resource_targets(&recoverable_error).is_empty());
     }
 
+    /// A session gets its `target` as soon as the target exists, which is
+    /// before its worker binary has finished being copied into place. Polling
+    /// that window runs `execve` on a file `cp` still holds open for writing:
+    /// `ETXTBSY`, and a session recorded as unreachable while it was merely
+    /// still being built.
+    #[test]
+    fn a_provisioning_session_is_not_polled_before_its_worker_exists() {
+        let provisioning = podman_controller(SessionState::Provisioning);
+        assert!(
+            provisioning
+                .state
+                .sessions
+                .values()
+                .all(|session| session.target.is_some())
+        );
+
+        assert!(dashboard_worker_targets(&provisioning).is_empty());
+        assert!(dashboard_resource_targets(&provisioning).is_empty());
+
+        // Provisioning connects to its own worker and then marks the session
+        // running, which is when there is something to poll.
+        let running = podman_controller(SessionState::Running);
+        assert_eq!(dashboard_worker_targets(&running).len(), 1);
+        assert_eq!(dashboard_resource_targets(&running).len(), 1);
+    }
+
     #[test]
     fn lifecycle_owned_session_stays_out_of_worker_targets() {
-        let controller = podman_controller(SessionState::Provisioning);
+        let controller = podman_controller(SessionState::Running);
         assert_eq!(dashboard_worker_targets(&controller).len(), 1);
 
         let excluded = controller
