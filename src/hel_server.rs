@@ -37,7 +37,7 @@ use crate::hel_config::{HelConfig, TargetTemplate, validate_id};
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse, MAX_ELICITATION_BYTES};
 use crate::hel_state::{HelState, SessionState};
 
-const COOKIE_NAME: &str = "hel_viewer_session";
+pub const COOKIE_NAME: &str = "hel_viewer_session";
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const EPHEMERAL_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BODY_BYTES: usize = 128 * 1024;
@@ -2051,6 +2051,21 @@ fn session_cookie_valid(key: &[u8], value: &str, now: u64) -> bool {
     cookie_viewer(key, value, now).is_some()
 }
 
+/// Mint a signed viewer-session cookie value without the HTTP login flow.
+///
+/// The desktop shell pre-authorizes its WebView with this: it runs as the same
+/// user as the daemon and reads the same persisted signing key, so possession
+/// of the key is the credential. The cookie carries the ephemeral TTL — a
+/// desktop window re-mints on every launch, so it never needs a long life.
+pub fn mint_desktop_session_cookie(key: &[u8]) -> AnyResult<String> {
+    let viewer = generate_viewer_id()?;
+    Ok(signed_cookie_value(
+        key,
+        &viewer,
+        now_unix().saturating_add(EPHEMERAL_SESSION_TTL.as_secs()),
+    ))
+}
+
 /// The viewer a cookie names, or `None` when the cookie is not valid.
 ///
 /// A legacy two-part cookie validates and names no viewer, which is the
@@ -2341,6 +2356,18 @@ mod tests {
         ProjectRepository,
     };
     use crate::hel_state::{STATE_VERSION, SessionRecord};
+
+    #[test]
+    fn minted_desktop_cookie_validates_and_names_a_viewer() {
+        let key = vec![7u8; COOKIE_KEY_BYTES];
+        let value = mint_desktop_session_cookie(&key).unwrap();
+        let viewer = cookie_viewer(&key, &value, now_unix());
+        assert!(
+            matches!(viewer, Some(Some(_))),
+            "minted cookie must validate and carry a viewer id: {value:?}"
+        );
+        assert!(!session_cookie_valid(&vec![8u8; COOKIE_KEY_BYTES], &value, now_unix()));
+    }
 
     fn sample_config_state() -> (HelConfig, HelState) {
         let config = HelConfig {

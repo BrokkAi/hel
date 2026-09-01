@@ -164,6 +164,37 @@ jobs:
         if-no-files-found: warn
         retention-days: 14
 
+  desktop-linux:
+    # The primary Linux jobs build for musl, where the desktop-app feature is
+    # deliberately inert, so this is the only pull-request compile-and-test
+    # gate for the Linux desktop shell path releases actually ship.
+    name: Desktop shell (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        components: clippy
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Install Linux desktop dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes libwebkit2gtk-4.1-dev
+
+    - name: Clippy over the desktop path
+      run: cargo clippy --locked -p brokk-mjolnir -p brokk-mj-desktop -- -D warnings
+
+    - name: Build the desktop crate
+      run: cargo check --locked -p brokk-mj-desktop
+
+    - name: Test the mj binary with the desktop feature active
+      run: cargo test --locked -p brokk-mjolnir --bin mj
+
   voice-worker:
     name: Voice worker (ubuntu-latest)
     runs-on: ubuntu-latest
