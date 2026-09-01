@@ -8,7 +8,7 @@
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="stylesheet" href="/viewer.css" />
-    <title>Hel</title>
+    <title>Mjolnir</title>
   </head>
   <body>
     <!-- Route-level announcements for a screen reader. One region, polite, so
@@ -21,7 +21,7 @@
 
     <header id="shell-header">
       <button id="back" class="icon-button hidden" aria-label="Back">&#8592;</button>
-      <h1 id="shell-title">HEL</h1>
+      <h1 id="shell-title">MJ</h1>
       <button
         id="menu-button"
         class="icon-button hidden"
@@ -31,7 +31,7 @@
       >
         &#9776;
       </button>
-      <nav id="menu" class="menu hidden" role="menu" aria-label="Hel">
+      <nav id="menu" class="menu hidden" role="menu" aria-label="Mjolnir">
         <button role="menuitem" data-route="targets">Targets</button>
         <button role="menuitem" data-route="quota">Quota</button>
         <button role="menuitem" id="logout">Sign out</button>
@@ -40,7 +40,7 @@
 
     <main id="login" class="card">
       <h2>Unlock viewer</h2>
-      <p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p>
+      <p class="dim">Enter the six-digit code shown by <code>mj daemon status</code>.</p>
       <form id="login-form" class="row">
         <input
           id="code"
@@ -110,6 +110,7 @@
           <div id="conversation-feed"></div>
         </div>
         <button id="jump-to-latest" class="jump-to-latest hidden">New messages ↓</button>
+        <div id="turn-review"></div>
         <div id="elicitations"></div>
         <details id="conversation-side" class="card">
           <summary>Queue and shells</summary>

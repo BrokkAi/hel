@@ -631,6 +631,7 @@ dependencies = [
  "ratatui",
  "rcgen",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sysinfo",

@@ -1474,7 +1474,22 @@ impl DurableRelay {
         self.append_relay_event(None, observation)
     }
 
-    pub fn record_session_update(&mut self, update: SessionUpdate) -> Result<u64> {
+    pub fn record_session_update(&mut self, mut update: SessionUpdate) -> Result<u64> {
+        // An ACP file edit arrives as the whole file before and the whole file
+        // after. Store the patch between them instead: nothing downstream
+        // reconstructs a file from those copies, and the patch is proportional
+        // to the edit rather than to the file. See `crate::hel_diff`.
+        match &mut update {
+            SessionUpdate::ToolCall(call) => {
+                crate::hel_diff::compact_tool_call_content(&mut call.content);
+            }
+            SessionUpdate::ToolCallUpdate(call) => {
+                if let Some(content) = call.fields.content.as_mut() {
+                    crate::hel_diff::compact_tool_call_content(content);
+                }
+            }
+            _ => {}
+        }
         self.record_observation(RelayObservation::SessionUpdate {
             update: Box::new(update),
         })

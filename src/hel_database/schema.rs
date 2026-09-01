@@ -8,7 +8,7 @@ pub fn database_path() -> PathBuf {
 pub(super) fn open_writer(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("create Hel data directory {}", parent.display()))?;
+            .with_context(|| format!("create Mjolnir data directory {}", parent.display()))?;
     }
     let connection = Connection::open(path)
         .with_context(|| format!("open Mjolnir database {}", path.display()))?;
@@ -55,10 +55,13 @@ fn open_reader_strict(path: &Path) -> Result<Connection> {
          PRAGMA query_only = ON;",
     )?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    ensure!(
-        version == SCHEMA_VERSION,
-        "Mjolnir database schema {version} is not the supported schema {SCHEMA_VERSION}; start the Mjolnir daemon to migrate it"
-    );
+    if version != SCHEMA_VERSION {
+        return Err(StoreSchemaMismatch {
+            found: version,
+            supported: SCHEMA_VERSION,
+        }
+        .into());
+    }
     Ok(connection)
 }
 
@@ -122,7 +125,11 @@ pub(super) fn forget_verified_schema(path: &Path) {
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
-        bail!("Mjolnir database schema {version} is newer than supported schema {SCHEMA_VERSION}");
+        return Err(StoreSchemaMismatch {
+            found: version,
+            supported: SCHEMA_VERSION,
+        }
+        .into());
     }
     if version == 0 {
         connection.execute_batch(
@@ -561,6 +568,21 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;"
         ))?;
     }
+    if version < 21 {
+        // Arming review moved into `[review]` in config.toml, which is where
+        // the rest of Mjolnir's durable global configuration lives and the only
+        // place a phone-only user could ever have set it. No data is
+        // migrated: a workspace-to-global mapping has no defensible merge
+        // rule, and the release note says to re-arm it in the config file.
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             DROP TABLE IF EXISTS turn_review_settings;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 21;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -928,7 +950,7 @@ fn migrate_grok_harness_kind(connection: &Connection) -> Result<()> {
 /// own display-only `archived` flag, which now means "hidden from the resume
 /// dialog". SQLite cannot narrow or widen a CHECK constraint in place, so this
 /// repeats the v9 table rebuild with the new state list and the new column.
-/// It also adds the hidden set for native sessions Hel only reads.
+/// It also adds the hidden set for native sessions Mjolnir only reads.
 fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
     connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
     let migration = connection.execute_batch(
@@ -1002,7 +1024,7 @@ fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Admit DeepSeek Harness in both stored sessions and Hel's native-session
+/// Admit DeepSeek Harness in both stored sessions and Mjolnir's native-session
 /// hidden set. SQLite requires rebuilding tables to widen CHECK constraints.
 fn migrate_deepseek_harness_kind(connection: &Connection) -> Result<()> {
     connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
@@ -1105,6 +1127,68 @@ fn ensure_projection_digest_column(connection: &Connection) -> Result<()> {
 #[cfg(test)]
 mod reader_tests {
     use super::*;
+
+    /// Rewrites a store's recorded schema version the way another build's
+    /// migration ladder would, and forgets that this process verified it.
+    fn stamp_schema_version(path: &Path, version: i64) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {version};"))
+            .unwrap();
+        drop(connection);
+        forget_verified_schema(path);
+    }
+
+    /// A store ahead of this build cannot be fixed by starting a daemon of
+    /// this build, so the reader must not say so. This is the message the
+    /// incident in #24 printed twice a second for an hour.
+    #[test]
+    fn strict_reader_reports_a_newer_store_without_blaming_the_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mj.sqlite3");
+        drop(open_writer(&path).unwrap());
+        stamp_schema_version(&path, SCHEMA_VERSION + 1);
+
+        let error = open_reader_strict(&path).unwrap_err();
+
+        let mismatch = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+            .expect("the reader reports the mismatch as a typed cause");
+        assert_eq!(mismatch.found, SCHEMA_VERSION + 1);
+        assert_eq!(mismatch.supported, SCHEMA_VERSION);
+        let message = mismatch.to_string();
+        assert!(message.contains("upgrade Mjolnir"), "got {message}");
+        assert!(
+            !message.contains("start the Mjolnir daemon"),
+            "got {message}"
+        );
+    }
+
+    /// A store behind this build keeps the advice that works, verbatim, so
+    /// existing log greps and runbooks keep matching.
+    #[test]
+    fn strict_reader_keeps_the_migrate_advice_when_the_store_is_behind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mj.sqlite3");
+        drop(open_writer(&path).unwrap());
+        stamp_schema_version(&path, SCHEMA_VERSION - 1);
+
+        let error = open_reader_strict(&path).unwrap_err();
+
+        let mismatch = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+            .expect("the reader reports the mismatch as a typed cause");
+        assert_eq!(
+            mismatch.to_string(),
+            format!(
+                "Mjolnir database schema {} is not the supported schema {SCHEMA_VERSION}; \
+                 start the Mjolnir daemon to migrate it",
+                SCHEMA_VERSION - 1
+            )
+        );
+    }
 
     #[test]
     fn strict_reader_rejects_mutation() {

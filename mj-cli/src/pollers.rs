@@ -1175,8 +1175,42 @@ pub(crate) struct RemoteDashboardWorkerPoller {
     pub(crate) control: SessionManagerControl,
     pub(crate) shutdown: SessionManagerShutdown,
     pub(crate) lifecycles: tokio::sync::watch::Receiver<Vec<daemon::RuntimeLifecycleView>>,
+    /// Reviews the daemon is running for this workspace's sessions.
+    pub(crate) reviews: tokio::sync::watch::Receiver<Vec<hel::hel_review::host::RuntimeReviewView>>,
     pub(crate) config: tokio::sync::watch::Receiver<hel::hel_config::HelConfig>,
     pub(crate) records: tokio::sync::watch::Receiver<Vec<SessionRecord>>,
+}
+
+/// What a session looked like the last time a view was published for it.
+///
+/// The poller compares this before reading anything, so a session that has not
+/// moved costs one comparison rather than a full transcript load. Nothing here
+/// grows with the transcript: the projection is identified by its ordinal and
+/// digest, and the operational state is bounded by the relay's own command and
+/// configuration surface.
+#[derive(Debug, Clone, PartialEq)]
+struct PublishedView {
+    projection_ordinal: u64,
+    projection_digest: String,
+    operational: Option<hel::hel_worker::RelayOperationalState>,
+    connected: bool,
+    error: Option<String>,
+}
+
+impl PublishedView {
+    fn of(runtime: &crate::daemon::RuntimeSessionView) -> Self {
+        Self {
+            projection_ordinal: runtime.projection_ordinal,
+            projection_digest: runtime.projection_digest.clone(),
+            operational: runtime.operational.clone(),
+            connected: runtime.connected,
+            error: runtime.error.as_ref().map(|error| format!("{error:?}")),
+        }
+    }
+
+    fn matches(&self, runtime: &crate::daemon::RuntimeSessionView) -> bool {
+        *self == Self::of(runtime)
+    }
 }
 
 const PROJECTION_CONVERGENCE_RETRIES: u8 = 20;
@@ -1229,12 +1263,21 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         mut requests,
     } = channels;
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::watch::channel(Vec::new());
+    let (reviews_tx, reviews_rx) = tokio::sync::watch::channel(Vec::new());
     let (config_tx, config_rx) = tokio::sync::watch::channel(hel::hel_config::HelConfig::default());
     let (records_tx, records_rx) = tokio::sync::watch::channel(Vec::new());
     tokio::spawn(async move {
         let mut revision = 0_u64;
         let mut requests_open = true;
         let mut projection_convergence = ProjectionConvergence::default();
+        // What was last published for each session, so an unchanged session
+        // costs nothing. Without this every poll re-read and re-deserialised
+        // every live session's whole transcript to discover that none of it
+        // had moved, which made the cost of showing anything proportional to
+        // everything that had ever happened in the conversation. The stored
+        // value is bounded by the relay's operational state; the transcript
+        // itself is never held here.
+        let mut published = std::collections::BTreeMap::<String, PublishedView>::new();
         // One session's requests reach the daemon in the order they were made;
         // different sessions still overlap.
         let mut request_order = hel::hel_session_manager::SessionRequestOrder::new();
@@ -1269,9 +1312,20 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                 }
                             });
                             lifecycle_tx.send_replace(snapshot.lifecycles);
+                            reviews_tx.send_replace(snapshot.reviews);
                             for runtime in snapshot.sessions {
                                 let session_id = runtime.session_id.clone();
-                                let view = match runtime.operational {
+                                // Nothing about this session has moved, so
+                                // there is nothing to read and nothing to say.
+                                // Consumers hold the last view they were sent.
+                                if published
+                                    .get(&session_id)
+                                    .is_some_and(|last| last.matches(&runtime))
+                                {
+                                    continue;
+                                }
+                                let fingerprint = PublishedView::of(&runtime);
+                                let view = match runtime.operational.clone() {
                                     Some(operational) => {
                                         let loaded = tokio::task::spawn_blocking({
                                             let session_id = session_id.clone();
@@ -1355,6 +1409,14 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                         error: runtime.error,
                                     },
                                 };
+                                // Only a view that was actually built is
+                                // remembered: an error path must be retried on
+                                // the next poll rather than cached as current.
+                                if view.snapshot.is_some() {
+                                    published.insert(session_id.clone(), fingerprint);
+                                } else {
+                                    published.remove(&session_id);
+                                }
                                 if publisher.publish(session_id, view).await.is_err() {
                                     return;
                                 }
@@ -1383,6 +1445,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         control,
         shutdown,
         lifecycles: lifecycle_rx,
+        reviews: reviews_rx,
         config: config_rx,
         records: records_rx,
     })
@@ -1698,7 +1761,6 @@ pub(crate) enum LifecycleSuccess {
     Resumed {
         profile_id: String,
         target_id: String,
-        materialized: Box<MaterializedSession>,
     },
     Closed,
     ForceStopped,
@@ -1796,6 +1858,61 @@ pub(crate) fn reserve_recovery_or_cancel(
 
 #[cfg(test)]
 mod tests {
+
+    /// The poller used to re-read and re-deserialise every live session's whole
+    /// transcript on every runtime snapshot, then compare ordinals to discover
+    /// that nothing had moved. On a real session that is 28,066 rows and
+    /// 635 MiB, per poll. The comparison has to happen before the read.
+    #[test]
+    fn an_unchanged_session_is_recognised_without_reading_its_transcript() {
+        let runtime = runtime_view("session-1", 42, "digest-42");
+        let published = PublishedView::of(&runtime);
+
+        assert!(
+            published.matches(&runtime),
+            "an identical snapshot was treated as a change, so it would be re-read"
+        );
+
+        // Anything a viewer would notice has to defeat the skip.
+        let advanced = runtime_view("session-1", 43, "digest-43");
+        assert!(
+            !published.matches(&advanced),
+            "a moved projection was mistaken for an unchanged one"
+        );
+
+        // A digest change at the same ordinal is a rewritten projection, not a
+        // quiet one: the convergence path exists precisely for this.
+        let rewritten = runtime_view("session-1", 42, "digest-other");
+        assert!(
+            !published.matches(&rewritten),
+            "a rewritten projection at the same ordinal was skipped"
+        );
+
+        // The transcript can stand still while the agent starts a turn, and a
+        // viewer has to see that.
+        let mut busy = runtime_view("session-1", 42, "digest-42");
+        busy.connected = false;
+        assert!(
+            !published.matches(&busy),
+            "a disconnect was skipped as unchanged"
+        );
+    }
+
+    fn runtime_view(
+        session_id: &str,
+        projection_ordinal: u64,
+        projection_digest: &str,
+    ) -> crate::daemon::RuntimeSessionView {
+        crate::daemon::RuntimeSessionView {
+            session_id: session_id.to_owned(),
+            projection_ordinal,
+            projection_digest: projection_digest.to_owned(),
+            operational: None,
+            latest_credential_sync_signal: None,
+            connected: true,
+            error: None,
+        }
+    }
     use super::*;
 
     fn podman_controller(state: SessionState) -> Controller {

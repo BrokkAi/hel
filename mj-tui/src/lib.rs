@@ -8,6 +8,7 @@
 //! It deliberately has no provisioning or persistence side effects. Input is
 //! reduced to [`DashboardAction`] values for the controller to run.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -53,10 +54,6 @@ pub use crate::ingest::{
 };
 pub use crate::resume::resume_profile_placeholders;
 
-/// How many live sessions the compact Sessions list shows in full before it
-/// narrows to the current project and counts the rest.
-pub(crate) const COMPACT_SESSION_LIMIT: usize = 5;
-
 /// One drawn row of the Sessions pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionsRow {
@@ -69,8 +66,6 @@ pub(crate) enum SessionsRow {
     /// A live session, by index into `ordered_sessions()`. `expanded` picks
     /// the four-row form over the one-line form.
     Session { index: usize, expanded: bool },
-    /// The live sessions the compact list left out.
-    Others { active: usize, idle: usize },
 }
 
 /// Sessions, targets, and quotas. Sessions that are not live live in
@@ -399,6 +394,12 @@ pub struct DashboardState {
     /// pane shows different row sets in its compact and focused modes, so a
     /// position would silently point at a different session when focus moves.
     pub(crate) selected_session_id: Option<String>,
+    /// Persisted scroll offsets for the three list panes, so each scrolls only
+    /// far enough to keep its selection visible instead of jumping back to the
+    /// top every frame. Written by the renderer after it lets the table settle.
+    pub(crate) sessions_scroll: Cell<usize>,
+    pub(crate) targets_scroll: Cell<usize>,
+    pub(crate) quota_scroll: Cell<usize>,
     pub(crate) capacity_index: usize,
     pub(crate) quota_index: usize,
     pub(crate) focus: Focus,
@@ -438,7 +439,8 @@ pub struct DashboardState {
     last_row_click: Option<(Focus, usize, Instant)>,
     pub(crate) mode: Mode,
     pub(crate) notices: Notices,
-    pub(crate) greeting: String,
+    /// The workspace name, shown at the right of the Sessions title bar.
+    pub(crate) workspace_name: String,
 }
 
 impl DashboardState {
@@ -456,6 +458,9 @@ impl DashboardState {
             session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
             selected_session_id: None,
+            sessions_scroll: Cell::new(0),
+            targets_scroll: Cell::new(0),
+            quota_scroll: Cell::new(0),
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Sessions,
@@ -474,7 +479,7 @@ impl DashboardState {
             last_row_click: None,
             mode: Mode::Dashboard,
             notices: Notices::default(),
-            greeting: "Welcome to Mjolnir".into(),
+            workspace_name: String::new(),
         };
         dashboard.session_details = dashboard
             .state
@@ -1066,78 +1071,19 @@ impl DashboardState {
             .collect()
     }
 
-    /// The project the compact list belongs to: the conversation on screen,
-    /// falling back to whatever the pane has selected, and then to the first
-    /// live session.
+    /// The rows the Sessions pane draws, the same for every pane-dial
+    /// position: a heading per project and one row per live session.
     ///
-    /// The last fallback matters. Without it a workspace with more than
-    /// [`COMPACT_SESSION_LIMIT`] live sessions and no conversation open would
-    /// exclude every session, leaving nothing selectable, which would in turn
-    /// keep the selection empty: a pane showing only a count of sessions it
-    /// refuses to list.
-    pub(crate) fn current_project_key(&self) -> Option<String> {
-        self.current_session_id
-            .as_deref()
-            .and_then(|id| self.state.sessions.get(id))
-            .filter(|session| session.state.is_active())
-            .or_else(|| self.selected_session())
-            .map(|session| self.project_source(session).key)
-            .or_else(|| self.project_keys().into_iter().next())
-    }
-
-    /// The rows the Sessions pane draws.
-    ///
-    /// The pane has two forms, and which one it takes follows the pane dial
-    /// rather than focus. Until the dial reaches its last position it is the
-    /// full list: every project, with a heading and four rows per expanded
-    /// session. At that position it is a one-line-per-session summary — and
-    /// once more than [`COMPACT_SESSION_LIMIT`] sessions are live it narrows
-    /// to the current project and counts the rest, because a list longer than
-    /// that stops being glanceable and starts eating the transcript.
-    ///
-    /// Keying this on the dial rather than on focus is what keeps the two
-    /// collapsed positions distinguishable whatever has the keyboard, and it
-    /// stops the pane changing shape underneath a Tab.
+    /// What differs between positions is how the renderer *draws* those rows —
+    /// four lines per session when expanded, one line when the support panes
+    /// are collapsed, and a compact three-column grid when minimized — not
+    /// which sessions appear. Keying the shape on the dial in the renderer
+    /// rather than on focus here keeps the collapsed positions distinguishable
+    /// whatever has the keyboard, and stops the pane changing shape underneath
+    /// a Tab.
     pub(crate) fn sessions_rows(&self) -> Vec<SessionsRow> {
         let sessions = self.ordered_sessions();
-        if !self.layout.sessions_compact() {
-            return self.expanded_sessions_rows(&sessions);
-        }
-        if sessions.len() <= COMPACT_SESSION_LIMIT {
-            return (0..sessions.len())
-                .map(|index| SessionsRow::Session {
-                    index,
-                    expanded: false,
-                })
-                .collect();
-        }
-        let current = self.current_project_key();
-        let mut rows = Vec::new();
-        let mut active = 0;
-        let mut idle = 0;
-        for (index, session) in sessions.iter().enumerate() {
-            if current
-                .as_ref()
-                .is_some_and(|key| *key == self.project_source(session).key)
-            {
-                rows.push(SessionsRow::Session {
-                    index,
-                    expanded: false,
-                });
-            } else if self
-                .session_details
-                .get(&session.id)
-                .is_some_and(|detail| detail.current_turn_started_at.is_some())
-            {
-                active += 1;
-            } else {
-                idle += 1;
-            }
-        }
-        if active + idle > 0 {
-            rows.push(SessionsRow::Others { active, idle });
-        }
-        rows
+        self.expanded_sessions_rows(&sessions)
     }
 
     fn expanded_sessions_rows(&self, sessions: &[&SessionRecord]) -> Vec<SessionsRow> {
@@ -1814,106 +1760,39 @@ mod tests {
             .collect()
     }
 
-    fn others_row(dashboard: &DashboardState) -> Option<(usize, usize)> {
-        dashboard
-            .sessions_rows()
-            .into_iter()
-            .find_map(|row| match row {
-                SessionsRow::Others { active, idle } => Some((active, idle)),
-                _ => None,
-            })
-    }
-
-    /// A short list is worth showing in full whatever project each session
-    /// belongs to; that is what makes the compact pane a glance rather than a
-    /// navigation step.
+    /// Every pane-dial position lists every session across every project, so
+    /// the minimized grid can show them all and navigation can reach them all.
+    /// The old compact list narrowed to the current project past a threshold;
+    /// that special casing is gone.
     #[test]
-    fn the_compact_list_shows_every_project_up_to_five_sessions() {
-        for count in [0, 1, 5] {
-            let mut dashboard = dashboard_with_live_sessions(count, 2);
-            dashboard.layout = PaneLayout::Minimal;
+    fn every_pane_position_lists_every_session_across_projects() {
+        for layout in [
+            PaneLayout::Expanded,
+            PaneLayout::SupportCollapsed,
+            PaneLayout::Minimal,
+        ] {
+            let mut dashboard = dashboard_with_live_sessions(6, 2);
+            dashboard.layout = layout;
+            dashboard.set_current_session(Some("session-0"));
+
             assert_eq!(
                 session_row_indices(&dashboard),
-                (0..count).collect::<Vec<_>>(),
-                "{count} live sessions"
+                [0, 1, 2, 3, 4, 5],
+                "{layout:?}"
             );
-            assert_eq!(others_row(&dashboard), None, "{count} live sessions");
+            assert_eq!(
+                dashboard.visible_session_indices(),
+                [0, 1, 2, 3, 4, 5],
+                "{layout:?}"
+            );
+            // Three projects, each with a heading.
+            let headings = dashboard
+                .sessions_rows()
+                .into_iter()
+                .filter(|row| matches!(row, SessionsRow::ProjectHeading { .. }))
+                .count();
+            assert_eq!(headings, 3, "{layout:?}");
         }
-    }
-
-    /// Past the threshold the list narrows to the project the conversation
-    /// belongs to and counts the rest, so it stays one glance instead of
-    /// growing without limit.
-    #[test]
-    fn beyond_five_sessions_the_compact_list_narrows_and_counts_the_rest() {
-        // Six sessions, two per project: the current project keeps two rows
-        // and the other four are counted.
-        let mut dashboard = dashboard_with_live_sessions(6, 2);
-        dashboard.layout = PaneLayout::Minimal;
-        dashboard.set_current_session(Some("session-0"));
-        // One of the four excluded sessions has a turn running.
-        apply_materialized_transcript_for(
-            &mut dashboard,
-            "session-3",
-            vec![agent_message(1, "still working")],
-        );
-
-        assert_eq!(session_row_indices(&dashboard), [0, 1]);
-        assert_eq!(others_row(&dashboard), Some((1, 3)));
-        // The counted sessions are not selectable, so navigation cannot land
-        // on a row that is not on screen.
-        assert_eq!(dashboard.visible_session_indices(), [0, 1]);
-    }
-
-    /// A long list with no conversation open still lists a project. Showing
-    /// only a count of sessions the pane will not list is not a state worth
-    /// having, and it would trap the selection empty.
-    #[test]
-    fn the_compact_list_always_shows_at_least_one_project() {
-        let mut dashboard = dashboard_with_live_sessions(6, 2);
-        dashboard.layout = PaneLayout::Minimal;
-        dashboard.set_current_session(None);
-        dashboard.selected_session_id = None;
-
-        assert_eq!(session_row_indices(&dashboard), [0, 1]);
-        assert_eq!(others_row(&dashboard), Some((0, 4)));
-    }
-
-    #[test]
-    fn the_others_count_follows_the_conversation_on_screen() {
-        let mut dashboard = dashboard_with_live_sessions(6, 3);
-        dashboard.layout = PaneLayout::Minimal;
-
-        dashboard.set_current_session(Some("session-0"));
-        assert_eq!(session_row_indices(&dashboard), [0, 1, 2]);
-        assert_eq!(others_row(&dashboard), Some((0, 3)));
-
-        dashboard.set_current_session(Some("session-5"));
-        assert_eq!(session_row_indices(&dashboard), [3, 4, 5]);
-        assert_eq!(others_row(&dashboard), Some((0, 3)));
-    }
-
-    /// The threshold is about keeping an unfocused pane small. Once the pane
-    /// has the keyboard it is the list the user is working in, so it shows
-    /// everything.
-    #[test]
-    fn the_focused_list_ignores_the_five_session_threshold() {
-        let mut dashboard = dashboard_with_live_sessions(6, 2);
-        dashboard.focus_sessions();
-        dashboard.set_current_session(Some("session-0"));
-
-        assert_eq!(session_row_indices(&dashboard), [0, 1, 2, 3, 4, 5]);
-        assert_eq!(others_row(&dashboard), None);
-        // Three projects, each with a heading and a toggle number.
-        let headings = dashboard
-            .sessions_rows()
-            .into_iter()
-            .filter_map(|row| match row {
-                SessionsRow::ProjectHeading { number, .. } => Some(number),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(headings, [Some(1), Some(2), Some(3)]);
     }
 
     #[test]

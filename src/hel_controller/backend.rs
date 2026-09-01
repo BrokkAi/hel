@@ -1296,6 +1296,7 @@ mod tests {
             version: crate::hel_config::CONFIG_VERSION,
             newer_config_version: None,
             phone: Default::default(),
+            review: Default::default(),
             profiles: BTreeMap::new(),
             bundles: BTreeMap::new(),
             targets: BTreeMap::from([

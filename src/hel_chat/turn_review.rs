@@ -7,22 +7,26 @@
 //! a critique. Turn review starts when a turn *finishes* and ends by forwarding
 //! validated findings, dismissing them, or cancelling.
 //!
-//! The view owns the screen while it is up, which is the whole point: review is
-//! synchronous, so findings can never land out of the blue in the middle of the
-//! next conversation. The rules of the review itself live in
-//! `crate::hel_review::driver`; this module is the keyboard, the pane, and the
-//! action bar.
+//! The review itself runs in the controller daemon
+//! (`crate::hel_review::host`), not here. This module is a projection of it:
+//! the terminal renders the [`RuntimeReviewView`] the daemon publishes and
+//! sends back resolutions, exactly as the phone does. That is why closing the
+//! terminal no longer ends a review, and why a session nobody is watching is
+//! reviewed too.
+//!
+//! The view still owns the screen while it is up, which is the point of a
+//! synchronous review: findings can never land out of the blue in the middle
+//! of the next conversation.
+
+use std::collections::BTreeMap;
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::hel_review::driver::{
-    Resolution, ReviewRequest, RoleState, TurnReviewDriver, TurnReviewPhase,
-};
-use crate::hel_review::verdict::ReviewVerdict;
-use crate::hel_second_opinion::{ReviewerSetup, SetupRequest};
+use crate::hel_review::driver::{Resolution, RoleState};
+use crate::hel_review::host::{RuntimeReviewView, VerdictKind};
 
 use super::second_opinion::ReviewerPane;
 
@@ -45,6 +49,15 @@ impl ReviewAction {
         }
     }
 
+    /// The resolution this action asks the daemon for.
+    const fn resolution(self) -> Resolution {
+        match self {
+            Self::Forward => Resolution::Forwarded,
+            Self::Dismiss => Resolution::Dismissed,
+            Self::Cancel => Resolution::Cancelled,
+        }
+    }
+
     fn next(self, delta: isize) -> Self {
         let position = Self::ORDER
             .iter()
@@ -60,22 +73,20 @@ impl ReviewAction {
     }
 }
 
-/// One turn review on screen.
+/// One turn review on screen: what the daemon published, plus where the
+/// reader is looking.
 pub(super) struct TurnReview {
-    pub(super) driver: TurnReviewDriver,
+    /// The daemon's latest word on this review. Replaced wholesale on every
+    /// snapshot, so nothing here can drift from what is actually running.
+    pub(super) view: RuntimeReviewView,
     /// One pane per reviewing role: the extended tier runs a supervisor, an
     /// intent analyst and several lanes at once, and each has its own journal.
-    panes: std::collections::BTreeMap<String, ReviewerPane>,
+    panes: BTreeMap<String, ReviewerPane>,
     /// Which role's transcript the pane is showing. Tab cycles it.
     selected: String,
     pub(super) action: ReviewAction,
-    /// The reviewer waterfall, while the user is choosing which harness
-    /// reviews. It is skipped whenever the workspace already remembers one.
-    pub(super) setup: Option<Box<ReviewerSetup>>,
-    /// The role whose launch is waiting for that choice.
-    pub(super) pending_role: Option<String>,
-    /// A failure to report in place, rather than in a dialog that would take
-    /// the review off screen with it.
+    /// A refusal from the daemon, shown in place rather than in a dialog that
+    /// would take the review off screen with it.
     pub(super) failure: Option<String>,
 }
 
@@ -83,30 +94,42 @@ impl std::fmt::Debug for TurnReview {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TurnReview")
-            .field("phase", self.driver.phase())
+            .field("phase", &self.view.phase)
             .field("action", &self.action)
-            .field("choosing_reviewer", &self.setup.is_some())
             .finish()
     }
 }
 
 impl TurnReview {
     #[must_use]
-    pub(super) fn new(driver: TurnReviewDriver) -> Self {
+    pub(super) fn new(view: RuntimeReviewView) -> Self {
         Self {
-            driver,
-            panes: std::collections::BTreeMap::new(),
-            selected: crate::hel_review::driver::REVIEWER_ROLE.to_string(),
+            selected: view
+                .roles
+                .first()
+                .map(|role| role.role.clone())
+                .unwrap_or_else(|| crate::hel_review::driver::REVIEWER_ROLE.to_owned()),
+            view,
+            panes: BTreeMap::new(),
             action: ReviewAction::Forward,
-            setup: None,
-            pending_role: None,
             failure: None,
         }
     }
 
+    /// Takes the daemon's newer view of the same review.
+    pub(super) fn update(&mut self, view: RuntimeReviewView) {
+        if !view.roles.iter().any(|role| role.role == self.selected)
+            && let Some(first) = view.roles.first()
+        {
+            // The reader was watching a role this review no longer lists.
+            self.selected = first.role.clone();
+        }
+        self.view = view;
+    }
+
     /// One role's pane, created on first use.
     pub(super) fn pane(&mut self, role: &str) -> &mut ReviewerPane {
-        self.panes.entry(role.to_string()).or_default()
+        self.panes.entry(role.to_owned()).or_default()
     }
 
     /// The pane on screen. A review that has not produced a transcript yet
@@ -124,16 +147,17 @@ impl TurnReview {
     /// Moves the transcript to the next role that has one, so a reader can
     /// follow a lane without losing the supervisor.
     pub(super) fn cycle_selection(&mut self) {
-        let roles = self.driver.active_roles();
-        if roles.is_empty() {
+        if self.view.roles.is_empty() {
             return;
         }
-        let next = roles
+        let next = self
+            .view
+            .roles
             .iter()
-            .position(|role| *role == self.selected)
-            .map(|position| (position + 1) % roles.len())
+            .position(|role| role.role == self.selected)
+            .map(|position| (position + 1) % self.view.roles.len())
             .unwrap_or(0);
-        self.selected = roles[next].clone();
+        self.selected = self.view.roles[next].role.clone();
     }
 
     /// Where a role's journal has been read to.
@@ -168,33 +192,41 @@ impl TurnReview {
         if let Some(failure) = &self.failure {
             return failure.clone();
         }
-        self.driver.status().to_string()
+        match self.verdict_kind() {
+            Some(VerdictKind::Findings | VerdictKind::Failed) => {
+                "Enter to act · Tab switches agent".to_owned()
+            }
+            _ => self.view.status.clone(),
+        }
+    }
+
+    #[must_use]
+    fn verdict_kind(&self) -> Option<VerdictKind> {
+        self.view.verdict.as_ref().map(|verdict| verdict.kind)
+    }
+
+    /// Whether an action is available, which the daemon decides and publishes.
+    #[must_use]
+    fn allows(&self, action: ReviewAction) -> bool {
+        self.view
+            .verdict
+            .as_ref()
+            .is_some_and(|verdict| verdict.allowed.contains(&action.resolution()))
     }
 
     pub(super) fn report_failure(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        match self.setup.as_mut() {
-            Some(setup) => setup.probe_failed_current(message),
-            None => self.failure = Some(message),
-        }
+        self.failure = Some(message.into());
     }
 }
 
-/// What the turn-review view asked the session to do.
-#[derive(Debug, Clone, PartialEq)]
+/// What the turn-review view asked the session to do. Every variant is a
+/// request to the daemon: the terminal hosts no part of a review.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnReviewIntent {
-    /// Reviewer waterfall steps, in order.
-    Setup(Vec<SetupRequest>),
-    /// The user chose a reviewer; start the waiting role under it.
-    Confirmed {
-        profile_id: String,
-        model: Option<String>,
-        effort: Option<String>,
-    },
-    /// Work the review state machine asked for, in order.
-    Requests(Vec<ReviewRequest>),
-    /// The view closed with nothing further to do.
-    Closed,
+    /// Review the turn that just finished.
+    Start,
+    /// Forward the findings, dismiss them, or cancel the review.
+    Resolve(Resolution),
 }
 
 impl super::ChatState {
@@ -206,9 +238,7 @@ impl super::ChatState {
 
     /// Whether the split is up, which is when the transcript shares the frame.
     pub(super) fn turn_review_split(&self) -> bool {
-        self.turn_review
-            .as_ref()
-            .is_some_and(|review| review.setup.is_none())
+        self.turn_review.is_some()
     }
 
     pub(super) fn turn_review(&self) -> Option<&TurnReview> {
@@ -219,32 +249,13 @@ impl super::ChatState {
         self.turn_review.as_deref_mut()
     }
 
-    /// Why a review cannot start right now, or `None` when it can.
-    ///
-    /// Every gate here keeps review synchronous and unsurprising. A review only
-    /// starts from an idle session with an empty prompt queue, so it can hold
-    /// the composer without stranding work the user has already sent, and never
-    /// while another review owns the screen.
-    pub(super) fn turn_review_blocker(&self) -> Option<&'static str> {
-        if self.phase != crate::hel_worker::WorkerPhase::Idle {
-            return Some("A review runs between turns; this one is still working");
+    /// Shows the daemon's review, or takes the pane down when it has resolved.
+    pub(super) fn set_turn_review(&mut self, view: Option<RuntimeReviewView>) {
+        match (view, self.turn_review.as_mut()) {
+            (Some(view), Some(open)) => open.update(view),
+            (Some(view), None) => self.turn_review = Some(Box::new(TurnReview::new(view))),
+            (None, _) => self.close_turn_review(),
         }
-        if self.turn_review_active() {
-            return Some("A review is already open");
-        }
-        if self.second_opinion_active() {
-            return Some("A second opinion is already open");
-        }
-        if self.has_queued_prompts() {
-            // Reviewing now would hold prompts the user has already sent. The
-            // review after the queue drains covers the whole batch instead.
-            return Some("Prompts are queued; the review waits for them");
-        }
-        None
-    }
-
-    pub(super) fn open_turn_review(&mut self, driver: TurnReviewDriver) {
-        self.turn_review = Some(Box::new(TurnReview::new(driver)));
     }
 
     pub(super) fn close_turn_review(&mut self) {
@@ -263,25 +274,6 @@ impl super::ChatState {
         let Some(review) = self.turn_review.as_mut() else {
             return super::ChatAction::None;
         };
-        if let Some(setup) = review.setup.as_mut() {
-            let outcome = match code {
-                KeyCode::Up => {
-                    setup.move_selection(-1);
-                    return super::ChatAction::None;
-                }
-                KeyCode::Down => {
-                    setup.move_selection(1);
-                    return super::ChatAction::None;
-                }
-                KeyCode::Enter => setup.confirm(),
-                KeyCode::Char('r') if setup.failure().is_some() => setup.retry(),
-                KeyCode::Left | KeyCode::Backspace => setup.back(),
-                KeyCode::Esc => setup.cancel(),
-                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => setup.cancel(),
-                _ => return super::ChatAction::None,
-            };
-            return self.apply_turn_review_setup_outcome(outcome);
-        }
         match code {
             // Tab moves between the reviewing agents; the arrows move between
             // the actions, so a fan-out stays readable without giving up the
@@ -311,86 +303,35 @@ impl super::ChatState {
             KeyCode::Enter => self.activate_turn_review_action(),
             // Escape cancels at every stage before the review resolves, which
             // is what keeps the composer one keypress away.
-            KeyCode::Esc => self.cancel_turn_review(),
+            KeyCode::Esc => self.resolve_turn_review(Resolution::Cancelled),
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.cancel_turn_review()
+                self.resolve_turn_review(Resolution::Cancelled)
             }
             _ => super::ChatAction::None,
         }
     }
 
-    fn apply_turn_review_setup_outcome(
-        &mut self,
-        outcome: crate::hel_second_opinion::SetupOutcome,
-    ) -> super::ChatAction {
-        use crate::hel_second_opinion::SetupOutcome;
-
-        match outcome {
-            SetupOutcome::None => super::ChatAction::None,
-            SetupOutcome::Requests(requests) => {
-                super::ChatAction::TurnReview(TurnReviewIntent::Setup(requests))
-            }
-            SetupOutcome::Confirmed { selection } => {
-                if let Some(review) = self.turn_review.as_mut() {
-                    review.setup = None;
-                }
-                super::ChatAction::TurnReview(TurnReviewIntent::Confirmed {
-                    profile_id: selection.profile_id,
-                    model: selection.model,
-                    effort: selection.effort,
-                })
-            }
-            // Abandoning the reviewer choice abandons the review, which leaves
-            // the baseline alone: the next review covers this turn too.
-            SetupOutcome::Cancelled { requests } => {
-                let mut steps = self
-                    .turn_review
-                    .as_mut()
-                    .map(|review| review.driver.cancel())
-                    .unwrap_or_default();
-                self.close_turn_review();
-                for request in requests {
-                    if let SetupRequest::CancelProbe { .. } = request {
-                        steps.push(ReviewRequest::PauseRole {
-                            role: crate::hel_review::driver::REVIEWER_ROLE.to_string(),
-                        });
-                    }
-                }
-                super::ChatAction::TurnReview(TurnReviewIntent::Requests(steps))
-            }
-        }
-    }
-
     fn activate_turn_review_action(&mut self) -> super::ChatAction {
-        let Some(review) = self.turn_review.as_mut() else {
+        let Some(review) = self.turn_review.as_ref() else {
             return super::ChatAction::None;
         };
         let action = review.action;
-        if action == ReviewAction::Forward && !review.driver.can_forward() {
-            // Forwarding stays unavailable until a findings verdict exists;
-            // pressing it early does nothing.
+        // Cancel is always available; the rest wait for the verdict the daemon
+        // publishes, so pressing one early does nothing.
+        if action != ReviewAction::Cancel && !review.allows(action) {
             return super::ChatAction::None;
         }
-        if action != ReviewAction::Cancel && review.driver.verdict().is_none() {
-            return super::ChatAction::None;
-        }
-        let requests = match action {
-            ReviewAction::Forward => review.driver.forward(),
-            ReviewAction::Dismiss => review.driver.dismiss(),
-            ReviewAction::Cancel => review.driver.cancel(),
-        };
-        if requests.is_empty() {
-            return super::ChatAction::None;
-        }
-        super::ChatAction::TurnReview(TurnReviewIntent::Requests(requests))
+        self.resolve_turn_review(action.resolution())
     }
 
-    fn cancel_turn_review(&mut self) -> super::ChatAction {
-        let Some(review) = self.turn_review.as_mut() else {
+    fn resolve_turn_review(&mut self, resolution: Resolution) -> super::ChatAction {
+        if self.turn_review.is_none() {
             return super::ChatAction::None;
-        };
-        let requests = review.driver.cancel();
-        super::ChatAction::TurnReview(TurnReviewIntent::Requests(requests))
+        }
+        // The pane stays up until the daemon says the review is gone: the
+        // terminal is a projection, and pretending otherwise would flash the
+        // composer back for a moment when the request fails.
+        super::ChatAction::TurnReview(TurnReviewIntent::Resolve(resolution))
     }
 
     /// Activates the review action under the pointer, if any.
@@ -432,13 +373,8 @@ pub(super) fn render_turn_review_actions(
     let mut spans = Vec::new();
     let mut buttons = Vec::new();
     let mut column = area.x;
-    let has_verdict = review.driver.verdict().is_some();
     for candidate in ReviewAction::ORDER {
-        let available = match candidate {
-            ReviewAction::Forward => review.driver.can_forward(),
-            ReviewAction::Dismiss => has_verdict,
-            ReviewAction::Cancel => true,
-        };
+        let available = candidate == ReviewAction::Cancel || review.allows(candidate);
         let mut style = Style::default();
         if !available {
             style = style.fg(Color::DarkGray);
@@ -470,12 +406,11 @@ pub(super) fn render_turn_review_actions(
 /// this review is running and where each has got to.
 #[must_use]
 pub(super) fn role_strip(review: &TurnReview) -> Option<Line<'static>> {
-    let roles = review.driver.roles();
-    if roles.is_empty() {
+    if review.view.roles.is_empty() {
         return None;
     }
     let mut spans = Vec::new();
-    for (index, role) in roles.iter().enumerate() {
+    for (index, role) in review.view.roles.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
         }
@@ -500,30 +435,13 @@ pub(super) fn role_strip(review: &TurnReview) -> Option<Line<'static>> {
     Some(Line::from(spans))
 }
 
-/// A one-line note for the primary transcript when a review closes itself.
-#[must_use]
-pub fn resolution_notice(phase: &TurnReviewPhase) -> Option<String> {
-    let TurnReviewPhase::Resolved(resolution) = phase else {
-        return None;
-    };
-    Some(match resolution {
-        Resolution::Forwarded => "Review findings sent to the agent".to_string(),
-        Resolution::Dismissed => "Review dismissed".to_string(),
-        Resolution::Cancelled => "Review cancelled".to_string(),
-        Resolution::NothingToReview => "Nothing to review: the turn changed no files".to_string(),
-        Resolution::CoverageStarted => {
-            "Review coverage starts here; the next completed turn is reviewed".to_string()
-        }
-    })
-}
-
 /// What the reviewer pane's title says while a verdict is up.
 #[must_use]
-pub(super) fn verdict_title(verdict: Option<&ReviewVerdict>) -> &'static str {
-    match verdict {
-        Some(ReviewVerdict::Clean) => " Turn review · clean ",
-        Some(ReviewVerdict::Findings { .. }) => " Turn review · findings ",
-        Some(ReviewVerdict::Failed { .. }) => " Turn review · failed ",
+pub(super) fn verdict_title(review: Option<&TurnReview>) -> &'static str {
+    match review.and_then(TurnReview::verdict_kind) {
+        Some(VerdictKind::Clean) => " Turn review · clean ",
+        Some(VerdictKind::Findings) => " Turn review · findings ",
+        Some(VerdictKind::Failed) => " Turn review · failed ",
         None => " Turn review ",
     }
 }
@@ -532,71 +450,62 @@ pub(super) fn verdict_title(verdict: Option<&ReviewVerdict>) -> &'static str {
 mod tests {
     use super::*;
     use crate::hel_chat::ChatAction;
-    use crate::hel_chat::test_support::{key, queued, snapshot};
-    use crate::hel_review::driver::{TurnReviewDriver, TurnReviewSeed};
-    use crate::hel_review::lanes::{ReviewTier, UserMessage};
-    use crate::hel_worker::WorkerPhase;
+    use crate::hel_chat::test_support::{key, snapshot};
+    use crate::hel_review::driver::{RoleStatus, TurnReviewPhase};
+    use crate::hel_review::host::VerdictView;
+    use crate::hel_review::lanes::ReviewTier;
     use crossterm::event::KeyCode;
 
     fn chat() -> super::super::ChatState {
         super::super::ChatState::new(&snapshot(), &[])
     }
 
-    fn driver() -> TurnReviewDriver {
-        TurnReviewDriver::start(TurnReviewSeed {
+    fn running_view() -> RuntimeReviewView {
+        RuntimeReviewView {
+            session_id: "1234567890".to_owned(),
             tier: ReviewTier::Quick,
-            task: "add a retry".to_string(),
-            user_messages: vec![UserMessage::prompt("add a retry")],
-            initial_result: "done".to_string(),
-            trajectory: String::new(),
-            baselines: Default::default(),
-            through_ordinal: 7,
-            prior_review: None,
-        })
-        .0
+            phase: TurnReviewPhase::Running {
+                roles: vec![RoleStatus {
+                    role: "reviewer".to_owned(),
+                    label: "General".to_owned(),
+                    state: RoleState::Running,
+                }],
+            },
+            roles: vec![RoleStatus {
+                role: "reviewer".to_owned(),
+                label: "General".to_owned(),
+                state: RoleState::Running,
+            }],
+            status: "the reviewer is reading the change…".to_owned(),
+            verdict: None,
+        }
     }
 
-    #[test]
-    fn turn_completion_with_queued_prompts_does_not_trigger_review() {
-        let mut chat = chat();
-        assert_eq!(
-            chat.turn_review_blocker(),
-            None,
-            "an idle session with an empty queue is reviewable"
-        );
-        chat.queued_prompts.push_back(queued("queued-1", "next"));
-        assert_eq!(
-            chat.turn_review_blocker(),
-            Some("Prompts are queued; the review waits for them"),
-            "holding the composer would strand a prompt the user already sent"
-        );
-    }
-
-    #[test]
-    fn a_busy_session_and_an_open_review_both_refuse_a_second_review() {
-        let mut chat = chat();
-        chat.phase = WorkerPhase::Running;
-        assert_eq!(
-            chat.turn_review_blocker(),
-            Some("A review runs between turns; this one is still working")
-        );
-        chat.phase = WorkerPhase::Idle;
-        chat.open_turn_review(driver());
-        assert_eq!(chat.turn_review_blocker(), Some("A review is already open"));
+    fn findings_view() -> RuntimeReviewView {
+        RuntimeReviewView {
+            verdict: Some(VerdictView {
+                kind: VerdictKind::Findings,
+                text: "[P1] src/lib.rs:1 -- unbounded retry".to_owned(),
+                allowed: vec![
+                    Resolution::Forwarded,
+                    Resolution::Dismissed,
+                    Resolution::Cancelled,
+                ],
+            }),
+            ..running_view()
+        }
     }
 
     #[test]
     fn submission_refused_while_review_unresolved() {
         let mut chat = chat();
-        chat.open_turn_review(driver());
+        chat.set_turn_review(Some(running_view()));
         // Typed input never reaches the composer: the review owns the keyboard
         // while it is up.
         assert_eq!(chat.handle_key(key(KeyCode::Char('h'))), ChatAction::None);
         assert!(chat.input.is_empty(), "the composer takes no input");
 
-        // Even a prompt that arrives another way (a queued prompt peeled back,
-        // a remote submit) is refused while the review is unresolved.
-        chat.input = "next".to_string();
+        chat.input = "next".to_owned();
         chat.input_cursor = 4;
         assert_eq!(chat.submit_input(), ChatAction::None);
         assert!(
@@ -608,35 +517,60 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_the_review_and_gives_the_composer_back() {
+    fn escape_asks_the_daemon_to_cancel_and_leaves_the_pane_up() {
         let mut chat = chat();
-        chat.open_turn_review(driver());
-        let action = chat.handle_key(key(KeyCode::Esc));
-        let ChatAction::TurnReview(TurnReviewIntent::Requests(requests)) = action else {
-            panic!("escape cancels the review, got {action:?}");
-        };
-        // This review was cancelled before its capture landed, so no role had
-        // started and there is nothing to reap -- but the baseline still must
-        // not move, which is what makes cancelling lossless.
-        assert_eq!(requests, vec![ReviewRequest::Close]);
+        chat.set_turn_review(Some(running_view()));
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Esc)),
+            ChatAction::TurnReview(TurnReviewIntent::Resolve(Resolution::Cancelled))
+        );
         assert!(
-            !requests
-                .iter()
-                .any(|request| matches!(request, ReviewRequest::AdvanceBaseline { .. })),
-            "cancelling never advances the baseline"
+            chat.turn_review_active(),
+            "the pane closes when the daemon says the review is gone, not before"
         );
     }
 
     #[test]
-    fn the_action_bar_offers_nothing_until_a_verdict_arrives() {
+    fn the_action_bar_offers_nothing_until_the_daemon_publishes_a_verdict() {
         let mut chat = chat();
-        chat.open_turn_review(driver());
-        // Tab cycles the highlight, but neither Forward nor Dismiss does
-        // anything while the reviewer is still working.
+        chat.set_turn_review(Some(running_view()));
+        // Forward is highlighted first, and does nothing while the review runs.
         assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
-        assert_eq!(chat.handle_key(key(KeyCode::Tab)), ChatAction::None);
+        chat.set_turn_review(Some(findings_view()));
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::TurnReview(TurnReviewIntent::Resolve(Resolution::Forwarded))
+        );
+    }
+
+    #[test]
+    fn a_failed_verdict_offers_dismiss_and_cancel_but_not_forward() {
+        let mut chat = chat();
+        chat.set_turn_review(Some(RuntimeReviewView {
+            verdict: Some(VerdictView {
+                kind: VerdictKind::Failed,
+                text: "bifrost exited with 1".to_owned(),
+                allowed: vec![Resolution::Dismissed, Resolution::Cancelled],
+            }),
+            ..running_view()
+        }));
         assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
-        assert!(chat.turn_review_active(), "the review is still up");
+        // Right moves to Dismiss, which a failed review does allow.
+        assert_eq!(chat.handle_key(key(KeyCode::Right)), ChatAction::None);
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::TurnReview(TurnReviewIntent::Resolve(Resolution::Dismissed))
+        );
+    }
+
+    #[test]
+    fn the_daemon_taking_the_review_away_closes_the_pane() {
+        let mut chat = chat();
+        chat.set_turn_review(Some(running_view()));
+        assert!(chat.turn_review_active());
+        chat.set_turn_review(None);
+        assert!(!chat.turn_review_active());
+        assert!(!chat.turn_review_split());
     }
 
     /// A form is answered back to the harness that asked it. In the extended
@@ -645,7 +579,7 @@ mod tests {
     #[test]
     fn a_lanes_form_is_answered_back_to_that_lane() {
         let mut chat = chat();
-        chat.open_turn_review(driver());
+        chat.set_turn_review(Some(running_view()));
         let form = crate::hel_elicitation::ElicitationRequest {
             id: "lane-form-1".into(),
             message: "Allow reading /etc?".into(),
@@ -653,7 +587,7 @@ mod tests {
             description: None,
             fields: Vec::new(),
         };
-        assert!(chat.show_review_role_elicitation(Some("tests".to_string()), form));
+        assert!(chat.show_review_role_elicitation(Some("tests".to_owned()), form));
         assert!(chat.reviewer_elicitation_open());
 
         // The dialog takes the key, not the review's action bar: Escape here
@@ -677,15 +611,29 @@ mod tests {
     }
 
     #[test]
-    fn a_resolution_notice_names_what_happened() {
+    fn tab_follows_the_roles_the_daemon_published() {
+        let mut chat = chat();
+        let mut view = running_view();
+        view.roles.push(RoleStatus {
+            role: "tests".to_owned(),
+            label: "Tests".to_owned(),
+            state: RoleState::Running,
+        });
+        chat.set_turn_review(Some(view));
         assert_eq!(
-            resolution_notice(&TurnReviewPhase::Resolved(Resolution::Forwarded)).as_deref(),
-            Some("Review findings sent to the agent")
+            chat.turn_review().map(TurnReview::selected_role),
+            Some("reviewer")
         );
+        chat.handle_key(key(KeyCode::Tab));
         assert_eq!(
-            resolution_notice(&TurnReviewPhase::Resolved(Resolution::NothingToReview)).as_deref(),
-            Some("Nothing to review: the turn changed no files")
+            chat.turn_review().map(TurnReview::selected_role),
+            Some("tests")
         );
-        assert_eq!(resolution_notice(&TurnReviewPhase::CapturingDelta), None);
+        // A role that goes away takes the selection with it.
+        chat.set_turn_review(Some(running_view()));
+        assert_eq!(
+            chat.turn_review().map(TurnReview::selected_role),
+            Some("reviewer")
+        );
     }
 }

@@ -637,7 +637,7 @@ fn start_session_launch_with_repository_preflight(
                 request,
                 context.critical_operations.clone(),
                 move |_controller, _cancelled| {
-                    let materialized = runtime.block_on(async {
+                    runtime.block_on(async {
                         daemon::connect_or_start()
                             .await?
                             .resume_session(daemon::ResumeSessionRequest {
@@ -654,7 +654,6 @@ fn start_session_launch_with_repository_preflight(
                     Ok(LifecycleSuccess::Resumed {
                         profile_id,
                         target_id: target_template_id,
-                        materialized: Box::new(materialized),
                     })
                 },
             );

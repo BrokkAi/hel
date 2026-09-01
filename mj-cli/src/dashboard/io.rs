@@ -46,6 +46,11 @@ pub(crate) enum DashboardIoUpdate {
         session_id: String,
         result: std::result::Result<Box<PreparedMaterializedSessionDetail>, String>,
     },
+    /// A bounded tail of a resumed session's stored transcript, loaded off the
+    /// event loop so the conversation is not blank while the poller catches up.
+    TranscriptTailSeed {
+        materialized: Box<MaterializedSession>,
+    },
     StoredSessionSummary {
         session_id: String,
         result: std::result::Result<PreparedMaterializedSessionSummary, String>,
@@ -57,6 +62,12 @@ pub(crate) enum DashboardIoUpdate {
     ChatOpened {
         session_id: String,
         result: Box<std::result::Result<hel::hel_chat::ActiveChat, String>>,
+    },
+    /// The daemon refused a review action. The message is a sentence for the
+    /// person who pressed the key, so it goes back to the chat that sent it.
+    ReviewRefused {
+        session_id: String,
+        message: String,
     },
     CreateSession(Box<DashboardCreateSessionUpdate>),
     RenameSession {
@@ -963,6 +974,20 @@ impl DashboardContext {
     /// Folds one finished background job into dashboard and controller state.
     pub(super) fn apply_dashboard_io_update(&mut self, update: DashboardIoUpdate) {
         match update {
+            DashboardIoUpdate::ReviewRefused {
+                session_id,
+                message,
+            } => {
+                match self
+                    .active_chat
+                    .as_mut()
+                    .filter(|chat| chat.session_id() == session_id)
+                {
+                    Some(chat) => chat.report_review_refusal(message),
+                    // The chat moved on; the refusal still belongs on screen.
+                    None => self.dashboard.set_notice(message),
+                }
+            }
             DashboardIoUpdate::WorkerRecordPersistence { operation, result } => {
                 match (operation, result) {
                     (WorkerRecordPersistence::AcpTitle { .. }, Err(error)) => self
@@ -1053,6 +1078,15 @@ impl DashboardContext {
             DashboardIoUpdate::MaterializedSessionProjection { session_id, result } => {
                 self.finish_materialized_projection(session_id, result);
             }
+            DashboardIoUpdate::TranscriptTailSeed { materialized } => {
+                let viewed_through_event_ordinal = self
+                    .controller
+                    .state
+                    .sessions
+                    .get(&materialized.session_id)
+                    .map_or(0, |session| session.viewed_through_event_ordinal);
+                self.request_materialized_projection(*materialized, viewed_through_event_ordinal);
+            }
             DashboardIoUpdate::StoredSessionSummary { session_id, result } => {
                 match result {
                     Ok(summary) => {
@@ -1092,6 +1126,7 @@ impl DashboardContext {
                         // asynchronous; anything the surface learned while it
                         // was in flight is handed over now.
                         self.refresh_chat_context();
+                        self.apply_runtime_review_to_active_chat();
                         self.dashboard.set_current_session(Some(&session_id));
                         self.dashboard.clear_notice();
                         self.acknowledge_visible_chat();
@@ -1459,15 +1494,13 @@ impl DashboardContext {
             Ok(LifecycleSuccess::Resumed {
                 profile_id,
                 target_id,
-                materialized,
             }) => {
-                let viewed_through_event_ordinal = self
-                    .controller
-                    .state
-                    .sessions
-                    .get(&session_id)
-                    .map_or(0, |session| session.viewed_through_event_ordinal);
-                self.request_materialized_projection(*materialized, viewed_through_event_ordinal);
+                // Seed the conversation from the tail rather than from a
+                // transcript shipped back through the daemon reply. The view
+                // keeps `TAIL_SEED_ITEMS` and discards everything before it,
+                // so reading the whole projection was work proportional to
+                // history for a result that was thrown away.
+                self.request_transcript_tail_seed(&session_id);
                 self.dashboard.select_active_session(&session_id);
                 self.dashboard.set_notice(format!(
                     "Resumed {} with {profile_id} on {target_id}",

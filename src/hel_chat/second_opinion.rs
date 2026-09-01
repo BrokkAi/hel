@@ -789,15 +789,13 @@ pub(super) fn reviewer_session_id(primary_session_id: &str) -> String {
     format!("{primary_session_id}-reviewer")
 }
 
-/// The same, for one turn-review role. The default role keeps the plan
-/// reviewer's id, which is also the relay session id the worker uses, so a
-/// quick review folds into exactly the journal it reads.
+/// The same, for one turn-review role.
+///
+/// One definition, in the host that also folds these journals, so the pane and
+/// the review can never disagree about which session id a role's events belong
+/// under.
 pub(super) fn review_role_session_id(primary_session_id: &str, role: &str) -> String {
-    if role == crate::hel_review::driver::REVIEWER_ROLE {
-        reviewer_session_id(primary_session_id)
-    } else {
-        format!("{primary_session_id}-review-{role}")
-    }
+    crate::hel_review::host::role_session_id(primary_session_id, role)
 }
 
 /// Builds a pane straight from entries, for tests that need a populated

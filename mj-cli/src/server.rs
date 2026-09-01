@@ -494,6 +494,7 @@ pub(crate) async fn run_server(
             operational: &operational,
             operations: &operations,
             capacity: &viewer_capacity(&capacity_state),
+            reviews: &review_views(&daemon_runtime),
         },
         revision,
     ));
@@ -618,6 +619,7 @@ pub(crate) async fn run_server(
                         operational: &operational,
                         operations: &operations,
                         capacity: &viewer_capacity(&capacity_state),
+                        reviews: &review_views(&daemon_runtime),
                     },
                     $revision,
                 )) {
@@ -1147,6 +1149,7 @@ pub(crate) async fn run_server(
                                 operational: &operational,
                                 operations: &operations,
                                 capacity: &viewer_capacity(&capacity_state),
+                                reviews: &review_views(&daemon_runtime),
                             },
                             revision,
                         )) {
@@ -1344,7 +1347,9 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
         | ControllerAction::Rename { session_id, .. }
         | ControllerAction::CancelTurn { session_id }
         | ControllerAction::SetConfig { session_id, .. }
-        | ControllerAction::SetPlanMode { session_id, .. } => Some(session_id.clone()),
+        | ControllerAction::SetPlanMode { session_id, .. }
+        | ControllerAction::StartReview { session_id }
+        | ControllerAction::ResolveReview { session_id, .. } => Some(session_id.clone()),
         // A refresh belongs to a profile or a target rather than a session, so
         // it takes no session slot and cannot be refused as session-busy.
         ControllerAction::RefreshQuota { .. } | ControllerAction::RefreshCapacity { .. } => None,
@@ -1668,6 +1673,32 @@ async fn apply_phone_action(
             controller.rename_session(&session_id, &title)?;
             Ok(())
         }
+        ControllerAction::StartReview { session_id } => {
+            // The refusal is a sentence for the person holding the phone --
+            // "prompts are queued", "set [review] profile in config.toml" --
+            // so it travels as the error text of this action.
+            services
+                .daemon_runtime
+                .review_host()
+                .start(&session_id, true)
+                .await
+                .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+            Ok(())
+        }
+        ControllerAction::ResolveReview {
+            session_id,
+            resolution,
+        } => {
+            let resolution = hel::hel_server::resolution_from_name(&resolution)
+                .context("a review is resolved by forward, dismiss, or cancel")?;
+            services
+                .daemon_runtime
+                .review_host()
+                .resolve(&session_id, resolution)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(())
+        }
         ControllerAction::CancelTurn { session_id } => {
             services
                 .sessions
@@ -1757,6 +1788,9 @@ struct PhoneSessionViews<'a> {
     operations: &'a std::collections::BTreeMap<String, hel::hel_server::ViewerOperation>,
     /// The most recent capacity reading per probe target.
     capacity: &'a [hel::hel_server::ViewerTargetCapacity],
+    /// Reviews the daemon is running, keyed by session. The phone renders the
+    /// same review the terminal does, from the same host.
+    reviews: &'a std::collections::BTreeMap<String, hel::hel_review::host::RuntimeReviewView>,
 }
 
 /// What the phone server remembers about one probe target between readings.
@@ -1966,6 +2000,122 @@ fn phone_prompt_blocks(
     prompt
 }
 
+/// The Mjolnir commands a phone may offer for one session.
+///
+/// The list is built here, from what this session can actually do, and
+/// published: the browser used to keep its own copy, which is how `/review`
+/// was missing from the phone while the terminal had it.
+fn phone_commands(
+    session: &hel::hel_server::ViewerSession,
+    operational: Option<&hel::hel_worker::RelayOperationalState>,
+) -> Vec<hel::hel_server::ViewerMjCommand> {
+    use agent_client_protocol::schema::v1::AvailableCommandInput;
+    use hel::hel_server::ViewerCommandSource;
+
+    let command =
+        |name: &str, description: &str, argument: Option<&str>| hel::hel_server::ViewerMjCommand {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            source: ViewerCommandSource::Mj,
+            argument: argument.map(str::to_owned),
+        };
+    let mut commands = vec![
+        command("help", "show available Mjolnir and agent commands", None),
+        command(
+            "detach",
+            "leave the conversation without stopping the worker",
+            None,
+        ),
+    ];
+    let option = |key: &str| {
+        session
+            .config_options
+            .iter()
+            .any(|option| option.key == key)
+    };
+    if option("model") {
+        commands.push(command("model", "change the active model", Some("value")));
+        commands.push(command("fast", "toggle Codex Fast mode", None));
+    }
+    if option("effort") {
+        commands.push(command(
+            "effort",
+            "change the active reasoning effort",
+            Some("value"),
+        ));
+    }
+    if session.plan_mode_active.is_some() && session.capabilities.set_plan_mode {
+        commands.push(command("plan", "toggle plan mode", Some("message")));
+        commands.push(command(
+            "implement",
+            "leave plan mode and implement",
+            Some("instruction"),
+        ));
+    }
+    if session.capabilities.prompt || session.turn_review.is_some() {
+        commands.push(command(
+            "review",
+            "review the finished turn now, or report how review is configured",
+            Some("status"),
+        ));
+    }
+    // These names are handled by Mjolnir even when the corresponding control
+    // is unavailable for this session. An agent cannot claim one and turn a
+    // locally interpreted slash command into a misleading palette entry.
+    let reserved = [
+        "help",
+        "detach",
+        "model",
+        "fast",
+        "effort",
+        "plan",
+        "implement",
+        "review",
+    ];
+    for advertised in operational
+        .into_iter()
+        .flat_map(|state| state.available_commands.iter())
+    {
+        let name = advertised.name.trim();
+        if name.is_empty()
+            || reserved
+                .iter()
+                .any(|local| name.eq_ignore_ascii_case(local))
+            || commands
+                .iter()
+                .any(|existing| existing.name.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let argument = advertised.input.as_ref().and_then(|input| match input {
+            AvailableCommandInput::Unstructured(input) => {
+                let hint = input.hint.trim();
+                (!hint.is_empty()).then(|| hint.to_owned())
+            }
+            _ => None,
+        });
+        commands.push(hel::hel_server::ViewerMjCommand {
+            name: name.to_owned(),
+            description: advertised.description.trim().to_owned(),
+            source: ViewerCommandSource::Agent,
+            argument,
+        });
+    }
+    commands
+}
+
+/// The open reviews, keyed by session, for one snapshot.
+fn review_views(
+    daemon_runtime: &Arc<RuntimeState>,
+) -> std::collections::BTreeMap<String, hel::hel_review::host::RuntimeReviewView> {
+    daemon_runtime
+        .review_host()
+        .views()
+        .into_iter()
+        .map(|review| (review.session_id.clone(), review))
+        .collect()
+}
+
 fn viewer_snapshot(
     controller: &Controller,
     workspaces: &[hel::hel_workspace::WorkspaceRecord],
@@ -1975,6 +2125,7 @@ fn viewer_snapshot(
 ) -> ViewerSnapshot {
     let PhoneSessionViews {
         conversations,
+        reviews,
         queued_prompts,
         active_user_shells,
         pending_elicitations,
@@ -2093,8 +2244,12 @@ fn viewer_snapshot(
             .as_ref()
             .filter(|facts| facts.supports_plan_mode())
             .map(hel::hel_acp::AcpSessionFacts::plan_mode_active);
+        session.turn_review = reviews
+            .get(&session.id)
+            .map(hel::hel_server::ViewerTurnReview::from_runtime);
         session.capabilities =
             session_capabilities(session, live, operations.get(&session.id), facts.as_ref());
+        session.available_commands = phone_commands(session, live);
         if let Some(transcript) = conversations.get(&session.id) {
             session.conversation_available = true;
             let mut lines = transcript
@@ -2262,6 +2417,99 @@ mod tests {
     }
 
     #[test]
+    fn phone_snapshot_projects_capability_gated_and_agent_commands_with_provenance() {
+        use agent_client_protocol::schema::v1::{
+            AvailableCommand, AvailableCommandInput, SessionMode, SessionModeState,
+            UnstructuredCommandInput,
+        };
+        use hel::hel_server::ViewerCommandSource;
+        use hel::hel_worker::{RelayExecutionState, RelayOperationalState};
+
+        let mut controller = controller_with_profiles(&["claude"]);
+        let mut record = phone_session("session-1", 0);
+        record.harness_kind = HarnessKind::Claude;
+        record.last_profile = "claude".into();
+        record.state = SessionState::Running;
+        controller.state.sessions.insert(record.id.clone(), record);
+        let operational = RelayOperationalState {
+            session_id: "session-1".into(),
+            execution: RelayExecutionState::Idle,
+            latest_ordinal: 0,
+            latest_digest: String::new(),
+            acknowledged_through: 0,
+            acknowledged_digest: String::new(),
+            recovery_floor_ordinal: 0,
+            recovery_floor_digest: String::new(),
+            native_session_id: None,
+            agent_capabilities: None,
+            agent_info: None,
+            config_options: Vec::new(),
+            modes: Some(SessionModeState::new(
+                "default",
+                vec![
+                    SessionMode::new("default", "Default"),
+                    SessionMode::new("plan", "Plan"),
+                ],
+            )),
+            available_commands: vec![
+                AvailableCommand::new("inspect", " Inspect the workspace ").input(
+                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(" query ")),
+                ),
+                AvailableCommand::new("Review", "agent collision"),
+                AvailableCommand::new("INSPECT", "duplicate agent command"),
+            ],
+            config: std::collections::BTreeMap::new(),
+            active_prompt: None,
+            queued_prompts: Vec::new(),
+            active_user_shells: Vec::new(),
+            active_agent_terminals: Vec::new(),
+            checkpoint_barrier: None,
+            checkpoint_ready: None,
+            last_acp_activity_at_ms: None,
+        };
+        let operational = std::collections::BTreeMap::from([("session-1".into(), operational)]);
+        let snapshot = viewer_snapshot(
+            &controller,
+            &[],
+            &std::collections::BTreeMap::new(),
+            &PhoneSessionViews {
+                conversations: &std::collections::BTreeMap::new(),
+                queued_prompts: &std::collections::BTreeMap::new(),
+                active_user_shells: &std::collections::BTreeMap::new(),
+                pending_elicitations: &std::collections::BTreeMap::new(),
+                prompt_images: &std::collections::BTreeSet::new(),
+                operational: &operational,
+                operations: &std::collections::BTreeMap::new(),
+                capacity: &[],
+                reviews: &std::collections::BTreeMap::new(),
+            },
+            1,
+        );
+        let session = &snapshot.sessions[0];
+
+        assert!(session.capabilities.prompt);
+        assert!(session.capabilities.set_plan_mode);
+        assert_eq!(
+            session
+                .available_commands
+                .iter()
+                .map(|command| (command.name.as_str(), command.source))
+                .collect::<Vec<_>>(),
+            vec![
+                ("help", ViewerCommandSource::Mj),
+                ("detach", ViewerCommandSource::Mj),
+                ("plan", ViewerCommandSource::Mj),
+                ("implement", ViewerCommandSource::Mj),
+                ("review", ViewerCommandSource::Mj),
+                ("inspect", ViewerCommandSource::Agent),
+            ]
+        );
+        let inspect = session.available_commands.last().unwrap();
+        assert_eq!(inspect.description, "Inspect the workspace");
+        assert_eq!(inspect.argument.as_deref(), Some("query"));
+    }
+
+    #[test]
     fn tailscale_listener_preserves_the_configured_port() {
         assert_eq!(
             tailscale_bind("127.0.0.1:4765".parse().unwrap()),
@@ -2275,6 +2523,7 @@ mod tests {
                 version: CONFIG_VERSION,
                 newer_config_version: None,
                 phone: Default::default(),
+                review: Default::default(),
                 profiles: ids
                     .iter()
                     .map(|id| {
@@ -2578,6 +2827,7 @@ mod tests {
                     operational: &std::collections::BTreeMap::new(),
                     operations: &std::collections::BTreeMap::new(),
                     capacity: &[],
+                    reviews: &std::collections::BTreeMap::new(),
                 },
                 1,
             )

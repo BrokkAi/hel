@@ -37,8 +37,7 @@ use super::lanes::{
     supervisor_prompt, user_messages_packet, validate_dispatch,
 };
 use super::verdict::{
-    LaneOutcome, ReviewLaneEvidence, ReviewPassEvidence, ReviewVerdict, lane_report_is_clean,
-    synthesis_verdict,
+    LaneOutcome, ReviewLaneEvidence, ReviewVerdict, lane_report_is_clean, synthesis_verdict,
 };
 
 /// What the driver needs the caller to do next.
@@ -83,7 +82,8 @@ pub enum ReviewRequest {
 }
 
 /// Which stage of a review one role is in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoleState {
     Pending,
     Running,
@@ -105,8 +105,10 @@ impl RoleState {
     }
 }
 
-/// One reviewing agent's row in the review pane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One reviewing agent's row in the review pane. It crosses the daemon's
+/// snapshot to every surface, so it serializes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleStatus {
     pub role: String,
     pub label: String,
@@ -114,7 +116,8 @@ pub struct RoleStatus {
 }
 
 /// How a review ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Resolution {
     /// The findings went to the primary agent as a corrective prompt.
     Forwarded,
@@ -131,7 +134,8 @@ pub enum Resolution {
 }
 
 /// Where the review has got to.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
 pub enum TurnReviewPhase {
     /// Asking the worker what the turn changed.
     CapturingDelta,
@@ -934,19 +938,10 @@ pub fn correction_note(synthesis: &str) -> String {
     )
 }
 
-/// Evidence a completed review carries into the next one.
-#[must_use]
-pub fn evidence_with_intent(brief: Option<&str>) -> ReviewPassEvidence {
-    ReviewPassEvidence {
-        intent_brief: brief.unwrap_or_default().to_string(),
-        intent_available: brief.is_some(),
-        lanes: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hel_review::verdict::ReviewPassEvidence;
 
     fn seed() -> TurnReviewSeed {
         TurnReviewSeed {

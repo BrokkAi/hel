@@ -2220,6 +2220,7 @@ mod tests {
                 version: hel::hel_config::CONFIG_VERSION,
                 newer_config_version: None,
                 phone: Default::default(),
+                review: Default::default(),
                 profiles: Default::default(),
                 bundles: Default::default(),
                 targets: Default::default(),

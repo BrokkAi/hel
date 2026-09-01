@@ -63,7 +63,7 @@ use crate::pollers::{
     spawn_dashboard_capacity_poller, spawn_dashboard_resource_poller, spawn_quota_refresher,
     spawn_remote_dashboard_worker_poller, spawn_worker_diagnosis,
 };
-use crate::{TerminalGuard, short_id, startup_greeting};
+use crate::{TerminalGuard, short_id};
 
 /// Redraw cadence for displays that move with the wall clock: turn timers,
 /// countdowns, and elapsed times.
@@ -388,6 +388,12 @@ pub(crate) struct DashboardContext {
     worker_targets_tx: watch::Sender<Vec<WorkerPollTarget>>,
     worker: Feed<SessionManagerUpdates>,
     runtime_lifecycles: Feed<watch::Receiver<Vec<crate::daemon::RuntimeLifecycleView>>>,
+    /// Reviews the daemon is running. The chat renders one of these rather
+    /// than driving a review of its own.
+    runtime_reviews: Feed<watch::Receiver<Vec<hel::hel_review::host::RuntimeReviewView>>>,
+    /// Last complete review projection, retained even while the session list
+    /// is on screen so a subsequently opened chat starts in the right state.
+    runtime_review_views: BTreeMap<String, hel::hel_review::host::RuntimeReviewView>,
     runtime_config: Feed<watch::Receiver<HelConfig>>,
     runtime_records: Feed<watch::Receiver<Vec<SessionRecord>>>,
     config_reload_in_flight: bool,
@@ -622,6 +628,10 @@ pub(crate) async fn run_dashboard_for_workspace(
                 let woke = context.runtime_lifecycles.accept(update);
                 context.dirty |= woke;
             }
+            update = context.runtime_reviews.wait(), if context.runtime_reviews.is_open() => {
+                let woke = context.runtime_reviews.accept(update);
+                context.dirty |= woke;
+            }
             update = context.runtime_config.wait(), if context.runtime_config.is_open() => {
                 let woke = context.runtime_config.accept(update);
                 context.dirty |= woke;
@@ -854,7 +864,6 @@ impl DashboardContext {
             .find(|workspace| workspace.id == workspace_id)
             .with_context(|| format!("unknown workspace {workspace_id:?}"))?
             .name;
-        let greeting = format!("{workspace_name}  ·  {}", startup_greeting(&controller));
         let mut dashboard = DashboardState::new(
             controller.config.clone(),
             controller.state.clone(),
@@ -865,7 +874,7 @@ impl DashboardContext {
         for (session_id, queued) in projected_queued_prompts(&controller)? {
             dashboard.apply_queued_prompts(&session_id, queued);
         }
-        dashboard.set_greeting(greeting);
+        dashboard.set_workspace_name(workspace_name);
         let mut terminal = TerminalGuard::enter()?;
         if configuration_needs_setup(&controller.config) {
             terminal.suspend()?;
@@ -891,6 +900,13 @@ impl DashboardContext {
         let worker_commands_tx = remote_worker.control;
         let worker_shutdown = remote_worker.shutdown;
         let runtime_lifecycles_rx = remote_worker.lifecycles;
+        let runtime_reviews_rx = remote_worker.reviews;
+        let runtime_review_views = runtime_reviews_rx
+            .borrow()
+            .iter()
+            .cloned()
+            .map(|review| (review.session_id.clone(), review))
+            .collect();
         let runtime_config_rx = remote_worker.config;
         let runtime_records_rx = remote_worker.records;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
@@ -950,6 +966,8 @@ impl DashboardContext {
             worker_targets_tx,
             worker: Feed::new(worker_updates_rx),
             runtime_lifecycles: Feed::new(runtime_lifecycles_rx),
+            runtime_reviews: Feed::new(runtime_reviews_rx),
+            runtime_review_views,
             runtime_config: Feed::new(runtime_config_rx),
             runtime_records: Feed::new(runtime_records_rx),
             config_reload_in_flight: false,
@@ -1004,6 +1022,60 @@ impl DashboardContext {
     /// Keeps one projection per session in flight and remembers only the
     /// newest snapshot that arrived behind it. The shared permits bound work
     /// across different sessions as well.
+    /// Fill a freshly resumed conversation from the tail of its stored
+    /// transcript, off the event loop.
+    ///
+    /// The projection is durable the moment the resume completes, so nothing
+    /// has to travel back through the daemon reply to show it. The view keeps
+    /// only the last `TAIL_SEED_ITEMS` entries, so the seed reads exactly that
+    /// many rather than the whole history. The poller delivers the complete
+    /// projection a moment later; this exists so the conversation is not blank
+    /// until it does.
+    pub(super) fn request_transcript_tail_seed(&mut self, session_id: &str) {
+        let session_id = session_id.to_owned();
+        let updates = self.dashboard_io_tx.clone();
+        tokio::spawn(async move {
+            let seeded = tokio::task::spawn_blocking({
+                let session_id = session_id.clone();
+                move || -> anyhow::Result<Option<MaterializedSession>> {
+                    let Some((applied_event_ordinal, applied_event_digest)) =
+                        hel::hel_database::materialized_event_frontier(&session_id)?
+                    else {
+                        return Ok(None);
+                    };
+                    let transcript = hel::hel_database::load_materialized_transcript_tail(
+                        &session_id,
+                        hel::hel_chat::TAIL_SEED_ITEMS,
+                    )?;
+                    let mut materialized = MaterializedSession::empty(session_id);
+                    materialized.applied_event_ordinal = applied_event_ordinal;
+                    materialized.applied_event_digest = applied_event_digest;
+                    materialized.transcript = transcript;
+                    Ok(Some(materialized))
+                }
+            })
+            .await;
+            // A failed seed costs a blank conversation until the next poll,
+            // which is where the full projection comes from anyway. It is not
+            // worth failing a resume that otherwise succeeded.
+            let materialized = match seeded {
+                Ok(Ok(Some(materialized))) => materialized,
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => {
+                    tracing::debug!(%session_id, %error, "transcript tail seed failed");
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(%session_id, %error, "transcript tail seed task failed");
+                    return;
+                }
+            };
+            let _ = updates.send(DashboardIoUpdate::TranscriptTailSeed {
+                materialized: Box::new(materialized),
+            });
+        });
+    }
+
     pub(super) fn request_materialized_projection(
         &mut self,
         materialized: MaterializedSession,
@@ -1458,20 +1530,30 @@ impl DashboardContext {
             session: session_record,
         };
         let (persistence_tx, mut persistence_rx) =
-            tokio::sync::mpsc::unbounded_channel::<hel::hel_chat::ChatPersistenceRequest>();
+            tokio::sync::mpsc::unbounded_channel::<hel::hel_chat::ChatDaemonRequest>();
+        let refusals = self.dashboard_io_tx.clone();
         tokio::spawn(async move {
             while let Some(request) = persistence_rx.recv().await {
+                // A review action's refusal is a sentence for the person who
+                // pressed the key, so it comes back to the chat rather than
+                // only into the log.
+                let refusal_session = match &request {
+                    hel::hel_chat::ChatDaemonRequest::StartTurnReview { session_id }
+                    | hel::hel_chat::ChatDaemonRequest::ResolveTurnReview { session_id, .. } => {
+                        Some(session_id.clone())
+                    }
+                    _ => None,
+                };
                 let result = async {
                     let mut daemon = crate::daemon::connect_or_start().await?;
                     match request {
-                        hel::hel_chat::ChatPersistenceRequest::SaveReview {
-                            session_id,
-                            review,
-                        } => daemon.save_active_review(session_id, review).await,
-                        hel::hel_chat::ChatPersistenceRequest::ClearReview { session_id } => {
+                        hel::hel_chat::ChatDaemonRequest::SaveReview { session_id, review } => {
+                            daemon.save_active_review(session_id, review).await
+                        }
+                        hel::hel_chat::ChatDaemonRequest::ClearReview { session_id } => {
                             daemon.clear_active_review(session_id).await
                         }
-                        hel::hel_chat::ChatPersistenceRequest::RememberReviewerSelection {
+                        hel::hel_chat::ChatDaemonRequest::RememberReviewerSelection {
                             workspace_id,
                             selection,
                         } => {
@@ -1479,21 +1561,26 @@ impl DashboardContext {
                                 .remember_reviewer_selection(workspace_id, selection)
                                 .await
                         }
-                        hel::hel_chat::ChatPersistenceRequest::SaveTurnReviewState {
-                            session_id,
-                            state,
-                        } => daemon.save_turn_review_state(session_id, state).await,
-                        hel::hel_chat::ChatPersistenceRequest::SaveTurnReviewSettings {
-                            workspace_id,
-                            settings,
-                        } => {
-                            daemon
-                                .save_turn_review_settings(workspace_id, settings)
-                                .await
+                        hel::hel_chat::ChatDaemonRequest::StartTurnReview { session_id } => {
+                            daemon.start_turn_review(session_id).await
                         }
+                        hel::hel_chat::ChatDaemonRequest::ResolveTurnReview {
+                            session_id,
+                            resolution,
+                        } => daemon.resolve_turn_review(session_id, resolution).await,
                     }
                 }
                 .await;
+                if let (Err(error), Some(session_id)) = (&result, refusal_session)
+                    && refusals
+                        .send(DashboardIoUpdate::ReviewRefused {
+                            session_id,
+                            message: format!("{error:#}"),
+                        })
+                        .is_err()
+                {
+                    tracing::debug!("a review refusal was dropped because the dashboard closed");
+                }
                 if let Err(error) = result {
                     tracing::warn!(%error, "could not persist chat state through the daemon");
                 }
@@ -1565,6 +1652,7 @@ impl DashboardContext {
         self.drain_runtime_records();
         self.drain_worker_updates();
         self.drain_runtime_lifecycles();
+        self.drain_runtime_reviews();
         self.drain_runtime_config();
         schedule_due_credential_syncs(
             &mut self.credential_sync_signals,
@@ -1587,6 +1675,35 @@ impl DashboardContext {
     /// A review can only be started from inside a chat, so the open chat is
     /// the authority while there is one. This is an in-memory read: the loop
     /// never touches the database for it.
+    /// Hands the open chat whatever review the daemon is running for it.
+    ///
+    /// The chat draws the pane and sends the resolutions; it hosts nothing.
+    /// A session with no review gets `None`, which closes the pane.
+    fn drain_runtime_reviews(&mut self) {
+        let mut latest = None;
+        while let Some(reviews) = self.runtime_reviews.next_ready() {
+            latest = Some(reviews);
+        }
+        let Some(reviews) = latest else {
+            return;
+        };
+        self.runtime_review_views = reviews
+            .into_iter()
+            .map(|review| (review.session_id.clone(), review))
+            .collect();
+        self.apply_runtime_review_to_active_chat();
+    }
+
+    /// Applies the retained daemon projection whenever a chat becomes active.
+    /// Absence is meaningful: it closes a review the previous projection held.
+    pub(crate) fn apply_runtime_review_to_active_chat(&mut self) {
+        let Some(chat) = self.active_chat.as_mut() else {
+            return;
+        };
+        let review = self.runtime_review_views.get(chat.session_id()).cloned();
+        chat.apply_review_view(review);
+    }
+
     fn refresh_open_review(&mut self) {
         let Some(chat) = self.active_chat.as_ref() else {
             return;
@@ -1782,6 +1899,12 @@ impl DashboardContext {
         let Some(config) = latest else {
             return;
         };
+        // The chat's copy of `[review]` follows the daemon's, so `/review
+        // status` and the composer's armed indicator report what is actually
+        // running rather than what this process last read from disk.
+        if let Some(chat) = self.active_chat.as_mut() {
+            chat.set_review_config(config.review.clone());
+        }
         if config == self.controller.config || self.config_reload_in_flight {
             return;
         }
@@ -2652,6 +2775,55 @@ mod tests {
             .flat_map(|y| (quotas.rect.x..quotas.rect.right()).map(move |x| (x, y)))
             .collect::<Vec<_>>();
         assert_eq!(reversed_cells(&terminal), expected);
+    }
+
+    #[test]
+    fn tiny_borderless_grid_can_be_selected_and_copied() {
+        let mut dashboard = populated_dashboard();
+        dashboard.cycle_pane_layout();
+        dashboard.cycle_pane_layout();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+        let mut selection = SelectionState::new();
+        draw_with_selection(&mut terminal, &mut dashboard, &selection);
+        let surface = *dashboard
+            .frame_surfaces()
+            .surface(SurfaceId::DashboardPane(0))
+            .expect("tiny sessions grid registered");
+        assert_eq!(surface.rect.height, 2);
+
+        let start = (surface.rect.x, surface.rect.y);
+        let end = (surface.rect.right() - 1, surface.rect.bottom() - 1);
+        assert_eq!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Down(MouseButton::Left), start.0, start.1),
+            ),
+            SelectionRouting::Consumed
+        );
+        assert_eq!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Drag(MouseButton::Left), end.0, end.1),
+            ),
+            SelectionRouting::Consumed
+        );
+        assert!(matches!(
+            route_selection_event(
+                &mut selection,
+                dashboard.frame_surfaces(),
+                mouse(MouseEventKind::Up(MouseButton::Left), end.0, end.1),
+            ),
+            SelectionRouting::Copy {
+                surface: SurfaceId::DashboardPane(0),
+                ..
+            }
+        ));
+
+        let copied = draw_with_selection(&mut terminal, &mut dashboard, &selection)
+            .expect("tiny grid selection extracts text");
+        assert!(copied.contains("podman"), "copied grid text: {copied:?}");
     }
 
     /// A press is held back until the button comes up, then replayed to the

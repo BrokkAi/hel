@@ -2,6 +2,7 @@
 //! transcript and composer the combined surface asks it to draw into the
 //! regions it has chosen.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +46,12 @@ use super::{
 
 /// Durable chat-side state that a host process must ask the daemon to store.
 #[derive(Debug, Clone)]
-pub enum ChatPersistenceRequest {
+/// What the chat asks the controller daemon to do.
+///
+/// The chat runs in the terminal process, which owns no session state and no
+/// database: everything here crosses to the daemon, which does. Review actions
+/// travel this way too -- the review runs there.
+pub enum ChatDaemonRequest {
     SaveReview {
         session_id: String,
         review: crate::hel_database::StoredReview,
@@ -57,13 +63,14 @@ pub enum ChatPersistenceRequest {
         workspace_id: String,
         selection: crate::hel_second_opinion::ReviewerSelection,
     },
-    SaveTurnReviewState {
+    /// Review the turn this session just finished.
+    StartTurnReview {
         session_id: String,
-        state: crate::hel_database::TurnReviewState,
     },
-    SaveTurnReviewSettings {
-        workspace_id: String,
-        settings: crate::hel_database::TurnReviewSettings,
+    /// Forward the findings, dismiss them, or cancel the review.
+    ResolveTurnReview {
+        session_id: String,
+        resolution: crate::hel_review::driver::Resolution,
     },
 }
 use crate::hel_second_opinion::{
@@ -117,33 +124,10 @@ enum ChatIoUpdate {
     ReviewerEvents {
         result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
     },
-    /// What the finished turn changed, as the worker captured it.
-    TurnReviewDelta {
-        result: std::result::Result<Vec<crate::hel_worker::RepoDelta>, String>,
-    },
-    /// Bifrost's semantic analysis of the captured trees.
-    TurnReviewAnalysis {
-        result: std::result::Result<String, String>,
-    },
-    /// One reviewing role's harness is up, or could not start.
-    TurnReviewRoleStarted {
-        role: String,
-        result: std::result::Result<(), String>,
-    },
     /// A page of one reviewing role's own relay events.
     TurnReviewEvents {
         role: String,
         result: std::result::Result<Vec<crate::hel_worker::RelayEvent>, String>,
-    },
-    /// Specialist lanes the review supervisor asked for through its MCP tool.
-    TurnReviewDispatches {
-        result: std::result::Result<Vec<crate::hel_review::lanes::ReviewSubagentRequest>, String>,
-    },
-    /// The review baselines a workspace acquires when auto-review is switched
-    /// on, so the first review covers what happens next rather than every
-    /// change already in the tree.
-    TurnReviewBaselines {
-        result: std::result::Result<std::collections::BTreeMap<std::path::PathBuf, String>, String>,
     },
 }
 
@@ -308,12 +292,7 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
         | ChatIoUpdate::ReviewerConfigured { .. }
         | ChatIoUpdate::ReviewerStarted(_)
         | ChatIoUpdate::ReviewerEvents { .. }
-        | ChatIoUpdate::TurnReviewDelta { .. }
-        | ChatIoUpdate::TurnReviewAnalysis { .. }
-        | ChatIoUpdate::TurnReviewRoleStarted { .. }
-        | ChatIoUpdate::TurnReviewEvents { .. }
-        | ChatIoUpdate::TurnReviewDispatches { .. }
-        | ChatIoUpdate::TurnReviewBaselines { .. } => {}
+        | ChatIoUpdate::TurnReviewEvents { .. } => {}
         ChatIoUpdate::SessionReconnected(_) => {
             unreachable!("session reconnects are applied by ActiveChat")
         }
@@ -426,17 +405,11 @@ pub struct ActiveChat {
     /// workspace has already chosen a reviewer. It short-circuits the
     /// waterfall: the choice is only asked again when this fails.
     resuming_reviewer: Option<ReviewerSelection>,
-    /// Whether this session's workspace reviews every completed turn, and how
-    /// thoroughly.
-    turn_review_settings: crate::hel_database::TurnReviewSettings,
-    /// How far this session has been reviewed: the per-repository baselines a
-    /// capture is taken against, and the transcript ordinal a completed review
-    /// has read through.
-    turn_review_state: crate::hel_database::TurnReviewState,
-    /// The phase the previous drain saw. A turn finishing is the transition
-    /// from running to idle, and it is what arms an automatic review.
-    last_phase: WorkerPhase,
-    persistence: Option<tokio::sync::mpsc::UnboundedSender<ChatPersistenceRequest>>,
+    /// Reviewing roles whose journals this chat is already reading. The
+    /// daemon runs the review; the terminal only displays it, so this is
+    /// display bookkeeping and nothing more.
+    reviewed_roles: BTreeSet<String>,
+    persistence: Option<tokio::sync::mpsc::UnboundedSender<ChatDaemonRequest>>,
 }
 
 impl ActiveChat {
@@ -479,7 +452,7 @@ impl ActiveChat {
         header: SessionHeaderIdentity,
         draft: String,
         notices: Notices,
-        persistence: Option<tokio::sync::mpsc::UnboundedSender<ChatPersistenceRequest>>,
+        persistence: Option<tokio::sync::mpsc::UnboundedSender<ChatDaemonRequest>>,
     ) -> Self {
         let view = session.view();
         let needs_initial_sync = view.snapshot.is_none();
@@ -506,6 +479,9 @@ impl ActiveChat {
                 .or_else(|| context.as_ref().map(|context| context.session.harness_kind))
             {
                 state.set_harness_kind(harness_kind);
+            }
+            if let Some(context) = context.as_ref() {
+                state.set_review_config(context.config.review.clone());
             }
             state.set_session_modes(
                 snapshot
@@ -617,24 +593,7 @@ impl ActiveChat {
                 );
             }
         }
-        let workspace_id = context
-            .as_ref()
-            .map(|context| context.session.workspace_id.clone())
-            .unwrap_or_default();
-        let turn_review_settings = crate::hel_database::turn_review_settings(&workspace_id)
-            .unwrap_or_else(|error| {
-                tracing::debug!(error = %format!("{error:#}"), "could not read the review settings");
-                crate::hel_database::TurnReviewSettings::default()
-            });
-        let mut turn_review_state = crate::hel_database::turn_review_state(session.session_id())
-            .unwrap_or_else(|error| {
-                tracing::debug!(error = %format!("{error:#}"), "could not read the review state");
-                crate::hel_database::TurnReviewState::default()
-            });
-        let restart_cancelled_review = turn_review_state.active.take().is_some();
-        state.set_turn_review_settings(turn_review_settings);
-        let phase = state.phase();
-        let mut chat = Self {
+        let chat = Self {
             state,
             session,
             session_manager: control,
@@ -654,25 +613,11 @@ impl ActiveChat {
             reconnect_notice_pending_sync: false,
             reviewer_generation,
             resuming_reviewer: None,
-            turn_review_settings,
-            turn_review_state,
-            last_phase: phase,
+            reviewed_roles: BTreeSet::new(),
             persistence,
         };
         if chat.state.second_opinion_split() {
             chat.poll_reviewer_events();
-        }
-        if restart_cancelled_review {
-            // A review that was running when the daemon stopped is not
-            // resumed: the baseline never advanced, so the next review covers
-            // the same change, and half a multi-agent fan-out is not worth
-            // rebuilding.
-            chat.state
-                .set_notice("A turn review was cancelled when Hel restarted");
-            chat.persist_turn_review_state();
-        }
-        if chat.turn_review_settings.auto_review && chat.turn_review_state.baselines.is_empty() {
-            chat.initialize_review_baselines();
         }
         chat
     }
@@ -726,6 +671,7 @@ impl ActiveChat {
         if let Some(session) = session.filter(|session| session.id == context.session.id) {
             context.session = session.clone();
         }
+        self.state.set_review_config(config.review.clone());
     }
 
     /// The composer's current text. The surface saves this on detach so
@@ -790,7 +736,6 @@ impl ActiveChat {
             self.apply_session_view(view);
         }
         self.advance_review();
-        self.advance_turn_review();
     }
 
     /// Moves a review on when the planner has answered the context request.
@@ -834,322 +779,60 @@ impl ActiveChat {
         self.run_workflow_request(request);
     }
 
-    /// Starts a review when the turn that just finished changed something and
-    /// this workspace asked for reviews.
+    /// Shows whatever review the daemon is running for this session.
     ///
-    /// Every gate here exists to keep review synchronous and unsurprising. A
-    /// review only starts from an idle session with an empty prompt queue, so
-    /// it can hold the composer without stranding work the user already typed,
-    /// and never while another review owns the screen.
-    fn advance_turn_review(&mut self) {
-        let phase = self.state.phase();
-        let just_finished = self.last_phase == WorkerPhase::Running && phase == WorkerPhase::Idle;
-        self.last_phase = phase;
-        if !just_finished || !self.turn_review_settings.auto_review {
+    /// The terminal hosts no part of a review: it renders this view, reads the
+    /// reviewing roles' journals to show their transcripts, and sends
+    /// resolutions back. A review therefore survives this view closing.
+    pub fn apply_review_view(&mut self, view: Option<crate::hel_review::host::RuntimeReviewView>) {
+        let roles = view
+            .as_ref()
+            .map(|view| {
+                view.roles
+                    .iter()
+                    .map(|role| role.role.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.state.set_turn_review(view);
+        if self.state.turn_review().is_none() {
+            self.reviewed_roles.clear();
             return;
         }
-        self.start_turn_review(false);
-    }
-
-    /// Opens the review view and asks the worker what the turn changed.
-    fn start_turn_review(&mut self, manual: bool) {
-        if let Some(blocker) = self.state.turn_review_blocker() {
-            if manual {
-                self.state.set_notice(blocker);
-            }
-            return;
-        }
-        debug_assert!(
-            !self.state.second_opinion_active(),
-            "turn review and plan second opinion are mutually exclusive: one triggers at an \
-             idle session, the other at a mid-turn plan decision"
-        );
-        let Some(seed) = self.turn_review_seed() else {
-            return;
-        };
-        let (driver, requests) = crate::hel_review::driver::TurnReviewDriver::start(seed);
-        self.state.open_turn_review(driver);
-        // Recorded before any agent starts: the web control surface reads this
-        // row to hold its own prompts, and a daemon restart reads it to know a
-        // review was interrupted.
-        self.turn_review_state.active =
-            Some(serde_json::json!({ "opened_at_ordinal": self.state.latest_seq() }).to_string());
-        self.persist_turn_review_state();
-        self.run_review_requests(requests);
-    }
-
-    /// Everything about the finished turn the review needs before its capture
-    /// lands: what the user asked for, what the agent answered, and how far
-    /// the last completed review had read.
-    fn turn_review_seed(&self) -> Option<crate::hel_review::driver::TurnReviewSeed> {
-        let inputs = self
-            .state
-            .turn_review_inputs(self.turn_review_state.reviewed_through_ordinal);
-        Some(crate::hel_review::driver::TurnReviewSeed {
-            tier: self.turn_review_settings.tier,
-            task: inputs.task,
-            user_messages: inputs.user_messages,
-            initial_result: inputs.initial_result,
-            trajectory: inputs.trajectory,
-            baselines: self.turn_review_state.baselines.clone(),
-            through_ordinal: self.state.latest_seq(),
-            prior_review: self.turn_review_state.prior_review.clone(),
-        })
-    }
-
-    /// Runs what the review state machine asked for, in order.
-    fn run_review_requests(&mut self, requests: Vec<crate::hel_review::driver::ReviewRequest>) {
-        for request in requests {
-            self.run_review_request(request);
-        }
-    }
-
-    fn run_review_request(&mut self, request: crate::hel_review::driver::ReviewRequest) {
-        use crate::hel_review::driver::ReviewRequest;
-
-        match request {
-            ReviewRequest::CaptureDelta { baselines } => {
-                let session = self.session.clone();
-                let updates = self.chat_io_tx.clone();
-                tokio::spawn(async move {
-                    let result = match session
-                        .reviewer(ReviewerAction::CaptureDelta { baselines })
-                        .await
-                    {
-                        Ok(ReviewerOutcome::Delta { repositories }) => Ok(repositories),
-                        Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
-                        Err(error) => Err(format!("{error:#}")),
-                    };
-                    if let Err(error) = updates.send(ChatIoUpdate::TurnReviewDelta { result }) {
-                        tracing::debug!(%error, "review capture dropped because the chat closed");
-                    }
-                });
-            }
-            ReviewRequest::AnalyzeDelta { repositories } => {
-                let session = self.session.clone();
-                let updates = self.chat_io_tx.clone();
-                tokio::spawn(async move {
-                    let result = match session
-                        .reviewer(ReviewerAction::AnalyzeDelta { repositories })
-                        .await
-                    {
-                        Ok(ReviewerOutcome::ChangedFunctions { packet }) => Ok(packet),
-                        Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
-                        Err(error) => Err(format!("{error:#}")),
-                    };
-                    if let Err(error) = updates.send(ChatIoUpdate::TurnReviewAnalysis { result }) {
-                        tracing::debug!(%error, "review analysis dropped because the chat closed");
-                    }
-                });
-            }
-            ReviewRequest::StartRole { role, fresh } => self.start_review_role(role, fresh),
-            ReviewRequest::PromptRole {
-                role,
-                command_id,
-                prompt,
-            } => {
-                self.submit_to_review_role(role.clone(), command_id, prompt);
+        // One reader per role, started the first time the daemon names it.
+        for role in roles {
+            if self.reviewed_roles.insert(role.clone()) {
                 self.poll_turn_review_role(&role);
             }
-            ReviewRequest::PromptPrimary { command_id, prompt } => {
-                queue_chat_remote_operation(
-                    self.remote.operations(),
-                    ChatRemoteOperation::Prompt {
-                        command_id,
-                        text: prompt,
-                    },
-                    &mut self.state,
-                );
-            }
-            ReviewRequest::PauseRole { role } => self.pause_review_role(role),
-            ReviewRequest::AdvanceBaseline {
-                trees,
-                reviewed_through_ordinal,
-            } => {
-                self.turn_review_state.baselines = trees.clone();
-                self.turn_review_state.reviewed_through_ordinal = reviewed_through_ordinal;
-                self.turn_review_state.active = None;
-                self.persist_turn_review_state();
-                let session = self.session.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = session
-                        .reviewer(ReviewerAction::AdvanceBaseline { trees })
-                        .await
-                    {
-                        // The controller's copy is what the next capture is
-                        // taken against; the worker-side ref is only a gc pin,
-                        // so a failure here costs nothing but the pin.
-                        tracing::debug!(
-                            error = %format!("{error:#}"),
-                            "the review baseline ref could not be pinned"
-                        );
-                    }
+        }
+    }
+
+    /// Mirrors `[review]` into the view, from the config the dashboard drains.
+    pub fn set_review_config(&mut self, review: crate::hel_config::ReviewConfig) {
+        self.state.set_review_config(review);
+    }
+
+    /// Asks the daemon to review the turn that just finished.
+    fn request_turn_review(&mut self) {
+        let session_id = self.session.session_id().to_owned();
+        self.state.set_notice("Starting a review…");
+        self.send_daemon_request(ChatDaemonRequest::StartTurnReview { session_id });
+    }
+
+    /// Sends one resolution to the daemon, which owns the review.
+    fn run_turn_review(&mut self, intent: crate::hel_chat::TurnReviewRequest) {
+        use crate::hel_chat::TurnReviewRequest;
+
+        let session_id = self.session.session_id().to_owned();
+        match intent {
+            TurnReviewRequest::Start => self.request_turn_review(),
+            TurnReviewRequest::Resolve(resolution) => {
+                self.send_daemon_request(ChatDaemonRequest::ResolveTurnReview {
+                    session_id,
+                    resolution,
                 });
             }
-            ReviewRequest::RecordPriorReview { prior } => {
-                self.turn_review_state.prior_review = Some(prior);
-                self.persist_turn_review_state();
-            }
-            ReviewRequest::ClearPriorReview => {
-                self.turn_review_state.prior_review = None;
-                self.persist_turn_review_state();
-            }
-            ReviewRequest::Close => {
-                let notice = self
-                    .state
-                    .turn_review()
-                    .and_then(|review| crate::hel_chat::resolution_notice(review.driver.phase()));
-                self.state.close_turn_review();
-                self.turn_review_state.active = None;
-                self.persist_turn_review_state();
-                if let Some(notice) = notice {
-                    self.state.set_notice(notice);
-                }
-            }
         }
-    }
-
-    /// Starts one reviewing role's harness, asking the user which harness
-    /// reviews when the workspace has not chosen one yet.
-    fn start_review_role(&mut self, role: String, fresh: bool) {
-        let Some(context) = self.context.as_ref() else {
-            self.fail_turn_review("this session cannot start a reviewer");
-            return;
-        };
-        let workspace_id = context.session.workspace_id.clone();
-        let defaults = crate::hel_database::reviewer_defaults().unwrap_or_default();
-        // A remembered profile that is no longer configured is not carried
-        // forward; the waterfall asks again instead.
-        let configured = context.config.profiles.clone();
-        let remembered = defaults
-            .profile(&workspace_id)
-            .filter(|id| configured.contains_key(*id))
-            .map(str::to_owned);
-        let Some(profile_id) = remembered else {
-            self.open_turn_review_setup(role, workspace_id, defaults);
-            return;
-        };
-        let model = remembered_value(defaults.model(&workspace_id, &profile_id));
-        let effort = remembered_value(
-            defaults.effort(
-                &workspace_id,
-                &profile_id,
-                model
-                    .as_deref()
-                    .unwrap_or(crate::hel_second_opinion::HARNESS_DEFAULT_VALUE),
-            ),
-        );
-        self.launch_review_role(role, profile_id, model, effort, fresh);
-    }
-
-    /// Puts the reviewer waterfall over the review, so the user chooses which
-    /// harness reviews before anything starts.
-    fn open_turn_review_setup(
-        &mut self,
-        role: String,
-        workspace_id: String,
-        defaults: crate::hel_second_opinion::ReviewerDefaults,
-    ) {
-        let profiles = self.reviewer_profiles();
-        if profiles.is_empty() {
-            self.fail_turn_review(
-                "no other harness profile is configured, so nothing can review this turn",
-            );
-            return;
-        }
-        let setup = ReviewerSetup::new(workspace_id, profiles, defaults);
-        let Some(review) = self.state.turn_review_mut() else {
-            return;
-        };
-        review.pending_role = Some(role);
-        review.setup = Some(Box::new(setup));
-    }
-
-    /// Stages the chosen profile and starts the reviewer under it.
-    fn launch_review_role(
-        &mut self,
-        role: String,
-        profile_id: String,
-        model: Option<String>,
-        effort: Option<String>,
-        fresh: bool,
-    ) {
-        let Some(context) = self.context.as_ref() else {
-            self.fail_turn_review("this session cannot start a reviewer");
-            return;
-        };
-        let controller = reviewer_staging_controller(context);
-        let session_id = self.session.session_id().to_owned();
-        let session = self.session.clone();
-        let updates = self.chat_io_tx.clone();
-        let repositories = self
-            .state
-            .turn_review()
-            .map(|review| review.driver.repository_roots())
-            .unwrap_or_default();
-        // A specialist lane's analyzers are its identity, so it gets the
-        // `slopcop` set as well as navigation; every other role navigates and
-        // reads rather than running analyzers. The intent analyst gets no
-        // tools at all: it reads the user's messages, not the code.
-        let lane = crate::hel_review::lanes::lane_by_id(&role).is_some();
-        let intent = role == crate::hel_review::driver::INTENT_ROLE;
-        let mcp_servers = if intent {
-            Vec::new()
-        } else {
-            crate::hel_review::bifrost::review_mcp_servers(
-                &repositories,
-                if lane {
-                    crate::hel_review::lanes::LANE_BIFROST_TOOLSET
-                } else {
-                    crate::hel_review::lanes::SUPERVISOR_BIFROST_TOOLSET
-                },
-            )
-        };
-        // Only the supervisor may launch specialists.
-        let dispatch_tool = role == crate::hel_review::driver::SUPERVISOR_ROLE;
-        // A fresh role must not reuse the running harness session: the
-        // validator judges the reviewer's claims against source, so it must
-        // not inherit them. Bumping the generation is what the sidecar reads
-        // as "this is a different reviewer".
-        if fresh {
-            self.reviewer_generation = self.reviewer_generation.saturating_add(1);
-        }
-        let generation = self.reviewer_generation;
-        tokio::spawn(async move {
-            let staged = tokio::task::spawn_blocking(move || {
-                controller.stage_reviewer_profile_with_mcp(
-                    &session_id,
-                    &profile_id,
-                    generation,
-                    &mcp_servers,
-                    dispatch_tool,
-                )
-            })
-            .await;
-            let result = async {
-                let mut config = match staged {
-                    Ok(Ok(config)) => config,
-                    Ok(Err(error)) => return Err(format!("{error:#}")),
-                    Err(error) => return Err(format!("staging the reviewer stopped: {error}")),
-                };
-                config.model = model;
-                config.effort = effort;
-                match session
-                    .reviewer(ReviewerAction::Start {
-                        config: Box::new(config),
-                    })
-                    .await
-                {
-                    Ok(ReviewerOutcome::Started(_)) => Ok(()),
-                    Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
-                    Err(error) => Err(format!("{error:#}")),
-                }
-            }
-            .await;
-            if let Err(error) = updates.send(ChatIoUpdate::TurnReviewRoleStarted { role, result }) {
-                tracing::debug!(%error, "review role result dropped because the chat closed");
-            }
-        });
     }
 
     /// The configured profiles a reviewer can run under. The waterfall offers
@@ -1170,234 +853,27 @@ impl ActiveChat {
             .collect()
     }
 
-    /// Sends one prompt to one reviewing role.
-    fn submit_to_review_role(&mut self, role: String, command_id: String, prompt: String) {
-        let session = self.session.clone();
-        let updates = self.chat_io_tx.clone();
-        tokio::spawn(async move {
-            let result = session
-                .reviewer_as(
-                    Some(role),
-                    ReviewerAction::Submit {
-                        command_id,
-                        command: crate::hel_worker::RelayCommand::Prompt {
-                            prompt: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
-                                agent_client_protocol::schema::v1::TextContent::new(prompt),
-                            )],
-                        },
-                    },
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| format!("{error:#}"));
-            if let Err(error) = updates.send(ChatIoUpdate::ReviewerStarted(result)) {
-                tracing::debug!(%error, "reviewer prompt result dropped");
-            }
-        });
-    }
-
-    /// Stops one reviewing role's harness, keeping its staged profile.
-    fn pause_review_role(&self, role: String) {
-        let session = self.session.clone();
-        tokio::spawn(async move {
-            if let Err(error) = session.reviewer_as(Some(role), ReviewerAction::Pause).await {
-                tracing::debug!(error = %format!("{error:#}"), "pausing a review role failed");
-            }
-        });
-    }
-
-    /// Folds a capture into the review, or fails it when the worker could not
-    /// take one.
-    fn apply_turn_review_delta(
-        &mut self,
-        result: std::result::Result<Vec<crate::hel_worker::RepoDelta>, String>,
-    ) {
-        let deltas = match result {
-            Ok(deltas) => deltas,
-            Err(error) => {
-                self.fail_turn_review(format!("the change could not be captured: {error}"));
-                return;
-            }
-        };
-        let Some(review) = self.state.turn_review_mut() else {
+    /// Hands one request to the daemon bridge, or reports that this chat has
+    /// none: a chat without a bridge cannot reach the daemon at all, and
+    /// silently dropping a review action would leave the pane sitting there.
+    fn send_daemon_request(&mut self, request: ChatDaemonRequest) {
+        let Some(persistence) = &self.persistence else {
+            self.state
+                .set_notice("This chat cannot reach the Mjolnir daemon");
             return;
         };
-        let requests = review.driver.delta_captured(deltas);
-        self.run_review_requests(requests);
-    }
-
-    /// Ends a review that cannot continue. Every failure path is the same: a
-    /// verdict the user dismisses, and a baseline that stays where it was, so
-    /// the change is reviewed again rather than silently skipped.
-    fn fail_turn_review(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        let Some(review) = self.state.turn_review_mut() else {
-            return;
-        };
-        review.report_failure(message.clone());
-        let requests = review.driver.request_failed(message);
-        self.run_review_requests(requests);
-    }
-
-    /// Records how far this session has been reviewed.
-    fn persist_turn_review_state(&self) {
-        let session_id = self.session.session_id().to_owned();
-        let state = self.turn_review_state.clone();
-        if let Some(persistence) = &self.persistence {
-            if let Err(error) =
-                persistence.send(ChatPersistenceRequest::SaveTurnReviewState { session_id, state })
-            {
-                tracing::warn!(%error, "could not queue the review state for persistence");
-            }
-        } else if let Err(error) =
-            crate::hel_database::save_turn_review_state(self.session.session_id(), &state)
-        {
-            tracing::debug!(error = %format!("{error:#}"), "could not record the review state");
+        if let Err(error) = persistence.send(request) {
+            tracing::warn!(%error, "a review request could not be queued for the daemon");
+            self.state.set_notice("The Mjolnir daemon is not reachable");
         }
     }
 
-    /// Turns auto-review on or off for this session's workspace.
-    fn set_turn_review_settings(&mut self, settings: crate::hel_database::TurnReviewSettings) {
-        let Some(workspace_id) = self
-            .context
-            .as_ref()
-            .map(|context| context.session.workspace_id.clone())
-        else {
-            return;
-        };
-        let enabling = settings.auto_review && !self.turn_review_settings.auto_review;
-        self.turn_review_settings = settings;
-        self.state.set_turn_review_settings(settings);
-        if let Some(persistence) = &self.persistence {
-            if let Err(error) = persistence.send(ChatPersistenceRequest::SaveTurnReviewSettings {
-                workspace_id: workspace_id.clone(),
-                settings,
-            }) {
-                tracing::warn!(%error, "could not queue the review settings for persistence");
-            }
-        } else if let Err(error) =
-            crate::hel_database::save_turn_review_settings(&workspace_id, settings)
-        {
-            tracing::debug!(error = %format!("{error:#}"), "could not record the review settings");
-        }
-        self.state.set_notice(if settings.auto_review {
-            format!(
-                "Reviewing every completed turn ({} tier)",
-                settings.tier.label()
-            )
-        } else {
-            "Turn review is off".to_owned()
-        });
-        if enabling {
-            self.initialize_review_baselines();
-        }
-    }
-
-    /// Records the current trees as the review baseline, so the first review
-    /// covers what happens after the switch rather than everything already in
-    /// the working tree.
-    fn initialize_review_baselines(&mut self) {
-        if !self.turn_review_state.baselines.is_empty() {
-            return;
-        }
-        let session = self.session.clone();
-        let updates = self.chat_io_tx.clone();
-        tokio::spawn(async move {
-            let result = match session
-                .reviewer(ReviewerAction::CaptureDelta {
-                    baselines: std::collections::BTreeMap::new(),
-                })
-                .await
-            {
-                Ok(ReviewerOutcome::Delta { repositories }) => {
-                    Ok(crate::hel_review::delta::captured_trees(&repositories))
-                }
-                Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
-                Err(error) => Err(format!("{error:#}")),
-            };
-            if let Err(error) = updates.send(ChatIoUpdate::TurnReviewBaselines { result }) {
-                tracing::debug!(%error, "review baseline dropped because the chat closed");
-            }
-        });
-    }
-
-    fn store_review_baselines(
-        &mut self,
-        trees: std::collections::BTreeMap<std::path::PathBuf, String>,
-    ) {
-        if !self.turn_review_state.baselines.is_empty() {
-            return;
-        }
-        self.turn_review_state.baselines = trees.clone();
-        self.turn_review_state.reviewed_through_ordinal = self.state.latest_seq();
-        self.persist_turn_review_state();
-        let session = self.session.clone();
-        tokio::spawn(async move {
-            if let Err(error) = session
-                .reviewer(ReviewerAction::AdvanceBaseline { trees })
-                .await
-            {
-                tracing::debug!(
-                    error = %format!("{error:#}"),
-                    "the review baseline ref could not be pinned"
-                );
-            }
-        });
-    }
-
-    /// Runs what the turn-review view asked for.
-    fn run_turn_review(&mut self, intent: crate::hel_chat::TurnReviewRequest) {
-        use crate::hel_chat::TurnReviewRequest;
-
-        match intent {
-            TurnReviewRequest::Setup(requests) => {
-                for request in requests {
-                    self.run_setup_request(request);
-                }
-            }
-            TurnReviewRequest::Confirmed {
-                profile_id,
-                model,
-                effort,
-            } => {
-                if let Some(context) = self.context.as_ref() {
-                    let selection = ReviewerSelection {
-                        profile_id: profile_id.clone(),
-                        model: model.clone(),
-                        effort: effort.clone(),
-                    };
-                    self.remember_reviewer_selection(
-                        context.session.workspace_id.clone(),
-                        selection,
-                    );
-                }
-                let role = self
-                    .state
-                    .turn_review_mut()
-                    .and_then(|review| review.pending_role.take())
-                    .unwrap_or_else(|| crate::hel_review::driver::REVIEWER_ROLE.to_owned());
-                self.launch_review_role(role, profile_id, model, effort, true);
-            }
-            TurnReviewRequest::Requests(requests) => self.run_review_requests(requests),
-            TurnReviewRequest::Closed => {}
-        }
-    }
-
-    /// Remembers which harness this workspace reviews with.
-    fn remember_reviewer_selection(&self, workspace_id: String, selection: ReviewerSelection) {
-        if let Some(persistence) = &self.persistence {
-            if let Err(error) =
-                persistence.send(ChatPersistenceRequest::RememberReviewerSelection {
-                    workspace_id,
-                    selection,
-                })
-            {
-                tracing::warn!(%error, "could not queue the reviewer choice for persistence");
-            }
-        } else if let Err(error) =
-            crate::hel_database::remember_reviewer_selection(&workspace_id, &selection)
-        {
-            tracing::debug!(%error, "could not remember the reviewer choice");
+    /// Reports a daemon refusal in the review pane, or as a notice when no
+    /// review is open -- a refused `/review` has nowhere else to appear.
+    pub fn report_review_refusal(&mut self, message: String) {
+        match self.state.turn_review_mut() {
+            Some(review) => review.report_failure(message),
+            None => self.state.set_notice(message),
         }
     }
 
@@ -1435,7 +911,7 @@ impl ActiveChat {
                     if let Some(view) = self.state.second_opinion_mut() {
                         view.report_failure(error);
                     } else {
-                        self.fail_turn_review(error);
+                        self.report_review_refusal(error);
                     }
                 }
                 return;
@@ -1444,76 +920,8 @@ impl ActiveChat {
                 self.apply_reviewer_events(result);
                 return;
             }
-            ChatIoUpdate::TurnReviewDelta { result } => {
-                self.apply_turn_review_delta(result);
-                return;
-            }
-            ChatIoUpdate::TurnReviewAnalysis { result } => {
-                let Some(review) = self.state.turn_review_mut() else {
-                    return;
-                };
-                let requests = review.driver.analysis_completed(result);
-                self.run_review_requests(requests);
-                return;
-            }
-            ChatIoUpdate::TurnReviewRoleStarted { role, result } => {
-                match result {
-                    Ok(()) => {
-                        let Some(review) = self.state.turn_review_mut() else {
-                            return;
-                        };
-                        let requests = review.driver.role_started(&role);
-                        self.run_review_requests(requests);
-                        self.poll_turn_review_role(&role);
-                    }
-                    // A lane that cannot start is a coverage gap the
-                    // supervisor is told about; any other role failing to
-                    // start fails the review.
-                    Err(error) => {
-                        let lane = crate::hel_review::lanes::lane_by_id(&role).is_some();
-                        let Some(review) = self.state.turn_review_mut() else {
-                            return;
-                        };
-                        let requests = if lane {
-                            review.driver.lane_failed(&role, error)
-                        } else {
-                            review.driver.request_failed(error)
-                        };
-                        self.run_review_requests(requests);
-                    }
-                }
-                return;
-            }
             ChatIoUpdate::TurnReviewEvents { role, result } => {
                 self.apply_turn_review_role_events(role, result);
-                return;
-            }
-            ChatIoUpdate::TurnReviewDispatches { result } => {
-                match result {
-                    Ok(requests) => {
-                        let Some(review) = self.state.turn_review_mut() else {
-                            return;
-                        };
-                        let requests = review.driver.lanes_dispatched(requests);
-                        self.run_review_requests(requests);
-                    }
-                    // A dropped dispatch would leave the supervisor waiting for
-                    // lanes that never run, so it fails the review rather than
-                    // stalling it.
-                    Err(error) => self.fail_turn_review(format!(
-                        "the review could not collect the supervisor's specialists: {error}"
-                    )),
-                }
-                return;
-            }
-            ChatIoUpdate::TurnReviewBaselines { result } => {
-                match result {
-                    Ok(trees) => self.store_review_baselines(trees),
-                    Err(error) => tracing::debug!(
-                        %error,
-                        "the review baseline could not be initialized; the first review will cover the whole tree"
-                    ),
-                }
                 return;
             }
             update => update,
@@ -1784,9 +1192,8 @@ impl ActiveChat {
             ChatAction::SecondOpinion(intent) => {
                 self.run_second_opinion(intent);
             }
-            ChatAction::StartTurnReview => self.start_turn_review(true),
+            ChatAction::StartTurnReview => self.request_turn_review(),
             ChatAction::TurnReview(intent) => self.run_turn_review(intent),
-            ChatAction::SetTurnReviewSettings(settings) => self.set_turn_review_settings(settings),
             ChatAction::RespondReviewerElicitation {
                 role,
                 elicitation_id,
@@ -1977,7 +1384,7 @@ impl ActiveChat {
             reviewer_transcript: review.reviewer.transcript(),
         };
         if let Some(persistence) = &self.persistence {
-            if let Err(error) = persistence.send(ChatPersistenceRequest::SaveReview {
+            if let Err(error) = persistence.send(ChatDaemonRequest::SaveReview {
                 session_id: self.session.session_id().to_owned(),
                 review: stored,
             }) {
@@ -1993,7 +1400,7 @@ impl ActiveChat {
     /// Forgets a review that has finished, so nothing is restored for it.
     fn forget_review(&self) {
         if let Some(persistence) = &self.persistence {
-            if let Err(error) = persistence.send(ChatPersistenceRequest::ClearReview {
+            if let Err(error) = persistence.send(ChatDaemonRequest::ClearReview {
                 session_id: self.session.session_id().to_owned(),
             }) {
                 tracing::warn!(%error, "could not queue the finished review for persistence");
@@ -2091,12 +1498,10 @@ impl ActiveChat {
                 effort,
             };
             if let Some(persistence) = &self.persistence {
-                if let Err(error) =
-                    persistence.send(ChatPersistenceRequest::RememberReviewerSelection {
-                        workspace_id: context.session.workspace_id.clone(),
-                        selection,
-                    })
-                {
+                if let Err(error) = persistence.send(ChatDaemonRequest::RememberReviewerSelection {
+                    workspace_id: context.session.workspace_id.clone(),
+                    selection,
+                }) {
                     tracing::warn!(%error, "could not queue the reviewer choice for persistence");
                 }
             } else if let Err(error) = crate::hel_database::remember_reviewer_selection(
@@ -2354,24 +1759,6 @@ impl ActiveChat {
         });
     }
 
-    /// Collects the specialist lanes the supervisor asked for through its MCP
-    /// tool. The tool answers the supervisor at once and leaves the request in
-    /// the worker; this is where the controller picks it up and launches them.
-    fn poll_lane_dispatches(&self) {
-        let session = self.session.clone();
-        let updates = self.chat_io_tx.clone();
-        tokio::spawn(async move {
-            let result = match session.reviewer(ReviewerAction::TakeLaneDispatches).await {
-                Ok(ReviewerOutcome::LaneDispatches { requests }) => Ok(requests),
-                Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
-                Err(error) => Err(format!("{error:#}")),
-            };
-            if let Err(error) = updates.send(ChatIoUpdate::TurnReviewDispatches { result }) {
-                tracing::debug!(%error, "review dispatches dropped because the chat closed");
-            }
-        });
-    }
-
     /// Reports what the reviewer advertises back to the waterfall.
     ///
     /// A result from a probe the user has moved past is dropped by the state
@@ -2420,51 +1807,11 @@ impl ActiveChat {
         }
     }
 
-    /// Folds a page of reviewer events into whichever review is open.
+    /// Folds one reviewing role's events into its pane, and keeps reading.
     ///
-    /// The turn review reads the same journal as the plan review, but it
-    /// cannot take the pane's newest agent message as its answer: after the
-    /// validator starts, the reviewer's own findings are still the newest
-    /// message until the validator replies. The relay's completion record for
-    /// the exact command that was submitted is what settles it.
-    fn apply_turn_review_events(&mut self, role: &str, events: &[crate::hel_worker::RelayEvent]) {
-        let session_id = review_role_session_id(self.session.session_id(), role);
-        let Some(review) = self.state.turn_review_mut() else {
-            return;
-        };
-        if !events.is_empty() {
-            review.pane(role).apply_events(&session_id, events);
-        }
-        let Some(awaited) = review
-            .driver
-            .awaited_commands()
-            .into_iter()
-            .find(|(awaited_role, _)| awaited_role == role)
-            .map(|(_, command_id)| command_id)
-        else {
-            return;
-        };
-        let completed = events.iter().any(|event| {
-            matches!(
-                &event.observation,
-                crate::hel_worker::RelayObservation::CommandCompleted { command_id, outcome }
-                    if command_id == &awaited
-                        && matches!(
-                            outcome,
-                            crate::hel_worker::RelayCommandOutcome::Prompt { .. }
-                        )
-            )
-        });
-        if !completed {
-            return;
-        }
-        let answer = review.pane(role).latest_answer().unwrap_or_default();
-        let requests = review.driver.role_turn_completed(&awaited, &answer);
-        self.run_review_requests(requests);
-    }
-
-    /// Folds one role's events in, then keeps reading that role and, while the
-    /// supervisor is running, collects any lanes it dispatched.
+    /// Display only: the daemon reads the same journals to drive the review,
+    /// and nothing here advances it. Two readers on one journal are safe --
+    /// an attach is a read at a cursor, and only the host acknowledges.
     fn apply_turn_review_role_events(
         &mut self,
         role: String,
@@ -2473,33 +1820,33 @@ impl ActiveChat {
         let events = match result {
             Ok(events) => events,
             Err(error) => {
-                self.fail_turn_review(error);
+                // A journal this terminal cannot read is a display problem,
+                // not a review problem: the daemon is still running it.
+                tracing::debug!(%role, %error, "could not read a reviewing role's journal");
+                self.report_review_refusal(error);
                 return;
             }
         };
         let idle = events.is_empty();
-        self.apply_turn_review_events(&role, &events);
-        self.surface_reviewer_elicitations();
-        let Some(review) = self.state.turn_review() else {
-            return;
-        };
-        if review.driver.finished() {
-            return;
-        }
-        if review.driver.active_roles().contains(&role) {
-            self.poll_turn_review_role_after(
-                &role,
-                if idle {
-                    REVIEW_POLL_IDLE_INTERVAL
-                } else {
-                    Duration::ZERO
-                },
-            );
-        }
-        if role == crate::hel_review::driver::SUPERVISOR_ROLE && review.driver.supervisor_running()
+        let session_id = review_role_session_id(self.session.session_id(), &role);
+        if let Some(review) = self.state.turn_review_mut()
+            && !events.is_empty()
         {
-            self.poll_lane_dispatches();
+            review.pane(&role).apply_events(&session_id, &events);
         }
+        self.surface_reviewer_elicitations();
+        if self.state.turn_review().is_none() {
+            self.reviewed_roles.remove(&role);
+            return;
+        }
+        self.poll_turn_review_role_after(
+            &role,
+            if idle {
+                REVIEW_POLL_IDLE_INTERVAL
+            } else {
+                Duration::ZERO
+            },
+        );
     }
 
     /// Folds a page of reviewer events into the pane and keeps reading.
@@ -2659,25 +2006,8 @@ fn reviewer_staging_controller(context: &ChatSessionContext) -> crate::hel_contr
 impl Drop for ActiveChat {
     fn drop(&mut self) {
         self.cancel_dictation();
-        // A review lives in this view, so closing the view ends it. The
-        // in-flight row is what the web surface reads to hold its own
-        // prompts, and leaving it behind would hold them for ever; the
-        // baseline stays where it is, so the next review still covers this
-        // turn.
-        if self.state.turn_review_active() || self.turn_review_state.active.is_some() {
-            let requests = self
-                .state
-                .turn_review_mut()
-                .map(|review| review.driver.cancel())
-                .unwrap_or_default();
-            for request in requests {
-                if let crate::hel_review::driver::ReviewRequest::PauseRole { role } = request {
-                    self.pause_review_role(role);
-                }
-            }
-            self.turn_review_state.active = None;
-            self.persist_turn_review_state();
-        }
+        // A review outlives this view: the daemon owns it, so closing the
+        // terminal leaves it running and resolvable from the phone.
     }
 }
 
@@ -2770,11 +2100,7 @@ pub(super) fn render_in(
                 .map(super::turn_review::TurnReview::status)
                 .unwrap_or_default();
             let strip = chat.turn_review().and_then(super::turn_review::role_strip);
-            let title = super::turn_review::verdict_title(
-                chat.turn_review()
-                    .and_then(|review| review.driver.verdict()),
-            )
-            .to_owned();
+            let title = super::turn_review::verdict_title(chat.turn_review()).to_owned();
             if let Some(review) = chat.turn_review_mut() {
                 let (inner, top, total) = super::second_opinion::render_reviewer_titled(
                     frame,
@@ -2914,19 +2240,6 @@ pub(super) fn render_in(
         chat.frame_surfaces
             .push(SurfaceFrame::fixed(SurfaceId::AutocompletePopup, popup));
     }
-    if let Some(setup) = chat
-        .turn_review()
-        .and_then(|review| review.setup.as_deref())
-    {
-        // Choosing a reviewer owns the frame the same way the plan review's
-        // waterfall does, so the chat behind it stops being selectable.
-        let area = centered(inner, 60, 16);
-        let body = render_setup(frame, area, "Reviewing the change this turn made", setup);
-        chat.frame_surfaces.clear();
-        chat.frame_surfaces
-            .push(SurfaceFrame::fixed(SurfaceId::ModalBody, body));
-        return;
-    }
     if let Some(SecondOpinion::Setup { captured, setup }) = chat.second_opinion() {
         // The waterfall owns the frame's interaction, so the chat behind it
         // stops being selectable while a reviewer is being chosen.
@@ -3052,8 +2365,8 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
     }
     // Auto-review changes what happens when this turn ends, so the composer
     // says it is armed rather than surprising the user with a pane.
-    let review = chat.turn_review_settings();
-    if review.auto_review {
+    let review = chat.review_config();
+    if review.enabled && review.reviewer_profile().is_some() {
         parts.push(format!("review {}", review.tier.label()));
     }
     format!(" {} ", parts.join(" · "))
@@ -3552,6 +2865,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn review_status_configuration_is_applied_on_open_and_refresh() {
+        use crate::hel_review::lanes::ReviewTier;
+
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-review", 88);
+        let mut context = chat_context("session-review", &[]);
+        context.config.review = crate::hel_config::ReviewConfig {
+            enabled: true,
+            tier: ReviewTier::Extended,
+            profile: Some("reviewer-a".into()),
+            model: None,
+            effort: None,
+        };
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            Some(context),
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+        );
+
+        assert_eq!(
+            chat.state.review_config(),
+            &crate::hel_config::ReviewConfig {
+                enabled: true,
+                tier: ReviewTier::Extended,
+                profile: Some("reviewer-a".into()),
+                model: None,
+                effort: None,
+            }
+        );
+
+        let mut reloaded = HelConfig::default();
+        reloaded.review.profile = Some("reviewer-b".into());
+        chat.refresh_context(&reloaded, None);
+
+        assert_eq!(chat.state.review_config(), &reloaded.review);
+    }
+
     /// A failed recovery copy is the one thing the user has to see on opening
     /// the session, so it is raised after the connection notice a cold open
     /// also sets: a notice is a single slot, and the last write wins.
@@ -3576,42 +2931,6 @@ mod tests {
             chat.state.notice().as_deref(),
             Some("Recovery copy failed: the target ran out of disk")
         );
-    }
-
-    /// Auto-review is remembered per workspace, and the database refuses an
-    /// empty workspace id, so a chat that does not know its session's record
-    /// saved nothing at all.
-    #[tokio::test]
-    async fn changing_turn_review_settings_persists_under_the_sessions_workspace() {
-        let fixture =
-            crate::hel_session_manager::replacement_session_test_fixture("session-settings", 82);
-        let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut chat = ActiveChat::open_with_persistence(
-            fixture.stopped,
-            "bundle-1",
-            Some(chat_context("session-settings", &[])),
-            fixture.control,
-            SessionHeaderIdentity::default(),
-            String::new(),
-            Notices::default(),
-            Some(persistence_tx),
-        );
-
-        chat.set_turn_review_settings(crate::hel_database::TurnReviewSettings {
-            auto_review: true,
-            tier: crate::hel_review::lanes::ReviewTier::Quick,
-        });
-
-        match persistence_rx.try_recv() {
-            Ok(ChatPersistenceRequest::SaveTurnReviewSettings {
-                workspace_id,
-                settings,
-            }) => {
-                assert_eq!(workspace_id, CONTEXT_TEST_WORKSPACE);
-                assert!(settings.auto_review);
-            }
-            other => panic!("the settings are saved under the session's workspace, got {other:?}"),
-        }
     }
 
     /// A captured plan opens the waterfall over the profiles the context

@@ -233,7 +233,7 @@ impl Controller {
         }
     }
 
-    /// Verify a mount source on the host where Hel will consume it, and report
+    /// Verify a mount source on the host where Mjolnir will consume it, and report
     /// the filesystem reason it must be attached read-only, if there is one.
     ///
     /// The probe runs in the same round trip as the existence check so the
@@ -796,7 +796,7 @@ fn scp_command_spec(ssh: &SshTarget, source: &Path, remote: &str, recursive: boo
 }
 
 fn ssh_args_with_identity(args: &[String], identity: Option<&Path>) -> Vec<String> {
-    // Hel drives ssh non-interactively from a TUI; a host-key or password
+    // Mjolnir drives ssh non-interactively from a TUI; a host-key or password
     // prompt would steal the terminal and wedge provisioning. BatchMode fails
     // fast instead of prompting, and accept-new trusts a first-seen host key
     // (fresh EC2 instances are always first-seen) while still rejecting
@@ -1035,6 +1035,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         let mut controller = Controller {
             config: registration_config(),
@@ -1071,8 +1073,6 @@ mod tests {
     fn a_session_the_database_rejects_is_never_left_in_memory() {
         if std::env::var_os(UNPERSISTABLE_SESSION_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
-            // A directory where the database file belongs fails every write.
-            std::fs::create_dir(directory.path().join("mj.sqlite3")).unwrap();
             run_registration_child(
                 UNPERSISTABLE_SESSION_CHILD,
                 "a_session_the_database_rejects_is_never_left_in_memory",
@@ -1080,11 +1080,32 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         let mut controller = Controller {
             config: registration_config(),
             state: HelState::default(),
         };
+        // The store has to be healthy enough to open before it can reject a
+        // write: this test is about a write the database refuses, not about a
+        // store that cannot be opened at all, which now fails earlier and
+        // louder when the writer is installed. The first registration builds
+        // the schema the second one then loses.
+        controller
+            .register_session_with_resources(
+                "codex",
+                "project",
+                "podman",
+                "first",
+                launch_options(Vec::new()),
+            )
+            .expect("a healthy store registers a session");
+        rusqlite::Connection::open(crate::hel_database::database_path())
+            .unwrap()
+            .execute_batch("DROP TABLE sessions")
+            .unwrap();
+
         let error = controller
             .register_session_with_resources(
                 "codex",
@@ -1093,14 +1114,23 @@ mod tests {
                 "unpersistable",
                 launch_options(Vec::new()),
             )
-            .expect_err("an unwritable store cannot register a session");
+            .expect_err("a store that rejects the write cannot register a session");
         assert!(
-            format!("{error:#}").contains("Mjolnir database"),
+            format!("{error:#}").contains("sessions"),
             "unexpected error: {error:#}"
         );
-        assert!(
-            controller.state.sessions.is_empty(),
+        assert_eq!(
+            controller.state.sessions.len(),
+            1,
             "a session the database never accepted stayed in controller memory"
+        );
+        assert!(
+            controller
+                .state
+                .sessions
+                .values()
+                .all(|session| session.title != "unpersistable"),
+            "the rejected session is the one that stayed"
         );
     }
 
@@ -1119,6 +1149,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         let mut controller = Controller {
             config: registration_config(),
@@ -1162,6 +1194,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         let mut controller = Controller {
             config: registration_config(),

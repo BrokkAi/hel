@@ -2676,6 +2676,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // A connection that never comes back would hang the suite instead of
         // failing it, so turn a stall into a hard error.
@@ -2771,6 +2773,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // A barrier that never releases would hang the suite instead of failing
         // it, so turn a stall into a hard error.
@@ -2876,6 +2880,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // A rejected release that lost its barrier would hang the suite instead
         // of failing it, so turn a stall into a hard error.
@@ -2958,6 +2964,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // An abandoned barrier that never releases its connection would hang
         // the suite instead of failing it, so turn a stall into a hard error.
@@ -3027,6 +3035,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // A latch that never returns would hang the suite instead of failing
         // it, so turn a stall into a hard error.

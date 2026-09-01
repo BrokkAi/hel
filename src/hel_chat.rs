@@ -67,22 +67,51 @@ pub use rendering::truncate_line_to_width;
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
 use second_opinion::{SecondOpinion, SecondOpinionIntent};
 use transcript::{
-    TAIL_SEED_ITEMS, ToolDiffstatRequest, TranscriptAnchor, TranscriptRenderCache,
-    TranscriptSelectionSpace, content_block_text, materialized_chat_entries_reusing, plan_status,
-    tool_content_details, tool_diff_paths, tool_location_details, tool_status,
+    ToolDiffstatRequest, TranscriptAnchor, TranscriptRenderCache, TranscriptSelectionSpace,
+    content_block_text, materialized_chat_entries_reusing, plan_status, tool_content_details,
+    tool_diff_paths, tool_location_details, tool_status,
 };
 use turn_review::{TurnReview, TurnReviewIntent};
 
 const MOUSE_SCROLL_ROWS: usize = 3;
 
-pub use active::{ActiveChat, ChatPersistenceRequest};
+pub use active::{ActiveChat, ChatDaemonRequest};
 pub use second_opinion::SecondOpinionIntent as SecondOpinionRequest;
 pub use transcript::{
-    BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, format_event_time,
-    materialized_chunks_text, materialized_content_text, materialized_tool_diffstats,
-    render_agent_message_head, render_agent_message_tail,
+    BrowserTranscript, BrowserTranscriptEntry, TAIL_SEED_ITEMS, TranscriptSnapshot,
+    format_event_time, materialized_chunks_text, materialized_content_text,
+    materialized_tool_diffstats, render_agent_message_head, render_agent_message_tail,
 };
-pub use turn_review::{TurnReviewIntent as TurnReviewRequest, resolution_notice};
+pub use turn_review::TurnReviewIntent as TurnReviewRequest;
+
+/// What `/review status` reports, on every surface.
+///
+/// It answers the two questions a person actually has: is every turn reviewed,
+/// and is one being reviewed right now.
+#[must_use]
+pub fn review_status_line(review: &crate::hel_config::ReviewConfig, open: bool) -> String {
+    let armed = match (review.enabled, review.reviewer_profile()) {
+        (true, Some(profile)) => format!(
+            "Reviewing every completed turn with [review] profile {profile:?} ({} tier)",
+            review.tier.label()
+        ),
+        (true, None) => {
+            "[review] enabled = true but no profile is named, so nothing can review".to_owned()
+        }
+        (false, Some(profile)) => format!(
+            "Automatic review is off; /review reviews one turn with {profile:?} ({} tier)",
+            review.tier.label()
+        ),
+        (false, None) => {
+            "Turn review needs a reviewer: set [review] profile in config.toml".to_owned()
+        }
+    };
+    if open {
+        format!("{armed}. A review is open now.")
+    } else {
+        armed
+    }
+}
 
 /// Where a host surface has told the chat to draw itself.
 ///
@@ -162,9 +191,6 @@ pub enum ChatAction {
     StartTurnReview,
     /// Work the turn-review view asked the session to perform.
     TurnReview(TurnReviewIntent),
-    /// Turn auto-review on or off for this session's workspace, and choose how
-    /// thorough each review is.
-    SetTurnReviewSettings(crate::hel_database::TurnReviewSettings),
     /// An answer to a form a reviewing harness is waiting on. It is routed to
     /// the role that asked, never to the primary: a turn review can have
     /// several harnesses waiting at once.
@@ -182,15 +208,6 @@ pub enum ChatAction {
     CyclePaneLayout,
     OpenWebDialog,
     QuitDetach,
-}
-
-/// What a turn review reads out of the primary conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TurnReviewInputs {
-    pub(super) task: String,
-    pub(super) user_messages: Vec<crate::hel_review::lanes::UserMessage>,
-    pub(super) initial_result: String,
-    pub(super) trajectory: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,9 +378,9 @@ pub struct ChatState {
     turn_review: Option<Box<TurnReview>>,
     /// Where the turn review's action buttons sat on the last frame.
     turn_review_action_areas: Vec<(turn_review::ReviewAction, Rect)>,
-    /// This workspace's turn-review settings, mirrored here so `/review` can
-    /// toggle them and the composer can say what is on.
-    turn_review_settings: crate::hel_database::TurnReviewSettings,
+    /// What `[review]` says, mirrored from the config the TUI already drains,
+    /// so `/review status` and the composer title can report it.
+    review_config: crate::hel_config::ReviewConfig,
     /// Whether the dialog on screen belongs to the reviewer rather than the
     /// primary, so its answer is routed to the harness that asked.
     elicitation_is_reviewers: bool,
@@ -448,7 +465,7 @@ impl ChatState {
             second_opinion_sequence: 0,
             turn_review: None,
             turn_review_action_areas: Vec::new(),
-            turn_review_settings: crate::hel_database::TurnReviewSettings::default(),
+            review_config: crate::hel_config::ReviewConfig::default(),
             elicitation_is_reviewers: false,
             elicitation_role: None,
             goal_prompt_active: snapshot
@@ -900,90 +917,15 @@ impl ChatState {
         self.latest_seq
     }
 
-    /// Mirrors the workspace's review settings into the view, so `/review`
-    /// toggles from the current value rather than from a default.
-    pub(super) fn set_turn_review_settings(
-        &mut self,
-        settings: crate::hel_database::TurnReviewSettings,
-    ) {
-        self.turn_review_settings = settings;
+    /// Mirrors `[review]` into the view, so `/review status` and the composer
+    /// title report what the daemon is actually armed with.
+    pub fn set_review_config(&mut self, review: crate::hel_config::ReviewConfig) {
+        self.review_config = review;
     }
 
     #[must_use]
-    pub(super) fn turn_review_settings(&self) -> crate::hel_database::TurnReviewSettings {
-        self.turn_review_settings
-    }
-
-    /// Whether prompts are waiting to be sent. A turn review never starts
-    /// while any are: holding the composer would strand work the user has
-    /// already sent, and the review after the queue drains covers the whole
-    /// batch anyway.
-    pub(super) fn has_queued_prompts(&self) -> bool {
-        !self.queued_prompts.is_empty()
-    }
-
-    /// What a turn review knows about the conversation it is reviewing.
-    pub(super) fn turn_review_inputs(&self, reviewed_through_ordinal: u64) -> TurnReviewInputs {
-        // The session's opening prompt is the turn's stated task, which is
-        // what the review prompts call <original_task>.
-        let task = self
-            .entries
-            .iter()
-            .find(|entry| entry.role == ChatRole::User && !entry.text.trim().is_empty())
-            .map(|entry| entry.text.clone())
-            .unwrap_or_default();
-        let user_messages = self
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.role == ChatRole::User
-                    && entry.start_seq > reviewed_through_ordinal
-                    && !entry.text.trim().is_empty()
-                    // Hel's own generated prompts -- a forwarded review, a
-                    // plan-review context request -- are not user intent, and
-                    // reading them as intent would let a review grade the
-                    // agent against Hel's words.
-                    && !crate::hel_second_opinion::is_control_origin_prompt(&entry.text)
-            })
-            .map(|entry| crate::hel_review::lanes::UserMessage::prompt(entry.text.clone()))
-            .collect::<Vec<_>>();
-        let initial_result = self
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
-            .map(|entry| entry.text.clone())
-            .unwrap_or_default();
-        // A compact trajectory: what the agent said and which tools it ran,
-        // without tool output or edit diffs, which the captured patch already
-        // carries in full.
-        let trajectory = self
-            .entries
-            .iter()
-            .filter(|entry| entry.start_seq > reviewed_through_ordinal)
-            .filter_map(|entry| match entry.role {
-                ChatRole::Agent => Some(format!("agent: {}", entry.text.trim())),
-                ChatRole::Tool => Some(format!("tool: {}", entry.text.trim())),
-                ChatRole::User => Some(format!("user: {}", entry.text.trim())),
-                _ => None,
-            })
-            .filter(|line| !line.ends_with(": "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let task = if task.is_empty() {
-            user_messages
-                .first()
-                .map(|message| message.text.clone())
-                .unwrap_or_default()
-        } else {
-            task
-        };
-        TurnReviewInputs {
-            task,
-            user_messages,
-            initial_result,
-            trajectory,
-        }
+    pub(super) fn review_config(&self) -> &crate::hel_config::ReviewConfig {
+        &self.review_config
     }
 
     fn mark_prompt_submitted(&mut self, prompt: &str) {
@@ -1446,40 +1388,26 @@ impl ChatState {
                 LocalCommand::Review => {
                     self.record_prompt_history(&prompt);
                     self.clear_input();
-                    let settings = self.turn_review_settings;
+                    let review = &self.review_config;
                     return match args.trim().to_ascii_lowercase().as_str() {
                         // Bare `/review` reviews the turn that just finished,
-                        // whether or not the workspace reviews automatically.
+                        // whether or not automatic review is armed.
                         "" => ChatAction::StartTurnReview,
-                        "on" | "off" => ChatAction::SetTurnReviewSettings(
-                            crate::hel_database::TurnReviewSettings {
-                                auto_review: args.trim().eq_ignore_ascii_case("on"),
-                                ..settings
-                            },
-                        ),
-                        "quick" | "extended" => ChatAction::SetTurnReviewSettings(
-                            crate::hel_database::TurnReviewSettings {
-                                tier: crate::hel_review::lanes::ReviewTier::parse(args)
-                                    .unwrap_or(crate::hel_review::lanes::ReviewTier::Quick),
-                                ..settings
-                            },
-                        ),
+                        // Arming is configuration, not a session gesture: a
+                        // slash command that edited config.toml would change a
+                        // machine-wide setting from inside one conversation.
+                        "on" | "off" | "quick" | "extended" => {
+                            self.set_notice(
+                                "automatic review is configured in config.toml: [review] enabled, tier",
+                            );
+                            ChatAction::None
+                        }
                         "status" => {
-                            self.set_notice(if settings.auto_review {
-                                format!(
-                                    "Reviewing every completed turn ({} tier)",
-                                    settings.tier.label()
-                                )
-                            } else {
-                                format!(
-                                    "Turn review is off; /review reviews one turn ({} tier)",
-                                    settings.tier.label()
-                                )
-                            });
+                            self.set_notice(review_status_line(review, self.turn_review.is_some()));
                             ChatAction::None
                         }
                         _ => {
-                            self.set_notice("usage: /review [on|off|quick|extended|status]");
+                            self.set_notice("usage: /review [status]");
                             ChatAction::None
                         }
                     };

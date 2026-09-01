@@ -2117,6 +2117,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         /// Provisioning runs after the resumed record is persisted, so the
         /// durable mounts read here are the ones resume just committed.
@@ -2300,6 +2302,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         struct FailAfterWorktreeRestore;
 
@@ -2417,6 +2421,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         /// Real Git, no container runtime. Provisioning fails at preflight,
         /// after the conversion has already reshaped the record.

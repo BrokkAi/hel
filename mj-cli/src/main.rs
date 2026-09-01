@@ -28,7 +28,6 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::io;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -43,9 +42,7 @@ use crossterm::terminal::{
 };
 use hel::hel_config::{HelConfig, config_path};
 use hel::hel_controller::Controller;
-use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_state::{SessionState, TargetLocator};
 #[cfg(test)]
 use hel::hel_targets::ProcessExecutor;
 use hel::hel_worker_runtime::{
@@ -867,99 +864,6 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     }
 }
 
-fn target_uses_container(target: &TargetLocator) -> bool {
-    matches!(
-        target,
-        TargetLocator::LocalPodman { .. }
-            | TargetLocator::LocalDocker { .. }
-            | TargetLocator::AppleContainer { .. }
-            | TargetLocator::SshPodman { .. }
-    )
-}
-
-pub(crate) fn startup_greeting(controller: &Controller) -> String {
-    let active = controller
-        .state
-        .sessions
-        .values()
-        .filter(|session| session.state.is_active())
-        .collect::<Vec<_>>();
-    let raw_localhost_active = active
-        .iter()
-        .any(|session| matches!(session.target, Some(TargetLocator::LocalBare { .. })));
-    let container_active = active
-        .iter()
-        .any(|session| session.target.as_ref().is_some_and(target_uses_container));
-    let remote_active = active.iter().any(|session| {
-        matches!(
-            session.target,
-            Some(
-                TargetLocator::AwsEc2 { .. }
-                    | TargetLocator::SshBare { .. }
-                    | TargetLocator::SshPodman { .. }
-            )
-        )
-    });
-    let facts = GreetingFacts {
-        first_name: git_output(&["config", "--get", "user.name"])
-            .and_then(|name| name.split_whitespace().next().map(str::to_owned)),
-        returning: !controller.state.sessions.is_empty(),
-        profile_count: controller.config.profiles.len(),
-        active_sessions: active.len(),
-        stopped_sessions: controller
-            .state
-            .sessions
-            .values()
-            .filter(|session| session.state == SessionState::Stopped)
-            .count(),
-        raw_localhost_active,
-        container_active,
-        remote_active,
-        repository: repository_greeting_facts(),
-        ..GreetingFacts::default()
-    };
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    hel::hel_greeting::select(&facts, seed)
-}
-
-fn repository_greeting_facts() -> Option<RepositoryGreetingFacts> {
-    git_output(&["rev-parse", "--is-inside-work-tree"]).filter(|answer| answer == "true")?;
-    let status = git_output(&["status", "--porcelain=v1"])?;
-    let conflicted = git_output(&["diff", "--name-only", "--diff-filter=U"])
-        .is_some_and(|paths| !paths.is_empty());
-    let (ahead, behind) =
-        git_output(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
-            .and_then(|counts| {
-                let mut counts = counts.split_whitespace();
-                Some((
-                    counts.next()?.parse::<u64>().ok()?,
-                    counts.next()?.parse::<u64>().ok()?,
-                ))
-            })
-            .unwrap_or_default();
-    Some(RepositoryGreetingFacts {
-        clean: status.is_empty(),
-        dirty: !status.is_empty(),
-        ahead: ahead > 0 && behind == 0,
-        behind: behind > 0 && ahead == 0,
-        diverged_or_conflicted: conflicted || (ahead > 0 && behind > 0),
-    })
-}
-
-fn git_output(arguments: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(arguments)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
 /// The prefix every message uses when it names a session, so notices stay
 /// readable without losing which session they are about.
 pub(crate) fn short_id(id: &str) -> &str {
@@ -1088,7 +992,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hel::hel_state::{HelState, SessionRecord};
+    use hel::hel_state::{HelState, SessionRecord, SessionState};
 
     #[test]
     fn dashboard_runtime_does_not_wait_for_disposable_blocking_work() {
@@ -1184,16 +1088,6 @@ mod tests {
     fn short_session_ids_are_safe() {
         assert_eq!(short_id("0123456789"), "01234567");
         assert_eq!(short_id("tiny"), "tiny");
-    }
-
-    #[test]
-    fn docker_sessions_are_classified_as_container_backed_for_the_greeting() {
-        assert!(target_uses_container(&TargetLocator::LocalDocker {
-            container_id: "hel-session-12345678".into(),
-        }));
-        assert!(!target_uses_container(&TargetLocator::LocalBare {
-            worker_root: PathBuf::from("hel-worker"),
-        }));
     }
 
     #[test]

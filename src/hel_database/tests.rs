@@ -52,6 +52,123 @@ fn a_bounded_prompt_search_reports_that_it_stopped_early() {
     assert!(!all.truncated, "a complete answer reported itself partial");
 }
 
+/// The eviction the daemon performs depends on the typed cause reaching the
+/// refresher through `Controller::load`, which is three `anyhow` hops away.
+/// Nothing plumbs it; this pins that nothing has to.
+#[test]
+fn store_schema_mismatch_survives_the_controller_load_error_chain() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    drop(schema::open_writer(&database).unwrap());
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+        .unwrap();
+    drop(connection);
+    forget_verified_schema(&database);
+
+    let error = load_state_from(&database).unwrap_err();
+
+    let mismatch = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+        .expect("the mismatch survives every hop to the caller");
+    assert_eq!(mismatch.found, SCHEMA_VERSION + 1);
+    assert_eq!(mismatch.supported, SCHEMA_VERSION);
+}
+
+/// The writer verifies the schema once, when it opens. Issue #24 is what
+/// happens next: another process migrated the store, and this lane kept
+/// writing rows the store's new ladder does not expect. Every queued write is
+/// now refused with the reason.
+#[test]
+fn writer_refuses_a_projection_write_after_the_store_moves() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let owner = start_database_writer_at(&database, false).unwrap();
+    let writer = owner.writer.clone();
+    migrate_store_underneath(&database);
+
+    let mutation = MaterializedSessionMutation {
+        last_activity_at_ms: Some(105),
+        ..MaterializedSessionMutation::default()
+    };
+    let digest = event_digest(1);
+    let failure = writer
+        .execute("apply_projection_event", move |connection| {
+            apply_projection_page_with(connection, "session-1", |page| {
+                page.apply(1, RELAY_EVENT_GENESIS_DIGEST, &digest, &mutation)
+            })
+        })
+        .unwrap_err();
+
+    assert_mismatch(&failure);
+    // Read back on a raw connection: the store is ahead of this build now, so
+    // every reader this crate offers correctly refuses to open it.
+    let applied = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT applied_event_ordinal FROM materialized_sessions WHERE session_id = 'session-1'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        applied,
+        Some(0),
+        "the refused write left the projection where it was"
+    );
+    owner.shutdown().unwrap();
+}
+
+#[test]
+fn writer_refuses_a_read_receipt_after_the_store_moves() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let owner = start_database_writer_at(&database, false).unwrap();
+    let writer = owner.writer.clone();
+    migrate_store_underneath(&database);
+
+    let failure = writer
+        .execute("persist_read_receipt", move |connection| {
+            persist_read_receipt_with(connection, "client-1", DEFAULT_WORKSPACE_ID, "session-1", 0)
+        })
+        .unwrap_err();
+
+    assert_mismatch(&failure);
+    let receipts = Connection::open(&database)
+        .unwrap()
+        .query_row("SELECT count(*) FROM client_read_frontiers", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(receipts, 0, "the refused receipt wrote no row");
+    owner.shutdown().unwrap();
+}
+
+/// Moves the store's recorded schema forward the way another build's ladder
+/// would, under a writer that has already opened it.
+fn migrate_store_underneath(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+        .unwrap();
+    drop(connection);
+    forget_verified_schema(path);
+}
+
+fn assert_mismatch(failure: &anyhow::Error) {
+    let mismatch = failure
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+        .unwrap_or_else(|| panic!("the refusal names the divergence, got {failure:#}"));
+    assert_eq!(mismatch.found, SCHEMA_VERSION + 1);
+    assert_eq!(mismatch.supported, SCHEMA_VERSION);
+}
+
 #[test]
 fn database_writer_orders_jobs_and_survives_an_operation_error() {
     let directory = tempfile::tempdir().unwrap();
@@ -713,7 +830,6 @@ fn version_thirteen_restores_checkpointed_lost_sessions_to_recoverable_errors() 
 fn rewind_schema_to(connection: &Connection, version: i64) {
     for table in [
         "turn_review_state",
-        "turn_review_settings",
         "second_opinion_reviews",
         "second_opinion_defaults",
         "host_container_sizes",
@@ -2043,6 +2159,43 @@ fn queued_prompt_loader_does_not_deserialize_transcript_history() {
     assert!(load_materialized_session_from(&database, "session-1").is_err());
 }
 
+/// Seeding a conversation shows the end of it, so the reader must cost the
+/// rows it returns rather than the rows that exist. Corrupting the head proves
+/// the head is never touched.
+#[test]
+fn the_transcript_tail_reader_returns_the_end_without_reading_the_head() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    let materialized = materialized_session("session-1");
+    save_materialized_session_to(&database, &materialized).unwrap();
+    let connection = open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE materialized_transcript_items SET body_json = 'not-json' WHERE position <= 2",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let tail = load_materialized_transcript_tail_from(&database, "session-1", 2).unwrap();
+
+    assert_eq!(
+        tail.iter()
+            .map(|item| (item.stable_id.as_str(), item.position))
+            .collect::<Vec<_>>(),
+        vec![("tool:call-1", 3), ("plan:1", 4)]
+    );
+    // Asking for more than exists returns what exists, and the corrupt head is
+    // what makes that an error rather than a short read.
+    assert!(load_materialized_transcript_tail_from(&database, "session-1", 256).is_err());
+    assert!(
+        load_materialized_transcript_tail_from(&database, "unknown", 256)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// Resume compares frontiers to decide whether to rebuild a projection,
 /// and clears the queue without touching the transcript when it does not.
 #[test]
@@ -3069,59 +3222,6 @@ fn detached_drafts_keep_source_pid_and_workspace_without_overwriting_each_other(
 }
 
 #[test]
-fn turn_review_settings_default_to_off_and_persist_per_workspace() {
-    use crate::hel_review::lanes::ReviewTier;
-
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("hel.sqlite3");
-    save_session_to(&database, &session("session-1", "project-1")).unwrap();
-
-    // A workspace nobody configured reviews nothing: a review costs a second
-    // agent's turn, so it is opt-in.
-    let defaults = turn_review_settings_in(&database, "workspace-1").unwrap();
-    assert!(!defaults.auto_review);
-    assert_eq!(defaults.tier, ReviewTier::Quick);
-
-    save_turn_review_settings_in(
-        &database,
-        "workspace-1",
-        TurnReviewSettings {
-            auto_review: true,
-            tier: ReviewTier::Extended,
-        },
-    )
-    .unwrap();
-    let stored = turn_review_settings_in(&database, "workspace-1").unwrap();
-    assert!(stored.auto_review);
-    assert_eq!(stored.tier, ReviewTier::Extended);
-    // Writing again replaces the row rather than adding one.
-    save_turn_review_settings_in(
-        &database,
-        "workspace-1",
-        TurnReviewSettings {
-            auto_review: false,
-            tier: ReviewTier::Quick,
-        },
-    )
-    .unwrap();
-    assert!(
-        !turn_review_settings_in(&database, "workspace-1")
-            .unwrap()
-            .auto_review
-    );
-    // Another workspace keeps its own answer.
-    assert!(
-        !turn_review_settings_in(&database, "workspace-2")
-            .unwrap()
-            .auto_review
-    );
-    assert!(
-        save_turn_review_settings_in(&database, "  ", TurnReviewSettings::default()).is_err(),
-        "settings need a workspace to belong to"
-    );
-}
-
-#[test]
 fn review_baselines_survive_a_restart_and_a_restart_clears_a_running_review() {
     use crate::hel_review::lanes::PriorReviewContext;
 
@@ -3161,4 +3261,108 @@ fn review_baselines_survive_a_restart_and_a_restart_clears_a_running_review() {
     assert_eq!(restored.active, None);
     assert_eq!(restored.baselines, state.baselines);
     assert_eq!(restored.reviewed_through_ordinal, 42);
+}
+
+/// Arming review moved into `config.toml`, so the per-workspace row it used to
+/// live in is dropped rather than migrated: there is no defensible way to turn
+/// several workspaces' answers into one global one.
+#[test]
+fn migration_twenty_one_drops_the_workspace_review_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    // Rewound to exactly the schema this migration follows, with the table it
+    // drops present and populated, rather than through the broad rewind helper
+    // that other migration tests use: only migration 21 is under test here.
+    let connection = open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DELETE FROM schema_migrations WHERE version > 20;
+             PRAGMA user_version = 20;
+             CREATE TABLE turn_review_settings (
+                 workspace_id TEXT PRIMARY KEY,
+                 auto_review INTEGER NOT NULL,
+                 tier TEXT NOT NULL
+             ) STRICT;
+             INSERT INTO turn_review_settings VALUES ('workspace-1', 1, 'extended');",
+        )
+        .unwrap();
+    drop(connection);
+    forget_verified_schema(&database);
+
+    load_state_from(&database).unwrap();
+
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'turn_review_settings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "the workspace arming row is gone");
+    // Re-running the migration on an already-migrated database is safe.
+    drop(connection);
+    forget_verified_schema(&database);
+    load_state_from(&database).unwrap();
+}
+
+/// A review interrupted by a daemon restart is cancelled, not resumed, and the
+/// baseline it never advanced stays where it was.
+#[test]
+fn clearing_interrupted_reviews_keeps_every_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    save_session_to(&database, &session("session-2", "project-1")).unwrap();
+
+    let baselines = std::collections::BTreeMap::from([(
+        std::path::PathBuf::from("/workspace/app"),
+        "1234abcd".to_string(),
+    )]);
+    save_turn_review_state_in(
+        &database,
+        "session-1",
+        &TurnReviewState {
+            baselines: baselines.clone(),
+            reviewed_through_ordinal: 42,
+            prior_review: None,
+            active: Some("{\"opened_at_ordinal\":42}".to_string()),
+        },
+    )
+    .unwrap();
+    save_turn_review_state_in(
+        &database,
+        "session-2",
+        &TurnReviewState {
+            baselines: baselines.clone(),
+            reviewed_through_ordinal: 7,
+            prior_review: None,
+            active: None,
+        },
+    )
+    .unwrap();
+
+    let interrupted = clear_interrupted_turn_reviews_in(&database).unwrap();
+    assert_eq!(interrupted, vec!["session-1".to_string()]);
+
+    let restored = turn_review_state_in(&database, "session-1").unwrap();
+    assert_eq!(restored.active, None);
+    assert_eq!(
+        restored.baselines, baselines,
+        "the baseline is left alone, so the next review covers the same change"
+    );
+    assert_eq!(restored.reviewed_through_ordinal, 42);
+    assert!(
+        clear_interrupted_turn_reviews_in(&database)
+            .unwrap()
+            .is_empty(),
+        "a second sweep has nothing to clear"
+    );
 }

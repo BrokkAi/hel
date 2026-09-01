@@ -27,7 +27,7 @@ use crate::hel_workspace::{
     normalize_workspace_name,
 };
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -41,6 +41,39 @@ impl std::fmt::Display for ProjectionIntegrityError {
 }
 
 impl std::error::Error for ProjectionIntegrityError {}
+
+/// A store whose schema is not the one this build supports.
+///
+/// Carried as a typed cause rather than a message so the daemon can tell a
+/// store that moved underneath it from a transport failure. It survives every
+/// `anyhow` hop to the caller, which finds it with `error.chain()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreSchemaMismatch {
+    pub found: i64,
+    pub supported: i64,
+}
+
+impl std::fmt::Display for StoreSchemaMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { found, supported } = self;
+        // Direction decides the advice. A store ahead of this build cannot be
+        // migrated by starting a daemon of this build -- that is what the old
+        // single message told the user to do, for an hour.
+        if found > supported {
+            write!(
+                formatter,
+                "Mjolnir database schema {found} is newer than this Mjolnir build supports ({supported}); upgrade Mjolnir"
+            )
+        } else {
+            write!(
+                formatter,
+                "Mjolnir database schema {found} is not the supported schema {supported}; start the Mjolnir daemon to migrate it"
+            )
+        }
+    }
+}
+
+impl std::error::Error for StoreSchemaMismatch {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
@@ -92,10 +125,12 @@ use schema::{forget_verified_schema, table_has_column};
 use schema::{open, open_reader};
 
 const DATABASE_WRITE_QUEUE_CAPACITY: usize = 256;
-static DATABASE_WRITER_REQUIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
-type DatabaseWriteJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+/// A queued write, handed either the writer's connection or the reason it
+/// must not be used. The job -- not the lane -- decides what a refusal means
+/// to its caller.
+type DatabaseWriteJob =
+    Box<dyn FnOnce(std::result::Result<&mut Connection, StoreSchemaMismatch>) + Send + 'static>;
 
 enum DatabaseWriterMessage {
     Run {
@@ -136,7 +171,14 @@ impl DatabaseWriter {
             .send(DatabaseWriterMessage::Run {
                 label,
                 job: Box::new(move |connection| {
-                    let _ = reply_tx.send(operation(connection));
+                    let reply = match connection {
+                        Ok(connection) => operation(connection),
+                        // The mismatch travels as the operation's own failure,
+                        // so a refused write reports why rather than the
+                        // writer-stopped message a dropped reply would give.
+                        Err(mismatch) => Err(anyhow::Error::new(mismatch)),
+                    };
+                    let _ = reply_tx.send(reply);
                 }),
             })
             .map_err(|_| {
@@ -221,6 +263,22 @@ fn clear_database_writer(id: u64) {
     }
 }
 
+/// Install the process-wide writer for a test that owns its data directory.
+///
+/// Production installs this once, in the daemon, after `ControllerStoreGuard`
+/// establishes exclusivity, and the daemon is then the only process that
+/// writes. A test may do the same only because it re-execs itself with its own
+/// `MJ_DATA_DIR` and is therefore alone in its process — which is exactly why
+/// the tests that need this are shaped that way.
+///
+/// The returned owner has to be held for the rest of the test: dropping it
+/// stops the writer, and the next write fails with the message above.
+#[cfg(test)]
+#[must_use = "the writer stops when this owner is dropped"]
+pub(crate) fn install_isolated_test_writer() -> DatabaseWriterOwner {
+    start_database_writer().expect("install the writer for an isolated test child")
+}
+
 pub(crate) fn start_database_writer() -> Result<DatabaseWriterOwner> {
     start_database_writer_at(&database_path(), true)
 }
@@ -229,6 +287,7 @@ fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<Datab
     static NEXT_WRITER_ID: AtomicU64 = AtomicU64::new(1);
 
     let connection = schema::open_writer(path)?;
+    let path = path.to_owned();
     let (sender, receiver) = sync_channel(DATABASE_WRITE_QUEUE_CAPACITY);
     let (stopped_tx, stopped) = sync_channel(1);
     let id = NEXT_WRITER_ID.fetch_add(1, Ordering::Relaxed);
@@ -239,7 +298,6 @@ fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<Datab
             .unwrap_or_else(PoisonError::into_inner);
         ensure!(installed.is_none(), "database writer is already running");
         *installed = Some(writer.clone());
-        DATABASE_WRITER_REQUIRED.store(true, Ordering::Release);
     }
     let thread = match thread::Builder::new()
         .name("hel-database-writer".to_owned())
@@ -250,7 +308,16 @@ fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<Datab
                     match receiver.recv() {
                         Ok(DatabaseWriterMessage::Run { label, job }) => {
                             tracing::trace!(operation = label, "running database writer operation");
-                            job(&mut connection);
+                            // This connection verified the schema once, when it
+                            // opened. Another process can migrate the store
+                            // afterwards, and this lane would keep writing rows
+                            // a foreign ladder no longer expects. Re-read the
+                            // recorded version per job: it is one pragma
+                            // against an open connection.
+                            match writer_schema_state(&path, &connection, label) {
+                                Ok(()) => job(Ok(&mut connection)),
+                                Err(mismatch) => job(Err(mismatch)),
+                            }
                         }
                         Ok(DatabaseWriterMessage::Shutdown) => break Ok(()),
                         Err(error) => {
@@ -285,6 +352,47 @@ fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<Datab
     })
 }
 
+/// Whether the writer's own connection still sees the schema it opened.
+///
+/// A version that reads successfully and differs is divergence in either
+/// direction: a store rolled back under this connection is as foreign to it as
+/// one migrated forward. A pragma that fails to read is not divergence at all
+/// -- the connection is broken, and the job it is about to run reports its own
+/// I/O error, which is a truer message than a schema claim this code cannot
+/// support.
+fn writer_schema_state(
+    path: &Path,
+    connection: &Connection,
+    label: &'static str,
+) -> std::result::Result<(), StoreSchemaMismatch> {
+    let version: i64 = match connection.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!(
+                operation = label,
+                path = %path.display(),
+                error = %error,
+                "could not read the store's schema version before a write; running the operation"
+            );
+            return Ok(());
+        }
+    };
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    tracing::error!(
+        operation = label,
+        path = %path.display(),
+        found = version,
+        supported = SCHEMA_VERSION,
+        "the store's schema moved underneath this writer; refusing the operation"
+    );
+    Err(StoreSchemaMismatch {
+        found: version,
+        supported: SCHEMA_VERSION,
+    })
+}
+
 fn submit_database_write<T, F>(label: &'static str, operation: F) -> Result<T>
 where
     T: Send + 'static,
@@ -296,14 +404,15 @@ where
         .clone();
     if let Some(writer) = writer {
         writer.execute(label, operation)
-    } else if DATABASE_WRITER_REQUIRED.load(Ordering::Acquire) {
-        bail!("database writer is not available for operation {label}")
     } else {
-        // Unit tests and isolated library tools use temporary databases
-        // without starting the production daemon. Production callers install
-        // the writer immediately after acquiring ControllerStoreGuard.
-        let mut connection = schema::open_writer(&database_path())?;
-        operation(&mut connection)
+        // There is one way to write, and this is not it. In production the
+        // daemon installs the writer after `ControllerStoreGuard` establishes
+        // exclusivity, and it is the only process that writes; a caller
+        // reaching here has no exclusivity and would be competing with
+        // whatever does. This used to open `database_path()` directly, which
+        // meant any process without a writer silently wrote to — and migrated
+        // — the real user database as a side effect of doing something else.
+        bail!("database writer is not available for operation {label}")
     }
 }
 
@@ -1809,6 +1918,79 @@ fn last_materialized_agent_message(
     Ok((!text.trim().is_empty()).then_some((position, text)))
 }
 
+/// Read the newest `limit` transcript items for a session, oldest first.
+///
+/// A conversation view seeds itself from the tail and discards everything
+/// before it — `ChatState::from_materialized_tail` keeps `TAIL_SEED_ITEMS`
+/// and drops the rest — so reading the whole transcript to show the end of it
+/// is work proportional to history for a result that never was. On a real
+/// session that meant reading 28,066 rows to render 256.
+///
+/// The `materialized_transcript_position` index covers the ordering, so this
+/// costs the rows it returns rather than the rows that exist.
+pub fn load_materialized_transcript_tail(
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<Arc<TranscriptItem>>> {
+    load_materialized_transcript_tail_from(&database_path(), session_id, limit)
+}
+
+fn load_materialized_transcript_tail_from(
+    path: &Path,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<Arc<TranscriptItem>>> {
+    let connection = open_reader(path)?;
+    let mut statement = connection.prepare(
+        "SELECT stable_id, position, latest_content_event_ordinal, created_at_ms,
+                last_changed_at_ms, body_json
+         FROM materialized_transcript_items
+         WHERE session_id = ?1
+         ORDER BY position DESC, stable_id DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(params![session_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Option<u64>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The query walks the index backwards to bound what it reads; the caller
+    // wants the tail in the order it was written.
+    let mut items = rows
+        .into_iter()
+        .map(
+            |(
+                stable_id,
+                position,
+                latest_content_event_ordinal,
+                created_at_ms,
+                last_changed_at_ms,
+                body_json,
+            )| {
+                Ok(Arc::new(TranscriptItem {
+                    stable_id,
+                    position,
+                    latest_content_event_ordinal,
+                    created_at_ms,
+                    last_changed_at_ms,
+                    body: serde_json::from_str(&body_json).with_context(|| {
+                        format!("parse materialized transcript body for session {session_id}")
+                    })?,
+                }))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    items.reverse();
+    Ok(items)
+}
+
 /// Read only the projection's event frontier. Deciding whether a stored
 /// projection already matches an archive costs one row this way, instead of
 /// deserializing every transcript item to compare two integers.
@@ -2652,25 +2834,6 @@ fn clear_active_review_in(path: &Path, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a workspace reviews every completed turn, and how thoroughly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct TurnReviewSettings {
-    pub auto_review: bool,
-    pub tier: crate::hel_review::lanes::ReviewTier,
-}
-
-impl Default for TurnReviewSettings {
-    /// Off, and quick when switched on. A review costs a second agent's turn,
-    /// so a workspace opts in rather than out, and the cheaper tier is the one
-    /// that arrives first.
-    fn default() -> Self {
-        Self {
-            auto_review: false,
-            tier: crate::hel_review::lanes::ReviewTier::Quick,
-        }
-    }
-}
-
 /// How far this session has been reviewed.
 ///
 /// `baselines` are Git tree ids by repository root: the working tree as of the
@@ -2686,64 +2849,6 @@ pub struct TurnReviewState {
     /// A review that was running when the daemon stopped. On recovery it is
     /// cleared without advancing the baseline.
     pub active: Option<String>,
-}
-
-/// Turn-review settings for `workspace_id`, or the defaults when the workspace
-/// has never been configured.
-pub fn turn_review_settings(workspace_id: &str) -> Result<TurnReviewSettings> {
-    turn_review_settings_in(&database_path(), workspace_id)
-}
-
-fn turn_review_settings_in(path: &Path, workspace_id: &str) -> Result<TurnReviewSettings> {
-    let connection = open_reader(path)?;
-    let row = connection
-        .query_row(
-            "SELECT auto_review, tier FROM turn_review_settings WHERE workspace_id = ?1",
-            [workspace_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let Some((auto_review, tier)) = row else {
-        return Ok(TurnReviewSettings::default());
-    };
-    Ok(TurnReviewSettings {
-        auto_review: auto_review != 0,
-        tier: crate::hel_review::lanes::ReviewTier::parse(&tier)
-            .unwrap_or(crate::hel_review::lanes::ReviewTier::Quick),
-    })
-}
-
-/// Records a workspace's turn-review settings.
-pub fn save_turn_review_settings(workspace_id: &str, settings: TurnReviewSettings) -> Result<()> {
-    let workspace_id = workspace_id.to_owned();
-    submit_database_write("save_turn_review_settings", move |_| {
-        save_turn_review_settings_in(&database_path(), &workspace_id, settings)
-    })
-}
-
-fn save_turn_review_settings_in(
-    path: &Path,
-    workspace_id: &str,
-    settings: TurnReviewSettings,
-) -> Result<()> {
-    ensure!(
-        !workspace_id.trim().is_empty(),
-        "turn-review settings need a workspace"
-    );
-    let connection = open(path)?;
-    connection.execute(
-        "INSERT INTO turn_review_settings(workspace_id, auto_review, tier)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(workspace_id) DO UPDATE SET
-             auto_review = excluded.auto_review,
-             tier = excluded.tier",
-        params![
-            workspace_id,
-            i64::from(settings.auto_review),
-            settings.tier.label(),
-        ],
-    )?;
-    Ok(())
 }
 
 /// How far `session_id` has been reviewed, or a fresh state when it has never
@@ -2816,6 +2921,39 @@ fn save_turn_review_state_in(path: &Path, session_id: &str, state: &TurnReviewSt
         ],
     )?;
     Ok(())
+}
+
+/// Clears every session's in-flight review flag.
+///
+/// A review that was running when the daemon stopped is not resumed: the
+/// baseline never advanced, so the next review covers the same change, and half
+/// a multi-agent fan-out is not worth rebuilding. Baselines are deliberately
+/// left alone, which is what makes the interruption lossless. Returns the
+/// sessions whose review was interrupted, so the daemon can say so in each
+/// conversation.
+pub fn clear_interrupted_turn_reviews() -> Result<Vec<String>> {
+    submit_database_write("clear_interrupted_turn_reviews", move |_| {
+        clear_interrupted_turn_reviews_in(&database_path())
+    })
+}
+
+fn clear_interrupted_turn_reviews_in(path: &Path) -> Result<Vec<String>> {
+    let connection = open(path)?;
+    let interrupted = {
+        let mut statement = connection
+            .prepare("SELECT session_id FROM turn_review_state WHERE active IS NOT NULL")?;
+        let mut rows = statement.query([])?;
+        let mut interrupted = Vec::new();
+        while let Some(row) = rows.next()? {
+            interrupted.push(row.get::<_, String>(0)?);
+        }
+        interrupted
+    };
+    connection.execute(
+        "UPDATE turn_review_state SET active = NULL WHERE active IS NOT NULL",
+        [],
+    )?;
+    Ok(interrupted)
 }
 
 /// Marks this session's reviewer conversation as no longer continuable, and

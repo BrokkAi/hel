@@ -71,6 +71,7 @@ async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> 
         version: CONFIG_VERSION,
         newer_config_version: None,
         phone: Default::default(),
+        review: Default::default(),
         profiles: BTreeMap::from([(
             "claude-e2e".into(),
             HarnessProfile {
@@ -180,6 +181,7 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
         version: CONFIG_VERSION,
         newer_config_version: None,
         phone: Default::default(),
+        review: Default::default(),
         profiles: BTreeMap::from([(
             "kimi-e2e".into(),
             HarnessProfile {
@@ -296,6 +298,7 @@ async fn imported_grok_session_resumes_natively_async() -> anyhow::Result<()> {
         version: CONFIG_VERSION,
         newer_config_version: None,
         phone: Default::default(),
+        review: Default::default(),
         profiles: BTreeMap::from([(
             "grok-e2e".into(),
             HarnessProfile {
@@ -519,6 +522,7 @@ async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
         version: CONFIG_VERSION,
         newer_config_version: None,
         phone: Default::default(),
+        review: Default::default(),
         profiles: BTreeMap::from([(
             "codex-e2e".into(),
             HarnessProfile {

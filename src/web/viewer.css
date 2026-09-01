@@ -430,6 +430,27 @@ pre.entry-body {
   overscroll-behavior: contain;
 }
 
+/* A turn review under way, or waiting for the reader to answer its findings.
+ * It borrows the elicitation card's shape because it asks the same kind of
+ * question: something is blocked until you answer it. */
+.turn-review {
+  border-color: var(--plan);
+}
+
+.turn-review-roles {
+  margin: 6px 0;
+}
+
+.turn-review-findings {
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0 0 10px;
+  /* Findings scroll rather than pushing their own buttons off the screen. */
+  max-height: 40dvh;
+  overflow-y: auto;
+}
+
 .elicitation-field {
   display: flex;
   flex-direction: column;

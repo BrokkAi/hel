@@ -16,13 +16,16 @@ use hel::hel_controller::{
     SessionResumeOptions,
 };
 use hel::hel_credentials::CredentialSyncSignal;
+use hel::hel_database::StoreSchemaMismatch;
 use hel::hel_elicitation::ElicitationResponse;
+use hel::hel_review::driver::Resolution;
+use hel::hel_review::host::{RuntimeReviewView, TurnReviewHost};
 use hel::hel_session_manager::{
     ManagedSessionView, RemoteSessionPublisher, RemoteSessionRequest, SessionManagerChannels,
     SessionManagerControl, ViewError, spawn_remote_session_manager, spawn_session_manager,
 };
 use hel::hel_state::{
-    HostContainerSize, MaterializedSession, RecoveryObservation, RecoveryObserver, SessionRecord,
+    HostContainerSize, RecoveryObservation, RecoveryObserver, SessionRecord,
     SessionResourceAllocation, SessionState,
 };
 use hel::hel_targets::{
@@ -41,9 +44,27 @@ use crate::pollers::{
     reserve_recovery_or_cancel, spawn_interrupted_close_recovery,
 };
 
-pub(crate) const PROTOCOL_VERSION: u32 = 4;
+pub(crate) const PROTOCOL_VERSION: u32 = 5;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long a daemon is given to exit after it accepts a stop.
+///
+/// Stopping cancels a token and returns immediately; the daemon then unwinds
+/// its session manager, its phone server and its pollers. That is normally
+/// fast, but a daemon whose database has been migrated out from under it fails
+/// every read while it winds down and has been observed taking over five
+/// seconds — which the previous five-second bound missed by a fraction,
+/// reporting a stop that had in fact worked as `did not stop` and aborting the
+/// restart that depended on it.
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the epilogue is given before the process leaves anyway.
+///
+/// Every daemon exit -- stop, SIGTERM, idle, a store that moved underneath it
+/// -- unwinds through the same epilogue, and every step of it is bounded in
+/// practice. This makes "the daemon did not stop" impossible rather than
+/// unlikely, and it must stay well inside [`STOP_TIMEOUT`] so a client waiting
+/// on a stop sees the exit rather than its own deadline.
+const SHUTDOWN_FORCE_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_millis(40);
 
 fn metadata_path() -> PathBuf {
@@ -132,6 +153,9 @@ pub(crate) struct RuntimeSnapshot {
     pub records: Vec<SessionRecord>,
     pub sessions: Vec<RuntimeSessionView>,
     pub lifecycles: Vec<RuntimeLifecycleView>,
+    /// Reviews the daemon is running, so every surface renders the same one.
+    #[serde(default)]
+    pub reviews: Vec<RuntimeReviewView>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,14 +287,6 @@ enum DaemonAction {
         workspace_id: String,
         selection: hel::hel_second_opinion::ReviewerSelection,
     },
-    SaveTurnReviewState {
-        session_id: String,
-        state: hel::hel_database::TurnReviewState,
-    },
-    SaveTurnReviewSettings {
-        workspace_id: String,
-        settings: hel::hel_database::TurnReviewSettings,
-    },
     PersistImportedSession {
         session: Box<SessionRecord>,
     },
@@ -348,6 +364,15 @@ enum DaemonAction {
         role: Option<String>,
         action: hel::hel_session_manager::ReviewerAction,
     },
+    /// Review the turn this session just finished, on a surface's request.
+    StartTurnReview {
+        session_id: String,
+    },
+    /// Forward, dismiss, or cancel the open review.
+    ResolveTurnReview {
+        session_id: String,
+        resolution: Resolution,
+    },
     CloseSession {
         session_id: String,
     },
@@ -397,7 +422,6 @@ enum DaemonReply {
     Workspace(WorkspaceRecord),
     Snapshot(WorkspaceSnapshot),
     RuntimeSnapshot(RuntimeSnapshot),
-    MaterializedSession(MaterializedSession),
     RegisteredSession(Box<RegisteredSession>),
     Ordinal(u64),
     Text(String),
@@ -504,6 +528,11 @@ pub(crate) struct RuntimeState {
     controller_loader: fn() -> Result<Controller>,
     config_mutation: tokio::sync::Mutex<()>,
     recovery_observer: RecoveryObserver,
+    /// What `[review]` last said, republished by the target refresher.
+    review_config: Arc<Mutex<hel::hel_config::ReviewConfig>>,
+    /// Turn review runs here, in the process that owns every session, so a
+    /// review happens whether the terminal, the phone, or nobody is attached.
+    review_host: TurnReviewHost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -529,7 +558,6 @@ struct ActiveLifecycle {
 #[derive(Debug, Clone)]
 enum DaemonLifecycleResult {
     Done,
-    Materialized(Box<MaterializedSession>),
 }
 
 impl From<LifecycleKind> for RuntimeLifecycleKind {
@@ -574,6 +602,19 @@ impl RuntimeState {
         let initial_revision = u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap_or(1);
         let (revision_tx, _) = tokio::sync::watch::channel(initial_revision);
         let (workspaces_tx, _) = tokio::sync::watch::channel(workspaces);
+        // The host reads `[review]` at each trigger decision. The target
+        // refresher already reloads config.toml every 500 ms and installs the
+        // result here, so arming needs no reload machinery of its own.
+        let review_config = Arc::new(Mutex::new(controller.config.review.clone()));
+        let review_host = TurnReviewHost::spawn(session_manager.clone(), {
+            let installed = review_config.clone();
+            Arc::new(move || {
+                installed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            })
+        });
         Self {
             attachments: Mutex::new(BTreeMap::new()),
             phone_status: Mutex::new(WebViewerStatus::Starting),
@@ -588,7 +629,14 @@ impl RuntimeState {
             controller_loader,
             config_mutation: tokio::sync::Mutex::new(()),
             recovery_observer,
+            review_config,
+            review_host,
         }
+    }
+
+    /// The review host, for the surfaces that project and resolve reviews.
+    pub(crate) fn review_host(&self) -> &TurnReviewHost {
+        &self.review_host
     }
 
     pub(crate) fn allocate_revision(&self) -> u64 {
@@ -748,6 +796,12 @@ impl RuntimeState {
                 notice: active.notice.clone(),
             })
             .collect();
+        let reviews = self
+            .review_host
+            .views()
+            .into_iter()
+            .filter(|review| session_ids.contains(&review.session_id))
+            .collect();
         let controller = self
             .controller
             .lock()
@@ -759,6 +813,7 @@ impl RuntimeState {
             records,
             sessions,
             lifecycles,
+            reviews,
         })
     }
 
@@ -978,9 +1033,6 @@ impl RuntimeState {
         self.remove_completed_lifecycle(&channel);
         match outcome? {
             DaemonLifecycleResult::Done => Ok(()),
-            DaemonLifecycleResult::Materialized(_) => {
-                bail!("daemon create completed with an unexpected projection")
-            }
         }
     }
 
@@ -1034,38 +1086,34 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Resume a session, and return nothing.
+    ///
+    /// This used to answer with the whole `MaterializedSession`. That reply
+    /// travels as one JSON frame against `MAX_FRAME_BYTES`, so a session whose
+    /// projection outgrew 8 MiB could not be resumed at all — it built a
+    /// several-hundred-megabyte buffer and then refused to send it. The
+    /// projection is already durable; a viewer reads it from the store.
     pub(crate) async fn resume_session(
         self: &Arc<Self>,
         request: ResumeSessionRequest,
-    ) -> Result<MaterializedSession> {
+    ) -> Result<()> {
         let session_id = request.session_id.clone();
+        // Whether it is already running is a boolean. Answering it used to
+        // load the entire projection so it could be handed back as the reply.
         let already_running = blocking({
             let session_id = session_id.clone();
             move || {
                 let controller = Controller::load()?;
-                if controller
+                Ok(controller
                     .state
                     .sessions
                     .get(&session_id)
-                    .is_some_and(|session| session.state == SessionState::Running)
-                {
-                    Ok(Some(
-                        hel::hel_database::load_materialized_session(&session_id)?.with_context(
-                            || {
-                                format!(
-                                    "running session {session_id} has no materialized projection"
-                                )
-                            },
-                        )?,
-                    ))
-                } else {
-                    Ok(None)
-                }
+                    .is_some_and(|session| session.state == SessionState::Running))
             }
         })
         .await?;
-        if let Some(materialized) = already_running {
-            return Ok(materialized);
+        if already_running {
+            return Ok(());
         }
         let profile_id = request.profile_id.clone();
         let target_template_id = request.target_template_id.clone();
@@ -1104,7 +1152,11 @@ impl RuntimeState {
                         &executor,
                     )
                     .await?;
-                Ok(DaemonLifecycleResult::Materialized(Box::new(materialized)))
+                // The projection stays where it was written. A viewer reads
+                // it from the store; shipping it back through the daemon
+                // reply put a whole transcript in one IPC frame.
+                let _ = materialized;
+                Ok(DaemonLifecycleResult::Done)
             },
         )?;
         self.set_lifecycle_resume_destination(
@@ -1115,11 +1167,8 @@ impl RuntimeState {
         let channel = result.clone();
         let result = Self::wait_lifecycle_result(result).await;
         self.remove_completed_lifecycle(&channel);
-        let result = result?;
-        match result {
-            DaemonLifecycleResult::Materialized(materialized) => Ok(*materialized),
-            DaemonLifecycleResult::Done => bail!("daemon resume completed without a projection"),
-        }
+        let DaemonLifecycleResult::Done = result?;
+        Ok(())
     }
 
     async fn force_stop_session(self: &Arc<Self>, session_id: String) -> Result<()> {
@@ -1364,13 +1413,53 @@ fn epoch_seconds() -> u64 {
         .as_secs()
 }
 
+/// Whether a process has exited but not yet been reaped.
+///
+/// A zombie still answers `kill(pid, 0)`, because its process-table entry
+/// survives until its parent waits for it — so an existence probe alone calls
+/// it alive forever and anything waiting for it to leave waits forever. Mjolnir
+/// spawns its daemon with `spawn_detached`, which drops the `Child` without
+/// waiting, and Rust does not reap on drop; so a daemon spawned by a long-lived
+/// Mjolnir process stays a zombie under it for as long as that process lives.
+/// That is exactly the shape of `mj daemon restart` refusing to restart a daemon
+/// that had already stopped.
+///
+/// Treating a zombie as gone is also safe in the direction that matters: a
+/// zombie's PID cannot be reused until it is reaped, so nothing else can be
+/// occupying that number while this returns true.
+#[cfg(unix)]
+fn process_is_zombie(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system
+        .process(pid)
+        .is_some_and(|process| process.status() == sysinfo::ProcessStatus::Zombie)
+}
+
+/// Wait for a process to leave, within [`STOP_TIMEOUT`].
+///
+/// The error says the process was still running rather than that it "did not
+/// stop": a daemon that is still winding down has not refused, and the two
+/// read very differently to somebody deciding whether to reach for a kill.
+async fn wait_for_exit(pid: u32) -> Result<()> {
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline && process_is_alive(pid) {
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
+    ensure!(!process_is_alive(pid), "process {pid} is still running");
+    Ok(())
+}
+
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: kill(pid, 0) sends no signal and is the standard existence
         // probe. EPERM still means the process exists.
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let exists =
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        exists && !process_is_zombie(pid)
     }
     #[cfg(not(unix))]
     {
@@ -1694,37 +1783,6 @@ impl DaemonClient {
         }
     }
 
-    pub(crate) async fn save_turn_review_state(
-        &mut self,
-        session_id: String,
-        state: hel::hel_database::TurnReviewState,
-    ) -> Result<()> {
-        match self
-            .request(DaemonAction::SaveTurnReviewState { session_id, state })
-            .await?
-        {
-            DaemonReply::Done => Ok(()),
-            reply => bail!("unexpected turn-review-state reply {reply:?}"),
-        }
-    }
-
-    pub(crate) async fn save_turn_review_settings(
-        &mut self,
-        workspace_id: String,
-        settings: hel::hel_database::TurnReviewSettings,
-    ) -> Result<()> {
-        match self
-            .request(DaemonAction::SaveTurnReviewSettings {
-                workspace_id,
-                settings,
-            })
-            .await?
-        {
-            DaemonReply::Done => Ok(()),
-            reply => bail!("unexpected turn-review-settings reply {reply:?}"),
-        }
-    }
-
     pub(crate) async fn remember_reviewer_selection(
         &mut self,
         workspace_id: String,
@@ -1930,6 +1988,38 @@ impl DaemonClient {
         }
     }
 
+    /// Ask the daemon to review the turn this session just finished.
+    ///
+    /// The refusal is a sentence for a person -- "prompts are queued", "set
+    /// [review] profile in config.toml" -- so it travels as text rather than
+    /// as a code every surface would have to translate.
+    pub(crate) async fn start_turn_review(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::StartTurnReview { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected turn-review reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn resolve_turn_review(
+        &mut self,
+        session_id: String,
+        resolution: Resolution,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::ResolveTurnReview {
+                session_id,
+                resolution,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected turn-review resolution reply {reply:?}"),
+        }
+    }
+
     pub(crate) async fn reviewer_action(
         &mut self,
         session_id: String,
@@ -2011,12 +2101,9 @@ impl DaemonClient {
         }
     }
 
-    pub(crate) async fn resume_session(
-        &mut self,
-        request: ResumeSessionRequest,
-    ) -> Result<MaterializedSession> {
+    pub(crate) async fn resume_session(&mut self, request: ResumeSessionRequest) -> Result<()> {
         match self.request(DaemonAction::ResumeSession(request)).await? {
-            DaemonReply::MaterializedSession(materialized) => Ok(materialized),
+            DaemonReply::Done => Ok(()),
             reply => bail!("unexpected resume-session reply {reply:?}"),
         }
     }
@@ -2097,12 +2184,12 @@ impl ManagementClient {
     pub(crate) async fn stop_and_wait(mut self) -> Result<()> {
         let pid = self.inner.metadata.pid;
         self.inner.stop().await?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && process_is_alive(pid) {
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
-        ensure!(!process_is_alive(pid), "Mjolnir daemon {pid} did not stop");
-        Ok(())
+        wait_for_exit(pid).await.with_context(|| {
+            format!(
+                "Mjolnir daemon {pid} accepted the stop but was still running after {}s",
+                STOP_TIMEOUT.as_secs()
+            )
+        })
     }
 }
 
@@ -2176,7 +2263,7 @@ async fn signal_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
             true,
         );
         // The PID comes from the owner-only metadata file; the argv check
-        // guards against PID recycling, not against other Hel builds — old
+        // guards against PID recycling, not against other Mjolnir builds — old
         // daemons are exactly what this function exists to retire.
         let is_hel_daemon = system
             .process(sysinfo::Pid::from_u32(metadata.pid))
@@ -2200,16 +2287,13 @@ async fn signal_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
                 return Err(error).context("stop incompatible Mjolnir daemon");
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && process_is_alive(metadata.pid) {
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
-        ensure!(
-            !process_is_alive(metadata.pid),
-            "incompatible Mjolnir daemon {} did not stop",
-            metadata.pid
-        );
-        Ok(())
+        wait_for_exit(metadata.pid).await.with_context(|| {
+            format!(
+                "incompatible Mjolnir daemon {} was signalled but was still running after {}s",
+                metadata.pid,
+                STOP_TIMEOUT.as_secs()
+            )
+        })
     }
     #[cfg(not(unix))]
     {
@@ -2394,10 +2478,15 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
                     tracing::warn!(%error, "phone session view bridge stopped");
                     phone_publisher = None;
                 }
+                // Every session's view passes here whether or not anything is
+                // attached, which is exactly what an automatic review needs to
+                // see: the turn that just finished.
+                state.review_host().observe(&update.session_id, &update.view);
                 state.publish_session(update.session_id, update.view).await?;
             }
         }
     }
+    spawn_shutdown_watchdog();
     // The idle-exit path does not arrive through the termination coordinator,
     // so explicitly stop every daemon-owned background task before awaiting it.
     cancellation.cancel();
@@ -2417,6 +2506,31 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
         .await
         .context("database writer shutdown task panicked")??;
     Ok(())
+}
+
+/// Bounds the epilogue below.
+///
+/// The daemon leaves on its own long before this fires: a graceful exit
+/// returns from `run_daemon_process`, the process exits 0, and this task dies
+/// with the runtime. It exists so no unwinding step can hold the process open
+/// past the deadline its clients wait on, whatever the cause of the shutdown.
+fn spawn_shutdown_watchdog() {
+    tokio::spawn(async move {
+        tokio::time::sleep(SHUTDOWN_FORCE_EXIT_TIMEOUT).await;
+        tracing::error!(
+            seconds = SHUTDOWN_FORCE_EXIT_TIMEOUT.as_secs(),
+            "daemon shutdown did not finish in time; exiting"
+        );
+        // The metadata file points clients at a process that is about to stop
+        // answering. Removing it is what the epilogue would have done.
+        if let Err(error) = fs::remove_file(metadata_path())
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "could not remove daemon metadata before the forced exit");
+        }
+        // 128 + signal is reserved for exits that really were signalled.
+        std::process::exit(1);
+    });
 }
 
 fn spawn_manager_target_refresher(
@@ -2446,6 +2560,12 @@ fn spawn_manager_target_refresher(
                                 &lifecycle_sessions,
                             );
                             let changed = {
+                                let mut review = state
+                                    .review_config
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner);
+                                review.clone_from(&controller.config.review);
+                                drop(review);
                                 let mut current = state
                                     .controller
                                     .lock()
@@ -2460,6 +2580,26 @@ fn spawn_manager_target_refresher(
                             }
                         }
                         Ok(Err(error)) => {
+                            // The one place divergence is classified. Every
+                            // read this daemon makes re-checks the recorded
+                            // schema, so a store migrated by another process
+                            // arrives here within one tick. A daemon that
+                            // cannot read its own store cannot serve anyone,
+                            // and its writer is already refusing work, so the
+                            // answer is the shutdown it already knows how to
+                            // perform.
+                            if let Some(mismatch) = error
+                                .chain()
+                                .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+                            {
+                                tracing::error!(
+                                    found = mismatch.found,
+                                    supported = mismatch.supported,
+                                    "daemon store schema diverged underneath the daemon; shutting down"
+                                );
+                                cancellation.cancel();
+                                return;
+                            }
                             tracing::warn!(error = format!("{error:#}"), "could not refresh daemon session targets");
                         }
                         Err(error) => {
@@ -2632,7 +2772,7 @@ async fn serve_client(
         };
         let request_id = request.request_id;
         // The frozen management subset is served for every protocol version so
-        // any Hel build can inspect, stop, or replace this daemon; everything
+        // any Mjolnir build can inspect, stop, or replace this daemon; everything
         // else requires an exact protocol match.
         let is_management = matches!(
             request.action,
@@ -2645,6 +2785,15 @@ async fn serve_client(
                 "incompatible daemon protocol {}; expected {}",
                 request.protocol_version, PROTOCOL_VERSION
             ))
+        } else if cancellation.is_cancelled() && !is_management {
+            // A daemon in its epilogue still holds a snapshot in memory and
+            // would happily serve it, from a store it has stopped reading and
+            // may no longer be able to. The retry reaches a fresh daemon,
+            // which either migrates the store or reports the mismatch with the
+            // numbers it read itself. Ping, Status, and Stop stay answered:
+            // they touch no store, and a client asking a stopping daemon to
+            // stop should not be refused.
+            Err("daemon is shutting down; retry to reach a fresh daemon".to_owned())
         } else {
             handle_action(request.action, &metadata, &state, &cancellation)
                 .await
@@ -2873,19 +3022,6 @@ async fn handle_action(
             .await?;
             Ok(DaemonReply::Done)
         }
-        DaemonAction::SaveTurnReviewState { session_id, state } => {
-            blocking(move || hel::hel_database::save_turn_review_state(&session_id, &state))
-                .await?;
-            Ok(DaemonReply::Done)
-        }
-        DaemonAction::SaveTurnReviewSettings {
-            workspace_id,
-            settings,
-        } => {
-            blocking(move || hel::hel_database::save_turn_review_settings(&workspace_id, settings))
-                .await?;
-            Ok(DaemonReply::Done)
-        }
         DaemonAction::PersistImportedSession { session } => {
             blocking(move || crate::import::persist_imported_session_locally(&session)).await?;
             refresh_runtime_controller(state).await;
@@ -3070,6 +3206,27 @@ async fn handle_action(
                 session.reviewer_as(role, action).await?,
             )))
         }
+        DaemonAction::StartTurnReview { session_id } => {
+            state
+                .review_host()
+                .start(&session_id, true)
+                .await
+                .map_err(|refusal| anyhow!("{refusal}"))?;
+            state.publish_revision();
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::ResolveTurnReview {
+            session_id,
+            resolution,
+        } => {
+            state
+                .review_host()
+                .resolve(&session_id, resolution)
+                .await
+                .map_err(|error| anyhow!("{error}"))?;
+            state.publish_revision();
+            Ok(DaemonReply::Done)
+        }
         DaemonAction::SyncSession { session_id } => {
             state
                 .session_manager
@@ -3103,9 +3260,10 @@ async fn handle_action(
             state.wait_create_session(&session_id).await?;
             Ok(DaemonReply::Done)
         }
-        DaemonAction::ResumeSession(request) => Ok(DaemonReply::MaterializedSession(
-            state.resume_session(request).await?,
-        )),
+        DaemonAction::ResumeSession(request) => {
+            state.resume_session(request).await?;
+            Ok(DaemonReply::Done)
+        }
         DaemonAction::ForceStopSession { session_id } => {
             state.force_stop_session(session_id).await?;
             Ok(DaemonReply::Done)
@@ -3210,6 +3368,38 @@ fn session_state_label(state: SessionState) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A process that has exited but has not been reaped still answers
+    /// `kill(pid, 0)`. Counting it as alive is what made `mj daemon restart`
+    /// refuse to restart a daemon that had already stopped and logged so:
+    /// Mjolnir spawns the daemon with `spawn_detached`, which drops the `Child`
+    /// without waiting, so a daemon spawned by a long-lived Mjolnir process
+    /// stays a zombie under it and the wait never ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_exited_but_was_not_reaped_counts_as_gone() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a process that exits immediately");
+        let pid = child.id();
+
+        // Deliberately not reaped: wait for it to become a zombie rather than
+        // calling wait(), which is what the daemon spawner also never does.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !process_is_zombie(pid) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_is_zombie(pid),
+            "the child never became a zombie, so this check proves nothing"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "an exited but unreaped process was reported as still running"
+        );
+
+        child.wait().expect("reap the child");
+    }
+
     fn test_runtime_state() -> Arc<RuntimeState> {
         let remote = spawn_remote_session_manager().unwrap();
         let recovery = hel::hel_recovery::RecoveryCoordinator::spawn(remote.control.clone());
@@ -3283,6 +3473,86 @@ mod tests {
         sender.await.unwrap();
     }
 
+    /// A stopping daemon still holds a snapshot in memory, and used to serve
+    /// it through the whole epilogue -- from a store it had stopped reading.
+    /// Management stays answered so a client can still see it and stop it.
+    #[tokio::test]
+    async fn daemon_stops_serving_data_actions_once_shutdown_begins() {
+        let state = test_runtime_state();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let metadata = DaemonMetadata {
+            protocol_version: PROTOCOL_VERSION,
+            pid: 1,
+            address,
+            token: "right-token".into(),
+            started_at: "now".into(),
+            build_version: "test".into(),
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let server_metadata = metadata.clone();
+        let server_cancellation = cancellation.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(stream, server_metadata, state, server_cancellation)
+                .await
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+
+        let mut request_id = 0;
+        let mut ask = async |stream: &mut TcpStream, action: DaemonAction| {
+            request_id += 1;
+            write_frame(
+                stream,
+                &RequestEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    token: "right-token".to_owned(),
+                    action,
+                },
+            )
+            .await
+            .unwrap();
+            read_frame::<ResponseEnvelope>(stream).await.unwrap().result
+        };
+
+        let refused = ask(
+            &mut stream,
+            DaemonAction::Snapshot {
+                workspace_id: "workspace-a".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            refused.unwrap_err(),
+            "daemon is shutting down; retry to reach a fresh daemon"
+        );
+        assert!(matches!(
+            ask(&mut stream, DaemonAction::Ping).await,
+            Ok(DaemonReply::Pong)
+        ));
+        assert!(matches!(
+            ask(&mut stream, DaemonAction::Status).await,
+            Ok(DaemonReply::Status(_))
+        ));
+        assert!(matches!(
+            ask(&mut stream, DaemonAction::Stop).await,
+            Ok(DaemonReply::Done)
+        ));
+
+        drop(stream);
+        server.await.unwrap();
+    }
+
+    /// The forced exit is the daemon's own bound, so it has to fire inside the
+    /// window a client waiting on a stop is prepared to wait.
+    #[test]
+    fn shutdown_force_exit_finishes_before_the_stop_deadline() {
+        assert!(SHUTDOWN_FORCE_EXIT_TIMEOUT < STOP_TIMEOUT);
+    }
+
     #[tokio::test]
     async fn daemon_rejects_a_request_with_the_wrong_owner_token() {
         let state = test_runtime_state();
@@ -3323,8 +3593,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_four_rejects_a_version_three_client_before_dispatch() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    async fn the_daemon_rejects_a_client_one_protocol_behind_before_dispatch() {
+        assert_eq!(PROTOCOL_VERSION, 5);
         let state = test_runtime_state();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3347,7 +3617,7 @@ mod tests {
         write_frame(
             &mut stream,
             &RequestEnvelope {
-                protocol_version: 3,
+                protocol_version: PROTOCOL_VERSION - 1,
                 request_id: 43,
                 token: metadata.token,
                 action: DaemonAction::PersistReadReceipt {
@@ -3362,12 +3632,10 @@ mod tests {
         .unwrap();
         let response: ResponseEnvelope = read_frame(&mut stream).await.unwrap();
         assert_eq!(response.request_id, 43);
-        assert!(
-            response
-                .result
-                .unwrap_err()
-                .contains("incompatible daemon protocol 3; expected 4")
-        );
+        assert!(response.result.unwrap_err().contains(&format!(
+            "incompatible daemon protocol {}; expected {PROTOCOL_VERSION}",
+            PROTOCOL_VERSION - 1
+        )));
         drop(stream);
         server.await.unwrap();
     }
