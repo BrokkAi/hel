@@ -16,6 +16,7 @@ use hel::hel_controller::{
     SessionResumeOptions,
 };
 use hel::hel_credentials::CredentialSyncSignal;
+use hel::hel_database::StoreSchemaMismatch;
 use hel::hel_elicitation::ElicitationResponse;
 use hel::hel_review::driver::Resolution;
 use hel::hel_review::host::{RuntimeReviewView, TurnReviewHost};
@@ -56,6 +57,14 @@ const START_TIMEOUT: Duration = Duration::from_secs(8);
 /// reporting a stop that had in fact worked as `did not stop` and aborting the
 /// restart that depended on it.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the epilogue is given before the process leaves anyway.
+///
+/// Every daemon exit -- stop, SIGTERM, idle, a store that moved underneath it
+/// -- unwinds through the same epilogue, and every step of it is bounded in
+/// practice. This makes "the daemon did not stop" impossible rather than
+/// unlikely, and it must stay well inside [`STOP_TIMEOUT`] so a client waiting
+/// on a stop sees the exit rather than its own deadline.
+const SHUTDOWN_FORCE_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_millis(40);
 
 fn metadata_path() -> PathBuf {
@@ -2488,6 +2497,7 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
             }
         }
     }
+    spawn_shutdown_watchdog();
     // The idle-exit path does not arrive through the termination coordinator,
     // so explicitly stop every daemon-owned background task before awaiting it.
     cancellation.cancel();
@@ -2507,6 +2517,31 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
         .await
         .context("database writer shutdown task panicked")??;
     Ok(())
+}
+
+/// Bounds the epilogue below.
+///
+/// The daemon leaves on its own long before this fires: a graceful exit
+/// returns from `run_daemon_process`, the process exits 0, and this task dies
+/// with the runtime. It exists so no unwinding step can hold the process open
+/// past the deadline its clients wait on, whatever the cause of the shutdown.
+fn spawn_shutdown_watchdog() {
+    tokio::spawn(async move {
+        tokio::time::sleep(SHUTDOWN_FORCE_EXIT_TIMEOUT).await;
+        tracing::error!(
+            seconds = SHUTDOWN_FORCE_EXIT_TIMEOUT.as_secs(),
+            "daemon shutdown did not finish in time; exiting"
+        );
+        // The metadata file points clients at a process that is about to stop
+        // answering. Removing it is what the epilogue would have done.
+        if let Err(error) = fs::remove_file(metadata_path())
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "could not remove daemon metadata before the forced exit");
+        }
+        // 128 + signal is reserved for exits that really were signalled.
+        std::process::exit(1);
+    });
 }
 
 fn spawn_manager_target_refresher(
@@ -2556,6 +2591,26 @@ fn spawn_manager_target_refresher(
                             }
                         }
                         Ok(Err(error)) => {
+                            // The one place divergence is classified. Every
+                            // read this daemon makes re-checks the recorded
+                            // schema, so a store migrated by another process
+                            // arrives here within one tick. A daemon that
+                            // cannot read its own store cannot serve anyone,
+                            // and its writer is already refusing work, so the
+                            // answer is the shutdown it already knows how to
+                            // perform.
+                            if let Some(mismatch) = error
+                                .chain()
+                                .find_map(|cause| cause.downcast_ref::<StoreSchemaMismatch>())
+                            {
+                                tracing::error!(
+                                    found = mismatch.found,
+                                    supported = mismatch.supported,
+                                    "daemon store schema diverged underneath the daemon; shutting down"
+                                );
+                                cancellation.cancel();
+                                return;
+                            }
                             tracing::warn!(error = format!("{error:#}"), "could not refresh daemon session targets");
                         }
                         Err(error) => {
@@ -2741,6 +2796,15 @@ async fn serve_client(
                 "incompatible daemon protocol {}; expected {}",
                 request.protocol_version, PROTOCOL_VERSION
             ))
+        } else if cancellation.is_cancelled() && !is_management {
+            // A daemon in its epilogue still holds a snapshot in memory and
+            // would happily serve it, from a store it has stopped reading and
+            // may no longer be able to. The retry reaches a fresh daemon,
+            // which either migrates the store or reports the mismatch with the
+            // numbers it read itself. Ping, Status, and Stop stay answered:
+            // they touch no store, and a client asking a stopping daemon to
+            // stop should not be refused.
+            Err("daemon is shutting down; retry to reach a fresh daemon".to_owned())
         } else {
             handle_action(request.action, &metadata, &state, &cancellation)
                 .await
@@ -3417,6 +3481,86 @@ mod tests {
         let (mut stream, _) = listener.accept().await.unwrap();
         assert!(read_frame::<String>(&mut stream).await.is_err());
         sender.await.unwrap();
+    }
+
+    /// A stopping daemon still holds a snapshot in memory, and used to serve
+    /// it through the whole epilogue -- from a store it had stopped reading.
+    /// Management stays answered so a client can still see it and stop it.
+    #[tokio::test]
+    async fn daemon_stops_serving_data_actions_once_shutdown_begins() {
+        let state = test_runtime_state();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let metadata = DaemonMetadata {
+            protocol_version: PROTOCOL_VERSION,
+            pid: 1,
+            address,
+            token: "right-token".into(),
+            started_at: "now".into(),
+            build_version: "test".into(),
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let server_metadata = metadata.clone();
+        let server_cancellation = cancellation.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(stream, server_metadata, state, server_cancellation)
+                .await
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+
+        let mut request_id = 0;
+        let mut ask = async |stream: &mut TcpStream, action: DaemonAction| {
+            request_id += 1;
+            write_frame(
+                stream,
+                &RequestEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    token: "right-token".to_owned(),
+                    action,
+                },
+            )
+            .await
+            .unwrap();
+            read_frame::<ResponseEnvelope>(stream).await.unwrap().result
+        };
+
+        let refused = ask(
+            &mut stream,
+            DaemonAction::Snapshot {
+                workspace_id: "workspace-a".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            refused.unwrap_err(),
+            "daemon is shutting down; retry to reach a fresh daemon"
+        );
+        assert!(matches!(
+            ask(&mut stream, DaemonAction::Ping).await,
+            Ok(DaemonReply::Pong)
+        ));
+        assert!(matches!(
+            ask(&mut stream, DaemonAction::Status).await,
+            Ok(DaemonReply::Status(_))
+        ));
+        assert!(matches!(
+            ask(&mut stream, DaemonAction::Stop).await,
+            Ok(DaemonReply::Done)
+        ));
+
+        drop(stream);
+        server.await.unwrap();
+    }
+
+    /// The forced exit is the daemon's own bound, so it has to fire inside the
+    /// window a client waiting on a stop is prepared to wait.
+    #[test]
+    fn shutdown_force_exit_finishes_before_the_stop_deadline() {
+        assert!(SHUTDOWN_FORCE_EXIT_TIMEOUT < STOP_TIMEOUT);
     }
 
     #[tokio::test]
