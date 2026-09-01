@@ -32,6 +32,18 @@ targets = [
     "x86_64-pc-windows-msvc",
 ]
 
+# libmimalloc-sys vendors upstream mimalloc under c_src. cargo-about's
+# filesystem scan otherwise chooses nondeterministically between that license
+# and the Rust wrapper's package license; the native license is carried by the
+# generated supplemental notice.
+[libmimalloc-sys.clarify]
+license = "MIT"
+
+[[libmimalloc-sys.clarify.files]]
+path = "LICENSE.txt"
+license = "MIT"
+checksum = "a08554fab028af3af047e8588d32d019662c1b1bf07959a195a2f75fe340726b"
+
 # ureq is dual-licensed and cargo-about can otherwise choose a different
 # accepted license file on different platforms.
 [ureq.clarify]
