@@ -11,9 +11,10 @@ Publish the current `master` state, including the corrected Docker guide source 
 - [x] (2026-09-01 12:45Z) Read `.agents/PLANS.md` and `RELEASING.md`; confirmed clean `master`, current version 0.4.1, and latest tag `v0.4.1`.
 - [x] (2026-09-01 12:48Z) Bumped and synchronized version 0.4.2, lockfile, and generated license report.
 - [x] (2026-09-01 12:53Z) Ran version check, locked metadata, formatting, full tests, Clippy with warnings denied, and dirty-candidate package verification for both publishable roots.
-- [ ] Commit and push the release candidate, then wait for exact-commit CI and Coverage success (first candidate `41703fd`: Coverage passed, CI failed because local license generation consolidated duplicate MIT blocks differently from CI; correction in progress).
-- [ ] Recheck the clean release commit, create and push annotated tag `v0.4.2`.
-- [ ] Watch release and publication workflows and verify release assets, crates, and installer.
+- [x] (2026-09-01 13:00Z) Committed and pushed the corrected release candidate, incorporated the concurrent latest `master` change, and waited for exact-commit CI and Coverage success on `7da087a`.
+- [x] (2026-09-01 13:02Z) Rechecked the clean release commit, then created and pushed annotated tag `v0.4.2` at `7da087a`.
+- [x] (2026-09-01 13:13Z) Verified the successful GitHub release workflow, all three archives and checksums, and the documented installer (`hel 0.4.2`).
+- [ ] Publish all four crates. The dispatched workflow is blocked because crates.io has no Trusted Publisher configuration for repository `BrokkAi/hel`; configure each crate as documented in `RELEASING.md`, then rerun `publish.yml` for the immutable tag.
 
 ## Surprises & Discoveries
 
@@ -23,6 +24,9 @@ Publish the current `master` state, including the corrected Docker guide source 
 - Observation: Regenerating the license report consolidated duplicate MIT license blocks for `mimalloc` and `libmimalloc-sys`.
   Evidence: The local generator made both crates share one `MIT License` section, but exact-commit CI failed `Check shipped notice reports`. The CI-reproducible prior report keeps separate blocks; the correction preserves that structure and changes only the four Hel version links.
 
+- Observation: crates.io Trusted Publishing has not been configured for this repository.
+  Evidence: Workflow run `33511588952` successfully verified and packaged the immutable tag, then crates.io returned HTTP 400: `No Trusted Publishing config found for repository BrokkAi/hel` before any crate was published.
+
 ## Decision Log
 
 - Decision: Release 0.4.2 as the next patch version.
@@ -31,7 +35,9 @@ Publish the current `master` state, including the corrected Docker guide source 
 
 ## Outcomes & Retrospective
 
-In progress.
+GitHub release `v0.4.2` is public at commit `7da087a`, including the latest local-runtime target configuration change. Exact-commit CI and Coverage passed, all three platform archives and checksum assets were published, and the documented installer installed a checksum-verified Linux archive that reported `hel 0.4.2`.
+
+crates.io publication remains incomplete due to missing one-time Trusted Publisher configuration for all four crates. No crate publication was attempted after authentication failed. Once the configuration in `RELEASING.md` is added, rerunning `publish.yml` for `v0.4.2` safely resumes publication without moving the tag.
 
 ## Context and Orientation
 
@@ -83,3 +89,5 @@ Revision note (2026-09-01): Created the release execution record after inspectin
 Revision note (2026-09-01): Recorded synchronized artifacts, passing local candidate gates, and Cargo's dirty-tree packaging constraint.
 
 Revision note (2026-09-01): Recorded the first candidate's CI license-report failure and the correction that preserves the previously CI-generated report structure.
+
+Revision note (2026-09-01): Recorded the tagged GitHub release, successful installer verification, and external crates.io Trusted Publisher blocker.
