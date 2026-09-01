@@ -539,12 +539,17 @@ pub(crate) fn render_sessions(
         [Constraint::Min(1)],
     )
     .block(block);
-    let mut state = TableState::default().with_selected(
-        dashboard
-            .selected_visible_index()
-            .filter(|index| *index < drawn.len()),
-    );
+    let mut state = TableState::default()
+        .with_offset(dashboard.sessions_scroll.get())
+        .with_selected(
+            dashboard
+                .selected_visible_index()
+                .filter(|index| *index < drawn.len()),
+        );
     frame.render_stateful_widget(table, area, &mut state);
+    // The table scrolled only as far as it had to; remember where it settled
+    // so the next frame does not scroll back to the top.
+    dashboard.sessions_scroll.set(state.offset());
 
     let offset = state.offset();
     let mut row_y = area.y + 1;
@@ -1267,10 +1272,13 @@ pub(crate) fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut Das
             .border_type(focus_border(focused))
             .title(" Targets "),
     );
-    let mut state = TableState::default().with_selected(
-        (!dashboard.capacity_details.is_empty()).then_some(dashboard.capacity_index),
-    );
+    let mut state = TableState::default()
+        .with_offset(dashboard.targets_scroll.get())
+        .with_selected(
+            (!dashboard.capacity_details.is_empty()).then_some(dashboard.capacity_index),
+        );
     frame.render_stateful_widget(table, area, &mut state);
+    dashboard.targets_scroll.set(state.offset());
     render_session_scrollbar(
         frame,
         area,
@@ -1769,8 +1777,10 @@ pub(crate) fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut Dashb
                 .title(title),
         );
     let mut state = TableState::default()
+        .with_offset(dashboard.quota_scroll.get())
         .with_selected((!dashboard.config.profiles.is_empty()).then_some(dashboard.quota_index));
     frame.render_stateful_widget(table, area, &mut state);
+    dashboard.quota_scroll.set(state.offset());
     render_session_scrollbar(
         frame,
         area,
@@ -3016,6 +3026,76 @@ mod tests {
                 "{gone} should be dropped: {lines:?}"
             );
         }
+    }
+
+    /// `count` live one-line sessions in a single project, so the
+    /// support-collapsed pane has more rows than fit and has to scroll.
+    fn scrollable_sessions_dashboard(count: usize) -> DashboardState {
+        let mut sessions = BTreeMap::new();
+        for index in 0..count {
+            let mut session = running_session();
+            session.id = format!("session-{index:02}");
+            session.created_at = format!("2026-08-{:02}T00:00:00Z", index + 1);
+            sessions.insert(session.id.clone(), session);
+        }
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+                container_sizes: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        // One turn of the dial: support panes collapsed, sessions one line each.
+        dashboard.cycle_pane_layout();
+        dashboard.focus_sessions();
+        dashboard
+    }
+
+    /// Navigating the Sessions pane scrolls only as far as it must to keep the
+    /// selection on screen. Once a down-arrow has scrolled to reveal a row, an
+    /// up-arrow that lands on a still-visible row must not scroll back — the
+    /// pane only scrolls up again when the selection would leave the top.
+    #[test]
+    fn the_sessions_pane_scrolls_only_to_keep_the_selection_visible() {
+        let mut dashboard = scrollable_sessions_dashboard(12);
+        // Collapse the project so each session is one line and several show at
+        // once — the case where over-scrolling would be visible.
+        for key in dashboard.project_keys() {
+            dashboard.collapsed_project_keys.insert(key);
+        }
+        dashboard.selected_session_id = Some("session-00".into());
+
+        // At the top, no scroll.
+        drawn(&mut dashboard, 120, 34);
+        assert_eq!(dashboard.sessions_scroll.get(), 0);
+
+        // Arrow down far enough that the pane has to scroll.
+        for _ in 0..9 {
+            dashboard.handle_key(key(KeyCode::Down));
+            drawn(&mut dashboard, 120, 34);
+        }
+        let scrolled = dashboard.sessions_scroll.get();
+        assert!(scrolled > 0, "the pane should have scrolled down");
+
+        // One arrow up lands on a row that is still visible, so the pane holds
+        // its position rather than scrolling back toward the top.
+        dashboard.handle_key(key(KeyCode::Up));
+        drawn(&mut dashboard, 120, 34);
+        assert_eq!(
+            dashboard.sessions_scroll.get(),
+            scrolled,
+            "an up-arrow onto a visible row must not scroll"
+        );
+
+        // Walking all the way back to the first session does scroll up.
+        for _ in 0..11 {
+            dashboard.handle_key(key(KeyCode::Up));
+            drawn(&mut dashboard, 120, 34);
+        }
+        assert_eq!(dashboard.sessions_scroll.get(), 0);
     }
 
     #[test]

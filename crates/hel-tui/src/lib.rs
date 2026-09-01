@@ -8,6 +8,7 @@
 //! It deliberately has no provisioning or persistence side effects. Input is
 //! reduced to [`DashboardAction`] values for the controller to run.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -393,6 +394,12 @@ pub struct DashboardState {
     /// pane shows different row sets in its compact and focused modes, so a
     /// position would silently point at a different session when focus moves.
     pub(crate) selected_session_id: Option<String>,
+    /// Persisted scroll offsets for the three list panes, so each scrolls only
+    /// far enough to keep its selection visible instead of jumping back to the
+    /// top every frame. Written by the renderer after it lets the table settle.
+    pub(crate) sessions_scroll: Cell<usize>,
+    pub(crate) targets_scroll: Cell<usize>,
+    pub(crate) quota_scroll: Cell<usize>,
     pub(crate) capacity_index: usize,
     pub(crate) quota_index: usize,
     pub(crate) focus: Focus,
@@ -451,6 +458,9 @@ impl DashboardState {
             session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
             selected_session_id: None,
+            sessions_scroll: Cell::new(0),
+            targets_scroll: Cell::new(0),
+            quota_scroll: Cell::new(0),
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Sessions,
