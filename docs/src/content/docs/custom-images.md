@@ -84,13 +84,16 @@ both in because a session's unprivileged user cannot install them later.
 Playwright's Chromium needs a set of X11, GTK, and font shared libraries that
 most base images omit. The reference image installs them with
 `npx playwright@<version> install-deps chromium`, pinned to the same Playwright
-version `tests/e2e/web/package.json` uses, and pre-installs the browser into
-`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` so a test run needs no network. If
-your image skips this, run `npx playwright install --with-deps chromium` inside
-the session before browser tests, which needs root or passwordless `sudo`.
+version `tests/e2e/web/package.json` uses, and pre-installs the Chromium
+headless shell into `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` so a test run
+needs no network. Only the shell is baked in, which is what a `headless: true`
+config launches; add `npx playwright install chromium` yourself if you need
+headed Chromium. If your image skips all of this, run
+`npx playwright install --with-deps chromium` inside the session before browser
+tests, which needs root or passwordless `sudo`.
 
 The reference image also carries `perf` (Debian's `linux-perf`),
-`cargo-flamegraph`, `samply`, `valgrind`, and `heaptrack`. `perf` depends on the
+`cargo-flamegraph`, `samply`, and `heaptrack`. `perf` depends on the
 host kernel as well as the image: it needs `kernel.perf_event_paranoid` set to 1
 or lower on the host, or the container run with `--cap-add SYS_ADMIN`.
 

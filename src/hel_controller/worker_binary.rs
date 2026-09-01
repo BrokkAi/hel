@@ -861,9 +861,9 @@ fn workspace_paths(
 // releases could cancel the first project-memory startup while immediately
 // replacing it with an equivalent connection, leaving a false failed-tool
 // event at the beginning of every session.
-const CODEX_ACP_FALLBACK_VERSION: &str = "1.6.2";
+const CODEX_ACP_FALLBACK_VERSION: &str = "1.8.0";
 
-const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
+const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.73.0";
 
 const DEEPSEEK_HARNESS_FALLBACK_VERSION: &str = "0.1.1-rc.2";
 
@@ -2407,7 +2407,7 @@ mod tests {
         );
         assert_eq!(codex_command, "sh");
         assert_eq!(codex_arguments[0], "-c");
-        assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.6.2"));
+        assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.8.0"));
         assert!(codex_arguments[1].contains("codex-acp --version"));
 
         let (claude_command, claude_arguments) = bridge_launch(
@@ -2417,7 +2417,7 @@ mod tests {
         );
         assert_eq!(claude_command, "sh");
         assert_eq!(claude_arguments[0], "-c");
-        assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.68.0"));
+        assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.73.0"));
 
         let (deepseek_command, deepseek_arguments) = bridge_launch(
             crate::hel_config::HarnessKind::Deepseek,
