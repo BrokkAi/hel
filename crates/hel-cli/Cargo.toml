@@ -47,4 +47,8 @@ mimalloc = "0.1"
 
 [dev-dependencies]
 libc = "0.2"
+# Same spec as hel-core's, so the features unify and SQLite compiles once. The
+# store-divergence test migrates the daemon's store from outside the daemon,
+# which is exactly what the incident it reproduces did.
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"

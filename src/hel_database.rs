@@ -42,6 +42,39 @@ impl std::fmt::Display for ProjectionIntegrityError {
 
 impl std::error::Error for ProjectionIntegrityError {}
 
+/// A store whose schema is not the one this build supports.
+///
+/// Carried as a typed cause rather than a message so the daemon can tell a
+/// store that moved underneath it from a transport failure. It survives every
+/// `anyhow` hop to the caller, which finds it with `error.chain()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreSchemaMismatch {
+    pub found: i64,
+    pub supported: i64,
+}
+
+impl std::fmt::Display for StoreSchemaMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { found, supported } = self;
+        // Direction decides the advice. A store ahead of this build cannot be
+        // migrated by starting a daemon of this build -- that is what the old
+        // single message told the user to do, for an hour.
+        if found > supported {
+            write!(
+                formatter,
+                "Hel database schema {found} is newer than this Hel build supports ({supported}); upgrade Hel"
+            )
+        } else {
+            write!(
+                formatter,
+                "Hel database schema {found} is not the supported schema {supported}; start the Hel daemon to migrate it"
+            )
+        }
+    }
+}
+
+impl std::error::Error for StoreSchemaMismatch {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
     Project,
@@ -93,7 +126,11 @@ use schema::{open, open_reader};
 
 const DATABASE_WRITE_QUEUE_CAPACITY: usize = 256;
 
-type DatabaseWriteJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+/// A queued write, handed either the writer's connection or the reason it
+/// must not be used. The job -- not the lane -- decides what a refusal means
+/// to its caller.
+type DatabaseWriteJob =
+    Box<dyn FnOnce(std::result::Result<&mut Connection, StoreSchemaMismatch>) + Send + 'static>;
 
 enum DatabaseWriterMessage {
     Run {
@@ -134,7 +171,14 @@ impl DatabaseWriter {
             .send(DatabaseWriterMessage::Run {
                 label,
                 job: Box::new(move |connection| {
-                    let _ = reply_tx.send(operation(connection));
+                    let reply = match connection {
+                        Ok(connection) => operation(connection),
+                        // The mismatch travels as the operation's own failure,
+                        // so a refused write reports why rather than the
+                        // writer-stopped message a dropped reply would give.
+                        Err(mismatch) => Err(anyhow::Error::new(mismatch)),
+                    };
+                    let _ = reply_tx.send(reply);
                 }),
             })
             .map_err(|_| {
@@ -243,6 +287,7 @@ fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<Datab
     static NEXT_WRITER_ID: AtomicU64 = AtomicU64::new(1);
 
     let connection = schema::open_writer(path)?;
+    let path = path.to_owned();
     let (sender, receiver) = sync_channel(DATABASE_WRITE_QUEUE_CAPACITY);
     let (stopped_tx, stopped) = sync_channel(1);
     let id = NEXT_WRITER_ID.fetch_add(1, Ordering::Relaxed);
@@ -263,7 +308,16 @@ fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<Datab
                     match receiver.recv() {
                         Ok(DatabaseWriterMessage::Run { label, job }) => {
                             tracing::trace!(operation = label, "running database writer operation");
-                            job(&mut connection);
+                            // This connection verified the schema once, when it
+                            // opened. Another process can migrate the store
+                            // afterwards, and this lane would keep writing rows
+                            // a foreign ladder no longer expects. Re-read the
+                            // recorded version per job: it is one pragma
+                            // against an open connection.
+                            match writer_schema_state(&path, &connection, label) {
+                                Ok(()) => job(Ok(&mut connection)),
+                                Err(mismatch) => job(Err(mismatch)),
+                            }
                         }
                         Ok(DatabaseWriterMessage::Shutdown) => break Ok(()),
                         Err(error) => {
@@ -295,6 +349,47 @@ fn start_database_writer_at(path: &Path, install_globally: bool) -> Result<Datab
         writer,
         thread: Some(thread),
         stopped,
+    })
+}
+
+/// Whether the writer's own connection still sees the schema it opened.
+///
+/// A version that reads successfully and differs is divergence in either
+/// direction: a store rolled back under this connection is as foreign to it as
+/// one migrated forward. A pragma that fails to read is not divergence at all
+/// -- the connection is broken, and the job it is about to run reports its own
+/// I/O error, which is a truer message than a schema claim this code cannot
+/// support.
+fn writer_schema_state(
+    path: &Path,
+    connection: &Connection,
+    label: &'static str,
+) -> std::result::Result<(), StoreSchemaMismatch> {
+    let version: i64 = match connection.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!(
+                operation = label,
+                path = %path.display(),
+                error = %error,
+                "could not read the store's schema version before a write; running the operation"
+            );
+            return Ok(());
+        }
+    };
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    tracing::error!(
+        operation = label,
+        path = %path.display(),
+        found = version,
+        supported = SCHEMA_VERSION,
+        "the store's schema moved underneath this writer; refusing the operation"
+    );
+    Err(StoreSchemaMismatch {
+        found: version,
+        supported: SCHEMA_VERSION,
     })
 }
 

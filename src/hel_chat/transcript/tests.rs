@@ -862,6 +862,32 @@ fn kimi_shell_tool_run_collapses_to_command_names() {
     );
 }
 
+/// A harness that quotes or decorates the command it reports still names a
+/// tool. The label used to keep the decoration, so a collapsed streak read
+/// `"sed, ./build, ls`.
+#[test]
+fn a_collapsed_tool_label_starts_at_the_command_name() {
+    let mut chat = ChatState::new(&snapshot(), &[]);
+    chat.entries
+        .push(completed_tool(1, "Running: \"sed -n 1,10p\" notes.md"));
+    chat.entries.push(completed_tool(2, "./build.sh --release"));
+    chat.entries.push(completed_tool(3, "Running: `ls -la`"));
+    chat.entries
+        .push(ChatEntry::plain(4, ChatRole::User, "continue"));
+
+    assert_eq!(
+        transcript_text(&mut chat, 80),
+        [
+            "✓ Tool · done",
+            "│ sed, build.sh, ls",
+            "",
+            "❯ You",
+            "│ continue",
+            "",
+        ]
+    );
+}
+
 #[test]
 fn interleaved_tools_and_thoughts_render_latest_thinking_then_tool_cdl() {
     let mut chat = ChatState::new(&snapshot(), &[]);
