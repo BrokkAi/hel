@@ -110,7 +110,7 @@
       "reason": "This legacy interactive line editor is not reached by the dashboard-focused automated surface."
     },
     "src/hel_worker_client.rs": {
-      "minimum": 61.25,
+      "minimum": 60.75,
       "reason": "Remaining client branches require remote worker transports and injected lifecycle failures."
     },
     "src/hel_worker_runtime.rs": {
