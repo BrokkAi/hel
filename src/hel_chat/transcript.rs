@@ -957,6 +957,10 @@ fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> V
 /// The compact label for one completed tool. Kimi describes shell calls as
 /// `Running: <command>` (or `Starting background: <command>`); the lifecycle
 /// verb says nothing once the call is complete, so summarize those by command.
+///
+/// A harness may quote or otherwise decorate the command it reports, so the
+/// label starts at the first alphanumeric character rather than at the first
+/// non-blank one -- `"sed` is not the name of anything.
 fn collapsed_tool_label(title: &str) -> &str {
     let title = title.trim();
     let subject = title
@@ -965,7 +969,11 @@ fn collapsed_tool_label(title: &str) -> &str {
         .map(str::trim_start)
         .filter(|subject| !subject.is_empty())
         .unwrap_or(title);
-    subject.split_whitespace().next().unwrap_or("tool")
+    subject
+        .trim_start_matches(|character: char| !character.is_alphanumeric())
+        .split_whitespace()
+        .next()
+        .unwrap_or("tool")
 }
 
 /// The single cell that stands in for a streak of completed tools: the compact
