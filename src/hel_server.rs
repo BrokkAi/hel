@@ -4311,7 +4311,6 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                     Resolution::Cancelled,
                 ],
             }),
-            started_at_epoch_seconds: 0,
         };
 
         let projected = ViewerTurnReview::from_runtime(&review);

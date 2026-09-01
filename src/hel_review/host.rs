@@ -59,7 +59,6 @@ pub struct RuntimeReviewView {
     pub status: String,
     /// Present once the review has reached a verdict the user must answer.
     pub verdict: Option<VerdictView>,
-    pub started_at_epoch_seconds: u64,
 }
 
 /// A verdict as a surface renders it.
@@ -459,7 +458,6 @@ struct ReviewSlot {
     /// Bumped per role launch: the sidecar reads a new generation as "this is
     /// a different reviewer" and refuses to reuse the running one.
     generation: u64,
-    started_at_epoch_seconds: u64,
 }
 
 /// One role's journal, folded far enough to read its final answer.
@@ -854,7 +852,6 @@ impl HostState {
                 reviewer: prepared.reviewer,
                 state: prepared.state,
                 generation: 0,
-                started_at_epoch_seconds: crate::clock::epoch_seconds(),
             },
         );
         // The lock goes on before any agent starts: a review the user cannot
@@ -1379,7 +1376,6 @@ impl ReviewSlot {
                     allowed: vec![Resolution::Dismissed, Resolution::Cancelled],
                 },
             }),
-            started_at_epoch_seconds: self.started_at_epoch_seconds,
         }
     }
 }

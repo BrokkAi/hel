@@ -37,8 +37,7 @@ use super::lanes::{
     supervisor_prompt, user_messages_packet, validate_dispatch,
 };
 use super::verdict::{
-    LaneOutcome, ReviewLaneEvidence, ReviewPassEvidence, ReviewVerdict, lane_report_is_clean,
-    synthesis_verdict,
+    LaneOutcome, ReviewLaneEvidence, ReviewVerdict, lane_report_is_clean, synthesis_verdict,
 };
 
 /// What the driver needs the caller to do next.
@@ -939,19 +938,10 @@ pub fn correction_note(synthesis: &str) -> String {
     )
 }
 
-/// Evidence a completed review carries into the next one.
-#[must_use]
-pub fn evidence_with_intent(brief: Option<&str>) -> ReviewPassEvidence {
-    ReviewPassEvidence {
-        intent_brief: brief.unwrap_or_default().to_string(),
-        intent_available: brief.is_some(),
-        lanes: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hel_review::verdict::ReviewPassEvidence;
 
     fn seed() -> TurnReviewSeed {
         TurnReviewSeed {

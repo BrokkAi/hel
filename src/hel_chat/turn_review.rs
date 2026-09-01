@@ -478,7 +478,6 @@ mod tests {
             }],
             status: "the reviewer is reading the change…".to_owned(),
             verdict: None,
-            started_at_epoch_seconds: 0,
         }
     }
 
