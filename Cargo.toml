@@ -15,6 +15,7 @@ include = [
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
+    "docs/DOCKER.md",
     "docs/PODMAN.md",
     "LICENSE",
     "licenses/THIRD_PARTY_LICENSES.html",
