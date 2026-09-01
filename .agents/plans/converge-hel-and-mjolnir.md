@@ -6,7 +6,7 @@ The canonical rules for ExecPlans live in `.agents/PLANS.md`, relative to the re
 
 ## Purpose / Big Picture
 
-Mjolnir 2.0 took Hel's session-control-plane source and then changed the public package, executable, configuration, environment-variable, documentation, and deployment identities from Hel to Mjolnir. Hel continued to receive work after that cutover. This integration must bring those newer behavioral changes into Mjolnir without reverting its identity, and then publish one merge history back to Hel so both repositories share a tip and future updates no longer require a rename-aware port. Mjolnir's GitHub repository must also stop offering squash or rebase merges so future pull requests preserve this ancestry.
+Mjolnir 2.0 took Hel's session-control-plane source and then changed the public package, executable, configuration, environment-variable, documentation, and deployment identities from Hel to Mjolnir. Hel continued to receive work after that cutover. This integration must bring those newer behavioral changes into Mjolnir without reverting its identity, and then publish one merge history back to Hel so both repositories share a tip and future updates no longer require a rename-aware port. Both GitHub repositories must also stop offering squash or rebase merges so future pull requests preserve this ancestry.
 
 Success is observable in four ways. The resulting commit is a descendant of both the pre-integration Mjolnir and Hel tips; the working tree retains the `mj`, `brokk-mj-*`, `.mjolnir`, and `MJ_*` public identities while containing Hel's post-cutover behavior; the complete Rust test and lint gates pass; and GitHub reports merge commits enabled with squash and rebase merges disabled. After publication, `hel/master` resolves to the converged commit rather than its old divergent tip.
 
@@ -17,10 +17,11 @@ Success is observable in four ways. The resulting commit is a descendant of both
 - [x] (2026-09-01 17:49Z) Fetched and pruned both remotes. The tips remained `origin/master=ab52f179` and `hel/master=d2a62062`; the semantic Hel range is 30 commits and 53 paths after `7742631f`.
 - [x] (2026-09-01 17:50Z) Changed `BrokkAi/mjolnir` repository settings to allow merge commits and disallow both squash and rebase merges.
 - [x] (2026-09-01 17:52Z) Merged retained `mj2` tip `ab1d5f55` as ancestry-only bridge `f88dc9fe`. Its tree equals its first parent exactly, and the Hel merge base is now `7742631f`.
-- [ ] Merge `hel/master` into the repaired current branch (completed: all nine merge conflicts are resolved, renamed paths and new public strings use the Mjolnir identity, the removed greeting module stays removed, and the first validation pass is green; remaining: commit this merge, then incrementally merge Hel's one newer commit `58659f1f`).
+- [x] (2026-09-01 18:20Z) Committed the resolved Hel merge as `8f16c990`, then merged Hel's one newer minimized-grid commit as `e861523d` with no conflicts.
 - [x] (2026-09-01 18:18Z) Corrected the complete TUI/web state-projection findings with focused behavior tests. Deferred the broader daemon/review-host refactor at the user's direction so convergence can ship and follow-up fixes can land on the shared history instead of racing it.
-- [ ] Run validation (completed: formatting, locked metadata, viewer JavaScript syntax, release-version check, full `cargo test`, warnings-denied Clippy, optimized release build, and focused UI/web tests all passed; remaining: one compile/format smoke pass after the final one-commit Hel delta).
-- [ ] Record the final evidence here, commit the integration on the current branch, and publish the converged history to the authorized remote or remotes.
+- [x] (2026-09-01 18:20Z) Passed formatting, locked metadata, viewer JavaScript syntax, release-version check, full `cargo test`, warnings-denied Clippy, optimized release build, focused UI/web tests, and the eight minimized-grid tests after the final Hel delta.
+- [x] (2026-09-01 18:21Z) Fast-forwarded both `hel/master` and `origin/master` to `e861523d`; local and both remote-tracking refs contain the same commit.
+- [x] (2026-09-01 18:31Z) Changed `BrokkAi/hel` to the same merge-only policy so a PR through either repository cannot discard the shared ancestry again.
 
 ## Surprises & Discoveries
 
@@ -66,7 +67,7 @@ Success is observable in four ways. The resulting commit is a descendant of both
   Rationale: Hel contains the newer behavior, while Mjolnir contains newer identity and integration work. Either blanket side would silently lose valid changes.
   Date/Author: 2026-09-01, Codex.
 
-- Decision: Enforce merge commits for future Mjolnir pull requests by disabling both squash and rebase merge methods in GitHub.
+- Decision: Enforce merge commits for future pull requests in both repositories by disabling both squash and rebase merge methods in GitHub.
   Rationale: merely enabling merge commits leaves the ancestry-destroying buttons available. Making it the only merge method prevents this failure mode from recurring through the normal PR UI.
   Date/Author: 2026-09-01, Codex.
 
@@ -88,7 +89,9 @@ Success is observable in four ways. The resulting commit is a descendant of both
 
 ## Outcomes & Retrospective
 
-Work is in progress. This section will record the final commit, remote state, validation results, and any intentionally retained divergence.
+Mjolnir and Hel converged at `e861523d78e34ddf12e9f1e80b6af68eb5716254`. The final commit has parents `8f16c990` (the rename-aware integration) and `58659f1f` (the Hel commit that arrived during validation), so both original histories are retained and subsequent movement can be merged incrementally. `origin/master` and `hel/master` were both fast-forwarded to that object without force.
+
+Both repositories now offer merge commits only: merge commits are enabled and squash and rebase merges are disabled. Public package, executable, protocol, state-directory, environment-variable, and web branding remain Mjolnir while intentional internal Rust `hel` names remain shared. The complete Rust suite, warnings-denied Clippy, optimized build, JavaScript checks, focused web tests, and focused final TUI tests passed. Broader review-host and daemon lifecycle findings were deliberately deferred until after convergence and continue under `.agents/plans/harden-turn-review-daemon.md` on the now-shared history.
 
 ## Context and Orientation
 
@@ -178,3 +181,7 @@ Revision note (2026-09-01 17:56Z): Recorded the ancestry-only bridge commit, the
 Revision note (2026-09-01 18:06Z): Recorded the green first validation pass and the production state-propagation defects found by independent review. Added a correction milestone before final validation and commit.
 
 Revision note (2026-09-01 18:18Z): Froze scope at Hel tip `58659f1f` after it advanced once during the integration. Recorded the completed UI corrections and the explicit decision to publish convergence before undertaking the broader daemon refactor.
+
+Revision note (2026-09-01 18:22Z): Closed the plan with the two merge commits, validation evidence, merge-only GitHub policy, and matching published remote tip. Linked the separate follow-up hardening plan for the intentionally deferred daemon findings.
+
+Revision note (2026-09-01 18:31Z): Extended the merge-only policy to Hel as well; preserving ancestry requires removing squash and rebase entry points on either side of the shared history.
