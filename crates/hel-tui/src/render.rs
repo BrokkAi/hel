@@ -723,7 +723,16 @@ fn render_sessions_grid(
                     let target = targets.get(*index).cloned().unwrap_or_default();
                     let target = crate::widgets::truncate_text(&target, target_room);
                     session_row_areas.push((*index, rect));
-                    Line::styled(format!("{prefix}{target} {clock}"), facts.style())
+                    // Right-justify the clock at the column's edge: pad between
+                    // the target and the clock so the clocks line up in a
+                    // column instead of trailing each target.
+                    let used =
+                        prefix.chars().count() + target.chars().count() + clock.chars().count();
+                    let gap = (column_width as usize).saturating_sub(used).max(1);
+                    Line::styled(
+                        format!("{prefix}{target}{:gap$}{clock}", ""),
+                        facts.style(),
+                    )
                 }
             };
             frame.render_widget(Paragraph::new(line), rect);
@@ -2857,6 +2866,25 @@ mod tests {
             lines.iter().any(|line| line.matches("podman").count() >= 2),
             "two columns on one row: {lines:?}"
         );
+    }
+
+    /// The clock is right-justified at each column's edge, so the clocks line
+    /// up in a column rather than trailing immediately after each target.
+    #[test]
+    fn the_minimized_grid_right_justifies_the_clock() {
+        let mut dashboard = minimized_grid_dashboard(1, 1);
+        let rows = grid_content_rows(&mut dashboard, 120, 34);
+        let session = rows
+            .iter()
+            .find(|line| line.contains("[idle]"))
+            .expect("the session row");
+
+        // Column 0 spans the inner width less two 2-space gaps, split three
+        // ways; the clock ends flush against that column's right edge.
+        let inner = 120u16 - 2;
+        let column0 = (inner - 4) / 3 + u16::from(!(inner - 4).is_multiple_of(3));
+        let expected = 1 + column0 - "[idle]".len() as u16;
+        assert_eq!(cell_column(session, "[idle]"), expected, "{session:?}");
     }
 
     /// A session cell is coloured by the same state rule the expanded rows
