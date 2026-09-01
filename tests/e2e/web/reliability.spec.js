@@ -132,6 +132,20 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await session.getByRole('button', { name: 'Open' }).click();
     await expect(page).toHaveURL(/#conversation\//);
     await expect(page.locator('#conversation-title')).toHaveText(title);
+
+    // The transcript scrolls inside itself, so the page cannot scroll away
+    // from the composer while somebody is reading.
+    await expect(page.locator('#conversation-scroll')).toBeVisible();
+    // The composer offers the commands the harness can actually satisfy, and
+    // /help lists them in the transcript.
+    await page.locator('#prompt-text').fill('/he');
+    await expect(page.locator('#command-palette')).toBeVisible();
+    await expect(page.locator('#command-palette')).toContainText('/help');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#prompt-text')).toHaveText('/help ');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#conversation-feed')).toContainText('Available commands');
+    await expect(page.locator('#conversation-feed')).toContainText('run a shell command');
     // The browser's own Back button returns to the dashboard rather than
     // leaving the application.
     await page.goBack();

@@ -41,6 +41,11 @@ const login = document.querySelector('#login'),
   actionError = document.querySelector('#action-error'),
   resumeError = document.querySelector('#resume-error'),
   feed = document.querySelector('#conversation-feed'),
+  feedScroll = document.querySelector('#conversation-scroll'),
+  jumpToLatest = document.querySelector('#jump-to-latest'),
+  cancelTurnButton = document.querySelector('#cancel-turn'),
+  commandPalette = document.querySelector('#command-palette'),
+  sendButton = document.querySelector('#send-button'),
   queue = document.querySelector('#conversation-queue'),
   shells = document.querySelector('#conversation-shells'),
   elicitations = document.querySelector('#elicitations'),
@@ -987,7 +992,7 @@ async function refresh() {
       renderQueue(session);
       renderElicitations(session);
       renderAttachments();
-      document.querySelector('#conversation-state').textContent = session.state;
+      renderConversationHeader(session);
     }
     renderRoute();
     if (!eventSource) startEvents();
@@ -1015,7 +1020,15 @@ function renderQueue(session) {
       ? prompts.map((prompt, index) => {
           const row = el('div', 'queue-item');
           row.append(el('span', '', `${index + 1}. ${prompt.text}`));
-          row.append(button('Remove', 'danger', { queueId: prompt.id }));
+          const controls = el('div', 'row');
+          // The newest queued prompt can be taken back into the composer, the
+          // way the terminal's edit-latest does, because the last thing you
+          // queued is the one you most often want to change.
+          if (index === prompts.length - 1) {
+            controls.append(button('Edit', 'secondary', { editQueueId: prompt.id }));
+          }
+          controls.append(button('Remove', 'danger', { queueId: prompt.id }));
+          row.append(controls);
           return row;
         })
       : [el('p', 'dim', 'No queued prompts.')]),
@@ -1487,81 +1500,415 @@ function renderAttachments() {
     attachments.append(chip);
   }
 }
-async function submitPrompt() {
-  if (!currentSession) return;
-  const value = composerText(),
-    images = promptImages;
-  if (!value.trim() && !images.length) return;
+// ---------------------------------------------------------------------------
+// Slash commands
+// ---------------------------------------------------------------------------
+//
+// The rules behind these live in Rust and are published in the session
+// projection. Whether fast mode exists, whether plan mode can be driven, and
+// which values `model` and `effort` accept are facts about the harness, so the
+// browser reads the published answer rather than deciding again. Where a check
+// here and a check there ever disagree, the Rust one is right and this one is
+// the bug.
+
+const HEL_COMMANDS = [
+  { name: 'help', description: 'show available Hel and agent commands' },
+  { name: 'detach', description: 'leave the conversation without stopping the worker' },
+  { name: 'model', description: 'change the active model', argument: 'value' },
+  { name: 'effort', description: 'change the active reasoning effort', argument: 'value' },
+  { name: 'fast', description: 'toggle Codex Fast mode' },
+  { name: 'plan', description: 'toggle plan mode', argument: 'message' },
+  { name: 'implement', description: 'leave plan mode and implement', argument: 'instruction' },
+];
+
+function activeSession() {
+  return snapshot?.sessions.find(session => session.id === currentSession);
+}
+
+function configOption(key) {
+  return activeSession()?.config_options?.find(option => option.key === key);
+}
+
+/// The commands offered for what has been typed so far.
+///
+/// A command whose rule the session cannot satisfy is not offered: `/plan` on a
+/// harness with no plan mode, or `/model` on one that advertised no models.
+function availableCommands() {
+  const session = activeSession();
+  return HEL_COMMANDS.filter(command => {
+    if (command.name === 'model' || command.name === 'effort')
+      return Boolean(configOption(command.name));
+    if (command.name === 'plan' || command.name === 'implement') {
+      return session?.plan_mode_active !== undefined && session?.capabilities?.set_plan_mode;
+    }
+    if (command.name === 'fast') return Boolean(configOption('model'));
+    return true;
+  });
+}
+
+let paletteMatches = [];
+let paletteSelected = 0;
+
+/// What the palette should offer, given the composer's text.
+///
+/// After a complete `/model ` the palette offers values rather than commands,
+/// and a fully typed advertised value closes it so Enter submits instead of
+/// accepting the text again.
+function paletteState(text) {
+  for (const key of ['model', 'effort']) {
+    const prefix = `/${key} `;
+    if (!text.startsWith(prefix)) continue;
+    const option = configOption(key);
+    if (!option) return null;
+    const query = text.slice(prefix.length);
+    if (option.choices.some(choice => choice.value === query)) return null;
+    const matches = option.choices
+      .filter(
+        choice =>
+          choice.value.toLowerCase().startsWith(query.toLowerCase()) ||
+          choice.name.toLowerCase().includes(query.toLowerCase()),
+      )
+      .map(choice => ({
+        insert: `/${key} ${choice.value}`,
+        label: choice.value,
+        hint: choice.name,
+      }));
+    return matches.length ? matches : null;
+  }
+  if (!text.startsWith('/') || /\s/.test(text)) return null;
+  const query = text.slice(1).toLowerCase();
+  const matches = availableCommands()
+    .filter(
+      command =>
+        command.name.startsWith(query) || command.description.toLowerCase().includes(query),
+    )
+    .map(command => ({
+      insert: `/${command.name} `,
+      label: `/${command.name}${command.argument ? ` <${command.argument}>` : ''}`,
+      hint: command.description,
+    }));
+  return matches.length ? matches : null;
+}
+
+function updateCommandPalette() {
+  const matches = paletteState(composerText());
+  if (!matches) {
+    paletteMatches = [];
+    commandPalette.classList.add('hidden');
+    commandPalette.replaceChildren();
+    return;
+  }
+  // Keep the highlighted entry by name across a re-render, so typing another
+  // character does not silently move the selection under the reader.
+  const previous = paletteMatches[paletteSelected]?.insert;
+  paletteMatches = matches;
+  paletteSelected = Math.max(
+    0,
+    matches.findIndex(match => match.insert === previous),
+  );
+  commandPalette.replaceChildren(
+    ...matches.map((match, index) => {
+      const row = el('button', 'palette-row');
+      row.type = 'button';
+      row.setAttribute('role', 'option');
+      row.setAttribute('aria-selected', String(index === paletteSelected));
+      row.dataset.insert = match.insert;
+      row.append(el('span', 'palette-name', match.label), el('span', 'dim', match.hint));
+      return row;
+    }),
+  );
+  commandPalette.classList.remove('hidden');
+}
+
+function moveCommandSelection(delta) {
+  if (!paletteMatches.length) return false;
+  paletteSelected = (paletteSelected + delta + paletteMatches.length) % paletteMatches.length;
+  updateCommandPaletteSelection();
+  return true;
+}
+
+function updateCommandPaletteSelection() {
+  [...commandPalette.children].forEach((row, index) => {
+    row.setAttribute('aria-selected', String(index === paletteSelected));
+  });
+}
+
+function acceptCommandSelection() {
+  const match = paletteMatches[paletteSelected];
+  if (!match) return false;
+  setComposerText(match.insert);
+  placeComposerCaretAtEnd();
+  updateCommandPalette();
+  return true;
+}
+
+/// Everything Hel and the agent offer, as a system note in the transcript.
+function showHelp() {
+  const lines = ['Available commands:', '!<command> — run a shell command in this session [hel]'];
+  for (const command of availableCommands()) {
+    const argument = command.argument ? ` <${command.argument}>` : '';
+    lines.push(`/${command.name}${argument} — ${command.description} [hel]`);
+  }
+  const note = el('article', 'entry tone-system');
+  const heading = el('strong');
+  const glyph = el('span', 'entry-glyph', '─');
+  glyph.setAttribute('aria-hidden', 'true');
+  heading.append(glyph, el('span', 'entry-label', 'Hel'));
+  note.append(heading, el('pre', 'entry-body', lines.join('\n')));
+  feed.append(note);
+  scrollToTail();
+}
+
+/// Run a local command, or report that nothing here can.
+///
+/// Returns true when the text was a command this surface handled, so the
+/// caller knows not to send it to the agent as a prompt.
+async function runLocalCommand(text) {
+  const match = /^\/([a-zA-Z][\w-]*)\s*(.*)$/.exec(text);
+  if (!match) return false;
+  const [, name, argument] = match;
   const error = document.querySelector('#conversation-error');
-  if (value.startsWith('!') && images.length) {
-    error.textContent = 'Shell commands cannot carry images.';
-    return;
-  }
-  const body = value.startsWith('!')
-    ? { action: 'run-shell', session_id: currentSession, command: value.slice(1) }
-    : {
-        action: 'prompt',
+  const session = activeSession();
+
+  switch (name) {
+    case 'help':
+      setComposerText('');
+      showHelp();
+      return true;
+    case 'detach':
+      setComposerText('');
+      navigate({ name: 'dashboard', workspaceId: selectedWorkspaceId() });
+      return true;
+    case 'model':
+    case 'effort': {
+      if (!argument) {
+        error.textContent = `usage: /${name} <value>`;
+        return true;
+      }
+      await sendAction({
+        action: 'set-config',
         session_id: currentSession,
-        text: value,
-        images: images.map(image => ({
-          data_base64: image.data_base64,
-          mime_type: image.mime_type,
-          width: image.width,
-          height: image.height,
-        })),
-      };
-  const payload = JSON.stringify(body);
-  if (new TextEncoder().encode(payload).byteLength > MAX_PROMPT_REQUEST_BYTES) {
-    error.textContent = 'Prompt attachments exceed the 32 MiB request limit.';
-    return;
+        key: name,
+        value: argument,
+      });
+      return true;
+    }
+    case 'fast': {
+      const option = configOption('model');
+      const current = option?.current || '';
+      if (!option) {
+        error.textContent = 'Fast mode is unavailable for this agent.';
+        return true;
+      }
+      // Fast mode is a model, so the toggle is between the current model and
+      // its fast counterpart, both of which the harness advertised.
+      const fast = option.choices.find(choice => /fast/i.test(choice.value));
+      if (!fast) {
+        error.textContent = 'Fast mode is unavailable for the active model.';
+        return true;
+      }
+      const target = /fast/i.test(current)
+        ? option.choices.find(choice => !/fast/i.test(choice.value))?.value
+        : fast.value;
+      if (!target) {
+        error.textContent = 'Fast mode is unavailable for the active model.';
+        return true;
+      }
+      await sendAction({
+        action: 'set-config',
+        session_id: currentSession,
+        key: 'model',
+        value: target,
+      });
+      return true;
+    }
+    case 'plan':
+    case 'implement': {
+      if (!session?.capabilities?.set_plan_mode) {
+        error.textContent = 'Plan mode is only available while the agent is idle.';
+        return true;
+      }
+      const active = name === 'plan' ? !session.plan_mode_active : false;
+      await sendAction({ action: 'set-plan-mode', session_id: currentSession, active });
+      // A trailing instruction is a prompt to send once the mode has changed.
+      if (argument) {
+        await sendAction({
+          action: 'prompt',
+          session_id: currentSession,
+          text: argument,
+          images: [],
+        });
+      }
+      return true;
+    }
+    default:
+      // Anything else is the agent's own command, and the agent is the one
+      // that knows what to do with it.
+      return false;
   }
+}
+
+/// Post one action and report its failure where the composer can be seen.
+async function sendAction(body) {
+  const error = document.querySelector('#conversation-error');
   try {
-    await request('/api/actions', { method: 'POST', body: payload });
+    await request('/api/actions', { method: 'POST', body: JSON.stringify(body) });
     setComposerText('');
-    promptImages = [];
-    renderAttachments();
     error.textContent = '';
     await refresh();
   } catch (err) {
     error.textContent = err.message;
   }
 }
-/// Roles whose body is prose the agent or the person wrote, and so is rendered
-/// as Markdown. Everything else — tool output, plans, Hel's own notes — is
-/// preformatted text, because Markdown in a tool dump is a coincidence rather
-/// than an intent.
+
+/// Guard against sending twice.
+///
+/// Enter calls submit directly, so it bypasses the disabled button entirely;
+/// without this a fast double press sends the same prompt twice.
+let promptInFlight = false;
+
+async function submitPrompt() {
+  if (!currentSession || promptInFlight) return;
+  const value = composerText();
+  const images = promptImages;
+  if (!value.trim() && !images.length) return;
+  const error = document.querySelector('#conversation-error');
+
+  promptInFlight = true;
+  sendButton.disabled = true;
+  try {
+    if (value.startsWith('/') && (await runLocalCommand(value.trim()))) return;
+
+    if (value.startsWith('!') && images.length) {
+      error.textContent = 'Shell commands cannot carry images.';
+      return;
+    }
+    const body = value.startsWith('!')
+      ? { action: 'run-shell', session_id: currentSession, command: value.slice(1) }
+      : {
+          action: 'prompt',
+          session_id: currentSession,
+          text: value,
+          images: images.map(image => ({
+            data_base64: image.data_base64,
+            mime_type: image.mime_type,
+            width: image.width,
+            height: image.height,
+          })),
+        };
+    const payload = JSON.stringify(body);
+    if (new TextEncoder().encode(payload).byteLength > MAX_PROMPT_REQUEST_BYTES) {
+      error.textContent = 'Prompt attachments exceed the 32 MiB request limit.';
+      return;
+    }
+    await request('/api/actions', { method: 'POST', body: payload });
+    // The composer is cleared only once the daemon has taken the prompt, so a
+    // refusal leaves the text where it can be edited and sent again.
+    setComposerText('');
+    promptImages = [];
+    renderAttachments();
+    updateCommandPalette();
+    error.textContent = '';
+    await refresh();
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    promptInFlight = false;
+    sendButton.disabled = false;
+  }
+}
+
 const PROSE_ROLES = new Set(['user', 'agent', 'thought']);
 
-/// The glyph and label the terminal surface gives each role, so the two read
-/// alike. `fn entry_visual` in `src/hel_chat/transcript.rs` is the original;
-/// Milestone 3 carries the glyph in the projection so this copy can go.
-const ROLE_GLYPH = {
-  user: '\u276f',
-  agent: '\u25cf',
-  thought: '\u25cb',
-  tool: '\u2022',
-  plan: '\u25c7',
-  'plan-proposal': '\u25c8',
-  system: '\u2500',
-};
+/// How close to the bottom still counts as reading the tail.
+const TAIL_SLACK_PX = 48;
+
+/// Whether the reader is at the tail, and so wants to be carried along.
+function atTail() {
+  const distance = feedScroll.scrollHeight - feedScroll.scrollTop - feedScroll.clientHeight;
+  return distance <= TAIL_SLACK_PX;
+}
+
+function scrollToTail() {
+  feedScroll.scrollTop = feedScroll.scrollHeight;
+  jumpToLatest.classList.add('hidden');
+}
 
 function entryBody(entry) {
-  const text = entry.lines.join('\n');
-  if (PROSE_ROLES.has(entry.role)) {
-    const body = el('div', 'entry-body');
-    body.append(renderMarkdown(text));
-    return body;
-  }
   const body = el('div', 'entry-body');
-  body.append(renderToolOutput(text));
+  if (PROSE_ROLES.has(entry.role)) {
+    body.append(renderMarkdown(entry.lines.join('\n')));
+  } else {
+    body.append(renderToolOutput(entry.lines.join('\n')));
+  }
+  if (entry.diffstats?.length) {
+    body.append(renderDiffStats(entry.diffstats));
+  }
   return body;
 }
 
+/// The files a tool changed, from the projection's own numbers.
+function renderDiffStats(diffstats) {
+  const list = el('ul', 'diffstat');
+  for (const stat of diffstats) {
+    const item = el('li');
+    item.append(el('span', 'diffstat-path', stat.path));
+    item.append(el('span', 'diffstat-added', `+${stat.insertions}`));
+    item.append(el('span', 'diffstat-removed', `−${stat.deletions}`));
+    list.append(item);
+  }
+  return list;
+}
+
+function entryTimestamp(entry) {
+  if (!entry.recorded_at_ms) return null;
+  const node = el('time', 'entry-time', new Date(entry.recorded_at_ms).toLocaleTimeString());
+  node.setAttribute('datetime', new Date(entry.recorded_at_ms).toISOString());
+  return node;
+}
+
+/// Rewrite one entry's row.
+///
+/// Thinking and tool detail are collapsed by default, and which folds the
+/// reader had opened is recorded and restored, so an update does not snap shut
+/// something they were part way through reading.
+function paintEntry(node, entry) {
+  const openFolds = new Set(
+    [...node.querySelectorAll('details.block-fold[open] > summary')].map(
+      summary => summary.textContent,
+    ),
+  );
+  node.className = `entry tone-${entry.tone}`;
+  const heading = el('strong');
+  const glyph = el('span', 'entry-glyph', entry.glyph || '─');
+  glyph.setAttribute('aria-hidden', 'true');
+  heading.append(glyph, el('span', 'entry-label', entry.label));
+  const time = entryTimestamp(entry);
+  if (time) heading.append(time);
+
+  const body = entryBody(entry);
+  // Thinking is background: it is there for someone who wants it, and closed
+  // for everyone else.
+  if (entry.role === 'thought') {
+    const fold = el('details', 'block-fold');
+    const summary = el('summary', '', entry.label);
+    fold.append(summary, body);
+    node.replaceChildren(heading, fold);
+  } else {
+    node.replaceChildren(heading, body);
+  }
+  for (const summary of node.querySelectorAll('details.block-fold > summary')) {
+    if (openFolds.has(summary.textContent)) summary.parentElement.open = true;
+  }
+}
+
 function renderEntries(entries, replace) {
+  const wasAtTail = atTail();
   if (replace) {
     feed.replaceChildren();
     entryNodes.clear();
   }
+  let appended = false;
   for (const entry of entries) {
     let node = entryNodes.get(entry.id);
     if (!node) {
@@ -1569,43 +1916,79 @@ function renderEntries(entries, replace) {
       node.dataset.entryId = entry.id;
       entryNodes.set(entry.id, node);
       feed.append(node);
+      appended = true;
     }
-    node.className = `entry ${entry.role}`;
-    const heading = el('strong');
-    const glyph = el('span', 'entry-glyph', ROLE_GLYPH[entry.role] || '\u2500');
-    // The glyph repeats what the label already says, so it is decoration to a
-    // screen reader and must not be read out twice.
-    glyph.setAttribute('aria-hidden', 'true');
-    heading.append(glyph, el('span', 'entry-label', entry.label));
-    node.replaceChildren(heading, entryBody(entry));
+    // An entry that has not moved is left alone: rewriting it would collapse
+    // its folds and drop any text the reader had selected.
+    if (node.dataset.updatedSeq === String(entry.updated_seq)) continue;
+    node.dataset.updatedSeq = entry.updated_seq;
+    paintEntry(node, entry);
   }
-  window.scrollTo(0, document.body.scrollHeight);
+  if (wasAtTail) scrollToTail();
+  else if (appended) jumpToLatest.classList.remove('hidden');
 }
+
+/// A counter that retires an in-flight request when the conversation changes.
+///
+/// Switching sessions quickly is how one session's text arrives under
+/// another's header: the older fetch resolves last and wins. Every request
+/// carries the generation it was issued in and drops itself if that generation
+/// has moved on.
+let conversationGeneration = 0;
+let conversationInFlight = false;
+let conversationPending = false;
+
 async function loadConversation(delta = false) {
   if (!currentSession) return;
+  // Revisions arrive in bursts. One load runs at a time and remembers that
+  // another was asked for, so a burst costs one extra fetch rather than one
+  // fetch each.
+  if (conversationInFlight) {
+    conversationPending = true;
+    return;
+  }
+  conversationInFlight = true;
+  const generation = conversationGeneration;
+  const sessionId = currentSession;
   try {
     const result = await request(
-      `/api/conversations/${encodeURIComponent(currentSession)}${delta && cursor ? `?after_seq=${cursor}` : ''}`,
+      `/api/conversations/${encodeURIComponent(sessionId)}${delta && cursor ? `?after_seq=${cursor}` : ''}`,
     );
+    if (generation !== conversationGeneration) return;
     renderEntries(result.entries, !delta || result.reset);
     cursor = result.latest_seq;
     if (cursor > acknowledged) {
       const through = cursor;
-      await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`, {
+      await request(`/api/conversations/${encodeURIComponent(sessionId)}/read`, {
         method: 'POST',
         body: JSON.stringify({ through }),
       });
+      if (generation !== conversationGeneration) return;
       acknowledged = through;
     }
   } catch (err) {
+    if (generation !== conversationGeneration) return;
+    if (err.message === 'unauthorized') {
+      showLogin();
+      return;
+    }
     document.querySelector('#conversation-error').textContent = err.message;
+  } finally {
+    conversationInFlight = false;
+    if (conversationPending && generation === conversationGeneration) {
+      conversationPending = false;
+      loadConversation(true);
+    }
   }
 }
+
 async function openConversation(id) {
   if (currentSession === id) return;
   const session = snapshot?.sessions.find(x => x.id === id);
   if (!session?.capabilities?.open) return;
   currentSession = id;
+  conversationGeneration += 1;
+  conversationPending = false;
   cursor = 0;
   acknowledged = 0;
   entryNodes.clear();
@@ -1614,9 +1997,36 @@ async function openConversation(id) {
   document.querySelector('#conversation-state').textContent = session.state;
   renderQueue(session);
   renderElicitations(session);
+  renderConversationHeader(session);
   promptImages = [];
   renderAttachments();
   await loadConversation(false);
+}
+
+/// The header, the turn control and the composer, all from what the daemon
+/// published about this session.
+///
+/// The placeholder says whether Send will send or queue, because a person
+/// pressing it deserves to know which of those is about to happen.
+function renderConversationHeader(session) {
+  document.querySelector('#conversation-title').textContent = session.title;
+  const state = document.querySelector('#conversation-state');
+  state.textContent = session.state;
+  state.className = `pill state-${session.lifecycle}`;
+  cancelTurnButton.classList.toggle('hidden', !session.capabilities?.cancel_turn);
+
+  const running = session.chat_phase === 'running';
+  const queued = (session.queued_prompts || []).length;
+  promptText.dataset.placeholder = running
+    ? 'The agent is working; this will queue'
+    : 'Message the agent or use !command';
+  sendButton.textContent = running || queued ? 'Queue' : 'Send';
+  const canPrompt = session.capabilities?.prompt !== false;
+  promptText.setAttribute('contenteditable', String(canPrompt));
+  sendButton.disabled = !canPrompt || promptInFlight;
+  if (session.plan_mode_active) {
+    state.textContent = `${session.state} · plan`;
+  }
 }
 
 /// Drop everything the conversation view was holding.
@@ -1625,6 +2035,8 @@ async function openConversation(id) {
 /// the next conversation opens on top of the last one's rows.
 function leaveConversation() {
   currentSession = null;
+  conversationGeneration += 1;
+  conversationPending = false;
   cursor = 0;
   acknowledged = 0;
   entryNodes.clear();
@@ -1801,7 +2213,28 @@ document.querySelector('#prompt-form').onsubmit = e => {
   e.preventDefault();
   submitPrompt();
 };
-promptText.addEventListener('input', composerInputChanged);
+promptText.addEventListener('input', () => {
+  composerInputChanged();
+  updateCommandPalette();
+});
+
+commandPalette.onclick = event => {
+  const row = event.target.closest('button[data-insert]');
+  if (!row) return;
+  setComposerText(row.dataset.insert);
+  placeComposerCaretAtEnd();
+  promptText.focus();
+  updateCommandPalette();
+};
+
+jumpToLatest.onclick = scrollToTail;
+feedScroll.addEventListener('scroll', () => {
+  if (atTail()) jumpToLatest.classList.add('hidden');
+});
+
+cancelTurnButton.onclick = async () => {
+  await sendAction({ action: 'cancel-turn', session_id: currentSession });
+};
 // Rich text, and anything a paste or drop would inject as markup, never
 // belongs in a prompt: refuse it here and re-insert the plain text instead.
 promptText.addEventListener('beforeinput', e => {
@@ -1862,6 +2295,20 @@ promptText.addEventListener('drop', e => {
 // so the composer must not read those keys until the composition ends.
 promptText.addEventListener('keydown', e => {
   if (e.isComposing || e.keyCode === 229) return;
+  // The palette owns the arrows, Tab and Enter while it is open, and gives
+  // them back the moment it closes.
+  if (paletteMatches.length) {
+    if (e.key === 'ArrowDown' && moveCommandSelection(1)) return e.preventDefault();
+    if (e.key === 'ArrowUp' && moveCommandSelection(-1)) return e.preventDefault();
+    if ((e.key === 'Tab' || e.key === 'Enter') && !e.shiftKey && acceptCommandSelection()) {
+      return e.preventDefault();
+    }
+    if (e.key === 'Escape') {
+      paletteMatches = [];
+      commandPalette.classList.add('hidden');
+      return e.preventDefault();
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
     e.preventDefault();
     submitPrompt();
@@ -1884,22 +2331,38 @@ imagePicker.onchange = () => {
   attachImageFiles(files);
 };
 queue.onclick = async e => {
-  const button = e.target.closest('button[data-queue-id]');
-  if (!button) return;
+  const edit = e.target.closest('button[data-edit-queue-id]');
+  const remove = e.target.closest('button[data-queue-id]');
+  const target = edit || remove;
+  if (!target) return;
+  const id = edit ? edit.dataset.editQueueId : remove.dataset.queueId;
+  const session = activeSession();
+  const queued = session?.queued_prompts?.find(prompt => prompt.id === id);
+  const error = document.querySelector('#conversation-error');
   try {
     await request('/api/actions', {
       method: 'POST',
       body: JSON.stringify({
         action: 'remove-queued-prompt',
         session_id: currentSession,
-        queue_id: button.dataset.queueId,
+        queue_id: id,
       }),
     });
+    if (edit && queued) {
+      setComposerText(queued.text);
+      placeComposerCaretAtEnd();
+      promptText.focus();
+      updateCommandPalette();
+    }
+    error.textContent = '';
     await refresh();
   } catch (err) {
-    document.querySelector('#conversation-error').textContent = err.message;
+    // A removal that failed leaves the prompt queued, so the composer must not
+    // be filled with a copy of something that is still going to run.
+    error.textContent = err.message;
   }
 };
+
 shells.onclick = async e => {
   const button = e.target.closest('button[data-shell-id]');
   if (!button) return;
@@ -1917,6 +2380,29 @@ shells.onclick = async e => {
     document.querySelector('#conversation-error').textContent = err.message;
   }
 };
+// ---------------------------------------------------------------------------
+// Keyboard inset
+// ---------------------------------------------------------------------------
+//
+// How much of the window the on-screen keyboard is covering, as a custom
+// property the layout reads. The `offsetTop` term is the one naive versions
+// miss: on iOS the visual viewport scrolls within the layout viewport, and
+// without it the composer drifts by exactly that offset.
+function syncKeyboardInset() {
+  const viewport = window.visualViewport;
+  const inset = viewport
+    ? Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop)
+    : 0;
+  document.documentElement.style.setProperty('--keyboard-inset', `${Math.round(inset)}px`);
+}
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', syncKeyboardInset);
+  window.visualViewport.addEventListener('scroll', syncKeyboardInset);
+}
+window.addEventListener('resize', syncKeyboardInset);
+syncKeyboardInset();
+
 window.addEventListener('online', () => {
   startEvents();
   refresh();

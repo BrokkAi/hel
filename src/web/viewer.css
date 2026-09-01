@@ -879,3 +879,140 @@ article > h3 {
   align-items: baseline;
   justify-content: space-between;
 }
+
+/* ---- the conversation screen ----
+ *
+ * A full-height column: header, a transcript that scrolls inside itself, and a
+ * composer pinned to the bottom above the keyboard. The page itself never
+ * scrolls, so the composer cannot wander off and the header cannot slide away
+ * while somebody is reading.
+ */
+
+.conversation {
+  display: flex;
+  flex-direction: column;
+  /* The visible viewport minus whatever the keyboard is covering. */
+  height: calc(100dvh - var(--keyboard-inset) - 90px);
+  min-height: 320px;
+}
+
+.conversation-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.conversation-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.jump-to-latest {
+  align-self: center;
+  margin: 6px 0;
+}
+
+#conversation-side {
+  margin: 8px 0;
+}
+
+#conversation-side > summary {
+  cursor: pointer;
+  min-height: var(--touch);
+  display: flex;
+  align-items: center;
+  color: var(--dim);
+}
+
+.composer {
+  position: relative;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.entry-time {
+  margin-left: auto;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+/* Tone names come from the projection; what they look like is decided here. */
+.entry.tone-user {
+  --role: var(--user);
+}
+.entry.tone-agent {
+  --role: var(--agent);
+}
+.entry.tone-thinking {
+  --role: var(--thinking);
+  color: var(--dim);
+}
+.entry.tone-running {
+  --role: var(--running);
+}
+.entry.tone-done {
+  --role: var(--done);
+}
+.entry.tone-failed {
+  --role: var(--failed);
+}
+.entry.tone-plan {
+  --role: var(--plan);
+}
+.entry.tone-plan-proposal {
+  --role: var(--plan-proposal);
+}
+.entry.tone-system {
+  --role: var(--system);
+  color: var(--dim);
+}
+
+/* ---- command palette ---- */
+
+.palette {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  max-height: 40dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+}
+
+.palette-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  width: 100%;
+  background: none;
+  color: var(--text);
+  font-weight: 400;
+  text-align: left;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.palette-row[aria-selected='true'] {
+  background: var(--surface);
+  box-shadow: inset 2px 0 0 var(--focus);
+}
+
+.palette-name {
+  color: var(--accent);
+  white-space: nowrap;
+}

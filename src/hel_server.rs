@@ -3740,6 +3740,10 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                     label: "You".into(),
                     recorded_at_ms: None,
                     lines: vec!["begin".into()],
+                    glyph: "\u{276f}",
+                    tone: "user",
+                    tool_status: None,
+                    diffstats: Vec::new(),
                 },
                 crate::hel_chat::BrowserTranscriptEntry {
                     id: 7,
@@ -3748,6 +3752,10 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                     label: "Agent".into(),
                     recorded_at_ms: None,
                     lines: vec!["live".into()],
+                    glyph: "\u{25cf}",
+                    tone: "agent",
+                    tool_status: None,
+                    diffstats: Vec::new(),
                 },
             ],
         };

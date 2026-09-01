@@ -96,20 +96,31 @@
         <div id="quota"></div>
       </section>
 
-      <section id="conversation" class="page hidden">
-        <div class="card">
-          <h2 id="conversation-title">Conversation</h2>
+      <section id="conversation" class="page conversation hidden">
+        <div class="conversation-header">
+          <span id="conversation-title" class="conversation-name">Conversation</span>
           <span id="conversation-state" class="pill"></span>
+          <button id="cancel-turn" class="secondary hidden">Stop turn</button>
+        </div>
+        <div id="conversation-scroll" class="conversation-scroll">
           <div id="conversation-feed"></div>
         </div>
+        <button id="jump-to-latest" class="jump-to-latest hidden">New messages ↓</button>
         <div id="elicitations"></div>
-        <section class="card">
+        <details id="conversation-side" class="card">
+          <summary>Queue and shells</summary>
           <h3>Queued prompts</h3>
           <div id="conversation-queue"></div>
           <h3>Shell commands</h3>
           <div id="conversation-shells"></div>
-        </section>
-        <form id="prompt-form" class="card">
+        </details>
+        <form id="prompt-form" class="composer">
+          <div
+            id="command-palette"
+            class="palette hidden"
+            role="listbox"
+            aria-label="Commands"
+          ></div>
           <div
             id="prompt-text"
             class="composer-input"
@@ -123,7 +134,7 @@
           ></div>
           <div id="attachments" class="row" aria-label="Attached images"></div>
           <div class="row">
-            <button>Send or queue</button>
+            <button id="send-button">Send</button>
             <button
               type="button"
               id="attach-image"
