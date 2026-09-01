@@ -530,6 +530,9 @@ pub fn restore_git_snapshot(
     repository: &Path,
     snapshot: &RepositorySnapshot,
 ) -> Result<()> {
+    if let Some(branch) = &snapshot.metadata.branch {
+        ensure_branch_available_for_checkout(runner, repository, branch)?;
+    }
     if !snapshot.committed_bundle.is_empty() {
         let mut bundle = tempfile::NamedTempFile::new_in(repository)
             .with_context(|| format!("create temporary Git bundle in {}", repository.display()))?;
@@ -606,7 +609,7 @@ pub fn restore_git_snapshot(
 /// `git checkout -B` permits this on some Git versions, leaving one branch
 /// attached to two worktrees. The restore path must detect that before it
 /// fetches or changes the destination checkout.
-pub(crate) fn ensure_branch_available_for_checkout(
+fn ensure_branch_available_for_checkout(
     runner: &dyn GitCommandRunner,
     repository: &Path,
     branch: &str,

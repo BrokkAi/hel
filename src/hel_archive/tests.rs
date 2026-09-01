@@ -1800,6 +1800,9 @@ fn restore_without_a_bundle_reports_an_unreachable_commit_actionably() {
 fn git_restore_routes_patches_through_injected_runner() {
     let destination = tempfile::tempdir().unwrap();
     let runner = FakeGit::with_outputs([
+        // The worktree guard reads HEAD first; naming the snapshot's own
+        // branch means it is already the checkout's branch.
+        git_ok("feature/hel\n"),
         git_ok(Vec::new()),
         git_ok(Vec::new()),
         git_ok(Vec::new()),
@@ -1810,9 +1813,9 @@ fn git_restore_routes_patches_through_injected_runner() {
     snapshot.untracked_tar = tar_with_file("new.sh", b"echo hi\n", 0o755);
     restore_git_snapshot(&runner, destination.path(), &snapshot).unwrap();
     let commands = runner.commands();
-    assert_eq!(commands.len(), 4);
-    assert_eq!(commands[2].stdin, b"staged-repo");
-    assert_eq!(commands[3].stdin, b"unstaged-repo");
+    assert_eq!(commands.len(), 5);
+    assert_eq!(commands[3].stdin, b"staged-repo");
+    assert_eq!(commands[4].stdin, b"unstaged-repo");
     assert_eq!(
         fs::read(destination.path().join("new.sh")).unwrap(),
         b"echo hi\n"

@@ -21,9 +21,9 @@ use crate::hel_archive::{
     ArchiveInput, BundleManifest, CanonicalSessionSnapshot, CanonicalTranscriptBody,
     GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode, NativeArtifact, PayloadRole,
     RepositorySnapshot, SessionManifest, SystemGit, TargetManifest, collect_git_metadata_snapshot,
-    collect_git_snapshot, ensure_branch_available_for_checkout, ensure_no_symlink_ancestors,
-    has_origin_refs, is_secret_like_path, read_archive_verified, restore_git_snapshot,
-    validate_component, verify_archive_streaming, write_archive_hashed,
+    collect_git_snapshot, ensure_no_symlink_ancestors, has_origin_refs, is_secret_like_path,
+    read_archive_verified, restore_git_snapshot, validate_component, verify_archive_streaming,
+    write_archive_hashed,
 };
 use crate::hel_config::HarnessKind;
 use crate::hel_targets::{
@@ -448,7 +448,6 @@ pub fn restore_single_repository_onto_branch(
     };
     let mut snapshot = archived_repository_snapshot(&archive, repository)?;
     let archived_branch = snapshot.metadata.branch.replace(branch.to_owned());
-    ensure_branch_available_for_checkout(git, repository_path, branch)?;
     restore_git_snapshot(git, repository_path, &snapshot)
         .with_context(|| format!("restore repository {:?}", repository.metadata.id))?;
     Ok(archived_branch)
@@ -3955,6 +3954,56 @@ mod tests {
             fs::read_to_string(checkout.join("README.md")).unwrap(),
             "edited",
             "a rejected restore leaves the worktree unchanged"
+        );
+    }
+
+    #[test]
+    fn a_workspace_restore_refuses_a_branch_checked_out_in_another_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, archive_path) = fixture(temp.path());
+        let repository = spec.workspace_root.join("app");
+        fs::write(repository.join("feature.txt"), b"session work").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "session work"]);
+        let archived_branch = git(&repository, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        export_checkpoint(&spec).unwrap();
+
+        // The restore destination is a sibling worktree of the same repository,
+        // so the archived branch is already owned by the main checkout.
+        let restore_root = temp.path().join("restore-workspace");
+        let destination = restore_root.join("app");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "mj/session",
+                &destination.to_string_lossy(),
+                "HEAD~1",
+            ],
+        );
+        let before = git(&destination, &["rev-parse", "HEAD"]);
+
+        let error = restore_repositories(&archive_path, &restore_root, &SystemGit).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("is checked out in another worktree"),
+            "{error:#}"
+        );
+        assert_eq!(
+            git(&destination, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "mj/session",
+            "a rejected restore leaves the destination on its own branch"
+        );
+        assert_eq!(
+            git(&destination, &["rev-parse", "HEAD"]),
+            before,
+            "a rejected restore leaves the destination checkout unchanged"
+        );
+        assert_eq!(
+            git(&repository, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            archived_branch
         );
     }
 
