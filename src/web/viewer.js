@@ -1,4 +1,5 @@
 import { renderMarkdown } from './markdown.js';
+import { renderToolOutput } from './tool-output.js';
 
 /// Build one element. Every piece of this application creates nodes and sets
 /// `textContent`; nothing builds markup as a string, which is what makes agent
@@ -745,7 +746,9 @@ function entryBody(entry) {
     body.append(renderMarkdown(text));
     return body;
   }
-  return el('pre', 'entry-body', text);
+  const body = el('div', 'entry-body');
+  body.append(renderToolOutput(text));
+  return body;
 }
 
 function renderEntries(entries, replace) {

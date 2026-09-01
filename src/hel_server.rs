@@ -666,6 +666,7 @@ fn router(options: ServerOptions) -> Router {
         .route("/viewer.css", get(viewer_css))
         .route("/viewer.js", get(viewer_js))
         .route("/markdown.js", get(markdown_js))
+        .route("/tool-output.js", get(tool_output_js))
         .route("/manifest.webmanifest", get(manifest))
         .route("/service-worker.js", get(service_worker))
         .route("/icon.svg", get(icon))
@@ -1367,6 +1368,7 @@ const VIEWER_HTML: &str = include_str!("web/viewer.html");
 const VIEWER_CSS: &str = include_str!("web/viewer.css");
 const VIEWER_JS: &str = include_str!("web/viewer.js");
 const MARKDOWN_JS: &str = include_str!("web/markdown.js");
+const TOOL_OUTPUT_JS: &str = include_str!("web/tool-output.js");
 /// A fake DOM for running the shipped renderers under Node. It is deliberately
 /// not served: it exists so `cargo test` can exercise `markdown.js` without a
 /// browser.
@@ -1413,6 +1415,10 @@ async fn viewer_js() -> Response<Body> {
 
 async fn markdown_js() -> Response<Body> {
     static_response("text/javascript; charset=utf-8", MARKDOWN_JS, false)
+}
+
+async fn tool_output_js() -> Response<Body> {
+    static_response("text/javascript; charset=utf-8", TOOL_OUTPUT_JS, false)
 }
 
 async fn manifest() -> Response<Body> {
@@ -1960,7 +1966,11 @@ mod tests {
     /// test by its real name instead of against a copy pasted into a string.
     fn run_web_check(name: &str, check: &str) {
         let directory = tempfile::tempdir().expect("temporary directory for a web check");
-        for (file, source) in [("test-dom.js", TEST_DOM_JS), ("markdown.js", MARKDOWN_JS)] {
+        for (file, source) in [
+            ("test-dom.js", TEST_DOM_JS),
+            ("markdown.js", MARKDOWN_JS),
+            ("tool-output.js", TOOL_OUTPUT_JS),
+        ] {
             std::fs::write(directory.path().join(file), source).expect("write a web module");
         }
         let path = directory.path().join(format!("{name}.mjs"));
@@ -2017,8 +2027,9 @@ checkEqual(elements(render('1. a\n2. b'), 'ol').length, 1, 'ordered list');
 // Fenced code stays unparsed
 const fenced = render('```rust\nlet x = *y*;\n```');
 checkEqual(only(fenced, 'code').textContent, 'let x = *y*;', 'fenced code');
+check(elements(fenced, 'span').some(s => s.className === 'tok-kw'), 'fenced rust untinted');
 checkEqual(elements(fenced, 'em').length, 0, 'fence emphasised its contents');
-checkEqual(only(fenced, 'code').className, 'language-rust', 'fence language');
+checkEqual(only(fenced, 'pre').dataset.lang, 'rust', 'fence language');
 
 // Inline code beats emphasis
 checkEqual(only(render('`*not em*`'), 'code').textContent, '*not em*', 'inline code');
@@ -2087,6 +2098,96 @@ console.log('all markdown checks passed');
         );
     }
 
+    /// Tool output is not prose, and rendering it as prose loses the parts
+    /// that matter: which words in a command are the program and which are
+    /// paths, where a JSON payload begins, and whether a five-thousand-line
+    /// dump has to be paid for before anyone asks to see it.
+    #[test]
+    fn tool_output_is_tinted_folded_and_never_read_as_markdown() {
+        run_web_check(
+            "tool-output",
+            r#"import { installDocument, elements, only, check, checkEqual, openFold } from './test-dom.js';
+installDocument();
+const { renderToolOutput, codeBlock, detectLang, appendCommandTokens, isPathLike } = await import(
+  './tool-output.js'
+);
+
+const classes = root => elements(root, 'span').map(s => s.className);
+
+// A shell command is told apart into program, subcommand, flag and path.
+const line = document.createElement('pre');
+appendCommandTokens(line, 'cargo test --workspace src/lib.rs');
+const seen = classes(line);
+check(seen.includes('cmd-program'), 'no program: ' + seen);
+check(seen.includes('cmd-subcommand'), 'no subcommand: ' + seen);
+check(seen.includes('cmd-flag'), 'no flag: ' + seen);
+check(seen.includes('cmd-path'), 'no path: ' + seen);
+checkEqual(line.textContent, 'cargo test --workspace src/lib.rs', 'command text changed');
+
+// An operator starts the program count again, so both programs are found.
+const piped = document.createElement('pre');
+appendCommandTokens(piped, 'git status && cargo build');
+checkEqual(classes(piped).filter(c => c === 'cmd-program').length, 2, 'pipeline reset');
+
+// Prose with a slash is not a path; a real path is.
+check(!isPathLike('and/or'), '"and/or" read as a path');
+check(isPathLike('src/lib/thing.rs'), 'a real path did not');
+check(isPathLike('./x'), 'a relative path did not');
+check(isPathLike('Cargo.toml'), 'a file with an extension did not');
+
+// JSON is pretty-printed and tinted, keys apart from values.
+const json = renderToolOutput('{"name":"hel","count":3,"ok":true}');
+const jsonClasses = classes(json);
+check(jsonClasses.includes('tok-key'), 'no JSON key: ' + jsonClasses);
+check(jsonClasses.includes('tok-str'), 'no JSON string: ' + jsonClasses);
+check(jsonClasses.includes('tok-num'), 'no JSON number: ' + jsonClasses);
+check(jsonClasses.includes('tok-kw'), 'no JSON keyword: ' + jsonClasses);
+check(json.textContent.includes('"name"'), 'JSON lost its content');
+
+// Rust is tinted; an unknown language is not.
+const rust = codeBlock('pub fn main() {\n    let x = 1;\n}', 'rust');
+check(classes(rust).includes('tok-kw'), 'rust keywords untinted');
+checkEqual(only(rust, 'pre').dataset.lang, 'rust', 'rust data-lang');
+const plain = codeBlock('nothing in particular here', 'brainfuck');
+checkEqual(classes(plain).length, 0, 'unknown language was tinted');
+
+// Sniffing is conservative: a log stays plain, real code does not.
+checkEqual(detectLang('12:03 INFO started\n12:04 INFO done\n12:05 INFO stopped'), '', 'a log was sniffed');
+checkEqual(
+  detectLang('fn a() {}\nfn b() {}\nlet mut x = 1;\nuse std::fmt;\nimpl Foo {}\nlet y = x.unwrap();'),
+  'rust',
+  'rust was not sniffed',
+);
+checkEqual(detectLang('--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new'), 'diff', 'diff was not sniffed');
+
+// A long dump is one closed fold that has built nothing yet.
+const long = Array.from({ length: 400 }, (_, i) => `line ${i}`).join('\n');
+const folded = renderToolOutput(long);
+checkEqual(folded.nodeName, 'DETAILS', 'a 400-line dump was not folded');
+checkEqual(elements(folded, 'pre').length, 0, 'a closed fold built its content anyway');
+check(only(folded, 'summary').textContent.includes('400 lines'), 'fold summary: ' + only(folded, 'summary').textContent);
+openFold(folded);
+checkEqual(elements(folded, 'pre').length, 1, 'an opened fold built nothing');
+check(elements(folded, 'pre')[0].textContent.includes('line 399'), 'the fold lost its content');
+
+// Opening twice builds once.
+openFold(folded);
+checkEqual(elements(folded, 'pre').length, 1, 'reopening rebuilt the content');
+
+// A short dump is not folded.
+checkEqual(renderToolOutput('one\ntwo').nodeName, 'PRE', 'a short dump was folded');
+
+// Tool output is never parsed as Markdown, so an underscore is an underscore.
+const literal = renderToolOutput('a _b_ c <img src=x>');
+checkEqual(elements(literal, 'em').length, 0, 'tool output was emphasised');
+checkEqual(elements(literal, 'img').length, 0, 'tool output produced an element');
+check(literal.textContent.includes('<img src=x>'), 'tool output lost its text');
+
+console.log('all tool-output checks passed');
+"#,
+        );
+    }
+
     /// The renderer's guarantee is structural — this code cannot inject markup
     /// because it never builds markup — and a single stray assignment would
     /// quietly replace it with no guarantee at all. `escapeHtml` uses
@@ -2105,7 +2206,11 @@ console.log('all markdown checks passed');
         // There is no allowance. Every one of these sinks was removed in
         // Milestone 2, and the point of the test is that none comes back.
         const ALLOWED: [(&str, &str); 0] = [];
-        for (name, source) in [("viewer.js", VIEWER_JS), ("markdown.js", MARKDOWN_JS)] {
+        for (name, source) in [
+            ("viewer.js", VIEWER_JS),
+            ("markdown.js", MARKDOWN_JS),
+            ("tool-output.js", TOOL_OUTPUT_JS),
+        ] {
             for (number, line) in source.lines().enumerate() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("//") || trimmed.starts_with("///") {

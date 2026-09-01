@@ -7,6 +7,8 @@
 // argument, and it is why the renderer returns a DocumentFragment rather than
 // a string a caller could be tempted to assign somewhere.
 
+import { codeBlock } from './tool-output.js';
+
 /// Schemes a link may use. A link is a navigation the reader did not choose,
 /// so `javascript:` and `data:` are refused outright rather than sanitised,
 /// and anything unrecognised is refused with them.
@@ -308,12 +310,9 @@ function renderBlocks(lines) {
       }
       // A fence that never closes still has content worth showing.
       if (index < lines.length) index += 1;
-      const pre = element('pre');
-      const code = element('code');
-      if (fence[2]) code.className = `language-${fence[2].replace(/[^\w.+-]/g, '')}`;
-      code.textContent = body.join('\n');
-      pre.append(code);
-      fragment.append(pre);
+      // Fenced code is tinted, folded when long, and pretty-printed when it
+      // turns out to be JSON, by the same layer that renders tool output.
+      fragment.append(codeBlock(body.join('\n'), fence[2].toLowerCase().replace(/[^\w.+-]/g, '')));
       continue;
     }
 

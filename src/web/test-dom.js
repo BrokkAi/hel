@@ -18,6 +18,23 @@ class FakeNode {
     this.attributes = new Map();
     this.className = '';
     this.value = '';
+    this.dataset = {};
+    this.listeners = new Map();
+    // `<details>` carries its own openness, and the fold under test builds its
+    // content on the first toggle, so the shim has to model both.
+    this.open = false;
+  }
+
+  addEventListener(type, listener) {
+    const existing = this.listeners.get(type) || [];
+    existing.push(listener);
+    this.listeners.set(type, existing);
+  }
+
+  /// Fire an event the way a browser would, so a check can open a fold and see
+  /// what the fold then built.
+  dispatch(type) {
+    for (const listener of this.listeners.get(type) || []) listener();
   }
 
   get tagName() {
@@ -101,6 +118,13 @@ export function only(root, tagName) {
     throw new Error(`expected exactly one <${tagName}>, found ${found.length}`);
   }
   return found[0];
+}
+
+/// Open a `<details>` the way a tap would: set `open`, then fire `toggle`.
+export function openFold(details) {
+  details.open = true;
+  details.dispatch('toggle');
+  return details;
 }
 
 /// Assert, with a message that says what was expected and what happened.
