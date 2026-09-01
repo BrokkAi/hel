@@ -678,11 +678,16 @@ Writes go through `submit_database_write` so the daemon stays the only writer, a
 
 ## Follow-up issues to open before implementation
 
-Two GitHub issues on `BrokkAi/hel` are required before implementation starts, and neither is implemented by this plan. Confirm with the repository owner before opening them, because opening an issue is an outward-facing action.
+Two GitHub issues on `BrokkAi/hel` are required, and neither is implemented by this plan. Both are open:
 
-The first is "Web viewer: add a mobile second-opinion workflow". Hel already has a second-opinion feature in `src/hel_second_opinion.rs`; the issue is about reaching it from a phone. It must reference this parity work, and define the phone user experience, how a request in flight is cancelled and how failures are reported, the accessibility requirements, and the acceptance tests.
+- [#19 Web viewer: add a mobile second-opinion workflow](https://github.com/BrokkAi/hel/issues/19)
+- [#20 Web viewer: add browser dictation](https://github.com/BrokkAi/hel/issues/20)
 
-The second is "Web viewer: add browser dictation". Hel already has speech support in `src/speech.rs` and `voice-worker/`; the issue is about dictating a prompt in the browser. It must reference this parity work, and define the phone user experience, cancellation and error handling, accessibility, and — most importantly — the privacy and microphone-permission behaviour, plus acceptance tests.
+Checked against the twelve issues that existed beforehand; neither duplicates one.
+
+#19 covers reaching the existing second-opinion feature from a phone. `ReviewerSetup` in `src/hel_second_opinion.rs` and `ReviewerAction` in `src/hel_session_manager.rs` already exist and are reachable only from the terminal; nothing about a reviewer is projected to the phone today. The issue defines the flow as a route in the shape of the New wizard, cancellation as a `202` with an operation identifier, the redaction the reviewer's own error text needs, the accessibility requirements, and the acceptance tests.
+
+#20 covers dictating a prompt in the browser. `run_dictation` in `src/speech.rs` captures audio on the machine running the daemon, which is not the machine holding the phone, so this is a different mechanism rather than a projection of the existing one. The issue makes the choice between the browser's own `SpeechRecognition` — which in Chrome sends audio to a third party — and capturing in the browser to recognise in the existing `voice-worker`, an explicit decision the implementing plan must record rather than make silently. It defines the composer control, cancellation on navigation and page hide, the permission and privacy behaviour in detail, and the acceptance tests.
 
 Reviewer and dictation controls are explicitly out of scope for every milestone above.
 
