@@ -104,7 +104,7 @@ pub fn load_or_create_cookie_key(path: &std::path::Path) -> AnyResult<Vec<u8>> {
     }
     let key = generate_cookie_key()?;
     crate::hel_config::atomic_write(path, &key)
-        .with_context(|| format!("persist Hel phone cookie key {}", path.display()))?;
+        .with_context(|| format!("persist Mjolnir phone cookie key {}", path.display()))?;
     Ok(key.to_vec())
 }
 
@@ -211,7 +211,7 @@ pub async fn run_server(options: ServerOptions) -> AnyResult<()> {
     let viewer_code = options.viewer_code.clone();
     let tls_config = options.tls_config.take();
     let app = router(options);
-    println!("Hel viewer code: {viewer_code}");
+    println!("Mjolnir viewer code: {viewer_code}");
     if let Some(tls_config) = tls_config {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
@@ -227,7 +227,7 @@ pub async fn run_server(options: ServerOptions) -> AnyResult<()> {
     } else {
         let listener = tokio::net::TcpListener::bind(bind)
             .await
-            .with_context(|| format!("bind Hel phone server to {bind}"))?;
+            .with_context(|| format!("bind Mjolnir phone server to {bind}"))?;
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown.cancelled_owned())
             .await
@@ -1987,7 +1987,7 @@ fn generate_viewer_code() -> AnyResult<String> {
     loop {
         let mut bytes = [0_u8; 4];
         getrandom::fill(&mut bytes)
-            .map_err(|error| anyhow::anyhow!("generate Hel viewer code: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("generate Mjolnir viewer code: {error}"))?;
         let value = u32::from_le_bytes(bytes);
         if value < LIMIT {
             return Ok(format!("{:06}", value % RANGE));
@@ -1998,14 +1998,14 @@ fn generate_viewer_code() -> AnyResult<String> {
 fn generate_login_token() -> AnyResult<String> {
     let mut token = [0_u8; 32];
     getrandom::fill(&mut token)
-        .map_err(|error| anyhow::anyhow!("generate Hel viewer login token: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("generate Mjolnir viewer login token: {error}"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token))
 }
 
 fn generate_cookie_key() -> AnyResult<[u8; COOKIE_KEY_BYTES]> {
     let mut key = [0_u8; COOKIE_KEY_BYTES];
     getrandom::fill(&mut key)
-        .map_err(|error| anyhow::anyhow!("generate Hel cookie key: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("generate Mjolnir cookie key: {error}"))?;
     Ok(key)
 }
 
