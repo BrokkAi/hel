@@ -2771,7 +2771,6 @@ mod tests {
     fn tiny_borderless_grid_can_be_selected_and_copied() {
         let mut dashboard = populated_dashboard();
         dashboard.cycle_pane_layout();
-        dashboard.cycle_pane_layout();
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
         let mut selection = SelectionState::new();
         draw_with_selection(&mut terminal, &mut dashboard, &selection);

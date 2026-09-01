@@ -169,21 +169,17 @@ and `Shift+Tab` reverses it. Once the support panes are collapsed the ring is
 the two panes that are still lists. The transcript is not a Tab stop: read it
 with the mouse wheel or `PageUp`/`PageDown` from wherever you are.
 
-`Ctrl+G` is a dial with three positions, each giving the conversation more
-room than the last, and it wraps back to the first:
-
-1. every pane at full size;
-2. Targets and Quota collapsed to one summary row each — host names with CPU
-   load, EC2 fleets with how many machines they are running, profile names
-   with weekly quota remaining;
-3. those, and the session list down to one line per session.
+`Ctrl+G` is a two-position dial: panes open, or panes collapsed for the
+conversation. Collapsed, Targets and Quota become one summary row each — host
+names with CPU load, EC2 fleets with how many machines they are running,
+profile names with weekly quota remaining — and the session list shrinks to a
+fixed grid, one line per session, unless your terminal is taller than it is
+wide, in which case the list stays a list.
 
 `Ctrl+G` always leaves the keyboard in Prompt: asking for room around the
 conversation and asking to work in it are the same gesture.
 
-Tab leaves the dial where you set it, with one exception: from the third
-position, asking for another pane is asking for the session list back, so Tab
-opens the dial one position and lands on Sessions.
+Tab leaves the dial where you set it.
 
 `F2` opens the workspace picker, `F3` the web viewer, and `Ctrl+Q` detaches.
 
