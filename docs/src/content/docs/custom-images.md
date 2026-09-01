@@ -76,6 +76,24 @@ write access to `/workspace` and `/var/lib/Mjolnir` — the reference image gran
 it by creating both directories and `chown`-ing them to `mj:Mjolnir` before
 switching to that user.
 
+## Browser tests and profiling tools
+
+Nothing in the container contract requires either, but the reference image bakes
+both in because a session's unprivileged user cannot install them later.
+
+Playwright's Chromium needs a set of X11, GTK, and font shared libraries that
+most base images omit. The reference image installs them with
+`npx playwright@<version> install-deps chromium`, pinned to the same Playwright
+version `tests/e2e/web/package.json` uses, and pre-installs the browser into
+`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` so a test run needs no network. If
+your image skips this, run `npx playwright install --with-deps chromium` inside
+the session before browser tests, which needs root or passwordless `sudo`.
+
+The reference image also carries `perf` (Debian's `linux-perf`),
+`cargo-flamegraph`, `samply`, `valgrind`, and `heaptrack`. `perf` depends on the
+host kernel as well as the image: it needs `kernel.perf_event_paranoid` set to 1
+or lower on the host, or the container run with `--cap-add SYS_ADMIN`.
+
 ## Resource metrics
 
 mj samples `/sys/fs/cgroup` (`memory.current`, `memory.max`,

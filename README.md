@@ -134,6 +134,12 @@ docker pull ghcr.io/brokkai/mjolnir/agent-dev:latest
 It includes Rust, cargo-nextest, Node, OpenJDK 25, Git, GitHub CLI, the Codex
 and Claude ACP bridges, and pinned DeepSeek Harness plus `dsh-acp-server`
 packages.
+It also bakes in Playwright's Chromium system libraries and the Chromium build
+itself (in `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`), so browser tests run
+without a privileged install or a run-time download,
+and the profiling tools `perf`, `cargo-flamegraph`, `samply`, `valgrind`, and
+`heaptrack` (`perf` also needs the host's `kernel.perf_event_paranoid` to be 1
+or lower, or `--cap-add SYS_ADMIN` on the container).
 See [docs/src/content/docs/custom-images.md](docs/src/content/docs/custom-images.md)
 to build your own.
 

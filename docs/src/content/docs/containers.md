@@ -49,7 +49,13 @@ installs both Linux companions.
 mj ships a reference container image with everything a session needs
 pre-installed: Rust, cargo-nextest, Node 24, OpenJDK 25, Git, GitHub CLI, the
 Codex and Claude ACP bridges, and pinned DeepSeek Harness plus
-`dsh-acp-server`. It's published at
+`dsh-acp-server`. It also carries Playwright's Chromium system libraries and a
+pre-installed Chromium in `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, so browser
+tests need no privileged install and no run-time browser download, and the
+profiling tools `perf`, `cargo-flamegraph`, `samply`, `valgrind`, and
+`heaptrack`; `perf` additionally needs the host's `kernel.perf_event_paranoid`
+set to 1 or lower, or the container run with `--cap-add SYS_ADMIN`. It's
+published at
 `ghcr.io/brokkai/mjolnir/agent-dev:latest`, public and
 multi-arch for both `linux/amd64` and `linux/arm64`, so the same image name
 works whether Mjolnir is running it through Podman, Docker, Apple's `container`

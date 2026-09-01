@@ -30,6 +30,13 @@ LABEL org.opencontainers.image.title="Hel agent development environment" \
 # brings in Node, npm, npx, Corepack, and the headers needed by native modules.
 COPY --from=node /usr/local/ /usr/local/
 
+# Profiling tools ship in this layer: `linux-perf` is Debian's `perf` build for
+# the packaged kernel, and `valgrind`/`heaptrack` are both small enough here
+# (heaptrack only pulls libunwind and three Boost runtime libraries) to be worth
+# baking in. `perf` inside a rootless container still depends on the *host*
+# kernel: it needs `kernel.perf_event_paranoid` <= 1 or the container to be run
+# with `--cap-add SYS_ADMIN`. That is a host setting; nothing in this image can
+# or should change it.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         bash \
@@ -42,9 +49,11 @@ RUN apt-get update \
         file \
         git \
         gh \
+        heaptrack \
         jq \
         less \
         libssl-dev \
+        linux-perf \
         musl-tools \
         openjdk-25-jdk-headless \
         openssh-client \
@@ -57,6 +66,7 @@ RUN apt-get update \
         ripgrep \
         sudo \
         unzip \
+        valgrind \
         zip \
     && rm -rf /var/lib/apt/lists/*
 
@@ -107,9 +117,56 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && java --version \
     && javac --version
 
+# Playwright's Chromium needs a long list of X11, GTK and font shared libraries
+# that this base image does not carry, and the unprivileged `hel` user cannot
+# apt-get them at run time. `playwright install-deps` is the vendor's own,
+# distro-aware mapping of that list, so it is preferred over a hand-copied apt
+# package list that would silently rot as Playwright's requirements move. It is
+# pinned to the exact version tests/e2e/web/package.json depends on; bump both
+# together. Note that install-deps needs apt lists, which the layer above
+# deletes, so this layer refreshes and re-deletes them.
+#
+# The browser binary itself is baked in too: the download is a few hundred MB
+# against a multi-GB image, and pre-installing means a test run does not need
+# network access. It lives in a shared PLAYWRIGHT_BROWSERS_PATH readable by
+# every user rather than in root's or hel's home cache.
+ARG PLAYWRIGHT_VERSION=1.62.1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN apt-get update \
+    && npx --yes playwright@${PLAYWRIGHT_VERSION} install-deps chromium \
+    && npx --yes playwright@${PLAYWRIGHT_VERSION} install chromium \
+    && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH" \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
+# Rust profiling front ends. `cargo install --locked` at pinned versions matches
+# how the rest of this image treats tooling: the version moves only when someone
+# edits these lines. The registry and build caches are dropped afterwards
+# because nothing at run time reads them.
+ARG FLAMEGRAPH_VERSION=0.6.14
+ARG SAMPLY_VERSION=0.13.1
+RUN cargo install --locked flamegraph@${FLAMEGRAPH_VERSION} \
+    && cargo install --locked samply@${SAMPLY_VERSION} \
+    && rm -rf "${CARGO_HOME:-/usr/local/cargo}/registry" \
+    && perf --version \
+    && cargo flamegraph --version \
+    && samply --version
+
 # The turn-review feature requires this binary; a review whose worker cannot
 # run it fails loudly and names an image rebuild as the fix.
 COPY --from=bifrost /opt/bifrost/bin/bifrost /usr/local/bin/bifrost
+
+# Debian's /etc/profile overwrites PATH, so a login shell drops the Rust image's
+# cargo bin directory and everything installed into it (cargo itself,
+# cargo-nextest, and now cargo-flamegraph and samply). Agent-requested shell
+# commands run through `bash -lc`, so without this they cannot see those tools.
+RUN printf '%s\n' \
+        'case ":${PATH}:" in' \
+        '  *:/usr/local/cargo/bin:*) ;;' \
+        '  *) PATH="/usr/local/cargo/bin:${PATH}" ;;' \
+        'esac' \
+        'export PATH' \
+        > /etc/profile.d/10-cargo-path.sh \
+    && bash -lc 'command -v cargo && command -v samply'
 
 RUN useradd --create-home --shell /bin/bash hel \
     && mkdir -p /workspace /var/lib/hel \
