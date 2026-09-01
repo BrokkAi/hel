@@ -561,6 +561,21 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;"
         ))?;
     }
+    if version < 21 {
+        // Arming review moved into `[review]` in config.toml, which is where
+        // the rest of Hel's durable global configuration lives and the only
+        // place a phone-only user could ever have set it. No data is
+        // migrated: a workspace-to-global mapping has no defensible merge
+        // rule, and the release note says to re-arm it in the config file.
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             DROP TABLE IF EXISTS turn_review_settings;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 21;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)

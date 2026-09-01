@@ -31,6 +31,7 @@
 pub mod bifrost;
 pub mod delta;
 pub mod driver;
+pub mod host;
 pub mod lanes;
 pub mod mcp;
 pub mod verdict;

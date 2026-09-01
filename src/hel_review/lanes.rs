@@ -190,9 +190,13 @@ pub fn lane_by_id(id: &str) -> Option<&'static ReviewLane> {
 /// Which tier a review runs at. Quick is one reviewer plus a validator only
 /// when that reviewer reports something; extended adds a supervisor that
 /// chooses specialist lanes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewTier {
+    /// One general reviewer, and a validator only when it reports something.
+    /// The cheaper tier is the default: it is the one a workspace gets by
+    /// naming nothing.
+    #[default]
     Quick,
     Extended,
 }

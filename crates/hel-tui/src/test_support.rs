@@ -87,6 +87,7 @@ pub(crate) fn config() -> HelConfig {
         version: CONFIG_VERSION,
         newer_config_version: None,
         phone: Default::default(),
+        review: Default::default(),
         profiles: BTreeMap::from([
             (
                 "claude-1".into(),

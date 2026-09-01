@@ -388,6 +388,9 @@ pub(crate) struct DashboardContext {
     worker_targets_tx: watch::Sender<Vec<WorkerPollTarget>>,
     worker: Feed<SessionManagerUpdates>,
     runtime_lifecycles: Feed<watch::Receiver<Vec<crate::daemon::RuntimeLifecycleView>>>,
+    /// Reviews the daemon is running. The chat renders one of these rather
+    /// than driving a review of its own.
+    runtime_reviews: Feed<watch::Receiver<Vec<hel::hel_review::host::RuntimeReviewView>>>,
     runtime_config: Feed<watch::Receiver<HelConfig>>,
     runtime_records: Feed<watch::Receiver<Vec<SessionRecord>>>,
     config_reload_in_flight: bool,
@@ -620,6 +623,10 @@ pub(crate) async fn run_dashboard_for_workspace(
             }
             update = context.runtime_lifecycles.wait(), if context.runtime_lifecycles.is_open() => {
                 let woke = context.runtime_lifecycles.accept(update);
+                context.dirty |= woke;
+            }
+            update = context.runtime_reviews.wait(), if context.runtime_reviews.is_open() => {
+                let woke = context.runtime_reviews.accept(update);
                 context.dirty |= woke;
             }
             update = context.runtime_config.wait(), if context.runtime_config.is_open() => {
@@ -891,6 +898,7 @@ impl DashboardContext {
         let worker_commands_tx = remote_worker.control;
         let worker_shutdown = remote_worker.shutdown;
         let runtime_lifecycles_rx = remote_worker.lifecycles;
+        let runtime_reviews_rx = remote_worker.reviews;
         let runtime_config_rx = remote_worker.config;
         let runtime_records_rx = remote_worker.records;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
@@ -950,6 +958,7 @@ impl DashboardContext {
             worker_targets_tx,
             worker: Feed::new(worker_updates_rx),
             runtime_lifecycles: Feed::new(runtime_lifecycles_rx),
+            runtime_reviews: Feed::new(runtime_reviews_rx),
             runtime_config: Feed::new(runtime_config_rx),
             runtime_records: Feed::new(runtime_records_rx),
             config_reload_in_flight: false,
@@ -1454,20 +1463,30 @@ impl DashboardContext {
         let bundle_id = session_record.bundle_id.clone();
         let draft = session_record.draft_input.clone();
         let (persistence_tx, mut persistence_rx) =
-            tokio::sync::mpsc::unbounded_channel::<hel::hel_chat::ChatPersistenceRequest>();
+            tokio::sync::mpsc::unbounded_channel::<hel::hel_chat::ChatDaemonRequest>();
+        let refusals = self.dashboard_io_tx.clone();
         tokio::spawn(async move {
             while let Some(request) = persistence_rx.recv().await {
+                // A review action's refusal is a sentence for the person who
+                // pressed the key, so it comes back to the chat rather than
+                // only into the log.
+                let refusal_session = match &request {
+                    hel::hel_chat::ChatDaemonRequest::StartTurnReview { session_id }
+                    | hel::hel_chat::ChatDaemonRequest::ResolveTurnReview { session_id, .. } => {
+                        Some(session_id.clone())
+                    }
+                    _ => None,
+                };
                 let result = async {
                     let mut daemon = crate::daemon::connect_or_start().await?;
                     match request {
-                        hel::hel_chat::ChatPersistenceRequest::SaveReview {
-                            session_id,
-                            review,
-                        } => daemon.save_active_review(session_id, review).await,
-                        hel::hel_chat::ChatPersistenceRequest::ClearReview { session_id } => {
+                        hel::hel_chat::ChatDaemonRequest::SaveReview { session_id, review } => {
+                            daemon.save_active_review(session_id, review).await
+                        }
+                        hel::hel_chat::ChatDaemonRequest::ClearReview { session_id } => {
                             daemon.clear_active_review(session_id).await
                         }
-                        hel::hel_chat::ChatPersistenceRequest::RememberReviewerSelection {
+                        hel::hel_chat::ChatDaemonRequest::RememberReviewerSelection {
                             workspace_id,
                             selection,
                         } => {
@@ -1475,21 +1494,26 @@ impl DashboardContext {
                                 .remember_reviewer_selection(workspace_id, selection)
                                 .await
                         }
-                        hel::hel_chat::ChatPersistenceRequest::SaveTurnReviewState {
-                            session_id,
-                            state,
-                        } => daemon.save_turn_review_state(session_id, state).await,
-                        hel::hel_chat::ChatPersistenceRequest::SaveTurnReviewSettings {
-                            workspace_id,
-                            settings,
-                        } => {
-                            daemon
-                                .save_turn_review_settings(workspace_id, settings)
-                                .await
+                        hel::hel_chat::ChatDaemonRequest::StartTurnReview { session_id } => {
+                            daemon.start_turn_review(session_id).await
                         }
+                        hel::hel_chat::ChatDaemonRequest::ResolveTurnReview {
+                            session_id,
+                            resolution,
+                        } => daemon.resolve_turn_review(session_id, resolution).await,
                     }
                 }
                 .await;
+                if let (Err(error), Some(session_id)) = (&result, refusal_session)
+                    && refusals
+                        .send(DashboardIoUpdate::ReviewRefused {
+                            session_id,
+                            message: format!("{error:#}"),
+                        })
+                        .is_err()
+                {
+                    tracing::debug!("a review refusal was dropped because the dashboard closed");
+                }
                 if let Err(error) = result {
                     tracing::warn!(%error, "could not persist chat state through the daemon");
                 }
@@ -1561,6 +1585,7 @@ impl DashboardContext {
         self.drain_runtime_records();
         self.drain_worker_updates();
         self.drain_runtime_lifecycles();
+        self.drain_runtime_reviews();
         self.drain_runtime_config();
         schedule_due_credential_syncs(
             &mut self.credential_sync_signals,
@@ -1583,6 +1608,29 @@ impl DashboardContext {
     /// A review can only be started from inside a chat, so the open chat is
     /// the authority while there is one. This is an in-memory read: the loop
     /// never touches the database for it.
+    /// Hands the open chat whatever review the daemon is running for it.
+    ///
+    /// The chat draws the pane and sends the resolutions; it hosts nothing.
+    /// A session with no review gets `None`, which closes the pane.
+    fn drain_runtime_reviews(&mut self) {
+        let mut latest = None;
+        while let Some(reviews) = self.runtime_reviews.next_ready() {
+            latest = Some(reviews);
+        }
+        let Some(reviews) = latest else {
+            return;
+        };
+        let Some(chat) = self.active_chat.as_mut() else {
+            return;
+        };
+        let session_id = chat.session_id().to_owned();
+        chat.apply_review_view(
+            reviews
+                .into_iter()
+                .find(|review| review.session_id == session_id),
+        );
+    }
+
     fn refresh_open_review(&mut self) {
         let Some(chat) = self.active_chat.as_ref() else {
             return;
@@ -1764,6 +1812,12 @@ impl DashboardContext {
         let Some(config) = latest else {
             return;
         };
+        // The chat's copy of `[review]` follows the daemon's, so `/review
+        // status` and the composer's armed indicator report what is actually
+        // running rather than what this process last read from disk.
+        if let Some(chat) = self.active_chat.as_mut() {
+            chat.set_review_config(config.review.clone());
+        }
         if config == self.controller.config || self.config_reload_in_flight {
             return;
         }

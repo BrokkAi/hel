@@ -2275,6 +2275,7 @@ mod tests {
                 version: CONFIG_VERSION,
                 newer_config_version: None,
                 phone: Default::default(),
+                review: Default::default(),
                 profiles: ids
                     .iter()
                     .map(|id| {

@@ -58,6 +58,12 @@ pub(crate) enum DashboardIoUpdate {
         session_id: String,
         result: Box<std::result::Result<hel::hel_chat::ActiveChat, String>>,
     },
+    /// The daemon refused a review action. The message is a sentence for the
+    /// person who pressed the key, so it goes back to the chat that sent it.
+    ReviewRefused {
+        session_id: String,
+        message: String,
+    },
     CreateSession(Box<DashboardCreateSessionUpdate>),
     RenameSession {
         session_id: String,
@@ -963,6 +969,20 @@ impl DashboardContext {
     /// Folds one finished background job into dashboard and controller state.
     pub(super) fn apply_dashboard_io_update(&mut self, update: DashboardIoUpdate) {
         match update {
+            DashboardIoUpdate::ReviewRefused {
+                session_id,
+                message,
+            } => {
+                match self
+                    .active_chat
+                    .as_mut()
+                    .filter(|chat| chat.session_id() == session_id)
+                {
+                    Some(chat) => chat.report_review_refusal(message),
+                    // The chat moved on; the refusal still belongs on screen.
+                    None => self.dashboard.set_notice(message),
+                }
+            }
             DashboardIoUpdate::WorkerRecordPersistence { operation, result } => {
                 match (operation, result) {
                     (WorkerRecordPersistence::AcpTitle { .. }, Err(error)) => self

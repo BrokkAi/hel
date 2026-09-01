@@ -17,6 +17,8 @@ use hel::hel_controller::{
 };
 use hel::hel_credentials::CredentialSyncSignal;
 use hel::hel_elicitation::ElicitationResponse;
+use hel::hel_review::driver::Resolution;
+use hel::hel_review::host::{RuntimeReviewView, TurnReviewHost};
 use hel::hel_session_manager::{
     ManagedSessionView, RemoteSessionPublisher, RemoteSessionRequest, SessionManagerChannels,
     SessionManagerControl, ViewError, spawn_remote_session_manager, spawn_session_manager,
@@ -132,6 +134,9 @@ pub(crate) struct RuntimeSnapshot {
     pub records: Vec<SessionRecord>,
     pub sessions: Vec<RuntimeSessionView>,
     pub lifecycles: Vec<RuntimeLifecycleView>,
+    /// Reviews the daemon is running, so every surface renders the same one.
+    #[serde(default)]
+    pub reviews: Vec<RuntimeReviewView>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,14 +268,6 @@ enum DaemonAction {
         workspace_id: String,
         selection: hel::hel_second_opinion::ReviewerSelection,
     },
-    SaveTurnReviewState {
-        session_id: String,
-        state: hel::hel_database::TurnReviewState,
-    },
-    SaveTurnReviewSettings {
-        workspace_id: String,
-        settings: hel::hel_database::TurnReviewSettings,
-    },
     PersistImportedSession {
         session: Box<SessionRecord>,
     },
@@ -347,6 +344,15 @@ enum DaemonAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
         action: hel::hel_session_manager::ReviewerAction,
+    },
+    /// Review the turn this session just finished, on a surface's request.
+    StartTurnReview {
+        session_id: String,
+    },
+    /// Forward, dismiss, or cancel the open review.
+    ResolveTurnReview {
+        session_id: String,
+        resolution: Resolution,
     },
     CloseSession {
         session_id: String,
@@ -504,6 +510,11 @@ pub(crate) struct RuntimeState {
     controller_loader: fn() -> Result<Controller>,
     config_mutation: tokio::sync::Mutex<()>,
     recovery_observer: RecoveryObserver,
+    /// What `[review]` last said, republished by the target refresher.
+    review_config: Arc<Mutex<hel::hel_config::ReviewConfig>>,
+    /// Turn review runs here, in the process that owns every session, so a
+    /// review happens whether the terminal, the phone, or nobody is attached.
+    review_host: TurnReviewHost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +585,19 @@ impl RuntimeState {
         let initial_revision = u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap_or(1);
         let (revision_tx, _) = tokio::sync::watch::channel(initial_revision);
         let (workspaces_tx, _) = tokio::sync::watch::channel(workspaces);
+        // The host reads `[review]` at each trigger decision. The target
+        // refresher already reloads config.toml every 500 ms and installs the
+        // result here, so arming needs no reload machinery of its own.
+        let review_config = Arc::new(Mutex::new(controller.config.review.clone()));
+        let review_host = TurnReviewHost::spawn(session_manager.clone(), {
+            let installed = review_config.clone();
+            Arc::new(move || {
+                installed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            })
+        });
         Self {
             attachments: Mutex::new(BTreeMap::new()),
             phone_status: Mutex::new(WebViewerStatus::Starting),
@@ -588,7 +612,14 @@ impl RuntimeState {
             controller_loader,
             config_mutation: tokio::sync::Mutex::new(()),
             recovery_observer,
+            review_config,
+            review_host,
         }
+    }
+
+    /// The review host, for the surfaces that project and resolve reviews.
+    pub(crate) fn review_host(&self) -> &TurnReviewHost {
+        &self.review_host
     }
 
     pub(crate) fn allocate_revision(&self) -> u64 {
@@ -748,6 +779,12 @@ impl RuntimeState {
                 notice: active.notice.clone(),
             })
             .collect();
+        let reviews = self
+            .review_host
+            .views()
+            .into_iter()
+            .filter(|review| session_ids.contains(&review.session_id))
+            .collect();
         let controller = self
             .controller
             .lock()
@@ -759,6 +796,7 @@ impl RuntimeState {
             records,
             sessions,
             lifecycles,
+            reviews,
         })
     }
 
@@ -1694,37 +1732,6 @@ impl DaemonClient {
         }
     }
 
-    pub(crate) async fn save_turn_review_state(
-        &mut self,
-        session_id: String,
-        state: hel::hel_database::TurnReviewState,
-    ) -> Result<()> {
-        match self
-            .request(DaemonAction::SaveTurnReviewState { session_id, state })
-            .await?
-        {
-            DaemonReply::Done => Ok(()),
-            reply => bail!("unexpected turn-review-state reply {reply:?}"),
-        }
-    }
-
-    pub(crate) async fn save_turn_review_settings(
-        &mut self,
-        workspace_id: String,
-        settings: hel::hel_database::TurnReviewSettings,
-    ) -> Result<()> {
-        match self
-            .request(DaemonAction::SaveTurnReviewSettings {
-                workspace_id,
-                settings,
-            })
-            .await?
-        {
-            DaemonReply::Done => Ok(()),
-            reply => bail!("unexpected turn-review-settings reply {reply:?}"),
-        }
-    }
-
     pub(crate) async fn remember_reviewer_selection(
         &mut self,
         workspace_id: String,
@@ -1927,6 +1934,38 @@ impl DaemonClient {
         {
             DaemonReply::Ordinal(ordinal) => Ok(ordinal),
             reply => bail!("unexpected session command reply {reply:?}"),
+        }
+    }
+
+    /// Ask the daemon to review the turn this session just finished.
+    ///
+    /// The refusal is a sentence for a person -- "prompts are queued", "set
+    /// [review] profile in config.toml" -- so it travels as text rather than
+    /// as a code every surface would have to translate.
+    pub(crate) async fn start_turn_review(&mut self, session_id: String) -> Result<()> {
+        match self
+            .request(DaemonAction::StartTurnReview { session_id })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected turn-review reply {reply:?}"),
+        }
+    }
+
+    pub(crate) async fn resolve_turn_review(
+        &mut self,
+        session_id: String,
+        resolution: Resolution,
+    ) -> Result<()> {
+        match self
+            .request(DaemonAction::ResolveTurnReview {
+                session_id,
+                resolution,
+            })
+            .await?
+        {
+            DaemonReply::Done => Ok(()),
+            reply => bail!("unexpected turn-review resolution reply {reply:?}"),
         }
     }
 
@@ -2394,6 +2433,10 @@ pub(crate) async fn run_daemon_process() -> Result<()> {
                     tracing::warn!(%error, "phone session view bridge stopped");
                     phone_publisher = None;
                 }
+                // Every session's view passes here whether or not anything is
+                // attached, which is exactly what an automatic review needs to
+                // see: the turn that just finished.
+                state.review_host().observe(&update.session_id, &update.view);
                 state.publish_session(update.session_id, update.view).await?;
             }
         }
@@ -2446,6 +2489,12 @@ fn spawn_manager_target_refresher(
                                 &lifecycle_sessions,
                             );
                             let changed = {
+                                let mut review = state
+                                    .review_config
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner);
+                                review.clone_from(&controller.config.review);
+                                drop(review);
                                 let mut current = state
                                     .controller
                                     .lock()
@@ -2873,19 +2922,6 @@ async fn handle_action(
             .await?;
             Ok(DaemonReply::Done)
         }
-        DaemonAction::SaveTurnReviewState { session_id, state } => {
-            blocking(move || hel::hel_database::save_turn_review_state(&session_id, &state))
-                .await?;
-            Ok(DaemonReply::Done)
-        }
-        DaemonAction::SaveTurnReviewSettings {
-            workspace_id,
-            settings,
-        } => {
-            blocking(move || hel::hel_database::save_turn_review_settings(&workspace_id, settings))
-                .await?;
-            Ok(DaemonReply::Done)
-        }
         DaemonAction::PersistImportedSession { session } => {
             blocking(move || crate::import::persist_imported_session_locally(&session)).await?;
             refresh_runtime_controller(state).await;
@@ -3069,6 +3105,27 @@ async fn handle_action(
             Ok(DaemonReply::Reviewer(Box::new(
                 session.reviewer_as(role, action).await?,
             )))
+        }
+        DaemonAction::StartTurnReview { session_id } => {
+            state
+                .review_host()
+                .start(&session_id, true)
+                .await
+                .map_err(|refusal| anyhow!("{refusal}"))?;
+            state.publish_revision();
+            Ok(DaemonReply::Done)
+        }
+        DaemonAction::ResolveTurnReview {
+            session_id,
+            resolution,
+        } => {
+            state
+                .review_host()
+                .resolve(&session_id, resolution)
+                .await
+                .map_err(|error| anyhow!("{error}"))?;
+            state.publish_revision();
+            Ok(DaemonReply::Done)
         }
         DaemonAction::SyncSession { session_id } => {
             state

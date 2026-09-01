@@ -66,6 +66,77 @@ impl PhoneConfig {
     }
 }
 
+/// Automatic cross-harness review of every completed coding turn.
+///
+/// Review is armed here, in the one file that belongs to the machine rather
+/// than to any surface: a session driven from a phone is reviewed on the same
+/// terms as one driven from the terminal, and the person who set it can see
+/// what they set. `profile` names a harness profile defined in this same file
+/// -- the reviewer runs under that profile, and it must not be the profile the
+/// session under review is using, or the "second opinion" is the same opinion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConfig {
+    /// Whether every completed turn is reviewed automatically. A one-off
+    /// `/review` works whether or not this is set, as long as `profile` names
+    /// a reviewer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_default_tier")]
+    pub tier: crate::hel_review::lanes::ReviewTier,
+    /// The harness profile the reviewing agents run under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Model and effort applied to every reviewing role, when the reviewing
+    /// harness advertises such a selector. Absent means the profile's own
+    /// default, which is what most configurations want.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_default_tier(tier: &crate::hel_review::lanes::ReviewTier) -> bool {
+    *tier == crate::hel_review::lanes::ReviewTier::default()
+}
+
+impl ReviewConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Rejects a configuration that cannot review.
+    ///
+    /// Arming review without naming a reviewer is a configuration mistake with
+    /// no sensible default -- Hel will not pick a profile on the user's behalf,
+    /// because which agent reviews is the most consequential review setting.
+    /// Naming a profile while disabled is valid: it is what a one-off `/review`
+    /// needs.
+    fn validate(&self, profiles: &BTreeMap<String, HarnessProfile>) -> Result<()> {
+        if self.enabled && self.profile.is_none() {
+            bail!(
+                "[review] enabled = true needs `profile` naming the harness profile that reviews"
+            );
+        }
+        if let Some(profile) = &self.profile
+            && !profiles.contains_key(profile)
+        {
+            bail!("[review] profile {profile:?} is not a profile defined in this config");
+        }
+        Ok(())
+    }
+
+    /// Whether a turn review can run at all: it needs a reviewer, armed or not.
+    #[must_use]
+    pub fn reviewer_profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+}
+
 pub const CONFIG_VERSION: u32 = 1;
 pub const PRODUCT_DIR: &str = "hel";
 
@@ -754,6 +825,8 @@ pub struct HelConfig {
     pub newer_config_version: Option<u32>,
     #[serde(default, skip_serializing_if = "PhoneConfig::is_default")]
     pub phone: PhoneConfig,
+    #[serde(default, skip_serializing_if = "ReviewConfig::is_default")]
+    pub review: ReviewConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, HarnessProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -768,6 +841,7 @@ impl Default for HelConfig {
             version: CONFIG_VERSION,
             newer_config_version: None,
             phone: PhoneConfig::default(),
+            review: ReviewConfig::default(),
             profiles: BTreeMap::new(),
             bundles: BTreeMap::new(),
             targets: BTreeMap::new(),
@@ -787,6 +861,9 @@ impl HelConfig {
         for (id, profile) in &self.profiles {
             profile.validate(id)?;
         }
+        // Checked after the profiles, so a review pointing at a malformed
+        // profile reports the profile's own error first.
+        self.review.validate(&self.profiles)?;
         for (id, bundle) in &self.bundles {
             bundle.validate(id)?;
         }
@@ -864,6 +941,13 @@ impl HelConfig {
             config.phone = phone;
         }
         config.profiles = salvage_map(document, "profiles", HarnessProfile::validate);
+        // Salvaged after the profiles, because whether a review section is
+        // usable depends on which profiles survived.
+        if let Some(review) = salvage_section::<ReviewConfig>(document, "review")
+            && review.validate(&config.profiles).is_ok()
+        {
+            config.review = review;
+        }
         config.bundles = salvage_map(document, "bundles", ProjectBundle::validate);
         config.targets = salvage_map(document, "targets", TargetTemplate::validate);
         config
@@ -1209,6 +1293,7 @@ mod tests {
             version: CONFIG_VERSION,
             newer_config_version: None,
             phone: PhoneConfig::default(),
+            review: ReviewConfig::default(),
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
@@ -1688,6 +1773,149 @@ mod tests {
         assert!(config.phone.enabled);
         assert!(config.phone.tailscale_detect);
         assert_eq!(config.phone.bind, "127.0.0.1:4765");
+    }
+
+    /// A profile that exists, so a `[review]` section has something to name.
+    fn config_with_profile(profile: &str) -> String {
+        format!(
+            "version = 1\n\n[profiles.{profile}]\nkind = \"claude\"\nhome = \"/home/u/.claude\"\n"
+        )
+    }
+
+    #[test]
+    fn review_is_off_and_quick_until_the_config_says_otherwise() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, config_with_profile("reviewer")).unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+
+        assert!(!config.review.enabled, "review is opt-in");
+        assert_eq!(
+            config.review.tier,
+            crate::hel_review::lanes::ReviewTier::Quick
+        );
+        assert_eq!(config.review.reviewer_profile(), None);
+    }
+
+    #[test]
+    fn a_review_section_names_the_profile_that_reviews() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "{}\n[review]\nenabled = true\ntier = \"extended\"\nprofile = \"reviewer\"\nmodel = \"opus\"\n",
+                config_with_profile("reviewer")
+            ),
+        )
+        .unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+
+        assert!(config.review.enabled);
+        assert_eq!(
+            config.review.tier,
+            crate::hel_review::lanes::ReviewTier::Extended
+        );
+        assert_eq!(config.review.reviewer_profile(), Some("reviewer"));
+        assert_eq!(config.review.model.as_deref(), Some("opus"));
+        assert_eq!(config.review.effort, None);
+    }
+
+    /// Arming review without naming a reviewer has no sensible default: Hel
+    /// will not choose which agent reviews on the user's behalf.
+    #[test]
+    fn arming_review_without_a_profile_is_refused() {
+        let config = HelConfig {
+            review: ReviewConfig {
+                enabled: true,
+                ..ReviewConfig::default()
+            },
+            ..HelConfig::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("armed review needs a reviewer");
+        assert!(
+            format!("{error:#}").contains("needs `profile`"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_review_profile_that_names_nothing_is_refused() {
+        let config = HelConfig {
+            review: ReviewConfig {
+                profile: Some("missing".into()),
+                ..ReviewConfig::default()
+            },
+            ..HelConfig::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("a reviewer must be a profile in this file");
+        assert!(
+            format!("{error:#}").contains("not a profile defined in this config"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// A one-off `/review` needs a reviewer without automatic review, so a
+    /// profile with `enabled = false` is a valid configuration.
+    #[test]
+    fn a_reviewer_without_automatic_review_is_valid() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "{}\n[review]\nprofile = \"reviewer\"\n",
+                config_with_profile("reviewer")
+            ),
+        )
+        .unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+        assert!(!config.review.enabled);
+        assert_eq!(config.review.reviewer_profile(), Some("reviewer"));
+    }
+
+    /// A review section that survives salvage is one whose profile also
+    /// survived: the section is only usable if its reviewer exists.
+    #[test]
+    fn salvage_keeps_a_review_section_whose_profile_survived() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "version = 9999\n{}\n[review]\nenabled = true\nprofile = \"reviewer\"\n",
+                config_with_profile("reviewer")
+                    .strip_prefix("version = 1\n")
+                    .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+        assert_eq!(config.newer_config_version, Some(9999));
+        assert!(config.review.enabled);
+        assert_eq!(config.review.reviewer_profile(), Some("reviewer"));
+    }
+
+    #[test]
+    fn salvage_drops_a_review_section_whose_profile_did_not_survive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "version = 9999\n[review]\nenabled = true\nprofile = \"gone\"\n",
+        )
+        .unwrap();
+
+        let config = HelConfig::load_from(&path).unwrap();
+        assert_eq!(config.review, ReviewConfig::default());
     }
 
     #[test]

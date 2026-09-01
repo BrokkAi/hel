@@ -713,7 +713,6 @@ fn version_thirteen_restores_checkpointed_lost_sessions_to_recoverable_errors() 
 fn rewind_schema_to(connection: &Connection, version: i64) {
     for table in [
         "turn_review_state",
-        "turn_review_settings",
         "second_opinion_reviews",
         "second_opinion_defaults",
         "host_container_sizes",
@@ -3069,59 +3068,6 @@ fn detached_drafts_keep_source_pid_and_workspace_without_overwriting_each_other(
 }
 
 #[test]
-fn turn_review_settings_default_to_off_and_persist_per_workspace() {
-    use crate::hel_review::lanes::ReviewTier;
-
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("hel.sqlite3");
-    save_session_to(&database, &session("session-1", "project-1")).unwrap();
-
-    // A workspace nobody configured reviews nothing: a review costs a second
-    // agent's turn, so it is opt-in.
-    let defaults = turn_review_settings_in(&database, "workspace-1").unwrap();
-    assert!(!defaults.auto_review);
-    assert_eq!(defaults.tier, ReviewTier::Quick);
-
-    save_turn_review_settings_in(
-        &database,
-        "workspace-1",
-        TurnReviewSettings {
-            auto_review: true,
-            tier: ReviewTier::Extended,
-        },
-    )
-    .unwrap();
-    let stored = turn_review_settings_in(&database, "workspace-1").unwrap();
-    assert!(stored.auto_review);
-    assert_eq!(stored.tier, ReviewTier::Extended);
-    // Writing again replaces the row rather than adding one.
-    save_turn_review_settings_in(
-        &database,
-        "workspace-1",
-        TurnReviewSettings {
-            auto_review: false,
-            tier: ReviewTier::Quick,
-        },
-    )
-    .unwrap();
-    assert!(
-        !turn_review_settings_in(&database, "workspace-1")
-            .unwrap()
-            .auto_review
-    );
-    // Another workspace keeps its own answer.
-    assert!(
-        !turn_review_settings_in(&database, "workspace-2")
-            .unwrap()
-            .auto_review
-    );
-    assert!(
-        save_turn_review_settings_in(&database, "  ", TurnReviewSettings::default()).is_err(),
-        "settings need a workspace to belong to"
-    );
-}
-
-#[test]
 fn review_baselines_survive_a_restart_and_a_restart_clears_a_running_review() {
     use crate::hel_review::lanes::PriorReviewContext;
 
@@ -3161,4 +3107,108 @@ fn review_baselines_survive_a_restart_and_a_restart_clears_a_running_review() {
     assert_eq!(restored.active, None);
     assert_eq!(restored.baselines, state.baselines);
     assert_eq!(restored.reviewed_through_ordinal, 42);
+}
+
+/// Arming review moved into `config.toml`, so the per-workspace row it used to
+/// live in is dropped rather than migrated: there is no defensible way to turn
+/// several workspaces' answers into one global one.
+#[test]
+fn migration_twenty_one_drops_the_workspace_review_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    // Rewound to exactly the schema this migration follows, with the table it
+    // drops present and populated, rather than through the broad rewind helper
+    // that other migration tests use: only migration 21 is under test here.
+    let connection = open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DELETE FROM schema_migrations WHERE version > 20;
+             PRAGMA user_version = 20;
+             CREATE TABLE turn_review_settings (
+                 workspace_id TEXT PRIMARY KEY,
+                 auto_review INTEGER NOT NULL,
+                 tier TEXT NOT NULL
+             ) STRICT;
+             INSERT INTO turn_review_settings VALUES ('workspace-1', 1, 'extended');",
+        )
+        .unwrap();
+    drop(connection);
+    forget_verified_schema(&database);
+
+    load_state_from(&database).unwrap();
+
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'turn_review_settings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "the workspace arming row is gone");
+    // Re-running the migration on an already-migrated database is safe.
+    drop(connection);
+    forget_verified_schema(&database);
+    load_state_from(&database).unwrap();
+}
+
+/// A review interrupted by a daemon restart is cancelled, not resumed, and the
+/// baseline it never advanced stays where it was.
+#[test]
+fn clearing_interrupted_reviews_keeps_every_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("hel.sqlite3");
+    save_session_to(&database, &session("session-1", "project-1")).unwrap();
+    save_session_to(&database, &session("session-2", "project-1")).unwrap();
+
+    let baselines = std::collections::BTreeMap::from([(
+        std::path::PathBuf::from("/workspace/app"),
+        "1234abcd".to_string(),
+    )]);
+    save_turn_review_state_in(
+        &database,
+        "session-1",
+        &TurnReviewState {
+            baselines: baselines.clone(),
+            reviewed_through_ordinal: 42,
+            prior_review: None,
+            active: Some("{\"opened_at_ordinal\":42}".to_string()),
+        },
+    )
+    .unwrap();
+    save_turn_review_state_in(
+        &database,
+        "session-2",
+        &TurnReviewState {
+            baselines: baselines.clone(),
+            reviewed_through_ordinal: 7,
+            prior_review: None,
+            active: None,
+        },
+    )
+    .unwrap();
+
+    let interrupted = clear_interrupted_turn_reviews_in(&database).unwrap();
+    assert_eq!(interrupted, vec!["session-1".to_string()]);
+
+    let restored = turn_review_state_in(&database, "session-1").unwrap();
+    assert_eq!(restored.active, None);
+    assert_eq!(
+        restored.baselines, baselines,
+        "the baseline is left alone, so the next review covers the same change"
+    );
+    assert_eq!(restored.reviewed_through_ordinal, 42);
+    assert!(
+        clear_interrupted_turn_reviews_in(&database)
+            .unwrap()
+            .is_empty(),
+        "a second sweep has nothing to clear"
+    );
 }

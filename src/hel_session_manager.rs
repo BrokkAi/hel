@@ -1718,6 +1718,24 @@ async fn run_session_actor(
                 }
                 match command {
                     ActorCommand::Submit { command_id, command, reply } => {
+                        // A turn under review holds its session's prompts, and
+                        // this is where that is enforced: the process that owns
+                        // the review owns the refusal, so no surface can bypass
+                        // it and no stale record can outlive it. The review's
+                        // own corrective prompt is submitted after the review
+                        // resolves, so it is never the one refused.
+                        if matches!(command, RelayCommand::Prompt { .. })
+                            && let Some(refusal) =
+                                crate::hel_review::host::prompt_refusal(&target.session_id)
+                        {
+                            tracing::debug!(
+                                session_id = %target.session_id,
+                                %command_id,
+                                "refusing a prompt while a turn review is unresolved"
+                            );
+                            let _ = reply.send(Err(refusal.to_owned()));
+                            continue;
+                        }
                         if lifecycle.is_leased() {
                             // A checkpoint or other lifecycle operation owns the
                             // connection. Hold the prompt instead of rejecting it

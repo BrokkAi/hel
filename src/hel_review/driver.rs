@@ -83,7 +83,8 @@ pub enum ReviewRequest {
 }
 
 /// Which stage of a review one role is in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoleState {
     Pending,
     Running,
@@ -105,8 +106,10 @@ impl RoleState {
     }
 }
 
-/// One reviewing agent's row in the review pane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One reviewing agent's row in the review pane. It crosses the daemon's
+/// snapshot to every surface, so it serializes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleStatus {
     pub role: String,
     pub label: String,
@@ -114,7 +117,8 @@ pub struct RoleStatus {
 }
 
 /// How a review ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Resolution {
     /// The findings went to the primary agent as a corrective prompt.
     Forwarded,
@@ -131,7 +135,8 @@ pub enum Resolution {
 }
 
 /// Where the review has got to.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
 pub enum TurnReviewPhase {
     /// Asking the worker what the turn changed.
     CapturingDelta,

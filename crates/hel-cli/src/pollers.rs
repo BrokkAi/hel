@@ -1175,6 +1175,8 @@ pub(crate) struct RemoteDashboardWorkerPoller {
     pub(crate) control: SessionManagerControl,
     pub(crate) shutdown: SessionManagerShutdown,
     pub(crate) lifecycles: tokio::sync::watch::Receiver<Vec<daemon::RuntimeLifecycleView>>,
+    /// Reviews the daemon is running for this workspace's sessions.
+    pub(crate) reviews: tokio::sync::watch::Receiver<Vec<hel::hel_review::host::RuntimeReviewView>>,
     pub(crate) config: tokio::sync::watch::Receiver<hel::hel_config::HelConfig>,
     pub(crate) records: tokio::sync::watch::Receiver<Vec<SessionRecord>>,
 }
@@ -1229,6 +1231,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         mut requests,
     } = channels;
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::watch::channel(Vec::new());
+    let (reviews_tx, reviews_rx) = tokio::sync::watch::channel(Vec::new());
     let (config_tx, config_rx) = tokio::sync::watch::channel(hel::hel_config::HelConfig::default());
     let (records_tx, records_rx) = tokio::sync::watch::channel(Vec::new());
     tokio::spawn(async move {
@@ -1269,6 +1272,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
                                 }
                             });
                             lifecycle_tx.send_replace(snapshot.lifecycles);
+                            reviews_tx.send_replace(snapshot.reviews);
                             for runtime in snapshot.sessions {
                                 let session_id = runtime.session_id.clone();
                                 let view = match runtime.operational {
@@ -1383,6 +1387,7 @@ pub(crate) fn spawn_remote_dashboard_worker_poller(
         control,
         shutdown,
         lifecycles: lifecycle_rx,
+        reviews: reviews_rx,
         config: config_rx,
         records: records_rx,
     })
