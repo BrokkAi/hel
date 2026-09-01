@@ -1930,7 +1930,7 @@ pub(super) fn configure_github_cli(
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    const ORIGINAL_BASH_ENV: &str = "HEL_ORIGINAL_BASH_ENV";
+    const ORIGINAL_BASH_ENV: &str = "MJ_ORIGINAL_BASH_ENV";
 
     let bin = root.join("bin");
     if std::fs::symlink_metadata(&bin).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
@@ -1988,13 +1988,13 @@ exec gh "$@"
             shell_environment.display()
         );
     }
-    const SHELL_ENVIRONMENT: &str = r#"if [ -n "${HEL_ORIGINAL_BASH_ENV:-}" ] && [ "${HEL_ORIGINAL_BASH_ENV}" != "${BASH_ENV:-}" ] && [ -r "${HEL_ORIGINAL_BASH_ENV}" ]; then
-    . "${HEL_ORIGINAL_BASH_ENV}"
+    const SHELL_ENVIRONMENT: &str = r#"if [ -n "${MJ_ORIGINAL_BASH_ENV:-}" ] && [ "${MJ_ORIGINAL_BASH_ENV}" != "${BASH_ENV:-}" ] && [ -r "${MJ_ORIGINAL_BASH_ENV}" ]; then
+    . "${MJ_ORIGINAL_BASH_ENV}"
 fi
-if [ -n "${HEL_GITHUB_CLI_BIN:-}" ]; then
+if [ -n "${MJ_GITHUB_CLI_BIN:-}" ]; then
     case ":${PATH:-}:" in
-        *:"${HEL_GITHUB_CLI_BIN}":*) ;;
-        *) PATH="${HEL_GITHUB_CLI_BIN}${PATH:+:${PATH}}"; export PATH ;;
+        *:"${MJ_GITHUB_CLI_BIN}":*) ;;
+        *) PATH="${MJ_GITHUB_CLI_BIN}${PATH:+:${PATH}}"; export PATH ;;
     esac
 fi
 "#;

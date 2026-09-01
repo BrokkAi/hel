@@ -136,7 +136,7 @@ sherpa-onnx native static payload 1.13.3
 ================================================================================
 
 Source: https://crates.io/crates/sherpa-onnx-sys/1.13.3
-Inclusion: statically linked into hel-voice-worker on Linux, macOS, and Windows
+Inclusion: statically linked into mj-voice-worker on Linux, macOS, and Windows
 
 The sherpa-onnx-sys build downloads a native archive that contains only static libraries, without legal files. The linked payload was audited against these exact upstream revisions:
 

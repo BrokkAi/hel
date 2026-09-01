@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${HEL_CHAOS_ISOLATED:-} != 1 ]]; then
-    echo "refusing to run crash hooks without HEL_CHAOS_ISOLATED=1" >&2
+if [[ ${MJ_CHAOS_ISOLATED:-} != 1 ]]; then
+    echo "refusing to run crash hooks without MJ_CHAOS_ISOLATED=1" >&2
     exit 2
 fi
 if [[ $# -lt 1 ]]; then

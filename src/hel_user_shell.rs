@@ -356,7 +356,7 @@ impl HeadTailBuffer {
             let dropped = self
                 .total
                 .saturating_sub(OUTPUT_HEAD_BYTES + OUTPUT_TAIL_BYTES);
-            bytes.extend_from_slice(format!("\n[hel dropped {dropped} middle bytes]\n").as_bytes());
+            bytes.extend_from_slice(format!("\n[mj dropped {dropped} middle bytes]\n").as_bytes());
         }
         bytes.extend(self.tail.iter().copied());
         (String::from_utf8_lossy(&bytes).into_owned(), truncated)
@@ -464,7 +464,7 @@ mod tests {
         assert!(truncated);
         assert!(text.starts_with(&"a".repeat(OUTPUT_HEAD_BYTES)));
         assert!(text.ends_with(&"b".repeat(OUTPUT_TAIL_BYTES)));
-        assert!(text.contains("hel dropped"));
+        assert!(text.contains("mj dropped"));
         assert_eq!(output.head.len(), OUTPUT_HEAD_BYTES);
         assert_eq!(output.tail.len(), OUTPUT_TAIL_BYTES);
     }

@@ -53,21 +53,21 @@ jobs:
     - name: Check crate package contents and build
       run: |
         diff -u LICENSE voice-worker/LICENSE
-        cargo package --locked --allow-dirty --list -p hel-core > /tmp/hel-package-files.txt
-        cargo package --locked --allow-dirty --list -p hel-voice-worker > /tmp/voice-worker-package-files.txt
+        cargo package --locked --allow-dirty --list -p brokk-mj-core > /tmp/hel-package-files.txt
+        cargo package --locked --allow-dirty --list -p brokk-mj-voice-worker > /tmp/voice-worker-package-files.txt
         grep -Fx LICENSE /tmp/hel-package-files.txt
         grep -Fx licenses/THIRD_PARTY_LICENSES.html /tmp/hel-package-files.txt
         grep -Fx licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/hel-package-files.txt
         grep -Fx LICENSE /tmp/voice-worker-package-files.txt
-        diff -u LICENSE crates/hel-tui/LICENSE
-        diff -u LICENSE crates/hel-cli/LICENSE
-        cargo package --locked --allow-dirty --list -p hel-tui > /tmp/hel-tui-package-files.txt
-        cargo package --locked --allow-dirty --list -p hel-cli > /tmp/hel-cli-package-files.txt
+        diff -u LICENSE mj-tui/LICENSE
+        diff -u LICENSE mj-cli/LICENSE
+        cargo package --locked --allow-dirty --list -p brokk-mj-tui > /tmp/hel-tui-package-files.txt
+        cargo package --locked --allow-dirty --list -p brokk-mjolnir > /tmp/hel-cli-package-files.txt
         grep -Fx LICENSE /tmp/hel-tui-package-files.txt
         grep -Fx LICENSE /tmp/hel-cli-package-files.txt
-        cargo package --locked -p hel-core
+        cargo package --locked -p brokk-mj-core
 
-  hel:
+  mjolnir:
     strategy:
       fail-fast: false
       matrix:
@@ -150,10 +150,10 @@ jobs:
         sudo apt-get install --no-install-recommends --assume-yes musl-tools
 
     - name: Build the isolated-test controller
-      run: cargo build --locked -p hel-cli
+      run: cargo build --locked -p brokk-mjolnir
 
     - name: Run deterministic daemon, two-TUI, and web scenario
-      run: tests/e2e/run-reliability.sh --scenario multi-client-happy-path --seed 1 ./target/x86_64-unknown-linux-musl/debug/hel
+      run: tests/e2e/run-reliability.sh --scenario multi-client-happy-path --seed 1 ./target/x86_64-unknown-linux-musl/debug/mj
 
     - name: Upload reliability evidence
       if: always()
@@ -163,6 +163,37 @@ jobs:
         path: target/reliability-artifacts/
         if-no-files-found: warn
         retention-days: 14
+
+  desktop-linux:
+    # The primary Linux jobs build for musl, where the desktop-app feature is
+    # deliberately inert, so this is the only pull-request compile-and-test
+    # gate for the Linux desktop shell path releases actually ship.
+    name: Desktop shell (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        components: clippy
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Install Linux desktop dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes libwebkit2gtk-4.1-dev
+
+    - name: Clippy over the desktop path
+      run: cargo clippy --locked -p brokk-mjolnir -p brokk-mj-desktop -- -D warnings
+
+    - name: Build the desktop crate
+      run: cargo check --locked -p brokk-mj-desktop
+
+    - name: Test the mj binary with the desktop feature active
+      run: cargo test --locked -p brokk-mjolnir --bin mj
 
   voice-worker:
     name: Voice worker (ubuntu-latest)
@@ -205,7 +236,7 @@ jobs:
         fi
 
     - name: Check voice worker
-      run: cargo clippy -p hel-voice-worker --all-targets -- -D warnings
+      run: cargo clippy -p brokk-mj-voice-worker --all-targets -- -D warnings
 
     - name: Test voice worker
-      run: cargo test -p hel-voice-worker
+      run: cargo test -p brokk-mj-voice-worker

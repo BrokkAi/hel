@@ -638,7 +638,7 @@ fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
         ),
         ChatRole::Plan => ("plan", "Plan".to_owned()),
         ChatRole::PlanProposal => ("plan-proposal", "Proposed plan".to_owned()),
-        ChatRole::System => ("system", "Hel".to_owned()),
+        ChatRole::System => ("system", "Mjolnir".to_owned()),
     };
     let source = if entry.role == ChatRole::Plan {
         entry
@@ -2315,7 +2315,7 @@ fn entry_visual(entry: &ChatEntry) -> EntryVisual {
             let style = Style::default().fg(Color::DarkGray);
             EntryVisual {
                 glyph: "─",
-                label: "Hel".into(),
+                label: "Mjolnir".into(),
                 header_style: style,
                 body_style: style,
                 rail_style: style,

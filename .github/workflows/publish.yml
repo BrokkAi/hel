@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing Hel release tag to package, in the form vX.Y.Z
+        description: Existing Mjolnir release tag to package, in the form vX.Y.Z
         required: true
         type: string
       publish:
@@ -24,7 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
-      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v6
@@ -33,30 +32,40 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          targets: x86_64-unknown-linux-musl
 
-      - name: Install Linux build dependencies
+      - name: Install Linux native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev musl-tools
+          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev libwebkit2gtk-4.1-dev
 
-      - name: Verify tag, manifests, and lockfile agree
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
         run: |
-          node scripts/release-version.mjs check "$RELEASE_TAG"
-          cargo metadata --locked --format-version 1 >/dev/null
+          set -euo pipefail
+          tag="${RELEASE_TAG#v}"
+          # Every workspace member inherits `version.workspace`, so check them
+          # all rather than a hand-maintained list that goes stale the next time
+          # a crate is extracted.
+          versions="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | [.name, .version] | @tsv')"
+          test -n "$versions"
+          while IFS=$'\t' read -r crate version; do
+            if [ "$tag" != "$version" ]; then
+              echo "Tag version ($tag) does not match $crate version ($version)" >&2
+              exit 1
+            fi
+          done <<< "$versions"
 
       - name: Package crates
         run: |
-          # Only crates without in-workspace registry dependencies can be
-          # packaged before publishing: cargo package requires a dependency to
-          # exist in the index even with --no-verify, and hel-core is not there
-          # until this same release publishes it. hel-tui and hel-cli are
-          # packaged (and verify-built) by cargo publish itself, which runs in
-          # dependency order after hel-core is live.
-          cargo package --locked -p hel-core
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
-            cargo package --locked -p hel-voice-worker
+          # Packaging the whole workspace in one run lets cargo resolve the
+          # same-release sibling versions (brokk-mj-core, brokk-mj-tui,
+          # brokk-mj-desktop) against the crates packaged alongside them
+          # instead of against the registry, where this version does not exist
+          # until the publish job.
+          cargo package --locked --workspace
+          # Build the normal desktop CLI after package verification.
+          cargo build --locked -p brokk-mjolnir
 
       - uses: actions/upload-artifact@v7
         with:
@@ -75,7 +84,6 @@ jobs:
       contents: read
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
-      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v6
@@ -84,13 +92,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          targets: x86_64-unknown-linux-musl
 
-      - name: Install Linux build dependencies
+      - name: Install Linux native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev musl-tools
+          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev libwebkit2gtk-4.1-dev
 
       - name: Authenticate to crates.io
         uses: rust-lang/crates-io-auth-action@v1
@@ -135,17 +141,21 @@ jobs:
                 ;;
             esac
           }
-          # Dependency order: cargo publish waits for each crate to reach the
-          # index before returning, so the next crate in the chain resolves.
-          for crate in hel-core hel-tui hel-cli hel-voice-worker; do
+          # Dependency order: brokk-mj-core has no workspace dependencies;
+          # brokk-mj-tui needs it; and the root binary needs both plus
+          # brokk-mj-desktop. brokk-mj-voice-worker and brokk-mj-desktop are
+          # independent. Publishing out of this order fails on a missing
+          # registry dependency.
+          for crate in brokk-mj-voice-worker brokk-mj-core brokk-mj-tui brokk-mj-desktop brokk-mjolnir; do
             if already_published "$crate"; then
               echo "$crate $version is already on crates.io, skipping"
               continue
             fi
-            if [ "$crate" = hel-voice-worker ]; then
-              CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
-                cargo publish --locked -p "$crate"
-            else
-              cargo publish --locked -p "$crate"
-            fi
+            # The sparse index may take a moment to expose a just-published
+            # workspace sibling that the next crate needs while packaging.
+            for attempt in 1 2 3 4 5 6; do
+              cargo publish --locked -p "$crate" && break
+              test "$attempt" -lt 6 || exit 1
+              sleep 10
+            done
           done

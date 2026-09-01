@@ -213,7 +213,7 @@ function applyRoute() {
       targets: 'Targets',
       quota: 'Quota',
       conversation: 'Conversation',
-    }[name] || 'HEL';
+    }[name] || 'MJ';
 
   if (name === 'conversation') {
     openConversation(route.sessionId);
@@ -683,7 +683,7 @@ async function commitNew() {
   }
 }
 
-/// Sessions that are not live and that Hel owns, which is what "resume" means.
+/// Sessions that are not live and that Mjolnir owns, which is what "resume" means.
 ///
 /// A session that cannot resume anywhere is still listed, with one plain
 /// sentence saying why and where to finish it. Hiding it would leave a person
@@ -981,6 +981,7 @@ function showLogin() {
   }
   // Nothing from the previous viewer may survive a sign-out in this tab.
   pendingActions.clear();
+  pendingReviewSessions.clear();
   entryNodes.clear();
   elicitationCards.clear();
   sentElicitations.clear();
@@ -1067,6 +1068,7 @@ function renderQueue(session) {
 // leaves the snapshot.
 /// The review last drawn, so the card is rebuilt only when it changes.
 let reviewSignature = null;
+const pendingReviewSessions = new Set();
 const elicitationCards = new Map(),
   sentElicitations = new Set();
 function elicitationKey(sessionId, id) {
@@ -1123,7 +1125,7 @@ function elicitationFieldValue(field, control) {
 }
 // Builds the controls and returns collect(), which reads them back as ACP
 // content. A custom answer replaces the select it belongs to unless the
-// request pairs it with one specific option, which is how Hel's chat form
+// request pairs it with one specific option, which is how Mjolnir's chat form
 // submits the same request.
 function buildElicitationForm(form, request, register) {
   const entries = [];
@@ -1269,7 +1271,9 @@ function buildElicitationCard(session, request) {
 /// on a button does not lose it every two seconds.
 function renderTurnReview(session) {
   const review = session?.turn_review || null;
-  const signature = JSON.stringify(review);
+  // The session belongs in the identity too. Two sessions can publish an
+  // identical review, but their controls must still close over different ids.
+  const signature = JSON.stringify([session?.id || null, review]);
   if (reviewSignature === signature) return;
   reviewSignature = signature;
   if (!review) {
@@ -1305,14 +1309,30 @@ function renderTurnReview(session) {
     // Cancel always works; the rest wait for the verdict the daemon
     // published, and the daemon refuses anything else anyway.
     button.disabled =
-      resolution !== 'cancel' && !(verdict?.allowed || []).includes(resolution);
-    button.addEventListener('click', () => {
-      button.disabled = true;
-      sendAction({
-        action: 'resolve-review',
-        session_id: session.id,
-        resolution,
-      });
+      pendingReviewSessions.has(session.id) ||
+      (resolution !== 'cancel' && !(verdict?.allowed || []).includes(resolution));
+    button.addEventListener('click', async () => {
+      if (pendingReviewSessions.has(session.id)) return;
+      pendingReviewSessions.add(session.id);
+      // One resolution owns the whole card while it is in flight. Otherwise a
+      // second tap can race a different answer into the same review.
+      for (const control of actions.children) control.disabled = true;
+      try {
+        await sendAction({
+          action: 'resolve-review',
+          session_id: session.id,
+          resolution,
+        });
+      } finally {
+        pendingReviewSessions.delete(session.id);
+        // A failed request leaves the review open. Rebuild the still-current
+        // card from its published gates so every valid action becomes usable
+        // again; never revive controls from a conversation already left behind.
+        if (currentSession === session.id) {
+          reviewSignature = null;
+          renderTurnReview(activeSession());
+        }
+      }
     });
     actions.append(button);
   }
@@ -1717,7 +1737,7 @@ function configOption(key) {
 /// The commands offered for what has been typed so far.
 ///
 /// The list is the daemon's: it knows what this session's harness advertised
-/// and what Hel itself offers, and publishing it is what keeps the phone from
+/// and what Mjolnir itself offers, and publishing it is what keeps the phone from
 /// missing a command the terminal has.
 function availableCommands() {
   return activeSession()?.available_commands || [];
@@ -1821,21 +1841,44 @@ function acceptCommandSelection() {
   return true;
 }
 
-/// Everything Hel and the agent offer, as a system note in the transcript.
+/// Everything Mjolnir and the agent offer, as a system note in the transcript.
 function showHelp() {
-  const lines = ['Available commands:', '!<command> — run a shell command in this session [hel]'];
+  const lines = ['Available commands:', '!<command> — run a shell command in this session [mj]'];
   for (const command of availableCommands()) {
     const argument = command.argument ? ` <${command.argument}>` : '';
-    lines.push(`/${command.name}${argument} — ${command.description} [hel]`);
+    lines.push(
+      `/${command.name}${argument} — ${command.description} [${command.source || 'mj'}]`,
+    );
   }
   const note = el('article', 'entry tone-system');
   const heading = el('strong');
   const glyph = el('span', 'entry-glyph', '─');
   glyph.setAttribute('aria-hidden', 'true');
-  heading.append(glyph, el('span', 'entry-label', 'Hel'));
+  heading.append(glyph, el('span', 'entry-label', 'Mjolnir'));
   note.append(heading, el('pre', 'entry-body', lines.join('\n')));
   feed.append(note);
   scrollToTail();
+}
+
+/// The shared `/review status` sentence, from the bounded config projection.
+///
+/// Keep this byte-for-byte aligned with `hel_chat::review_status_line`: the
+/// same configuration should answer the same way on the terminal and phone.
+function reviewStatusLine(review, open) {
+  const enabled = review?.enabled === true;
+  const profile = review?.profile;
+  const tier = review?.tier || 'quick';
+  let armed;
+  if (enabled && profile) {
+    armed = `Reviewing every completed turn with [review] profile ${JSON.stringify(profile)} (${tier} tier)`;
+  } else if (enabled) {
+    armed = '[review] enabled = true but no profile is named, so nothing can review';
+  } else if (profile) {
+    armed = `Automatic review is off; /review reviews one turn with ${JSON.stringify(profile)} (${tier} tier)`;
+  } else {
+    armed = 'Turn review needs a reviewer: set [review] profile in config.toml';
+  }
+  return open ? `${armed}. A review is open now.` : armed;
 }
 
 /// Run a local command, or report that nothing here can.
@@ -1904,12 +1947,10 @@ async function runLocalCommand(text) {
     case 'review': {
       const scope = argument.trim().toLowerCase();
       if (scope === 'status') {
-        // What the daemon published about this session is the answer: whether
-        // a review is running now, and what tier it is running at.
-        const review = session?.turn_review;
-        error.textContent = review
-          ? `A review is open now (${review.tier}): ${review.status}`
-          : 'No review is open. /review reviews the finished turn; automatic review is configured in config.toml under [review].';
+        error.textContent = reviewStatusLine(
+          snapshot?.review_config,
+          Boolean(session?.turn_review),
+        );
         setComposerText('');
         return true;
       }
@@ -1952,13 +1993,20 @@ async function runLocalCommand(text) {
 /// Post one action and report its failure where the composer can be seen.
 async function sendAction(body) {
   const error = document.querySelector('#conversation-error');
+  const sessionId = body.session_id;
   try {
     await request('/api/actions', { method: 'POST', body: JSON.stringify(body) });
-    setComposerText('');
-    error.textContent = '';
+    // Do not let an action that completed after navigation clear the next
+    // conversation's draft or error state.
+    if (!sessionId || currentSession === sessionId) {
+      setComposerText('');
+      error.textContent = '';
+    }
     await refresh();
+    return true;
   } catch (err) {
-    error.textContent = err.message;
+    if (!sessionId || currentSession === sessionId) error.textContent = err.message;
+    return false;
   }
 }
 

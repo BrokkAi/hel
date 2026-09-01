@@ -101,7 +101,7 @@ When testing code that streams through pipes or bounded buffers, drive it
 with more than 64KB of data so buffer-boundary deadlocks and truncation
 actually show up; toy-sized fixtures prove nothing about this class of bug.
 
-Unit tests are colocated in module-level `#[cfg(test)]` blocks. `crates/hel-cli/tests/` holds the PTY termination test, and `tests/e2e/` holds the shell/expect harness.
+Unit tests are colocated in module-level `#[cfg(test)]` blocks. `mj-cli/tests/` holds the PTY termination test, and `tests/e2e/` holds the shell/expect harness.
 
 ## Coding Style & Naming Conventions
 

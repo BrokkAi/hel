@@ -551,7 +551,7 @@ fn projects_jsonl_projects_user_and_assistant_text_in_source_order() {
     fs::write(
             &path,
             concat!(
-                r#"{"type":"user","cwd":"/work/app","message":{"content":"<hel-project-memory>private</hel-project-memory>\nfirst prompt"}}"#,
+                r#"{"type":"user","cwd":"/work/app","message":{"content":"<mj-project-memory>private</mj-project-memory>\nfirst prompt"}}"#,
                 "\n",
                 r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"first reply"}]}}"#,
                 "\n",
@@ -685,7 +685,7 @@ fn local_source_repository_import_carries_no_committed_bundle() {
     let snapshots = collect_local_repositories(&bundle, &[app], None).unwrap();
 
     assert!(snapshots[0].committed_bundle.is_empty());
-    assert_eq!(snapshots[0].metadata.origin, "hel-local:app");
+    assert_eq!(snapshots[0].metadata.origin, "mj-local:app");
     assert!(!snapshots[0].untracked_tar.is_empty());
 }
 
@@ -728,7 +728,7 @@ fn codex_jsonl_projects_user_and_agent_messages() {
             concat!(
                 r#"{"type":"session_meta","payload":{"session_id":"019feb6c-5ffc-7c12-ad99-bdeaeb6be79d","cwd":"/work/app","history_mode":"paginated"}}"#,
                 "\n",
-                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"<hel-project-memory>private</hel-project-memory>","text_elements":[]},{"type":"text","text":"first prompt","text_elements":[]}]}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"<mj-project-memory>private</mj-project-memory>","text_elements":[]},{"type":"text","text":"first prompt","text_elements":[]}]}}}"#,
                 "\n",
                 r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"agent-1","content":[{"type":"Text","text":"first reply"}],"phase":"final_answer"}}}"#,
                 "\n",
@@ -1696,7 +1696,7 @@ fn kimi_wire_projects_user_prompt_and_text_without_thought() {
     fs::write(
             &wire_path,
             concat!(
-                r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"<hel-project-memory>private</hel-project-memory>"},{"type":"text","text":"first prompt"}]}"#,
+                r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"<mj-project-memory>private</mj-project-memory>"},{"type":"text","text":"first prompt"}]}"#,
                 "\n",
                 r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"think","think":"hidden"}}}"#,
                 "\n",
@@ -1778,7 +1778,7 @@ fn grok_chat_history_projects_prompts_thoughts_and_replies() {
         "\n",
         r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>ignore me</system-reminder>"}],"synthetic_reason":"system_reminder"}"#,
         "\n",
-        r#"{"type":"user","content":[{"type":"text","text":"<hel-project-memory>private</hel-project-memory>"},{"type":"text","text":"first prompt"}],"prompt_index":0}"#,
+        r#"{"type":"user","content":[{"type":"text","text":"<mj-project-memory>private</mj-project-memory>"},{"type":"text","text":"first prompt"}],"prompt_index":0}"#,
         "\n",
         r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking it over"}],"encrypted_content":"opaque"}"#,
         "\n",

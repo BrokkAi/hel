@@ -247,7 +247,7 @@ fn cert_domain(status: &Status) -> Result<String> {
         .filter(|domain| !domain.is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "this tailnet has no HTTPS certificate domains; enable MagicDNS and HTTPS Certificates under the DNS tab at https://login.tailscale.com/admin/dns, then run `hel daemon restart`"
+                "this tailnet has no HTTPS certificate domains; enable MagicDNS and HTTPS Certificates under the DNS tab at https://login.tailscale.com/admin/dns, then run `mj daemon restart`"
             )
         })
 }
@@ -336,7 +336,7 @@ mod tests {
         let error = discover_with_binary(PathBuf::from("tailscale"), &executor).unwrap_err();
 
         assert!(error.to_string().contains("MagicDNS"));
-        assert!(error.to_string().contains("hel daemon restart"));
+        assert!(error.to_string().contains("mj daemon restart"));
     }
 
     #[test]

@@ -99,7 +99,7 @@ impl ControllerStoreGuard {
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => bail!(
-                "another Hel controller is already using {}; stop it before starting this command",
+                "another Mjolnir controller is already using {}; stop it before starting this command",
                 directory.display()
             ),
             Err(std::fs::TryLockError::Error(error)) => {
@@ -233,7 +233,7 @@ impl Controller {
         }
     }
 
-    /// Verify a mount source on the host where Hel will consume it, and report
+    /// Verify a mount source on the host where Mjolnir will consume it, and report
     /// the filesystem reason it must be attached read-only, if there is one.
     ///
     /// The probe runs in the same round trip as the existence check so the
@@ -796,7 +796,7 @@ fn scp_command_spec(ssh: &SshTarget, source: &Path, remote: &str, recursive: boo
 }
 
 fn ssh_args_with_identity(args: &[String], identity: Option<&Path>) -> Vec<String> {
-    // Hel drives ssh non-interactively from a TUI; a host-key or password
+    // Mjolnir drives ssh non-interactively from a TUI; a host-key or password
     // prompt would steal the terminal and wedge provisioning. BatchMode fails
     // fast instead of prompting, and accept-new trusts a first-seen host key
     // (fresh EC2 instances are always first-seen) while still rejecting
@@ -998,7 +998,7 @@ mod tests {
         assert!(controller.state.sessions.is_empty());
     }
 
-    /// HEL_DATA_DIR is process-global, so every test that reaches the
+    /// MJ_DATA_DIR is process-global, so every test that reaches the
     /// controller database runs in an exact child with its own data directory.
     fn run_registration_child(marker: &str, test: &str, data_directory: &Path) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1008,8 +1008,8 @@ mod tests {
                 "--nocapture",
             ])
             .env(marker, "1")
-            .env("HEL_DATA_DIR", data_directory)
-            .env("HEL_CONFIG_DIR", data_directory)
+            .env("MJ_DATA_DIR", data_directory)
+            .env("MJ_CONFIG_DIR", data_directory)
             .output()
             .unwrap();
         assert!(
@@ -1020,9 +1020,9 @@ mod tests {
         );
     }
 
-    const UNPERSISTABLE_SESSION_CHILD: &str = "HEL_TEST_UNPERSISTABLE_SESSION_CHILD";
+    const UNPERSISTABLE_SESSION_CHILD: &str = "MJ_TEST_UNPERSISTABLE_SESSION_CHILD";
 
-    const CONFIG_ID_RENAME_CHILD: &str = "HEL_TEST_CONFIG_ID_RENAME_CHILD";
+    const CONFIG_ID_RENAME_CHILD: &str = "MJ_TEST_CONFIG_ID_RENAME_CHILD";
 
     #[test]
     fn configuration_id_rename_rewrites_durable_session_references() {
@@ -1134,9 +1134,9 @@ mod tests {
         );
     }
 
-    const MOUNT_HISTORY_FAILURE_CHILD: &str = "HEL_TEST_MOUNT_HISTORY_FAILURE_CHILD";
+    const MOUNT_HISTORY_FAILURE_CHILD: &str = "MJ_TEST_MOUNT_HISTORY_FAILURE_CHILD";
 
-    const CONTAINER_SIZE_HISTORY_CHILD: &str = "HEL_TEST_CONTAINER_SIZE_HISTORY_CHILD";
+    const CONTAINER_SIZE_HISTORY_CHILD: &str = "MJ_TEST_CONTAINER_SIZE_HISTORY_CHILD";
 
     #[test]
     fn registration_remembers_launch_size_but_session_overrides_do_not_replace_it() {
@@ -1271,9 +1271,9 @@ mod tests {
                 "hel_controller::tests::controller_store_lock_subprocess_probe",
                 "--nocapture",
             ])
-            .env("HEL_CONTROLLER_LOCK_PROBE", directory)
+            .env("MJ_CONTROLLER_LOCK_PROBE", directory)
             .env(
-                "HEL_CONTROLLER_LOCK_EXPECTED",
+                "MJ_CONTROLLER_LOCK_EXPECTED",
                 if expect_locked { "locked" } else { "available" },
             )
             .output()
@@ -1287,15 +1287,15 @@ mod tests {
     }
     #[test]
     fn controller_store_lock_subprocess_probe() {
-        let Some(directory) = std::env::var_os("HEL_CONTROLLER_LOCK_PROBE") else {
+        let Some(directory) = std::env::var_os("MJ_CONTROLLER_LOCK_PROBE") else {
             return;
         };
-        let expected = std::env::var("HEL_CONTROLLER_LOCK_EXPECTED").unwrap();
+        let expected = std::env::var("MJ_CONTROLLER_LOCK_EXPECTED").unwrap();
         let acquired = ControllerStoreGuard::acquire_at(Path::new(&directory));
         match expected.as_str() {
             "locked" => {
                 let error = acquired.expect_err("a second process acquired the controller store");
-                assert!(error.to_string().contains("another Hel controller"));
+                assert!(error.to_string().contains("another Mjolnir controller"));
             }
             "available" => {
                 acquired.expect("released controller store stayed locked");

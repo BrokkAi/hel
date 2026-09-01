@@ -840,11 +840,11 @@ mod tests {
 
     use super::*;
 
-    const FAILED_ADOPTION_CHILD: &str = "HEL_TEST_FAILED_ADOPTION_CHILD";
+    const FAILED_ADOPTION_CHILD: &str = "MJ_TEST_FAILED_ADOPTION_CHILD";
 
     #[tokio::test]
     async fn a_failed_adoption_records_the_failure_and_stays_retryable() {
-        // HEL_DATA_DIR is process-global, so the database-backed half runs in
+        // MJ_DATA_DIR is process-global, so the database-backed half runs in
         // an exact child test with its own data directory.
         if std::env::var_os(FAILED_ADOPTION_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -856,7 +856,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(FAILED_ADOPTION_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             assert!(
@@ -976,9 +976,9 @@ mod tests {
             },
         };
         let json = serde_json::json!([
-            {"Labels": {"dev.hel.managed": "true", "dev.hel.session": "0123456789abcdef0123456789abcdef"}},
-            {"Labels": {"dev.hel.managed": "false", "dev.hel.session": "not-owned"}},
-            {"configuration": {"labels": "dev.hel.managed=true,dev.hel.session=abcdef0123456789abcdef0123456789"}}
+            {"Labels": {"dev.mj.managed": "true", "dev.mj.session": "0123456789abcdef0123456789abcdef"}},
+            {"Labels": {"dev.mj.managed": "false", "dev.mj.session": "not-owned"}},
+            {"configuration": {"labels": "dev.mj.managed=true,dev.mj.session=abcdef0123456789abcdef0123456789"}}
         ]);
         let candidates = candidates_from_container_json(
             "local",
@@ -1004,7 +1004,7 @@ mod tests {
         };
         let session = "0123456789abcdef0123456789abcdef";
         let output = format!(
-            "{{\"Labels\":\"dev.hel.managed=true,dev.hel.session={session}\"}}\n{{\"Labels\":\"dev.hel.managed=false,dev.hel.session=ignored\"}}\n"
+            "{{\"Labels\":\"dev.mj.managed=true,dev.mj.session={session}\"}}\n{{\"Labels\":\"dev.mj.managed=false,dev.mj.session=ignored\"}}\n"
         );
 
         let candidates =
@@ -1025,8 +1025,8 @@ mod tests {
             "InstanceId": "i-exact",
             "PrivateIpAddress": "10.0.0.7",
             "Tags": [
-                {"Key": "dev.hel.managed", "Value": "true"},
-                {"Key": "dev.hel.session", "Value": "0123456789abcdef0123456789abcdef"}
+                {"Key": "dev.mj.managed", "Value": "true"},
+                {"Key": "dev.mj.session", "Value": "0123456789abcdef0123456789abcdef"}
             ]
         }]}]});
         let candidates = candidates_from_aws_json(

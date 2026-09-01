@@ -112,8 +112,8 @@ impl CodexUsageClient {
                 "initialize",
                 json!({
                     "clientInfo": {
-                        "name": "hel",
-                        "title": "Hel",
+                        "name": "mj",
+                        "title": "Mjolnir",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }),

@@ -149,8 +149,8 @@ impl Controller {
         let worktree = ManagedWorktree {
             source_project_directory: source.to_path_buf(),
             source_repository: source.to_path_buf(),
-            worktree_root: source.join(".hel").join("worktrees").join(&session.id),
-            branch: format!("hel/{}", session.id),
+            worktree_root: source.join(".mj").join("worktrees").join(&session.id),
+            branch: format!("mj/{}", session.id),
             target: managed_worktree_target(
                 self.config
                     .targets
@@ -196,14 +196,14 @@ impl Controller {
             .to_path_buf();
         let worktree_root = inspection
             .source_repository
-            .join(".hel")
+            .join(".mj")
             .join("worktrees")
             .join(session_id);
         let managed = ManagedWorktree {
             source_project_directory: inspection.source_project_directory,
             source_repository: inspection.source_repository,
             worktree_root: worktree_root.clone(),
-            branch: format!("hel/{session_id}"),
+            branch: format!("mj/{session_id}"),
             target,
         };
         ensure_managed_worktree_available(executor, &managed)?;
@@ -707,7 +707,7 @@ fn ensure_managed_worktree_excluded(
             "--quiet",
             "--no-index",
             "--",
-            ".hel/worktrees/",
+            ".mj/worktrees/",
         ],
         "check managed worktree exclusion",
     );
@@ -732,7 +732,7 @@ fn ensure_managed_worktree_excluded(
         ],
         "resolve repository-local exclude file",
     )?);
-    const ENTRY: &str = "/.hel/worktrees/";
+    const ENTRY: &str = "/.mj/worktrees/";
     match target {
         ManagedWorktreeTarget::Local => {
             use std::io::Write;
@@ -1076,8 +1076,8 @@ fn remove_empty_managed_worktree_directories(
     executor: &impl CommandExecutor,
     worktree: &ManagedWorktree,
 ) -> Result<()> {
-    let worktrees = worktree.source_repository.join(".hel").join("worktrees");
-    let hel = worktree.source_repository.join(".hel");
+    let worktrees = worktree.source_repository.join(".mj").join("worktrees");
+    let hel = worktree.source_repository.join(".mj");
     match &worktree.target {
         ManagedWorktreeTarget::Local => {
             for directory in [&worktrees, &hel] {
@@ -1410,7 +1410,7 @@ mod tests {
         RepositoryMetadata {
             id: "project".into(),
             relative_destination: PathBuf::from("project"),
-            origin: "hel-local:project".into(),
+            origin: "mj-local:project".into(),
             base_commit: String::new(),
             head_commit: head_commit.into(),
             branch: branch.map(str::to_owned),
@@ -1423,7 +1423,7 @@ mod tests {
         let directory = session.project_directory.clone().unwrap();
         let executor = CheckoutPositionExecutor {
             head_commit: "b".repeat(40),
-            branch: Some("hel/0123456789abcdef0123456789abcdef".into()),
+            branch: Some("mj/0123456789abcdef0123456789abcdef".into()),
         };
 
         let live = raw_checkout_position(&session, &config, &directory, &executor).unwrap();
@@ -1440,7 +1440,7 @@ mod tests {
         );
         assert!(notice.contains("aaaaaaaaaaaa (main)"), "{notice}");
         assert!(
-            notice.contains("bbbbbbbbbbbb (hel/0123456789abcdef0123456789abcdef)"),
+            notice.contains("bbbbbbbbbbbb (mj/0123456789abcdef0123456789abcdef)"),
             "{notice}"
         );
         assert!(
@@ -1749,8 +1749,8 @@ mod tests {
         let worktree = ManagedWorktree {
             source_project_directory: inspection.source_project_directory,
             source_repository: inspection.source_repository,
-            worktree_root: repository.path().join(".hel/worktrees").join(session_id),
-            branch: format!("hel/{session_id}"),
+            worktree_root: repository.path().join(".mj/worktrees").join(session_id),
+            branch: format!("mj/{session_id}"),
             target,
         };
         create_managed_worktree(
@@ -1778,7 +1778,7 @@ mod tests {
 
         cleanup_managed_worktree(&ProcessExecutor, &worktree).unwrap();
         assert!(!worktree.worktree_root.exists());
-        assert!(!repository.path().join(".hel").exists());
+        assert!(!repository.path().join(".mj").exists());
         let output = Command::new("git")
             .arg("-C")
             .arg(repository.path())
@@ -1803,7 +1803,7 @@ mod tests {
         retire_managed_worktree(&ProcessExecutor, &worktree).unwrap();
 
         assert!(!worktree.worktree_root.exists());
-        assert!(!repository.path().join(".hel").exists());
+        assert!(!repository.path().join(".mj").exists());
         let branch = Command::new("git")
             .arg("-C")
             .arg(repository.path())
@@ -1852,8 +1852,8 @@ mod tests {
         let worktree = ManagedWorktree {
             source_project_directory: PathBuf::from("/srv/project"),
             source_repository: PathBuf::from("/srv/project"),
-            worktree_root: PathBuf::from("/srv/project/.hel/worktrees/session"),
-            branch: "hel/session".into(),
+            worktree_root: PathBuf::from("/srv/project/.mj/worktrees/session"),
+            branch: "mj/session".into(),
             target: ManagedWorktreeTarget::Ssh {
                 destination: "builder".into(),
                 ssh_args: Vec::new(),
@@ -2073,8 +2073,8 @@ mod tests {
             ManagedWorktree {
                 source_project_directory: repository.path().to_path_buf(),
                 source_repository: repository.path().to_path_buf(),
-                worktree_root: repository.path().join(".hel/worktrees").join(session_id),
-                branch: format!("hel/{session_id}"),
+                worktree_root: repository.path().join(".mj/worktrees").join(session_id),
+                branch: format!("mj/{session_id}"),
                 target: ManagedWorktreeTarget::Local,
             }
         );
@@ -2122,8 +2122,8 @@ mod tests {
             worktree: ManagedWorktree {
                 source_project_directory: repository.clone(),
                 source_repository: repository.clone(),
-                worktree_root: repository.join(".hel/worktrees").join(session_id),
-                branch: format!("hel/{session_id}"),
+                worktree_root: repository.join(".mj/worktrees").join(session_id),
+                branch: format!("mj/{session_id}"),
                 target: ManagedWorktreeTarget::Local,
             },
         };
@@ -2159,8 +2159,8 @@ mod tests {
                 worktree: ManagedWorktree {
                     source_project_directory: repository.clone(),
                     source_repository: repository.clone(),
-                    worktree_root: repository.join(".hel/worktrees").join(session_id),
-                    branch: format!("hel/{session_id}"),
+                    worktree_root: repository.join(".mj/worktrees").join(session_id),
+                    branch: format!("mj/{session_id}"),
                     target: ManagedWorktreeTarget::Local,
                 },
             },
@@ -2216,8 +2216,8 @@ mod tests {
         let worktree = ManagedWorktree {
             source_project_directory: repository.path().to_path_buf(),
             source_repository: repository.path().to_path_buf(),
-            worktree_root: repository.path().join(".hel/worktrees").join(session_id),
-            branch: format!("hel/{session_id}"),
+            worktree_root: repository.path().join(".mj/worktrees").join(session_id),
+            branch: format!("mj/{session_id}"),
             target: ManagedWorktreeTarget::Local,
         };
         create_managed_worktree(
@@ -2246,7 +2246,7 @@ mod tests {
             .unwrap();
 
         assert!(!worktree.worktree_root.exists());
-        assert!(!repository.path().join(".hel").exists());
+        assert!(!repository.path().join(".mj").exists());
         let branch = Command::new("git")
             .arg("-C")
             .arg(repository.path())
@@ -2269,8 +2269,8 @@ mod tests {
         let managed = ManagedWorktree {
             source_project_directory: inspection.source_project_directory,
             source_repository: inspection.source_repository,
-            worktree_root: repository.path().join(".hel/worktrees").join(session_id),
-            branch: format!("hel/{session_id}"),
+            worktree_root: repository.path().join(".mj/worktrees").join(session_id),
+            branch: format!("mj/{session_id}"),
             target: target.clone(),
         };
         let error = create_managed_worktree(
@@ -2303,12 +2303,12 @@ mod tests {
         let repository = committed_repository();
         let target = ManagedWorktreeTarget::Local;
         let session_id = "abcdef0123456789abcdef0123456789";
-        let branch = format!("hel/{session_id}");
+        let branch = format!("mj/{session_id}");
         test_git(repository.path(), &["branch", &branch]);
         let worktree = ManagedWorktree {
             source_project_directory: repository.path().to_path_buf(),
             source_repository: repository.path().to_path_buf(),
-            worktree_root: repository.path().join(".hel/worktrees").join(session_id),
+            worktree_root: repository.path().join(".mj/worktrees").join(session_id),
             branch: branch.clone(),
             target,
         };

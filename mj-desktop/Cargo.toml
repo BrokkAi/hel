@@ -1,0 +1,44 @@
+[package]
+name = "brokk-mj-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Native desktop shell for Mjolnir"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+publish = true
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+rcgen = "0.13"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tao = { version = "0.35", default-features = false, features = ["rwh_06", "x11"] }
+webbrowser = "1.2"
+wry = "0.55.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = { version = "0.6.4", features = ["exception", "disable-encoding-assertions"] }
+objc2-foundation = { version = "0.3.0", default-features = false, features = ["std", "NSData", "NSDictionary", "NSEnumerator", "NSHTTPCookie", "NSObject", "NSString", "NSURL", "NSURLAuthenticationChallenge", "NSURLCredential", "NSURLProtectionSpace", "NSURLRequest", "NSURLSession"] }
+objc2-web-kit = { version = "0.3.0", default-features = false, features = ["std", "objc2-app-kit", "block2", "WKHTTPCookieStore", "WKNavigationAction", "WKNavigationDelegate", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore"] }
+
+[target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
+gio = "0.18"
+soup = { package = "soup3", version = "0.5" }
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "0.38"
+windows-core = "0.61"

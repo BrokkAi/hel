@@ -37,7 +37,7 @@ impl ElicitationRequest {
         let params = object(&params, "elicitation params")?;
         ensure!(
             string(params, "mode")? == "form",
-            "Hel only supports form elicitations"
+            "Mjolnir only supports form elicitations"
         );
         ensure!(
             params.get("sessionId").and_then(Value::as_str).is_some()

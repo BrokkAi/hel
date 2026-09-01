@@ -22,7 +22,7 @@ use hel::hel_state::{HelState, MaterializedSession, SessionState, TranscriptBody
 use hel::hel_worker::RelayCommand;
 
 fn hel_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_hel") {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_mj") {
         return PathBuf::from(path);
     }
     let mut path = std::env::current_exe().expect("resolve current test executable");
@@ -43,10 +43,10 @@ fn imported_claude_session_resumes_natively() {
 }
 
 async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> {
-    let root = required_path("HEL_IMPORT_E2E_ROOT");
+    let root = required_path("MJ_IMPORT_E2E_ROOT");
     let claude_home = required_path("CLAUDE_CONFIG_DIR");
-    let repository = std::env::var("HEL_IMPORT_E2E_REPOSITORY")?;
-    let image = std::env::var("HEL_IMPORT_E2E_IMAGE")?;
+    let repository = std::env::var("MJ_IMPORT_E2E_REPOSITORY")?;
+    let image = std::env::var("MJ_IMPORT_E2E_IMAGE")?;
     let scratch = root.join("scratch");
     if scratch.exists() {
         fs::remove_dir_all(&scratch)?;
@@ -174,9 +174,9 @@ fn imported_kimi_session_resumes_natively() {
 
 async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
     let kimi_home = required_path("KIMI_CODE_HOME");
-    let native_session_id = std::env::var("HEL_IMPORT_E2E_KIMI_SESSION")?;
-    let repository = std::env::var("HEL_IMPORT_E2E_KIMI_REPOSITORY")?;
-    let image = std::env::var("HEL_IMPORT_E2E_IMAGE")?;
+    let native_session_id = std::env::var("MJ_IMPORT_E2E_KIMI_SESSION")?;
+    let repository = std::env::var("MJ_IMPORT_E2E_KIMI_REPOSITORY")?;
+    let image = std::env::var("MJ_IMPORT_E2E_IMAGE")?;
     let config = HelConfig {
         version: CONFIG_VERSION,
         newer_config_version: None,
@@ -291,9 +291,9 @@ fn imported_grok_session_resumes_natively() {
 
 async fn imported_grok_session_resumes_natively_async() -> anyhow::Result<()> {
     let grok_home = required_path("GROK_HOME");
-    let native_session_id = std::env::var("HEL_IMPORT_E2E_GROK_SESSION")?;
-    let repository = std::env::var("HEL_IMPORT_E2E_GROK_REPOSITORY")?;
-    let image = std::env::var("HEL_IMPORT_E2E_IMAGE")?;
+    let native_session_id = std::env::var("MJ_IMPORT_E2E_GROK_SESSION")?;
+    let repository = std::env::var("MJ_IMPORT_E2E_GROK_REPOSITORY")?;
+    let image = std::env::var("MJ_IMPORT_E2E_IMAGE")?;
     let config = HelConfig {
         version: CONFIG_VERSION,
         newer_config_version: None,
@@ -515,9 +515,9 @@ fn imported_codex_session_resumes_natively() {
 
 async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
     let codex_home = required_path("CODEX_HOME");
-    let native_session_id = std::env::var("HEL_IMPORT_E2E_CODEX_SESSION")?;
-    let repository = std::env::var("HEL_IMPORT_E2E_CODEX_REPOSITORY")?;
-    let image = std::env::var("HEL_IMPORT_E2E_IMAGE")?;
+    let native_session_id = std::env::var("MJ_IMPORT_E2E_CODEX_SESSION")?;
+    let repository = std::env::var("MJ_IMPORT_E2E_CODEX_REPOSITORY")?;
+    let image = std::env::var("MJ_IMPORT_E2E_IMAGE")?;
     let config = HelConfig {
         version: CONFIG_VERSION,
         newer_config_version: None,

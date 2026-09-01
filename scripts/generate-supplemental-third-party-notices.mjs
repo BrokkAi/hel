@@ -19,6 +19,13 @@ const outputPath = path.resolve(
 // otherwise change without anyone deciding whether an artifact notice is due.
 const auditedStandaloneNotices = new Set(["cfg_aliases/NOTICES.md"]);
 const auditedLinksPackages = new Set([
+  // Desktop system-library bindings and objc2's compiled helper are covered
+  // by their Cargo package licenses; they do not embed separate payloads.
+  "atk-sys",
+  "gdk-sys",
+  "gtk-sys",
+  "objc2-exception-helper",
+  "webkit2gtk-sys",
   "alsa-sys",
   "bzip2-sys",
   "libmimalloc-sys",
@@ -177,7 +184,7 @@ async function sherpaNativePayload(metadata) {
   return {
     component: `sherpa-onnx native static payload ${packageInfo.version}`,
     source: packageUrl(packageInfo),
-    scope: "statically linked into hel-voice-worker on Linux, macOS, and Windows",
+    scope: "statically linked into mj-voice-worker on Linux, macOS, and Windows",
     text: [
       "The sherpa-onnx-sys build downloads a native archive that contains only static libraries, without legal files. The linked payload was audited against these exact upstream revisions:",
       "",

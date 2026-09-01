@@ -629,7 +629,7 @@ impl Controller {
                         capture: CheckpointRepositoryCapture::SessionDelta,
                         origin_override: repository
                             .is_local()
-                            .then(|| format!("hel-local:{}", repository.id)),
+                            .then(|| format!("mj-local:{}", repository.id)),
                     })
                     .collect();
                 (workspace_root, bundle.primary_repo.clone(), repositories)
@@ -1528,7 +1528,7 @@ fn export_uploaded_spec(
 }
 
 /// When the installed worker cannot execute this export protocol, replace its
-/// `hel` with the controller's current binary and tell the caller to retry. The
+/// `mj` with the controller's current binary and tell the caller to retry. The
 /// live daemon keeps the previous inode; only the next `export-checkpoint`
 /// process changes.
 fn replace_stale_export_worker(
@@ -1574,7 +1574,7 @@ fn export_spec_stdin_unsupported(failure: &str) -> bool {
 /// Whether an export failure says the target's worker cannot deserialize this
 /// spec. `CheckpointExportSpec` and its nested canonical snapshot use
 /// `deny_unknown_fields`, so a controller that gained a field such as
-/// `terminal_refs` cannot pause a session whose installed `hel` predates it.
+/// `terminal_refs` cannot pause a session whose installed `mj` predates it.
 fn export_spec_schema_unsupported(failure: &str) -> bool {
     failure.contains("parse checkpoint")
         && (failure.contains("unknown field") || failure.contains("unknown variant"))
@@ -2454,19 +2454,19 @@ mod tests {
             "Error: unsupported checkpoint export protocol version 2; worker supports 1\n"
         ));
     }
-    const LATCH_RELAY_ROOT: &str = "HEL_TEST_LATCH_RELAY_ROOT";
-    const LATCH_RELAY_STARTS: &str = "HEL_TEST_LATCH_RELAY_STARTS";
-    const LATCH_RELAY_REJECT_RELEASE: &str = "HEL_TEST_LATCH_REJECT_RELEASE";
+    const LATCH_RELAY_ROOT: &str = "MJ_TEST_LATCH_RELAY_ROOT";
+    const LATCH_RELAY_STARTS: &str = "MJ_TEST_LATCH_RELAY_STARTS";
+    const LATCH_RELAY_REJECT_RELEASE: &str = "MJ_TEST_LATCH_REJECT_RELEASE";
     #[cfg(unix)]
-    const LATCH_TEST_CHILD: &str = "HEL_TEST_LATCH_CHILD";
+    const LATCH_TEST_CHILD: &str = "MJ_TEST_LATCH_CHILD";
     #[cfg(unix)]
-    const ABANDON_TEST_CHILD: &str = "HEL_TEST_ABANDON_LATCH_CHILD";
+    const ABANDON_TEST_CHILD: &str = "MJ_TEST_ABANDON_LATCH_CHILD";
     #[cfg(unix)]
-    const RELEASE_TEST_CHILD: &str = "HEL_TEST_RELEASE_LATCH_CHILD";
+    const RELEASE_TEST_CHILD: &str = "MJ_TEST_RELEASE_LATCH_CHILD";
     #[cfg(unix)]
-    const LEGACY_RELEASE_TEST_CHILD: &str = "HEL_TEST_LEGACY_RELEASE_LATCH_CHILD";
+    const LEGACY_RELEASE_TEST_CHILD: &str = "MJ_TEST_LEGACY_RELEASE_LATCH_CHILD";
     #[cfg(unix)]
-    const REUSE_TEST_CHILD: &str = "HEL_TEST_REUSE_LATCH_CHILD";
+    const REUSE_TEST_CHILD: &str = "MJ_TEST_REUSE_LATCH_CHILD";
     const LATCH_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-0123456789ab";
     /// Whether the scripted relay understands the early checkpoint release.
     #[cfg(unix)]
@@ -2683,7 +2683,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ending_the_checkpoint_latch_returns_the_connection_to_its_actor() {
-        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // MJ_DATA_DIR is process-global, so run the database-backed half in an
         // exact child test instead of racing unrelated tests in this process.
         if std::env::var_os(LATCH_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -2696,7 +2696,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(LATCH_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             assert!(
@@ -2780,7 +2780,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn releasing_a_checkpoint_after_capture_defers_only_the_recovery_floor() {
-        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // MJ_DATA_DIR is process-global, so run the database-backed half in an
         // exact child test instead of racing unrelated tests in this process.
         if std::env::var_os(RELEASE_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -2793,7 +2793,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(RELEASE_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             assert!(
@@ -2887,7 +2887,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_worker_that_rejects_the_release_keeps_its_barrier_through_the_transfer() {
-        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // MJ_DATA_DIR is process-global, so run the database-backed half in an
         // exact child test instead of racing unrelated tests in this process.
         if std::env::var_os(LEGACY_RELEASE_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -2900,7 +2900,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(LEGACY_RELEASE_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             assert!(
@@ -2971,7 +2971,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn abandoning_a_latched_checkpoint_drops_the_connection_that_opened_its_barrier() {
-        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // MJ_DATA_DIR is process-global, so run the database-backed half in an
         // exact child test instead of racing unrelated tests in this process.
         if std::env::var_os(ABANDON_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -2984,7 +2984,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(ABANDON_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             assert!(
@@ -3042,7 +3042,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_close_latch_reuses_an_unchanged_archive_and_exports_after_new_content() {
-        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // MJ_DATA_DIR is process-global, so run the database-backed half in an
         // exact child test instead of racing unrelated tests in this process.
         if std::env::var_os(REUSE_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -3055,7 +3055,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(REUSE_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             assert!(
@@ -3111,7 +3111,7 @@ mod tests {
             }
         }
 
-        let data_directory = PathBuf::from(std::env::var_os("HEL_DATA_DIR").unwrap());
+        let data_directory = PathBuf::from(std::env::var_os("MJ_DATA_DIR").unwrap());
         let relay_root = data_directory.join("relay");
         let profile_home = data_directory.join("profile");
         let archive_directory = data_directory.join("archives");

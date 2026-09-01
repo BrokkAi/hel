@@ -37,7 +37,7 @@ use crate::hel_config::{HelConfig, TargetTemplate, validate_id};
 use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse, MAX_ELICITATION_BYTES};
 use crate::hel_state::{HelState, SessionState};
 
-const COOKIE_NAME: &str = "hel_viewer_session";
+pub const COOKIE_NAME: &str = "hel_viewer_session";
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const EPHEMERAL_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BODY_BYTES: usize = 128 * 1024;
@@ -104,7 +104,7 @@ pub fn load_or_create_cookie_key(path: &std::path::Path) -> AnyResult<Vec<u8>> {
     }
     let key = generate_cookie_key()?;
     crate::hel_config::atomic_write(path, &key)
-        .with_context(|| format!("persist Hel phone cookie key {}", path.display()))?;
+        .with_context(|| format!("persist Mjolnir phone cookie key {}", path.display()))?;
     Ok(key.to_vec())
 }
 
@@ -211,7 +211,7 @@ pub async fn run_server(options: ServerOptions) -> AnyResult<()> {
     let viewer_code = options.viewer_code.clone();
     let tls_config = options.tls_config.take();
     let app = router(options);
-    println!("Hel viewer code: {viewer_code}");
+    println!("Mjolnir viewer code: {viewer_code}");
     if let Some(tls_config) = tls_config {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
@@ -223,15 +223,15 @@ pub async fn run_server(options: ServerOptions) -> AnyResult<()> {
             .handle(handle)
             .serve(app.into_make_service())
             .await
-            .context("run Hel HTTPS phone server")
+            .context("run Mjolnir HTTPS phone server")
     } else {
         let listener = tokio::net::TcpListener::bind(bind)
             .await
-            .with_context(|| format!("bind Hel phone server to {bind}"))?;
+            .with_context(|| format!("bind Mjolnir phone server to {bind}"))?;
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown.cancelled_owned())
             .await
-            .context("run Hel HTTP phone server")
+            .context("run Mjolnir HTTP phone server")
     }
 }
 
@@ -246,6 +246,10 @@ pub struct ViewerSnapshot {
     pub profiles: Vec<ViewerProfile>,
     pub targets: Vec<ViewerTarget>,
     pub bundles: Vec<ViewerBundle>,
+    /// The bounded part of `[review]` needed to report whether review is
+    /// armed. Reviewer model and effort remain controller-private.
+    #[serde(default)]
+    pub review_config: ViewerReviewConfig,
     /// One entry per host or fleet that can be probed. Empty until the phone
     /// server's capacity poller has published a reading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -370,6 +374,11 @@ impl ViewerSnapshot {
             profiles,
             targets,
             bundles,
+            review_config: ViewerReviewConfig {
+                enabled: config.review.enabled,
+                tier: config.review.tier.label().to_owned(),
+                profile: config.review.profile.clone(),
+            },
             capacity: Vec::new(),
         }
     }
@@ -463,23 +472,43 @@ pub struct ViewerSession {
     /// renders the same review the terminal does and resolves it the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_review: Option<ViewerTurnReview>,
-    /// The Hel commands this session accepts, published rather than hardcoded
+    /// The Mjolnir commands this session accepts, published rather than hardcoded
     /// in the browser: a command list kept in two places is a command list that
     /// drifts, which is how `/review` went missing from the phone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub available_commands: Vec<ViewerHelCommand>,
+    pub available_commands: Vec<ViewerMjCommand>,
     pub capabilities: ViewerSessionCapabilities,
 }
 
-/// One Hel command a phone may offer for this session.
+/// One Mjolnir command a phone may offer for this session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ViewerHelCommand {
+pub struct ViewerMjCommand {
     pub name: String,
     pub description: String,
+    /// Whether Mjolnir handles this command locally or forwards it to the
+    /// active agent.
+    pub source: ViewerCommandSource,
     /// What the argument is called, when the command takes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewerCommandSource {
+    Mj,
+    Agent,
+}
+
+/// Public review configuration: exactly what `/review status` needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerReviewConfig {
+    pub enabled: bool,
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// A turn review as a phone renders it.
@@ -2118,7 +2147,7 @@ fn generate_viewer_code() -> AnyResult<String> {
     loop {
         let mut bytes = [0_u8; 4];
         getrandom::fill(&mut bytes)
-            .map_err(|error| anyhow::anyhow!("generate Hel viewer code: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("generate Mjolnir viewer code: {error}"))?;
         let value = u32::from_le_bytes(bytes);
         if value < LIMIT {
             return Ok(format!("{:06}", value % RANGE));
@@ -2129,14 +2158,14 @@ fn generate_viewer_code() -> AnyResult<String> {
 fn generate_login_token() -> AnyResult<String> {
     let mut token = [0_u8; 32];
     getrandom::fill(&mut token)
-        .map_err(|error| anyhow::anyhow!("generate Hel viewer login token: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("generate Mjolnir viewer login token: {error}"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token))
 }
 
 fn generate_cookie_key() -> AnyResult<[u8; COOKIE_KEY_BYTES]> {
     let mut key = [0_u8; COOKIE_KEY_BYTES];
     getrandom::fill(&mut key)
-        .map_err(|error| anyhow::anyhow!("generate Hel cookie key: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("generate Mjolnir cookie key: {error}"))?;
     Ok(key)
 }
 
@@ -2149,7 +2178,8 @@ fn generate_cookie_key() -> AnyResult<[u8; COOKIE_KEY_BYTES]> {
 /// identity everything per-viewer hangs from.
 fn generate_viewer_id() -> AnyResult<String> {
     let mut id = [0_u8; 16];
-    getrandom::fill(&mut id).map_err(|error| anyhow::anyhow!("generate Hel viewer id: {error}"))?;
+    getrandom::fill(&mut id)
+        .map_err(|error| anyhow::anyhow!("generate Mjolnir viewer id: {error}"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id))
 }
 
@@ -2180,6 +2210,21 @@ fn legacy_signed_cookie_value(key: &[u8], expiry: u64) -> String {
 
 fn session_cookie_valid(key: &[u8], value: &str, now: u64) -> bool {
     cookie_viewer(key, value, now).is_some()
+}
+
+/// Mint a signed viewer-session cookie value without the HTTP login flow.
+///
+/// The desktop shell pre-authorizes its WebView with this: it runs as the same
+/// user as the daemon and reads the same persisted signing key, so possession
+/// of the key is the credential. The cookie carries the ephemeral TTL — a
+/// desktop window re-mints on every launch, so it never needs a long life.
+pub fn mint_desktop_session_cookie(key: &[u8]) -> AnyResult<String> {
+    let viewer = generate_viewer_id()?;
+    Ok(signed_cookie_value(
+        key,
+        &viewer,
+        now_unix().saturating_add(EPHEMERAL_SESSION_TTL.as_secs()),
+    ))
 }
 
 /// The viewer a cookie names, or `None` when the cookie is not valid.
@@ -2472,6 +2517,22 @@ mod tests {
         ProjectRepository,
     };
     use crate::hel_state::{STATE_VERSION, SessionRecord};
+
+    #[test]
+    fn minted_desktop_cookie_validates_and_names_a_viewer() {
+        let key = vec![7u8; COOKIE_KEY_BYTES];
+        let value = mint_desktop_session_cookie(&key).unwrap();
+        let viewer = cookie_viewer(&key, &value, now_unix());
+        assert!(
+            matches!(viewer, Some(Some(_))),
+            "minted cookie must validate and carry a viewer id: {value:?}"
+        );
+        assert!(!session_cookie_valid(
+            &[8u8; COOKIE_KEY_BYTES],
+            &value,
+            now_unix()
+        ));
+    }
 
     fn sample_config_state() -> (HelConfig, HelState) {
         let config = HelConfig {
@@ -2776,6 +2837,33 @@ mod tests {
         assert!(!json.contains("secret.registry"));
         assert!(!json.contains("native-secret-id"));
         assert!(json.contains("\"has_error\":true"));
+    }
+
+    #[test]
+    fn public_snapshot_exposes_only_review_status_configuration() {
+        let (mut config, state) = sample_config_state();
+        config.review = crate::hel_config::ReviewConfig {
+            enabled: true,
+            tier: crate::hel_review::lanes::ReviewTier::Extended,
+            profile: Some("reviewer-1".into()),
+            model: Some("private-review-model".into()),
+            effort: Some("private-review-effort".into()),
+        };
+
+        let value =
+            serde_json::to_value(ViewerSnapshot::from_config_state(&config, &state, 9)).unwrap();
+
+        assert_eq!(
+            value.get("review_config"),
+            Some(&serde_json::json!({
+                "enabled": true,
+                "tier": "extended",
+                "profile": "reviewer-1",
+            }))
+        );
+        let json = value.to_string();
+        assert!(!json.contains("private-review-model"));
+        assert!(!json.contains("private-review-effort"));
     }
 
     fn sample_elicitation() -> ElicitationRequest {

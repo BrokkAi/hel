@@ -1,11 +1,11 @@
 [package]
-name = "hel-core"
+name = "brokk-mj-core"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 description = "Session control plane for ACP coding agents"
 license = "GPL-3.0-only"
-repository = "https://github.com/BrokkAi/hel"
+repository = "https://github.com/BrokkAi/mjolnir"
 publish = true
 include = [
     "src/**/*.rs",
@@ -22,9 +22,9 @@ include = [
     "licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
 ]
 
-# The crates.io name `hel` belongs to an unrelated crate, so the package
-# publishes as `hel-core` while the library keeps the `hel` crate name that
-# the workspace imports use.
+# The package publishes under the Brokk namespace while the library keeps the
+# `hel` crate name that the workspace imports use, so the rename to the
+# mjolnir deploy identities required no source changes.
 [lib]
 name = "hel"
 
@@ -33,14 +33,23 @@ default = []
 test-hooks = []
 
 [workspace]
-members = [".", "crates/hel-tui", "crates/hel-cli", "voice-worker"]
-default-members = [".", "crates/hel-tui", "crates/hel-cli"]
+# mj-desktop stays out of the default set: its tests need native desktop
+# dependencies, and the primary Linux CI target is musl, where the desktop
+# shell does not build. Its own CI job and the macOS/Windows matrix carry it.
+members = [".", "mj-tui", "mj-cli", "mj-desktop", "voice-worker"]
+default-members = [".", "mj-tui", "mj-cli"]
 
 # Single source of truth for the release version. Every published crate
 # inherits it with `version.workspace = true`, so the four package versions
 # cannot drift apart (RELEASING.md requires them to match).
 [workspace.package]
-version = "0.4.2"
+version = "2.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/BrokkAi/mjolnir"
+homepage = "https://github.com/BrokkAi/mjolnir"
+keywords = ["mjolnir", "acp", "ai", "agents"]
+categories = ["development-tools", "command-line-utilities"]
 # The real compiler floor is the pinned toolchain in `rust-toolchain.toml`,
 # not just what edition 2024 implies. Declaring it makes `cargo install` on an
 # older compiler fail with a clear version message instead of mid-build
@@ -54,8 +63,9 @@ rust-version = "1.96"
 # `node scripts/release-version.mjs check` (run in CI) fails when these fall
 # behind the workspace version.
 [workspace.dependencies]
-hel = { path = ".", package = "hel-core", version = "0.4.2" }
-hel-tui = { path = "crates/hel-tui", version = "0.4.2" }
+hel = { path = ".", package = "brokk-mj-core", version = "2.0.0" }
+hel-tui = { path = "mj-tui", package = "brokk-mj-tui", version = "2.0.0" }
+mj-desktop = { path = "mj-desktop", package = "brokk-mj-desktop", version = "2.0.0" }
 
 [workspace.lints.clippy]
 disallowed_methods = "warn"

@@ -39,11 +39,11 @@ jobs:
         sudo apt-get update
         sudo apt-get install --no-install-recommends --assume-yes musl-tools
     - name: Build feature-gated crash hooks
-      run: cargo build --locked -p hel-cli --features test-hooks
+      run: cargo build --locked -p brokk-mjolnir --features test-hooks
     - name: Run named durability boundaries
-      run: HEL_CHAOS_ISOLATED=1 tests/e2e/run-test-hook-chaos.sh ./target/x86_64-unknown-linux-musl/debug/hel --seed "$RELIABILITY_SEED"
+      run: MJ_CHAOS_ISOLATED=1 tests/e2e/run-test-hook-chaos.sh ./target/x86_64-unknown-linux-musl/debug/mj --seed "$RELIABILITY_SEED"
     - name: Run worker topology deaths
-      run: HEL_CHAOS_ISOLATED=1 HEL_CHAOS_ARTIFACT_DIR=target/reliability-artifacts/worker-topology tests/e2e/session_restart_chaos.sh ./target/x86_64-unknown-linux-musl/debug/hel
+      run: MJ_CHAOS_ISOLATED=1 MJ_CHAOS_ARTIFACT_DIR=target/reliability-artifacts/worker-topology tests/e2e/session_restart_chaos.sh ./target/x86_64-unknown-linux-musl/debug/mj
     - name: Upload crash evidence
       if: always()
       uses: actions/upload-artifact@v7
@@ -74,9 +74,9 @@ jobs:
         npm ci --prefix tests/e2e/web
         npx --prefix tests/e2e/web playwright install --with-deps chromium
     - name: Build Hel
-      run: cargo build --locked -p hel-cli
+      run: cargo build --locked -p brokk-mjolnir
     - name: Run real viewer against a concurrent TUI
-      run: tests/e2e/run-browser-reliability.sh --seed "$RELIABILITY_SEED" ./target/x86_64-unknown-linux-musl/debug/hel
+      run: tests/e2e/run-browser-reliability.sh --seed "$RELIABILITY_SEED" ./target/x86_64-unknown-linux-musl/debug/mj
     - name: Upload browser evidence
       if: always()
       uses: actions/upload-artifact@v7
@@ -139,11 +139,11 @@ jobs:
         sudo apt-get update
         sudo apt-get install --no-install-recommends --assume-yes musl-tools
     - name: Build Hel
-      run: cargo build --locked -p hel-cli
+      run: cargo build --locked -p brokk-mjolnir
     - name: Run bounded replayable soak
       env:
         SOAK_MINUTES: ${{ inputs.soak_minutes || '30' }}
-      run: tests/e2e/run-reliability-soak.sh --minutes "$SOAK_MINUTES" --seed "$RELIABILITY_SEED" ./target/x86_64-unknown-linux-musl/debug/hel
+      run: tests/e2e/run-reliability-soak.sh --minutes "$SOAK_MINUTES" --seed "$RELIABILITY_SEED" ./target/x86_64-unknown-linux-musl/debug/mj
     - name: Upload every soak iteration
       if: always()
       uses: actions/upload-artifact@v7

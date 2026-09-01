@@ -23,15 +23,15 @@ def main() -> int:
     lab = Lab(args.hel, "luna-manual", args.seed)
     port = lab.prepare(fake_acp_delay_ms=args.fake_delay_ms)
     values = {
-        "HEL_CONFIG_DIR": str(lab.config),
-        "HEL_DATA_DIR": str(lab.data),
-        "HEL_CHAOS_ISOLATED": "1",
+        "MJ_CONFIG_DIR": str(lab.config),
+        "MJ_DATA_DIR": str(lab.data),
+        "MJ_CHAOS_ISOLATED": "1",
         "RUST_LOG": "hel=debug,hel_cli=debug",
-        "HEL_LUNA_ARTIFACTS": str(lab.root),
-        "HEL_LUNA_RUNTIME_ROOT": str(lab.runtime_root),
-        "HEL_LUNA_PORT": str(port),
-        "HEL_LUNA_BINARY": str(lab.hel),
-        "HEL_LUNA_FAKE_ACP_DELAY_MS": str(args.fake_delay_ms),
+        "MJ_LUNA_ARTIFACTS": str(lab.root),
+        "MJ_LUNA_RUNTIME_ROOT": str(lab.runtime_root),
+        "MJ_LUNA_PORT": str(port),
+        "MJ_LUNA_BINARY": str(lab.hel),
+        "MJ_LUNA_FAKE_ACP_DELAY_MS": str(args.fake_delay_ms),
     }
     environment_file = lab.root / "luna-env.sh"
     environment_file.write_text(

@@ -32,8 +32,8 @@ function projectPath(filename) {
   }
 
   for (const marker of [
-    "crates/hel-cli/src/",
-    "crates/hel-tui/src/",
+    "mj-cli/src/",
+    "mj-tui/src/",
     "voice-worker/src/",
     "src/",
   ]) {
@@ -50,7 +50,7 @@ for (const file of data.files) {
   const modulePath = projectPath(file.filename);
   const percent = file.summary?.lines?.percent;
   if (
-    !/^(src|crates\/hel-(cli|tui)\/src|voice-worker\/src)\/.*\.rs$/.test(
+    !/^(src|mj-(cli|tui)\/src|voice-worker\/src)\/.*\.rs$/.test(
       modulePath,
     ) ||
     !Number.isFinite(percent)

@@ -85,7 +85,7 @@ fn an_enormous_edit_keeps_whole_hunks_and_says_it_dropped_the_rest() {
     let patch = patch_of(&huge);
     assert!(patch.truncated);
     assert!(patch.text.len() <= DIFF_PATCH_BYTES + 64);
-    assert!(patch.text.ends_with("[hel dropped the remaining hunks]\n"));
+    assert!(patch.text.ends_with("[mj dropped the remaining hunks]\n"));
     assert_eq!(patch.insertions, 20_000);
     assert_eq!(patch.deletions, 20_000);
     // Whole hunks only: every line is a patch line, never a severed one.

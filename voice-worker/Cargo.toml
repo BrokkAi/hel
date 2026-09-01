@@ -1,18 +1,18 @@
 [package]
-name = "hel-voice-worker"
+name = "brokk-mj-voice-worker"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
-description = "Native local speech-recognition sidecar for Hel"
+description = "Native local speech-recognition sidecar for Mjolnir"
 license = "GPL-3.0-only"
-repository = "https://github.com/BrokkAi/hel"
+repository = "https://github.com/BrokkAi/mjolnir"
 publish = true
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "hel-voice-worker"
+name = "mj-voice-worker"
 path = "src/main.rs"
 
 [dependencies]

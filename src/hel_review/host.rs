@@ -161,10 +161,10 @@ pub trait ReviewEnvironment: Send + Sync {
     /// controller's database.
     fn load_state(&self, session_id: &str) -> Result<TurnReviewState, String>;
 
-    /// Records how far this session has been reviewed. Failure is reported,
-    /// never propagated: a review that reached a verdict has done its work
-    /// even if the bookkeeping could not be written.
-    fn save_state(&self, session_id: &str, state: &TurnReviewState);
+    /// Records how far this session has been reviewed. Blocking: the host
+    /// routes it through its ordered persistence lane rather than calling it
+    /// on the Tokio task that owns review state.
+    fn save_state(&self, session_id: &str, state: &TurnReviewState) -> Result<(), String>;
 
     /// Clears the in-flight flag of every review a restart interrupted, and
     /// reports whose they were. Baselines are deliberately left alone: the
@@ -190,15 +190,11 @@ impl ReviewEnvironment for ControllerEnvironment {
                 "turn review needs a reviewer: [review] profile {profile:?} is not a profile in config.toml"
             ));
         }
-        if controller
-            .state
-            .sessions
-            .get(session_id)
-            .is_some_and(|record| record.archived)
-        {
-            return Err("this session is archived".to_owned());
-        }
-        Ok(())
+        validate_reviewer_assignment(
+            session_id,
+            controller.state.sessions.get(session_id),
+            profile,
+        )
     }
 
     fn stage(
@@ -226,14 +222,9 @@ impl ReviewEnvironment for ControllerEnvironment {
         crate::hel_database::turn_review_state(session_id).map_err(|error| format!("{error:#}"))
     }
 
-    fn save_state(&self, session_id: &str, state: &TurnReviewState) {
-        if let Err(error) = crate::hel_database::save_turn_review_state(session_id, state) {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %format!("{error:#}"),
-                "could not record how far this session has been reviewed"
-            );
-        }
+    fn save_state(&self, session_id: &str, state: &TurnReviewState) -> Result<(), String> {
+        crate::hel_database::save_turn_review_state(session_id, state)
+            .map_err(|error| format!("{error:#}"))
     }
 
     fn clear_interrupted(&self) -> Result<Vec<String>, String> {
@@ -241,17 +232,39 @@ impl ReviewEnvironment for ControllerEnvironment {
     }
 }
 
+fn validate_reviewer_assignment(
+    session_id: &str,
+    session: Option<&crate::hel_state::SessionRecord>,
+    profile: &str,
+) -> Result<(), String> {
+    let Some(session) = session else {
+        return Err(format!(
+            "session {session_id:?} is not in the controller store"
+        ));
+    };
+    if session.archived {
+        return Err("this session is archived".to_owned());
+    }
+    if session.last_profile == profile {
+        return Err(format!(
+            "turn review profile {profile:?} is also this session's primary profile; choose a different [review] profile"
+        ));
+    }
+    Ok(())
+}
+
 /// A handle on the review host. Cheap to clone; every method is a message.
 #[derive(Clone)]
 pub struct TurnReviewHost {
-    events: mpsc::Sender<HostEvent>,
+    events: mpsc::UnboundedSender<HostEvent>,
     shared: Arc<HostShared>,
 }
 
 /// What surfaces read without waiting for the host's task.
-#[derive(Default)]
 struct HostShared {
     views: Mutex<BTreeMap<String, RuntimeReviewView>>,
+    changed: Arc<dyn Fn() + Send + Sync>,
+    shutdown: tokio::sync::OnceCell<Result<(), String>>,
 }
 
 impl std::fmt::Debug for TurnReviewHost {
@@ -264,7 +277,18 @@ impl TurnReviewHost {
     /// Starts the host's task, reviewing through the real controller.
     #[must_use]
     pub fn spawn(control: SessionManagerControl, config: ReviewConfigSource) -> Self {
-        Self::spawn_in(control, config, Arc::new(ControllerEnvironment))
+        Self::spawn_notifying(control, config, Arc::new(|| {}))
+    }
+
+    /// Starts the production host and calls `changed` whenever a surface view
+    /// is added, changed, or removed.
+    #[must_use]
+    pub fn spawn_notifying(
+        control: SessionManagerControl,
+        config: ReviewConfigSource,
+        changed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self::spawn_in_notifying(control, config, Arc::new(ControllerEnvironment), changed)
     }
 
     /// The same, against a caller-supplied environment. `config` is read at
@@ -275,12 +299,38 @@ impl TurnReviewHost {
         config: ReviewConfigSource,
         environment: Arc<dyn ReviewEnvironment>,
     ) -> Self {
-        let (events, receiver) = mpsc::channel(256);
-        let shared = Arc::new(HostShared::default());
+        Self::spawn_in_notifying(control, config, environment, Arc::new(|| {}))
+    }
+
+    #[must_use]
+    fn spawn_in_notifying(
+        control: SessionManagerControl,
+        config: ReviewConfigSource,
+        environment: Arc<dyn ReviewEnvironment>,
+        changed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let (events, receiver) = mpsc::unbounded_channel();
+        let (persistence, persistence_receiver) = mpsc::unbounded_channel();
+        let shared = Arc::new(HostShared {
+            views: Mutex::default(),
+            changed,
+            shutdown: tokio::sync::OnceCell::new(),
+        });
         let host = Self {
             events: events.clone(),
             shared: shared.clone(),
         };
+        let persistence_task = tokio::spawn(persistence_loop(
+            environment.clone(),
+            events.clone(),
+            persistence_receiver,
+        ));
+        // The restart sweep is the first operation in the same FIFO lane that
+        // records new active reviews, so it cannot clear a review that opened
+        // while the sweep was still running.
+        persistence
+            .send(PersistenceRequest::SweepInterrupted)
+            .expect("new review persistence lane accepts its initial sweep");
         tokio::spawn(host_loop(
             HostState {
                 control,
@@ -288,8 +338,12 @@ impl TurnReviewHost {
                 environment,
                 shared,
                 events,
+                persistence: Some(persistence),
+                persistence_task: Some(persistence_task),
                 reviews: BTreeMap::new(),
                 preparing: BTreeSet::new(),
+                pending_open: BTreeMap::new(),
+                closing: BTreeSet::new(),
                 next_epoch: 0,
                 sessions: BTreeMap::new(),
                 missing_reviewer_reported: BTreeSet::new(),
@@ -301,9 +355,11 @@ impl TurnReviewHost {
 
     /// Reports one session's latest view. This is the trigger's only input.
     pub fn observe(&self, session_id: &str, view: &ManagedSessionView) {
-        // A dropped observation is not worth blocking the daemon's update loop
-        // for: the next view arrives within 150 ms and carries the same phase.
-        let _ = self.events.try_send(HostEvent::View {
+        // Running -> Idle is an edge, not a level: the session manager
+        // suppresses unchanged views, so dropping one here can lose an
+        // automatic review permanently. An unbounded hand-off keeps the
+        // daemon's update loop nonblocking without dropping that edge.
+        let _ = self.events.send(HostEvent::View {
             session_id: session_id.to_owned(),
             snapshot: view
                 .snapshot
@@ -321,7 +377,6 @@ impl TurnReviewHost {
                 manual,
                 reply: Some(reply),
             })
-            .await
             .map_err(|_| StartRefusal("the review host stopped".to_owned()))?;
         answer
             .await
@@ -337,11 +392,29 @@ impl TurnReviewHost {
                 resolution,
                 reply,
             })
-            .await
             .map_err(|_| "the review host stopped".to_owned())?;
         answer
             .await
             .map_err(|_| "the review host stopped".to_owned())?
+    }
+
+    /// Stops accepting review work, releases every prompt hold, and drains the
+    /// ordered persistence lane before the daemon shuts its database writer
+    /// down.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.shared
+            .shutdown
+            .get_or_init(|| async {
+                let (reply, answer) = oneshot::channel();
+                self.events
+                    .send(HostEvent::Shutdown { reply })
+                    .map_err(|_| "the review host stopped".to_owned())?;
+                answer
+                    .await
+                    .map_err(|_| "the review host stopped during shutdown".to_owned())?
+            })
+            .await
+            .clone()
     }
 
     /// Every open review, for a snapshot a surface renders.
@@ -391,6 +464,11 @@ enum HostEvent {
         reply: Option<oneshot::Sender<Result<(), StartRefusal>>>,
         prepared: Result<Prepared, StartRefusal>,
     },
+    StateSaved {
+        session_id: String,
+        completion: PersistenceCompletion,
+        result: Result<(), String>,
+    },
     /// One asynchronous step of a review that was open when it started.
     ///
     /// `epoch` is which review asked. mjolnir's orchestrator tags every review
@@ -412,6 +490,27 @@ enum HostEvent {
     /// Reviews a daemon restart interrupted, so each session's conversation
     /// says what happened to it.
     Interrupted { interrupted: Vec<String> },
+    Shutdown {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceCompletion {
+    Open,
+    Close,
+}
+
+enum PersistenceRequest {
+    SweepInterrupted,
+    Save {
+        session_id: String,
+        state: TurnReviewState,
+        completion: Option<PersistenceCompletion>,
+    },
+    ClearActive {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// One asynchronous step's result, belonging to exactly one review.
@@ -419,6 +518,10 @@ enum ReviewStep {
     Delta(Result<Vec<crate::hel_worker::RepoDelta>, String>),
     Analysis(Result<String, String>),
     RoleStarted {
+        role: String,
+        result: Result<(), String>,
+    },
+    RolePrompted {
         role: String,
         result: Result<(), String>,
     },
@@ -434,6 +537,16 @@ struct Prepared {
     state: TurnReviewState,
     reviewer: ReviewerIdentity,
     tier: ReviewTier,
+    /// Read from the live actor after the admission hold is installed and a
+    /// reviewer status command drains every actor command ahead of it.
+    materialized: Box<MaterializedSession>,
+}
+
+struct PendingOpen {
+    epoch: u64,
+    manual: bool,
+    reply: Option<oneshot::Sender<Result<(), StartRefusal>>>,
+    prepared: Prepared,
 }
 
 /// Which harness reviews, and how it is configured. Read from `[review]`.
@@ -515,13 +628,21 @@ struct HostState {
     config: ReviewConfigSource,
     environment: Arc<dyn ReviewEnvironment>,
     shared: Arc<HostShared>,
-    events: mpsc::Sender<HostEvent>,
+    events: mpsc::UnboundedSender<HostEvent>,
+    persistence: Option<mpsc::UnboundedSender<PersistenceRequest>>,
+    persistence_task: Option<tokio::task::JoinHandle<()>>,
     reviews: BTreeMap<String, ReviewSlot>,
     /// Sessions whose review is being prepared. Preparation is asynchronous,
     /// so without this an automatic trigger and a manual `/review` racing each
     /// other would both create a review and the second would overwrite the
     /// first.
     preparing: BTreeSet<String>,
+    /// Reviews whose durable active marker is being written. They are not
+    /// visible and start no agents until that write succeeds.
+    pending_open: BTreeMap<String, PendingOpen>,
+    /// Reviews whose durable active marker is being cleared. Their resolved
+    /// view and prompt hold remain until the ordered write completes.
+    closing: BTreeSet<String>,
     /// Distinguishes reviews. Every asynchronous step carries the epoch of the
     /// review that asked for it, so a late result cannot land on its
     /// successor.
@@ -539,40 +660,80 @@ struct SessionWatch {
     materialized: Option<Box<MaterializedSession>>,
 }
 
-async fn host_loop(mut state: HostState, mut events: mpsc::Receiver<HostEvent>) {
-    // A review interrupted by a daemon restart is not resumed: the baseline
-    // never advanced, so the next review covers the same change, and half a
-    // multi-agent fan-out is not worth rebuilding. The sweep runs beside the
-    // loop rather than in front of it, so a slow database cannot delay the
-    // first review of the daemon's life.
-    {
-        let environment = state.environment.clone();
-        let events = state.events.clone();
-        tokio::spawn(async move {
-            let swept = tokio::task::spawn_blocking(move || environment.clear_interrupted()).await;
-            let interrupted = match swept {
-                Ok(Ok(sessions)) => sessions,
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "could not clear interrupted reviews");
-                    return;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "the interrupted-review sweep did not run");
-                    return;
-                }
-            };
-            if !interrupted.is_empty() {
-                let _ = events.send(HostEvent::Interrupted { interrupted }).await;
-            }
-        });
-    }
+async fn host_loop(mut state: HostState, mut events: mpsc::UnboundedReceiver<HostEvent>) {
     while let Some(event) = events.recv().await {
-        state.handle(event).await;
+        if state.handle(event).await {
+            break;
+        }
+    }
+}
+
+async fn persistence_loop(
+    environment: Arc<dyn ReviewEnvironment>,
+    events: mpsc::UnboundedSender<HostEvent>,
+    mut requests: mpsc::UnboundedReceiver<PersistenceRequest>,
+) {
+    while let Some(request) = requests.recv().await {
+        match request {
+            PersistenceRequest::SweepInterrupted => {
+                let environment = environment.clone();
+                match tokio::task::spawn_blocking(move || environment.clear_interrupted()).await {
+                    Ok(Ok(interrupted)) if !interrupted.is_empty() => {
+                        let _ = events.send(HostEvent::Interrupted { interrupted });
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "could not clear interrupted reviews");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "the interrupted-review sweep did not run");
+                    }
+                }
+            }
+            PersistenceRequest::Save {
+                session_id,
+                state,
+                completion,
+            } => {
+                let environment = environment.clone();
+                let owner = session_id.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || environment.save_state(&owner, &state))
+                        .await
+                        .map_err(|error| format!("review state persistence task stopped: {error}"))
+                        .and_then(|result| result);
+                if let Some(completion) = completion {
+                    let _ = events.send(HostEvent::StateSaved {
+                        session_id,
+                        completion,
+                        result,
+                    });
+                } else if let Err(error) = result {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        %error,
+                        "could not record how far this session has been reviewed"
+                    );
+                }
+            }
+            PersistenceRequest::ClearActive { reply } => {
+                let environment = environment.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    environment.clear_interrupted().map(|_| ())
+                })
+                .await
+                .map_err(|error| format!("review shutdown persistence task stopped: {error}"))
+                .and_then(|result| result);
+                let _ = reply.send(result);
+            }
+        }
     }
 }
 
 impl HostState {
-    async fn handle(&mut self, event: HostEvent) {
+    /// Returns true once shutdown has drained persistence and the host loop may
+    /// stop.
+    async fn handle(&mut self, event: HostEvent) -> bool {
         match event {
             HostEvent::View {
                 session_id,
@@ -589,6 +750,11 @@ impl HostState {
                 reply,
                 prepared,
             } => self.prepared(session_id, manual, reply, prepared),
+            HostEvent::StateSaved {
+                session_id,
+                completion,
+                result,
+            } => self.state_saved(session_id, completion, result),
             HostEvent::Resolve {
                 session_id,
                 resolution,
@@ -606,11 +772,17 @@ impl HostState {
                 for session_id in interrupted {
                     self.record_notice(
                         &session_id,
-                        "Turn review was cancelled when Hel restarted; the next review covers the same changes".to_owned(),
+                        "Turn review was cancelled when Mjolnir restarted; the next review covers the same changes".to_owned(),
                     );
                 }
             }
+            HostEvent::Shutdown { reply } => {
+                let result = self.shutdown().await;
+                let _ = reply.send(result);
+                return true;
+            }
         }
+        false
     }
 
     /// Applies one asynchronous result to the review that asked for it.
@@ -656,13 +828,21 @@ impl HostState {
                         Err(error) if super::lanes::lane_by_id(&role).is_some() => {
                             slot.driver.lane_failed(&role, error)
                         }
-                        Err(error) => slot.driver.request_failed(error),
+                        Err(error) => {
+                            self.fail(&session_id, error);
+                            return;
+                        }
                     },
                     None => return,
                 };
                 self.run(&session_id, requests);
-                if self.reviews.contains_key(&session_id) {
-                    self.poll_role(&session_id, &role, Duration::ZERO);
+            }
+            ReviewStep::RolePrompted { role, result } => {
+                if let Err(error) = result {
+                    self.fail(
+                        &session_id,
+                        format!("reviewing role {role:?} could not be prompted: {error}"),
+                    );
                 }
             }
             ReviewStep::RoleEvents { role, result } => self.role_events(session_id, role, result),
@@ -760,17 +940,19 @@ impl HostState {
         let events = self.events.clone();
         let prepare_session = session_id.clone();
         let environment = self.environment.clone();
+        // Admission and prompt refusal are one transition. Any prompt already
+        // ahead of the preparation's reviewer-status command is drained before
+        // `prepare` reads the actor view; every later prompt sees this hold.
+        hold_prompts(&session_id);
         self.preparing.insert(session_id);
         tokio::spawn(async move {
             let prepared = prepare(&control, &environment, &prepare_session, &reviewer, tier).await;
-            let _ = events
-                .send(HostEvent::Prepared {
-                    session_id: prepare_session,
-                    manual,
-                    reply,
-                    prepared,
-                })
-                .await;
+            let _ = events.send(HostEvent::Prepared {
+                session_id: prepare_session,
+                manual,
+                reply,
+                prepared,
+            });
         });
     }
 
@@ -808,57 +990,139 @@ impl HostState {
         reply: Option<oneshot::Sender<Result<(), StartRefusal>>>,
         prepared: Result<Prepared, StartRefusal>,
     ) {
-        self.preparing.remove(&session_id);
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(refusal) => {
+                self.preparing.remove(&session_id);
+                release_prompts(&session_id);
                 answer(reply, Err(refusal));
                 return;
             }
         };
-        // The session may have started another turn while preparation ran.
-        if let Some(refusal) = self.refuse_start(&session_id) {
+        if self.reviews.contains_key(&session_id) {
+            self.preparing.remove(&session_id);
+            release_prompts(&session_id);
+            let refusal = StartRefusal("a review is already open".to_owned());
             answer(reply, Err(refusal));
             return;
         }
-        let Some(materialized) = self
-            .sessions
-            .get(&session_id)
-            .and_then(|watch| watch.materialized.as_deref())
-        else {
-            answer(
-                reply,
-                Err(StartRefusal(
-                    "this session has no transcript yet".to_owned(),
-                )),
-            );
-            return;
-        };
-        let seed = seed_from_session(
-            materialized,
-            prepared.tier,
-            &prepared.state,
-            if manual { "manual" } else { "automatic" },
-        );
-        let (driver, requests) = TurnReviewDriver::start(seed);
         self.next_epoch = self.next_epoch.saturating_add(1);
         let epoch = self.next_epoch;
-        self.reviews.insert(
+        let mut prepared = prepared;
+        prepared.state.active = Some(format!("review-{epoch}"));
+        let state = prepared.state.clone();
+        self.pending_open.insert(
             session_id.clone(),
-            ReviewSlot {
+            PendingOpen {
                 epoch,
-                driver,
-                roles: BTreeMap::new(),
-                reviewer: prepared.reviewer,
-                state: prepared.state,
-                generation: 0,
+                manual,
+                reply,
+                prepared,
             },
         );
-        // The lock goes on before any agent starts: a review the user cannot
-        // see yet still holds the turn it is about to review.
-        hold_prompts(&session_id);
-        answer(reply, Ok(()));
-        self.run(&session_id, requests);
+        if let Err(error) =
+            self.persist(session_id.clone(), state, Some(PersistenceCompletion::Open))
+        {
+            let pending = self
+                .pending_open
+                .remove(&session_id)
+                .expect("pending review was just inserted");
+            self.preparing.remove(&session_id);
+            release_prompts(&session_id);
+            answer(
+                pending.reply,
+                Err(StartRefusal(format!(
+                    "could not record the active review: {error}"
+                ))),
+            );
+        }
+    }
+
+    fn state_saved(
+        &mut self,
+        session_id: String,
+        completion: PersistenceCompletion,
+        result: Result<(), String>,
+    ) {
+        match completion {
+            PersistenceCompletion::Open => {
+                let Some(pending) = self.pending_open.remove(&session_id) else {
+                    return;
+                };
+                self.preparing.remove(&session_id);
+                if let Err(error) = result {
+                    release_prompts(&session_id);
+                    answer(
+                        pending.reply,
+                        Err(StartRefusal(format!(
+                            "could not record the active review: {error}"
+                        ))),
+                    );
+                    return;
+                }
+                let seed = seed_from_session(
+                    &pending.prepared.materialized,
+                    pending.prepared.tier,
+                    &pending.prepared.state,
+                    if pending.manual {
+                        "manual"
+                    } else {
+                        "automatic"
+                    },
+                );
+                let (driver, requests) = TurnReviewDriver::start(seed);
+                self.reviews.insert(
+                    session_id.clone(),
+                    ReviewSlot {
+                        epoch: pending.epoch,
+                        driver,
+                        roles: BTreeMap::new(),
+                        reviewer: pending.prepared.reviewer,
+                        state: pending.prepared.state,
+                        generation: 0,
+                    },
+                );
+                answer(pending.reply, Ok(()));
+                self.run(&session_id, requests);
+            }
+            PersistenceCompletion::Close => {
+                self.closing.remove(&session_id);
+                if let Err(error) = result {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        %error,
+                        "could not clear the active review marker"
+                    );
+                }
+                let notice = self
+                    .reviews
+                    .get(&session_id)
+                    .and_then(|slot| resolution_notice(slot.driver.phase()));
+                self.reviews.remove(&session_id);
+                release_prompts(&session_id);
+                if let Some(notice) = notice {
+                    self.record_notice(&session_id, notice);
+                }
+                self.publish(&session_id);
+            }
+        }
+    }
+
+    fn persist(
+        &self,
+        session_id: String,
+        state: TurnReviewState,
+        completion: Option<PersistenceCompletion>,
+    ) -> Result<(), String> {
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| "the review persistence lane stopped".to_owned())?
+            .send(PersistenceRequest::Save {
+                session_id,
+                state,
+                completion,
+            })
+            .map_err(|_| "the review persistence lane stopped".to_owned())
     }
 
     /// Forwards, dismisses, or cancels an open review on a surface's request.
@@ -898,7 +1162,15 @@ impl HostState {
         let Some(slot) = self.reviews.get_mut(session_id) else {
             return;
         };
+        slot.state.active = None;
+        let state = slot.state.clone();
         let requests = slot.driver.request_failed(message);
+        // A failed review remains visible so the person can dismiss it, but it
+        // no longer owns the turn or has work capable of progressing.
+        release_prompts(session_id);
+        if let Err(error) = self.persist(session_id.to_owned(), state, None) {
+            tracing::warn!(session_id, %error, "could not queue failed review persistence");
+        }
         self.run(session_id, requests);
     }
 
@@ -975,8 +1247,10 @@ impl HostState {
                 if let Some(slot) = self.reviews.get_mut(session_id) {
                     slot.state.baselines = trees.clone();
                     slot.state.reviewed_through_ordinal = reviewed_through_ordinal;
-                    slot.state.active = None;
-                    self.environment.save_state(session_id, &slot.state);
+                    let state = slot.state.clone();
+                    if let Err(error) = self.persist(session_id.to_owned(), state, None) {
+                        tracing::warn!(session_id, %error, "could not queue review baseline persistence");
+                    }
                 }
                 let session_id = session_id.to_owned();
                 self.spawn_reviewer(
@@ -1001,27 +1275,44 @@ impl HostState {
             ReviewRequest::RecordPriorReview { prior } => {
                 if let Some(slot) = self.reviews.get_mut(session_id) {
                     slot.state.prior_review = Some(prior);
-                    self.environment.save_state(session_id, &slot.state);
+                    let state = slot.state.clone();
+                    if let Err(error) = self.persist(session_id.to_owned(), state, None) {
+                        tracing::warn!(session_id, %error, "could not queue prior review persistence");
+                    }
                 }
             }
             ReviewRequest::ClearPriorReview => {
                 if let Some(slot) = self.reviews.get_mut(session_id) {
                     slot.state.prior_review = None;
-                    self.environment.save_state(session_id, &slot.state);
+                    let state = slot.state.clone();
+                    if let Err(error) = self.persist(session_id.to_owned(), state, None) {
+                        tracing::warn!(session_id, %error, "could not queue prior review cleanup");
+                    }
                 }
             }
             ReviewRequest::Close => {
-                let notice = self
-                    .reviews
-                    .get(session_id)
-                    .and_then(|slot| resolution_notice(slot.driver.phase()));
-                if let Some(mut slot) = self.reviews.remove(session_id) {
-                    slot.state.active = None;
-                    self.environment.save_state(session_id, &slot.state);
+                if self.closing.contains(session_id) {
+                    return;
                 }
-                release_prompts(session_id);
-                if let Some(notice) = notice {
-                    self.record_notice(session_id, notice);
+                if let Some(slot) = self.reviews.get_mut(session_id) {
+                    slot.state.active = None;
+                    let state = slot.state.clone();
+                    self.closing.insert(session_id.to_owned());
+                    // Logical close is synchronous. In particular, a forwarded
+                    // review spawned its corrective primary prompt earlier in
+                    // this request list; releasing before this task yields lets
+                    // that prompt pass the actor's authoritative check.
+                    release_prompts(session_id);
+                    if let Err(error) = self.persist(
+                        session_id.to_owned(),
+                        state,
+                        Some(PersistenceCompletion::Close),
+                    ) {
+                        tracing::warn!(session_id, %error, "could not queue review close persistence");
+                        self.closing.remove(session_id);
+                        self.reviews.remove(session_id);
+                        release_prompts(session_id);
+                    }
                 }
             }
         }
@@ -1058,18 +1349,20 @@ impl HostState {
                 &repositories,
             )
             .await;
-            let _ = events
-                .send(HostEvent::Step {
-                    session_id,
-                    epoch,
-                    step: ReviewStep::RoleStarted { role, result },
-                })
-                .await;
+            let _ = events.send(HostEvent::Step {
+                session_id,
+                epoch,
+                step: ReviewStep::RoleStarted { role, result },
+            });
         });
     }
 
     fn prompt_role(&mut self, session_id: &str, role: &str, command_id: String, prompt: String) {
-        let session_id_for_log = session_id.to_owned();
+        let Some(epoch) = self.reviews.get(session_id).map(|slot| slot.epoch) else {
+            return;
+        };
+        let owner = session_id.to_owned();
+        let result_role = role.to_owned();
         self.spawn_reviewer(
             session_id.to_owned(),
             Some(role.to_owned()),
@@ -1078,14 +1371,18 @@ impl HostState {
                 command: prompt_command(prompt),
             },
             move |outcome| {
-                if let Err(error) = outcome {
-                    tracing::warn!(
-                        session_id = %session_id_for_log,
-                        %error,
-                        "a reviewing role could not be prompted"
-                    );
-                }
-                None
+                let result = match outcome {
+                    Ok(ReviewerOutcome::Accepted { .. }) => Ok(()),
+                    other => Err(unexpected(other)),
+                };
+                Some(HostEvent::Step {
+                    session_id: owner,
+                    epoch,
+                    step: ReviewStep::RolePrompted {
+                        role: result_role,
+                        result,
+                    },
+                })
             },
         );
     }
@@ -1152,13 +1449,11 @@ impl HostState {
                 Ok(ReviewerOutcome::Attached(attachment)) => Ok(attachment.events),
                 other => Err(unexpected(other)),
             };
-            let _ = events
-                .send(HostEvent::Step {
-                    session_id,
-                    epoch,
-                    step: ReviewStep::RoleEvents { role, result },
-                })
-                .await;
+            let _ = events.send(HostEvent::Step {
+                session_id,
+                epoch,
+                step: ReviewStep::RoleEvents { role, result },
+            });
         });
     }
 
@@ -1320,7 +1615,7 @@ impl HostState {
         tokio::spawn(async move {
             let outcome = reviewer_action(&control, &session_id, role, action).await;
             if let Some(event) = into_event(outcome) {
-                let _ = events.send(event).await;
+                let _ = events.send(event);
             }
         });
     }
@@ -1333,14 +1628,91 @@ impl HostState {
             .views
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.reviews.get(session_id) {
+        let changed = match self.reviews.get(session_id) {
             Some(slot) => {
-                views.insert(session_id.to_owned(), slot.view(session_id));
+                let next = slot.view(session_id);
+                if views.get(session_id) == Some(&next) {
+                    false
+                } else {
+                    views.insert(session_id.to_owned(), next);
+                    true
+                }
             }
-            None => {
-                views.remove(session_id);
+            None => views.remove(session_id).is_some(),
+        };
+        drop(views);
+        if changed {
+            (self.shared.changed)();
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<(), String> {
+        let session_ids = self
+            .preparing
+            .iter()
+            .chain(self.reviews.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for pending in std::mem::take(&mut self.pending_open).into_values() {
+            answer(
+                pending.reply,
+                Err(StartRefusal("the daemon is shutting down".to_owned())),
+            );
+        }
+
+        // Take the lane once and use that single sender for every final write.
+        // No sender may survive the join below or the receiver can never
+        // observe EOF.
+        let lane = self.persistence.take();
+        for (session_id, slot) in &mut self.reviews {
+            slot.state.active = None;
+            let queued = lane
+                .as_ref()
+                .ok_or_else(|| "the review persistence lane stopped".to_owned())
+                .and_then(|persistence| {
+                    persistence
+                        .send(PersistenceRequest::Save {
+                            session_id: session_id.clone(),
+                            state: slot.state.clone(),
+                            completion: None,
+                        })
+                        .map_err(|_| "the review persistence lane stopped".to_owned())
+                });
+            if let Err(error) = queued {
+                tracing::warn!(session_id, %error, "could not queue review shutdown persistence");
             }
         }
+        self.preparing.clear();
+        self.closing.clear();
+        self.reviews.clear();
+        for session_id in &session_ids {
+            release_prompts(session_id);
+            self.publish(session_id);
+        }
+
+        let clear_result = match lane {
+            Some(lane) => {
+                let (reply, cleared) = oneshot::channel();
+                let sent = lane
+                    .send(PersistenceRequest::ClearActive { reply })
+                    .map_err(|_| "the review persistence lane stopped during shutdown".to_owned());
+                drop(lane);
+                match sent {
+                    Ok(()) => cleared.await.map_err(|_| {
+                        "the review persistence lane stopped before cleanup".to_owned()
+                    })?,
+                    Err(error) => Err(error),
+                }
+            }
+            None => Err("the review persistence lane already stopped".to_owned()),
+        };
+        let task_result = match self.persistence_task.take() {
+            Some(task) => task
+                .await
+                .map_err(|error| format!("review persistence lane panicked: {error}")),
+            None => Ok(()),
+        };
+        clear_result.and(task_result)
     }
 }
 
@@ -1518,19 +1890,49 @@ async fn prepare(
     // default reviewer role, and the running one keeps the slot. Checked
     // against the worker rather than against any UI's state, because the
     // worker is the only place that knows.
-    match reviewer_action(control, session_id, None, ReviewerAction::Status).await {
+    let handle = control
+        .session(session_id.to_owned())
+        .await
+        .map_err(|error| StartRefusal(format!("{error:#}")))?;
+    match handle.reviewer(ReviewerAction::Status).await {
         Ok(ReviewerOutcome::Status(state)) if state.active_prompt.is_some() => {
             return Err(StartRefusal(
                 "the reviewer is busy with a second opinion".to_owned(),
             ));
         }
         Ok(_) => {}
-        Err(error) => return Err(StartRefusal(error)),
+        Err(error) => return Err(StartRefusal(format!("{error:#}"))),
+    }
+    // Reviewer actions and primary prompt submissions are serialized by the
+    // same session actor. Anything accepted before the admission hold is
+    // reflected here; anything after it was refused by the actor.
+    let view = handle.view();
+    if !view.connected {
+        return Err(StartRefusal("this session is not connected".to_owned()));
+    }
+    let Some(snapshot) = view.snapshot else {
+        return Err(StartRefusal(
+            "this session has no transcript yet".to_owned(),
+        ));
+    };
+    if !matches!(
+        snapshot.materialized.execution,
+        MaterializedExecutionState::Idle
+    ) {
+        return Err(StartRefusal(
+            "a review runs between turns; this one is still working".to_owned(),
+        ));
+    }
+    if !snapshot.materialized.queued_prompts.is_empty() {
+        return Err(StartRefusal(
+            "prompts are queued; the review waits for them".to_owned(),
+        ));
     }
     Ok(Prepared {
         state,
         reviewer: reviewer.clone(),
         tier,
+        materialized: Box::new(snapshot.materialized),
     })
 }
 
@@ -1582,10 +1984,10 @@ fn seed_from_session(
                 if item.position > reviewed_through
                     && !crate::hel_second_opinion::is_control_origin_prompt(text)
                 {
-                    // Hel's own generated prompts -- a forwarded review, a
+                    // Mjolnir's own generated prompts -- a forwarded review, a
                     // plan-review context request -- are not user intent, and
                     // reading them as intent would let a review grade the
-                    // agent against Hel's words.
+                    // agent against Mjolnir's words.
                     user_messages.push(UserMessage::prompt(text));
                     trajectory.push(format!("user: {text}"));
                 }
@@ -1843,6 +2245,49 @@ mod tests {
         /// The review bookkeeping, in memory rather than in the developer's
         /// own database.
         state: Mutex<TurnReviewState>,
+        writes: Mutex<Vec<(TurnReviewState, std::thread::ThreadId)>>,
+        save_gate: Mutex<Option<Arc<SaveGate>>>,
+    }
+
+    struct SaveGate {
+        entered: tokio::sync::Notify,
+        released: Mutex<bool>,
+        released_changed: std::sync::Condvar,
+    }
+
+    impl SaveGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: tokio::sync::Notify::new(),
+                released: Mutex::new(false),
+                released_changed: std::sync::Condvar::new(),
+            })
+        }
+
+        async fn entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn wait(&self) {
+            self.entered.notify_one();
+            let released = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(
+                self.released_changed
+                    .wait_while(released, |released| !*released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+
+        fn release(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            self.released_changed.notify_all();
+        }
     }
 
     impl FakeEnvironment {
@@ -1850,6 +2295,8 @@ mod tests {
             Arc::new(Self {
                 staged: Mutex::new(Vec::new()),
                 state: Mutex::new(TurnReviewState::default()),
+                writes: Mutex::new(Vec::new()),
+                save_gate: Mutex::new(None),
             })
         }
 
@@ -1865,6 +2312,22 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        fn writes(&self) -> Vec<(TurnReviewState, std::thread::ThreadId)> {
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn block_saves(&self) -> Arc<SaveGate> {
+            let gate = SaveGate::new();
+            *self
+                .save_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+            gate
         }
     }
 
@@ -1903,14 +2366,31 @@ mod tests {
             Ok(self.state())
         }
 
-        fn save_state(&self, _session_id: &str, state: &TurnReviewState) {
+        fn save_state(&self, _session_id: &str, state: &TurnReviewState) -> Result<(), String> {
+            let gate = self
+                .save_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(gate) = gate {
+                gate.wait();
+            }
             *self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = state.clone();
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((state.clone(), std::thread::current().id()));
+            Ok(())
         }
 
         fn clear_interrupted(&self) -> Result<Vec<String>, String> {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active = None;
             Ok(Vec::new())
         }
     }
@@ -1924,6 +2404,44 @@ mod tests {
             model: None,
             effort: None,
         })
+    }
+
+    #[test]
+    fn the_reviewer_profile_must_be_separate_from_the_primary_profile() {
+        let session = crate::hel_state::SessionRecord {
+            id: "session-1".to_owned(),
+            workspace_id: crate::hel_workspace::DEFAULT_WORKSPACE_ID.to_owned(),
+            title: "task".to_owned(),
+            harness_kind: crate::hel_config::HarnessKind::Codex,
+            last_profile: "primary".to_owned(),
+            bundle_id: "bundle".to_owned(),
+            project_directory: None,
+            managed_worktree: None,
+            target_template_id: "local".to_owned(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            container_cpus: None,
+            container_memory: None,
+            state: crate::hel_state::SessionState::Running,
+            archived: false,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            viewed_through_event_ordinal: 0,
+            draft_input: String::new(),
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        };
+
+        let refusal = validate_reviewer_assignment("session-1", Some(&session), "primary")
+            .expect_err("one harness profile cannot review its own output independently");
+        assert!(refusal.contains("primary profile"), "{refusal}");
+        validate_reviewer_assignment("session-1", Some(&session), "reviewer")
+            .expect("a separate reviewer profile is accepted");
     }
 
     /// Drives a session from running to idle, which is the edge that arms an
@@ -2002,6 +2520,10 @@ mod tests {
             .next_reviewer(|_, action| matches!(action, ReviewerAction::Status))
             .await;
         assert!(matches!(action, ReviewerAction::Status));
+        assert!(
+            host.refuses_prompt(session),
+            "admission holds prompts before preparation waits on the session actor"
+        );
         let _ = reply.send(Ok(ReviewerOutcome::Status(Box::new(operational()))));
 
         // Then the capture that defines what is under review.
@@ -2012,6 +2534,10 @@ mod tests {
         assert!(
             host.refuses_prompt(session),
             "the review holds the session's prompts from the moment it opens"
+        );
+        assert!(
+            environment.state().active.is_some(),
+            "the active marker is durable before review work starts"
         );
         // Nothing changed, so the review records its baseline and resolves.
         let _ = reply.send(Ok(ReviewerOutcome::Delta {
@@ -2041,13 +2567,199 @@ mod tests {
         let _ = reply.send(Ok(ReviewerOutcome::BaselineAdvanced));
 
         tokio::time::timeout(Duration::from_secs(5), async {
+            while host.refuses_prompt(session)
+                || host.view(session).is_some()
+                || environment.state().active.is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a resolved review releases prompts and drains its durable close");
+        assert!(host.view(session).is_none(), "the review is over");
+        assert_eq!(environment.state().active, None);
+    }
+
+    /// A prompt that landed before the admission hold is reflected by the
+    /// live actor recheck, so preparation refuses and gives the prompt lock
+    /// back instead of reviewing a stale idle snapshot.
+    #[tokio::test]
+    async fn preparation_rechecks_the_live_actor_after_installing_the_prompt_hold() {
+        let session = session_id("preparelive");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let host = TurnReviewHost::spawn_in(
+            manager.control.clone(),
+            armed(Some("reviewer")),
+            environment.clone(),
+        );
+
+        finish_a_turn(&manager, &host).await;
+        let (_, _, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::Status))
+            .await;
+        assert!(host.refuses_prompt(session));
+
+        manager
+            .publisher
+            .publish(
+                session.to_owned(),
+                view(
+                    session,
+                    MaterializedExecutionState::Running { started_at_ms: 1 },
+                ),
+            )
+            .await
+            .expect("publish the command that won the admission race");
+        let _ = reply.send(Ok(ReviewerOutcome::Status(Box::new(operational()))));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
             while host.refuses_prompt(session) {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("a resolved review releases the session's prompts");
-        assert!(host.view(session).is_none(), "the review is over");
+        .expect("a refused preparation releases its prompt hold");
+        assert!(host.view(session).is_none());
+        assert_eq!(environment.state().active, None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), manager.requests.recv())
+                .await
+                .is_err(),
+            "stale preparation never starts capture"
+        );
+        host.shutdown().await.expect("shutdown the host");
+    }
+
+    /// Session observations are an edge stream. A burst larger than the old
+    /// bounded hand-off must retain its final idle edge, or manual admission
+    /// sees a stale running session and automatic review can be lost too.
+    #[tokio::test]
+    async fn observation_bursts_do_not_drop_the_final_idle_edge() {
+        let session = session_id("losslessobs");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let config: ReviewConfigSource = Arc::new(|| ReviewConfig {
+            enabled: false,
+            tier: ReviewTier::Quick,
+            profile: Some("reviewer".to_owned()),
+            model: None,
+            effort: None,
+        });
+        let host = TurnReviewHost::spawn_in(manager.control.clone(), config, environment);
+
+        let running = view(
+            session,
+            MaterializedExecutionState::Running { started_at_ms: 1 },
+        );
+        for _ in 0..256 {
+            host.observe(session, &running);
+        }
+        host.observe(session, &view(session, MaterializedExecutionState::Idle));
+
+        let starting_host = host.clone();
+        let session_owned = session.to_owned();
+        let starting = tokio::spawn(async move { starting_host.start(&session_owned, true).await });
+        let (_, _, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::Status))
+            .await;
+        let _ = reply.send(Ok(ReviewerOutcome::Status(Box::new(operational()))));
+        starting
+            .await
+            .expect("start task")
+            .expect("the retained idle edge admits the review");
+        assert!(host.refuses_prompt(session));
+        host.shutdown().await.expect("shutdown the host");
+    }
+
+    /// Durable state uses one blocking FIFO lane: a blocked write cannot stop
+    /// the host actor, opening is not exposed before `active` is stored, and
+    /// shutdown waits for the final clear. The public shutdown is safe for
+    /// concurrent daemon cleanup callers and subsequent idempotent calls.
+    #[tokio::test]
+    async fn persistence_is_nonblocking_ordered_and_drained_on_shutdown() {
+        let session = session_id("persistlane");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let host = TurnReviewHost::spawn_in(
+            manager.control.clone(),
+            armed(Some("reviewer")),
+            environment.clone(),
+        );
+
+        finish_a_turn(&manager, &host).await;
+        let (_, _, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::Status))
+            .await;
+        let open_gate = environment.block_saves();
+        let _ = reply.send(Ok(ReviewerOutcome::Status(Box::new(operational()))));
+        tokio::time::timeout(Duration::from_secs(5), open_gate.entered())
+            .await
+            .expect("the active write reaches the blocking lane");
+
+        let refusal = tokio::time::timeout(Duration::from_secs(1), host.start(session, true))
+            .await
+            .expect("the host loop remains responsive while persistence blocks")
+            .expect_err("the same review is already starting");
+        assert!(refusal.0.contains("already starting"), "{refusal}");
+        assert!(host.view(session).is_none(), "open is not exposed early");
+
+        open_gate.release();
+        let (_, _, _capture_reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::CaptureDelta { .. }))
+            .await;
+        assert!(environment.state().active.is_some());
+        assert!(host.view(session).is_some());
+
+        let close_gate = environment.block_saves();
+        let first_host = host.clone();
+        let second_host = host.clone();
+        let first = tokio::spawn(async move { first_host.shutdown().await });
+        let second = tokio::spawn(async move { second_host.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(5), close_gate.entered())
+            .await
+            .expect("shutdown queues the final inactive state");
+        assert!(!first.is_finished(), "shutdown drains the blocked write");
+        assert!(
+            !second.is_finished(),
+            "concurrent shutdown joins the same drain"
+        );
+        assert!(
+            !host.refuses_prompt(session),
+            "logical shutdown releases prompts before persistence finishes"
+        );
+        close_gate.release();
+        first
+            .await
+            .expect("first shutdown task")
+            .expect("first drain");
+        second
+            .await
+            .expect("second shutdown task")
+            .expect("shared drain");
+        host.shutdown().await.expect("shutdown stays idempotent");
+
+        assert_eq!(environment.state().active, None);
+        assert!(host.view(session).is_none());
+        let writes = environment.writes();
+        assert!(
+            writes
+                .first()
+                .is_some_and(|(state, _)| state.active.is_some())
+        );
+        assert!(
+            writes
+                .last()
+                .is_some_and(|(state, _)| state.active.is_none())
+        );
+        let test_thread = std::thread::current().id();
+        assert!(
+            writes.iter().all(|(_, writer)| *writer != test_thread),
+            "synchronous database writes run off the Tokio host thread"
+        );
     }
 
     /// Queued prompts hold the review back: reviewing now would hold work the
@@ -2165,6 +2877,74 @@ mod tests {
         .expect("cancelling releases the prompts");
     }
 
+    /// A reviewer launch failure is a durable failed verdict, but it no longer
+    /// owns the primary turn: the active marker and admission hold are both
+    /// cleared before the user dismisses the visible failure.
+    #[tokio::test]
+    async fn a_failed_review_clears_durable_active_state_and_the_prompt_hold() {
+        let session = session_id("failedrole0");
+        let session = session.as_str();
+        let mut manager = FakeManager::new(session).await;
+        let environment = FakeEnvironment::new();
+        let host = TurnReviewHost::spawn_in(
+            manager.control.clone(),
+            armed(Some("reviewer")),
+            environment.clone(),
+        );
+        finish_a_turn(&manager, &host).await;
+
+        let (_, _, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::CaptureDelta { .. }))
+            .await;
+        assert!(environment.state().active.is_some());
+        let _ = reply.send(Ok(ReviewerOutcome::Delta {
+            repositories: vec![crate::hel_worker::RepoDelta {
+                root: PathBuf::from("/workspace/app"),
+                baseline_tree: Some("base".to_owned()),
+                current_tree: "new".to_owned(),
+                patch: "diff --git a/a b/a\n@@\n+one\n".to_owned(),
+                diffstat: "1 file changed, 1 insertion(+)".to_owned(),
+                changed_lines: 1,
+            }],
+        }));
+        let (_, _, reply) = manager
+            .next_reviewer(|_, action| matches!(action, ReviewerAction::Start { .. }))
+            .await;
+        let _ = reply.send(Err("review harness failed to launch".to_owned()));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let failed = host.view(session).is_some_and(|view| {
+                    matches!(
+                        view.verdict,
+                        Some(VerdictView {
+                            kind: VerdictKind::Failed,
+                            ..
+                        })
+                    )
+                });
+                if failed && !host.refuses_prompt(session) && environment.state().active.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failure releases and persists the turn");
+
+        host.resolve(session, Resolution::Dismissed)
+            .await
+            .expect("the visible failure can be dismissed");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.view(session).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dismissal closes the failed review");
+        host.shutdown().await.expect("shutdown the host");
+    }
+
     /// A relay event carrying one agent message, for the answer a role's
     /// journal reports.
     fn agent_event(ordinal: u64, previous_digest: &str, text: &str) -> RelayEvent {
@@ -2219,16 +2999,23 @@ mod tests {
         let session = session.as_str();
         let mut manager = FakeManager::new(session).await;
         let environment = FakeEnvironment::new();
-        let host = TurnReviewHost::spawn_in(
+        let publications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published = publications.clone();
+        let host = TurnReviewHost::spawn_in_notifying(
             manager.control.clone(),
             armed(Some("reviewer")),
             environment.clone(),
+            Arc::new(move || {
+                published.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
         );
         finish_a_turn(&manager, &host).await;
 
         let (_, _, reply) = manager
             .next_reviewer(|_, action| matches!(action, ReviewerAction::CaptureDelta { .. }))
             .await;
+        let after_add = publications.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_add > 0, "opening publishes and wakes surfaces");
         let _ = reply.send(Ok(ReviewerOutcome::Delta {
             repositories: vec![crate::hel_worker::RepoDelta {
                 root: std::path::PathBuf::from("/workspace/app"),
@@ -2244,6 +3031,11 @@ mod tests {
         let (role, _, reply) = manager
             .next_reviewer(|_, action| matches!(action, ReviewerAction::Start { .. }))
             .await;
+        let after_change = publications.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            after_change > after_add,
+            "a projected review state change wakes surfaces"
+        );
         assert_eq!(role.as_deref(), Some(super::super::driver::REVIEWER_ROLE));
         let _ = reply.send(Ok(ReviewerOutcome::Started(Box::new(
             crate::hel_worker_client::StartedReviewer {
@@ -2283,6 +3075,35 @@ mod tests {
                     && matches!(action, ReviewerAction::Attach { .. })
             })
             .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.requests.recv())
+                .await
+                .is_err(),
+            "one role prompt has only one attachment poll in flight"
+        );
+        let before_identical = publications.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = reply.send(Ok(ReviewerOutcome::Attached(Box::new(
+            crate::hel_worker_client::RelayAttachment {
+                state: operational(),
+                events: Vec::new(),
+                through_ordinal: 0,
+                through_digest: crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+            },
+        ))));
+
+        // An empty journal page runs the host's publish path but leaves the
+        // projection identical. It schedules another poll without a wakeup.
+        let (_, _, reply) = manager
+            .next_reviewer(|role, action| {
+                role.as_deref() == Some(super::super::driver::REVIEWER_ROLE)
+                    && matches!(action, ReviewerAction::Attach { .. })
+            })
+            .await;
+        assert_eq!(
+            publications.load(std::sync::atomic::Ordering::SeqCst),
+            before_identical,
+            "an identical projection does not wake surfaces"
+        );
         let answer = agent_event(
             1,
             crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST,
@@ -2300,13 +3121,20 @@ mod tests {
         ))));
 
         tokio::time::timeout(Duration::from_secs(5), async {
-            while host.refuses_prompt(session) {
+            while host.refuses_prompt(session)
+                || host.view(session).is_some()
+                || environment.state().active.is_some()
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("a clean review releases the turn by itself");
+        .expect("a clean review releases and durably closes the turn by itself");
         assert!(host.view(session).is_none());
+        assert!(
+            publications.load(std::sync::atomic::Ordering::SeqCst) > before_identical,
+            "closing removes the view and wakes surfaces"
+        );
 
         // The reviewer ran under the configured profile, and only the
         // supervisor is ever given the tool that launches specialists.
@@ -2326,5 +3154,6 @@ mod tests {
         );
         assert_eq!(recorded.reviewed_through_ordinal, 12);
         assert_eq!(recorded.active, None);
+        host.shutdown().await.expect("shutdown the host");
     }
 }

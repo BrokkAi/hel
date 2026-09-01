@@ -6,3 +6,7 @@
 # everyone who runs the test benefits from these saved cases.
 cc 87b05b6e086dbcc70d2a5b83f77ac285aa6a521854c1ac242d954f040946b300 # shrinks to message_sizes = [11, 0], idx_seed = 8874278699578593, byte_seed = 7768182960840943930
 cc 7b3259b424696cf5d7eaecc2dee6ea23a48dfa8ed47f55b5a353c56bfee2fc51 # shrinks to message_sizes = [17], fault_kind = 0, idx_seed = 3977137245947754, byte_seed = 11954145812164314268
+cc f6ae7261cde15f99352976ac6e9650ca400adddbf2ca174d142a2b096941f3e9 # shrinks to prefix_sizes = [21, 30, 38, 10, 9, 52, 57, 89, 79, 87, 26, 10, 39], tail_sizes = [47, 29, 27, 17, 78, 84, 28, 49, 51], checkpoint_prune = false, ack_seed = 12906238017234743158, fault_kind = 5
+cc 8550442e524bd0d04d0b870d7722ee583e8b1f207c964348fb81f7e329ecd916 # shrinks to message_sizes = [5, 38], idx_seed = 12299866419470509197, byte_seed = 7587732912917247928
+cc 45ee44e17b17539627b7a3449d4bca73e1fd4d184e2c9a6f00c5abb07083fe0f # shrinks to message_sizes = [47, 1, 22, 29, 28, 35, 43, 42], fault_kind = 0, idx_seed = 6583477077419099449, byte_seed = 67536414735562686
+cc 3878c33b68bd1eefb5102dbcb37a7844c86e3cf38157bdf67a665479371e921c # shrinks to prefix_sizes = [80, 8, 32, 70, 32, 36, 19, 92, 67, 63, 61, 82, 15, 8, 22, 31, 55, 62], tail_sizes = [19, 34, 60, 64, 66, 45, 19], checkpoint_prune = true, ack_seed = 5140893502715818340, fault_kind = 0

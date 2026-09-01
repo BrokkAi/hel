@@ -3,7 +3,7 @@ import starlight from '@astrojs/starlight';
 import { defineConfig } from 'astro/config';
 import rehypeBasePathLinks from './rehype-base-path-links.mjs';
 
-const site = process.env.PUBLIC_DOCS_SITE ?? 'https://brokkai.github.io/hel/';
+const site = process.env.PUBLIC_DOCS_SITE ?? 'https://mjolnir.brokk.ai/';
 const productionBase = process.env.PUBLIC_DOCS_BASE ?? '/';
 const isDev = process.argv.includes('dev');
 const base = isDev ? '/' : productionBase;
@@ -22,7 +22,7 @@ export default defineConfig({
   },
   integrations: [
     starlight({
-      title: 'Hel',
+      title: 'Mjolnir',
       description: 'A terminal control plane for long-running ACP coding-agent sessions, with local, container, and remote targets.',
       head: [
         { tag: 'link', attrs: { rel: 'preconnect', href: 'https://fonts.googleapis.com' } },
@@ -43,7 +43,7 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             property: 'og:image:alt',
-            content: 'Hel: a terminal control plane for Codex, Claude Code, and Kimi Code sessions.',
+            content: 'Mjolnir: a terminal control plane for Codex, Claude Code, and Kimi Code sessions.',
           },
         },
         { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
@@ -52,7 +52,7 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             name: 'twitter:image:alt',
-            content: 'Hel: a terminal control plane for Codex, Claude Code, and Kimi Code sessions.',
+            content: 'Mjolnir: a terminal control plane for Codex, Claude Code, and Kimi Code sessions.',
           },
         },
       ],
@@ -63,13 +63,13 @@ export default defineConfig({
       },
       favicon: '/favicon.svg',
       editLink: {
-        baseUrl: 'https://github.com/BrokkAi/hel/edit/master/docs/',
+        baseUrl: 'https://github.com/BrokkAi/mjolnir/edit/master/docs/',
       },
       social: [
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/BrokkAi/hel',
+          href: 'https://github.com/BrokkAi/mjolnir',
         },
       ],
       sidebar: [
@@ -77,8 +77,8 @@ export default defineConfig({
           label: 'Containers',
           items: [
             { label: 'Container targets', slug: 'containers' },
-            { label: 'Podman for Hel', slug: 'podman' },
-            { label: 'Docker for Hel', slug: 'docker' },
+            { label: 'Podman for Mjolnir', slug: 'podman' },
+            { label: 'Docker for Mjolnir', slug: 'docker' },
             { label: 'Custom container images', slug: 'custom-images' },
           ],
         },

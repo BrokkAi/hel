@@ -20,12 +20,12 @@ pub fn reach_test_hook(name: &'static str) -> Result<()> {
 
     use anyhow::{Context as _, bail, ensure};
 
-    if std::env::var_os("HEL_TEST_HOOK").as_deref() != Some(std::ffi::OsStr::new(name)) {
+    if std::env::var_os("MJ_TEST_HOOK").as_deref() != Some(std::ffi::OsStr::new(name)) {
         return Ok(());
     }
     ensure!(
-        std::env::var_os("HEL_CHAOS_ISOLATED").as_deref() == Some(std::ffi::OsStr::new("1")),
-        "test hook {name} requires HEL_CHAOS_ISOLATED=1"
+        std::env::var_os("MJ_CHAOS_ISOLATED").as_deref() == Some(std::ffi::OsStr::new("1")),
+        "test hook {name} requires MJ_CHAOS_ISOLATED=1"
     );
     ensure!(
         name.bytes()
@@ -33,8 +33,8 @@ pub fn reach_test_hook(name: &'static str) -> Result<()> {
         "invalid test hook name {name:?}"
     );
     let directory = PathBuf::from(
-        std::env::var_os("HEL_TEST_HOOK_DIR")
-            .context("active test hook requires HEL_TEST_HOOK_DIR")?,
+        std::env::var_os("MJ_TEST_HOOK_DIR")
+            .context("active test hook requires MJ_TEST_HOOK_DIR")?,
     );
     ensure!(
         directory.is_dir(),

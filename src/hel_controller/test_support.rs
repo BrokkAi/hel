@@ -158,7 +158,7 @@ pub(super) fn raw_session_on(target_template_id: &str, directory: &str) -> Sessi
 pub(super) fn managed_raw_session(target: ManagedWorktreeTarget) -> SessionRecord {
     let session_id = "0123456789abcdef0123456789abcdef";
     let repository = PathBuf::from("/home/dev/project");
-    let worktree_root = repository.join(".hel").join("worktrees").join(session_id);
+    let worktree_root = repository.join(".mj").join("worktrees").join(session_id);
     let mut session = raw_session_on(
         match target {
             ManagedWorktreeTarget::Local => "local-bare",
@@ -170,7 +170,7 @@ pub(super) fn managed_raw_session(target: ManagedWorktreeTarget) -> SessionRecor
         source_project_directory: repository.clone(),
         source_repository: repository,
         worktree_root,
-        branch: format!("hel/{session_id}"),
+        branch: format!("mj/{session_id}"),
         target,
     });
     session
@@ -229,8 +229,8 @@ pub(super) fn managed_worktree_session(repository: &Path, session_id: &str) -> S
     let worktree = ManagedWorktree {
         source_project_directory: repository.to_path_buf(),
         source_repository: repository.to_path_buf(),
-        worktree_root: repository.join(".hel/worktrees").join(session_id),
-        branch: format!("hel/{session_id}"),
+        worktree_root: repository.join(".mj/worktrees").join(session_id),
+        branch: format!("mj/{session_id}"),
         target: ManagedWorktreeTarget::Local,
     };
     create_managed_worktree(

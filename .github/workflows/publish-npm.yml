@@ -1,0 +1,172 @@
+name: Package and publish npm
+
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: [GitHub Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing Mjolnir release tag to package, in the form vX.Y.Z
+        required: true
+        type: string
+      publish:
+        description: Publish to npm after every package and smoke test passes
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  package:
+    name: Verify and package
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name || github.event.workflow_run.head_branch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install Linux WebKitGTK runtime for smoke test
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --assume-yes libwebkit2gtk-4.1-0
+
+      - name: Confirm the tag owns the Cargo release version
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          test "v$version" = "$RELEASE_TAG"
+
+      - name: Download GitHub release assets and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" --repo BrokkAi/mjolnir \
+            --dir release-assets \
+            --pattern 'brokk-mjolnir-*.tar.gz' \
+            --pattern 'brokk-mjolnir-*.tar.gz.sha256' \
+            --pattern 'brokk-mjolnir-*.zip' \
+            --pattern 'brokk-mjolnir-*.zip.sha256'
+
+      - name: Run npm packaging tests
+        working-directory: npm
+        run: npm test
+
+      - name: Verify release checksums and build npm tarballs
+        working-directory: npm
+        run: npm run package-release -- --release-tag "$RELEASE_TAG" --assets ../release-assets
+
+      - name: Inspect npm tarballs
+        run: |
+          for tarball in npm/dist/*.tgz; do
+            if tar -tzf "$tarball" | grep -E '(^|/)([.]npmrc|[.]git|id_rsa|credentials)($|/)'; then
+              echo "unexpected sensitive path in $tarball" >&2
+              exit 1
+            fi
+          done
+
+      - name: Smoke-test the Linux npm installation
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          mkdir npm-smoke
+          npm install --prefix npm-smoke --ignore-scripts \
+            "npm/dist/brokkai-mjolnir-$version.tgz" \
+            "npm/dist/brokkai-mjolnir-linux-x64-gnu-$version.tgz"
+          test -x npm-smoke/node_modules/@brokkai/mjolnir-linux-x64-gnu/bin/mj
+          test -x npm-smoke/node_modules/@brokkai/mjolnir-linux-x64-gnu/bin/mj-voice-worker
+          npm-smoke/node_modules/.bin/mj --version
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-tarballs-${{ env.RELEASE_TAG }}
+          path: npm/dist/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish npm packages
+    needs: package
+    if: github.event_name == 'release' || github.event_name == 'workflow_run' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name || github.event.workflow_run.head_branch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-tarballs-${{ env.RELEASE_TAG }}
+          path: npm-tarballs
+
+      - name: Publish missing platform packages before the root wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          wait_for_version() {
+            local package="$1"
+            local published_version
+            for attempt in {1..12}; do
+              if published_version="$(npm view "$package" version --registry=https://registry.npmjs.org 2>/dev/null)" &&
+                [[ "$published_version" == "$version" ]]; then
+                printf '%s\n' "$published_version"
+                return 0
+              fi
+              if [[ "$attempt" -lt 12 ]]; then
+                echo "waiting for $package to become available (attempt $attempt/12)" >&2
+                sleep 5
+              fi
+            done
+            echo "$package did not become available after 12 attempts" >&2
+            return 1
+          }
+          packages=(
+            @brokkai/mjolnir-darwin-universal
+            @brokkai/mjolnir-linux-x64-gnu
+            @brokkai/mjolnir-linux-arm64-gnu
+            @brokkai/mjolnir-android-arm64
+            @brokkai/mjolnir-win32-x64
+          )
+          tarballs=(
+            brokkai-mjolnir-darwin-universal-$version.tgz
+            brokkai-mjolnir-linux-x64-gnu-$version.tgz
+            brokkai-mjolnir-linux-arm64-gnu-$version.tgz
+            brokkai-mjolnir-android-arm64-$version.tgz
+            brokkai-mjolnir-win32-x64-$version.tgz
+          )
+          for index in "${!packages[@]}"; do
+            package="${packages[$index]}@$version"
+            if ! npm view "$package" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+              npm publish "./npm-tarballs/${tarballs[$index]}" --access public --provenance
+            fi
+            wait_for_version "$package"
+          done
+          root=@brokkai/mjolnir
+          if ! npm view "$root@$version" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            npm publish "./npm-tarballs/brokkai-mjolnir-$version.tgz" --access public --provenance
+          fi
+          wait_for_version "$root@$version"

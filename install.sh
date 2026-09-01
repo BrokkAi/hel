@@ -1,51 +1,49 @@
-#!/bin/sh
-# Install a published Hel release without requiring Rust or a source checkout.
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
-SCRIPT_VERSION="1.0.0"
-OWNER="${HEL_GITHUB_OWNER:-BrokkAi}"
-REPOSITORY="${HEL_GITHUB_REPOSITORY:-hel}"
-: "${HOME:?HOME must be set}"
-PREFIX="${HEL_PREFIX:-$HOME/.local}"
-VERSION="${HEL_VERSION:-}"
+SCRIPT_VERSION="1.0.3"
+
+OWNER="${MJOLNIR_GITHUB_OWNER:-BrokkAi}"
+INSTALL_DIR="${MJOLNIR_INSTALL_DIR:-${INSTALL_DIR:-$HOME/.local/bin}}"
+
 TMP_DIR=""
-TARGET=""
-BIN_DIR=""
+OS_FAMILY=""
+ARCH=""
+RUST_TARGET=""
 
 log() {
-  printf 'hel-installer: %s\n' "$*"
+  printf 'mjolnir-installer: %s\n' "$*"
+}
+
+warn() {
+  printf 'mjolnir-installer: warning: %s\n' "$*" >&2
 }
 
 die() {
-  printf 'hel-installer: error: %s\n' "$*" >&2
+  printf 'mjolnir-installer: error: %s\n' "$*" >&2
   exit 1
 }
 
 usage() {
-  cat <<'EOF'
-Install the latest Hel release.
+  cat <<EOF
+Install the latest Mjolnir binaries.
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/BrokkAi/hel/master/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/BrokkAi/hel/master/install.sh | sh -s -- --prefix /usr/local
-
-Options:
-  --prefix DIRECTORY  Install binaries in DIRECTORY/bin (default: ~/.local/bin).
-  --version TAG       Install a specific release tag instead of the latest release.
-  -h, --help          Show this help.
+  curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | bash
 
 Environment:
-  HEL_PREFIX              Same as --prefix.
-  HEL_VERSION             Same as --version, for example v0.1.0.
-  HEL_GITHUB_OWNER        GitHub owner to download from (default: BrokkAi).
-  HEL_GITHUB_REPOSITORY   GitHub repository to download from (default: hel).
-  GITHUB_TOKEN            Optional token for GitHub download rate limits.
+  INSTALL_DIR              Install directory. Defaults to ~/.local/bin.
+  MJOLNIR_INSTALL_DIR      Same as INSTALL_DIR, with higher precedence.
+  MJOLNIR_GITHUB_OWNER     GitHub owner to download from. Defaults to BrokkAi.
+  MJOLNIR_VERSION          Optional mjolnir tag to install, for example v0.3.4.
+  GITHUB_TOKEN             Optional token for GitHub API rate limits.
+  PROFILE                  Optional shell profile to update when INSTALL_DIR is not on PATH.
 EOF
 }
 
 cleanup() {
-  if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
-    rm -rf "$TMP_DIR"
+  if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
+    rm -rf "${TMP_DIR}"
   fi
 }
 
@@ -53,214 +51,518 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-download_file() {
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    curl -fsSL --retry 3 --retry-delay 1 \
-      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      -o "$2" "$1"
-  else
-    curl -fsSL --retry 3 --retry-delay 1 -o "$2" "$1"
+curl_args() {
+  printf '%s\0' -fsSL --retry 3 --retry-delay 1
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf '%s\0' -H "Authorization: Bearer ${GITHUB_TOKEN}"
   fi
+}
+
+download_file() {
+  local url="$1"
+  local dest="$2"
+  local -a args=()
+
+  while IFS= read -r -d '' arg; do
+    args+=("$arg")
+  done < <(curl_args)
+
+  curl "${args[@]}" -o "$dest" "$url"
 }
 
 detect_platform() {
-  os_name="$(uname -s)"
-  arch_name="$(uname -m)"
+  local uname_s
+  local uname_m
+  local uname_o=""
 
-  case "$os_name/$arch_name" in
-    Darwin/arm64 | Darwin/aarch64)
-      TARGET="aarch64-apple-darwin"
+  uname_s="$(uname -s)"
+  uname_m="$(uname -m)"
+  if uname -o >/dev/null 2>&1; then
+    uname_o="$(uname -o)"
+  fi
+
+  case "$uname_m" in
+    x86_64 | amd64)
+      ARCH="x86_64"
       ;;
-    Linux/x86_64 | Linux/amd64)
-      TARGET="x86_64-unknown-linux-musl"
-      ;;
-    Linux/arm64 | Linux/aarch64)
-      TARGET="aarch64-unknown-linux-musl"
-      ;;
-    Darwin/*)
-      die "unsupported macOS architecture: ${arch_name}; Apple silicon is currently supported"
-      ;;
-    Linux/*)
-      die "unsupported Linux architecture: ${arch_name}"
+    arm64 | aarch64)
+      ARCH="aarch64"
       ;;
     *)
-      die "unsupported platform: ${os_name}/${arch_name}"
+      die "unsupported CPU architecture: ${uname_m}"
+      ;;
+  esac
+
+  case "$uname_s" in
+    Darwin)
+      OS_FAMILY="macos"
+      RUST_TARGET="${ARCH}-apple-darwin"
+      ;;
+    Linux)
+      if [[ "$uname_o" == "Android" || "${PREFIX:-}" == *com.termux* ]]; then
+        OS_FAMILY="android"
+        RUST_TARGET="${ARCH}-linux-android"
+      else
+        OS_FAMILY="linux"
+        RUST_TARGET="${ARCH}-unknown-linux-gnu"
+      fi
+      ;;
+    *)
+      die "unsupported OS: ${uname_s}"
       ;;
   esac
 }
 
-validate_release_tag() {
-  if [ -z "$VERSION" ]; then
-    return
-  fi
+release_endpoint() {
+  local repo="$1"
+  local version="$2"
 
-  case "$VERSION" in
-    *[!A-Za-z0-9._-]*) die "invalid release tag: ${VERSION}" ;;
-  esac
-}
-
-release_download_base() {
-  if [ -n "$VERSION" ]; then
-    printf 'https://github.com/%s/%s/releases/download/%s\n' \
-      "$OWNER" "$REPOSITORY" "$VERSION"
+  if [[ -n "$version" ]]; then
+    printf 'https://api.github.com/repos/%s/%s/releases/tags/%s\n' "$OWNER" "$repo" "$version"
   else
-    printf 'https://github.com/%s/%s/releases/latest/download\n' \
-      "$OWNER" "$REPOSITORY"
+    printf 'https://api.github.com/repos/%s/%s/releases/latest\n' "$OWNER" "$repo"
   fi
 }
 
-sha256_file() {
+fetch_release() {
+  local repo="$1"
+  local version="$2"
+  local dest="$3"
+  local endpoint
+
+  endpoint="$(release_endpoint "$repo" "$version")"
+  download_file "$endpoint" "$dest"
+}
+
+release_tag() {
+  local release_file="$1"
+
+  { grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' "$release_file" || true; } |
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -n 1
+}
+
+release_asset_urls() {
+  local release_file="$1"
+
+  { grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$release_file" || true; } |
+    sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+available_assets() {
+  local release_file="$1"
+
+  release_asset_urls "$release_file" |
+    sed 's#.*/##' |
+    sed '/[.]sha256$/d' |
+    tr '\n' ' '
+}
+
+select_asset() {
+  local release_file="$1"
+  local label="$2"
+  local tag="$3"
+  shift 3
+  local url
+  local name
+  local pattern
+
+  while IFS= read -r url; do
+    name="${url##*/}"
+    for pattern in "$@"; do
+      if [[ "$name" =~ $pattern ]]; then
+        printf '%s\n' "$url"
+        return 0
+      fi
+    done
+  done < <(release_asset_urls "$release_file")
+
+  die "no ${label} asset found for ${OS_FAMILY}/${ARCH} in ${OWNER} release ${tag}. Available assets: $(available_assets "$release_file")"
+}
+
+checksum_url_for() {
+  local release_file="$1"
+  local asset_name="$2"
+  local checksum_name="${asset_name}.sha256"
+  local url
+
+  while IFS= read -r url; do
+    if [[ "${url##*/}" == "$checksum_name" ]]; then
+      printf '%s\n' "$url"
+      return 0
+    fi
+  done < <(release_asset_urls "$release_file")
+}
+
+fetch_checksum() {
+  local release_file="$1"
+  local asset_name="$2"
+  local checksum_url
+  local checksum_file
+
+  checksum_url="$(checksum_url_for "$release_file" "$asset_name" || true)"
+  if [[ -z "$checksum_url" ]]; then
+    return 1
+  fi
+
+  checksum_file="${TMP_DIR}/${asset_name}.sha256"
+  download_file "$checksum_url" "$checksum_file"
+  awk '{print $1}' "$checksum_file" | head -n 1
+}
+
+stored_checksum_path() {
+  printf '%s/.cache/mjolnir-installer/checksums/%s.sha256\n' "$HOME" "$1"
+}
+
+hash_file() {
+  local file="$1"
+
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
+    sha256sum "$file" | awk '{print $1}'
   else
-    shasum -a 256 "$1" | awk '{print $1}'
+    shasum -a 256 "$file" | awk '{print $1}'
   fi
 }
 
-checksum_for_asset() {
-  awk -v asset="$2" '
-    NF >= 2 && ($2 == asset || $2 == "*" asset) &&
-    length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ {
-      print tolower($1)
-      exit
-    }
-  ' "$1"
+verify_checksum() {
+  local expected="$1"
+  local actual="$2"
+  local label="$3"
+
+  if [[ "$expected" != "$actual" ]]; then
+    die "checksum mismatch for ${label}: expected ${expected}, got ${actual}"
+  fi
 }
 
-install_binary() {
-  source_path="$1"
-  binary_name="$2"
-  install -m 0755 "$source_path" "$BIN_DIR/$binary_name" ||
-    die "could not install ${binary_name} to ${BIN_DIR}"
+verify_checksum_if_present() {
+  local release_file="$1"
+  local asset_name="$2"
+  local asset_file="$3"
+  local expected
+  local actual
+
+  expected="$(fetch_checksum "$release_file" "$asset_name" || true)"
+  if [[ -z "$expected" ]]; then
+    warn "no checksum published for ${asset_name}; skipping checksum verification"
+    return 0
+  fi
+
+  actual="$(hash_file "$asset_file")"
+  verify_checksum "$expected" "$actual" "$asset_name"
 }
 
-path_includes_bin_dir() {
-  case ":${PATH:-}:" in
-    *":${BIN_DIR}:"*) return 0 ;;
+strip_quarantine() {
+  local path="$1"
+
+  if [[ "$OS_FAMILY" == "macos" ]] && command -v xattr >/dev/null 2>&1; then
+    xattr -dr com.apple.quarantine "$path" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_install_dir() {
+  if [[ -d "$INSTALL_DIR" ]]; then
+    return 0
+  fi
+
+  if mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+    return 0
+  fi
+
+  command -v sudo >/dev/null 2>&1 || die "cannot create ${INSTALL_DIR}; set INSTALL_DIR to a writable directory"
+  sudo mkdir -p "$INSTALL_DIR"
+}
+
+install_dir_on_path() {
+  case ":${PATH}:" in
+    *":${INSTALL_DIR}:"*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-print_next_steps() {
-  hel_command="hel"
-  if ! path_includes_bin_dir; then
-    hel_command="$BIN_DIR/hel"
-    log "${BIN_DIR} is not on PATH; add it to your shell profile to use hel directly"
-  fi
-
-  printf '\nNext steps:\n'
-  printf '  %s doctor\n' "$hel_command"
-  printf '  %s setup\n' "$hel_command"
+can_prompt_on_tty() {
+  [[ -r /dev/tty && -w /dev/tty ]] && { : >/dev/tty; } 2>/dev/null
 }
 
-parse_arguments() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --prefix)
-        [ "$#" -ge 2 ] || die "--prefix requires a directory"
-        PREFIX="$2"
-        shift 2
-        ;;
-      --prefix=*)
-        PREFIX="${1#--prefix=}"
-        shift
-        ;;
-      --version)
-        [ "$#" -ge 2 ] || die "--version requires a tag"
-        VERSION="$2"
-        shift 2
-        ;;
-      --version=*)
-        VERSION="${1#--version=}"
-        shift
-        ;;
-      -h | --help)
-        usage
-        exit 0
-        ;;
-      *)
-        die "unknown argument: $1"
-        ;;
-    esac
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
+path_export_line() {
+  printf 'export PATH=%s:"$PATH"\n' "$(shell_quote "$INSTALL_DIR")"
+}
+
+default_shell_profile() {
+  local shell_name
+
+  if [[ -n "${PROFILE:-}" ]]; then
+    printf '%s\n' "$PROFILE"
+    return 0
+  fi
+
+  shell_name="${SHELL:-}"
+  shell_name="${shell_name##*/}"
+  if [[ -z "$shell_name" ]]; then
+    return 1
+  fi
+
+  case "$shell_name" in
+    zsh)
+      printf '%s/.zshrc\n' "$HOME"
+      ;;
+    bash)
+      if [[ "$OS_FAMILY" == "macos" ]]; then
+        printf '%s/.bash_profile\n' "$HOME"
+      else
+        printf '%s/.bashrc\n' "$HOME"
+      fi
+      ;;
+    ksh)
+      printf '%s/.kshrc\n' "$HOME"
+      ;;
+    sh)
+      printf '%s/.profile\n' "$HOME"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+append_install_dir_to_profile() {
+  local profile="$1"
+  local line="$2"
+  local profile_dir
+
+  profile_dir="$(dirname "$profile")"
+  if ! mkdir -p "$profile_dir" 2>/dev/null; then
+    warn "could not create ${profile_dir}; add this manually: ${line}"
+    return 1
+  fi
+
+  {
+    printf '\n# Added by mjolnir installer\n'
+    printf '%s\n' "$line"
+  } >>"$profile" || {
+    warn "could not update ${profile}; add this manually: ${line}"
+    return 1
+  }
+
+  log "added ${INSTALL_DIR} to PATH in ${profile}"
+  log "restart your shell or run: ${line}"
+}
+
+ensure_install_dir_on_path() {
+  local profile
+  local line
+  local answer
+
+  if install_dir_on_path; then
+    return 0
+  fi
+
+  line="$(path_export_line)"
+  profile="$(default_shell_profile || true)"
+
+  if [[ -z "$profile" ]]; then
+    warn "${INSTALL_DIR} is not on PATH"
+    log "add this to your shell profile: ${line}"
+    return 0
+  fi
+
+  if [[ -f "$profile" ]] && grep -Fq "$INSTALL_DIR" "$profile"; then
+    warn "${INSTALL_DIR} is not on the current PATH, but it already appears in ${profile}"
+    log "restart your shell or run: ${line}"
+    return 0
+  fi
+
+  if ! can_prompt_on_tty; then
+    warn "${INSTALL_DIR} is not on PATH"
+    log "add this to ${profile}: ${line}"
+    return 0
+  fi
+
+  printf 'mjolnir-installer: %s is not on PATH. Add it to %s? [Y/n] ' "$INSTALL_DIR" "$profile" >/dev/tty
+  read -r answer </dev/tty || answer=""
+
+  case "$answer" in
+    "" | y | Y | yes | YES)
+      append_install_dir_to_profile "$profile" "$line" || true
+      ;;
+    *)
+      warn "${INSTALL_DIR} is not on PATH"
+      log "add this to ${profile}: ${line}"
+      ;;
+  esac
+}
+
+install_binary() {
+  local src="$1"
+  local name="$2"
+  local dest="${INSTALL_DIR}/${name}"
+
+  chmod 0755 "$src"
+  strip_quarantine "$src"
+
+  if [[ -w "$INSTALL_DIR" ]]; then
+    install -m 0755 "$src" "$dest"
+    strip_quarantine "$dest"
+  else
+    command -v sudo >/dev/null 2>&1 || die "cannot write ${INSTALL_DIR}; set INSTALL_DIR to a writable directory"
+    sudo install -m 0755 "$src" "$dest"
+    if [[ "$OS_FAMILY" == "macos" ]] && command -v xattr >/dev/null 2>&1; then
+      sudo xattr -dr com.apple.quarantine "$dest" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  log "installed ${name} to ${dest}"
+}
+
+find_extracted_binary() {
+  local dir="$1"
+  local name="$2"
+  local found
+
+  found="$(find "$dir" -type f -name "$name" -print -quit)"
+  if [[ -z "$found" ]]; then
+    die "archive did not contain expected binary: ${name}"
+  fi
+  printf '%s\n' "$found"
+}
+
+install_from_asset() {
+  local label="$1"
+  local repo="$2"
+  local bin_name="$3"
+  local version="$4"
+  local companion_name="$5"
+  shift 5
+  local release_file="${TMP_DIR}/${repo}-release.json"
+  local tag
+  local asset_url
+  local asset_name
+  local asset_file
+  local extract_dir
+  local src
+  local dest="${INSTALL_DIR}/${bin_name}"
+  local expected
+  local actual
+
+  fetch_release "$repo" "$version" "$release_file"
+  tag="$(release_tag "$release_file")"
+  [[ -n "$tag" ]] || die "could not read latest ${label} release metadata"
+
+  asset_url="$(select_asset "$release_file" "$label" "$tag" "$@")"
+  asset_name="${asset_url##*/}"
+
+  # Skip download when the stored archive checksum matches the remote one
+  expected="$(fetch_checksum "$release_file" "$asset_name" || true)"
+  local companions_present=1
+  local companion
+  for companion in $companion_name; do
+    [[ -f "${INSTALL_DIR}/${companion}" ]] || companions_present=0
   done
+  if [[ -n "$expected" && -f "$dest" && "$companions_present" == 1 ]]; then
+    local stored_checksum_file
+    stored_checksum_file="$(stored_checksum_path "$bin_name")"
+    if [[ -f "$stored_checksum_file" ]]; then
+      local stored
+      stored="$(cat "$stored_checksum_file")"
+      if [[ "$expected" == "$stored" ]]; then
+        log "${bin_name} ${tag} is already installed; skipping download"
+        return 0
+      fi
+    fi
+  fi
+
+  asset_file="${TMP_DIR}/${asset_name}"
+
+  log "downloading ${label} ${tag} (${asset_name})"
+  download_file "$asset_url" "$asset_file"
+  verify_checksum_if_present "$release_file" "$asset_name" "$asset_file"
+
+  # Remember the archive checksum so we can skip next time
+  if [[ -n "$expected" ]]; then
+    mkdir -p "$(dirname "$(stored_checksum_path "$bin_name")")"
+    printf '%s\n' "$expected" > "$(stored_checksum_path "$bin_name")"
+  fi
+
+  extract_dir="${TMP_DIR}/${repo}-extract"
+
+  case "$asset_name" in
+    *.tar.gz | *.tgz)
+      mkdir -p "$extract_dir"
+      tar -xzf "$asset_file" -C "$extract_dir"
+      strip_quarantine "$extract_dir"
+      src="$(find_extracted_binary "$extract_dir" "$bin_name")"
+      install_binary "$src" "$bin_name"
+      for companion in $companion_name; do
+        src="$(find_extracted_binary "$extract_dir" "$companion")"
+        install_binary "$src" "$companion"
+      done
+      ;;
+    *.zip)
+      require_command unzip
+      mkdir -p "$extract_dir"
+      unzip -q "$asset_file" -d "$extract_dir"
+      strip_quarantine "$extract_dir"
+      src="$(find_extracted_binary "$extract_dir" "$bin_name")"
+      install_binary "$src" "$bin_name"
+      for companion in $companion_name; do
+        src="$(find_extracted_binary "$extract_dir" "$companion")"
+        install_binary "$src" "$companion"
+      done
+      ;;
+    *)
+      install_binary "$asset_file" "$bin_name"
+      ;;
+  esac
+}
+
+install_mjolnir() {
+  local -a patterns=()
+
+  if [[ "$OS_FAMILY" == "macos" ]]; then
+    patterns+=("^brokk-mjolnir-.*-universal-apple-darwin[.]tar[.]gz$")
+  fi
+  patterns+=("^brokk-mjolnir-.*-${RUST_TARGET}[.]tar[.]gz$")
+
+  # Session workers are the static Linux binaries the controller uploads into
+  # disposable targets; they install beside mj so the worker lookup finds them.
+  local companion="mj-voice-worker mj-worker-x86_64-unknown-linux-musl mj-worker-aarch64-unknown-linux-musl"
+  if [[ "$OS_FAMILY" == "android" ]]; then
+    companion=""
+  fi
+  install_from_asset "mjolnir" "mjolnir" "mj" "${MJOLNIR_VERSION:-}" "$companion" "${patterns[@]}"
 }
 
 main() {
-  parse_arguments "$@"
-  [ -n "$PREFIX" ] || die "installation prefix must not be empty"
-  validate_release_tag
-
-  require_command awk
-  require_command curl
-  require_command install
-  require_command mktemp
-  require_command tar
-  require_command tr
-  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
-    die "required command not found: sha256sum or shasum"
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
   fi
+
+  require_command curl
+  require_command awk
+  require_command grep
+  require_command sed
+  require_command tar
+  require_command install
+  require_command find
 
   detect_platform
-  BIN_DIR="$PREFIX/bin"
-  if ! mkdir -p "$BIN_DIR"; then
-    die "could not create ${BIN_DIR}; choose a writable --prefix"
-  fi
+  ensure_install_dir
 
-  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hel-installer.XXXXXX")" ||
-    die "could not create a temporary directory"
-  trap cleanup 0 HUP INT TERM
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mjolnir-installer.XXXXXX")"
+  trap cleanup EXIT
 
-  asset_name="hel-${TARGET}.tar.gz"
-  archive_path="$TMP_DIR/$asset_name"
-  checksum_path="$TMP_DIR/$asset_name.sha256"
-  download_base="$(release_download_base)"
+  log "installing for ${OS_FAMILY}/${ARCH} into ${INSTALL_DIR} (script ${SCRIPT_VERSION})"
+  install_mjolnir
 
-  log "downloading ${VERSION:-latest} Hel release for ${TARGET}"
-  download_file "$download_base/$asset_name" "$archive_path"
-  download_file "$download_base/$asset_name.sha256" "$checksum_path"
+  ensure_install_dir_on_path
 
-  expected_checksum="$(checksum_for_asset "$checksum_path" "$asset_name")"
-  [ -n "$expected_checksum" ] ||
-    die "published checksum did not contain a valid entry for ${asset_name}"
-  actual_checksum="$(sha256_file "$archive_path" | tr 'A-F' 'a-f')"
-  [ "$expected_checksum" = "$actual_checksum" ] ||
-    die "checksum mismatch for ${asset_name}"
-  log "verified ${asset_name}"
-
-  extract_dir="$TMP_DIR/extract"
-  mkdir "$extract_dir"
-  tar -xzf "$archive_path" -C "$extract_dir"
-  archive_root="$extract_dir/hel-$TARGET"
-  [ -f "$archive_root/hel" ] || die "archive did not contain hel"
-  case "$TARGET" in
-    x86_64-unknown-linux-musl)
-      [ -f "$archive_root/hel-worker-aarch64-unknown-linux-musl" ] ||
-        die "archive did not contain the aarch64 Linux worker"
-      ;;
-    aarch64-unknown-linux-musl)
-      [ -f "$archive_root/hel-worker-x86_64-unknown-linux-musl" ] ||
-        die "archive did not contain the x86_64 Linux worker"
-      ;;
-    aarch64-apple-darwin)
-      [ -f "$archive_root/hel-worker-x86_64-unknown-linux-musl" ] ||
-        die "archive did not contain the x86_64 Linux worker"
-      [ -f "$archive_root/hel-worker-aarch64-unknown-linux-musl" ] ||
-        die "archive did not contain the aarch64 Linux worker"
-      ;;
-  esac
-
-  install_binary "$archive_root/hel" hel
-  for worker in \
-    hel-worker-x86_64-unknown-linux-musl \
-    hel-worker-aarch64-unknown-linux-musl
-  do
-    if [ -f "$archive_root/$worker" ]; then
-      install_binary "$archive_root/$worker" "$worker"
-    fi
-  done
-
-  log "installed Hel to ${BIN_DIR} (installer ${SCRIPT_VERSION})"
-  print_next_steps
+  log "done"
 }
 
 main "$@"

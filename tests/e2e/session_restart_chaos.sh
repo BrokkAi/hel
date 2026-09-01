@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${HEL_CHAOS_ISOLATED:-} != 1 ]]; then
+if [[ ${MJ_CHAOS_ISOLATED:-} != 1 ]]; then
     echo "refusing to signal processes outside an explicitly isolated chaos container" >&2
-    echo "set HEL_CHAOS_ISOLATED=1 only inside a disposable Podman container" >&2
+    echo "set MJ_CHAOS_ISOLATED=1 only inside a disposable Podman container" >&2
     exit 2
 fi
 if [[ $# -ne 1 ]]; then
@@ -18,7 +18,7 @@ command -v python3 >/dev/null
 command -v timeout >/dev/null
 
 chaos_root=$(mktemp -d)
-artifact_dir=${HEL_CHAOS_ARTIFACT_DIR:-}
+artifact_dir=${MJ_CHAOS_ARTIFACT_DIR:-}
 worker_root=$chaos_root/worker
 workspace=$chaos_root/workspace
 profile=$chaos_root/profile
@@ -57,9 +57,9 @@ import subprocess
 import sys
 import traceback
 
-state = os.environ["HEL_CHAOS_STATE"]
-hel = os.environ["HEL_CHAOS_BINARY"]
-memory_root = os.environ["HEL_CHAOS_MEMORY"]
+state = os.environ["MJ_CHAOS_STATE"]
+hel = os.environ["MJ_CHAOS_BINARY"]
+memory_root = os.environ["MJ_CHAOS_MEMORY"]
 bridge_log = os.path.join(state, "bridge.log")
 
 def log(message):
@@ -130,9 +130,9 @@ with open(config, "w", encoding="utf-8") as output:
         "bridge_args": [bridge],
         "environment": {
             "KIMI_HOME": profile,
-            "HEL_CHAOS_STATE": state,
-            "HEL_CHAOS_BINARY": hel,
-            "HEL_CHAOS_MEMORY": memory,
+            "MJ_CHAOS_STATE": state,
+            "MJ_CHAOS_BINARY": hel,
+            "MJ_CHAOS_MEMORY": memory,
         },
         "cwd": workspace,
         "additional_directories": [],

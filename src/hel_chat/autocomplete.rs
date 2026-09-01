@@ -222,7 +222,7 @@ impl ChatState {
                     .map(|hint| format!(" <{hint}>"))
                     .unwrap_or_default();
                 let source = match command.source {
-                    CommandSource::Hel => "hel",
+                    CommandSource::Hel => "mj",
                     CommandSource::Agent => "agent",
                 };
                 format!(
@@ -236,7 +236,7 @@ impl ChatState {
         self.entries.push(ChatEntry::plain(
             self.latest_seq,
             ChatRole::System,
-            format!("Available commands:\n!<command> — run a Bash command in this session [hel]\n{commands}"),
+            format!("Available commands:\n!<command> — run a Bash command in this session [mj]\n{commands}"),
         ));
     }
 }
@@ -275,8 +275,8 @@ fn matching_indices<T>(
 
 pub(super) fn builtin_command_choices() -> Vec<CommandChoice> {
     [
-        ("help", "show available Hel and agent commands", None),
-        ("detach", "leave Hel without stopping the worker", None),
+        ("help", "show available Mjolnir and agent commands", None),
+        ("detach", "leave Mjolnir without stopping the worker", None),
         (
             "model",
             "change the active model, queued while the agent is busy",
@@ -396,7 +396,7 @@ fn autocomplete_row(chat: &ChatState, kind: AutocompleteKind, index: usize) -> O
                 .map(|hint| format!(" <{hint}>"))
                 .unwrap_or_default();
             let source = match command.source {
-                CommandSource::Hel => "hel",
+                CommandSource::Hel => "mj",
                 CommandSource::Agent => "agent",
             };
             Some(format!(

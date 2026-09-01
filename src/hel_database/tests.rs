@@ -439,12 +439,12 @@ fn normalized_state_round_trip_preserves_children_and_order() {
     let database = directory.path().join("hel.sqlite3");
     let mut state = HelState::default();
     let mut record = session("session-1", "project-1");
-    record.project_directory = Some(PathBuf::from("/srv/project-1/.hel/worktrees/session-1"));
+    record.project_directory = Some(PathBuf::from("/srv/project-1/.mj/worktrees/session-1"));
     record.managed_worktree = Some(ManagedWorktree {
         source_project_directory: PathBuf::from("/srv/project-1"),
         source_repository: PathBuf::from("/srv/project-1"),
-        worktree_root: PathBuf::from("/srv/project-1/.hel/worktrees/session-1"),
-        branch: "hel/session-1".into(),
+        worktree_root: PathBuf::from("/srv/project-1/.mj/worktrees/session-1"),
+        branch: "mj/session-1".into(),
         target: ManagedWorktreeTarget::Ssh {
             destination: "builder".into(),
             ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
@@ -592,7 +592,7 @@ fn loading_state_does_not_restore_a_hidden_context_session_name() {
     let database = directory.path().join("hel.sqlite3");
     let mut state = HelState::default();
     let mut record = session("session-1", "project-1");
-    record.acp_session_title = Some("<hel-project-memory>private and truncated".into());
+    record.acp_session_title = Some("<mj-project-memory>private and truncated".into());
     state.sessions.insert(record.id.clone(), record);
     save_state_to(&database, &state).unwrap();
 

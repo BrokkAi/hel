@@ -1085,7 +1085,7 @@ fn write_zip(
             .raw_copy_file(compressed_entry)
             .with_context(|| format!("write ZIP entry '{}'", entry.name))?;
     }
-    writer.finish().context("finish Hel archive ZIP")?;
+    writer.finish().context("finish Mjolnir archive ZIP")?;
     Ok(())
 }
 
@@ -1148,7 +1148,7 @@ enum EntryExpectation<'a> {
 /// a time through a single handle, and the deflate decoder already buffers.
 fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    zip::ZipArchive::new(file).context("open Hel archive ZIP")
+    zip::ZipArchive::new(file).context("open Mjolnir archive ZIP")
 }
 
 /// Payload bodies the caller keeps.
@@ -1491,12 +1491,12 @@ fn parse_archive_manifest(manifest_bytes: &[u8]) -> Result<ArchiveManifest> {
     ensure!(
         header.schema_version == ARCHIVE_SCHEMA_VERSION
             || header.schema_version == ARCHIVE_SCHEMA_VERSION_SHARDED,
-        "incompatible Hel archive schema {}; this build requires schema {}",
+        "incompatible Mjolnir archive schema {}; this build requires schema {}",
         header.schema_version,
         ARCHIVE_SCHEMA_VERSION
     );
     let manifest: ArchiveManifest =
-        serde_json::from_slice(manifest_bytes).context("parse Hel archive manifest")?;
+        serde_json::from_slice(manifest_bytes).context("parse Mjolnir archive manifest")?;
     validate_manifest(&manifest)?;
     Ok(manifest)
 }
@@ -1516,7 +1516,7 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
     let expected_schema = expected_schema_version(&manifest.payloads);
     ensure!(
         manifest.schema_version == expected_schema,
-        "incompatible Hel archive schema {}; this build requires schema {}",
+        "incompatible Mjolnir archive schema {}; this build requires schema {}",
         manifest.schema_version,
         expected_schema
     );
@@ -1938,7 +1938,7 @@ fn digest_reader(reader: &mut impl Read) -> Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = reader.read(&mut buffer).context("hash Hel archive")?;
+        let read = reader.read(&mut buffer).context("hash Mjolnir archive")?;
         if read == 0 {
             break;
         }

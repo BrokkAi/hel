@@ -62,12 +62,12 @@ impl std::fmt::Display for StoreSchemaMismatch {
         if found > supported {
             write!(
                 formatter,
-                "Hel database schema {found} is newer than this Hel build supports ({supported}); upgrade Hel"
+                "Mjolnir database schema {found} is newer than this Mjolnir build supports ({supported}); upgrade Mjolnir"
             )
         } else {
             write!(
                 formatter,
-                "Hel database schema {found} is not the supported schema {supported}; start the Hel daemon to migrate it"
+                "Mjolnir database schema {found} is not the supported schema {supported}; start the Mjolnir daemon to migrate it"
             )
         }
     }
@@ -268,7 +268,7 @@ fn clear_database_writer(id: u64) {
 /// Production installs this once, in the daemon, after `ControllerStoreGuard`
 /// establishes exclusivity, and the daemon is then the only process that
 /// writes. A test may do the same only because it re-execs itself with its own
-/// `HEL_DATA_DIR` and is therefore alone in its process — which is exactly why
+/// `MJ_DATA_DIR` and is therefore alone in its process — which is exactly why
 /// the tests that need this are shaped that way.
 ///
 /// The returned owner has to be held for the rest of the test: dropping it
@@ -4307,7 +4307,7 @@ fn migrate_legacy_state_from(legacy: &Path, database: &Path) -> Result<()> {
     save_state_to(database, &state)?;
     let migrated = legacy.with_file_name("state.json.migrated-v1");
     fs::rename(legacy, &migrated)
-        .with_context(|| format!("retain migrated Hel state as {}", migrated.display()))?;
+        .with_context(|| format!("retain migrated Mjolnir state as {}", migrated.display()))?;
     Ok(())
 }
 

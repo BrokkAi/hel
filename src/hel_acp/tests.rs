@@ -82,7 +82,7 @@ fn project_memory_mcp_honors_harness_delivery_and_claude_native_memory() {
     let [McpServer::Stdio(server)] = servers.as_slice() else {
         panic!("non-Claude sessions receive exactly one memory MCP server");
     };
-    assert_eq!(server.name, "hel-project-memory");
+    assert_eq!(server.name, "mj-project-memory");
     assert_eq!(server.command, Path::new("/worker/hel"));
     assert_eq!(
         server.args,
@@ -2355,8 +2355,8 @@ mod terminals {
                 "command": "/bin/sh",
                 // `PATH` proves the daemon environment is inherited rather
                 // than replaced by the agent's additions.
-                "args": ["-c", "printf 'ran %s %s' \"$HEL_TERMINAL_TEST\" \"${PATH:+inherited}\""],
-                "env": [{"name": "HEL_TERMINAL_TEST", "value": "overlaid"}],
+                "args": ["-c", "printf 'ran %s %s' \"$MJ_TERMINAL_TEST\" \"${PATH:+inherited}\""],
+                "env": [{"name": "MJ_TERMINAL_TEST", "value": "overlaid"}],
             }),
         )
         .await;

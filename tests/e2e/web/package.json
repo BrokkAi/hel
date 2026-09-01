@@ -3,7 +3,8 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
-    "test": "playwright test"
+    "test": "node --test viewer.unit.test.mjs && playwright test",
+    "test:unit": "node --test viewer.unit.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1"

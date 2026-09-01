@@ -7,7 +7,7 @@
 //! read back on every resume. Measured on one real session, tool-call content
 //! reached 561 MB and the largest single transcript item was 2,087,180 bytes.
 //!
-//! Nothing in hel ever reconstructs a file from those two copies. The only
+//! Nothing in Mjolnir ever reconstructs a file from those two copies. The only
 //! reader is the diffstat — `path  +12 −3`. A unified patch answers that and
 //! is proportional to the edit rather than to the file, so that is what gets
 //! written. It also leaves the change renderable, which two discarded file
@@ -26,7 +26,7 @@ use similar::TextDiff;
 
 /// The `_meta` key holding a diff's patch. Namespaced because `_meta` is
 /// shared with whatever the agent puts there.
-pub const DIFF_PATCH_META_KEY: &str = "dev.hel.diffPatch";
+pub const DIFF_PATCH_META_KEY: &str = "dev.mj.diffPatch";
 
 /// How much patch text one edit may record.
 ///
@@ -198,7 +198,7 @@ fn build_patch(path: &str, old_text: Option<&str>, new_text: &str) -> DiffPatch 
         text.push_str(&rendered);
     }
     if truncated {
-        text.push_str("[hel dropped the remaining hunks]\n");
+        text.push_str("[mj dropped the remaining hunks]\n");
     }
     DiffPatch {
         text,

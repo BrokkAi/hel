@@ -480,6 +480,9 @@ impl ActiveChat {
             {
                 state.set_harness_kind(harness_kind);
             }
+            if let Some(context) = context.as_ref() {
+                state.set_review_config(context.config.review.clone());
+            }
             state.set_session_modes(
                 snapshot
                     .as_ref()
@@ -668,6 +671,7 @@ impl ActiveChat {
         if let Some(session) = session.filter(|session| session.id == context.session.id) {
             context.session = session.clone();
         }
+        self.state.set_review_config(config.review.clone());
     }
 
     /// The composer's current text. The surface saves this on detach so
@@ -855,12 +859,12 @@ impl ActiveChat {
     fn send_daemon_request(&mut self, request: ChatDaemonRequest) {
         let Some(persistence) = &self.persistence else {
             self.state
-                .set_notice("This chat cannot reach the Hel daemon");
+                .set_notice("This chat cannot reach the Mjolnir daemon");
             return;
         };
         if let Err(error) = persistence.send(request) {
             tracing::warn!(%error, "a review request could not be queued for the daemon");
-            self.state.set_notice("The Hel daemon is not reachable");
+            self.state.set_notice("The Mjolnir daemon is not reachable");
         }
     }
 
@@ -1230,7 +1234,7 @@ impl ActiveChat {
                     self.state.set_notice("Stopping voice dictation…");
                 } else if !crate::speech::voice_input_supported() {
                     self.state.set_notice(
-                        "Voice helper unavailable; install hel-voice-worker beside hel or set HEL_VOICE_WORKER",
+                        "Voice helper unavailable; install mj-voice-worker beside mj or set MJ_VOICE_WORKER",
                     );
                 } else {
                     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
@@ -2860,6 +2864,48 @@ mod tests {
                 ("codex-1".to_owned(), "codex".to_owned()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn review_status_configuration_is_applied_on_open_and_refresh() {
+        use crate::hel_review::lanes::ReviewTier;
+
+        let fixture =
+            crate::hel_session_manager::replacement_session_test_fixture("session-review", 88);
+        let mut context = chat_context("session-review", &[]);
+        context.config.review = crate::hel_config::ReviewConfig {
+            enabled: true,
+            tier: ReviewTier::Extended,
+            profile: Some("reviewer-a".into()),
+            model: None,
+            effort: None,
+        };
+        let mut chat = ActiveChat::open(
+            fixture.stopped,
+            "bundle-1",
+            Some(context),
+            fixture.control,
+            SessionHeaderIdentity::default(),
+            String::new(),
+            Notices::default(),
+        );
+
+        assert_eq!(
+            chat.state.review_config(),
+            &crate::hel_config::ReviewConfig {
+                enabled: true,
+                tier: ReviewTier::Extended,
+                profile: Some("reviewer-a".into()),
+                model: None,
+                effort: None,
+            }
+        );
+
+        let mut reloaded = HelConfig::default();
+        reloaded.review.profile = Some("reviewer-b".into());
+        chat.refresh_context(&reloaded, None);
+
+        assert_eq!(chat.state.review_config(), &reloaded.review);
     }
 
     /// A failed recovery copy is the one thing the user has to see on opening

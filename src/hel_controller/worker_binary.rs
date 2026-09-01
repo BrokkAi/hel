@@ -541,14 +541,14 @@ fn configure_kimi_project_memory_mcp(
             "args": [
                 "-c",
                 "exec \"$HOME/$1\" worker memory-mcp --root \"$HOME/$2\"",
-                "hel-project-memory",
+                "mj-project-memory",
                 worker,
                 memory_root
             ],
             "runtime_id": "local"
         })
     };
-    servers.insert("hel-project-memory".into(), server);
+    servers.insert("mj-project-memory".into(), server);
     let mut body = serde_json::to_vec_pretty(&document)?;
     body.push(b'\n');
     atomic_write(&path, &body)
@@ -585,7 +585,7 @@ pub enum WorkerBinaryAvailability {
 }
 
 fn packaged_worker_binary_path(directory: &Path, triple: &str) -> PathBuf {
-    directory.join(format!("hel-worker-{triple}"))
+    directory.join(format!("mj-worker-{triple}"))
 }
 
 /// Find a worker source without downloading it.
@@ -596,23 +596,23 @@ fn packaged_worker_binary_path(directory: &Path, triple: &str) -> PathBuf {
 /// container or making a network request.
 pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAvailability> {
     let triple = format!("{arch}-unknown-linux-musl");
-    if let Some(path) = std::env::var_os("HEL_WORKER_BINARY").map(PathBuf::from) {
+    if let Some(path) = crate::hel_config::env_override_os("WORKER_BINARY").map(PathBuf::from) {
         if !path.is_file() {
-            bail!("HEL_WORKER_BINARY is not a file: {}", path.display());
+            bail!("MJ_WORKER_BINARY is not a file: {}", path.display());
         }
         return Ok(WorkerBinaryAvailability::Local {
             path,
-            source: "HEL_WORKER_BINARY".into(),
+            source: "MJ_WORKER_BINARY".into(),
         });
     }
-    let current = std::env::current_exe().context("resolve Hel controller binary")?;
+    let current = std::env::current_exe().context("resolve Mjolnir controller binary")?;
     let mut candidates = Vec::new();
-    if let Some(directory) = std::env::var_os("HEL_WORKER_DIR").map(PathBuf::from) {
+    if let Some(directory) = crate::hel_config::env_override_os("WORKER_DIR").map(PathBuf::from) {
         candidates.push((
             packaged_worker_binary_path(&directory, &triple),
-            "HEL_WORKER_DIR",
+            "MJ_WORKER_DIR",
         ));
-        candidates.push((directory.join(&triple).join("hel"), "HEL_WORKER_DIR"));
+        candidates.push((directory.join(&triple).join("hel"), "MJ_WORKER_DIR"));
     }
     if let Some((path, source)) = candidates.into_iter().find(|(path, _)| path.is_file()) {
         return Ok(WorkerBinaryAvailability::Local {
@@ -664,9 +664,9 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
             source: "native Linux Hel binary".into(),
         });
     }
-    if let Ok(template) = std::env::var("HEL_WORKER_URL") {
-        let expected = std::env::var("HEL_WORKER_SHA256")
-            .context("HEL_WORKER_URL requires HEL_WORKER_SHA256")?;
+    if let Some(template) = crate::hel_config::env_override("WORKER_URL") {
+        let expected = crate::hel_config::env_override("WORKER_SHA256")
+            .context("MJ_WORKER_URL requires MJ_WORKER_SHA256")?;
         validate_worker_sha256(&expected)?;
         return Ok(WorkerBinaryAvailability::Remote {
             url: template.replace("{target}", &triple),
@@ -675,7 +675,7 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
         });
     }
     bail!(
-        "no Linux worker for {triple}; install hel-worker-{triple} beside Hel, set HEL_WORKER_DIR/HEL_WORKER_BINARY, or configure HEL_WORKER_URL and HEL_WORKER_SHA256"
+        "no Linux worker for {triple}; install mj-worker-{triple} beside mj, set MJ_WORKER_DIR/MJ_WORKER_BINARY, or configure MJ_WORKER_URL and MJ_WORKER_SHA256"
     )
 }
 
@@ -816,7 +816,7 @@ fn download_worker(url: &str, expected_sha256: &str, triple: &str) -> Result<Pat
 fn validate_worker_sha256(expected_sha256: &str) -> Result<()> {
     if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        bail!("HEL_WORKER_SHA256 must be a 64-character hexadecimal digest");
+        bail!("MJ_WORKER_SHA256 must be a 64-character hexadecimal digest");
     }
     Ok(())
 }
@@ -942,7 +942,7 @@ fn ensure_node_22_script() -> String {
     )
 }
 
-const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel disposable environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories under `/workspace`, including committed work, staged and unstaged changes, and untracked files. Hel then removes the container.\n\nEverything outside `/workspace`, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n";
+const MJ_CONTAINER_ENVIRONMENT: &str = "## Mjolnir disposable environment\n\nThis session runs in a disposable Mjolnir container. When the session closes, Mjolnir checkpoints everything in project workspace directories under `/workspace`, including committed work, staged and unstaged changes, and untracked files. Mjolnir then removes the container.\n\nEverything outside `/workspace`, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n";
 
 pub(super) fn stage_profile(
     profile: &crate::hel_config::HarnessProfile,
@@ -1018,7 +1018,7 @@ fn append_hel_target_environment(
         hel_targets::TargetLocator::LocalPodman { .. }
         | hel_targets::TargetLocator::LocalDocker { .. }
         | hel_targets::TargetLocator::AppleContainer { .. }
-        | hel_targets::TargetLocator::SshPodman { .. } => HEL_CONTAINER_ENVIRONMENT.to_owned(),
+        | hel_targets::TargetLocator::SshPodman { .. } => MJ_CONTAINER_ENVIRONMENT.to_owned(),
         hel_targets::TargetLocator::AwsEc2 { workspace, .. } => format!(
             "## Hel disposable environment\n\nThis session runs on a disposable Hel EC2 instance. When the session closes, Hel checkpoints everything in project workspace directories under `$HOME/{workspace}`, including committed work, staged and unstaged changes, and untracked files. Hel then terminates the instance.\n\nEverything outside `$HOME/{workspace}`, including installed packages, the rest of `$HOME`, and `/tmp`, is ephemeral and will be lost. Keep durable results in the workspace or push them to a remote.\n"
         ),
@@ -1256,7 +1256,7 @@ fn install_worker_files(
             // while scp expands it, and the two sides would disagree. Both
             // ssh commands (cwd is the login home) and scp resolve a relative
             // path against the remote home.
-            let cache_dir = format!(".cache/hel/workers/{digest}");
+            let cache_dir = format!(".cache/mjolnir/workers/{digest}");
             let cached_worker = format!("{cache_dir}/hel");
             let cached = matches!(
                 executor.execute(
@@ -1285,7 +1285,7 @@ fn install_worker_files(
                         .purpose("publish cached remote Hel worker"),
                 )?;
             }
-            let upload = format!(".cache/hel/uploads/{session_id}");
+            let upload = format!(".cache/mjolnir/uploads/{session_id}");
             execute_checked(
                 executor,
                 ssh_command_spec(ssh, ["mkdir", "-p", &upload])
@@ -1531,9 +1531,9 @@ fn installed_worker_binary_replacement_plan(
                 .purpose("make replaced Hel worker executable"),
         ],
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
-            let upload = format!(".cache/hel/uploads/{session_id}-hel.next");
+            let upload = format!(".cache/mjolnir/uploads/{session_id}-hel.next");
             vec![
-                ssh_command_spec(ssh, ["mkdir", "-p", ".cache/hel/uploads"])
+                ssh_command_spec(ssh, ["mkdir", "-p", ".cache/mjolnir/uploads"])
                     .purpose("create remote replacement worker staging"),
                 scp_command_spec(ssh, worker_binary, &upload, false)
                     .purpose("stage replacement Hel worker"),
@@ -1844,7 +1844,7 @@ fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str)
             ],
         ),
     }
-    .purpose("start detached Hel worker")
+    .purpose("start detached Mjolnir worker")
     // Everything before this moves data into the target and reports as Sync.
     // Start begins here, with the daemon launch.
     .stage(ProvisionStage::Starting)
@@ -1892,7 +1892,7 @@ pub(super) fn worker_probe_diagnosis(
                 "worker binary {binary} fails to run in the target: {detail}; \
                  if this is a loader/glibc error, provide a musl worker \
                  (cargo build --release --target <arch>-unknown-linux-musl, \
-                 or set HEL_WORKER_BINARY/HEL_WORKER_DIR)"
+                 or set MJ_WORKER_BINARY/MJ_WORKER_DIR)"
             ))
         }
         Err(probe_error) => error.context(format!("worker probe failed: {probe_error:#}")),
@@ -1978,11 +1978,11 @@ mod tests {
         let directory = Path::new("/opt/hel/bin");
         assert_eq!(
             packaged_worker_binary_path(directory, "x86_64-unknown-linux-musl"),
-            directory.join("hel-worker-x86_64-unknown-linux-musl")
+            directory.join("mj-worker-x86_64-unknown-linux-musl")
         );
         assert_eq!(
             packaged_worker_binary_path(directory, "aarch64-unknown-linux-musl"),
-            directory.join("hel-worker-aarch64-unknown-linux-musl")
+            directory.join("mj-worker-aarch64-unknown-linux-musl")
         );
     }
     #[cfg(target_os = "linux")]
@@ -2278,7 +2278,7 @@ mod tests {
         let (commands, fixture) = run_podman_install(false);
         let lines = rendered(&commands);
         let digest = &fixture.digest;
-        let cache_dir = format!(".cache/hel/workers/{digest}");
+        let cache_dir = format!(".cache/mjolnir/workers/{digest}");
         let session = "0123456789abcdef0123456789abcdef";
 
         assert!(
@@ -2320,7 +2320,7 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line.starts_with("scp")
                 && line.ends_with(&format!(
-                    "user@example.test:.cache/hel/uploads/{session}/hel"
+                    "user@example.test:.cache/mjolnir/uploads/{session}/hel"
                 ))),
             "the worker must not be staged in the per-session upload directory, got {lines:#?}"
         );
@@ -2330,7 +2330,7 @@ mod tests {
         let (commands, fixture) = run_podman_install(true);
         let lines = rendered(&commands);
         let digest = &fixture.digest;
-        let cache_dir = format!(".cache/hel/workers/{digest}");
+        let cache_dir = format!(".cache/mjolnir/workers/{digest}");
         let session = "0123456789abcdef0123456789abcdef";
 
         assert!(
@@ -2351,7 +2351,7 @@ mod tests {
             assert!(
                 lines.iter().any(|line| line.starts_with("scp")
                     && line.ends_with(&format!(
-                        "user@example.test:.cache/hel/uploads/{session}/{name}"
+                        "user@example.test:.cache/mjolnir/uploads/{session}/{name}"
                     ))),
                 "expected {name} to still be uploaded per session, got {lines:#?}"
             );
@@ -2762,7 +2762,7 @@ mod tests {
             "user-mcp"
         );
         assert_eq!(
-            configured["mcpServers"]["hel-project-memory"],
+            configured["mcpServers"]["mj-project-memory"],
             serde_json::json!({
                 "transport": "stdio",
                 "command": "/var/lib/hel/workers/session/hel",
@@ -2803,7 +2803,7 @@ mod tests {
         let configured: serde_json::Value =
             serde_json::from_slice(&std::fs::read(staged.path().join("mcp.json")).unwrap())
                 .unwrap();
-        let server = &configured["mcpServers"]["hel-project-memory"];
+        let server = &configured["mcpServers"]["mj-project-memory"];
         assert_eq!(server["command"], "sh");
         assert_eq!(server["runtime_id"], "local");
         assert_eq!(
@@ -2811,7 +2811,7 @@ mod tests {
             serde_json::json!([
                 "-c",
                 "exec \"$HOME/$1\" worker memory-mcp --root \"$HOME/$2\"",
-                "hel-project-memory",
+                "mj-project-memory",
                 ".local/share/hel/workers/session/hel",
                 ".local/share/hel/profiles/session/projects/project/memory"
             ])
@@ -2875,7 +2875,7 @@ mod tests {
 
             assert_eq!(
                 std::fs::read_to_string(staged.path().join(instructions)).unwrap(),
-                format!("{original}\n{HEL_CONTAINER_ENVIRONMENT}"),
+                format!("{original}\n{MJ_CONTAINER_ENVIRONMENT}"),
                 "{instructions} receives the section in the staged profile"
             );
             assert_eq!(
@@ -2911,7 +2911,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(staged.path().join("AGENTS.md")).unwrap(),
-            HEL_CONTAINER_ENVIRONMENT
+            MJ_CONTAINER_ENVIRONMENT
         );
         assert_eq!(
             std::fs::read_to_string(staged.path().join("SYSTEM.md")).unwrap(),

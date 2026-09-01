@@ -7,13 +7,13 @@ for (const guide of [
   {
     source: 'PODMAN.md',
     target: 'podman.md',
-    title: 'Podman for Hel',
+    title: 'Podman for Mjolnir',
     description: 'Rootless Podman installation, verification postconditions, and remediation for hel container targets.',
   },
   {
     source: 'DOCKER.md',
     target: 'docker.md',
-    title: 'Docker for Hel',
+    title: 'Docker for Mjolnir',
     description: 'Docker setup, OverlayFS attachments, lifecycle, and verification for hel container targets.',
   },
 ]) {

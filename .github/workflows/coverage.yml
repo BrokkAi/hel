@@ -5,6 +5,9 @@ on:
   push:
     branches: [ 'master' ]
   workflow_dispatch: {}
+  # Tag builds reach this through release.yml rather than a tag trigger, so the
+  # release can depend on the result instead of racing it.
+  workflow_call: {}
 
 permissions:
   contents: read
@@ -52,9 +55,9 @@ jobs:
 
     - name: Collect Hel coverage
       run: |
-        cargo llvm-cov --workspace --exclude hel-voice-worker --no-report --locked
-        cargo llvm-cov report -p hel-core -p hel-tui -p hel-cli --lcov --output-path coverage.lcov
-        cargo llvm-cov report -p hel-core -p hel-tui -p hel-cli --json --output-path coverage.json
+        cargo llvm-cov --workspace --exclude brokk-mj-voice-worker --exclude brokk-mj-desktop --no-report --locked
+        cargo llvm-cov report -p brokk-mj-core -p brokk-mj-tui -p brokk-mjolnir --lcov --output-path coverage.lcov
+        cargo llvm-cov report -p brokk-mj-core -p brokk-mj-tui -p brokk-mjolnir --json --output-path coverage.json
 
     - name: Check coverage baseline
       run: node scripts/check-coverage.mjs coverage.json .github/coverage-baseline.json coverage-summary.md

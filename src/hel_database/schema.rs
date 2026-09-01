@@ -2,16 +2,16 @@ use super::*;
 use rusqlite::OpenFlags;
 
 pub fn database_path() -> PathBuf {
-    data_dir().join("hel.sqlite3")
+    data_dir().join("mj.sqlite3")
 }
 
 pub(super) fn open_writer(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("create Hel data directory {}", parent.display()))?;
+            .with_context(|| format!("create Mjolnir data directory {}", parent.display()))?;
     }
-    let connection =
-        Connection::open(path).with_context(|| format!("open Hel database {}", path.display()))?;
+    let connection = Connection::open(path)
+        .with_context(|| format!("open Mjolnir database {}", path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -48,7 +48,7 @@ fn open_reader_strict(path: &Path) -> Result<Connection> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("open Hel database read-only {}", path.display()))?;
+    .with_context(|| format!("open Mjolnir database read-only {}", path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -570,7 +570,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     }
     if version < 21 {
         // Arming review moved into `[review]` in config.toml, which is where
-        // the rest of Hel's durable global configuration lives and the only
+        // the rest of Mjolnir's durable global configuration lives and the only
         // place a phone-only user could ever have set it. No data is
         // migrated: a workspace-to-global mapping has no defensible merge
         // rule, and the release note says to re-arm it in the config file.
@@ -589,7 +589,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
         })?;
     if recorded != Some(SCHEMA_VERSION) {
         bail!(
-            "Hel database migration ledger {:?} does not match schema {}",
+            "Mjolnir database migration ledger {:?} does not match schema {}",
             recorded,
             SCHEMA_VERSION
         );
@@ -950,7 +950,7 @@ fn migrate_grok_harness_kind(connection: &Connection) -> Result<()> {
 /// own display-only `archived` flag, which now means "hidden from the resume
 /// dialog". SQLite cannot narrow or widen a CHECK constraint in place, so this
 /// repeats the v9 table rebuild with the new state list and the new column.
-/// It also adds the hidden set for native sessions Hel only reads.
+/// It also adds the hidden set for native sessions Mjolnir only reads.
 fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
     connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
     let migration = connection.execute_batch(
@@ -1024,7 +1024,7 @@ fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Admit DeepSeek Harness in both stored sessions and Hel's native-session
+/// Admit DeepSeek Harness in both stored sessions and Mjolnir's native-session
 /// hidden set. SQLite requires rebuilding tables to widen CHECK constraints.
 fn migrate_deepseek_harness_kind(connection: &Connection) -> Result<()> {
     connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
@@ -1145,7 +1145,7 @@ mod reader_tests {
     #[test]
     fn strict_reader_reports_a_newer_store_without_blaming_the_daemon() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("hel.sqlite3");
+        let path = directory.path().join("mj.sqlite3");
         drop(open_writer(&path).unwrap());
         stamp_schema_version(&path, SCHEMA_VERSION + 1);
 
@@ -1158,8 +1158,11 @@ mod reader_tests {
         assert_eq!(mismatch.found, SCHEMA_VERSION + 1);
         assert_eq!(mismatch.supported, SCHEMA_VERSION);
         let message = mismatch.to_string();
-        assert!(message.contains("upgrade Hel"), "got {message}");
-        assert!(!message.contains("start the Hel daemon"), "got {message}");
+        assert!(message.contains("upgrade Mjolnir"), "got {message}");
+        assert!(
+            !message.contains("start the Mjolnir daemon"),
+            "got {message}"
+        );
     }
 
     /// A store behind this build keeps the advice that works, verbatim, so
@@ -1167,7 +1170,7 @@ mod reader_tests {
     #[test]
     fn strict_reader_keeps_the_migrate_advice_when_the_store_is_behind() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("hel.sqlite3");
+        let path = directory.path().join("mj.sqlite3");
         drop(open_writer(&path).unwrap());
         stamp_schema_version(&path, SCHEMA_VERSION - 1);
 
@@ -1180,8 +1183,8 @@ mod reader_tests {
         assert_eq!(
             mismatch.to_string(),
             format!(
-                "Hel database schema {} is not the supported schema {SCHEMA_VERSION}; \
-                 start the Hel daemon to migrate it",
+                "Mjolnir database schema {} is not the supported schema {SCHEMA_VERSION}; \
+                 start the Mjolnir daemon to migrate it",
                 SCHEMA_VERSION - 1
             )
         );
@@ -1190,7 +1193,7 @@ mod reader_tests {
     #[test]
     fn strict_reader_rejects_mutation() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("hel.sqlite3");
+        let path = directory.path().join("mj.sqlite3");
         drop(open_writer(&path).unwrap());
 
         let reader = open_reader_strict(&path).unwrap();

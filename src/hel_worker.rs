@@ -1,7 +1,7 @@
 //! Persistent, transport-neutral protocol core for a Hel target worker.
 //!
 //! The worker never listens on a network port. Controllers speak newline-
-//! delimited JSON through `hel worker proxy`, which can itself be carried over
+//! delimited JSON through `mj worker proxy`, which can itself be carried over
 //! SSH or a container exec stream.
 //!
 //! This module is the root of the relay implementation and keeps the
@@ -164,11 +164,11 @@ pub fn strip_hidden_prompt_context(mut text: &str) -> &str {
 }
 
 fn reserved_hidden_context_prefix(text: &str) -> bool {
-    text.starts_with("hel-") || text.starts_with("user_shell_command")
+    text.starts_with("hel-") || text.starts_with("mj-") || text.starts_with("user_shell_command")
 }
 
 fn reserved_hidden_context_tag(tag: &str) -> bool {
-    (tag.starts_with("hel-")
+    ((tag.starts_with("hel-") || tag.starts_with("mj-"))
         && tag
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
@@ -2367,14 +2367,14 @@ mod tests {
     #[test]
     fn hidden_prompt_context_is_removed_from_harness_visible_text() {
         let text = concat!(
-            "<hel-project-memory>private memory</hel-project-memory>\n\n",
+            "<mj-project-memory>private memory</mj-project-memory>\n\n",
             "<user_shell_command>private output</user_shell_command>\n",
             "ship the visible change"
         );
 
         assert_eq!(strip_hidden_prompt_context(text), "ship the visible change");
         assert_eq!(
-            strip_hidden_prompt_context("<hel-project-memory>truncated"),
+            strip_hidden_prompt_context("<mj-project-memory>truncated"),
             ""
         );
         assert_eq!(

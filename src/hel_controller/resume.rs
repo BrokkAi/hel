@@ -1424,8 +1424,8 @@ mod tests {
 
     use super::*;
 
-    const RESUME_ROLLBACK_TEST_CHILD: &str = "HEL_RESUME_ROLLBACK_TEST_CHILD";
-    const RETIRED_WORKTREE_RESUME_TEST_CHILD: &str = "HEL_RETIRED_WORKTREE_RESUME_TEST_CHILD";
+    const RESUME_ROLLBACK_TEST_CHILD: &str = "MJ_RESUME_ROLLBACK_TEST_CHILD";
+    const RETIRED_WORKTREE_RESUME_TEST_CHILD: &str = "MJ_RETIRED_WORKTREE_RESUME_TEST_CHILD";
 
     #[test]
     fn raw_in_place_preflight_does_not_require_its_synthetic_bundle() {
@@ -1942,7 +1942,7 @@ mod tests {
                     Some(ProvisionStage::Syncing)
                 ),
                 (
-                    "start detached Hel worker".to_owned(),
+                    "start detached Mjolnir worker".to_owned(),
                     Some(ProvisionStage::Starting)
                 ),
             ]
@@ -2092,7 +2092,7 @@ mod tests {
     }
     #[test]
     fn failed_resume_provisioning_preserves_checkpoint_and_projection_lineage() {
-        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // MJ_DATA_DIR is process-global, so run the database-backed half in an
         // exact child test instead of racing unrelated tests in this process.
         if std::env::var_os(RESUME_ROLLBACK_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -2105,7 +2105,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(RESUME_ROLLBACK_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .env("GH_TOKEN", "test-token")
                 .output()
                 .unwrap();
@@ -2156,7 +2156,7 @@ mod tests {
             }
         }
 
-        let data_directory = PathBuf::from(std::env::var_os("HEL_DATA_DIR").unwrap());
+        let data_directory = PathBuf::from(std::env::var_os("MJ_DATA_DIR").unwrap());
         let archive_directory = data_directory.join("archives");
         std::fs::create_dir_all(&archive_directory).unwrap();
         let session_id = "0123456789abcdef0123456789abcdef";
@@ -2290,8 +2290,8 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(RETIRED_WORKTREE_RESUME_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path().join("data"))
-                .env("HEL_CONFIG_DIR", directory.path().join("config"))
+                .env("MJ_DATA_DIR", directory.path().join("data"))
+                .env("MJ_CONFIG_DIR", directory.path().join("config"))
                 .output()
                 .unwrap();
             assert!(
@@ -2320,7 +2320,7 @@ mod tests {
             }
         }
 
-        let data_directory = PathBuf::from(std::env::var_os("HEL_DATA_DIR").unwrap());
+        let data_directory = PathBuf::from(std::env::var_os("MJ_DATA_DIR").unwrap());
         let archive_directory = data_directory.join("archives");
         std::fs::create_dir_all(&archive_directory).unwrap();
         let session_id = "0123456789abcdef0123456789abcdef";
@@ -2392,10 +2392,10 @@ mod tests {
             .unwrap();
         assert!(branch.success(), "resume rollback must retain the branch");
     }
-    const RAW_CONVERSION_TEST_CHILD: &str = "HEL_RAW_CONVERSION_TEST_CHILD";
+    const RAW_CONVERSION_TEST_CHILD: &str = "MJ_RAW_CONVERSION_TEST_CHILD";
     #[test]
     fn a_failed_raw_conversion_keeps_the_bundle_and_leaves_the_worktree_alone() {
-        // HEL_DATA_DIR and HEL_CONFIG_DIR are process-global, so run the half
+        // MJ_DATA_DIR and MJ_CONFIG_DIR are process-global, so run the half
         // that writes them in an exact child test.
         if std::env::var_os(RAW_CONVERSION_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -2408,8 +2408,8 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(RAW_CONVERSION_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path().join("data"))
-                .env("HEL_CONFIG_DIR", directory.path().join("config"))
+                .env("MJ_DATA_DIR", directory.path().join("data"))
+                .env("MJ_CONFIG_DIR", directory.path().join("config"))
                 .env("GH_TOKEN", "test-token")
                 .output()
                 .unwrap();
@@ -2441,7 +2441,7 @@ mod tests {
             }
         }
 
-        let data_directory = PathBuf::from(std::env::var_os("HEL_DATA_DIR").unwrap());
+        let data_directory = PathBuf::from(std::env::var_os("MJ_DATA_DIR").unwrap());
         let archive_directory = data_directory.join("archives");
         std::fs::create_dir_all(&archive_directory).unwrap();
         std::fs::create_dir_all(crate::hel_config::config_dir()).unwrap();
