@@ -931,8 +931,8 @@ pub(crate) fn render_web_dialog(
     let inner_area = modal_area(area);
     let max_inner = usize::from(inner_area.width).saturating_sub(2);
     let max_qr_height = usize::from(inner_area.height).saturating_sub(6);
-    let show_qr = matches!(qr_width, Some(width) if width <= max_inner)
-        && qr_lines.len() <= max_qr_height;
+    let show_qr =
+        matches!(qr_width, Some(width) if width <= max_inner) && qr_lines.len() <= max_qr_height;
 
     let mut inner_width = MIN_INNER_WIDTH;
     let mut lines = Vec::new();
@@ -995,7 +995,8 @@ pub(crate) fn render_web_dialog(
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" Web viewer "))
         .wrap(Wrap { trim: false });
-    let wrapped = u16::try_from(paragraph.line_count(box_width.saturating_sub(2))).unwrap_or(u16::MAX);
+    let wrapped =
+        u16::try_from(paragraph.line_count(box_width.saturating_sub(2))).unwrap_or(u16::MAX);
     let box_height = wrapped.saturating_add(2).min(inner_area.height);
     let popup = centered_modal_fixed(surfaces, box_width, box_height, area);
     frame.render_widget(Clear, popup);
@@ -2146,7 +2147,11 @@ mod tests {
             flat.contains(url),
             "the full URL should appear (wrapped) in the dialog"
         );
-        assert!(rendered.iter().any(|line| line.contains("Viewer code: 022160")));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Viewer code: 022160"))
+        );
     }
 
     fn dashboard_with_container_session() -> DashboardState {
