@@ -3031,9 +3031,17 @@ fn turn_review_settings_default_to_off_and_persist_per_workspace() {
         },
     )
     .unwrap();
-    assert!(!turn_review_settings_in(&database, "workspace-1").unwrap().auto_review);
+    assert!(
+        !turn_review_settings_in(&database, "workspace-1")
+            .unwrap()
+            .auto_review
+    );
     // Another workspace keeps its own answer.
-    assert!(!turn_review_settings_in(&database, "workspace-2").unwrap().auto_review);
+    assert!(
+        !turn_review_settings_in(&database, "workspace-2")
+            .unwrap()
+            .auto_review
+    );
     assert!(
         save_turn_review_settings_in(&database, "  ", TurnReviewSettings::default()).is_err(),
         "settings need a workspace to belong to"

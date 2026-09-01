@@ -110,9 +110,22 @@ pub fn capture_repository_deltas(
     for root in repositories {
         let current = capture_worktree_tree(git, root)
             .with_context(|| format!("capture the working tree of {}", root.display()))?;
-        let baseline = baselines.get(root).cloned();
-        let patch = diff_between_trees(git, root, baseline.as_deref(), &current)
-            .with_context(|| format!("diff the captured trees of {}", root.display()))?;
+        // A baseline is only usable while its tree object is still in this
+        // repository. It is gone when the session has never been reviewed, and
+        // also after a resume onto a fresh target, where the workspace is
+        // restored from a checkpoint and the old capture's objects are not.
+        // Either way the honest answer is that coverage starts here: diffing
+        // against the empty tree would present the whole repository as this
+        // turn's work.
+        let baseline = baselines
+            .get(root)
+            .filter(|tree| tree_exists(git, root, tree))
+            .cloned();
+        let patch = match &baseline {
+            Some(baseline) => diff_between_trees(git, root, Some(baseline), &current)
+                .with_context(|| format!("diff the captured trees of {}", root.display()))?,
+            None => String::new(),
+        };
         let summary = RawDiffSummary::from_patch(&patch);
         deltas.push(RepoDelta {
             root: root.clone(),
@@ -124,6 +137,23 @@ pub fn capture_repository_deltas(
         });
     }
     Ok(deltas)
+}
+
+/// Whether this repository still holds the tree a baseline names.
+fn tree_exists(git: &dyn GitCommandRunner, repository: &Path, tree: &str) -> bool {
+    git.run(
+        repository,
+        &crate::hel_archive::GitCommand {
+            arguments: vec![
+                "cat-file".into(),
+                "-e".into(),
+                format!("{tree}^{{tree}}").into(),
+            ],
+            stdin: Vec::new(),
+            env: Vec::new(),
+        },
+    )
+    .is_ok_and(|output| output.status == 0)
 }
 
 /// Pins each named tree as that repository's review baseline.
@@ -176,9 +206,9 @@ pub fn combined_diffstat(deltas: &[RepoDelta]) -> String {
 /// Total changed lines across every repository in the delta.
 #[must_use]
 pub fn changed_line_count(deltas: &[RepoDelta]) -> usize {
-    deltas
-        .iter()
-        .fold(0usize, |total, delta| total.saturating_add(delta.changed_lines))
+    deltas.iter().fold(0usize, |total, delta| {
+        total.saturating_add(delta.changed_lines)
+    })
 }
 
 /// The trees a completed review should record as its new baselines.
@@ -309,6 +339,96 @@ mod tests {
             "/w/app: 2 files changed, 3 insertions(+), 1 deletion(-)"
         );
         assert_eq!(changed_line_count(&deltas), 4);
-        assert_eq!(combined_diffstat(&[delta("/w/lib", "")]), "No files changed.");
+        assert_eq!(
+            combined_diffstat(&[delta("/w/lib", "")]),
+            "No files changed."
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::hel_archive::SystemGit;
+
+    fn git(repository: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn repository() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q", "-b", "main"]);
+        git(temp.path(), &["config", "user.name", "Hel Test"]);
+        git(temp.path(), &["config", "user.email", "hel@example.test"]);
+        std::fs::write(temp.path().join("tracked.rs"), "fn main() {}\n").unwrap();
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "-qm", "base"]);
+        temp
+    }
+
+    #[test]
+    fn a_capture_reports_what_changed_since_the_baseline() {
+        let temp = repository();
+        let roots = vec![temp.path().to_path_buf()];
+        let first = capture_repository_deltas(&SystemGit, &roots, &BTreeMap::new()).unwrap();
+        assert!(
+            !has_changes(&first),
+            "a repository with no baseline starts coverage rather than reviewing its whole history"
+        );
+        let baselines = captured_trees(&first);
+
+        std::fs::write(temp.path().join("tracked.rs"), "fn main() { retry(); }\n").unwrap();
+        let second = capture_repository_deltas(&SystemGit, &roots, &baselines).unwrap();
+        assert!(has_changes(&second));
+        assert!(second[0].patch.contains("+fn main() { retry(); }"));
+        assert_eq!(
+            second[0].baseline_tree.as_deref(),
+            baselines.values().next().map(String::as_str)
+        );
+        assert_eq!(second[0].changed_lines, 2);
+    }
+
+    #[test]
+    fn a_baseline_this_repository_no_longer_holds_restarts_coverage() {
+        let temp = repository();
+        let roots = vec![temp.path().to_path_buf()];
+        // A tree id from another repository -- what a resume onto a fresh
+        // target leaves behind. Reviewing the whole tree instead would bury
+        // the turn's own change in it.
+        let stale = BTreeMap::from([(
+            temp.path().to_path_buf(),
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+        )]);
+        let deltas = capture_repository_deltas(&SystemGit, &roots, &stale).unwrap();
+        assert!(!has_changes(&deltas));
+        assert_eq!(deltas[0].baseline_tree, None);
+        assert!(!deltas[0].current_tree.is_empty());
+    }
+
+    #[test]
+    fn discovery_finds_the_repository_a_workspace_root_sits_in() {
+        let temp = repository();
+        let nested = temp.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let roots = vec![
+            nested,
+            temp.path().to_path_buf(),
+            PathBuf::from("/nonexistent"),
+        ];
+        let discovered = discover_repositories(&SystemGit, &roots);
+        assert_eq!(
+            discovered.len(),
+            1,
+            "two roots inside one repository collapse, and a missing one is skipped: {discovered:?}"
+        );
     }
 }

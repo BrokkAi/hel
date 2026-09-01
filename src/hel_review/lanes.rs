@@ -519,7 +519,11 @@ pub fn quick_validation_prompt(job: &ReviewJob, findings: &str, change_packet: &
 /// so mj's "no analyzer tools" branch is not ported: a lane without its
 /// instruments is a lane without its identity.
 #[must_use]
-pub fn lane_prompt(lane: &ReviewLane, shared_context: &str, repository_roots: &[PathBuf]) -> String {
+pub fn lane_prompt(
+    lane: &ReviewLane,
+    shared_context: &str,
+    repository_roots: &[PathBuf],
+) -> String {
     let guidance = lane
         .guidance
         .iter()
@@ -596,7 +600,11 @@ pub fn change_packet(job: &ReviewJob, changed_functions: &SupplementalContext) -
              <changed_functions status=\"{status}\" source=\"bifrost analyze_diff CLI\" trust=\"supplemental evidence\">\n{}\n</changed_functions>",
             bound_review_section(&job.diff, LANE_DIFF_LIMIT, "workspace diff"),
             changed_functions.body,
-            status = if changed_functions.unavailable { "unavailable" } else { "available" },
+            status = if changed_functions.unavailable {
+                "unavailable"
+            } else {
+                "available"
+            },
         )
     } else {
         format!(
@@ -604,7 +612,11 @@ pub fn change_packet(job: &ReviewJob, changed_functions: &SupplementalContext) -
              <changed_functions status=\"{status}\" source=\"bifrost analyze_diff CLI\" trust=\"supplemental evidence\" changed_lines=\"{changed_lines}\">\n{}\n</changed_functions>",
             job.diffstat,
             changed_functions.body,
-            status = if changed_functions.unavailable { "unavailable" } else { "available" },
+            status = if changed_functions.unavailable {
+                "unavailable"
+            } else {
+                "available"
+            },
         )
     }
 }
@@ -786,7 +798,8 @@ mod tests {
             user_messages: vec![UserMessage::prompt("add a retry")],
             initial_result: "done".to_string(),
             trajectory: "edited src/lib.rs".to_string(),
-            diff: "Repository: /w/app\ndiff --git a/src/lib.rs b/src/lib.rs\n@@\n+retry\n".to_string(),
+            diff: "Repository: /w/app\ndiff --git a/src/lib.rs b/src/lib.rs\n@@\n+retry\n"
+                .to_string(),
             diffstat: "1 file changed, 1 insertion(+)".to_string(),
             changed_lines: 1,
             repository_roots: vec![PathBuf::from("/w/app")],
@@ -908,7 +921,8 @@ mod tests {
             !should_extract_intent(&job),
             "one governing message equal to the task needs no analyst"
         );
-        job.user_messages.push(UserMessage::prompt("also add a log"));
+        job.user_messages
+            .push(UserMessage::prompt("also add a log"));
         assert!(should_extract_intent(&job));
         job.user_messages = vec![UserMessage::prompt("something else entirely")];
         assert!(should_extract_intent(&job));

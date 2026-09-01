@@ -393,7 +393,9 @@ impl ReviewerAction {
 #[serde(rename_all = "snake_case")]
 pub enum ReviewerOutcome {
     Started(Box<StartedReviewer>),
-    Accepted { ordinal: u64 },
+    Accepted {
+        ordinal: u64,
+    },
     Attached(Box<RelayAttachment>),
     Acknowledged(RelayCursor),
     Status(Box<RelayOperationalState>),

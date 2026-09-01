@@ -166,9 +166,8 @@ fn configure_staged_review_mcp(
             serde_json::Value::Object(serde_json::Map::new())
         }
         Err(error) => {
-            return Err(error).with_context(|| {
-                format!("read staged reviewer configuration {}", path.display())
-            });
+            return Err(error)
+                .with_context(|| format!("read staged reviewer configuration {}", path.display()));
         }
     };
     let root = document.as_object_mut().with_context(|| {

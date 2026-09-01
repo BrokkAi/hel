@@ -2269,7 +2269,7 @@ mod terminals {
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
             extra_mcp_servers: Vec::new(),
-        project_memory: None,
+            project_memory: None,
             resume_session: None,
             harness: HarnessKind::Kimi,
             execution_policy: ExecutionPolicy::ConfiguredApprovals,

@@ -500,11 +500,9 @@ mod tests {
                 ]
             }),
         );
-        assert!(
-            chat.command_choices.iter().any(|command| {
-                command.name == "compact" && command.source == CommandSource::Agent
-            })
-        );
+        assert!(chat.command_choices.iter().any(|command| {
+            command.name == "compact" && command.source == CommandSource::Agent
+        }));
         // `/review` is Hel's: it opens the turn-review pane rather than
         // reaching the agent, so an agent command of the same name does not
         // replace it.

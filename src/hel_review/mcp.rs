@@ -142,10 +142,7 @@ fn send_dispatch(socket: &Path, dispatch: &LaneDispatch) -> Result<LaneDispatchR
 }
 
 fn tool_definition() -> Value {
-    let roster = REVIEW_LANES
-        .iter()
-        .map(|lane| lane.id)
-        .collect::<Vec<_>>();
+    let roster = REVIEW_LANES.iter().map(|lane| lane.id).collect::<Vec<_>>();
     let descriptions = REVIEW_LANES
         .iter()
         .map(|lane| format!("`{}` — {}: {}", lane.id, lane.label, lane.focus))

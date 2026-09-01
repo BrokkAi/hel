@@ -135,7 +135,9 @@ pub enum TurnReviewPhase {
     /// Staging and starting the first reviewing agent.
     LaunchingReviewer,
     /// One or more reviewing agents are working.
-    Running { roles: Vec<RoleStatus> },
+    Running {
+        roles: Vec<RoleStatus>,
+    },
     /// A verdict is on screen, waiting for the user.
     Verdict(ReviewVerdict),
     Resolved(Resolution),
@@ -533,7 +535,8 @@ impl TurnReviewDriver {
             // The supervisor is the extended tier's whole verdict path, and it
             // is told to inspect changed code with Bifrost's tools. Starting it
             // without them would be the degraded mode this design refuses.
-            return self.request_failed(format!("the review could not analyze the change: {reason}"));
+            return self
+                .request_failed(format!("the review could not analyze the change: {reason}"));
         }
         self.status = "starting the supervisor…".to_string();
         vec![self.start_role(SUPERVISOR_ROLE, true)]
@@ -1025,7 +1028,8 @@ mod tests {
         let mut seed = seed();
         seed.tier = ReviewTier::Extended;
         // Two governing messages, so the intent analyst is worth running.
-        seed.user_messages.push(UserMessage::prompt("bound the retry"));
+        seed.user_messages
+            .push(UserMessage::prompt("bound the retry"));
         let (mut driver, _) = TurnReviewDriver::start(seed);
         let requests = driver.delta_captured(changed_delta());
         assert!(
@@ -1414,7 +1418,8 @@ mod tests {
         assert!(driver.verdict().is_none(), "a verdict is blocked");
 
         // Reports arrive out of order; each is injected as it lands.
-        let requests = driver.role_turn_completed(&error_handling, "[P1] src/lib.rs:3 -- swallowed");
+        let requests =
+            driver.role_turn_completed(&error_handling, "[P1] src/lib.rs:3 -- swallowed");
         let injection = prompt_text(&requests, SUPERVISOR_ROLE);
         assert!(injection.contains("lane=\"error_handling\""));
         assert!(
@@ -1427,7 +1432,11 @@ mod tests {
         }));
 
         // The supervisor ends that turn before the last lane reports.
-        assert!(driver.role_turn_completed(&supervisor, "Still waiting.").is_empty());
+        assert!(
+            driver
+                .role_turn_completed(&supervisor, "Still waiting.")
+                .is_empty()
+        );
         let requests = driver.role_turn_completed(&tests, "No findings.");
         let injection = prompt_text(&requests, SUPERVISOR_ROLE);
         assert!(injection.contains("All currently selected reviewers have now reported"));

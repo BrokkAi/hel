@@ -2771,17 +2771,16 @@ async fn handle_action(
             Ok(DaemonReply::Done)
         }
         DaemonAction::SaveTurnReviewState { session_id, state } => {
-            blocking(move || hel::hel_database::save_turn_review_state(&session_id, &state)).await?;
+            blocking(move || hel::hel_database::save_turn_review_state(&session_id, &state))
+                .await?;
             Ok(DaemonReply::Done)
         }
         DaemonAction::SaveTurnReviewSettings {
             workspace_id,
             settings,
         } => {
-            blocking(move || {
-                hel::hel_database::save_turn_review_settings(&workspace_id, settings)
-            })
-            .await?;
+            blocking(move || hel::hel_database::save_turn_review_settings(&workspace_id, settings))
+                .await?;
             Ok(DaemonReply::Done)
         }
         DaemonAction::PersistImportedSession { session } => {

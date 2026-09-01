@@ -183,9 +183,12 @@ pub enum ReviewerRequest {
     /// Report what changed in every workspace repository since `baselines`.
     ///
     /// A baseline is a Git tree id recorded by an earlier capture, keyed by
-    /// repository root. A repository with no entry is diffed against the empty
-    /// tree, so its whole content reads as new. Capture never touches the
-    /// repository's index or working tree.
+    /// repository root. A repository with no baseline -- or one whose baseline
+    /// tree the repository no longer holds, as after a resume onto a fresh
+    /// target -- reports no changes and takes the capture as its new baseline:
+    /// coverage starts there rather than presenting the whole repository as
+    /// this turn's work. Capture never touches the repository's index or
+    /// working tree.
     CaptureDelta {
         baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
     },

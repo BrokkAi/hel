@@ -37,8 +37,7 @@ use super::remote::{
 use super::rendering::{display_width, truncate_to_width};
 use super::second_opinion::{
     CapturedProposal, SecondOpinion, SecondOpinionIntent, render_reviewer, render_setup,
-    review_role_session_id,
-    render_split_actions, reviewer_session_id,
+    render_split_actions, review_role_session_id, reviewer_session_id,
 };
 use super::transcript::{ToolDiffstatRequest, materialized_prefix_entries, render_transcript};
 use super::{
@@ -140,19 +139,13 @@ enum ChatIoUpdate {
     },
     /// Specialist lanes the review supervisor asked for through its MCP tool.
     TurnReviewDispatches {
-        result: std::result::Result<
-            Vec<crate::hel_review::lanes::ReviewSubagentRequest>,
-            String,
-        >,
+        result: std::result::Result<Vec<crate::hel_review::lanes::ReviewSubagentRequest>, String>,
     },
     /// The review baselines a workspace acquires when auto-review is switched
     /// on, so the first review covers what happens next rather than every
     /// change already in the tree.
     TurnReviewBaselines {
-        result: std::result::Result<
-            std::collections::BTreeMap<std::path::PathBuf, String>,
-            String,
-        >,
+        result: std::result::Result<std::collections::BTreeMap<std::path::PathBuf, String>, String>,
     },
 }
 
@@ -830,8 +823,7 @@ impl ActiveChat {
     /// and never while another review owns the screen.
     fn advance_turn_review(&mut self) {
         let phase = self.state.phase();
-        let just_finished =
-            self.last_phase == WorkerPhase::Running && phase == WorkerPhase::Idle;
+        let just_finished = self.last_phase == WorkerPhase::Running && phase == WorkerPhase::Idle;
         self.last_phase = phase;
         if !just_finished || !self.turn_review_settings.auto_review {
             return;
@@ -860,9 +852,8 @@ impl ActiveChat {
         // Recorded before any agent starts: the web control surface reads this
         // row to hold its own prompts, and a daemon restart reads it to know a
         // review was interrupted.
-        self.turn_review_state.active = Some(
-            serde_json::json!({ "opened_at_ordinal": self.state.latest_seq() }).to_string(),
-        );
+        self.turn_review_state.active =
+            Some(serde_json::json!({ "opened_at_ordinal": self.state.latest_seq() }).to_string());
         self.persist_turn_review_state();
         self.run_review_requests(requests);
     }
@@ -1019,13 +1010,15 @@ impl ActiveChat {
             return;
         };
         let model = remembered_value(defaults.model(&workspace_id, &profile_id));
-        let effort = remembered_value(defaults.effort(
-            &workspace_id,
-            &profile_id,
-            model
-                .as_deref()
-                .unwrap_or(crate::hel_second_opinion::HARNESS_DEFAULT_VALUE),
-        ));
+        let effort = remembered_value(
+            defaults.effort(
+                &workspace_id,
+                &profile_id,
+                model
+                    .as_deref()
+                    .unwrap_or(crate::hel_second_opinion::HARNESS_DEFAULT_VALUE),
+            ),
+        );
         self.launch_review_role(role, profile_id, model, effort, fresh);
     }
 
@@ -1142,9 +1135,7 @@ impl ActiveChat {
                 }
             }
             .await;
-            if let Err(error) =
-                updates.send(ChatIoUpdate::TurnReviewRoleStarted { role, result })
-            {
+            if let Err(error) = updates.send(ChatIoUpdate::TurnReviewRoleStarted { role, result }) {
                 tracing::debug!(%error, "review role result dropped because the chat closed");
             }
         });
@@ -1198,10 +1189,7 @@ impl ActiveChat {
     fn pause_review_role(&self, role: String) {
         let session = self.session.clone();
         tokio::spawn(async move {
-            if let Err(error) = session
-                .reviewer_as(Some(role), ReviewerAction::Pause)
-                .await
-            {
+            if let Err(error) = session.reviewer_as(Some(role), ReviewerAction::Pause).await {
                 tracing::debug!(error = %format!("{error:#}"), "pausing a review role failed");
             }
         });
@@ -1245,10 +1233,9 @@ impl ActiveChat {
         let session_id = self.session.session_id().to_owned();
         let state = self.turn_review_state.clone();
         if let Some(persistence) = &self.persistence {
-            if let Err(error) = persistence.send(ChatPersistenceRequest::SaveTurnReviewState {
-                session_id,
-                state,
-            }) {
+            if let Err(error) =
+                persistence.send(ChatPersistenceRequest::SaveTurnReviewState { session_id, state })
+            {
                 tracing::warn!(%error, "could not queue the review state for persistence");
             }
         } else if let Err(error) =
@@ -1377,9 +1364,7 @@ impl ActiveChat {
                     .state
                     .turn_review_mut()
                     .and_then(|review| review.pending_role.take())
-                    .unwrap_or_else(|| {
-                        crate::hel_review::driver::REVIEWER_ROLE.to_owned()
-                    });
+                    .unwrap_or_else(|| crate::hel_review::driver::REVIEWER_ROLE.to_owned());
                 self.launch_review_role(role, profile_id, model, effort, true);
             }
             TurnReviewRequest::Requests(requests) => self.run_review_requests(requests),
@@ -2358,10 +2343,7 @@ impl ActiveChat {
         let session = self.session.clone();
         let updates = self.chat_io_tx.clone();
         tokio::spawn(async move {
-            let result = match session
-                .reviewer(ReviewerAction::TakeLaneDispatches)
-                .await
-            {
+            let result = match session.reviewer(ReviewerAction::TakeLaneDispatches).await {
                 Ok(ReviewerOutcome::LaneDispatches { requests }) => Ok(requests),
                 Ok(other) => Err(format!("unexpected reviewer response {other:?}")),
                 Err(error) => Err(format!("{error:#}")),
@@ -2427,11 +2409,7 @@ impl ActiveChat {
     /// validator starts, the reviewer's own findings are still the newest
     /// message until the validator replies. The relay's completion record for
     /// the exact command that was submitted is what settles it.
-    fn apply_turn_review_events(
-        &mut self,
-        role: &str,
-        events: &[crate::hel_worker::RelayEvent],
-    ) {
+    fn apply_turn_review_events(&mut self, role: &str, events: &[crate::hel_worker::RelayEvent]) {
         let session_id = review_role_session_id(self.session.session_id(), role);
         let Some(review) = self.state.turn_review_mut() else {
             return;
@@ -2500,7 +2478,8 @@ impl ActiveChat {
                 },
             );
         }
-        if role == crate::hel_review::driver::SUPERVISOR_ROLE && review.driver.supervisor_running() {
+        if role == crate::hel_review::driver::SUPERVISOR_ROLE && review.driver.supervisor_running()
+        {
             self.poll_lane_dispatches();
         }
     }
@@ -2758,7 +2737,8 @@ pub(super) fn render_in(
                 .unwrap_or_default();
             let strip = chat.turn_review().and_then(super::turn_review::role_strip);
             let title = super::turn_review::verdict_title(
-                chat.turn_review().and_then(|review| review.driver.verdict()),
+                chat.turn_review()
+                    .and_then(|review| review.driver.verdict()),
             )
             .to_owned();
             if let Some(review) = chat.turn_review_mut() {

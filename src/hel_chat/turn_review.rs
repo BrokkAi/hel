@@ -19,10 +19,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::hel_review::driver::{
-    ReviewRequest, Resolution, RoleState, TurnReviewDriver, TurnReviewPhase,
+    Resolution, ReviewRequest, RoleState, TurnReviewDriver, TurnReviewPhase,
 };
-use crate::hel_second_opinion::{ReviewerSetup, SetupRequest};
 use crate::hel_review::verdict::ReviewVerdict;
+use crate::hel_second_opinion::{ReviewerSetup, SetupRequest};
 
 use super::second_opinion::ReviewerPane;
 

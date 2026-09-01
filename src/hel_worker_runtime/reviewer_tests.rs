@@ -854,10 +854,16 @@ async fn two_review_roles_run_side_by_side_with_their_own_homes_and_journals() {
                 .join("relay-state.json")
                 .exists(),
         "the lane journals into its own directory: {:?}",
-        std::fs::read_dir(fixture.worker_root.join("reviewer").join("roles").join("tests"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>()
+        std::fs::read_dir(
+            fixture
+                .worker_root
+                .join("reviewer")
+                .join("roles")
+                .join("tests")
+        )
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>()
     );
 
     // Each role answers its own prompts, and one role's transcript never

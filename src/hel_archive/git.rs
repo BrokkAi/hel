@@ -266,12 +266,18 @@ pub fn capture_worktree_tree(runner: &dyn GitCommandRunner, repository: &Path) -
     // a corrupt index.
     let index_path = index.into_temp_path();
     std::fs::remove_file(&index_path).ok();
-    let scratch = [(OsString::from("GIT_INDEX_FILE"), index_path.as_os_str().to_os_string())];
+    let scratch = [(
+        OsString::from("GIT_INDEX_FILE"),
+        index_path.as_os_str().to_os_string(),
+    )];
     let staged = git_success(
         runner,
         repository,
         GitCommand {
-            arguments: ["add", "-A", "--", "."].into_iter().map(OsString::from).collect(),
+            arguments: ["add", "-A", "--", "."]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
             stdin: Vec::new(),
             env: scratch.to_vec(),
         },

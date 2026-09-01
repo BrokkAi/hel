@@ -29,8 +29,7 @@ use tokio::task::JoinHandle;
 
 use super::unix::{ACP_EVENT_CHANNEL_CAPACITY, run_relay_coordinator};
 use super::{
-    AcpSupervisorSpec, REVIEWER_DIR, REVIEWER_PROFILE_DIR, REVIEWER_ROLES_DIR,
-    ReviewerLaunchConfig,
+    AcpSupervisorSpec, REVIEWER_DIR, REVIEWER_PROFILE_DIR, REVIEWER_ROLES_DIR, ReviewerLaunchConfig,
 };
 use crate::hel_acp::{self, CommandRequest, LaunchSpec};
 use crate::hel_worker::{
@@ -159,7 +158,8 @@ struct ReviewerRole {
 /// roles' journals throughout.
 pub struct ReviewerSidecar {
     placement: ReviewerPlacement,
-    roles: std::sync::Mutex<std::collections::BTreeMap<String, Arc<tokio::sync::Mutex<ReviewerRole>>>>,
+    roles:
+        std::sync::Mutex<std::collections::BTreeMap<String, Arc<tokio::sync::Mutex<ReviewerRole>>>>,
     /// Admission for specialist lanes, so a supervisor that dispatches the
     /// whole roster cannot put six harnesses in one container at once.
     lane_slots: Arc<tokio::sync::Semaphore>,
@@ -861,12 +861,8 @@ impl ReviewerRole {
             std::fs::remove_dir_all(&home)
                 .with_context(|| format!("clear the reviewer role home {}", home.display()))?;
         }
-        copy_tree(&self.placement.profile_home(), &home).with_context(|| {
-            format!(
-                "copy the staged reviewer profile into {}",
-                home.display()
-            )
-        })?;
+        copy_tree(&self.placement.profile_home(), &home)
+            .with_context(|| format!("copy the staged reviewer profile into {}", home.display()))?;
         std::fs::write(&marker, generation.to_string())
             .with_context(|| format!("record the reviewer role generation {}", marker.display()))?;
         Ok(home)
@@ -1022,11 +1018,8 @@ fn is_lane(role: &str) -> bool {
 
 /// Recursively copies a staged profile into a role's own home.
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(to)
-        .with_context(|| format!("create {}", to.display()))?;
-    for entry in std::fs::read_dir(from)
-        .with_context(|| format!("read {}", from.display()))?
-    {
+    std::fs::create_dir_all(to).with_context(|| format!("create {}", to.display()))?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
         let entry = entry?;
         let source = entry.path();
         let destination = to.join(entry.file_name());

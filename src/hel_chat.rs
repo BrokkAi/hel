@@ -15,8 +15,8 @@ mod input;
 mod remote;
 mod rendering;
 mod second_opinion;
-mod turn_review;
 mod transcript;
+mod turn_review;
 
 #[cfg(test)]
 mod test_support;
@@ -66,23 +66,23 @@ use history::{HistorySearch, HistorySearchRequest};
 pub use rendering::truncate_line_to_width;
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
 use second_opinion::{SecondOpinion, SecondOpinionIntent};
-use turn_review::{TurnReview, TurnReviewIntent};
 use transcript::{
     TAIL_SEED_ITEMS, ToolDiffstatRequest, TranscriptAnchor, TranscriptRenderCache,
     TranscriptSelectionSpace, content_block_text, materialized_chat_entries_reusing, plan_status,
     tool_content_details, tool_diff_paths, tool_location_details, tool_status,
 };
+use turn_review::{TurnReview, TurnReviewIntent};
 
 const MOUSE_SCROLL_ROWS: usize = 3;
 
 pub use active::{ActiveChat, ChatPersistenceRequest};
 pub use second_opinion::SecondOpinionIntent as SecondOpinionRequest;
-pub use turn_review::{TurnReviewIntent as TurnReviewRequest, resolution_notice};
 pub use transcript::{
     BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, format_event_time,
     materialized_chunks_text, materialized_content_text, materialized_tool_diffstats,
     render_agent_message_head, render_agent_message_tail,
 };
+pub use turn_review::{TurnReviewIntent as TurnReviewRequest, resolution_notice};
 
 /// Where a host surface has told the chat to draw itself.
 ///

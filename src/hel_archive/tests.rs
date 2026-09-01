@@ -1925,22 +1925,39 @@ fn review_capture_sees_tracked_modified_and_untracked_changes_without_touching_t
         large_text("added", 800),
     )
     .unwrap();
-    fs::write(repository.path().join("staged.txt"), large_text("staged", 800)).unwrap();
+    fs::write(
+        repository.path().join("staged.txt"),
+        large_text("staged", 800),
+    )
+    .unwrap();
     git(repository.path(), &["add", "staged.txt"]);
 
     let current = capture_worktree_tree(&SystemGit, repository.path()).unwrap();
-    assert_ne!(baseline, current, "the capture must follow the working tree");
+    assert_ne!(
+        baseline, current,
+        "the capture must follow the working tree"
+    );
 
-    let patch = diff_between_trees(&SystemGit, repository.path(), Some(&baseline), &current).unwrap();
+    let patch =
+        diff_between_trees(&SystemGit, repository.path(), Some(&baseline), &current).unwrap();
     assert!(
         patch.len() > 64 * 1024,
         "the fixture must exceed one pipe buffer, got {} bytes",
         patch.len()
     );
-    assert!(patch.contains("tracked.txt"), "modified tracked file is in the patch");
-    assert!(patch.contains("untracked.txt"), "untracked file is in the patch");
+    assert!(
+        patch.contains("tracked.txt"),
+        "modified tracked file is in the patch"
+    );
+    assert!(
+        patch.contains("untracked.txt"),
+        "untracked file is in the patch"
+    );
     assert!(patch.contains("staged.txt"), "staged file is in the patch");
-    assert!(patch.contains("+changed line 799"), "the patch carries file contents");
+    assert!(
+        patch.contains("+changed line 799"),
+        "the patch carries file contents"
+    );
 
     let status_after = git(repository.path(), &["status", "--porcelain"]);
     assert_eq!(
@@ -1959,13 +1976,18 @@ fn review_capture_sees_tracked_modified_and_untracked_changes_without_touching_t
         "the capture ref pins the tree so gc cannot collect it"
     );
     assert!(
-        !repository.path().join(".git").read_dir().unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("hel-review-index-")
-        }),
+        !repository
+            .path()
+            .join(".git")
+            .read_dir()
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("hel-review-index-")
+            }),
         "the scratch index is removed after the capture"
     );
 }

@@ -720,9 +720,12 @@ impl RelayClient {
         role: Option<&str>,
         config: ReviewerLaunchConfig,
     ) -> Result<StartedReviewer> {
-        let request = self.reviewer_request(role, ReviewerRequest::Start {
-            config: Box::new(config),
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::Start {
+                config: Box::new(config),
+            },
+        )?;
         match self
             .call_with_timeout(request, RELAY_HANDSHAKE_TIMEOUT)
             .await?
@@ -751,10 +754,13 @@ impl RelayClient {
         after_digest: impl Into<String>,
     ) -> Result<RelayAttachment> {
         let after_digest = after_digest.into();
-        let request = self.reviewer_request(role, ReviewerRequest::Attach {
-            after_ordinal,
-            after_digest: after_digest.clone(),
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::Attach {
+                after_ordinal,
+                after_digest: after_digest.clone(),
+            },
+        )?;
         let payload = self
             .call_with_timeout(request, RELAY_HISTORY_TIMEOUT)
             .await?;
@@ -798,10 +804,13 @@ impl RelayClient {
         through_ordinal: u64,
         through_digest: impl Into<String>,
     ) -> Result<RelayCursor> {
-        let request = self.reviewer_request(role, ReviewerRequest::Acknowledge {
-            through_ordinal,
-            through_digest: through_digest.into(),
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::Acknowledge {
+                through_ordinal,
+                through_digest: through_digest.into(),
+            },
+        )?;
         match self
             .call_with_timeout(request, RELAY_ACKNOWLEDGE_TIMEOUT)
             .await?
@@ -825,10 +834,13 @@ impl RelayClient {
         command: RelayCommand,
     ) -> Result<u64> {
         let command_id = command_id.into();
-        let request = self.reviewer_request(role, ReviewerRequest::Submit {
-            command_id: command_id.clone(),
-            command,
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::Submit {
+                command_id: command_id.clone(),
+                command,
+            },
+        )?;
         match self.call(request).await? {
             RelayResponsePayload::Accepted {
                 command_id: accepted_id,
@@ -857,10 +869,13 @@ impl RelayClient {
         elicitation_id: String,
         response: ElicitationResponse,
     ) -> Result<()> {
-        let request = self.reviewer_request(role, ReviewerRequest::RespondElicitation {
-            elicitation_id: elicitation_id.clone(),
-            response,
-        })?;
+        let request = self.reviewer_request(
+            role,
+            ReviewerRequest::RespondElicitation {
+                elicitation_id: elicitation_id.clone(),
+                response,
+            },
+        )?;
         match self.call(request).await? {
             RelayResponsePayload::ElicitationResolved {
                 elicitation_id: resolved,
@@ -893,7 +908,10 @@ impl RelayClient {
         baselines: std::collections::BTreeMap<std::path::PathBuf, String>,
     ) -> Result<Vec<crate::hel_worker::RepoDelta>> {
         let request = self.reviewer_request(role, ReviewerRequest::CaptureDelta { baselines })?;
-        match self.call_with_timeout(request, REVIEW_CAPTURE_TIMEOUT).await? {
+        match self
+            .call_with_timeout(request, REVIEW_CAPTURE_TIMEOUT)
+            .await?
+        {
             RelayResponsePayload::ReviewDelta { repositories } => Ok(repositories),
             _ => bail!("relay returned an unexpected review capture response"),
         }
@@ -907,7 +925,10 @@ impl RelayClient {
         trees: std::collections::BTreeMap<std::path::PathBuf, String>,
     ) -> Result<()> {
         let request = self.reviewer_request(role, ReviewerRequest::AdvanceBaseline { trees })?;
-        match self.call_with_timeout(request, REVIEW_CAPTURE_TIMEOUT).await? {
+        match self
+            .call_with_timeout(request, REVIEW_CAPTURE_TIMEOUT)
+            .await?
+        {
             RelayResponsePayload::ReviewBaselineAdvanced => Ok(()),
             _ => bail!("relay returned an unexpected review baseline response"),
         }
@@ -920,7 +941,8 @@ impl RelayClient {
         role: Option<&str>,
         repositories: Vec<crate::hel_worker::AnalyzeDeltaRepository>,
     ) -> Result<String> {
-        let request = self.reviewer_request(role, ReviewerRequest::AnalyzeDelta { repositories })?;
+        let request =
+            self.reviewer_request(role, ReviewerRequest::AnalyzeDelta { repositories })?;
         match self
             .call_with_timeout(request, REVIEW_ANALYSIS_TIMEOUT)
             .await?

@@ -64,15 +64,17 @@ pub fn review_mcp_servers(
     repositories
         .iter()
         .enumerate()
-        .map(|(index, repository)| crate::hel_worker_runtime::ReviewMcpServer {
-            name: if index == 0 {
-                "bifrost".to_string()
-            } else {
-                format!("bifrost_{}", index + 1)
+        .map(
+            |(index, repository)| crate::hel_worker_runtime::ReviewMcpServer {
+                name: if index == 0 {
+                    "bifrost".to_string()
+                } else {
+                    format!("bifrost_{}", index + 1)
+                },
+                command: binary.clone(),
+                args: mcp_server_args(repository, toolset),
             },
-            command: binary.clone(),
-            args: mcp_server_args(repository, toolset),
-        })
+        )
         .collect()
 }
 
@@ -204,7 +206,11 @@ impl AnalyzeDiffResult {
         if deletions > 0 {
             summary.push_str(&format!(
                 ", {deletions} {}(-)",
-                if deletions == 1 { "deletion" } else { "deletions" }
+                if deletions == 1 {
+                    "deletion"
+                } else {
+                    "deletions"
+                }
             ));
         }
         lines.push(summary);
@@ -462,7 +468,9 @@ mod tests {
     #[test]
     fn a_changed_function_packet_names_every_callable_the_turn_touched() {
         let packet = format_changed_functions(&analysis());
-        assert!(packet.contains("- introduced: src/lib.rs:10-20 `fn retry(times: usize)` (function); new callable"));
+        assert!(packet.contains(
+            "- introduced: src/lib.rs:10-20 `fn retry(times: usize)` (function); new callable"
+        ));
         assert!(packet.contains("- edited: src/lib.rs:30-40 `fn run(&self)` (method)"));
         assert!(packet.contains("- deleted: src/old.rs:1-5 `app::old` (function)"));
         assert!(packet.contains("- moved src/old.rs:1-2 `moved` (function) -> src/new.rs:1-2"));
@@ -504,10 +512,8 @@ mod tests {
 
     #[test]
     fn one_bifrost_server_is_attached_per_reviewed_repository() {
-        let servers = review_mcp_servers(
-            &[PathBuf::from("/w/app"), PathBuf::from("/w/lib")],
-            "core",
-        );
+        let servers =
+            review_mcp_servers(&[PathBuf::from("/w/app"), PathBuf::from("/w/lib")], "core");
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].name, "bifrost");
         assert_eq!(servers[1].name, "bifrost_2");
