@@ -226,6 +226,7 @@ pub fn render_combined(
     dashboard.chat_transcript_area = None;
     dashboard.chat_prompt_area = None;
     let area = frame.area();
+    dashboard.frame_size = Some((area.width, area.height));
     if area.width < MINIMUM_TERMINAL_WIDTH {
         render_terminal_too_small(
             frame,
@@ -251,7 +252,8 @@ pub fn render_combined(
     let desired_prompt = chat.as_ref().map_or(EMPTY_PROMPT_HEIGHT, |chat| {
         chat.desired_prompt_height(area.width)
     });
-    let sessions = if layout.sessions_compact() {
+    let sessions_compact = dashboard.sessions_compact();
+    let sessions = if sessions_compact {
         // Minimized: a fixed-height grid — five content rows in a tall enough
         // terminal plus its border, or two borderless rows on a tiny one. It
         // neither grows nor shrinks, so minimum, full and cap are the same.
@@ -355,7 +357,7 @@ pub fn render_combined(
     let rendered = render_sessions(frame, sessions_area, dashboard);
     dashboard.session_row_areas = rendered.session_row_areas;
     dashboard.project_heading_areas = rendered.project_heading_areas;
-    let sessions_content = if layout.sessions_compact() && !minimized_grid_bordered(area.height) {
+    let sessions_content = if sessions_compact && !minimized_grid_bordered(area.height) {
         // The tiny grid deliberately has no border, so all two rows are
         // content. Applying the bordered inset here would collapse it to a
         // zero-height selection surface.

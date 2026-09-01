@@ -522,12 +522,12 @@ pub(crate) fn render_sessions(
     area: Rect,
     dashboard: &DashboardState,
 ) -> SessionRowsRendered {
-    if dashboard.pane_layout().sessions_compact() {
+    if dashboard.sessions_compact() {
         return render_sessions_grid(frame, area, dashboard);
     }
     let drawn = drawn_session_rows(dashboard, area.width);
     let focused = dashboard.focus() == Focus::Sessions;
-    let expanded = !dashboard.pane_layout().sessions_compact();
+    let expanded = !dashboard.sessions_compact();
     let legend = sessions_pane_title(area.width, expanded);
     let block = sessions_block(focused, legend, &dashboard.workspace_name, area.width);
     let table = Table::new(
@@ -2847,8 +2847,7 @@ mod tests {
             },
             BTreeMap::new(),
         );
-        // Two turns of the dial reach the minimized grid.
-        dashboard.cycle_pane_layout();
+        // One turn of the dial reaches the minimized grid.
         dashboard.cycle_pane_layout();
         dashboard
     }
@@ -3039,10 +3038,10 @@ mod tests {
         );
     }
 
-    /// Clicking a grid cell selects that session and opens the panes back up,
-    /// the same promotion the collapsed one-line rows do.
+    /// Clicking a grid cell selects that session and leaves the dial where
+    /// the user set it; the grid draws the selection itself.
     #[test]
-    fn clicking_a_minimized_grid_cell_selects_it_and_restores_the_panes() {
+    fn clicking_a_minimized_grid_cell_selects_it_and_keeps_the_grid() {
         use crossterm::event::{MouseButton, MouseEventKind};
 
         let mut dashboard = minimized_grid_dashboard(2, 2);
@@ -3062,9 +3061,10 @@ mod tests {
 
         assert_eq!(dashboard.selected_session_id(), Some(expected.as_str()));
         assert!(
-            !dashboard.pane_layout().sessions_compact(),
-            "the click should restore the panes"
+            dashboard.sessions_compact(),
+            "the click should leave the grid alone"
         );
+        assert_eq!(dashboard.focus(), Focus::Sessions);
     }
 
     /// A tiny terminal (under 40 rows) strips the minimized grid down to bare
@@ -3139,21 +3139,61 @@ mod tests {
         );
     }
 
-    /// Mode 2 on a tiny terminal also drops the collapsed Targets and Quota
-    /// rows, but keeps the Sessions pane and its border.
+    /// The collapsed dial draws the fixed grid on a landscape terminal: the
+    /// Sessions pane is exactly the grid's five bordered rows.
     #[test]
-    fn a_tiny_mode_two_drops_the_support_panes_but_keeps_sessions() {
+    fn collapsed_on_a_landscape_terminal_draws_the_grid() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.cycle_pane_layout();
+
+        let lines = drawn(&mut dashboard, 120, 40);
+
+        assert!(dashboard.sessions_compact());
+        let sessions_height = lines
+            .iter()
+            .position(|line| line.contains("Conversation"))
+            .expect("the conversation band");
+        assert_eq!(
+            sessions_height,
+            usize::from(crate::combined::minimized_grid_rows(40)) + 2,
+            "{lines:#?}"
+        );
+    }
+
+    /// The same dial position on a portrait terminal keeps the scrolling list,
+    /// with the 1:2 Sessions/conversation split mode 2 has always had.
+    #[test]
+    fn collapsed_on_a_portrait_terminal_draws_the_list_with_the_one_third_split() {
+        let mut dashboard = dashboard_with_session(running_session());
+        dashboard.cycle_pane_layout();
+
+        let (width, height) = (40u16, 120u16);
+        let lines = drawn(&mut dashboard, width, height);
+
+        assert!(!dashboard.sessions_compact());
+        let sessions_height = lines
+            .iter()
+            .position(|line| line.contains("Conversation"))
+            .expect("the conversation band");
+        // 120 tall, the four-row empty-prompt band, two collapsed support
+        // rows, one footer row: shared = 113, and Sessions takes a third.
+        assert_eq!(sessions_height, (120 - 4 - 2 - 1) / 3, "{lines:#?}");
+    }
+
+    /// A tiny portrait terminal keeps the session list rather than the grid,
+    /// and still drops the collapsed Targets and Quota rows.
+    #[test]
+    fn a_tiny_portrait_terminal_drops_the_support_panes_but_keeps_the_list() {
         let mut dashboard = dashboard_with_session(running_session());
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
         dashboard.apply_quota(weekly_quota("claude-1", 63));
-        // One turn of the dial reaches mode 2.
         dashboard.cycle_pane_layout();
 
-        let lines = drawn(&mut dashboard, 120, 20);
+        let lines = drawn(&mut dashboard, 34, 38);
 
         assert!(
-            lines.iter().any(|line| line.contains("Sessions")),
-            "mode 2 keeps the Sessions title: {lines:?}"
+            lines[0].contains('┌') && lines[0].contains("Sessions"),
+            "the portrait list keeps its bordered Sessions title: {lines:?}"
         );
         for gone in ["Targets", "Quota"] {
             assert!(
@@ -3190,7 +3230,8 @@ mod tests {
     }
 
     /// Navigating the Sessions pane scrolls only as far as it must to keep the
-    /// selection on screen. Once a down-arrow has scrolled to reveal a row, an
+    /// selection on screen. Drawn in a portrait terminal, where the collapsed
+    /// dial keeps the scrolling list rather than the fixed grid. Once a down-arrow has scrolled to reveal a row, an
     /// up-arrow that lands on a still-visible row must not scroll back — the
     /// pane only scrolls up again when the selection would leave the top.
     #[test]
@@ -3204,13 +3245,13 @@ mod tests {
         dashboard.selected_session_id = Some("session-00".into());
 
         // At the top, no scroll.
-        drawn(&mut dashboard, 120, 44);
+        drawn(&mut dashboard, 36, 42);
         assert_eq!(dashboard.sessions_scroll.get(), 0);
 
         // Arrow down far enough that the pane has to scroll.
         for _ in 0..9 {
             dashboard.handle_key(key(KeyCode::Down));
-            drawn(&mut dashboard, 120, 44);
+            drawn(&mut dashboard, 36, 42);
         }
         let scrolled = dashboard.sessions_scroll.get();
         assert!(scrolled > 0, "the pane should have scrolled down");
@@ -3218,7 +3259,7 @@ mod tests {
         // One arrow up lands on a row that is still visible, so the pane holds
         // its position rather than scrolling back toward the top.
         dashboard.handle_key(key(KeyCode::Up));
-        drawn(&mut dashboard, 120, 44);
+        drawn(&mut dashboard, 36, 42);
         assert_eq!(
             dashboard.sessions_scroll.get(),
             scrolled,
@@ -3228,7 +3269,7 @@ mod tests {
         // Walking all the way back to the first session does scroll up.
         for _ in 0..11 {
             dashboard.handle_key(key(KeyCode::Up));
-            drawn(&mut dashboard, 120, 44);
+            drawn(&mut dashboard, 36, 42);
         }
         assert_eq!(dashboard.sessions_scroll.get(), 0);
     }
