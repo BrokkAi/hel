@@ -3422,103 +3422,152 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_serves_management_actions_for_any_protocol_version() {
-        let state = test_runtime_state();
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let metadata = DaemonMetadata {
-            protocol_version: PROTOCOL_VERSION,
-            pid: 1,
-            address,
-            token: "right-token".into(),
-            started_at: "now".into(),
-            build_version: "test".into(),
-        };
-        let server_metadata = metadata.clone();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            serve_client(stream, server_metadata, state, CancellationToken::new())
-                .await
-                .unwrap();
-        });
-        let mut stream = TcpStream::connect(address).await.unwrap();
-        write_frame(
-            &mut stream,
-            &RequestEnvelope {
-                protocol_version: 3,
-                request_id: 44,
+        // 3 is an older shipped client; 5 stands in for a future one. Both
+        // directions must stay manageable.
+        for version in [3_u32, 5] {
+            let state = test_runtime_state();
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let metadata = DaemonMetadata {
+                protocol_version: PROTOCOL_VERSION,
+                pid: 1,
+                address,
                 token: "right-token".into(),
-                action: DaemonAction::Status,
-            },
-        )
-        .await
-        .unwrap();
-        let response: ResponseEnvelope = read_frame(&mut stream).await.unwrap();
-        assert_eq!(response.protocol_version, 3, "reply must use the caller's dialect");
-        assert_eq!(response.request_id, 44);
-        match response.result.unwrap() {
-            DaemonReply::Status(status) => assert_eq!(status.build_version, "test"),
-            reply => panic!("unexpected reply {reply:?}"),
+                started_at: "now".into(),
+                build_version: "test".into(),
+            };
+            let server_metadata = metadata.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_client(stream, server_metadata, state, CancellationToken::new())
+                    .await
+                    .unwrap();
+            });
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            write_frame(
+                &mut stream,
+                &RequestEnvelope {
+                    protocol_version: version,
+                    request_id: 44,
+                    token: "right-token".into(),
+                    action: DaemonAction::Status,
+                },
+            )
+            .await
+            .unwrap();
+            let response: ResponseEnvelope = read_frame(&mut stream).await.unwrap();
+            assert_eq!(
+                response.protocol_version, version,
+                "reply must use the caller's dialect"
+            );
+            assert_eq!(response.request_id, 44);
+            match response.result.unwrap() {
+                DaemonReply::Status(status) => assert_eq!(status.build_version, "test"),
+                reply => panic!("unexpected reply {reply:?}"),
+            }
+            drop(stream);
+            server.await.unwrap();
         }
-        drop(stream);
-        server.await.unwrap();
+    }
+
+    struct ProtocolTranscript {
+        protocol_version: u32,
+        daemon_build: &'static str,
+        /// The exact frames the client must emit, in order (status, then stop).
+        expected_requests: [serde_json::Value; 2],
+        /// The exact frame bodies that version's daemon replies with, as raw
+        /// JSON so the fixture cannot drift along with this build's types.
+        responses: [&'static str; 2],
+    }
+
+    /// One transcript per released daemon protocol version, transcribed from
+    /// the release tags (v0.3.x speaks 3, v0.4.x speaks 4; v0.1/v0.2 predate
+    /// the daemon). When `PROTOCOL_VERSION` bumps, add the new version here —
+    /// the frozen management subset means the entry differs only in its
+    /// version number and build string. Do not edit existing entries: they are
+    /// what shipped.
+    fn released_protocol_transcripts() -> Vec<ProtocolTranscript> {
+        let requests = |version: u32| {
+            [
+                serde_json::json!({
+                    "protocol_version": version,
+                    "request_id": 1,
+                    "token": "tok",
+                    "action": {"action": "status"},
+                }),
+                serde_json::json!({
+                    "protocol_version": version,
+                    "request_id": 2,
+                    "token": "tok",
+                    "action": {"action": "stop"},
+                }),
+            ]
+        };
+        vec![
+            ProtocolTranscript {
+                protocol_version: 3,
+                daemon_build: "0.3.1",
+                expected_requests: requests(3),
+                responses: [
+                    r#"{"protocol_version":3,"request_id":1,"result":{"Ok":{"reply":"status","value":{"pid":4242,"started_at":"2026-09-01T07:48:14Z","build_version":"0.3.1","attached_clients":1,"phone_status":{"state":"ready","viewer_url":"https://example.test:1","viewer_code":"690451","qr_login_url":null,"fallback_reason":null}}}}}"#,
+                    r#"{"protocol_version":3,"request_id":2,"result":{"Ok":{"reply":"done"}}}"#,
+                ],
+            },
+            ProtocolTranscript {
+                protocol_version: 4,
+                daemon_build: "0.4.1",
+                expected_requests: requests(4),
+                responses: [
+                    r#"{"protocol_version":4,"request_id":1,"result":{"Ok":{"reply":"status","value":{"pid":4242,"started_at":"2026-09-01T07:48:14Z","build_version":"0.4.1","attached_clients":1,"phone_status":{"state":"disabled"}}}}}"#,
+                    r#"{"protocol_version":4,"request_id":2,"result":{"Ok":{"reply":"done"}}}"#,
+                ],
+            },
+        ]
     }
 
     #[tokio::test]
-    async fn management_client_drives_a_protocol_three_daemon() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            loop {
-                let request: RequestEnvelope = read_frame(&mut stream).await.unwrap();
-                assert_eq!(
-                    request.protocol_version, 3,
-                    "client must speak the daemon's dialect"
-                );
-                assert_eq!(request.token, "tok");
-                let reply = match request.action {
-                    DaemonAction::Status => DaemonReply::Status(DaemonStatus {
-                        pid: 4242,
-                        started_at: "2026-09-01T07:48:14Z".into(),
-                        build_version: "0.3.1".into(),
-                        attached_clients: 0,
-                        phone_status: WebViewerStatus::Disabled,
-                    }),
-                    DaemonAction::Stop => DaemonReply::Done,
-                    action => panic!("unexpected action {action:?}"),
-                };
-                let stopping = matches!(reply, DaemonReply::Done);
-                write_frame(
-                    &mut stream,
-                    &ResponseEnvelope {
-                        protocol_version: 3,
-                        request_id: request.request_id,
-                        result: Ok(reply),
-                    },
-                )
-                .await
-                .unwrap();
-                if stopping {
-                    break;
+    async fn management_client_talks_to_every_released_protocol_version() {
+        for transcript in released_protocol_transcripts() {
+            let protocol_version = transcript.protocol_version;
+            let daemon_build = transcript.daemon_build;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                for (expected, response) in transcript
+                    .expected_requests
+                    .iter()
+                    .zip(transcript.responses)
+                {
+                    let request: serde_json::Value = read_frame(&mut stream).await.unwrap();
+                    assert_eq!(
+                        &request, expected,
+                        "protocol {} daemon would reject this frame",
+                        transcript.protocol_version
+                    );
+                    stream.write_u32(response.len() as u32).await.unwrap();
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.flush().await.unwrap();
                 }
-            }
-        });
-        let metadata = DaemonMetadata {
-            protocol_version: 3,
-            pid: 4242,
-            address,
-            token: "tok".into(),
-            started_at: "2026-09-01T07:48:14Z".into(),
-            build_version: "0.3.1".into(),
-        };
-        let mut client = ManagementClient {
-            inner: DaemonClient::connect(metadata).await.unwrap(),
-        };
-        let status = client.status().await.unwrap();
-        assert_eq!(status.build_version, "0.3.1");
-        assert_eq!(client.protocol_version(), 3);
-        client.stop().await.unwrap();
-        server.await.unwrap();
+            });
+            let metadata = DaemonMetadata {
+                protocol_version,
+                pid: 4242,
+                address,
+                token: "tok".into(),
+                started_at: "2026-09-01T07:48:14Z".into(),
+                build_version: daemon_build.into(),
+            };
+            let mut client = ManagementClient {
+                inner: DaemonClient::connect(metadata).await.unwrap(),
+            };
+            let status = client.status().await.unwrap();
+            assert_eq!(status.build_version, daemon_build);
+            assert_eq!(status.attached_clients, 1);
+            assert_eq!(client.protocol_version(), protocol_version);
+            client.stop().await.unwrap();
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
