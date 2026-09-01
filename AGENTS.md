@@ -33,6 +33,7 @@ unless the user explicitly says not to commit. Do not push unless the user
 explicitly asks.
 
 Commit directly to the current branch. This rule also applies when the current branch is `master`.
+Similarly, push to upstream, even when upstream is `master`.
 
 Do not create a branch, change branches, rebase, or open a pull request unless the user gives an explicit instruction.
 
