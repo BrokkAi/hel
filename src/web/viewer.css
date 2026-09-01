@@ -112,8 +112,12 @@ h3 {
   color: var(--dim);
 }
 
+/* A utility that has to win. It is applied to elements whose own rule sets a
+ * display, and source order would otherwise decide which of the two applies —
+ * which is how a menu that had been told to hide stayed on screen, swallowing
+ * taps meant for the page behind it. */
 .hidden {
-  display: none;
+  display: none !important;
 }
 
 /* ---- surfaces ---- */
@@ -636,4 +640,153 @@ details.block-fold > pre {
   details.block-fold > summary::before {
     transition: none;
   }
+}
+
+/* ---- application shell ---- */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+#shell-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#shell-title {
+  flex: 1;
+  font-size: 22px;
+  letter-spacing: 0.08em;
+  margin: 12px 0;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.icon-button {
+  background: var(--surface-raised);
+  color: var(--text);
+  font-weight: 400;
+  padding: 0;
+  width: var(--touch);
+  height: var(--touch);
+  flex: 0 0 var(--touch);
+}
+
+.menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  min-width: 180px;
+}
+
+.menu button {
+  background: none;
+  color: var(--text);
+  font-weight: 400;
+  text-align: left;
+  border: 1px solid transparent;
+}
+
+/* ---- workspace tabs ---- */
+
+.tabstrip {
+  display: flex;
+  gap: 6px;
+  padding: 4px 0 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  background: none;
+  color: var(--dim);
+  font-weight: 400;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+/* Selection is a border and a word, never colour alone. */
+.tab[aria-current='page'] {
+  color: var(--text);
+  border-color: var(--focus);
+}
+
+/* ---- pages ---- */
+
+.page:focus {
+  outline: none;
+}
+
+.page-actions {
+  margin: 12px 0;
+}
+
+.project-heading {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 14px;
+  margin: 16px 0 4px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.session-status {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.state-glyph {
+  margin-right: 4px;
+}
+
+.pill.state-live {
+  color: var(--done);
+  border-color: var(--done);
+}
+.pill.state-starting,
+.pill.state-stopping {
+  color: var(--running);
+  border-color: var(--running);
+}
+.pill.state-failed {
+  color: var(--failed);
+  border-color: var(--failed);
+}
+
+.session-operation {
+  color: var(--running);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 12px 0;
+}
+
+.field > span {
+  color: var(--dim);
+  font-size: 14px;
 }

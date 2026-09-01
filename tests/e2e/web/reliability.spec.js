@@ -1,6 +1,10 @@
 const fs = require('node:fs');
 const { test, expect } = require('@playwright/test');
 
+function escapeForRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function required(name) {
   const value = process.env[name];
   if (!value) throw new Error(`missing ${name}`);
@@ -45,7 +49,9 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
   const qrPage = await qrContext.newPage();
   await qrPage.goto(qrLoginUrl);
   await expect(qrPage.locator('#app')).toBeVisible();
-  await expect(qrPage).toHaveURL(baseUrl + '/');
+  // The login token must not survive in the URL, and the viewer lands on a
+  // workspace rather than on a bare path.
+  await expect(qrPage).toHaveURL(new RegExp('^' + escapeForRegExp(baseUrl) + '/(#workspace/.+)?$'));
   await qrContext.close();
 
   stage('code-login');
@@ -67,8 +73,21 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
 
     stage('snapshot-rendered');
-    await expect(page.locator('#configured')).toContainText('fake');
-    await expect(page.locator('#configured')).toContainText('1 targets · 1 bundles');
+    // The dashboard opens on a workspace, and the workspace is in the URL.
+    await expect(page.locator('#workspaces .tab')).toHaveCount(1);
+    await expect(page).toHaveURL(/#workspace\//);
+    const workspaceHash = new URL(page.url()).hash;
+
+    // Quota is a page reached from the menu, not a card on the dashboard.
+    await page.locator('#menu-button').click();
+    await page.getByRole('menuitem', { name: 'Quota' }).click();
+    await expect(page).toHaveURL(/#quota$/);
+    await expect(page.locator('#quota')).toContainText('fake');
+    await page.getByRole('button', { name: 'Back' }).click();
+    await expect(page).toHaveURL(new RegExp(escapeForRegExp(workspaceHash) + '$'));
+
+    await page.getByRole('button', { name: 'New session' }).click();
+    await expect(page).toHaveURL(/\/new$/);
     await page.locator('#new-title').fill(title);
     await page.locator('#new-project-directory').fill(projectDirectory);
     await page.getByRole('button', { name: 'Start' }).click();
@@ -78,8 +97,12 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await expect(session).toContainText('running');
     stage('session-running');
     await session.getByRole('button', { name: 'Open' }).click();
+    await expect(page).toHaveURL(/#conversation\//);
     await expect(page.locator('#conversation-title')).toHaveText(title);
-    await page.getByRole('button', { name: 'Dashboard' }).click();
+    // The browser's own Back button returns to the dashboard rather than
+    // leaving the application.
+    await page.goBack();
+    await expect(page.locator('#dashboard')).toBeVisible();
 
     await context.setOffline(true);
     fs.writeFileSync(readyMarker, 'browser offline and ready\n');
@@ -87,12 +110,19 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await expect.poll(() => fs.existsSync(changedMarker)).toBe(true);
     await context.setOffline(false);
 
-    await expect(session).toContainText('stopped');
-    await session.getByRole('button', { name: 'Resume' }).click();
+    // A stopped session leaves the dashboard: it belongs to the resume flow,
+    // which is where a person can do something about it.
+    await expect(session).toHaveCount(0);
+    await page.getByRole('button', { name: 'Resume a session' }).click();
+    await expect(page).toHaveURL(/\/resume$/);
+    const resumable = page.locator('#resumable .session').filter({ hasText: title });
+    await expect(resumable).toBeVisible();
+    await resumable.getByRole('button', { name: 'Resume' }).click();
+    await page.getByRole('button', { name: 'Back' }).click();
     await expect(session).toContainText('running');
     page.once('dialog', dialog => dialog.accept());
     await session.getByRole('button', { name: 'Stop' }).click();
-    await expect(session).toContainText('stopped');
+    await expect(session).toHaveCount(0);
     await expect(page.locator('#action-error')).toHaveText('');
     expect(responseErrors).toEqual([]);
 
@@ -108,10 +138,14 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await expect(page.locator('#login')).toBeVisible();
     await codeLogin(page, baseUrl, code);
     expect(responseErrors).toEqual([]);
-    await page.getByRole('button', { name: 'Sign out' }).click();
+    await page.locator('#menu-button').click();
+    await page.getByRole('menuitem', { name: 'Sign out' }).click();
     await expect(page.locator('#login')).toBeVisible();
   } catch (error) {
-    await page.locator('#code').fill('').catch(() => {});
+    await page
+      .locator('#code')
+      .fill('')
+      .catch(() => {});
     await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
     await context.tracing.stop({ path: tracePath }).catch(() => {});
     throw error;

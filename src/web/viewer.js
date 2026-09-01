@@ -20,17 +20,28 @@ function button(label, className, data) {
 
 const login = document.querySelector('#login'),
   app = document.querySelector('#app'),
-  dashboard = document.querySelector('#dashboard'),
-  conversation = document.querySelector('#conversation'),
+  header = document.querySelector('#shell-header'),
+  shellTitle = document.querySelector('#shell-title'),
+  backButton = document.querySelector('#back'),
+  menuButton = document.querySelector('#menu-button'),
+  menu = document.querySelector('#menu'),
+  announcer = document.querySelector('#announcer'),
+  workspaceStrip = document.querySelector('#workspaces'),
   sessions = document.querySelector('#sessions'),
-  configured = document.querySelector('#configured'),
+  resumable = document.querySelector('#resumable'),
+  targetsPanel = document.querySelector('#targets'),
+  quotaPanel = document.querySelector('#quota'),
   logout = document.querySelector('#logout'),
   newForm = document.querySelector('#new-form'),
+  newTitle = document.querySelector('#new-title'),
   newProfile = document.querySelector('#new-profile'),
   newBundle = document.querySelector('#new-bundle'),
   newTarget = document.querySelector('#new-target'),
   newProjectDirectory = document.querySelector('#new-project-directory'),
+  newProjectDirectoryField = document.querySelector('#new-project-directory-field'),
+  newError = document.querySelector('#new-error'),
   actionError = document.querySelector('#action-error'),
+  resumeError = document.querySelector('#resume-error'),
   feed = document.querySelector('#conversation-feed'),
   queue = document.querySelector('#conversation-queue'),
   shells = document.querySelector('#conversation-shells'),
@@ -39,14 +50,34 @@ const login = document.querySelector('#login'),
   attachments = document.querySelector('#attachments'),
   attachImage = document.querySelector('#attach-image'),
   imagePicker = document.querySelector('#image-picker');
+
+/// Every page, by the route name that shows it.
+const PAGES = {
+  dashboard: document.querySelector('#dashboard'),
+  new: document.querySelector('#new-page'),
+  resume: document.querySelector('#resume-page'),
+  targets: document.querySelector('#targets-page'),
+  quota: document.querySelector('#quota-page'),
+  conversation: document.querySelector('#conversation'),
+};
+
 /// Transcript nodes by entry id, so an update patches the row it belongs to
 /// rather than searching the whole document for it.
 const entryNodes = new Map();
 let snapshot,
+  route = { name: 'dashboard' },
   currentSession,
   cursor = 0,
   acknowledged = 0,
   eventSource;
+
+/// Actions the browser has asked for and not yet heard back about.
+///
+/// A control is disabled because it is in this set, not because a handler
+/// disabled it: state decides, so a re-render cannot lose the fact and a
+/// failure cannot leave a button dead.
+const pendingActions = new Set();
+
 async function request(url, options = {}) {
   const response = await fetch(url, {
     ...options,
@@ -60,6 +91,319 @@ async function request(url, options = {}) {
   if (response.status === 202 || response.status === 204) return null;
   return response.json();
 }
+
+/// Say something once, for a screen reader.
+function announce(message) {
+  announcer.textContent = message;
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+//
+// The URL is the state. Back, Forward, reload and a shared link all work
+// because nothing but the router writes `location.hash`, and every page is
+// rendered from what the router parsed rather than from what a click handler
+// remembered.
+
+const ID = '[A-Za-z0-9_-]+';
+const ROUTE_PATTERNS = [
+  [new RegExp(`^#workspace/(${ID})/new$`), ([id]) => ({ name: 'new', workspaceId: id })],
+  [new RegExp(`^#workspace/(${ID})/resume$`), ([id]) => ({ name: 'resume', workspaceId: id })],
+  [new RegExp(`^#workspace/(${ID})$`), ([id]) => ({ name: 'dashboard', workspaceId: id })],
+  [new RegExp(`^#conversation/(${ID})$`), ([id]) => ({ name: 'conversation', sessionId: id })],
+  [/^#targets$/, () => ({ name: 'targets' })],
+  [/^#quota$/, () => ({ name: 'quota' })],
+];
+
+function parseRoute(hash) {
+  for (const [pattern, build] of ROUTE_PATTERNS) {
+    const match = pattern.exec(hash);
+    if (match) return build(match.slice(1));
+  }
+  return { name: 'dashboard' };
+}
+
+function routeHash(next) {
+  switch (next.name) {
+    case 'new':
+      return `#workspace/${next.workspaceId}/new`;
+    case 'resume':
+      return `#workspace/${next.workspaceId}/resume`;
+    case 'conversation':
+      return `#conversation/${next.sessionId}`;
+    case 'targets':
+      return '#targets';
+    case 'quota':
+      return '#quota';
+    default:
+      return next.workspaceId ? `#workspace/${next.workspaceId}` : '';
+  }
+}
+
+/// Go to a route. Assigning the hash it already has fires no `hashchange`, so
+/// the render is called directly in that case rather than being dropped.
+function navigate(next) {
+  const hash = routeHash(next);
+  const current = location.hash;
+  if (hash === current || (!hash && !current)) {
+    applyRoute();
+    return;
+  }
+  location.hash = hash;
+}
+
+/// The workspace the route names, or the one to fall back to.
+function selectedWorkspaceId() {
+  const workspaces = snapshot?.workspaces || [];
+  if (route.workspaceId && workspaces.some(w => w.id === route.workspaceId)) {
+    return route.workspaceId;
+  }
+  if (route.name === 'conversation') {
+    const session = snapshot?.sessions.find(s => s.id === route.sessionId);
+    if (session?.workspace_id) return session.workspace_id;
+  }
+  return workspaces[0]?.id;
+}
+
+function applyRoute() {
+  route = parseRoute(location.hash);
+  if (!snapshot) return;
+
+  // The dashboard names its workspace in the URL, so a reload, a Back press
+  // and a shared link all return to the same one. An empty hash is the state
+  // a first visit is in, and canonicalising it here is what gives every later
+  // navigation something to go back to.
+  if (route.name === 'dashboard' && !route.workspaceId) {
+    const workspaceId = selectedWorkspaceId();
+    if (workspaceId) {
+      navigate({ name: 'dashboard', workspaceId });
+      return;
+    }
+  }
+
+  // A conversation route only means a conversation while that session still
+  // has one. Otherwise it is a stale link, and the dashboard is the answer.
+  if (route.name === 'conversation') {
+    const session = snapshot.sessions.find(s => s.id === route.sessionId);
+    if (!session?.capabilities?.open) {
+      navigate({ name: 'dashboard', workspaceId: selectedWorkspaceId() });
+      return;
+    }
+  }
+
+  const name = PAGES[route.name] ? route.name : 'dashboard';
+  for (const [key, page] of Object.entries(PAGES)) page.classList.toggle('hidden', key !== name);
+  workspaceStrip.classList.toggle('hidden', name === 'conversation');
+  backButton.classList.toggle('hidden', name === 'dashboard');
+  shellTitle.textContent =
+    {
+      new: 'New session',
+      resume: 'Resume',
+      targets: 'Targets',
+      quota: 'Quota',
+      conversation: 'Conversation',
+    }[name] || 'HEL';
+
+  if (name === 'conversation') {
+    openConversation(route.sessionId);
+  } else if (currentSession) {
+    leaveConversation();
+  }
+  renderRoute();
+  // A screen reader should land at the top of the page it just moved to
+  // rather than wherever it happened to be.
+  PAGES[name].setAttribute('tabindex', '-1');
+  PAGES[name].focus({ preventScroll: true });
+  announce(shellTitle.textContent);
+}
+
+function renderRoute() {
+  if (!snapshot) return;
+  renderWorkspaces();
+  switch (route.name) {
+    case 'new':
+      renderNewForm();
+      break;
+    case 'resume':
+      renderResumable();
+      break;
+    case 'targets':
+      renderTargets();
+      break;
+    case 'quota':
+      renderQuota();
+      break;
+    case 'conversation':
+      break;
+    default:
+      renderSessions();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces
+// ---------------------------------------------------------------------------
+
+function renderWorkspaces() {
+  const selected = selectedWorkspaceId();
+  workspaceStrip.replaceChildren(
+    ...(snapshot.workspaces || []).map(workspace => {
+      const tab = el('button', 'tab', workspace.name);
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-selected', String(workspace.id === selected));
+      // Selection is a word to a screen reader and a border to everyone else,
+      // never colour alone.
+      if (workspace.id === selected) tab.setAttribute('aria-current', 'page');
+      tab.dataset.workspaceId = workspace.id;
+      return tab;
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The session list
+// ---------------------------------------------------------------------------
+
+/// The state word and its icon. Colour alone never says what a session is
+/// doing, because colour is the one channel a reader may not have.
+const LIFECYCLE_ICON = {
+  live: '●',
+  starting: '◐',
+  stopping: '◑',
+  stopped: '○',
+  failed: '×',
+};
+
+function liveSessions() {
+  const workspaceId = selectedWorkspaceId();
+  return (snapshot.sessions || []).filter(
+    session =>
+      session.workspace_id === workspaceId &&
+      ['live', 'starting', 'stopping'].includes(session.lifecycle),
+  );
+}
+
+/// Sessions grouped by project, in the order the projects first appear.
+function byProject(list) {
+  const groups = new Map();
+  for (const session of list) {
+    const key = session.project_key || session.bundle_id;
+    if (!groups.has(key)) groups.set(key, { label: session.project_label || key, sessions: [] });
+    groups.get(key).sessions.push(session);
+  }
+  return [...groups.values()];
+}
+
+function renderSessions() {
+  const groups = byProject(liveSessions());
+  if (!groups.length) {
+    sessions.replaceChildren(el('p', 'dim', 'No live sessions in this workspace.'));
+    return;
+  }
+  sessions.replaceChildren(
+    ...groups.map(group => {
+      const section = el('section', 'project');
+      const heading = el('h2', 'project-heading');
+      heading.append(el('span', '', group.label), el('span', 'dim', ` ${group.sessions.length}`));
+      section.append(heading);
+      const list = el('div', 'project-sessions');
+      list.setAttribute('role', 'list');
+      for (const session of group.sessions) {
+        const row = sessionCard(session);
+        row.setAttribute('role', 'listitem');
+        list.append(row);
+      }
+      section.append(list);
+      return section;
+    }),
+  );
+}
+
+/// One session row.
+///
+/// Every control here appears because a capability the daemon published says
+/// it may. Nothing on this page infers what is legal from a status string.
+function sessionCard(session) {
+  const card = el('article', 'card session');
+  card.dataset.sessionId = session.id;
+
+  const heading = el('h3', '', session.title);
+  card.append(heading);
+
+  const status = el('p', 'session-status');
+  const state = el('span', `pill state-${session.lifecycle}`);
+  state.append(
+    withHiddenGlyph(LIFECYCLE_ICON[session.lifecycle] || '○'),
+    el('span', '', session.state),
+  );
+  status.append(state);
+  if (session.has_error) status.append(el('span', 'pill alert', 'needs attention'));
+  if (session.pending_elicitations?.length) {
+    status.append(el('span', 'pill alert', 'input needed'));
+  }
+  const queued = (session.queued_prompts || []).length;
+  if (queued) status.append(el('span', 'pill', `${queued} queued`));
+  card.append(status);
+
+  if (session.operation) {
+    const stage = session.operation.stages.map(entry => entry.label).join(' · ');
+    card.append(
+      el(
+        'p',
+        'session-operation',
+        stage ? `${session.operation.kind} — ${stage}` : session.operation.kind,
+      ),
+    );
+  }
+
+  card.append(el('p', 'dim', `${session.target_id} · ${session.profile_id}`));
+
+  if (session.preview?.length) {
+    card.append(el('p', 'preview', session.preview.join('\n')));
+  }
+
+  const actions = el('div', 'row');
+  const can = session.capabilities || {};
+  if (can.open) actions.append(action('Open', '', { action: 'open', id: session.id }));
+  if (can.rename)
+    actions.append(action('Rename', 'secondary', { action: 'rename', id: session.id }));
+  if (can.cancel_operation) {
+    actions.append(action('Cancel', 'danger', { action: 'cancel', id: session.id }));
+  }
+  if (can.stop) actions.append(action('Stop', 'danger', { action: 'close', id: session.id }));
+  if (can.resume) {
+    actions.append(
+      action('Resume', '', {
+        action: 'resume',
+        id: session.id,
+        profile: session.profile_id,
+        target: session.target_id,
+      }),
+    );
+  }
+  card.append(actions);
+  return card;
+}
+
+/// A glyph that repeats what an adjacent word already says, so it is
+/// decoration to a screen reader rather than a second reading of the same fact.
+function withHiddenGlyph(glyph) {
+  const node = el('span', 'state-glyph', glyph);
+  node.setAttribute('aria-hidden', 'true');
+  return node;
+}
+
+function action(label, className, data) {
+  const node = button(label, className, data);
+  node.disabled = pendingActions.has(`${data.action}:${data.id}`);
+  return node;
+}
+
+// ---------------------------------------------------------------------------
+// The other pages
+// ---------------------------------------------------------------------------
+
 function fillOptions(select, items, selected) {
   select.replaceChildren(
     ...items.map(item => {
@@ -74,10 +418,128 @@ function fillOptions(select, items, selected) {
 function syncProjectDirectory() {
   const required =
     snapshot?.targets.find(x => x.id === newTarget.value)?.requires_project_directory === true;
-  newProjectDirectory.classList.toggle('hidden', !required);
+  newProjectDirectoryField.classList.toggle('hidden', !required);
   newProjectDirectory.required = required;
+  newBundle.closest('.field').classList.toggle('hidden', required);
   if (!required) newProjectDirectory.value = '';
 }
+
+function renderNewForm() {
+  if (!newProfile.value) fillOptions(newProfile, snapshot.profiles);
+  if (!newTarget.value) fillOptions(newTarget, snapshot.targets);
+  if (!newBundle.value) fillOptions(newBundle, snapshot.bundles);
+  syncProjectDirectory();
+}
+
+/// Sessions that are not live and that Hel owns, which is what "resume" means.
+function renderResumable() {
+  const workspaceId = selectedWorkspaceId();
+  const list = (snapshot.sessions || []).filter(
+    session => session.workspace_id === workspaceId && session.capabilities?.resume,
+  );
+  if (!list.length) {
+    resumable.replaceChildren(el('p', 'dim', 'No sessions to resume in this workspace.'));
+    return;
+  }
+  resumable.replaceChildren(
+    ...list.map(session => {
+      const card = el('article', 'card session');
+      card.dataset.sessionId = session.id;
+      card.append(el('h3', '', session.title));
+      card.append(el('p', 'dim', `${session.state} · ${session.profile_id}`));
+      if (!session.compatible_resume_targets?.length) {
+        card.append(
+          el(
+            'p',
+            'dim',
+            'This session cannot resume on any configured target. Finish it in the terminal.',
+          ),
+        );
+        return card;
+      }
+      const row = el('div', 'row');
+      const targets = el('select');
+      targets.setAttribute('aria-label', 'Target');
+      fillOptions(
+        targets,
+        session.compatible_resume_targets.map(id => ({ id })),
+        session.target_id,
+      );
+      targets.dataset.role = 'resume-target';
+      row.append(targets);
+      row.append(
+        action('Resume', '', {
+          action: 'resume',
+          id: session.id,
+          profile: session.profile_id,
+          target: session.target_id,
+        }),
+      );
+      card.append(row);
+      return card;
+    }),
+  );
+}
+
+function renderTargets() {
+  const readings = snapshot.capacity || [];
+  if (!readings.length) {
+    targetsPanel.replaceChildren(
+      el('p', 'dim', 'No capacity readings yet.'),
+      el(
+        'p',
+        'dim',
+        (snapshot.targets || []).map(target => `${target.id} (${target.kind})`).join(', '),
+      ),
+    );
+    return;
+  }
+  targetsPanel.replaceChildren(
+    ...readings.map(reading => {
+      const card = el('article', 'card');
+      card.append(el('h3', '', reading.label));
+      card.append(el('p', 'dim', reading.target_ids.join(', ')));
+      return card;
+    }),
+  );
+}
+
+function renderQuota() {
+  quotaPanel.replaceChildren(
+    ...(snapshot.profiles || []).map(profile => {
+      const card = el('article', 'card');
+      card.append(el('h3', '', profile.id));
+      card.append(el('p', 'dim', profile.harness_kind));
+      const quota = profile.quota;
+      if (!quota) {
+        card.append(el('p', 'dim', 'quota unavailable'));
+        return card;
+      }
+      for (const window of quota.windows || []) {
+        const row = el('p');
+        row.append(el('span', '', `${window.label} `));
+        row.append(
+          el(
+            'span',
+            '',
+            window.percent_used === undefined ? 'unknown' : `${window.percent_used}% used`,
+          ),
+        );
+        if (window.resets_at) row.append(el('span', 'dim', ` · resets ${window.resets_at}`));
+        card.append(row);
+      }
+      if (!(quota.windows || []).length) card.append(el('p', 'dim', quota.summary));
+      if (quota.stale) card.append(el('p', 'dim', 'stale'));
+      if (quota.has_error) card.append(el('p', 'dim', 'unavailable'));
+      return card;
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------
+
 function startEvents() {
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/api/events');
@@ -86,65 +548,25 @@ function startEvents() {
     if (currentSession) loadConversation(true);
   });
 }
-/// One session row.
-///
-/// Which actions appear is still read from the session's state string; the
-/// plan replaces that with the daemon's own `ViewerSessionCapabilities` in
-/// Milestone 3, and this is the only place that will have to change.
-function sessionCard(session) {
-  const card = el('article', 'card session');
-  card.append(el('h3', '', session.title));
 
-  const status = el('p');
-  status.append(el('span', 'pill', session.state));
-  if (session.has_error) status.append(el('span', 'pill alert', 'needs attention'));
-  if (session.pending_elicitations?.length) {
-    status.append(el('span', 'pill alert', 'input needed'));
+function showLogin() {
+  snapshot = undefined;
+  currentSession = null;
+  if (eventSource) {
+    eventSource.close();
+    eventSource = undefined;
   }
-  status.append(el('span', '', ` ${session.harness_kind} \u00b7 ${session.profile_id}`));
-  card.append(status);
-
-  const queued = (session.queued_prompts || []).length;
-  card.append(
-    el('p', 'dim', `${session.bundle_id} \u2192 ${session.target_id} \u00b7 ${queued} queued`),
-  );
-
-  if (session.preview?.length) {
-    card.append(el('p', 'preview', session.preview.join('\n')));
-  }
-
-  const actions = el('div', 'row');
-  const open = button('Open', '', { action: 'open', id: session.id });
-  open.disabled = !session.conversation_available;
-  actions.append(open);
-  if (session.state === 'provisioning') {
-    actions.append(button('Cancel', 'danger', { action: 'cancel', id: session.id }));
-  } else {
-    actions.append(
-      button('Resume', '', {
-        action: 'resume',
-        id: session.id,
-        profile: session.profile_id,
-        target: session.target_id,
-      }),
-      button('Stop', 'danger', { action: 'close', id: session.id }),
-    );
-  }
-  card.append(actions);
-  return card;
-}
-
-function profileRow(profile) {
-  const row = el('p');
-  row.append(el('strong', '', profile.id), el('span', '', ` \u00b7 ${profile.harness_kind}`));
-  row.append(el('br'));
-  const quota = profile.quota
-    ? profile.quota.summary +
-      (profile.quota.stale ? ' \u00b7 stale' : '') +
-      (profile.quota.has_error ? ' \u00b7 unavailable' : '')
-    : 'quota unavailable';
-  row.append(el('span', 'dim', quota));
-  return row;
+  // Nothing from the previous viewer may survive a sign-out in this tab.
+  pendingActions.clear();
+  entryNodes.clear();
+  elicitationCards.clear();
+  sentElicitations.clear();
+  promptImages = [];
+  login.classList.remove('hidden');
+  app.classList.add('hidden');
+  menuButton.classList.add('hidden');
+  backButton.classList.add('hidden');
+  closeMenu();
 }
 
 async function refresh() {
@@ -152,56 +574,37 @@ async function refresh() {
     snapshot = await request('/api/snapshot');
     login.classList.add('hidden');
     app.classList.remove('hidden');
-    logout.classList.remove('hidden');
-    if (!newProfile.value) fillOptions(newProfile, snapshot.profiles);
-    if (!newBundle.value) fillOptions(newBundle, snapshot.bundles);
-    if (!newTarget.value) fillOptions(newTarget, snapshot.targets);
-    syncProjectDirectory();
-    sessions.replaceChildren(...snapshot.sessions.map(sessionCard));
-    if (!snapshot.sessions.length) {
-      sessions.append(el('p', 'dim', 'No Hel-managed sessions.'));
-    }
-    configured.replaceChildren(
-      ...snapshot.profiles.map(profileRow),
-      el(
-        'p',
-        'dim',
-        `${snapshot.targets.length} targets \u00b7 ${snapshot.bundles.length} bundles`,
-      ),
-    );
+    menuButton.classList.remove('hidden');
     if (currentSession) {
       const session = snapshot.sessions.find(x => x.id === currentSession);
-      if (!session?.conversation_available) {
-        showDashboard();
-      } else {
-        renderQueue(session);
-        renderElicitations(session);
-        renderAttachments();
-        document.querySelector('#conversation-state').textContent = session.state;
+      if (!session?.capabilities?.open) {
+        navigate({ name: 'dashboard', workspaceId: selectedWorkspaceId() });
+        return true;
       }
+      renderQueue(session);
+      renderElicitations(session);
+      renderAttachments();
+      document.querySelector('#conversation-state').textContent = session.state;
     }
+    renderRoute();
     if (!eventSource) startEvents();
     return true;
   } catch (e) {
-    if (e.message === 'unauthorized') {
-      snapshot = undefined;
-      currentSession = null;
-      if (eventSource) {
-        eventSource.close();
-        eventSource = undefined;
-      }
-      login.classList.remove('hidden');
-      app.classList.add('hidden');
-      logout.classList.add('hidden');
-    }
+    if (e.message === 'unauthorized') showLogin();
     return false;
   }
 }
+
+/// Load the snapshot first, then honour the URL.
+///
+/// A protected route must stay a login page while the snapshot request is
+/// unauthorized: rendering it first would dereference a snapshot that is not
+/// there.
 async function restoreRoute() {
   if (!(await refresh())) return;
-  const match = location.hash.match(/^#conversation\/([A-Za-z0-9_-]+)$/);
-  if (match) await openConversation(match[1]);
+  applyRoute();
 }
+
 function renderQueue(session) {
   const prompts = session.queued_prompts || [];
   queue.replaceChildren(
@@ -796,17 +1199,14 @@ async function loadConversation(delta = false) {
   }
 }
 async function openConversation(id) {
+  if (currentSession === id) return;
   const session = snapshot?.sessions.find(x => x.id === id);
-  if (!session?.conversation_available) {
-    showDashboard();
-    return;
-  }
+  if (!session?.capabilities?.open) return;
   currentSession = id;
   cursor = 0;
   acknowledged = 0;
-  location.hash = `conversation/${id}`;
-  dashboard.classList.add('hidden');
-  conversation.classList.remove('hidden');
+  entryNodes.clear();
+  feed.replaceChildren();
   document.querySelector('#conversation-title').textContent = session.title;
   document.querySelector('#conversation-state').textContent = session.state;
   renderQueue(session);
@@ -815,18 +1215,23 @@ async function openConversation(id) {
   renderAttachments();
   await loadConversation(false);
 }
-function showDashboard() {
+
+/// Drop everything the conversation view was holding.
+///
+/// Leaving has to clear the keyed nodes and the pending elicitation cards, or
+/// the next conversation opens on top of the last one's rows.
+function leaveConversation() {
   currentSession = null;
   cursor = 0;
   acknowledged = 0;
-  location.hash = '';
+  entryNodes.clear();
+  feed.replaceChildren();
   elicitations.replaceChildren();
   elicitationCards.clear();
   promptImages = [];
   renderAttachments();
-  conversation.classList.add('hidden');
-  dashboard.classList.remove('hidden');
 }
+
 document.querySelector('#login-form').onsubmit = async e => {
   e.preventDefault();
   try {
@@ -840,70 +1245,163 @@ document.querySelector('#login-form').onsubmit = async e => {
     document.querySelector('#login-error').textContent = err.message;
   }
 };
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+function closeMenu() {
+  menu.classList.add('hidden');
+  menuButton.setAttribute('aria-expanded', 'false');
+}
+
+menuButton.onclick = () => {
+  const open = menu.classList.toggle('hidden');
+  menuButton.setAttribute('aria-expanded', String(!open));
+};
+
+// A tap outside the menu closes it, and so does Escape. Both are capture-phase
+// so a control inside the menu still receives its own click first.
+document.addEventListener('pointerdown', event => {
+  if (menu.classList.contains('hidden')) return;
+  if (menu.contains(event.target) || menuButton.contains(event.target)) return;
+  closeMenu();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeMenu();
+});
+
+menu.onclick = event => {
+  const target = event.target.closest('button[data-route]');
+  if (!target) return;
+  closeMenu();
+  navigate({ name: target.dataset.route });
+};
+
 logout.onclick = async () => {
   await request('/auth/session', { method: 'DELETE' });
+  location.hash = '';
   location.reload();
 };
+
+backButton.onclick = () => {
+  // Back means the page behind this one, which is the dashboard for the
+  // workspace this route belongs to.
+  navigate({ name: 'dashboard', workspaceId: selectedWorkspaceId() });
+};
+
+workspaceStrip.onclick = event => {
+  const tab = event.target.closest('button[data-workspace-id]');
+  if (!tab) return;
+  navigate({ name: 'dashboard', workspaceId: tab.dataset.workspaceId });
+};
+
+for (const node of document.querySelectorAll(
+  '.page-actions button[data-route], #new-form button[data-route]',
+)) {
+  node.onclick = event => {
+    event.preventDefault();
+    navigate({ name: node.dataset.route, workspaceId: selectedWorkspaceId() });
+  };
+}
+
+window.addEventListener('hashchange', applyRoute);
+
 newTarget.onchange = syncProjectDirectory;
 newForm.onsubmit = async e => {
   e.preventDefault();
   const target = snapshot.targets.find(x => x.id === newTarget.value);
+  const bare = target?.requires_project_directory;
+  const body = {
+    action: 'new',
+    workspace_id: selectedWorkspaceId(),
+    profile_id: newProfile.value,
+    bundle_id: bare ? newBundle.value || 'raw' : newBundle.value,
+    target_id: newTarget.value,
+    project_directory: bare ? newProjectDirectory.value : null,
+  };
+  const title = newTitle.value.trim();
+  if (title) body.title = title;
   try {
-    await request('/api/actions', {
-      method: 'POST',
-      body: JSON.stringify({
-        action: 'new',
-        title: document.querySelector('#new-title').value,
-        profile_id: newProfile.value,
-        bundle_id: newBundle.value,
-        target_id: newTarget.value,
-        project_directory: target?.requires_project_directory ? newProjectDirectory.value : null,
-      }),
-    });
-    document.querySelector('#new-title').value = '';
-    actionError.textContent = '';
+    await request('/api/actions', { method: 'POST', body: JSON.stringify(body) });
+    newTitle.value = '';
+    newError.textContent = '';
     await refresh();
+    navigate({ name: 'dashboard', workspaceId: selectedWorkspaceId() });
   } catch (err) {
-    actionError.textContent = err.message;
+    newError.textContent = err.message;
   }
 };
-sessions.onclick = async e => {
-  const button = e.target.closest('button[data-action]');
-  if (!button) return;
-  if (button.dataset.action === 'open') return openConversation(button.dataset.id);
+
+/// One session action, from the row that carries it.
+///
+/// The pending set is checked at entry and released in a `finally`, so a
+/// double tap cannot send twice and a failure cannot leave the control dead.
+async function runSessionAction(dataset, errorNode, extra) {
+  const key = `${dataset.action}:${dataset.id}`;
+  if (pendingActions.has(key)) return;
+  if (dataset.action === 'open') {
+    navigate({ name: 'conversation', sessionId: dataset.id });
+    return;
+  }
   if (
-    button.dataset.action === 'close' &&
+    dataset.action === 'close' &&
     !confirm(
       'Save a recovery copy, stop, and destroy this session target? Queued prompts will be preserved.',
     )
-  )
+  ) {
     return;
-  const body = { action: button.dataset.action, session_id: button.dataset.id };
-  if (button.dataset.action === 'resume') {
-    body.profile_id = button.dataset.profile;
-    body.target_id = button.dataset.target;
-    const session = snapshot.sessions.find(x => x.id === button.dataset.id);
+  }
+  const body = { action: dataset.action, session_id: dataset.id, ...extra };
+  if (dataset.action === 'rename') {
+    const session = snapshot.sessions.find(x => x.id === dataset.id);
+    const title = prompt('New session name', session?.title || '');
+    if (title === null || !title.trim()) return;
+    body.title = title.trim();
+  }
+  if (dataset.action === 'resume') {
+    body.profile_id = dataset.profile;
+    body.target_id = extra?.target_id || dataset.target;
     body.queue = 'start';
+    const session = snapshot.sessions.find(x => x.id === dataset.id);
     if (session?.queued_prompts?.length) {
-      const choice = prompt(
-        `This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,
-        'start',
-      );
-      if (choice === null) return;
-      if (!['start', 'discard'].includes(choice.toLowerCase()))
-        return alert('Enter start or discard.');
-      body.queue = choice.toLowerCase();
+      body.queue = confirm(
+        `This session has ${session.queued_prompts.length} queued prompt(s). Run them after resume?`,
+      )
+        ? 'start'
+        : 'discard';
     }
   }
+  pendingActions.add(key);
+  renderRoute();
   try {
     await request('/api/actions', { method: 'POST', body: JSON.stringify(body) });
-    actionError.textContent = '';
+    errorNode.textContent = '';
     await refresh();
   } catch (err) {
-    actionError.textContent = err.message;
+    errorNode.textContent = err.message;
+  } finally {
+    pendingActions.delete(key);
+    renderRoute();
   }
+}
+
+sessions.onclick = async e => {
+  const target = e.target.closest('button[data-action]');
+  if (!target) return;
+  await runSessionAction(target.dataset, actionError);
 };
-document.querySelector('#back').onclick = showDashboard;
+
+resumable.onclick = async e => {
+  const target = e.target.closest('button[data-action]');
+  if (!target) return;
+  const picker = target.closest('.row')?.querySelector('select[data-role="resume-target"]');
+  await runSessionAction(
+    target.dataset,
+    resumeError,
+    picker ? { target_id: picker.value } : undefined,
+  );
+};
+
 document.querySelector('#prompt-form').onsubmit = e => {
   e.preventDefault();
   submitPrompt();

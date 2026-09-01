@@ -168,7 +168,11 @@ def run(lab: Lab) -> None:
         changed_marker.write_text("TUI stop reached durable state\n")
         lab.record_action("tui-stopped-session", session_id=session["id"])
         try:
-            return_code = browser.wait(timeout=TIMEOUT * 2)
+            # The browser drives a full resume after the TUI stop — navigate to
+            # the resume page, resume the session, wait for it to provision,
+            # then stop it again — so it needs materially longer here than the
+            # single reconnect this wait was originally sized for.
+            return_code = browser.wait(timeout=TIMEOUT * 8)
         except subprocess.TimeoutExpired as error:
             raise ScenarioFailure("Playwright did not finish after SSE reconnection") from error
         if return_code != 0:

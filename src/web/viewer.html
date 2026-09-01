@@ -11,12 +11,27 @@
     <title>Hel</title>
   </head>
   <body>
-    <header>
-      <div>
-        <h1>HEL</h1>
-        <div class="dim">Welcome to Hel.</div>
-      </div>
-      <button id="logout" class="hidden">Sign out</button>
+    <!-- Route-level announcements for a screen reader. One region, polite, so
+         a background result is spoken without interrupting what is being read. -->
+    <p id="announcer" class="visually-hidden" role="status" aria-live="polite"></p>
+
+    <header id="shell-header">
+      <button id="back" class="icon-button hidden" aria-label="Back">&#8592;</button>
+      <h1 id="shell-title">HEL</h1>
+      <button
+        id="menu-button"
+        class="icon-button hidden"
+        aria-label="Menu"
+        aria-haspopup="menu"
+        aria-expanded="false"
+      >
+        &#9776;
+      </button>
+      <nav id="menu" class="menu hidden" role="menu" aria-label="Hel">
+        <button role="menuitem" data-route="targets">Targets</button>
+        <button role="menuitem" data-route="quota">Quota</button>
+        <button role="menuitem" id="logout">Sign out</button>
+      </nav>
     </header>
 
     <main id="login" class="card">
@@ -34,39 +49,71 @@
         />
         <button>Enter</button>
       </form>
-      <p id="login-error"></p>
+      <p id="login-error" role="alert"></p>
     </main>
 
     <main id="app" class="hidden">
-      <section id="dashboard">
-        <section class="card">
-          <h2>New session</h2>
-          <form id="new-form" class="row">
-            <input id="new-title" maxlength="120" placeholder="Session title" required />
-            <select id="new-profile" aria-label="Profile"></select>
-            <select id="new-bundle" aria-label="Bundle"></select>
-            <select id="new-target" aria-label="Target"></select>
-            <input
-              id="new-project-directory"
-              class="hidden"
-              placeholder="Absolute project directory"
-            />
-            <button>Start</button>
-          </form>
-          <p id="action-error"></p>
-        </section>
-        <section>
-          <h2>Sessions</h2>
-          <div id="sessions"></div>
-        </section>
-        <section class="card">
-          <h2>Configured</h2>
-          <div id="configured"></div>
-        </section>
+      <!-- The workspace strip scrolls sideways inside itself; the page never
+           does, however long a workspace is named. -->
+      <div id="workspaces" class="tabstrip scroll-x" role="tablist" aria-label="Workspaces"></div>
+
+      <section id="dashboard" class="page">
+        <div class="row page-actions">
+          <button data-route="new">New session</button>
+          <button data-route="resume" class="secondary">Resume a session</button>
+        </div>
+        <div id="sessions"></div>
+        <p id="action-error" role="alert"></p>
       </section>
 
-      <section id="conversation" class="hidden">
-        <button id="back" class="secondary">← Dashboard</button>
+      <section id="new-page" class="page hidden">
+        <h2>New session</h2>
+        <form id="new-form">
+          <label class="field">
+            <span>Title</span>
+            <input id="new-title" maxlength="120" placeholder="Optional; derived when empty" />
+          </label>
+          <label class="field">
+            <span>Profile</span>
+            <select id="new-profile"></select>
+          </label>
+          <label class="field">
+            <span>Target</span>
+            <select id="new-target"></select>
+          </label>
+          <label class="field">
+            <span>Bundle</span>
+            <select id="new-bundle"></select>
+          </label>
+          <label class="field hidden" id="new-project-directory-field">
+            <span>Project directory</span>
+            <input id="new-project-directory" placeholder="Absolute project directory" />
+          </label>
+          <div class="row">
+            <button>Start</button>
+            <button type="button" class="secondary" data-route="dashboard">Cancel</button>
+          </div>
+        </form>
+        <p id="new-error" role="alert"></p>
+      </section>
+
+      <section id="resume-page" class="page hidden">
+        <h2>Resume a session</h2>
+        <div id="resumable"></div>
+        <p id="resume-error" role="alert"></p>
+      </section>
+
+      <section id="targets-page" class="page hidden">
+        <h2>Targets</h2>
+        <div id="targets"></div>
+      </section>
+
+      <section id="quota-page" class="page hidden">
+        <h2>Quota</h2>
+        <div id="quota"></div>
+      </section>
+
+      <section id="conversation" class="page hidden">
         <div class="card">
           <h2 id="conversation-title">Conversation</h2>
           <span id="conversation-state" class="pill"></span>
@@ -105,7 +152,7 @@
             </button>
             <input id="image-picker" type="file" accept="image/*" multiple hidden />
           </div>
-          <p id="conversation-error"></p>
+          <p id="conversation-error" role="alert"></p>
         </form>
       </section>
     </main>
