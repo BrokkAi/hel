@@ -12,7 +12,7 @@ and relevance of what they submit. Please follow the
   is running. Use the other-bug form for installation, development setup,
   packaging, updating, or documentation problems. Blank issues remain
   available when neither form fits.
-- Keep changes focused on one problem or capability. For a large ACP, orchestration,
+- Keep changes focused on one problem or capability. For a large ACP, Council,
   permission, session-format, terminal-mode, or release change, open an issue
   or discuss the direction on [Discord](https://discord.gg/geYkWUeH) first.
 - Do not put credentials, private source code, or unredacted private
@@ -33,45 +33,11 @@ cargo build --release
 ./target/release/mj --cwd .
 ```
 
-The default desktop build includes the native WebView shell. On macOS, install
-Apple's Command Line Tools; the shell uses the WebKit framework from
-the macOS SDK:
-
-```bash
-xcode-select --install
-```
-
-On Linux, install the WebKitGTK 4.1 development package first:
-
-```bash
-# Ubuntu or Debian
-sudo apt-get update
-sudo apt-get install libwebkit2gtk-4.1-dev
-
-# Fedora
-sudo dnf install webkit2gtk4.1-devel
-```
-
-Use `webkit2gtk4.1-devel` on Fedora: the shell targets WebKitGTK's GTK 3 and
-libsoup 3 API, not the GTK 4 `webkitgtk6.0-devel` package. Then build it with:
-
-```bash
-cargo build --release
-```
-
 The `brokk-mj-voice-worker` workspace member provides local Ctrl-R dictation.
-On macOS it uses the system CoreAudio framework, so the Command Line Tools
-above are sufficient. On Linux, install the ALSA development package before
-building it:
+On Debian or Ubuntu, install the ALSA development headers before building it:
 
 ```bash
-# Ubuntu or Debian
-sudo apt-get update
 sudo apt-get install libasound2-dev
-
-# Fedora
-sudo dnf install alsa-lib-devel
-
 cargo build --release -p brokk-mj-voice-worker
 ```
 
@@ -82,7 +48,7 @@ dictation, put `mj-voice-worker` beside `mj` in the target directory or set
 ## Understand the Runtime Boundaries
 
 Mjolnir is an ACP client that owns terminal presentation, user input,
-permissions, session controls, multi-agent orchestration, and persistence around
+permissions, session controls, Council orchestration, and persistence around
 one or more agent subprocesses. The detailed repository contracts are
 maintained in [AGENTS.md](AGENTS.md). The most important contribution
 boundaries are:
@@ -90,15 +56,17 @@ boundaries are:
 - Do not write logs to standard error while the TUI owns the terminal. Use
   `--debug-file` or `BROKK_TUI_LOG` for Mjolnir diagnostics and
   `--agent-stderr` or `BROKK_TUI_AGENT_STDERR` for ACP adapter output.
+- Inline mode must remain inline. A cursor-position timeout or redraw problem
+  must not terminate the session or switch the user into the fullscreen TUI.
 - Permission requests must preserve the complete requested content. Long
   commands, descriptions, and option labels must remain reachable while
   wrapping, scrolling, paging, and resizing.
 - Terminal ownership and restoration must be deterministic across normal exit,
   cancellation, signals, panics, subprocess failures, and startup errors.
-- Keep model selection separate from ACP adapter selection. Agent role
+- Keep model selection separate from ACP adapter selection. Council role
   handoffs, cancellation, permissions, token usage, and transcript labels must
   remain attributable to the correct role.
-- Headless and remote paths share the orchestration runtime with the TUI. Preserve
+- Headless and remote paths share the Council runtime with the TUI. Preserve
   machine-readable output, non-blocking permission behavior, nested permission
   identity, and shutdown semantics when changing shared code.
 - Configuration and session provenance are versioned persisted formats. Make
@@ -117,14 +85,14 @@ Add the smallest regression test that would have caught the problem:
 - For state-machine changes, test the event transition or input handler
   directly instead of relying only on a manual TUI check.
 - Use `tests/termination_pty.rs` for terminal restoration and signal behavior.
-- Use the deterministic fixtures in `tests/e2e/` for ACP process, agent
+- Use the deterministic fixtures in `tests/e2e/` for ACP process, Council
   handoff, tool, permission, transcript, or cancellation flows that need a
   process boundary.
 - Add negative controls for permission, protocol, persistence, cleanup, and
   terminal-lifecycle changes.
 - Update the relevant page in the [documentation site](docs/src/content/docs/)
   when a user-visible command, keyboard action, setup flow, ACP adapter,
-  orchestration behavior, remote feature, configuration option, or limitation
+  Council behavior, remote feature, configuration option, or limitation
   changes. Update [README.md](README.md) when the front-door positioning,
   installation, compatibility, or primary quick start changes.
 - Update [AGENTS.md](AGENTS.md) when an implementation invariant or contributor
@@ -153,8 +121,9 @@ cargo build --release -p brokk-mj-voice-worker
 ```
 
 UI changes need proportionate manual validation in every affected surface.
-For layout changes, include narrow and resized terminals. Also exercise headless output or the remote viewer when
-shared rendering, orchestration, permission, or session code affects those paths.
+Check inline and fullscreen modes separately; for layout changes, include narrow
+and resized terminals. Also exercise headless output or the remote viewer when
+shared rendering, Council, permission, or session code affects those paths.
 Include a screenshot or terminal recording for visible rendering changes.
 
 CI runs the main checks on Linux, macOS, and Windows, checks the voice worker on
@@ -189,10 +158,8 @@ node scripts/generate-supplemental-third-party-notices.mjs
 
 Review the generated diff rather than assuming regeneration is sufficient. CI
 recreates both notice reports, inventories bundled native material, checks the
-crate package contents, and fails when committed output is stale. Every
-publishable crate ships its own copy of the GPL text, so a new workspace member
-needs a `LICENSE` file and CI keeps all of them byte-identical to the root
-license.
+crate package contents, and fails when committed output is stale. Keep
+`voice-worker/LICENSE` synchronized with the root license.
 
 ## Pull Requests
 
@@ -204,7 +171,7 @@ requests consistently provide:
 - Key semantic changes rather than a list of edited files.
 - Root cause for bug fixes when it is known.
 - Before/after evidence and capability or safety boundaries for UI, session,
-  ACP, orchestration, permission, terminal, remote, or voice changes.
+  ACP, Council, permission, terminal, remote, or voice changes.
 - Important touch points for broad or cross-cutting changes.
 - Exact test, lint, build, packaging, benchmark, and manual-validation commands
   actually run.
@@ -215,10 +182,11 @@ pass. Do not report a check as passing based only on an expected outcome.
 
 Reviewers will pay particular attention to:
 
-- Terminal ownership, restoration, and complete permission content.
+- Terminal ownership, restoration, inline-mode resilience, and complete
+  permission content.
 - ACP compatibility and correct separation between Mjolnir-owned and
   adapter-owned state.
-- Agent role attribution, cancellation, and deterministic transcript and
+- Council role attribution, cancellation, and deterministic transcript and
   tool-result behavior.
 - Safe permission, worktree, session, configuration, and remote-control
   boundaries.

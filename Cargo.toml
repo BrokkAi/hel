@@ -1,125 +1,153 @@
 [package]
-name = "brokk-mjolnir"
+name = "brokk-mj-core"
 version.workspace = true
 edition = "2024"
-rust-version = "1.97"
-description = "Forge-grade terminal client for any Agent Client Protocol (ACP) server"
+rust-version.workspace = true
+description = "Session control plane for ACP coding agents"
 license = "GPL-3.0-only"
 repository = "https://github.com/BrokkAi/mjolnir"
 publish = true
+include = [
+    "src/**/*.rs",
+    "src/web/**",
+    "src/icons/**",
+    "src/fonts/jetbrains-mono.woff2",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "docs/DOCKER.md",
+    "docs/PODMAN.md",
+    "LICENSE",
+    "licenses/THIRD_PARTY_LICENSES.html",
+    "licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
+]
+
+# The package publishes under the Brokk namespace while the library keeps the
+# `hel` crate name that the workspace imports use, so the rename to the
+# mjolnir deploy identities required no source changes.
+[lib]
+name = "hel"
+
+[features]
+default = []
+test-hooks = []
 
 [workspace]
-members = ["mj-core", "mj-agents", "mj-anvil", "mj-tui", "mj-desktop", "mj-remote", "voice-worker"]
-# Bare `cargo test`/`cargo clippy`/`cargo build` must cover the binary and every
-# crate its code was extracted into, or those crates lose their lint and test
-# gate. `mj-desktop` and `voice-worker` keep their own CI jobs because their
-# tests need native desktop and audio dependencies; the default `mj` binary
-# still links the desktop shell on supported desktop platforms.
-# `mj-anvil` only ships in the Android binary, so it also stays out of the
-# default set; the Android CI job carries its lint and test gate.
-default-members = [".", "mj-core", "mj-agents", "mj-tui", "mj-remote"]
+# mj-desktop stays out of the default set: its tests need native desktop
+# dependencies, and the primary Linux CI target is musl, where the desktop
+# shell does not build. Its own CI job and the macOS/Windows matrix carry it.
+members = [".", "mj-tui", "mj-cli", "mj-desktop", "voice-worker"]
+default-members = [".", "mj-tui", "mj-cli"]
 
-# Single source of truth for the release version; workspace crates inherit it, so
-# they cannot drift apart (RELEASING.md requires them to match).
+# Single source of truth for the release version. Every published crate
+# inherits it with `version.workspace = true`, so the four package versions
+# cannot drift apart (RELEASING.md requires them to match).
 [workspace.package]
-version = "1.17.0"
+version = "2.0.0"
 edition = "2024"
-rust-version = "1.97"
 license = "GPL-3.0-only"
 repository = "https://github.com/BrokkAi/mjolnir"
 homepage = "https://github.com/BrokkAi/mjolnir"
 keywords = ["mjolnir", "acp", "ai", "agents"]
 categories = ["development-tools", "command-line-utilities"]
+# The real compiler floor is the pinned toolchain in `rust-toolchain.toml`,
+# not just what edition 2024 implies. Declaring it makes `cargo install` on an
+# older compiler fail with a clear version message instead of mid-build
+# errors. Bump it in lockstep with `rust-toolchain.toml`.
+rust-version = "1.96"
 
-# Keep every same-release workspace dependency requirement here. Cargo requires
-# published path dependencies to carry a registry version, but release bumps
-# should still change that version in one manifest rather than in every crate.
+# Cargo requires a published path dependency to carry a registry version and
+# does not let that version inherit from `[workspace.package]`, so the number
+# is repeated here. Keeping every same-release path dependency in this one
+# table means a bump touches one manifest, and
+# `node scripts/release-version.mjs check` (run in CI) fails when these fall
+# behind the workspace version.
 [workspace.dependencies]
-mj-core = { package = "brokk-mj-core", path = "mj-core", version = "1.17.0" }
-mj-agents = { package = "brokk-mj-agents", path = "mj-agents", version = "1.17.0" }
-mj-anvil = { package = "brokk-mj-anvil", path = "mj-anvil", version = "1.17.0" }
-mj-tui = { package = "brokk-mj-tui", path = "mj-tui", version = "1.17.0" }
-mj-remote = { package = "brokk-mj-remote", path = "mj-remote", version = "1.17.0" }
-mj-desktop = { package = "brokk-mj-desktop", path = "mj-desktop", version = "1.17.0" }
+hel = { path = ".", package = "brokk-mj-core", version = "2.0.0" }
+hel-tui = { path = "mj-tui", package = "brokk-mj-tui", version = "2.0.0" }
+mj-desktop = { path = "mj-desktop", package = "brokk-mj-desktop", version = "2.0.0" }
 
-[[bin]]
-name = "mj"
-path = "src/main.rs"
+[workspace.lints.clippy]
+disallowed_methods = "warn"
 
-[features]
-default = ["desktop-app"]
-# Android deliberately has no dependency entries for this feature, and the
-# `mj app` command is excluded from its CLI.
-desktop-app = ["dep:mj-desktop"]
+[lints]
+workspace = true
 
 [dependencies]
-mj-core.workspace = true
-mj-agents.workspace = true
-mj-tui.workspace = true
 agent-client-protocol = { version = "2", features = ["unstable_session_fork", "unstable_end_turn_token_usage", "unstable_elicitation", "unstable_auth_methods"] }
 anyhow = "1"
-async-trait = "0.1"
-# Use the ring CryptoProvider (already pulled by reqwest/rcgen) instead of the
-# default aws-lc-rs, which needs cmake + a C toolchain and fails to
-# cross-compile cleanly for the Android CI target.
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+axum = "0.8"
+# Use the ring provider already pulled by reqwest instead of aws-lc-rs, which
+# needs a C toolchain and complicates cross-compilation.
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
+# Grok Build keys long session directories by BLAKE3; Hel has to reproduce that
+# name exactly to restore a checkpoint. `default-features = false` keeps the
+# cross-compiled musl build free of the optional Rayon and SIMD extras.
+blake3 = { version = "1", default-features = false, features = ["std"] }
 # `clock` pulls `iana-time-zone`/`android-tzdata` so `Local` can render reset
 # timestamps in the machine's wall-clock time (DST-correct); `default-features
-# = false` drops the wasm-only bits. chrono is already in the tree via rmcp.
+# = false` drops the wasm-only bits.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "6"
-flate2 = "1"
-futures = "0.3"
+getrandom = "0.3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # HMAC-SHA256 signs the stateless remote-viewer session cookie (keyed on a
 # persisted signing key); pairs with the existing `sha2`.
 hmac = "0.12"
 # Resolves the IANA zone name (e.g. "Europe/Paris") to append to reset times.
 iana-time-zone = "0.1"
-mj-remote.workspace = true
 libc = "0.2"
+pulldown-cmark = { version = "0.10", default-features = false }
+qrcode = { version = "0.14", default-features = false }
 signal-hook = "0.3"
-rcgen = "0.13"
+sysinfo = "0.32"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
-# Official Rust MCP SDK. Powers the in-process subagent, memory, and review
-# servers exposed to ACP adapters through the stdio bridge. MIT-licensed.
-rusqlite = { version = "0.32", features = ["bundled"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# Parses the tailscale-issued certificate/key PEMs for the SNI resolver
-# `mj server` installs when it detects a tailnet node. Already in the tree via
-# reqwest's rustls-tls.
-rustls-pemfile = "2"
-# JSON Schema derivation for MCP tool argument structs (used by rmcp's `#[tool]`
-# macro). Already in the tree via agent-client-protocol; pinned to the same 1.x.
-semver = "1"
-serde = { version = "1", features = ["derive"] }
+rayon = "1"
+reedline = { version = "0.51", default-features = false }
+regex = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+serde_yaml = "0.9"
 sha2 = "0.10"
-shell-words = "1"
 similar = "2.7"
 tar = "0.4"
 tempfile = "3"
-time = { version = "0.3", features = ["formatting"] }
+textwrap = "0.16"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
+tokio-stream = "0.1"
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+unicode-segmentation = "1"
+# Measures display width without the temporary `Line` that `Line::width()`
+# needs; transcript wrapping calls this once per grapheme.
+unicode-width = "0.2"
 url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-[target.'cfg(not(target_os = "android"))'.dependencies.mj-desktop]
-workspace = true
-optional = true
-
-# Anvil is the self-contained ACP route on Android, where the npx-based
-# built-in adapters cannot run (issue #685). Other targets never compile it.
-[target.'cfg(target_os = "android")'.dependencies.mj-anvil]
-workspace = true
-
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[profile.dev]
+# Line tables keep file:line backtraces while cutting ~230MB of DWARF per
+# binary; links and test builds get materially faster. Use a temporary
+# `debug = 2` override when a debugger needs full variable info.
+debug = "line-tables-only"
+
+# Checkpoint packaging runs in the target's development worker during normal
+# local use. Optimize the measured compression and digest hot loops without
+# changing the rest of the development build.
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import path from "node:path";
 
 const [reportPath, baselinePath, summaryPath] = process.argv.slice(2);
 if (!reportPath || !baselinePath || !summaryPath) {
@@ -19,37 +20,48 @@ if (!data?.totals?.lines || !Array.isArray(data.files)) {
 
 function projectPath(filename) {
   const normalized = filename.replaceAll("\\", "/");
-  for (const crate of [
-    "mj-agents",
-    "mj-anvil",
-    "mj-core",
-    "mj-remote",
-    "mj-tui",
-    "voice-worker",
-  ]) {
-    const marker = `/${crate}/src/`;
-    const index = normalized.lastIndexOf(marker);
-    if (index >= 0) {
-      return `${crate}/src/${normalized.slice(index + marker.length)}`;
-    }
+  const workspace = process.cwd().replaceAll("\\", "/");
+  const relative = path.posix.relative(workspace, normalized);
+  if (
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith("../") &&
+    !path.posix.isAbsolute(relative)
+  ) {
+    return relative;
   }
-  const sourceMarker = "/src/";
-  const sourceIndex = normalized.lastIndexOf(sourceMarker);
-  if (sourceIndex >= 0) {
-    return `src/${normalized.slice(sourceIndex + sourceMarker.length)}`;
+
+  for (const marker of [
+    "mj-cli/src/",
+    "mj-tui/src/",
+    "voice-worker/src/",
+    "src/",
+  ]) {
+    const index = normalized.lastIndexOf(`/${marker}`);
+    if (index >= 0) {
+      return `${marker}${normalized.slice(index + marker.length + 1)}`;
+    }
   }
   return normalized;
 }
 
-const moduleLines = new Map(
-  data.files
-    .map((file) => [projectPath(file.filename), file.summary?.lines?.percent])
-    .filter(
-      ([path, percent]) =>
-        /^(src|(?:mj-agents|mj-anvil|mj-core|mj-remote|mj-tui|voice-worker)\/src)\/.*\.rs$/.test(path) &&
-        Number.isFinite(percent),
-    ),
-);
+const moduleLines = new Map();
+for (const file of data.files) {
+  const modulePath = projectPath(file.filename);
+  const percent = file.summary?.lines?.percent;
+  if (
+    !/^(src|crates\/hel-(cli|tui)\/src|voice-worker\/src)\/.*\.rs$/.test(
+      modulePath,
+    ) ||
+    !Number.isFinite(percent)
+  ) {
+    continue;
+  }
+  if (moduleLines.has(modulePath)) {
+    throw new Error(`coverage report contains duplicate module ${modulePath}`);
+  }
+  moduleLines.set(modulePath, percent);
+}
 const aggregate = data.totals.lines.percent;
 const aggregateFloor =
   baseline.aggregate.lines - baseline.aggregate.material_regression_tolerance;

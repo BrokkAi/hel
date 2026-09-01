@@ -1,9 +1,10 @@
 name: Coverage
 
 on:
-  push:
-    branches: [ 'master', 'ci/**' ]
   pull_request: {}
+  push:
+    branches: [ 'master' ]
+  workflow_dispatch: {}
   # Tag builds reach this through release.yml rather than a tag trigger, so the
   # release can depend on the result instead of racing it.
   workflow_call: {}
@@ -16,21 +17,28 @@ jobs:
     name: LLVM coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
 
     steps:
     - uses: actions/checkout@v6
 
     - name: Install Rust toolchain
       id: toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@1.96.0
       with:
         components: llvm-tools-preview
+        targets: x86_64-unknown-linux-musl
 
-    - name: Install Linux desktop and audio dependencies
+    - name: Install Linux musl tools
       run: |
         sudo apt-get update
-        sudo apt-get install --no-install-recommends --assume-yes libasound2-dev libwebkit2gtk-4.1-dev
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
 
+    # Deliberately excludes `target/llvm-cov-target`: a restored cache brings
+    # back stale `.profraw` profiles and instrumented binaries from an earlier
+    # commit, which silently mixes into the reported percentage that
+    # `scripts/check-coverage.mjs` gates on.
     - name: Cache cargo registry
       uses: actions/cache@v5
       with:
@@ -45,11 +53,11 @@ jobs:
     - name: Install pinned coverage tool
       run: cargo install --locked cargo-llvm-cov --version 0.8.7
 
-    - name: Collect workspace coverage
+    - name: Collect Hel coverage
       run: |
-        cargo llvm-cov --workspace --exclude brokk-mj-desktop --exclude-from-report brokk-mj-voice-worker --no-report --locked
-        cargo llvm-cov --workspace --exclude brokk-mj-desktop --exclude-from-report brokk-mj-voice-worker --no-run --locked --lcov --output-path coverage.lcov
-        cargo llvm-cov --workspace --exclude brokk-mj-desktop --exclude-from-report brokk-mj-voice-worker --no-run --locked --json --output-path coverage.json
+        cargo llvm-cov --workspace --exclude brokk-mj-voice-worker --exclude brokk-mj-desktop --no-report --locked
+        cargo llvm-cov report -p brokk-mj-core -p brokk-mj-tui -p brokk-mjolnir --lcov --output-path coverage.lcov
+        cargo llvm-cov report -p brokk-mj-core -p brokk-mj-tui -p brokk-mjolnir --json --output-path coverage.json
 
     - name: Check coverage baseline
       run: node scripts/check-coverage.mjs coverage.json .github/coverage-baseline.json coverage-summary.md

@@ -9,11 +9,20 @@ jobs:
   licenses:
     name: Dependency licenses
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
     steps:
     - uses: actions/checkout@v6
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Install Linux musl tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
 
     - name: Set up Node
       uses: actions/setup-node@v6
@@ -41,51 +50,53 @@ jobs:
         node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
         diff -u licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
 
-    - name: Check crate package license files
+    - name: Check crate package contents and build
       run: |
-        # Every publishable crate carries its own copy of the GPL text, so each
-        # one must stay byte-identical to the root license and must survive
-        # packaging into the .crate that reaches crates.io.
-        for member in mj-core mj-agents mj-anvil mj-tui mj-remote mj-desktop voice-worker; do
-          diff -u LICENSE "$member/LICENSE"
-        done
-        cargo package --locked --allow-dirty --no-verify -p brokk-mj-desktop
-        # The root package cannot resolve its same-release workspace registry
-        # dependencies until publishing; the matrix build below validates it.
-        cargo package --locked --allow-dirty --list -p brokk-mjolnir > /tmp/mjolnir-package-files.txt
-        grep -Fx LICENSE /tmp/mjolnir-package-files.txt
-        grep -Fx licenses/THIRD_PARTY_LICENSES.html /tmp/mjolnir-package-files.txt
-        grep -Fx licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/mjolnir-package-files.txt
-        for member in brokk-mj-core brokk-mj-agents brokk-mj-anvil brokk-mj-tui brokk-mj-remote brokk-mj-desktop brokk-mj-voice-worker; do
-          cargo package --locked --allow-dirty --list -p "$member" | grep -Fx LICENSE
-        done
+        diff -u LICENSE voice-worker/LICENSE
+        cargo package --locked --allow-dirty --list -p brokk-mj-core > /tmp/hel-package-files.txt
+        cargo package --locked --allow-dirty --list -p brokk-mj-voice-worker > /tmp/voice-worker-package-files.txt
+        grep -Fx LICENSE /tmp/hel-package-files.txt
+        grep -Fx licenses/THIRD_PARTY_LICENSES.html /tmp/hel-package-files.txt
+        grep -Fx licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/hel-package-files.txt
+        grep -Fx LICENSE /tmp/voice-worker-package-files.txt
+        diff -u LICENSE mj-tui/LICENSE
+        diff -u LICENSE mj-cli/LICENSE
+        cargo package --locked --allow-dirty --list -p brokk-mj-tui > /tmp/hel-tui-package-files.txt
+        cargo package --locked --allow-dirty --list -p brokk-mjolnir > /tmp/hel-cli-package-files.txt
+        grep -Fx LICENSE /tmp/hel-tui-package-files.txt
+        grep -Fx LICENSE /tmp/hel-cli-package-files.txt
+        cargo package --locked -p brokk-mj-core
 
   mjolnir:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+        - os: ubuntu-latest
+          target: x86_64-unknown-linux-musl
+        - os: macos-latest
+          target: aarch64-apple-darwin
+        - os: windows-latest
+          target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
 
     steps:
     - uses: actions/checkout@v6
 
     - name: Install Rust toolchain
       id: toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@1.96.0
       with:
         components: rustfmt, clippy
+        targets: ${{ matrix.target }}
 
-    - name: Set up Node
-      uses: actions/setup-node@v6
-      with:
-        node-version: 24
-
-    - name: Install Linux native dependencies
+    - name: Install Linux musl tools
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install --no-install-recommends --assume-yes libasound2-dev libwebkit2gtk-4.1-dev
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
 
     - name: Cache cargo registry and build
       uses: actions/cache@v5
@@ -94,10 +105,10 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-mjolnir-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+        key: ${{ runner.os }}-hel-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-mjolnir-cargo-${{ steps.toolchain.outputs.cachekey }}-
-          ${{ runner.os }}-mjolnir-cargo-
+          ${{ runner.os }}-hel-cargo-${{ steps.toolchain.outputs.cachekey }}-
+          ${{ runner.os }}-hel-cargo-
 
     - name: Check Rust formatting
       run: cargo fmt --check
@@ -105,32 +116,96 @@ jobs:
     - name: Run Clippy lints
       run: cargo clippy --all-targets -- -D warnings
 
-    # `mj-desktop` is linked into the default desktop binary but remains outside
-    # the default workspace members, so its own test targets need this gate.
-    - name: Lint desktop crate
-      run: cargo clippy -p brokk-mj-desktop --all-targets -- -D warnings
-
-    - name: Build mjolnir
+    - name: Build Hel
       run: cargo build --release
 
+    # The runtime suite exercises Unix target paths, directory fsync, and Git
+    # worktree byte preservation. Clippy above still compiles every test target
+    # on Windows, while Linux and macOS execute the suite.
     - name: Run tests
+      if: runner.os != 'Windows'
       run: cargo test
 
-    - name: Test desktop crate
-      run: cargo test -p brokk-mj-desktop
+    - name: Compile tests on Windows
+      if: runner.os == 'Windows'
+      run: cargo test --no-run
 
-    - name: Verify packaged macOS desktop crate
-      if: runner.os == 'macOS'
-      run: cargo package --locked --allow-dirty -p brokk-mj-desktop
-
-  voice-worker:
-    name: Voice worker (ubuntu-latest)
+  reliability-smoke:
+    name: Three-client reliability smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
     steps:
     - uses: actions/checkout@v6
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Install Linux musl tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
+
+    - name: Build the isolated-test controller
+      run: cargo build --locked -p brokk-mjolnir
+
+    - name: Run deterministic daemon, two-TUI, and web scenario
+      run: tests/e2e/run-reliability.sh --scenario multi-client-happy-path --seed 1 ./target/x86_64-unknown-linux-musl/debug/mj
+
+    - name: Upload reliability evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: pull-request-reliability-smoke
+        path: target/reliability-artifacts/
+        if-no-files-found: warn
+        retention-days: 14
+
+  desktop-linux:
+    # The primary Linux jobs build for musl, where the desktop-app feature is
+    # deliberately inert, so this is the only pull-request compile-and-test
+    # gate for the Linux desktop shell path releases actually ship.
+    name: Desktop shell (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        components: clippy
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Install Linux desktop dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes libwebkit2gtk-4.1-dev
+
+    - name: Clippy over the desktop path
+      run: cargo clippy --locked -p brokk-mjolnir -p brokk-mj-desktop -- -D warnings
+
+    - name: Build the desktop crate
+      run: cargo check --locked -p brokk-mj-desktop
+
+    - name: Test the mj binary with the desktop feature active
+      run: cargo test --locked -p brokk-mjolnir --bin mj
+
+  voice-worker:
+    name: Voice worker (ubuntu-latest)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+      SHERPA_ONNX_ARCHIVE_DIR: ${{ github.workspace }}/.ci-cache/sherpa-onnx
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@1.96.0
       with:
         components: clippy
 
@@ -139,48 +214,29 @@ jobs:
         sudo apt-get update
         sudo apt-get install --no-install-recommends --assume-yes libasound2-dev
 
+    - name: Cache sherpa-onnx native archive
+      uses: actions/cache@v5
+      with:
+        path: .ci-cache/sherpa-onnx
+        key: sherpa-onnx-v1.13.3-linux-x64-static
+
+    - name: Fetch sherpa-onnx native archive
+      shell: bash
+      run: |
+        archive='sherpa-onnx-v1.13.3-linux-x64-static-lib.tar.bz2'
+        mkdir -p "$SHERPA_ONNX_ARCHIVE_DIR"
+        destination="$SHERPA_ONNX_ARCHIVE_DIR/$archive"
+        if [[ ! -f "$destination" ]] || ! tar -tjf "$destination" >/dev/null; then
+          rm -f "$destination" "$destination.part"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "$destination.part" \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.3/$archive"
+          tar -tjf "$destination.part" >/dev/null
+          mv "$destination.part" "$destination"
+        fi
+
     - name: Check voice worker
       run: cargo clippy -p brokk-mj-voice-worker --all-targets -- -D warnings
 
     - name: Test voice worker
       run: cargo test -p brokk-mj-voice-worker
-
-  android:
-    name: Android aarch64-linux-android
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
-      with:
-        targets: aarch64-linux-android
-        components: clippy
-
-    # mj-anvil is out of the workspace default-members (it only ships in the
-    # Android binary), so the host matrix job never builds it; its lint and
-    # test gate lives here instead.
-    - name: Lint Anvil crate
-      run: cargo clippy --locked -p brokk-mj-anvil --all-targets -- -D warnings
-
-    - name: Test Anvil crate
-      run: cargo test --locked -p brokk-mj-anvil
-
-    - name: Setup Android NDK
-      id: setup-ndk
-      uses: nttld/setup-ndk@v1
-      with:
-        ndk-version: r27d
-
-    - name: Export Android NDK toolchain
-      shell: bash
-      run: |
-        ndk_path='${{ steps.setup-ndk.outputs.ndk-path }}'
-        echo "ANDROID_NDK_HOME=$ndk_path" >> "$GITHUB_ENV"
-        echo "ANDROID_NDK_ROOT=$ndk_path" >> "$GITHUB_ENV"
-        echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
-        echo "CC_aarch64_linux_android=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
-        echo "AR_aarch64_linux_android=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
-
-    - name: Check Android target
-      run: cargo check --locked --no-default-features --target aarch64-linux-android

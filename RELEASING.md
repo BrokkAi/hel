@@ -33,14 +33,17 @@ regression both stop the release; tagging a commit whose coverage run was red
 on master fails here rather than shipping.
 
 The gate covers Linux tests and the coverage baseline only. Formatting, Clippy,
-the macOS and Windows test runs, the Android target check, and the
-dependency-license checks stay pull request checks, so a tag still relies on the
-tagged commit having passed CI on master.
+the macOS and Windows compile-and-test runs, and the dependency-license checks
+stay pull request checks, so a tag still relies on the tagged commit having
+passed CI on master.
 
-The builds cover Linux x86-64 and ARM64, Android ARM64, Windows x86-64, and a
-universal macOS archive. Desktop archives contain `mj` and the voice worker;
-Android omits the voice worker. Every archive includes the applicable licenses
-and notices and is published with a SHA-256 sidecar.
+The builds cover Linux x86-64 and ARM64 and a universal macOS archive; the
+controller supports Linux and macOS (Windows stays a CI compile gate only —
+use WSL2). Every archive contains `mj`, the voice worker, and the two static
+musl session workers (`mj-worker-x86_64-unknown-linux-musl` and
+`mj-worker-aarch64-unknown-linux-musl`) that the controller uploads into
+disposable targets. Every archive includes the applicable licenses and notices
+and is published with a SHA-256 sidecar.
 
 Neither registry publish runs off the tag push. Both wait for the release
 workflow to succeed, so the coverage gate and a build failure on any target
@@ -58,9 +61,8 @@ already-published release.
 ## crates.io publishing
 
 `publish.yml` publishes `brokk-mj-voice-worker`, `brokk-mj-core`,
-`brokk-mj-agents`, `brokk-mj-anvil`, `brokk-mj-tui`, `brokk-mj-remote`,
-`brokk-mj-desktop`, and `brokk-mjolnir` in dependency order: each library crate
-must reach the registry before anything that depends on it.
+`brokk-mj-tui`, `brokk-mj-desktop`, and `brokk-mjolnir` in dependency order:
+each library crate must reach the registry before anything that depends on it.
 It refuses to publish when the tag differs from any workspace crate version. It
 packages the whole workspace in one `cargo package --workspace` run — so the
 same-release sibling versions resolve against the crates packaged beside them

@@ -1,8 +1,12 @@
 [graph]
 all-features = true
 targets = [
+    # The controller and voice worker ship gnu Linux; the session workers are
+    # static musl builds of the same binary.
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
     "aarch64-linux-android",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
@@ -39,14 +43,12 @@ exceptions = [
     # third-party dependencies.
     { crate = "brokk-mjolnir", allow = ["GPL-3.0-only"] },
     { crate = "brokk-mj-core", allow = ["GPL-3.0-only"] },
-    { crate = "brokk-mj-agents", allow = ["GPL-3.0-only"] },
-    { crate = "brokk-mj-anvil", allow = ["GPL-3.0-only"] },
     { crate = "brokk-mj-desktop", allow = ["GPL-3.0-only"] },
-    { crate = "brokk-mj-remote", allow = ["GPL-3.0-only"] },
     { crate = "brokk-mj-tui", allow = ["GPL-3.0-only"] },
     { crate = "brokk-mj-voice-worker", allow = ["GPL-3.0-only"] },
     # MPL applies at file scope. Keep it limited to the reviewed crate.
     { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
+
     # Wry's Android-only URL handling uses Servo's MPL-covered parser crates.
     { crate = "cssparser@0.36.0", allow = ["MPL-2.0"] },
     { crate = "cssparser-macros@0.6.1", allow = ["MPL-2.0"] },

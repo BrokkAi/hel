@@ -18,15 +18,114 @@ jobs:
     name: Coverage gate
     uses: ./.github/workflows/coverage.yml
 
+  verify-version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check tag against workspace versions
+        run: node scripts/release-version.mjs check "$GITHUB_REF_NAME"
+
+  # Session workers run inside disposable Linux targets (containers and
+  # instances), so they are static musl builds of the mj binary regardless of
+  # the controller's platform. Desktop bundles ship both architectures beside
+  # the controller as mj-worker-<triple>, which is where the controller's
+  # worker lookup expects them.
+  build-worker-x64:
+    name: Build worker x86_64-unknown-linux-musl
+    needs: [coverage, verify-version]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --assume-yes musl-tools
+
+      - name: Build static worker
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --no-default-features --bin mj --target x86_64-unknown-linux-musl
+
+      - name: Verify static binary
+        run: |
+          binary=target/x86_64-unknown-linux-musl/release/mj
+          if readelf -lW "$binary" | grep 'Requesting program interpreter' >/dev/null; then
+            echo 'Worker unexpectedly has a dynamic program interpreter' >&2
+            exit 1
+          fi
+          if readelf -dW "$binary" | grep '(NEEDED)' >/dev/null; then
+            echo 'Worker unexpectedly needs a dynamic library' >&2
+            exit 1
+          fi
+          "$binary" --version
+
+      - name: Upload worker
+        uses: actions/upload-artifact@v7
+        with:
+          name: mj-worker-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/mj
+          if-no-files-found: error
+
+  build-worker-arm64:
+    name: Build worker aarch64-unknown-linux-musl
+    needs: [coverage, verify-version]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install musl linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --assume-yes musl-tools
+
+      - name: Build static worker
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --no-default-features --bin mj --target aarch64-unknown-linux-musl
+
+      - name: Verify static binary
+        run: |
+          binary=target/aarch64-unknown-linux-musl/release/mj
+          if readelf -lW "$binary" | grep 'Requesting program interpreter' >/dev/null; then
+            echo 'Worker unexpectedly has a dynamic program interpreter' >&2
+            exit 1
+          fi
+          if readelf -dW "$binary" | grep '(NEEDED)' >/dev/null; then
+            echo 'Worker unexpectedly needs a dynamic library' >&2
+            exit 1
+          fi
+          "$binary" --version
+
+      - name: Upload worker
+        uses: actions/upload-artifact@v7
+        with:
+          name: mj-worker-aarch64-unknown-linux-musl
+          path: target/aarch64-unknown-linux-musl/release/mj
+          if-no-files-found: error
+
   build-linux:
     name: Build x86_64-unknown-linux-gnu
-    needs: coverage
+    needs: [build-worker-x64, build-worker-arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-unknown-linux-gnu
 
@@ -41,6 +140,12 @@ jobs:
       - name: Build voice worker
         run: cargo build --release --locked -p brokk-mj-voice-worker --target x86_64-unknown-linux-gnu
 
+      - name: Download session workers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mj-worker-*
+          path: workers
+
       - name: Package archive
         shell: bash
         run: |
@@ -48,6 +153,9 @@ jobs:
           mkdir "$name"
           cp "target/x86_64-unknown-linux-gnu/release/mj" "$name/"
           cp "target/x86_64-unknown-linux-gnu/release/mj-voice-worker" "$name/"
+          cp workers/mj-worker-x86_64-unknown-linux-musl/mj "$name/mj-worker-x86_64-unknown-linux-musl"
+          cp workers/mj-worker-aarch64-unknown-linux-musl/mj "$name/mj-worker-aarch64-unknown-linux-musl"
+          chmod 0755 "$name/mj" "$name/mj-voice-worker" "$name"/mj-worker-*
           cp README.md LICENSE "$name/"
           mkdir "$name/licenses"
           cp licenses/SOURCE.md licenses/OFL-1.1.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/licenses/"
@@ -66,20 +174,17 @@ jobs:
 
   build-linux-arm64:
     name: Build aarch64-unknown-linux-gnu
-    needs: coverage
+    needs: [build-worker-x64, build-worker-arm64]
     # Build natively on a GitHub-hosted arm64 runner instead of cross. The
-    # cross images (ghcr.io/cross-rs/aarch64-unknown-linux-gnu, Ubuntu 20.04 /
-    # GCC 9 even on the main tag) ship a libstdc++ too old to link the
-    # GCC 11+ symbols in the prebuilt sherpa-onnx aarch64 static libs
-    # (std::__throw_bad_array_new_length, std::__cxx11::basic_stringstream,
-    # std::filesystem::path). ubuntu-24.04-arm ships GCC 13, matching the
-    # native build path that already succeeds on x86_64.
+    # cross images ship a libstdc++ too old to link the GCC 11+ symbols in the
+    # prebuilt sherpa-onnx aarch64 static libs; ubuntu-24.04-arm ships GCC 13,
+    # matching the native build path that already succeeds on x86_64.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: aarch64-unknown-linux-gnu
 
@@ -94,6 +199,12 @@ jobs:
       - name: Build voice worker
         run: cargo build --release --locked -p brokk-mj-voice-worker --target aarch64-unknown-linux-gnu
 
+      - name: Download session workers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mj-worker-*
+          path: workers
+
       - name: Package archive
         shell: bash
         run: |
@@ -101,6 +212,9 @@ jobs:
           mkdir "$name"
           cp "target/aarch64-unknown-linux-gnu/release/mj" "$name/"
           cp "target/aarch64-unknown-linux-gnu/release/mj-voice-worker" "$name/"
+          cp workers/mj-worker-x86_64-unknown-linux-musl/mj "$name/mj-worker-x86_64-unknown-linux-musl"
+          cp workers/mj-worker-aarch64-unknown-linux-musl/mj "$name/mj-worker-aarch64-unknown-linux-musl"
+          chmod 0755 "$name/mj" "$name/mj-voice-worker" "$name"/mj-worker-*
           cp README.md LICENSE "$name/"
           mkdir "$name/licenses"
           cp licenses/SOURCE.md licenses/OFL-1.1.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/licenses/"
@@ -117,112 +231,15 @@ jobs:
             brokk-mjolnir-*.tar.gz.sha256
           if-no-files-found: error
 
-  build-android:
-    name: Build aarch64-linux-android
-    needs: coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          targets: aarch64-linux-android
-
-      - name: Setup Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27d
-
-      - name: Export Android NDK toolchain
-        shell: bash
-        run: |
-          ndk_path='${{ steps.setup-ndk.outputs.ndk-path }}'
-          echo "ANDROID_NDK_HOME=$ndk_path" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ndk_path" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
-          echo "CC_aarch64_linux_android=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
-          echo "AR_aarch64_linux_android=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
-
-      - name: Build release binary
-        run: cargo build --release --locked --no-default-features --target aarch64-linux-android
-
-      - name: Package archive
-        shell: bash
-        run: |
-          name="brokk-mjolnir-${GITHUB_REF_NAME}-aarch64-linux-android"
-          mkdir "$name"
-          cp "target/aarch64-linux-android/release/mj" "$name/"
-          cp README.md LICENSE "$name/"
-          mkdir "$name/licenses"
-          cp licenses/SOURCE.md licenses/OFL-1.1.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/licenses/"
-          cp -R licenses/native "$name/licenses/"
-          tar czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: aarch64-linux-android
-          path: |
-            brokk-mjolnir-*.tar.gz
-            brokk-mjolnir-*.tar.gz.sha256
-          if-no-files-found: error
-
-  build-windows:
-    name: Build x86_64-pc-windows-msvc
-    needs: coverage
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Build release binary
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
-
-      - name: Build voice worker
-        run: cargo build --release --locked -p brokk-mj-voice-worker --target x86_64-pc-windows-msvc
-
-      - name: Package archive
-        shell: pwsh
-        run: |
-          $name = "brokk-mjolnir-${env:GITHUB_REF_NAME}-x86_64-pc-windows-msvc"
-          New-Item -ItemType Directory -Path $name | Out-Null
-          Copy-Item "target\x86_64-pc-windows-msvc\release\mj.exe" -Destination $name
-          Copy-Item "target\x86_64-pc-windows-msvc\release\mj-voice-worker.exe" -Destination $name
-          Copy-Item "README.md" -Destination $name
-          Copy-Item "LICENSE" -Destination $name
-          New-Item -ItemType Directory -Path "$name\licenses" | Out-Null
-          $legalFiles = @("licenses\SOURCE.md", "licenses\OFL-1.1.md", "licenses\THIRD_PARTY_LICENSES.html", "licenses\SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt")
-          Copy-Item $legalFiles -Destination "$name\licenses"
-          Copy-Item "licenses\native" -Destination "$name\licenses" -Recurse
-          Compress-Archive -Path $name -DestinationPath "$name.zip"
-          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
-          "$hash  $name.zip" | Set-Content -Path "$name.zip.sha256" -NoNewline
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: x86_64-pc-windows-msvc
-          path: |
-            brokk-mjolnir-*.zip
-            brokk-mjolnir-*.zip.sha256
-          if-no-files-found: error
-
   build-macos:
     name: Build macOS universal
-    needs: coverage
+    needs: [build-worker-x64, build-worker-arm64]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
 
@@ -252,12 +269,21 @@ jobs:
             -output target/universal-apple-darwin/release/mj-voice-worker
           lipo -info target/universal-apple-darwin/release/mj-voice-worker
 
+      - name: Download session workers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mj-worker-*
+          path: workers
+
       - name: Package archive
         run: |
           name="brokk-mjolnir-${GITHUB_REF_NAME}-universal-apple-darwin"
           mkdir "$name"
           cp target/universal-apple-darwin/release/mj "$name/"
           cp target/universal-apple-darwin/release/mj-voice-worker "$name/"
+          cp workers/mj-worker-x86_64-unknown-linux-musl/mj "$name/mj-worker-x86_64-unknown-linux-musl"
+          cp workers/mj-worker-aarch64-unknown-linux-musl/mj "$name/mj-worker-aarch64-unknown-linux-musl"
+          chmod 0755 "$name/mj" "$name/mj-voice-worker" "$name"/mj-worker-*
           cp README.md LICENSE "$name/"
           mkdir "$name/licenses"
           cp licenses/SOURCE.md licenses/OFL-1.1.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/licenses/"
@@ -276,7 +302,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build-linux, build-linux-arm64, build-android, build-windows, build-macos]
+    needs: [build-linux, build-linux-arm64, build-macos]
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -297,8 +323,6 @@ jobs:
           files: |
             artifacts/brokk-mjolnir-*.tar.gz
             artifacts/brokk-mjolnir-*.tar.gz.sha256
-            artifacts/brokk-mjolnir-*.zip
-            artifacts/brokk-mjolnir-*.zip.sha256
 
       # Events created with GITHUB_TOKEN do not start workflows, while crates.io
       # rejects trusted-publishing requests from the workflow_run event. An

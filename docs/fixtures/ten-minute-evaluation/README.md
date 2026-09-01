@@ -1,10 +1,5 @@
-# Weather utilities
+# Mjolnir ten-minute evaluation fixture
 
-Small temperature helpers: `status()` classifies a Celsius temperature and
-`fahrenheit()` converts one.
-
-Run the tests with:
-
-```
-python3 -m unittest -v
-```
+This disposable Python fixture starts with two passing tests. Follow
+`docs/src/content/docs/evaluate.md` to exercise a delegated subagent
+implementation and review without using a real repository.

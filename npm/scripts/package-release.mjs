@@ -45,26 +45,6 @@ export const PLATFORMS = [
     cpu: ["arm64"],
     libc: ["glibc"],
   },
-  {
-    packageName: "@brokkai/mjolnir-android-arm64",
-    target: "aarch64-linux-android",
-    extension: ".tar.gz",
-    binary: "mj",
-    desktop: false,
-    description: "Native Android ARM64 bundle for @brokkai/mjolnir",
-    os: ["android"],
-    cpu: ["arm64"],
-  },
-  {
-    packageName: "@brokkai/mjolnir-win32-x64",
-    target: "x86_64-pc-windows-msvc",
-    extension: ".zip",
-    binary: "mj.exe",
-    desktop: true,
-    description: "Native Windows x64 bundle for @brokkai/mjolnir",
-    os: ["win32"],
-    cpu: ["x64"],
-  },
 ];
 
 export function versionFromTag(tag) {
@@ -75,9 +55,8 @@ export function versionFromTag(tag) {
 
 export async function cargoVersion() {
   const manifest = await readFile(path.join(repositoryRoot, "Cargo.toml"), "utf8");
-  // The release version lives in [workspace.package]; both crates inherit it.
-  const version = manifest.match(/^\[workspace\.package\]$[^[]*^version = "([^"]+)"$/m)?.[1];
-  if (!version) throw new Error("could not read the [workspace.package] version from Cargo.toml");
+  const version = manifest.match(/^version = "([^"]+)"$/m)?.[1];
+  if (!version) throw new Error("could not read the root Cargo.toml version");
   return version;
 }
 
@@ -179,6 +158,15 @@ async function stagePlatform(platform, version, source, stagingRoot) {
     const worker = platform.binary === "mj.exe" ? "mj-voice-worker.exe" : "mj-voice-worker";
     await cp(path.join(source, worker), path.join(destination, "bin", worker));
     await ensureBinary(path.join(destination, "bin", worker), platform.binary !== "mj.exe");
+    // Session workers are static Linux binaries uploaded into disposable
+    // targets; the controller looks for them beside its own executable.
+    for (const sessionWorker of [
+      "mj-worker-x86_64-unknown-linux-musl",
+      "mj-worker-aarch64-unknown-linux-musl",
+    ]) {
+      await cp(path.join(source, sessionWorker), path.join(destination, "bin", sessionWorker));
+      await ensureBinary(path.join(destination, "bin", sessionWorker), platform.binary !== "mj.exe");
+    }
   }
   await ensureBinary(path.join(destination, "bin", platform.binary), platform.binary !== "mj.exe");
   await writeManifest(destination, platformManifest(platform, version));

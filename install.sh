@@ -458,7 +458,12 @@ install_from_asset() {
 
   # Skip download when the stored archive checksum matches the remote one
   expected="$(fetch_checksum "$release_file" "$asset_name" || true)"
-  if [[ -n "$expected" && -f "$dest" && ( -z "$companion_name" || -f "${INSTALL_DIR}/${companion_name}" ) ]]; then
+  local companions_present=1
+  local companion
+  for companion in $companion_name; do
+    [[ -f "${INSTALL_DIR}/${companion}" ]] || companions_present=0
+  done
+  if [[ -n "$expected" && -f "$dest" && "$companions_present" == 1 ]]; then
     local stored_checksum_file
     stored_checksum_file="$(stored_checksum_path "$bin_name")"
     if [[ -f "$stored_checksum_file" ]]; then
@@ -492,10 +497,10 @@ install_from_asset() {
       strip_quarantine "$extract_dir"
       src="$(find_extracted_binary "$extract_dir" "$bin_name")"
       install_binary "$src" "$bin_name"
-      if [[ -n "$companion_name" ]]; then
-        src="$(find_extracted_binary "$extract_dir" "$companion_name")"
-        install_binary "$src" "$companion_name"
-      fi
+      for companion in $companion_name; do
+        src="$(find_extracted_binary "$extract_dir" "$companion")"
+        install_binary "$src" "$companion"
+      done
       ;;
     *.zip)
       require_command unzip
@@ -504,10 +509,10 @@ install_from_asset() {
       strip_quarantine "$extract_dir"
       src="$(find_extracted_binary "$extract_dir" "$bin_name")"
       install_binary "$src" "$bin_name"
-      if [[ -n "$companion_name" ]]; then
-        src="$(find_extracted_binary "$extract_dir" "$companion_name")"
-        install_binary "$src" "$companion_name"
-      fi
+      for companion in $companion_name; do
+        src="$(find_extracted_binary "$extract_dir" "$companion")"
+        install_binary "$src" "$companion"
+      done
       ;;
     *)
       install_binary "$asset_file" "$bin_name"
@@ -523,7 +528,9 @@ install_mjolnir() {
   fi
   patterns+=("^brokk-mjolnir-.*-${RUST_TARGET}[.]tar[.]gz$")
 
-  local companion="mj-voice-worker"
+  # Session workers are the static Linux binaries the controller uploads into
+  # disposable targets; they install beside mj so the worker lookup finds them.
+  local companion="mj-voice-worker mj-worker-x86_64-unknown-linux-musl mj-worker-aarch64-unknown-linux-musl"
   if [[ "$OS_FAMILY" == "android" ]]; then
     companion=""
   fi

@@ -1,0 +1,154 @@
+name: Reliability
+
+on:
+  schedule:
+  - cron: '23 7 * * *'
+  workflow_dispatch:
+    inputs:
+      soak_minutes:
+        description: Seeded soak duration
+        required: true
+        default: '30'
+        type: choice
+        options: ['30', '45', '60']
+      seed:
+        description: First replay seed
+        required: true
+        default: '700001'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+  RELIABILITY_SEED: ${{ inputs.seed || '700001' }}
+
+jobs:
+  crash-matrix:
+    name: Process and durability crashes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        targets: x86_64-unknown-linux-musl
+    - name: Install Linux musl tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
+    - name: Build feature-gated crash hooks
+      run: cargo build --locked -p brokk-mjolnir --features test-hooks
+    - name: Run named durability boundaries
+      run: MJ_CHAOS_ISOLATED=1 tests/e2e/run-test-hook-chaos.sh ./target/x86_64-unknown-linux-musl/debug/mj --seed "$RELIABILITY_SEED"
+    - name: Run worker topology deaths
+      run: MJ_CHAOS_ISOLATED=1 MJ_CHAOS_ARTIFACT_DIR=target/reliability-artifacts/worker-topology tests/e2e/session_restart_chaos.sh ./target/x86_64-unknown-linux-musl/debug/mj
+    - name: Upload crash evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: reliability-crash-matrix
+        path: target/reliability-artifacts/
+        if-no-files-found: warn
+        retention-days: 30
+
+  browser:
+    name: Chromium and TUI convergence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        targets: x86_64-unknown-linux-musl
+    - uses: actions/setup-node@v6
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: tests/e2e/web/package-lock.json
+    - name: Install Linux build and browser dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
+        npm ci --prefix tests/e2e/web
+        npx --prefix tests/e2e/web playwright install --with-deps chromium
+    - name: Build Hel
+      run: cargo build --locked -p brokk-mjolnir
+    - name: Run real viewer against a concurrent TUI
+      run: tests/e2e/run-browser-reliability.sh --seed "$RELIABILITY_SEED" ./target/x86_64-unknown-linux-musl/debug/mj
+    - name: Upload browser evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: reliability-browser
+        path: |
+          target/reliability-artifacts/
+          tests/e2e/web/test-results/
+        if-no-files-found: warn
+        retention-days: 30
+
+  test-modes:
+    name: Tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: serialized
+          threads: '1'
+        - name: highly-parallel
+          threads: '16'
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        targets: x86_64-unknown-linux-musl
+    - name: Install Linux musl tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
+    - name: Run the full suite with fixed scheduling pressure
+      env:
+        PROPTEST_CASES: '256'
+        PROPTEST_RNG_SEED: ${{ env.RELIABILITY_SEED }}
+      run: cargo test --locked -- --test-threads=${{ matrix.threads }}
+    - name: Upload generated regressions and diagnostics
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: reliability-tests-${{ matrix.name }}
+        path: |
+          target/reliability-artifacts/
+          **/*.proptest-regressions
+        if-no-files-found: warn
+        retention-days: 30
+
+  soak:
+    name: Seeded multi-client soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@1.96.0
+      with:
+        targets: x86_64-unknown-linux-musl
+    - name: Install Linux musl tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends --assume-yes musl-tools
+    - name: Build Hel
+      run: cargo build --locked -p brokk-mjolnir
+    - name: Run bounded replayable soak
+      env:
+        SOAK_MINUTES: ${{ inputs.soak_minutes || '30' }}
+      run: tests/e2e/run-reliability-soak.sh --minutes "$SOAK_MINUTES" --seed "$RELIABILITY_SEED" ./target/x86_64-unknown-linux-musl/debug/mj
+    - name: Upload every soak iteration
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: reliability-soak
+        path: target/reliability-artifacts/
+        if-no-files-found: warn
+        retention-days: 30

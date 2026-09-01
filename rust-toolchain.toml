@@ -1,3 +1,8 @@
+# One compiler for local development, CI, and releases. Every workflow pins
+# `dtolnay/rust-toolchain` to this same version, so a new stable release (and
+# the new clippy lints CI runs with `-D warnings`) cannot break the build
+# without a deliberate bump here. Keep `[workspace.package] rust-version` in
+# `Cargo.toml` in step with this channel.
 [toolchain]
-channel = "1.97.1"
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]

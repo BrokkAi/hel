@@ -1,4 +1,4 @@
-MJOLNIR SUPPLEMENTAL THIRD-PARTY NOTICES
+HEL SUPPLEMENTAL THIRD-PARTY NOTICES
 
 This file supplements THIRD_PARTY_LICENSES.html. Cargo package metadata
 does not enumerate standalone NOTICE files, embedded web fonts, or every
@@ -6,7 +6,7 @@ license in native source and prebuilt static-library payloads.
 
 The sections below are generated from Cargo.lock, exact installed crate
 sources, and a reviewed inventory of the non-Cargo assets shipped by
-official Mjolnir archives.
+official Hel archives.
 
 ================================================================================
 cfg_aliases third-party attribution
@@ -93,18 +93,43 @@ bzip2/libbzip2 version 1.0.8 of 13 July 2019
 --------------------------------------------------------------------------
 
 ================================================================================
-SQLite 3.46.0
+mimalloc native allocator
 ================================================================================
 
-Source: https://crates.io/crates/libsqlite3-sys/0.30.1 (sqlite3/sqlite3.c)
-Inclusion: compiled from the bundled SQLite amalgamation
+Source: https://crates.io/crates/libmimalloc-sys/0.1.49 (c_src/mimalloc/v3/LICENSE)
+Inclusion: statically linked into the musl Linux hel controller and worker
 
-The author disclaims copyright to this source code.  In place of
-a legal notice, here is a blessing:
+MIT License
 
-   May you do good and not evil.
-   May you find forgiveness for yourself and forgive others.
-   May you share freely, never taking more than you give.
+Copyright (c) 2018-2025 Microsoft Corporation, Daan Leijen
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+SQLite 3.50.2 amalgamation
+================================================================================
+
+Source: https://crates.io/crates/libsqlite3-sys/0.35.0 (sqlite3/sqlite3.c)
+Inclusion: statically linked into hel by libsqlite3-sys with its bundled feature
+
+SQLite is dedicated to the public domain.
+https://www.sqlite.org/copyright.html
 
 ================================================================================
 sherpa-onnx native static payload 1.13.3
@@ -141,8 +166,8 @@ The Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, and GPLv3 texts are included in
 Embedded web fonts
 ================================================================================
 
-Source: mj-remote/src/fonts/*.woff2
-Inclusion: embedded in the mj binary and served by the remote viewer
+Source: src/fonts/*.woff2
+Inclusion: embedded in the hel binary and served by the remote viewer
 
 The following font software is licensed under the SIL Open Font License 1.1. The complete terms are in OFL-1.1.md.
 

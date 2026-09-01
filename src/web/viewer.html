@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <meta name="theme-color" content="#08090d" />
+    <link rel="icon" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/viewer.css" />
+    <title>Hel</title>
+  </head>
+  <body>
+    <!-- Route-level announcements for a screen reader. One region, polite, so
+         a background result is spoken without interrupting what is being read. -->
+    <p id="announcer" class="visually-hidden" role="status" aria-live="polite"></p>
+
+    <p id="connection" class="connection" role="status">
+      Offline. Showing the last state received.
+    </p>
+
+    <header id="shell-header">
+      <button id="back" class="icon-button hidden" aria-label="Back">&#8592;</button>
+      <h1 id="shell-title">HEL</h1>
+      <button
+        id="menu-button"
+        class="icon-button hidden"
+        aria-label="Menu"
+        aria-haspopup="menu"
+        aria-expanded="false"
+      >
+        &#9776;
+      </button>
+      <nav id="menu" class="menu hidden" role="menu" aria-label="Hel">
+        <button role="menuitem" data-route="targets">Targets</button>
+        <button role="menuitem" data-route="quota">Quota</button>
+        <button role="menuitem" id="logout">Sign out</button>
+      </nav>
+    </header>
+
+    <main id="login" class="card">
+      <h2>Unlock viewer</h2>
+      <p class="dim">Enter the six-digit code shown by <code>hel daemon status</code>.</p>
+      <form id="login-form" class="row">
+        <input
+          id="code"
+          inputmode="numeric"
+          autocomplete="one-time-code"
+          pattern="[0-9]{6}"
+          maxlength="6"
+          placeholder="000000"
+          required
+        />
+        <button>Enter</button>
+      </form>
+      <p id="login-error" role="alert"></p>
+    </main>
+
+    <main id="app" class="hidden">
+      <!-- The workspace strip scrolls sideways inside itself; the page never
+           does, however long a workspace is named. -->
+      <div id="workspaces" class="tabstrip scroll-x" role="tablist" aria-label="Workspaces"></div>
+
+      <section id="dashboard" class="page">
+        <div class="row page-actions">
+          <button data-route="new">New session</button>
+          <button data-route="resume" class="secondary">Resume a session</button>
+        </div>
+        <div id="sessions"></div>
+        <p id="action-error" role="alert"></p>
+      </section>
+
+      <section id="new-page" class="page hidden">
+        <h2 id="new-heading">New session</h2>
+        <p id="new-progress" class="dim"></p>
+        <form id="new-form">
+          <div id="new-step"></div>
+          <div class="row">
+            <button type="button" id="new-back" class="secondary">Back</button>
+            <button id="new-next">Next</button>
+            <button type="button" class="secondary" data-route="dashboard">Cancel</button>
+          </div>
+        </form>
+        <p id="new-error" role="alert"></p>
+      </section>
+
+      <section id="resume-page" class="page hidden">
+        <h2>Resume a session</h2>
+        <div id="resumable"></div>
+        <p id="resume-error" role="alert"></p>
+      </section>
+
+      <section id="targets-page" class="page hidden">
+        <h2>Targets</h2>
+        <div id="targets"></div>
+      </section>
+
+      <section id="quota-page" class="page hidden">
+        <h2>Quota</h2>
+        <div id="quota"></div>
+      </section>
+
+      <section id="conversation" class="page conversation hidden">
+        <div class="conversation-header">
+          <span id="conversation-title" class="conversation-name">Conversation</span>
+          <span id="conversation-state" class="pill"></span>
+          <button id="cancel-turn" class="secondary hidden">Stop turn</button>
+        </div>
+        <div id="conversation-scroll" class="conversation-scroll">
+          <div id="conversation-feed"></div>
+        </div>
+        <button id="jump-to-latest" class="jump-to-latest hidden">New messages ↓</button>
+        <div id="elicitations"></div>
+        <details id="conversation-side" class="card">
+          <summary>Queue and shells</summary>
+          <h3>Queued prompts</h3>
+          <div id="conversation-queue"></div>
+          <h3>Shell commands</h3>
+          <div id="conversation-shells"></div>
+        </details>
+        <form id="prompt-form" class="composer">
+          <div
+            id="command-palette"
+            class="palette hidden"
+            role="listbox"
+            aria-label="Commands"
+          ></div>
+          <div
+            id="prompt-text"
+            class="composer-input"
+            contenteditable="true"
+            role="textbox"
+            aria-multiline="true"
+            enterkeyhint="send"
+            spellcheck="true"
+            aria-label="Message the agent"
+            data-placeholder="Message the agent or use !command"
+          ></div>
+          <div id="attachments" class="row" aria-label="Attached images"></div>
+          <div class="row">
+            <button id="send-button">Send</button>
+            <button
+              type="button"
+              id="attach-image"
+              class="secondary"
+              aria-label="Attach one or more images"
+              hidden
+            >
+              Images
+            </button>
+            <input id="image-picker" type="file" accept="image/*" multiple hidden />
+          </div>
+          <p id="conversation-error" role="alert"></p>
+        </form>
+      </section>
+    </main>
+
+    <script type="module" src="/viewer.js"></script>
+  </body>
+</html>
