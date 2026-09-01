@@ -86,14 +86,27 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await page.getByRole('button', { name: 'Back' }).click();
     await expect(page).toHaveURL(new RegExp(escapeForRegExp(workspaceHash) + '$'));
 
+    // The New flow asks one thing per screen and reviews before committing.
     await page.getByRole('button', { name: 'New session' }).click();
     await expect(page).toHaveURL(/\/new$/);
-    await page.locator('#new-title').fill(title);
+    await expect(page.locator('#new-progress')).toContainText('Profile');
+    await page.getByRole('button', { name: 'Next' }).click();
+    await expect(page.locator('#new-progress')).toContainText('Target');
+    await page.getByRole('button', { name: 'Next' }).click();
+    // The lab's only target is bare, so the project step asks for a directory
+    // rather than offering a bundle.
+    await expect(page.locator('#new-project-directory')).toBeVisible();
     await page.locator('#new-project-directory').fill(projectDirectory);
+    await page.locator('#new-title').fill(title);
+    await page.getByRole('button', { name: 'Next' }).click();
+    await expect(page.locator('#new-progress')).toContainText('Review');
+    await expect(page.locator('.review')).toContainText(title);
     await page.getByRole('button', { name: 'Start' }).click();
     stage('session-requested');
 
-    const session = page.locator('.session').filter({ hasText: title });
+    // Scoped to the dashboard: the resume page renders session cards too, and
+    // a hidden page's nodes are still in the document.
+    const session = page.locator('#sessions .session').filter({ hasText: title });
     await expect(session).toContainText('running');
     stage('session-running');
     await session.getByRole('button', { name: 'Open' }).click();
@@ -120,9 +133,32 @@ test('real viewer converges with a TUI after an SSE disconnect', async ({ browse
     await resumable.getByRole('button', { name: 'Resume' }).click();
     await page.getByRole('button', { name: 'Back' }).click();
     await expect(session).toContainText('running');
-    page.once('dialog', dialog => dialog.accept());
-    await session.getByRole('button', { name: 'Stop' }).click();
+    // A stop needs the daemon's session manager to have adopted the session,
+    // and adoption is asynchronous, so a stop issued moments after a resume can
+    // fail with "is not managed". The terminal surface offers Retry stop for
+    // exactly this; the phone leaves the button in place and marks the session
+    // as needing attention, so retrying is what a person would do. The stop
+    // itself then checkpoints and tears down a target, which takes materially
+    // longer than a snapshot round trip.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if ((await session.count()) === 0) break;
+      const stop = session.getByRole('button', { name: 'Stop' });
+      if ((await stop.count()) === 0) {
+        await page.waitForTimeout(1000);
+        continue;
+      }
+      page.once('dialog', dialog => dialog.accept());
+      await stop.click();
+      await session
+        .waitFor({ state: 'detached', timeout: 45_000 })
+        .catch(() => {});
+    }
     await expect(session).toHaveCount(0);
+    // A stop that loses the adoption race fails after it was accepted, so its
+    // reason never travels in the response: it reaches the phone as the
+    // session's attention state and nothing else. This asserts that, and with
+    // it that the controller's own wording — which names sessions and
+    // workers — stays on the controller.
     await expect(page.locator('#action-error')).toHaveText('');
     expect(responseErrors).toEqual([]);
 

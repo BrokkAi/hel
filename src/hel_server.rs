@@ -105,6 +105,7 @@ pub struct ServerOptions {
     pub conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
     pub action_tx: mpsc::Sender<ControllerRequest>,
     pub receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+    pub preflight_tx: mpsc::Sender<PreflightRequest>,
     pub shutdown: CancellationToken,
     pub session_ttl: Duration,
     /// Keep this enabled for direct HTTPS or an HTTPS reverse proxy. It may be
@@ -123,6 +124,7 @@ impl ServerOptions {
         conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
         action_tx: mpsc::Sender<ControllerRequest>,
         receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+        preflight_tx: mpsc::Sender<PreflightRequest>,
     ) -> AnyResult<Self> {
         Ok(Self {
             bind,
@@ -130,6 +132,7 @@ impl ServerOptions {
             conversation_rx,
             action_tx,
             receipt_tx,
+            preflight_tx,
             shutdown: CancellationToken::new(),
             session_ttl: DEFAULT_SESSION_TTL,
             secure_cookie: true,
@@ -886,6 +889,30 @@ pub struct ControllerRequest {
 /// viewer and controller never went quiet; it also consumed the session's
 /// single action slot, intermittently rejecting real actions. A receipt
 /// therefore travels on its own channel and only persists one cursor field.
+/// A phone asking whether a session it is about to create would launch
+/// cleanly, and what it should be warned about first.
+///
+/// This is not a `ControllerAction`: it starts nothing, it takes no session
+/// slot, and it must answer before the person has decided anything. It also
+/// needs the controller, because whether a repository has uncommitted changes
+/// is a fact about the disk rather than about the projection.
+#[derive(Debug)]
+pub struct PreflightRequest {
+    pub bundle_id: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<PreflightNew, String>>,
+}
+
+/// What a preflight found.
+///
+/// The repositories are leaf names. The controller knows them by absolute
+/// path, and a phone is told just enough to recognise the repository it is
+/// about to launch over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightNew {
+    pub dirty_repositories: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct ReadReceiptRequest {
     pub client_id: String,
@@ -900,6 +927,7 @@ struct ServerState {
     conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
     action_tx: mpsc::Sender<ControllerRequest>,
     receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+    preflight_tx: mpsc::Sender<PreflightRequest>,
     viewer_code: Arc<str>,
     login_token: Arc<str>,
     cookie_key: Arc<[u8]>,
@@ -965,6 +993,7 @@ fn router(options: ServerOptions) -> Router {
         conversation_rx: options.conversation_rx,
         action_tx: options.action_tx,
         receipt_tx: options.receipt_tx,
+        preflight_tx: options.preflight_tx,
         viewer_code: options.viewer_code.into(),
         login_token: options.login_token.into(),
         cookie_key: options.cookie_key.into(),
@@ -980,6 +1009,7 @@ fn router(options: ServerOptions) -> Router {
             post(mark_conversation_read),
         )
         .route("/api/events", get(events))
+        .route("/api/preflight/new", post(preflight_new))
         .route(
             "/api/actions",
             post(action).layer(DefaultBodyLimit::max(MAX_PROMPT_BODY_BYTES)),
@@ -1201,6 +1231,65 @@ async fn mark_conversation_read(
         .map_err(|_| ApiError::controller_unavailable())?
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "read receipt failed"))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreflightNewRequest {
+    #[serde(default)]
+    workspace_id: String,
+    profile_id: String,
+    bundle_id: String,
+    target_id: String,
+    #[serde(default)]
+    project_directory: Option<PathBuf>,
+}
+
+/// Answer whether a new session would launch cleanly, and what to warn about.
+///
+/// The same validation the action itself runs happens here, so a phone learns
+/// about an impossible combination while it can still change it rather than
+/// after it has committed.
+async fn preflight_new(
+    State(state): State<ServerState>,
+    Json(request): Json<PreflightNewRequest>,
+) -> Result<Json<PreflightNew>, ApiError> {
+    let action = ControllerAction::New {
+        workspace_id: request.workspace_id,
+        profile_id: request.profile_id,
+        bundle_id: request.bundle_id.clone(),
+        target_id: request.target_id,
+        title: None,
+        project_directory: request.project_directory.clone(),
+        dirty_ack: Vec::new(),
+    };
+    validate_action(&action, &state.snapshot_rx.borrow())?;
+    // A bare target opens a directory the person named; there is no bundle to
+    // have uncommitted changes in.
+    if request.project_directory.is_some() {
+        return Ok(Json(PreflightNew {
+            dirty_repositories: Vec::new(),
+        }));
+    }
+    let (reply, result) = tokio::sync::oneshot::channel();
+    state
+        .preflight_tx
+        .send(PreflightRequest {
+            bundle_id: request.bundle_id,
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::controller_unavailable())?;
+    result
+        .await
+        .map_err(|_| ApiError::controller_unavailable())?
+        .map(Json)
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the controller could not check this project",
+            )
+        })
 }
 
 async fn events(State(state): State<ServerState>) -> impl IntoResponse {
@@ -2021,6 +2110,7 @@ mod tests {
         Router,
         mpsc::Receiver<ControllerRequest>,
         mpsc::Receiver<ReadReceiptRequest>,
+        mpsc::Receiver<PreflightRequest>,
     );
 
     fn app() -> TestServer {
@@ -2046,9 +2136,16 @@ mod tests {
         let (_conversation_tx, conversation_rx) = watch::channel(conversations);
         let (action_tx, action_rx) = mpsc::channel(8);
         let (receipt_tx, receipt_rx) = mpsc::channel(8);
-        let options = test_options(snapshot_rx, conversation_rx, action_tx, receipt_tx)
-            .with_test_credentials("123456", b"01234567890123456789012345678901");
-        (router(options), action_rx, receipt_rx)
+        let (preflight_tx, preflight_rx) = mpsc::channel(8);
+        let options = test_options(
+            snapshot_rx,
+            conversation_rx,
+            action_tx,
+            receipt_tx,
+            preflight_tx,
+        )
+        .with_test_credentials("123456", b"01234567890123456789012345678901");
+        (router(options), action_rx, receipt_rx, preflight_rx)
     }
 
     fn test_options(
@@ -2056,6 +2153,7 @@ mod tests {
         conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
         action_tx: mpsc::Sender<ControllerRequest>,
         receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+        preflight_tx: mpsc::Sender<PreflightRequest>,
     ) -> ServerOptions {
         ServerOptions::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -2063,6 +2161,7 @@ mod tests {
             conversation_rx,
             action_tx,
             receipt_tx,
+            preflight_tx,
         )
         .unwrap()
     }
@@ -2074,7 +2173,14 @@ mod tests {
         let (_conversation_tx, conversation_rx) = watch::channel(BTreeMap::new());
         let (action_tx, _action_rx) = mpsc::channel(1);
         let (receipt_tx, _receipt_rx) = mpsc::channel(1);
-        test_options(snapshot_rx, conversation_rx, action_tx, receipt_tx)
+        let (preflight_tx, _preflight_rx) = mpsc::channel(1);
+        test_options(
+            snapshot_rx,
+            conversation_rx,
+            action_tx,
+            receipt_tx,
+            preflight_tx,
+        )
     }
 
     /// A valid session cookie for the test server's key.
@@ -2118,7 +2224,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_requires_a_valid_signed_cookie() {
-        let (app, _, _) = app();
+        let (app, _, _, _) = app();
         let unauthorized = app
             .clone()
             .oneshot(Request::get("/api/snapshot").body(Body::empty()).unwrap())
@@ -2141,7 +2247,7 @@ mod tests {
 
     #[tokio::test]
     async fn qr_login_exchanges_the_secret_for_a_cookie_and_redirects_cleanly() {
-        let (app, _, _) = app();
+        let (app, _, _, _) = app();
         let rejected = app
             .clone()
             .oneshot(
@@ -2260,7 +2366,7 @@ mod tests {
 
     #[tokio::test]
     async fn elicitation_answer_is_typed_and_forwarded() {
-        let (app, mut actions, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let (app, mut actions, _, _) = app_with_snapshot(pending_elicitation_snapshot);
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -2292,7 +2398,7 @@ mod tests {
     #[tokio::test]
     async fn elicitation_answer_for_an_unknown_request_is_refused_without_reaching_the_controller()
     {
-        let (app, mut actions, _) = app_with_snapshot(pending_elicitation_snapshot);
+        let (app, mut actions, _, _) = app_with_snapshot(pending_elicitation_snapshot);
         let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
@@ -2518,7 +2624,7 @@ mod tests {
                 "set_config",
             ),
         ] {
-            let (app, mut actions, _) = app();
+            let (app, mut actions, _, _) = app();
             let response = post_action(app, cookie(), body.to_owned()).await;
             assert!(
                 response.status().is_client_error(),
@@ -2560,7 +2666,7 @@ mod tests {
                 "an unoffered value",
             ),
         ] {
-            let (app, mut actions, _) = app_with_snapshot(capable);
+            let (app, mut actions, _, _) = app_with_snapshot(capable);
             let response = post_action(app, cookie(), body.to_owned()).await;
             assert_eq!(
                 response.status(),
@@ -2571,7 +2677,7 @@ mod tests {
         }
 
         // The value the harness did advertise is forwarded unchanged.
-        let (app, mut actions, _) = app_with_snapshot(capable);
+        let (app, mut actions, _, _) = app_with_snapshot(capable);
         let response = tokio::spawn(post_action(
             app,
             cookie(),
@@ -2606,7 +2712,7 @@ mod tests {
             (oversized.as_str(), "an unbounded acknowledgement"),
             (r#""""#, "an empty repository name"),
         ] {
-            let (app, mut actions, _) = app();
+            let (app, mut actions, _, _) = app();
             let body = format!(
                 r#"{{"action":"new","workspace_id":"default","profile_id":"codex-1","bundle_id":"hel","target_id":"podman","dirty_ack":[{ack}]}}"#
             );
@@ -2620,7 +2726,7 @@ mod tests {
     /// terminal derives it, so the two surfaces name a session alike.
     #[tokio::test]
     async fn a_new_session_without_a_title_is_accepted() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _) = app();
         let response = tokio::spawn(post_action(
             app,
             cookie(),
@@ -2643,6 +2749,100 @@ mod tests {
         );
         action.reply.send(ActionOutcome::Accepted).unwrap();
         assert_eq!(response.await.unwrap().status(), StatusCode::ACCEPTED);
+    }
+
+    /// A preflight starts nothing. It answers the questions a person needs
+    /// before committing, and it refuses an impossible combination there
+    /// rather than after the commit.
+    #[tokio::test]
+    async fn a_preflight_validates_before_it_reaches_the_controller() {
+        for (body, why) in [
+            (
+                r#"{"profile_id":"nope","bundle_id":"hel","target_id":"podman"}"#,
+                "an unknown profile",
+            ),
+            (
+                r#"{"profile_id":"codex-1","bundle_id":"hel","target_id":"raw"}"#,
+                "a bare target with no directory",
+            ),
+        ] {
+            let (app, _, _, mut preflights) = app();
+            let response = app
+                .oneshot(
+                    Request::post("/api/preflight/new")
+                        .header(COOKIE, cookie())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{why}");
+            assert!(
+                preflights.try_recv().is_err(),
+                "{why} reached the controller"
+            );
+        }
+    }
+
+    /// A bare target opens a directory the person named, so there is no bundle
+    /// whose repositories could be dirty and nothing to ask the controller.
+    #[tokio::test]
+    async fn a_bare_preflight_answers_without_the_controller() {
+        let (app, _, _, mut preflights) = app();
+        let response = app
+            .oneshot(
+                Request::post("/api/preflight/new")
+                    .header(COOKIE, cookie())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"profile_id":"codex-1","bundle_id":"hel","target_id":"raw","project_directory":"/work/project"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(preflights.try_recv().is_err(), "the controller was asked");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let answer: PreflightNew = serde_json::from_slice(&body).unwrap();
+        assert!(answer.dirty_repositories.is_empty());
+    }
+
+    /// A bundle preflight asks the controller, because whether a working tree
+    /// has uncommitted changes is a fact about the disk.
+    #[tokio::test]
+    async fn a_bundle_preflight_reports_the_repositories_by_leaf_name() {
+        let (app, _, _, mut preflights) = app();
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/preflight/new")
+                    .header(COOKIE, cookie())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"profile_id":"codex-1","bundle_id":"hel","target_id":"podman"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let request = preflights.recv().await.expect("the controller was asked");
+        assert_eq!(request.bundle_id, "hel");
+        request
+            .reply
+            .send(Ok(PreflightNew {
+                dirty_repositories: vec!["hel".into()],
+            }))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let answer: PreflightNew = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer.dirty_repositories, vec!["hel".to_owned()]);
+        assert!(
+            !String::from_utf8_lossy(&body).contains('/'),
+            "the preflight published a path: {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// Everything an agent writes goes through the Markdown renderer, so the
@@ -3028,7 +3228,7 @@ if (sentElicitations.size !== 0) {
 
     #[tokio::test]
     async fn image_prompt_reaches_the_controller_with_its_images() {
-        let (app, mut actions, _) = app_with_snapshot(image_capable);
+        let (app, mut actions, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(8);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -3056,7 +3256,7 @@ if (sentElicitations.size !== 0) {
     /// carries prompts, so it is the route that gets the larger bound.
     #[tokio::test]
     async fn multi_image_prompts_are_accepted_over_the_general_body_limit() {
-        let (app, mut actions, _) = app_with_snapshot(image_capable);
+        let (app, mut actions, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(MAX_BODY_BYTES / 2);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -3075,7 +3275,7 @@ if (sentElicitations.size !== 0) {
 
     #[tokio::test]
     async fn a_body_over_the_prompt_limit_is_still_refused() {
-        let (app, _actions, _) = app_with_snapshot(image_capable);
+        let (app, _actions, _, _) = app_with_snapshot(image_capable);
         let cookie = login_cookie(&app).await;
         let image = sample_image(MAX_PROMPT_BODY_BYTES);
         let body = serde_json::to_string(&ControllerAction::Prompt {
@@ -3098,7 +3298,7 @@ if (sentElicitations.size !== 0) {
             ("", "image/png", 32, 24),
         ];
         for (data, mime, width, height) in cases {
-            let (app, mut actions, _) = app_with_snapshot(image_capable);
+            let (app, mut actions, _, _) = app_with_snapshot(image_capable);
             let cookie = login_cookie(&app).await;
             let body = serde_json::to_string(&ControllerAction::Prompt {
                 session_id: "session-1".into(),
@@ -3201,7 +3401,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
     /// to name an icon, and that icon has to be served.
     #[tokio::test]
     async fn viewer_declares_the_icon_route_instead_of_requesting_a_missing_favicon() {
-        let (app, _, _) = app();
+        let (app, _, _, _) = app();
         let page = fetch_text(app.clone(), "/").await;
         assert!(page.contains(r#"rel="icon""#), "the page declares no icon");
         assert!(page.contains("/icon.svg"), "the page names no icon route");
@@ -3219,7 +3419,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn valid_action_is_typed_and_forwarded() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -3248,7 +3448,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn shell_action_is_typed_and_forwarded() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -3333,7 +3533,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn bare_new_action_forwards_an_explicit_safe_project_directory() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -3410,7 +3610,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn cancel_action_is_typed_and_forwarded() {
-        let (app, mut actions, _) = app();
+        let (app, mut actions, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -3500,7 +3700,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn snapshot_endpoint_returns_only_public_projection() {
-        let (app, _, _) = app();
+        let (app, _, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
@@ -3551,7 +3751,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                 },
             ],
         };
-        let (app, _, _) =
+        let (app, _, _, _) =
             app_with_conversations(BTreeMap::from([("session-1".into(), transcript)]));
         let cookie = login_cookie(&app).await;
         let response = app
@@ -3574,7 +3774,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn conversation_read_receipt_never_contends_with_a_running_action() {
-        let (app, mut actions, mut receipts) = app();
+        let (app, mut actions, mut receipts, _) = app();
         let cookie = login_cookie(&app).await;
         // A prompt for the same session stays in flight for the whole test, so
         // a receipt that still travelled the action pipeline would either
@@ -3645,7 +3845,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
                 "could not start this action",
             ),
         ] {
-            let (app, mut actions, _) = app();
+            let (app, mut actions, _, _) = app();
             let cookie = login_cookie(&app).await;
             let response = tokio::spawn(
                 app.oneshot(
@@ -3673,7 +3873,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
         // An accepted action reports its outcome only through snapshots, so
         // the application has to react to `has_error` for a late failure to be
         // visible at all.
-        let (app, _, _) = app();
+        let (app, _, _, _) = app();
         let script = fetch_text(app, "/viewer.js").await;
         assert!(script.contains("has_error"), "viewer ignores has_error");
     }
@@ -3689,7 +3889,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
             "/manifest.webmanifest",
             "/api/snapshot",
         ] {
-            let (app, _, _) = app();
+            let (app, _, _, _) = app();
             let response = app
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
@@ -3730,7 +3930,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
     /// no Rust test would otherwise notice.
     #[tokio::test]
     async fn the_page_carries_no_inline_script_or_style() {
-        let (app, _, _) = app();
+        let (app, _, _, _) = app();
         let page = fetch_text(app, "/").await;
         assert!(
             !page.contains("<script>") && !page.contains("<style>"),
@@ -3747,7 +3947,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
     #[tokio::test]
     async fn live_state_and_the_service_worker_are_never_stored() {
         for path in ["/", "/service-worker.js", "/api/snapshot"] {
-            let (app, _, _) = app();
+            let (app, _, _, _) = app();
             let response = app
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
@@ -3789,7 +3989,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
             ("/apple-touch-icon.png", "image/png"),
             ("/fonts/jetbrains-mono.woff2", "font/woff2"),
         ] {
-            let (app, _, _) = app();
+            let (app, _, _, _) = app();
             let response = app
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
@@ -3818,7 +4018,7 @@ if (carriage !== "first\nsecond") throw new Error(`CRLF became ${JSON.stringify(
 
     #[tokio::test]
     async fn repeated_wrong_codes_lock_the_login_endpoint() {
-        let (app, _, _) = app();
+        let (app, _, _, _) = app();
         let attempt = |code: &'static str| {
             let app = app.clone();
             async move {

@@ -497,6 +497,7 @@ pub(crate) async fn run_server(
     let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
     let (receipt_tx, mut receipt_rx) = tokio::sync::mpsc::channel(32);
+    let (preflight_tx, mut preflight_rx) = tokio::sync::mpsc::channel(32);
     let SessionManagerChannels {
         targets: worker_targets_tx,
         control: worker_commands_tx,
@@ -509,8 +510,14 @@ pub(crate) async fn run_server(
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
     let mut credential_sync_signals = CredentialSyncSignalTracker::default();
     let mut credential_sync_notices = CredentialSyncNotices::default();
-    let mut options =
-        ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx, receipt_tx)?;
+    let mut options = ServerOptions::new(
+        bind,
+        snapshot_rx,
+        conversation_rx,
+        action_tx,
+        receipt_tx,
+        preflight_tx,
+    )?;
     options.shutdown = termination.clone();
     // Session cookies are stateless, so a per-process key would sign every
     // phone out on every restart. Delete the key file to sign them out on
@@ -729,6 +736,37 @@ pub(crate) async fn run_server(
                             eprintln!("Hel: {notice}");
                         }
                     }
+                }
+                preflight = preflight_rx.recv() => {
+                    let Some(hel::hel_server::PreflightRequest { bundle_id, reply }) = preflight else {
+                        failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering preflight requests");
+                        break;
+                    };
+                    // Reading a working tree's status touches the disk, so it
+                    // runs on its own task rather than on the loop that has to
+                    // stay responsive to every other feed.
+                    let bundle = controller.config.bundles.get(&bundle_id).cloned();
+                    tokio::spawn(async move {
+                        let answer = tokio::task::spawn_blocking(move || {
+                            let bundle = bundle.context("unknown bundle")?;
+                            let dirty = hel::hel_local_git::dirty_local_repositories(&bundle)?
+                                .into_iter()
+                                .map(|repository| dirty_repository_label(&repository.path))
+                                .collect();
+                            anyhow::Ok(hel::hel_server::PreflightNew {
+                                dirty_repositories: dirty,
+                            })
+                        })
+                        .await;
+                        let answer = match answer {
+                            Ok(Ok(answer)) => Ok(answer),
+                            Ok(Err(error)) => Err(format!("{error:#}")),
+                            Err(error) => Err(format!("preflight task failed: {error}")),
+                        };
+                        if reply.send(answer).is_err() {
+                            tracing::debug!("phone preflight reply dropped after client disconnect");
+                        }
+                    });
                 }
                 receipt = receipt_rx.recv() => {
                     let Some(ReadReceiptRequest { client_id, session_id, through, reply }) = receipt else {

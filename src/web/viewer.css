@@ -790,3 +790,39 @@ details.block-fold > pre {
   color: var(--dim);
   font-size: 14px;
 }
+
+/* ---- wizards ---- */
+
+.review {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  gap: 6px 14px;
+  margin: 8px 0;
+}
+
+.review dt {
+  color: var(--dim);
+}
+
+.review dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.field-inline {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 0;
+  min-height: var(--touch);
+}
+
+.field-inline input[type='checkbox'] {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+}
+
+#new-progress {
+  margin: 0 0 8px;
+}

@@ -33,12 +33,10 @@ const login = document.querySelector('#login'),
   quotaPanel = document.querySelector('#quota'),
   logout = document.querySelector('#logout'),
   newForm = document.querySelector('#new-form'),
-  newTitle = document.querySelector('#new-title'),
-  newProfile = document.querySelector('#new-profile'),
-  newBundle = document.querySelector('#new-bundle'),
-  newTarget = document.querySelector('#new-target'),
-  newProjectDirectory = document.querySelector('#new-project-directory'),
-  newProjectDirectoryField = document.querySelector('#new-project-directory-field'),
+  newStep = document.querySelector('#new-step'),
+  newProgress = document.querySelector('#new-progress'),
+  newBackButton = document.querySelector('#new-back'),
+  newNextButton = document.querySelector('#new-next'),
   newError = document.querySelector('#new-error'),
   actionError = document.querySelector('#action-error'),
   resumeError = document.querySelector('#resume-error'),
@@ -210,6 +208,9 @@ function applyRoute() {
   } else if (currentSession) {
     leaveConversation();
   }
+  // Arriving at the wizard starts it over; leaving it discards what was
+  // half-answered rather than keeping it to surprise the next visit.
+  if (name !== 'new') newDraft = null;
   renderRoute();
   // A screen reader should land at the top of the page it just moved to
   // rather than wherever it happened to be.
@@ -407,7 +408,7 @@ function action(label, className, data) {
 function fillOptions(select, items, selected) {
   select.replaceChildren(
     ...items.map(item => {
-      const option = el('option', '', item.id);
+      const option = el('option', '', item.label ?? item.id);
       option.value = item.id;
       if (item.id === selected) option.selected = true;
       return option;
@@ -415,23 +416,266 @@ function fillOptions(select, items, selected) {
   );
 }
 
-function syncProjectDirectory() {
-  const required =
-    snapshot?.targets.find(x => x.id === newTarget.value)?.requires_project_directory === true;
-  newProjectDirectoryField.classList.toggle('hidden', !required);
-  newProjectDirectory.required = required;
-  newBundle.closest('.field').classList.toggle('hidden', required);
-  if (!required) newProjectDirectory.value = '';
+// ---------------------------------------------------------------------------
+// The New wizard
+// ---------------------------------------------------------------------------
+//
+// One decision per screen, in the order the terminal asks them, ending in a
+// review that names every choice before anything is committed. A phone keyboard
+// covering a modal is how the previous single flat form became unusable, so
+// this is a route rather than a dialog.
+
+/// The steps, in order. `applies` lets a step drop out — a container target has
+/// no project directory to name, and a bundle with nothing dirty has nothing to
+/// confirm.
+const NEW_STEPS = [
+  { key: 'profile', title: 'Profile', applies: () => true },
+  { key: 'target', title: 'Target', applies: () => true },
+  { key: 'project', title: 'Project', applies: () => true },
+  { key: 'dirty', title: 'Uncommitted changes', applies: draft => draft.dirty.length > 0 },
+  { key: 'review', title: 'Review', applies: () => true },
+];
+
+let newDraft = null;
+
+function freshDraft() {
+  return {
+    step: 0,
+    profileId: snapshot?.profiles[0]?.id || '',
+    targetId: snapshot?.targets[0]?.id || '',
+    bundleId: snapshot?.bundles[0]?.id || '',
+    projectDirectory: '',
+    title: '',
+    dirty: [],
+    acknowledged: false,
+    preflighted: false,
+  };
+}
+
+function targetIsBare(targetId) {
+  return (
+    snapshot?.targets.find(target => target.id === targetId)?.requires_project_directory === true
+  );
+}
+
+function visibleSteps() {
+  return NEW_STEPS.filter(step => step.applies(newDraft));
+}
+
+/// The title the daemon would derive, shown on review so the person sees the
+/// name before committing rather than discovering it afterwards.
+function derivedTitle() {
+  const project = targetIsBare(newDraft.targetId)
+    ? newDraft.projectDirectory.replace(/\/+$/, '').split('/').pop() || newDraft.projectDirectory
+    : newDraft.bundleId;
+  return `${project} via ${newDraft.profileId}`;
 }
 
 function renderNewForm() {
-  if (!newProfile.value) fillOptions(newProfile, snapshot.profiles);
-  if (!newTarget.value) fillOptions(newTarget, snapshot.targets);
-  if (!newBundle.value) fillOptions(newBundle, snapshot.bundles);
-  syncProjectDirectory();
+  if (!newDraft) newDraft = freshDraft();
+  const steps = visibleSteps();
+  newDraft.step = Math.min(newDraft.step, steps.length - 1);
+  const step = steps[newDraft.step];
+  newProgress.textContent = `Step ${newDraft.step + 1} of ${steps.length} · ${step.title}`;
+  newBackButton.disabled = newDraft.step === 0;
+  newNextButton.textContent = step.key === 'review' ? 'Start' : 'Next';
+
+  const body = document.createDocumentFragment();
+  switch (step.key) {
+    case 'profile': {
+      body.append(
+        pickerField('Profile', 'new-profile', snapshot.profiles, newDraft.profileId, value => {
+          newDraft.profileId = value;
+        }),
+      );
+      break;
+    }
+    case 'target': {
+      body.append(
+        pickerField('Target', 'new-target', snapshot.targets, newDraft.targetId, value => {
+          newDraft.targetId = value;
+          // Changing the target changes which project question is asked, and
+          // invalidates anything the previous project answer was checked for.
+          newDraft.preflighted = false;
+          newDraft.dirty = [];
+          newDraft.acknowledged = false;
+          renderNewForm();
+        }),
+      );
+      break;
+    }
+    case 'project': {
+      if (targetIsBare(newDraft.targetId)) {
+        body.append(
+          textField(
+            'Project directory',
+            'new-project-directory',
+            newDraft.projectDirectory,
+            value => {
+              newDraft.projectDirectory = value;
+              newDraft.preflighted = false;
+            },
+          ),
+        );
+      } else {
+        body.append(
+          pickerField('Bundle', 'new-bundle', snapshot.bundles, newDraft.bundleId, value => {
+            newDraft.bundleId = value;
+            newDraft.preflighted = false;
+            newDraft.dirty = [];
+            newDraft.acknowledged = false;
+          }),
+        );
+      }
+      body.append(
+        textField('Title (optional)', 'new-title', newDraft.title, value => {
+          newDraft.title = value;
+        }),
+      );
+      break;
+    }
+    case 'dirty': {
+      body.append(
+        el(
+          'p',
+          '',
+          'These repositories have uncommitted changes. Starting a session copies them as they are.',
+        ),
+      );
+      const list = el('ul');
+      for (const repository of newDraft.dirty) list.append(el('li', '', repository));
+      body.append(list);
+      const label = el('label', 'field-inline');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.id = 'new-dirty-ack';
+      box.checked = newDraft.acknowledged;
+      box.onchange = () => {
+        newDraft.acknowledged = box.checked;
+      };
+      label.append(box, el('span', '', 'Start anyway'));
+      body.append(label);
+      break;
+    }
+    default: {
+      const review = el('dl', 'review');
+      const rows = [
+        ['Profile', newDraft.profileId],
+        ['Target', newDraft.targetId],
+        targetIsBare(newDraft.targetId)
+          ? ['Project directory', newDraft.projectDirectory]
+          : ['Bundle', newDraft.bundleId],
+        ['Name', newDraft.title.trim() || derivedTitle()],
+      ];
+      if (newDraft.dirty.length) rows.push(['Uncommitted changes', newDraft.dirty.join(', ')]);
+      for (const [term, value] of rows) {
+        review.append(el('dt', '', term), el('dd', '', value));
+      }
+      body.append(review);
+    }
+  }
+  newStep.replaceChildren(body);
+}
+
+function pickerField(label, id, items, value, onChange) {
+  const field = el('label', 'field');
+  field.append(el('span', '', label));
+  const select = el('select');
+  select.id = id;
+  fillOptions(select, items, value);
+  select.onchange = () => onChange(select.value);
+  field.append(select);
+  return field;
+}
+
+function textField(label, id, value, onInput) {
+  const field = el('label', 'field');
+  field.append(el('span', '', label));
+  const input = el('input');
+  input.id = id;
+  input.value = value;
+  input.oninput = () => onInput(input.value);
+  field.append(input);
+  return field;
+}
+
+/// Ask the daemon whether this combination would launch, and what to warn
+/// about, before the person commits to it.
+async function preflightNew() {
+  const bare = targetIsBare(newDraft.targetId);
+  const answer = await request('/api/preflight/new', {
+    method: 'POST',
+    body: JSON.stringify({
+      workspace_id: selectedWorkspaceId(),
+      profile_id: newDraft.profileId,
+      bundle_id: newDraft.bundleId,
+      target_id: newDraft.targetId,
+      project_directory: bare ? newDraft.projectDirectory : null,
+    }),
+  });
+  newDraft.dirty = answer.dirty_repositories || [];
+  newDraft.preflighted = true;
+  // A set the person has not seen cannot already be acknowledged.
+  if (!newDraft.dirty.length) newDraft.acknowledged = false;
+}
+
+async function advanceNew() {
+  const steps = visibleSteps();
+  const step = steps[newDraft.step];
+  newError.textContent = '';
+
+  if (step.key === 'project') {
+    if (targetIsBare(newDraft.targetId) && !newDraft.projectDirectory.trim()) {
+      newError.textContent = 'Name the project directory to open.';
+      return;
+    }
+    await preflightNew();
+    newDraft.step = Math.min(newDraft.step + 1, visibleSteps().length - 1);
+    renderNewForm();
+    return;
+  }
+  if (step.key === 'dirty' && !newDraft.acknowledged) {
+    newError.textContent = 'Confirm before starting over uncommitted changes.';
+    return;
+  }
+  if (step.key !== 'review') {
+    newDraft.step += 1;
+    renderNewForm();
+    return;
+  }
+  await commitNew();
+}
+
+async function commitNew() {
+  const bare = targetIsBare(newDraft.targetId);
+  const body = {
+    action: 'new',
+    workspace_id: selectedWorkspaceId(),
+    profile_id: newDraft.profileId,
+    bundle_id: newDraft.bundleId,
+    target_id: newDraft.targetId,
+    project_directory: bare ? newDraft.projectDirectory : null,
+    dirty_ack: newDraft.acknowledged ? newDraft.dirty : [],
+  };
+  if (newDraft.title.trim()) body.title = newDraft.title.trim();
+  newNextButton.disabled = true;
+  try {
+    await request('/api/actions', { method: 'POST', body: JSON.stringify(body) });
+    newDraft = null;
+    await refresh();
+    navigate({ name: 'dashboard', workspaceId: selectedWorkspaceId() });
+  } catch (err) {
+    newError.textContent = err.message;
+  } finally {
+    newNextButton.disabled = false;
+  }
 }
 
 /// Sessions that are not live and that Hel owns, which is what "resume" means.
+///
+/// A session that cannot resume anywhere is still listed, with one plain
+/// sentence saying why and where to finish it. Hiding it would leave a person
+/// looking for a session they know exists.
 function renderResumable() {
   const workspaceId = selectedWorkspaceId();
   const list = (snapshot.sessions || []).filter(
@@ -441,44 +685,75 @@ function renderResumable() {
     resumable.replaceChildren(el('p', 'dim', 'No sessions to resume in this workspace.'));
     return;
   }
-  resumable.replaceChildren(
-    ...list.map(session => {
-      const card = el('article', 'card session');
-      card.dataset.sessionId = session.id;
-      card.append(el('h3', '', session.title));
-      card.append(el('p', 'dim', `${session.state} · ${session.profile_id}`));
-      if (!session.compatible_resume_targets?.length) {
-        card.append(
-          el(
-            'p',
-            'dim',
-            'This session cannot resume on any configured target. Finish it in the terminal.',
-          ),
-        );
-        return card;
-      }
-      const row = el('div', 'row');
-      const targets = el('select');
-      targets.setAttribute('aria-label', 'Target');
-      fillOptions(
-        targets,
-        session.compatible_resume_targets.map(id => ({ id })),
-        session.target_id,
-      );
-      targets.dataset.role = 'resume-target';
-      row.append(targets);
-      row.append(
-        action('Resume', '', {
-          action: 'resume',
-          id: session.id,
-          profile: session.profile_id,
-          target: session.target_id,
-        }),
-      );
-      card.append(row);
-      return card;
+  resumable.replaceChildren(...list.map(resumableCard));
+}
+
+function resumableCard(session) {
+  const card = el('article', 'card session');
+  card.dataset.sessionId = session.id;
+  card.append(el('h3', '', session.title));
+  card.append(el('p', 'dim', `${session.state} · ${session.profile_id}`));
+
+  if (!session.compatible_resume_targets?.length) {
+    card.append(
+      el(
+        'p',
+        '',
+        'This session cannot resume on any target configured here. Finish it in the terminal, where the repair and import options live.',
+      ),
+    );
+    return card;
+  }
+
+  const profiles = el('label', 'field');
+  profiles.append(el('span', '', 'Profile'));
+  const profilePicker = el('select');
+  profilePicker.dataset.role = 'resume-profile';
+  fillOptions(profilePicker, snapshot.profiles, session.profile_id);
+  profiles.append(profilePicker);
+  card.append(profiles);
+
+  const targets = el('label', 'field');
+  targets.append(el('span', '', 'Target'));
+  const targetPicker = el('select');
+  targetPicker.dataset.role = 'resume-target';
+  fillOptions(
+    targetPicker,
+    session.compatible_resume_targets.map(id => ({ id })),
+    session.compatible_resume_targets.includes(session.target_id) ? session.target_id : undefined,
+  );
+  targets.append(targetPicker);
+  card.append(targets);
+
+  const queued = (session.queued_prompts || []).length;
+  if (queued) {
+    const choice = el('label', 'field');
+    choice.append(el('span', '', `${queued} queued prompt${queued === 1 ? '' : 's'}`));
+    const picker = el('select');
+    picker.dataset.role = 'resume-queue';
+    fillOptions(
+      picker,
+      [
+        { id: 'start', label: 'Run them after resuming' },
+        { id: 'discard', label: 'Discard them' },
+      ],
+      'start',
+    );
+    choice.append(picker);
+    card.append(choice);
+  }
+
+  const row = el('div', 'row');
+  row.append(
+    action('Resume', '', {
+      action: 'resume',
+      id: session.id,
+      profile: session.profile_id,
+      target: session.target_id,
     }),
   );
+  card.append(row);
+  return card;
 }
 
 function renderTargets() {
@@ -1306,27 +1581,17 @@ for (const node of document.querySelectorAll(
 
 window.addEventListener('hashchange', applyRoute);
 
-newTarget.onchange = syncProjectDirectory;
-newForm.onsubmit = async e => {
-  e.preventDefault();
-  const target = snapshot.targets.find(x => x.id === newTarget.value);
-  const bare = target?.requires_project_directory;
-  const body = {
-    action: 'new',
-    workspace_id: selectedWorkspaceId(),
-    profile_id: newProfile.value,
-    bundle_id: bare ? newBundle.value || 'raw' : newBundle.value,
-    target_id: newTarget.value,
-    project_directory: bare ? newProjectDirectory.value : null,
-  };
-  const title = newTitle.value.trim();
-  if (title) body.title = title;
+newBackButton.onclick = () => {
+  if (!newDraft || newDraft.step === 0) return;
+  newDraft.step -= 1;
+  newError.textContent = '';
+  renderNewForm();
+};
+
+newForm.onsubmit = async event => {
+  event.preventDefault();
   try {
-    await request('/api/actions', { method: 'POST', body: JSON.stringify(body) });
-    newTitle.value = '';
-    newError.textContent = '';
-    await refresh();
-    navigate({ name: 'dashboard', workspaceId: selectedWorkspaceId() });
+    await advanceNew();
   } catch (err) {
     newError.textContent = err.message;
   }
@@ -1359,17 +1624,11 @@ async function runSessionAction(dataset, errorNode, extra) {
     body.title = title.trim();
   }
   if (dataset.action === 'resume') {
-    body.profile_id = dataset.profile;
+    // The resume page asks these as labelled controls; a row elsewhere falls
+    // back to what the session last used.
+    body.profile_id = extra?.profile_id || dataset.profile;
     body.target_id = extra?.target_id || dataset.target;
-    body.queue = 'start';
-    const session = snapshot.sessions.find(x => x.id === dataset.id);
-    if (session?.queued_prompts?.length) {
-      body.queue = confirm(
-        `This session has ${session.queued_prompts.length} queued prompt(s). Run them after resume?`,
-      )
-        ? 'start'
-        : 'discard';
-    }
+    body.queue = extra?.queue || 'start';
   }
   pendingActions.add(key);
   renderRoute();
@@ -1394,12 +1653,13 @@ sessions.onclick = async e => {
 resumable.onclick = async e => {
   const target = e.target.closest('button[data-action]');
   if (!target) return;
-  const picker = target.closest('.row')?.querySelector('select[data-role="resume-target"]');
-  await runSessionAction(
-    target.dataset,
-    resumeError,
-    picker ? { target_id: picker.value } : undefined,
-  );
+  const card = target.closest('.session');
+  const pick = role => card?.querySelector(`select[data-role="${role}"]`)?.value;
+  await runSessionAction(target.dataset, resumeError, {
+    target_id: pick('resume-target'),
+    profile_id: pick('resume-profile'),
+    queue: pick('resume-queue'),
+  });
 };
 
 document.querySelector('#prompt-form').onsubmit = e => {

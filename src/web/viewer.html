@@ -67,30 +67,13 @@
       </section>
 
       <section id="new-page" class="page hidden">
-        <h2>New session</h2>
+        <h2 id="new-heading">New session</h2>
+        <p id="new-progress" class="dim"></p>
         <form id="new-form">
-          <label class="field">
-            <span>Title</span>
-            <input id="new-title" maxlength="120" placeholder="Optional; derived when empty" />
-          </label>
-          <label class="field">
-            <span>Profile</span>
-            <select id="new-profile"></select>
-          </label>
-          <label class="field">
-            <span>Target</span>
-            <select id="new-target"></select>
-          </label>
-          <label class="field">
-            <span>Bundle</span>
-            <select id="new-bundle"></select>
-          </label>
-          <label class="field hidden" id="new-project-directory-field">
-            <span>Project directory</span>
-            <input id="new-project-directory" placeholder="Absolute project directory" />
-          </label>
+          <div id="new-step"></div>
           <div class="row">
-            <button>Start</button>
+            <button type="button" id="new-back" class="secondary">Back</button>
+            <button id="new-next">Next</button>
             <button type="button" class="secondary" data-route="dashboard">Cancel</button>
           </div>
         </form>
