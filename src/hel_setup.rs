@@ -19,7 +19,7 @@ use crate::hel_doctor::{
 use crate::hel_targets::{
     CancellableProcessExecutor, CommandExecutor, CommandSpec,
     ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor,
-    TargetTemplate as RuntimeTargetTemplate, setup_smoke_plan,
+    TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test,
 };
 
 /// AWS credential detection must never stall an interactive first run, so the
@@ -1041,10 +1041,16 @@ fn prompt_ssh_target_name(
 /// Phrase a failed setup smoke test the way `hel doctor --smoke` phrases the
 /// same failure, so it joins the closing report instead of ending the run.
 fn smoke_failure_check(runtime: RuntimeKind, image: &str, error: &anyhow::Error) -> DoctorCheck {
+    let scope = match runtime {
+        RuntimeKind::Docker => "Disposable run/exec/remove and OverlayFS attachment smoke test",
+        RuntimeKind::Podman | RuntimeKind::AppleContainer => {
+            "Disposable run/exec/remove smoke test"
+        }
+    };
     DoctorCheck::fixable(
         format!("runtime.{}.smoke", runtime.id()),
         format!("{} smoke test", runtime.label()),
-        format!("Disposable run/exec/remove smoke test failed for image {image}: {error:#}"),
+        format!("{scope} failed for image {image}: {error:#}"),
         format!(
             "Fix the configured image or the {} runtime, then run `hel doctor --smoke` again.",
             runtime.label()
@@ -1239,32 +1245,14 @@ fn run_smoke_test(
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
-    let plan = setup_smoke_plan(target, &smoke_id)?;
-    let create = &plan.commands[0];
-    let execute = &plan.commands[1];
-    let cleanup = &plan.commands[2];
-
-    writeln!(output, "Smoke test: creating a disposable container...")?;
-    execute_smoke_command(executor, create)?;
-    writeln!(output, "Smoke test: executing a trivial command in it...")?;
-    let execution = execute_smoke_command(executor, execute);
-    writeln!(output, "Smoke test: deleting the disposable container...")?;
-    let cleanup_result = execute_smoke_command(executor, cleanup);
-    execution?;
-    cleanup_result
-}
-
-fn execute_smoke_command(executor: &impl CommandExecutor, command: &CommandSpec) -> Result<()> {
-    let output = executor.execute(command)?;
-    if output.status != 0 {
-        bail!(
-            "{} failed with status {}: {}",
-            command.purpose,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
+    let description = match target {
+        RuntimeTargetTemplate::LocalDocker(_) => {
+            "Smoke test: verifying a disposable container and writable OverlayFS attachment..."
+        }
+        _ => "Smoke test: verifying a disposable container...",
+    };
+    writeln!(output, "{description}")?;
+    run_setup_smoke_test(target, &smoke_id, executor)
 }
 
 #[cfg(test)]
@@ -2002,6 +1990,34 @@ Host builder
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 3);
         assert_eq!(commands[2].args[0], "rm");
+    }
+
+    #[test]
+    fn docker_smoke_test_exercises_the_managed_overlay_attachment_path() {
+        let executor = FakeExecutor::succeeds();
+        let mut output = Vec::new();
+
+        run_smoke_test(
+            &mut output,
+            &smoke_target(RuntimeKind::Docker, "ubuntu:24.04"),
+            &executor,
+        )
+        .unwrap();
+
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].program, "sh");
+        assert!(commands[0].args[1].contains("docker volume create"));
+        assert!(commands[0].args[1].contains("type=overlay"));
+        assert_eq!(commands[1].program, "docker");
+        assert_eq!(commands[1].args[0], "exec");
+        assert_eq!(commands[2].program, "sh");
+        assert!(commands[2].args[1].contains("docker volume rm --force"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("writable OverlayFS attachment")
+        );
     }
 
     #[test]
