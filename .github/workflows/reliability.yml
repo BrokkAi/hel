@@ -41,9 +41,9 @@ jobs:
     - name: Build feature-gated crash hooks
       run: cargo build --locked -p brokk-mjolnir --features test-hooks
     - name: Run named durability boundaries
-      run: HEL_CHAOS_ISOLATED=1 tests/e2e/run-test-hook-chaos.sh ./target/x86_64-unknown-linux-musl/debug/mj --seed "$RELIABILITY_SEED"
+      run: MJ_CHAOS_ISOLATED=1 tests/e2e/run-test-hook-chaos.sh ./target/x86_64-unknown-linux-musl/debug/mj --seed "$RELIABILITY_SEED"
     - name: Run worker topology deaths
-      run: HEL_CHAOS_ISOLATED=1 HEL_CHAOS_ARTIFACT_DIR=target/reliability-artifacts/worker-topology tests/e2e/session_restart_chaos.sh ./target/x86_64-unknown-linux-musl/debug/mj
+      run: MJ_CHAOS_ISOLATED=1 MJ_CHAOS_ARTIFACT_DIR=target/reliability-artifacts/worker-topology tests/e2e/session_restart_chaos.sh ./target/x86_64-unknown-linux-musl/debug/mj
     - name: Upload crash evidence
       if: always()
       uses: actions/upload-artifact@v7

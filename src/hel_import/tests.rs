@@ -685,7 +685,7 @@ fn local_source_repository_import_carries_no_committed_bundle() {
     let snapshots = collect_local_repositories(&bundle, &[app], None).unwrap();
 
     assert!(snapshots[0].committed_bundle.is_empty());
-    assert_eq!(snapshots[0].metadata.origin, "hel-local:app");
+    assert_eq!(snapshots[0].metadata.origin, "mj-local:app");
     assert!(!snapshots[0].untracked_tar.is_empty());
 }
 

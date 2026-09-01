@@ -43,8 +43,8 @@ async function unlock(page, baseUrl, code) {
 
 for (const viewport of VIEWPORTS) {
   test(`the viewer fits ${viewport.name} and stays reachable`, async ({ browser }) => {
-    const baseUrl = required('HEL_BROWSER_BASE_URL');
-    const code = required('HEL_BROWSER_CODE');
+    const baseUrl = required('MJ_BROWSER_BASE_URL');
+    const code = required('MJ_BROWSER_CODE');
 
     const context = await browser.newContext({
       ignoreHTTPSErrors: true,

@@ -5,14 +5,14 @@
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
-TEMPLATE_NAME="hel-runson"
+TEMPLATE_NAME="mj-runson"
 SOURCE_OWNER="135269210855"
 SOURCE_NAME_PATTERN="runs-on-v2.2-ubuntu26-full-x64-*"
 INSTANCE_TYPE="m8i-flex.large"
 ROOT_VOLUME_GIB=60
 SSH_PUBLIC_KEY="${HOME}/.ssh/vastai.pub"
 SSH_IDENTITY_FILE="${HOME}/.ssh/vastai"
-SECURITY_GROUP_NAME="hel-runson-ssh"
+SECURITY_GROUP_NAME="mj-runson-ssh"
 WRITE_HEL_CONFIG=false
 SOURCE_AMI=""
 
@@ -21,11 +21,11 @@ usage() {
         'Usage: scripts/update-runson-launch-template.sh [options]' \
         '' \
         'Copies the newest RunsOn Ubuntu 26 AMI into this AWS account, then creates a' \
-        'new default version of the hel-runson launch template.' \
+        'new default version of the mj-runson launch template.' \
         '' \
         'Options:' \
         '  --region REGION            AWS region (default: us-east-1)' \
-        '  --template-name NAME       Launch template name (default: hel-runson)' \
+        '  --template-name NAME       Launch template name (default: mj-runson)' \
         '  --source-ami AMI           Use this source AMI instead of resolving newest' \
         '  --instance-type TYPE       EC2 instance type (default: m8i-flex.large)' \
         '  --root-volume-gib GIB      Root volume size (default: 60)' \

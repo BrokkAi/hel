@@ -73,7 +73,7 @@ mod worker {
     }
 
     pub(super) fn voice_worker_executable() -> Result<PathBuf> {
-        if let Some(path) = crate::hel_config::env_os_compat("VOICE_WORKER") {
+        if let Some(path) = crate::hel_config::env_override_os("VOICE_WORKER") {
             let path = PathBuf::from(path);
             anyhow::ensure!(
                 path.is_file(),
@@ -261,7 +261,7 @@ mod worker {
             message.push_str(&format!(": {line}"));
         }
         let cache = dirs::cache_dir()
-            .map(|path| path.join("hel/voice").display().to_string())
+            .map(|path| path.join("mjolnir/voice").display().to_string())
             .unwrap_or_else(|| "the voice model cache".to_string());
         message.push_str(&format!(
             " — the dictation engine runs in a separate process, so your session is unaffected; \

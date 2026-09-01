@@ -351,8 +351,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("hel", type=pathlib.Path)
     args = parser.parse_args()
-    if os.environ.get("HEL_CHAOS_ISOLATED") != "1":
-        parser.error("set HEL_CHAOS_ISOLATED=1 only for a disposable test root")
+    if os.environ.get("MJ_CHAOS_ISOLATED") != "1":
+        parser.error("set MJ_CHAOS_ISOLATED=1 only for a disposable test root")
     selected = HOOKS if args.hook == "all" else [args.hook]
     for index, hook in enumerate(selected):
         run_one(args.hel.resolve(), hook, args.seed + index)

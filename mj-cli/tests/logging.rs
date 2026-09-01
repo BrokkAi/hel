@@ -9,8 +9,8 @@ fn top_level_failure_is_written_to_a_private_per_run_log() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
     command
         .args(["checkpoint", "--session", "definitely-missing"])
-        .env("HEL_DATA_DIR", &data)
-        .env("HEL_CONFIG_DIR", config);
+        .env("MJ_DATA_DIR", &data)
+        .env("MJ_CONFIG_DIR", config);
 
     let output = hel::hel_subprocess::run_with_input(&mut command, &[]).unwrap();
 

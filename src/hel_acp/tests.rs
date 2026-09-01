@@ -2355,8 +2355,8 @@ mod terminals {
                 "command": "/bin/sh",
                 // `PATH` proves the daemon environment is inherited rather
                 // than replaced by the agent's additions.
-                "args": ["-c", "printf 'ran %s %s' \"$HEL_TERMINAL_TEST\" \"${PATH:+inherited}\""],
-                "env": [{"name": "HEL_TERMINAL_TEST", "value": "overlaid"}],
+                "args": ["-c", "printf 'ran %s %s' \"$MJ_TERMINAL_TEST\" \"${PATH:+inherited}\""],
+                "env": [{"name": "MJ_TERMINAL_TEST", "value": "overlaid"}],
             }),
         )
         .await;

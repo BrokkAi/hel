@@ -17,8 +17,9 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, Response, StatusCode, header};
-use hel::hel_server::{COOKIE_NAME, cookie_key_path, load_or_create_cookie_key,
-    mint_desktop_session_cookie};
+use hel::hel_server::{
+    COOKIE_NAME, cookie_key_path, load_or_create_cookie_key, mint_desktop_session_cookie,
+};
 
 use crate::daemon::{self, WebViewerStatus};
 
@@ -46,7 +47,9 @@ pub(crate) async fn run_desktop_app() -> Result<()> {
     let viewer_url = match status.phone_status {
         WebViewerStatus::Ready { viewer_url, .. } => viewer_url,
         WebViewerStatus::Disabled => {
-            bail!("the web viewer is disabled; enable [phone] in config.toml and run `mj daemon restart`")
+            bail!(
+                "the web viewer is disabled; enable [phone] in config.toml and run `mj daemon restart`"
+            )
         }
         WebViewerStatus::Starting => {
             bail!("the web viewer is still starting; retry in a moment or check `mj daemon status`")
@@ -64,19 +67,15 @@ pub(crate) async fn run_desktop_app() -> Result<()> {
     let cookie_value =
         mint_desktop_session_cookie(&key).context("mint a desktop viewer session")?;
 
-    let certified = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_owned(),
-        "127.0.0.1".to_owned(),
-    ])
-    .context("generate the desktop TLS certificate")?;
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .context("generate the desktop TLS certificate")?;
     let certificate_der = certified.cert.der().to_vec();
     let key_der = certified.key_pair.serialize_der();
-    let tls = axum_server::tls_rustls::RustlsConfig::from_der(
-        vec![certificate_der.clone()],
-        key_der,
-    )
-    .await
-    .context("build the desktop TLS configuration")?;
+    let tls =
+        axum_server::tls_rustls::RustlsConfig::from_der(vec![certificate_der.clone()], key_der)
+            .await
+            .context("build the desktop TLS configuration")?;
 
     let proxy_state = ProxyState {
         client: reqwest::Client::builder()
@@ -85,13 +84,11 @@ pub(crate) async fn run_desktop_app() -> Result<()> {
             .context("build the desktop proxy client")?,
         upstream: viewer_url.trim_end_matches('/').to_owned(),
     };
-    let router = Router::new()
-        .fallback(proxy)
-        .with_state(proxy_state);
+    let router = Router::new().fallback(proxy).with_state(proxy_state);
 
     let handle = axum_server::Handle::new();
-    let server = axum_server::bind_rustls("127.0.0.1:0".parse::<SocketAddr>()?, tls)
-        .handle(handle.clone());
+    let server =
+        axum_server::bind_rustls("127.0.0.1:0".parse::<SocketAddr>()?, tls).handle(handle.clone());
     let server_task = tokio::spawn(server.serve(router.into_make_service()));
 
     let bound = handle
@@ -175,7 +172,9 @@ async fn forward(state: ProxyState, request: Request<Body>) -> Result<Response<B
         .context("assemble the proxied response")
 }
 
-fn filtered(headers: &HeaderMap) -> impl Iterator<Item = (&header::HeaderName, &header::HeaderValue)> {
+fn filtered(
+    headers: &HeaderMap,
+) -> impl Iterator<Item = (&header::HeaderName, &header::HeaderValue)> {
     headers
         .iter()
         .filter(|(name, _)| *name != header::HOST && !HOP_BY_HOP.contains(name))

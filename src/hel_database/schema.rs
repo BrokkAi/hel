@@ -2,7 +2,7 @@ use super::*;
 use rusqlite::OpenFlags;
 
 pub fn database_path() -> PathBuf {
-    data_dir().join("hel.sqlite3")
+    data_dir().join("mj.sqlite3")
 }
 
 pub(super) fn open_writer(path: &Path) -> Result<Connection> {
@@ -10,8 +10,8 @@ pub(super) fn open_writer(path: &Path) -> Result<Connection> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create Hel data directory {}", parent.display()))?;
     }
-    let connection =
-        Connection::open(path).with_context(|| format!("open Mjolnir database {}", path.display()))?;
+    let connection = Connection::open(path)
+        .with_context(|| format!("open Mjolnir database {}", path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -1109,7 +1109,7 @@ mod reader_tests {
     #[test]
     fn strict_reader_rejects_mutation() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("hel.sqlite3");
+        let path = directory.path().join("mj.sqlite3");
         drop(open_writer(&path).unwrap());
 
         let reader = open_reader_strict(&path).unwrap();

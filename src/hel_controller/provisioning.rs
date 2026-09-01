@@ -969,7 +969,7 @@ fn cleanup_failed_provision(
 ) -> Option<String> {
     let locator = provisioned_locator(target, session_id, create_output)?;
     let leak = format!(
-        "the resource may still exist; find it via its dev.hel.session={session_id} label/tag"
+        "the resource may still exist; find it via its dev.mj.session={session_id} label/tag"
     );
     let plan = match hel_targets::close_plan(&locator, session_id) {
         Ok(plan) => plan,
@@ -1134,7 +1134,7 @@ fn bootstrap_local_repositories(
                     id: repository.id.clone(),
                     relative_destination: repository.destination.clone(),
                     history: GitHistoryMode::NoBundle,
-                    origin_override: Some(format!("hel-local:{}", repository.id)),
+                    origin_override: Some(format!("mj-local:{}", repository.id)),
                 },
             )
             .with_context(|| format!("snapshot local repository {:?}", repository.id))
@@ -2499,7 +2499,7 @@ mod tests {
     /// session's broker, so a stand-in that holds it is indistinguishable from
     /// the real thing to everything that has to stop one.
     #[cfg(unix)]
-    const BROKER_STAND_IN_PID_PATH: &str = "HEL_TEST_BROKER_STAND_IN_PID_PATH";
+    const BROKER_STAND_IN_PID_PATH: &str = "MJ_TEST_BROKER_STAND_IN_PID_PATH";
 
     fn retirable_broker_files(directory: &Path) -> BrokerFiles {
         let files = BrokerFiles::in_directory(directory, PROVISIONED_SESSION);
@@ -2646,7 +2646,7 @@ mod tests {
         };
         let configured = PathBuf::from("/home/dev/project");
         let missing = vec![(&repository, &configured)];
-        let checkout = PathBuf::from("/home/dev/project/.hel/worktrees/session");
+        let checkout = PathBuf::from("/home/dev/project/.mj/worktrees/session");
 
         assert_eq!(seed_sources(&missing, &LocalBootstrap::Skip), None);
         assert_eq!(

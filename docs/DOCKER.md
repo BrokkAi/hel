@@ -47,8 +47,8 @@ this form:
 
 ```console
 docker volume create --driver local \
-  --label dev.hel.managed=true \
-  --label dev.hel.session=<session-id> \
+  --label dev.mj.managed=true \
+  --label dev.mj.session=<session-id> \
   --opt type=overlay \
   --opt device=overlay \
   --opt o=lowerdir=<source>,upperdir=<upper>,workdir=<work> \
@@ -57,7 +57,7 @@ docker volume create --driver local \
 
 Docker's built-in local volume driver passes these options to the Linux mount
 operation. The upper and work directories live below
-`~/.cache/hel/docker-overlays/<container-name>`. Mjolnir records an ownership
+`~/.cache/mjolnir/docker-overlays/<container-name>`. Mjolnir records an ownership
 marker there, verifies labels before reusing a volume, and refuses a colliding
 foreign volume or backing directory.
 

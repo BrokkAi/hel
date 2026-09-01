@@ -123,7 +123,7 @@ def run_layout_matrix(lab: Lab, web_root: pathlib.Path, environment: dict[str, s
     """
     log = (lab.root / "layout.log").open("wb")
     matrix_environment = dict(environment)
-    matrix_environment["HEL_BROWSER_SPEC"] = "layout.spec.js"
+    matrix_environment["MJ_BROWSER_SPEC"] = "layout.spec.js"
     matrix = subprocess.Popen(
         [str(web_root / "node_modules/.bin/playwright"), "test"],
         cwd=web_root,
@@ -164,15 +164,15 @@ def run(lab: Lab) -> None:
     environment = lab.environment()
     environment.update(
         {
-            "HEL_BROWSER_BASE_URL": lab.base_url,
-            "HEL_BROWSER_CODE": code,
-            "HEL_BROWSER_QR_URL": login_url,
-            "HEL_BROWSER_TITLE": title,
-            "HEL_BROWSER_PROJECT_DIRECTORY": str(lab.project),
-            "HEL_BROWSER_READY_MARKER": str(ready_marker),
-            "HEL_TUI_CHANGED_MARKER": str(changed_marker),
-            "HEL_BROWSER_TRACE": str(lab.root / "browser-trace.zip"),
-            "HEL_BROWSER_SCREENSHOT": str(lab.root / "browser-failure.png"),
+            "MJ_BROWSER_BASE_URL": lab.base_url,
+            "MJ_BROWSER_CODE": code,
+            "MJ_BROWSER_QR_URL": login_url,
+            "MJ_BROWSER_TITLE": title,
+            "MJ_BROWSER_PROJECT_DIRECTORY": str(lab.project),
+            "MJ_BROWSER_READY_MARKER": str(ready_marker),
+            "MJ_TUI_CHANGED_MARKER": str(changed_marker),
+            "MJ_BROWSER_TRACE": str(lab.root / "browser-trace.zip"),
+            "MJ_BROWSER_SCREENSHOT": str(lab.root / "browser-failure.png"),
         }
     )
     browser = subprocess.Popen(

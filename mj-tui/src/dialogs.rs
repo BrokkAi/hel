@@ -1155,8 +1155,12 @@ fn confirmation_body(confirmation: &Confirmation) -> (&'static str, Vec<Line<'st
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Mjolnir will permanently destroy the recovery archive and session record."),
-                Line::raw("Any Mjolnir-managed worktree and generated branch will also be removed."),
+                Line::raw(
+                    "Mjolnir will permanently destroy the recovery archive and session record.",
+                ),
+                Line::raw(
+                    "Any Mjolnir-managed worktree and generated branch will also be removed.",
+                ),
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (

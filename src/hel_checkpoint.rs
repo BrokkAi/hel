@@ -3665,11 +3665,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "timing measurement against HEL_CHECKPOINT_BENCH_ARCHIVE"]
+    #[ignore = "timing measurement against MJ_CHECKPOINT_BENCH_ARCHIVE"]
     fn checkpoint_packaging_throughput() {
-        let source = std::env::var_os("HEL_CHECKPOINT_BENCH_ARCHIVE")
+        let source = std::env::var_os("MJ_CHECKPOINT_BENCH_ARCHIVE")
             .map(PathBuf::from)
-            .expect("set HEL_CHECKPOINT_BENCH_ARCHIVE");
+            .expect("set MJ_CHECKPOINT_BENCH_ARCHIVE");
         let read_started = std::time::Instant::now();
         let archive = read_archive_verified(&source).unwrap();
         let canonical_session = archive.canonical_session().unwrap();
@@ -3907,7 +3907,7 @@ mod tests {
                 "worktree",
                 "add",
                 "-b",
-                "hel/session",
+                "mj/session",
                 &checkout.to_string_lossy(),
                 "HEAD~1",
             ],
@@ -3916,7 +3916,7 @@ mod tests {
         let restored = restore_single_repository_onto_branch(
             &archive_path,
             &checkout,
-            "hel/session",
+            "mj/session",
             &SystemGit,
         )
         .unwrap();
@@ -3925,7 +3925,7 @@ mod tests {
         assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head);
         assert_eq!(
             git(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "hel/session"
+            "mj/session"
         );
         assert_eq!(
             fs::read_to_string(checkout.join("README.md")).unwrap(),
@@ -3948,7 +3948,7 @@ mod tests {
         );
         assert_eq!(
             git(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "hel/session",
+            "mj/session",
             "a rejected restore leaves the checkout on its session branch"
         );
         assert_eq!(

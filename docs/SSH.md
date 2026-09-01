@@ -45,14 +45,14 @@ Shared SSH connection keys (flattened into both target kinds):
 | Key | Required | Notes |
 | --- | --- | --- |
 | `permissions` | yes | `guardian` preserves configured harness approvals; `yolo` runs unconstrained. |
-| `workspace_prefix` | no | Remote directory session workspaces are created under. Defaults to `.local/share/hel/workspaces` (relative to the login home). |
+| `workspace_prefix` | no | Remote directory session workspaces are created under. Defaults to `.local/share/mjolnir/workspaces` (relative to the login home). |
 
 ```toml
 [targets.builder]
 kind = "ssh-bare"
 host = "builder"
 permissions = "guardian"
-workspace_prefix = ".local/share/hel/workspaces"
+workspace_prefix = ".local/share/mjolnir/workspaces"
 ```
 
 `ssh-podman` always runs unconstrained and does not accept `permissions`. It

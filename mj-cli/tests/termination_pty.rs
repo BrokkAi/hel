@@ -244,9 +244,9 @@ image = "ubuntu:24.04"
         .stdin(Stdio::from(duplicate(slave.as_raw_fd())))
         .stdout(Stdio::from(duplicate(slave.as_raw_fd())))
         .stderr(Stdio::from(duplicate(slave.as_raw_fd())))
-        .env("HEL_CONFIG_DIR", config_root.join("hel"))
-        .env("HEL_DATA_DIR", storage.path().join("data/hel"))
-        .env("HEL_DAEMON_EXIT_WHEN_IDLE", "1");
+        .env("MJ_CONFIG_DIR", config_root.join("hel"))
+        .env("MJ_DATA_DIR", storage.path().join("data/hel"))
+        .env("MJ_DAEMON_EXIT_WHEN_IDLE", "1");
     // Libtest may alter its signal mask. A real `hel` invocation should start
     // with SIGTERM unmasked, so establish that condition across exec.
     unsafe {
@@ -354,8 +354,7 @@ fn sigterm_restores_real_pty_terminal() {
 
 #[test]
 fn dashboard_detach_restores_terminal_then_exits_promptly_with_final_message() {
-    const REATTACH_MESSAGE: &str =
-        "Active sessions will continue working; Mjolnir will reattach to them on your next invocation.";
+    const REATTACH_MESSAGE: &str = "Active sessions will continue working; Mjolnir will reattach to them on your next invocation.";
     let DashboardPty {
         _storage,
         mut master,

@@ -333,16 +333,16 @@ class Lab:
         env = os.environ.copy()
         env.update(
             {
-                "HEL_CONFIG_DIR": str(self.config),
-                "HEL_DATA_DIR": str(self.data),
-                "HEL_CHAOS_ISOLATED": "1",
+                "MJ_CONFIG_DIR": str(self.config),
+                "MJ_DATA_DIR": str(self.data),
+                "MJ_CHAOS_ISOLATED": "1",
                 "RUST_LOG": "hel=debug,hel_cli=debug",
             }
         )
-        env.pop("HEL_DAEMON_EXIT_WHEN_IDLE", None)
+        env.pop("MJ_DAEMON_EXIT_WHEN_IDLE", None)
         if self.hook_name is not None:
-            env["HEL_TEST_HOOK"] = self.hook_name
-            env["HEL_TEST_HOOK_DIR"] = str(self.hooks)
+            env["MJ_TEST_HOOK"] = self.hook_name
+            env["MJ_TEST_HOOK_DIR"] = str(self.hooks)
         return env
 
     @staticmethod
@@ -372,7 +372,7 @@ import sys
 import time
 
 session_id = "reliability-native"
-log_path = os.environ["HEL_FAKE_ACP_LOG"]
+log_path = os.environ["MJ_FAKE_ACP_LOG"]
 
 def send(payload):
     sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\\n")
@@ -383,12 +383,12 @@ def log(payload):
         output.write(json.dumps(payload, sort_keys=True) + "\\n")
 
 def delay():
-    delay_ms = int(os.environ.get("HEL_FAKE_ACP_DELAY_MS", "0"))
+    delay_ms = int(os.environ.get("MJ_FAKE_ACP_DELAY_MS", "0"))
     if delay_ms > 0:
         time.sleep(delay_ms / 1000)
 
 def wait_for_prompt_cancel():
-    delay_ms = int(os.environ.get("HEL_FAKE_ACP_DELAY_MS", "0"))
+    delay_ms = int(os.environ.get("MJ_FAKE_ACP_DELAY_MS", "0"))
     if delay_ms <= 0:
         return False
     ready, _, _ = select.select([sys.stdin], [], [], delay_ms / 1000)
@@ -513,7 +513,7 @@ tailscale_detect = false
 kind = "codex"
 home = {json.dumps(str(self.profile))}
 executable = {json.dumps(str(bridge))}
-environment = {{ HEL_FAKE_ACP_LOG = {json.dumps(str(self.runtime_root / "fake-acp.log"))}, HEL_FAKE_ACP_DELAY_MS = {json.dumps(str(fake_acp_delay_ms))}, PATH = {json.dumps(str(fixture_bin))} }}
+environment = {{ MJ_FAKE_ACP_LOG = {json.dumps(str(self.runtime_root / "fake-acp.log"))}, MJ_FAKE_ACP_DELAY_MS = {json.dumps(str(fake_acp_delay_ms))}, PATH = {json.dumps(str(fixture_bin))} }}
 
 [bundles.fixture]
 primary_repo = "fixture"
@@ -673,8 +673,8 @@ kind = "local-bare"
     def owned_pids(self) -> list[int]:
         owned: list[int] = []
         expected = {
-            f"HEL_CONFIG_DIR={self.config}".encode(),
-            f"HEL_DATA_DIR={self.data}".encode(),
+            f"MJ_CONFIG_DIR={self.config}".encode(),
+            f"MJ_DATA_DIR={self.data}".encode(),
         }
         for entry in pathlib.Path("/proc").iterdir():
             if not entry.name.isdigit() or int(entry.name) == os.getpid():

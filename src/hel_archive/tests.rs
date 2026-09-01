@@ -1735,13 +1735,13 @@ fn no_bundle_snapshot_carries_dirty_state_without_committed_history() {
             id: "repo".into(),
             relative_destination: "repo".into(),
             history: GitHistoryMode::NoBundle,
-            origin_override: Some("hel-local:repo".into()),
+            origin_override: Some("mj-local:repo".into()),
         },
     )
     .unwrap();
 
     assert!(snapshot.committed_bundle.is_empty());
-    assert_eq!(snapshot.metadata.origin, "hel-local:repo");
+    assert_eq!(snapshot.metadata.origin, "mj-local:repo");
     assert_eq!(snapshot.metadata.base_commit, head);
     assert!(!snapshot.staged_patch.is_empty());
     assert!(!snapshot.unstaged_patch.is_empty());

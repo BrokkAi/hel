@@ -1388,13 +1388,13 @@ fn default_resource_destination(
     } else {
         std::path::PathBuf::from("/home").join(ssh_user)
     };
-    let base = home.join("hel-resources").join(basename);
+    let base = home.join("mj-resources").join(basename);
     if !existing.iter().any(|resource| resource.destination == base) {
         return base;
     }
     for number in 2.. {
         let candidate = home
-            .join("hel-resources")
+            .join("mj-resources")
             .join(format!("{}-{number}", basename.to_string_lossy()));
         if !existing
             .iter()

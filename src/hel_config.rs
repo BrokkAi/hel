@@ -67,7 +67,7 @@ impl PhoneConfig {
 }
 
 pub const CONFIG_VERSION: u32 = 1;
-pub const PRODUCT_DIR: &str = "hel";
+pub const PRODUCT_DIR: &str = "mjolnir";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1044,22 +1044,19 @@ fn reject_removed_profile_overrides(contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read a configuration override under its `MJ_` name, falling back to the
-/// historical `HEL_` name for backwards compatibility. New documentation and
-/// messages name only the `MJ_` form.
-pub fn env_os_compat(name: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(format!("MJ_{name}")).or_else(|| std::env::var_os(format!("HEL_{name}")))
+/// Read a configuration override under its `MJ_` name. Mjolnir shares no
+/// state or environment with hel installs; there is no legacy fallback.
+pub fn env_override_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("MJ_{name}"))
 }
 
-/// String form of [`env_os_compat`] for overrides parsed as UTF-8.
-pub fn env_compat(name: &str) -> Option<String> {
-    std::env::var(format!("MJ_{name}"))
-        .ok()
-        .or_else(|| std::env::var(format!("HEL_{name}")).ok())
+/// String form of [`env_override_os`] for overrides parsed as UTF-8.
+pub fn env_override(name: &str) -> Option<String> {
+    std::env::var(format!("MJ_{name}")).ok()
 }
 
 pub fn config_dir() -> PathBuf {
-    if let Some(path) = env_os_compat("CONFIG_DIR") {
+    if let Some(path) = env_override_os("CONFIG_DIR") {
         return PathBuf::from(path);
     }
     dirs::config_dir()
@@ -1072,7 +1069,7 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn data_dir() -> PathBuf {
-    if let Some(path) = env_os_compat("DATA_DIR") {
+    if let Some(path) = env_override_os("DATA_DIR") {
         return PathBuf::from(path);
     }
     dirs::data_local_dir()

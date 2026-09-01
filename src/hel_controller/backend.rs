@@ -1049,7 +1049,7 @@ mod tests {
             resource_allocation: None,
             additional_mounts: vec![AdditionalMount {
                 source: source.path().to_path_buf(),
-                destination: "/home/ubuntu/hel-resources/data".into(),
+                destination: "/home/ubuntu/mj-resources/data".into(),
                 read_only: false,
             }],
             state: SessionState::Disconnected,

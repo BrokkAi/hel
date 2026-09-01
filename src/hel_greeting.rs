@@ -270,12 +270,12 @@ const GREETINGS: [Greeting; 45] = [
     ),
     greeting("Good afternoon, $firstname", Group::Time, afternoon),
     greeting("Good evening, $firstname", Group::Time, evening),
+    greeting("Bring the thunder, $firstname", Group::Time, friday_evening),
     greeting(
-        "Bring the thunder, $firstname",
+        "Give 'em the hammer, $firstname",
         Group::Time,
-        friday_evening,
+        weekday_morning,
     ),
-    greeting("Give 'em the hammer, $firstname", Group::Time, weekday_morning),
     greeting(
         "Midnight at the forge. Perfect coding weather",
         Group::Time,
@@ -286,11 +286,7 @@ const GREETINGS: [Greeting; 45] = [
         Group::State,
         returning,
     ),
-    greeting(
-        "Many hands, one hammer",
-        Group::State,
-        multiple_profiles,
-    ),
+    greeting("Many hands, one hammer", Group::State, multiple_profiles),
     greeting("No pitchforks. Just forks", Group::State, multiple_active),
     greeting(
         "Mjolnir awaits your command, $firstname",

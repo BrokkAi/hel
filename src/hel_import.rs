@@ -2965,7 +2965,7 @@ fn collect_local_repositories(
                     history,
                     origin_override: repository
                         .is_local()
-                        .then(|| format!("hel-local:{}", repository.id)),
+                        .then(|| format!("mj-local:{}", repository.id)),
                 },
                 control.is_none_or(|control| control.include_untracked),
                 &|progress| {

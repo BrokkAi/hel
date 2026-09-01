@@ -1637,7 +1637,7 @@ async function searchHistory(query) {
 // here and a check there ever disagree, the Rust one is right and this one is
 // the bug.
 
-const HEL_COMMANDS = [
+const MJ_COMMANDS = [
   { name: 'help', description: 'show available Hel and agent commands' },
   { name: 'detach', description: 'leave the conversation without stopping the worker' },
   { name: 'model', description: 'change the active model', argument: 'value' },
@@ -1661,7 +1661,7 @@ function configOption(key) {
 /// harness with no plan mode, or `/model` on one that advertised no models.
 function availableCommands() {
   const session = activeSession();
-  return HEL_COMMANDS.filter(command => {
+  return MJ_COMMANDS.filter(command => {
     if (command.name === 'model' || command.name === 'effort')
       return Boolean(configOption(command.name));
     if (command.name === 'plan' || command.name === 'implement') {

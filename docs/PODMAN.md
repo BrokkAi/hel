@@ -19,7 +19,7 @@ For a target such as:
 ```toml
 [targets.podman]
 kind = "local-podman"
-image = "localhost/hel/agent-dev:latest"
+image = "localhost/mjolnir/agent-dev:latest"
 ```
 
 Mjolnir invokes the local `podman` CLI as the user running Mjolnir; it does not use
@@ -49,8 +49,8 @@ pull an image; image refresh happens in the supervised provisioning task.
 ### Git clone cache
 
 For GitHub-backed bundles, Mjolnir keeps bare object mirrors under
-`~/.cache/hel/git/mirrors` on the Podman host. A launch refreshes the mirror,
-creates a session-specific local snapshot under `~/.cache/hel/git/sessions`,
+`~/.cache/mjolnir/git/mirrors` on the Podman host. A launch refreshes the mirror,
+creates a session-specific local snapshot under `~/.cache/mjolnir/git/sessions`,
 and mounts only that snapshot read-only into the container. The normal clone
 then uses it as a Git object reference, avoiding repeated object downloads
 while preserving the image's checkout behavior. Git object files are
@@ -64,7 +64,7 @@ mirror; later launches fetch only updates. Mjolnir removes session snapshots aft
 their owning container and prunes mirrors unused for 30 days, then applies a
 20 GiB least-recently-used soft cap. Cache directories are private to the
 Podman user because they may retain objects from private repositories. You can
-remove `~/.cache/hel/git/mirrors` while no launch is updating it; do not remove
+remove `~/.cache/mjolnir/git/mirrors` while no launch is updating it; do not remove
 the `sessions` directory while managed containers are running.
 
 `mj doctor --json` runs those three checks only when a `local-podman` target
@@ -92,7 +92,7 @@ the image or to work offline:
 ```console
 podman build --pull=always \
   --file containers/Containerfile.agent-dev \
-  --tag localhost/hel/agent-dev:latest \
+  --tag localhost/mjolnir/agent-dev:latest \
   containers
 ```
 
@@ -206,11 +206,11 @@ podman image exists "$IMAGE"
 ```
 
 Both commands must exit zero. Replace the example with the configured image
-if it differs. For Mjolnir's locally built `localhost/hel/agent-dev:latest`, build
+if it differs. For Mjolnir's locally built `localhost/mjolnir/agent-dev:latest`, build
 it with the command above and verify it without attempting a registry pull:
 
 ```console
-podman image exists localhost/hel/agent-dev:latest
+podman image exists localhost/mjolnir/agent-dev:latest
 ```
 
 ### 4. A container can run, execute a command, and be removed
@@ -219,8 +219,8 @@ Use the same image as the configured target. The Mjolnir development image suppo
 the following verbatim:
 
 ```console
-IMAGE=localhost/hel/agent-dev:latest
-CHECK_NAME="hel-podman-check-$$"
+IMAGE=localhost/mjolnir/agent-dev:latest
+CHECK_NAME="mj-podman-check-$$"
 podman run --init --detach --name "$CHECK_NAME" "$IMAGE" sleep infinity
 podman exec "$CHECK_NAME" /bin/sh -c 'printf "Mjolnir Podman exec works\n"'
 podman rm --force "$CHECK_NAME"

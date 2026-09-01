@@ -408,16 +408,16 @@ fn managed_resource_identity_args_build_container_labels_and_ec2_tags() {
         managed_resource_identity_args(ManagedResourceKind::Container, SESSION),
         vec![
             "--label",
-            "dev.hel.session=018f9dd2-a3b4-7c8d-9000-123456789abc",
+            "dev.mj.session=018f9dd2-a3b4-7c8d-9000-123456789abc",
             "--label",
-            "dev.hel.managed=true",
+            "dev.mj.managed=true",
         ]
     );
     assert_eq!(
         managed_resource_identity_args(ManagedResourceKind::Ec2Instance, SESSION),
         vec![
             "--tag-specifications",
-            "ResourceType=instance,Tags=[{Key=dev.hel.session,Value=018f9dd2-a3b4-7c8d-9000-123456789abc},{Key=dev.hel.managed,Value=true}]",
+            "ResourceType=instance,Tags=[{Key=dev.mj.session,Value=018f9dd2-a3b4-7c8d-9000-123456789abc},{Key=dev.mj.managed,Value=true}]",
         ]
     );
 }
@@ -2109,7 +2109,7 @@ fn podman_cleanup_ignores_an_already_absent_container() {
     assert_eq!(local.commands[0].program, "sh");
     let local_script = &local.commands[0].args[1];
     let remove_container = local_script.find("podman rm --force --ignore").unwrap();
-    let remove_cache = local_script.find(".cache/hel/git/sessions").unwrap();
+    let remove_cache = local_script.find(".cache/mjolnir/git/sessions").unwrap();
     assert!(remove_container < remove_cache);
     assert_eq!(local.commands[0].args.last().unwrap(), SESSION);
 
@@ -2123,7 +2123,7 @@ fn podman_cleanup_ignores_an_already_absent_container() {
     .unwrap();
     let remote = remote.commands[0].args.last().unwrap();
     let remove_container = remote.find("podman rm --force --ignore").unwrap();
-    let remove_cache = remote.find(".cache/hel/git/sessions").unwrap();
+    let remove_cache = remote.find(".cache/mjolnir/git/sessions").unwrap();
     assert!(remove_container < remove_cache);
     assert!(remote.contains(SESSION));
 }
@@ -2138,13 +2138,13 @@ fn docker_cleanup_removes_container_then_volumes_then_overlay_backing_files() {
     let remove_container = script.find("docker rm --force").unwrap();
     let list_volumes = script.find("docker volume ls").unwrap();
     let remove_volumes = script.find("docker volume rm --force").unwrap();
-    let remove_overlay = script.find(".cache/hel/docker-overlays").unwrap();
+    let remove_overlay = script.find(".cache/mjolnir/docker-overlays").unwrap();
     assert!(remove_container < list_volumes);
     assert!(list_volumes < remove_volumes);
     assert!(remove_volumes < remove_overlay);
     assert!(script.contains("if [ \"$status\" -eq 0 ]"));
-    assert!(script.contains("label=dev.hel.managed=true"));
-    assert!(script.contains("label=dev.hel.session=$2"));
+    assert!(script.contains("label=dev.mj.managed=true"));
+    assert!(script.contains("label=dev.mj.session=$2"));
     assert!(script.contains("true|$2"));
     assert!(script.contains("refusing to remove a Docker container Hel does not own"));
 }

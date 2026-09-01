@@ -12,7 +12,7 @@ use crate::hel_targets::{
 };
 
 const CACHE_CONTAINER_ROOT: &str = "/run/hel/git-cache";
-const CACHE_RELATIVE_ROOT: &str = ".cache/hel/git";
+const CACHE_RELATIVE_ROOT: &str = ".cache/mjolnir/git";
 const CACHE_MAX_KIB: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -462,7 +462,7 @@ fn cleanup_session_root(
     executor: &impl CommandExecutor,
 ) -> Result<()> {
     let command = host.shell_command(
-        "set -eu; root=$1; case $root in */.cache/hel/git/sessions/*) rm -rf -- \"$root\" ;; *) echo 'refusing unsafe clone-cache cleanup path' >&2; exit 2 ;; esac",
+        "set -eu; root=$1; case $root in */.cache/mjolnir/git/sessions/*) rm -rf -- \"$root\" ;; *) echo 'refusing unsafe clone-cache cleanup path' >&2; exit 2 ;; esac",
         [session_root.to_string_lossy().into_owned()],
         "remove failed session Git cache snapshot",
     );
@@ -573,10 +573,10 @@ mod tests {
         let token = "github-token-that-must-stay-private";
         let _ = prepare_repository(
             &CacheHost::LocalPodman,
-            Path::new("/home/test/.cache/hel/git"),
+            Path::new("/home/test/.cache/mjolnir/git"),
             "abc123",
             "https://github.com/example/app.git",
-            Path::new("/home/test/.cache/hel/git/sessions/session-12345678/abc123.git"),
+            Path::new("/home/test/.cache/mjolnir/git/sessions/session-12345678/abc123.git"),
             Some(token),
             &executor,
         );
@@ -636,7 +636,7 @@ mod tests {
                 "ps",
                 "--all",
                 "--filter",
-                "label=dev.hel.managed=true",
+                "label=dev.mj.managed=true",
                 "--format",
                 "json"
             ]

@@ -20,15 +20,15 @@ async function codeLogin(page, baseUrl, code) {
 }
 
 test('real viewer converges with a TUI after an SSE disconnect', async ({ browser }) => {
-  const baseUrl = required('HEL_BROWSER_BASE_URL');
-  const code = required('HEL_BROWSER_CODE');
-  const qrLoginUrl = required('HEL_BROWSER_QR_URL');
-  const title = required('HEL_BROWSER_TITLE');
-  const projectDirectory = required('HEL_BROWSER_PROJECT_DIRECTORY');
-  const readyMarker = required('HEL_BROWSER_READY_MARKER');
-  const changedMarker = required('HEL_TUI_CHANGED_MARKER');
-  const tracePath = required('HEL_BROWSER_TRACE');
-  const screenshotPath = required('HEL_BROWSER_SCREENSHOT');
+  const baseUrl = required('MJ_BROWSER_BASE_URL');
+  const code = required('MJ_BROWSER_CODE');
+  const qrLoginUrl = required('MJ_BROWSER_QR_URL');
+  const title = required('MJ_BROWSER_TITLE');
+  const projectDirectory = required('MJ_BROWSER_PROJECT_DIRECTORY');
+  const readyMarker = required('MJ_BROWSER_READY_MARKER');
+  const changedMarker = required('MJ_TUI_CHANGED_MARKER');
+  const tracePath = required('MJ_BROWSER_TRACE');
+  const screenshotPath = required('MJ_BROWSER_SCREENSHOT');
   const stage = value => process.stdout.write(`browser-stage: ${value}\n`);
 
   // A protected conversation route must remain a login page while its

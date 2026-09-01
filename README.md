@@ -204,8 +204,7 @@ output is saved in the transcript and included once as hidden context on the
 next prompt submitted after the command finishes. Press Escape in the TUI, or
 use the shell's Cancel button in the viewer, to stop it.
 
-Configuration lives at `~/.config/hel/config.toml` — the directory name is
-kept for backwards compatibility with existing state (the platform-equivalent
+Configuration lives at `~/.config/mjolnir/config.toml` (the platform-equivalent
 directory elsewhere). The first-run dialog writes a working single-target
 setup; everything beyond that is edited in TOML. A minimal example:
 

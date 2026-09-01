@@ -805,7 +805,10 @@ impl std::fmt::Display for KimiLockLoss {
             ),
             Self::Gone => formatter.write_str("another process removed it"),
             Self::Unproven(error) => {
-                write!(formatter, "Mjolnir could not confirm it still owns it: {error}")
+                write!(
+                    formatter,
+                    "Mjolnir could not confirm it still owns it: {error}"
+                )
             }
         }
     }

@@ -2366,7 +2366,11 @@ mod tests {
             matches!(viewer, Some(Some(_))),
             "minted cookie must validate and carry a viewer id: {value:?}"
         );
-        assert!(!session_cookie_valid(&vec![8u8; COOKIE_KEY_BYTES], &value, now_unix()));
+        assert!(!session_cookie_valid(
+            &vec![8u8; COOKIE_KEY_BYTES],
+            &value,
+            now_unix()
+        ));
     }
 
     fn sample_config_state() -> (HelConfig, HelState) {

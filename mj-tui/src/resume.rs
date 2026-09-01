@@ -679,8 +679,9 @@ impl DashboardState {
             return DashboardAction::None;
         };
         if row.natively_archived {
-            self.notices
-                .set("This session is archived in its own harness; Mjolnir never writes that back.");
+            self.notices.set(
+                "This session is archived in its own harness; Mjolnir never writes that back.",
+            );
             return DashboardAction::None;
         }
         let archived = !row.archived;

@@ -981,7 +981,7 @@ fn aws_resource_destinations_default_under_the_ssh_users_home() {
 
     assert_eq!(
         default_resource_destination(&target, std::path::Path::new("/opt/cache"), &[]),
-        std::path::PathBuf::from("/home/ubuntu/hel-resources/cache")
+        std::path::PathBuf::from("/home/ubuntu/mj-resources/cache")
     );
 }
 

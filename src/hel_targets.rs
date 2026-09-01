@@ -19,10 +19,10 @@ use sha2::{Digest, Sha256};
 
 use crate::hel_config::ImagePullPolicy;
 
-pub const SESSION_LABEL: &str = "dev.hel.session";
-pub const MANAGED_LABEL: &str = "dev.hel.managed";
-pub const SESSION_TAG: &str = "dev.hel.session";
-pub const MANAGED_TAG: &str = "dev.hel.managed";
+pub const SESSION_LABEL: &str = "dev.mj.session";
+pub const MANAGED_LABEL: &str = "dev.mj.managed";
+pub const SESSION_TAG: &str = "dev.mj.session";
+pub const MANAGED_TAG: &str = "dev.mj.managed";
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
 pub const PODMAN_DOCUMENTATION_PATH: &str = "docs/PODMAN.md";
 pub const DOCKER_DOCUMENTATION_PATH: &str = "docs/DOCKER.md";
@@ -1214,7 +1214,7 @@ impl CommandPlan {
                 command.args = vec![
                     "-c".to_owned(),
                     format!("{read_and_export} exec \"$@\""),
-                    "hel-secret-env".to_owned(),
+                    "mj-secret-env".to_owned(),
                     program,
                 ];
                 command.args.extend(args);
@@ -1561,7 +1561,7 @@ pub fn resource_name(session_id: &str) -> Result<String> {
         .collect();
     let digest = Sha256::digest(session_id.as_bytes());
     Ok(format!(
-        "hel-{readable}-{:02x}{:02x}{:02x}",
+        "mj-{readable}-{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2]
     ))
 }
@@ -1869,7 +1869,7 @@ fn run_docker_overlay_smoke_test(
 ) -> Result<()> {
     validate_container_template(container)?;
     let lower = tempfile::Builder::new()
-        .prefix("hel-docker-overlay-smoke-")
+        .prefix("mj-docker-overlay-smoke-")
         .tempdir()
         .context("create Docker OverlayFS smoke directory")?;
     let original = lower.path().join("original.txt");
@@ -2028,7 +2028,7 @@ pub fn target_recovery_plan(
                 [
                     "-c",
                     "docker container inspect \"$1\" >/dev/null 2>&1 && exit 0; docker info >/dev/null 2>&1 && exit 1; exit 125",
-                    "hel-docker-exists",
+                    "mj-docker-exists",
                     container_id,
                 ],
             )
@@ -2621,9 +2621,9 @@ while read -r hel_pid hel_args; do
     case "$hel_args" in
         *"$hel_match"*|*"$hel_match_home"*) hel_report_worker_state; exit 0 ;;
     esac
-done <<HEL_PS
+done <<MJ_PS
 $(hel_ps -eo pid=,args=)
-HEL_PS
+MJ_PS
 printf 'dead\n'
 "#,
     );
@@ -2683,9 +2683,9 @@ while read -r hel_pid hel_args; do
     case "$hel_args" in
         *"$hel_match"*|*"$hel_match_home"*) hel_left=1 ;;
     esac
-done <<HEL_PS
+done <<MJ_PS
 $(hel_ps -eo pid=,args=)
-HEL_PS
+MJ_PS
 if [ "$hel_left" -ne 0 ]; then
     echo "worker still running after stop: $hel_root" >&2
     exit 1
@@ -2753,13 +2753,13 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
                 .purpose("stop the local Hel worker and remove exact local Hel worker state")
         }
         TargetLocator::LocalPodman { container_id } => {
-            let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
-            CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
+            let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/mjolnir/git/sessions/$2\"; exit \"$status\"";
+            CommandSpec::new("sh", ["-c", script, "mj-close", container_id, session_id])
                 .purpose("remove local Podman session container and Git cache snapshot")
         }
         TargetLocator::LocalDocker { container_id } => {
             let script = r#"status=0
-if identity=$(docker container inspect --format '{{index .Config.Labels "dev.hel.managed"}}|{{index .Config.Labels "dev.hel.session"}}' "$1" 2>/dev/null); then
+if identity=$(docker container inspect --format '{{index .Config.Labels "dev.mj.managed"}}|{{index .Config.Labels "dev.mj.session"}}' "$1" 2>/dev/null); then
     if [ "$identity" = "true|$2" ]; then
         docker rm --force "$1" || status=$?
     else
@@ -2771,25 +2771,25 @@ elif ! docker info >/dev/null 2>&1; then
     status=1
 fi
 if [ "$status" -eq 0 ]; then
-    volumes=$(docker volume ls --quiet --filter "label=dev.hel.managed=true" --filter "label=dev.hel.session=$2") || status=$?
+    volumes=$(docker volume ls --quiet --filter "label=dev.mj.managed=true" --filter "label=dev.mj.session=$2") || status=$?
     if [ "$status" -eq 0 ]; then
         for volume in $volumes; do docker volume rm --force "$volume" || status=$?; done
     fi
 fi
-rm -rf -- "$HOME/.cache/hel/git/sessions/$2"
+rm -rf -- "$HOME/.cache/mjolnir/git/sessions/$2"
 if [ "$status" -eq 0 ]; then
-    root="$HOME/.cache/hel/docker-overlays/$1"
+    root="$HOME/.cache/mjolnir/docker-overlays/$1"
     if [ "$(cat "$root/.hel-session" 2>/dev/null || true)" = "$2" ]; then
         case $1 in hel-*) rm -rf -- "$root" ;; *) status=2 ;; esac
     fi
 fi
 exit "$status""#;
-            CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
+            CommandSpec::new("sh", ["-c", script, "mj-close", container_id, session_id])
                 .purpose("remove local Docker session container, overlay volumes, and cache state")
         }
         TargetLocator::AppleContainer { container_id } => {
-            let script = "status=0; container rm --force \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
-            CommandSpec::new("sh", ["-c", script, "hel-close", container_id, session_id])
+            let script = "status=0; container rm --force \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/mjolnir/git/sessions/$2\"; exit \"$status\"";
+            CommandSpec::new("sh", ["-c", script, "mj-close", container_id, session_id])
                 .purpose("remove Apple session container and Git cache snapshot")
         }
         TargetLocator::AwsEc2 {
@@ -2830,10 +2830,10 @@ exit "$status""#;
             )
         }
         TargetLocator::SshPodman { ssh, container_id } => {
-            let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/hel/git/sessions/$2\"; exit \"$status\"";
+            let script = "status=0; podman rm --force --ignore \"$1\" || status=$?; rm -rf -- \"$HOME/.cache/mjolnir/git/sessions/$2\"; exit \"$status\"";
             ssh_command(
                 ssh,
-                ["sh", "-c", script, "hel-close", container_id, session_id],
+                ["sh", "-c", script, "mj-close", container_id, session_id],
             )
             .purpose("remove exact remote Podman session container and Git cache snapshot")
         }
@@ -2867,7 +2867,7 @@ pub fn cleanup_target_is_confirmed_absent(
                 "sh",
                 [
                     "-c",
-                    "if docker container inspect \"$1\" >/dev/null 2>&1; then exit 1; fi; docker info >/dev/null 2>&1 || exit 2; test -z \"$(docker volume ls --quiet --filter label=dev.hel.managed=true --filter label=dev.hel.session=$2)\"",
+                    "if docker container inspect \"$1\" >/dev/null 2>&1; then exit 1; fi; docker info >/dev/null 2>&1 || exit 2; test -z \"$(docker volume ls --quiet --filter label=dev.mj.managed=true --filter label=dev.mj.session=$2)\"",
                     "hel-confirm-absent",
                     container_id,
                     session_id,
@@ -3056,7 +3056,7 @@ const DOCKER_OVERLAY_RUN_SCRIPT: &str = r#"set -eu
 session=$1
 container=$2
 shift 2
-root="$HOME/.cache/hel/docker-overlays/$container"
+root="$HOME/.cache/mjolnir/docker-overlays/$container"
 marker="$root/.hel-session"
 volumes=
 cleanup() {
@@ -3064,7 +3064,7 @@ cleanup() {
     trap - EXIT HUP INT TERM
     if [ "$status" -ne 0 ]; then
         released=true
-        if identity=$(docker container inspect --format '{{index .Config.Labels "dev.hel.managed"}}|{{index .Config.Labels "dev.hel.session"}}' "$container" 2>/dev/null); then
+        if identity=$(docker container inspect --format '{{index .Config.Labels "dev.mj.managed"}}|{{index .Config.Labels "dev.mj.session"}}' "$container" 2>/dev/null); then
             if [ "$identity" = "true|$session" ]; then
                 docker rm --force "$container" >/dev/null 2>&1 || released=false
             else
@@ -3109,14 +3109,14 @@ while [ "$1" != -- ]; do
     if ! docker volume inspect "$volume" >/dev/null 2>&1; then
         docker volume create \
             --driver local \
-            --label "dev.hel.managed=true" \
-            --label "dev.hel.session=$session" \
+            --label "dev.mj.managed=true" \
+            --label "dev.mj.session=$session" \
             --opt type=overlay \
             --opt device=overlay \
             --opt "o=lowerdir=$source,upperdir=$upper,workdir=$work" \
             "$volume" >/dev/null
     fi
-    identity=$(docker volume inspect --format '{{index .Labels "dev.hel.managed"}}|{{index .Labels "dev.hel.session"}}' "$volume")
+    identity=$(docker volume inspect --format '{{index .Labels "dev.mj.managed"}}|{{index .Labels "dev.mj.session"}}' "$volume")
     [ "$identity" = "true|$session" ] || {
         echo "refusing foreign Docker volume $volume" >&2
         exit 1

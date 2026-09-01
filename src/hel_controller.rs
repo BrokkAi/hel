@@ -998,7 +998,7 @@ mod tests {
         assert!(controller.state.sessions.is_empty());
     }
 
-    /// HEL_DATA_DIR is process-global, so every test that reaches the
+    /// MJ_DATA_DIR is process-global, so every test that reaches the
     /// controller database runs in an exact child with its own data directory.
     fn run_registration_child(marker: &str, test: &str, data_directory: &Path) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1008,8 +1008,8 @@ mod tests {
                 "--nocapture",
             ])
             .env(marker, "1")
-            .env("HEL_DATA_DIR", data_directory)
-            .env("HEL_CONFIG_DIR", data_directory)
+            .env("MJ_DATA_DIR", data_directory)
+            .env("MJ_CONFIG_DIR", data_directory)
             .output()
             .unwrap();
         assert!(
@@ -1020,9 +1020,9 @@ mod tests {
         );
     }
 
-    const UNPERSISTABLE_SESSION_CHILD: &str = "HEL_TEST_UNPERSISTABLE_SESSION_CHILD";
+    const UNPERSISTABLE_SESSION_CHILD: &str = "MJ_TEST_UNPERSISTABLE_SESSION_CHILD";
 
-    const CONFIG_ID_RENAME_CHILD: &str = "HEL_TEST_CONFIG_ID_RENAME_CHILD";
+    const CONFIG_ID_RENAME_CHILD: &str = "MJ_TEST_CONFIG_ID_RENAME_CHILD";
 
     #[test]
     fn configuration_id_rename_rewrites_durable_session_references() {
@@ -1072,7 +1072,7 @@ mod tests {
         if std::env::var_os(UNPERSISTABLE_SESSION_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
             // A directory where the database file belongs fails every write.
-            std::fs::create_dir(directory.path().join("hel.sqlite3")).unwrap();
+            std::fs::create_dir(directory.path().join("mj.sqlite3")).unwrap();
             run_registration_child(
                 UNPERSISTABLE_SESSION_CHILD,
                 "a_session_the_database_rejects_is_never_left_in_memory",
@@ -1104,9 +1104,9 @@ mod tests {
         );
     }
 
-    const MOUNT_HISTORY_FAILURE_CHILD: &str = "HEL_TEST_MOUNT_HISTORY_FAILURE_CHILD";
+    const MOUNT_HISTORY_FAILURE_CHILD: &str = "MJ_TEST_MOUNT_HISTORY_FAILURE_CHILD";
 
-    const CONTAINER_SIZE_HISTORY_CHILD: &str = "HEL_TEST_CONTAINER_SIZE_HISTORY_CHILD";
+    const CONTAINER_SIZE_HISTORY_CHILD: &str = "MJ_TEST_CONTAINER_SIZE_HISTORY_CHILD";
 
     #[test]
     fn registration_remembers_launch_size_but_session_overrides_do_not_replace_it() {
@@ -1237,9 +1237,9 @@ mod tests {
                 "hel_controller::tests::controller_store_lock_subprocess_probe",
                 "--nocapture",
             ])
-            .env("HEL_CONTROLLER_LOCK_PROBE", directory)
+            .env("MJ_CONTROLLER_LOCK_PROBE", directory)
             .env(
-                "HEL_CONTROLLER_LOCK_EXPECTED",
+                "MJ_CONTROLLER_LOCK_EXPECTED",
                 if expect_locked { "locked" } else { "available" },
             )
             .output()
@@ -1253,10 +1253,10 @@ mod tests {
     }
     #[test]
     fn controller_store_lock_subprocess_probe() {
-        let Some(directory) = std::env::var_os("HEL_CONTROLLER_LOCK_PROBE") else {
+        let Some(directory) = std::env::var_os("MJ_CONTROLLER_LOCK_PROBE") else {
             return;
         };
-        let expected = std::env::var("HEL_CONTROLLER_LOCK_EXPECTED").unwrap();
+        let expected = std::env::var("MJ_CONTROLLER_LOCK_EXPECTED").unwrap();
         let acquired = ControllerStoreGuard::acquire_at(Path::new(&directory));
         match expected.as_str() {
             "locked" => {

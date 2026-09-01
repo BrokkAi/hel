@@ -2,7 +2,7 @@ const { defineConfig } = require('@playwright/test');
 
 module.exports = defineConfig({
   testDir: '.',
-  testMatch: process.env.HEL_BROWSER_SPEC || 'reliability.spec.js',
+  testMatch: process.env.MJ_BROWSER_SPEC || 'reliability.spec.js',
   fullyParallel: false,
   workers: 1,
   timeout: 150_000,

@@ -59,12 +59,12 @@ wherever Mjolnir asks you to choose a target.
 [targets.ec2]
 kind = "aws-ec2"
 region = "us-east-1"
-launch_template = "hel-agent"
+launch_template = "mj-agent"
 ssh_user = "ubuntu"
 address_source = "public-dns"
 # aws_profile = "work"
 # launch_template_version = "3"
-# identity_file = "/home/me/.ssh/hel-ec2"
+# identity_file = "/home/me/.ssh/mj-ec2"
 # ssh_args = ["-o", "StrictHostKeyChecking=accept-new"]
 ```
 

@@ -3295,7 +3295,7 @@ mod tests {
                     "sh",
                     [
                         "-c",
-                        "test -f \"$HEL_TEST_REFRESHED\" && touch -- \"$HEL_TEST_RESTARTED\"",
+                        "test -f \"$MJ_TEST_REFRESHED\" && touch -- \"$MJ_TEST_RESTARTED\"",
                     ],
                 )
             } else {
@@ -3303,11 +3303,11 @@ mod tests {
             }
             .purpose("restart test worker");
             restart.env.insert(
-                "HEL_TEST_REFRESHED".into(),
+                "MJ_TEST_REFRESHED".into(),
                 refreshed.to_string_lossy().into_owned(),
             );
             restart.env.insert(
-                "HEL_TEST_RESTARTED".into(),
+                "MJ_TEST_RESTARTED".into(),
                 restarted.to_string_lossy().into_owned(),
             );
             WorkerRecoveryPlan {
@@ -3366,16 +3366,16 @@ mod tests {
             "sh",
             [
                 "-c",
-                "test -f \"$HEL_TEST_REFRESHED\" && touch -- \"$HEL_TEST_RESTARTED\"",
+                "test -f \"$MJ_TEST_REFRESHED\" && touch -- \"$MJ_TEST_RESTARTED\"",
             ],
         )
         .purpose("restart test worker");
         restart.env.insert(
-            "HEL_TEST_REFRESHED".into(),
+            "MJ_TEST_REFRESHED".into(),
             refreshed.to_string_lossy().into_owned(),
         );
         restart.env.insert(
-            "HEL_TEST_RESTARTED".into(),
+            "MJ_TEST_RESTARTED".into(),
             restarted.to_string_lossy().into_owned(),
         );
         let outcome = recover_worker(
@@ -3436,36 +3436,36 @@ mod tests {
             "sh",
             [
                 "-c",
-                "if [ -f \"$HEL_TEST_TARGET_STARTED\" ]; then printf '%s\\n' \"$HEL_TEST_RUNNING\"; else printf '%s\\n' \"$HEL_TEST_EXITED\"; fi",
+                "if [ -f \"$MJ_TEST_TARGET_STARTED\" ]; then printf '%s\\n' \"$MJ_TEST_RUNNING\"; else printf '%s\\n' \"$MJ_TEST_EXITED\"; fi",
             ],
         )
         .purpose("inspect test target");
         inspect.env.insert(
-            "HEL_TEST_TARGET_STARTED".into(),
+            "MJ_TEST_TARGET_STARTED".into(),
             target_started.to_string_lossy().into_owned(),
         );
         inspect
             .env
-            .insert("HEL_TEST_RUNNING".into(), inspection("running"));
+            .insert("MJ_TEST_RUNNING".into(), inspection("running"));
         inspect
             .env
-            .insert("HEL_TEST_EXITED".into(), inspection("exited"));
-        let mut start = CommandSpec::new("sh", ["-c", "touch -- \"$HEL_TEST_TARGET_STARTED\""])
+            .insert("MJ_TEST_EXITED".into(), inspection("exited"));
+        let mut start = CommandSpec::new("sh", ["-c", "touch -- \"$MJ_TEST_TARGET_STARTED\""])
             .purpose("start test target");
         start.env.insert(
-            "HEL_TEST_TARGET_STARTED".into(),
+            "MJ_TEST_TARGET_STARTED".into(),
             target_started.to_string_lossy().into_owned(),
         );
         let mut liveness = CommandSpec::new(
             "sh",
             [
                 "-c",
-                "test -f \"$HEL_TEST_TARGET_STARTED\" && printf 'dead\\n'",
+                "test -f \"$MJ_TEST_TARGET_STARTED\" && printf 'dead\\n'",
             ],
         )
         .purpose("probe test worker after target start");
         liveness.env.insert(
-            "HEL_TEST_TARGET_STARTED".into(),
+            "MJ_TEST_TARGET_STARTED".into(),
             target_started.to_string_lossy().into_owned(),
         );
 
@@ -3791,11 +3791,11 @@ mod tests {
         tasks.abort_all();
     }
 
-    const UNREACHABLE_VIEW_TEST_CHILD: &str = "HEL_TEST_UNREACHABLE_RELAY_CHILD";
+    const UNREACHABLE_VIEW_TEST_CHILD: &str = "MJ_TEST_UNREACHABLE_RELAY_CHILD";
 
     #[tokio::test(start_paused = true)]
     async fn unreachable_relay_publishes_error_view() {
-        // HEL_DATA_DIR is process-global, so run the database-backed half in
+        // MJ_DATA_DIR is process-global, so run the database-backed half in
         // an exact child test instead of racing unrelated tests in this
         // process.
         if std::env::var_os(UNREACHABLE_VIEW_TEST_CHILD).is_none() {
@@ -3809,7 +3809,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(UNREACHABLE_VIEW_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             assert!(
@@ -3865,11 +3865,11 @@ mod tests {
         assert!(!update.view.connected);
     }
 
-    const UNREADABLE_PROJECTION_TEST_CHILD: &str = "HEL_TEST_UNREADABLE_PROJECTION_CHILD";
+    const UNREADABLE_PROJECTION_TEST_CHILD: &str = "MJ_TEST_UNREADABLE_PROJECTION_CHILD";
 
     #[tokio::test]
     async fn connecting_to_an_absent_worker_never_reads_the_projection() {
-        // HEL_DATA_DIR is process-global, so run the database-backed half in
+        // MJ_DATA_DIR is process-global, so run the database-backed half in
         // an exact child test instead of racing unrelated tests in this
         // process.
         if std::env::var_os(UNREADABLE_PROJECTION_TEST_CHILD).is_none() {
@@ -3877,7 +3877,7 @@ mod tests {
             // A directory where the database file belongs makes every
             // projection read fail, so a read that happens at all shows up in
             // the reported error.
-            std::fs::create_dir(directory.path().join("hel.sqlite3")).unwrap();
+            std::fs::create_dir(directory.path().join("mj.sqlite3")).unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -3890,7 +3890,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(UNREADABLE_PROJECTION_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             assert!(
@@ -3923,23 +3923,23 @@ mod tests {
         );
     }
 
-    const LEASED_RELAY_ROOT: &str = "HEL_TEST_LEASED_RELAY_ROOT";
+    const LEASED_RELAY_ROOT: &str = "MJ_TEST_LEASED_RELAY_ROOT";
     #[cfg(unix)]
-    const AUTO_RESTART_TEST_CHILD: &str = "HEL_TEST_AUTO_RESTART_CHILD";
+    const AUTO_RESTART_TEST_CHILD: &str = "MJ_TEST_AUTO_RESTART_CHILD";
     #[cfg(unix)]
-    const AUTO_RESTART_MARKER: &str = "HEL_TEST_AUTO_RESTART_MARKER";
+    const AUTO_RESTART_MARKER: &str = "MJ_TEST_AUTO_RESTART_MARKER";
     #[cfg(unix)]
-    const DEFERRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_DEFERRED_SUBMIT_CHILD";
+    const DEFERRED_SUBMIT_TEST_CHILD: &str = "MJ_TEST_DEFERRED_SUBMIT_CHILD";
     #[cfg(unix)]
-    const RETIRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_RETIRED_SUBMIT_CHILD";
+    const RETIRED_SUBMIT_TEST_CHILD: &str = "MJ_TEST_RETIRED_SUBMIT_CHILD";
     #[cfg(unix)]
-    const RETURNED_LEASE_VIEW_TEST_CHILD: &str = "HEL_TEST_RETURNED_LEASE_VIEW_CHILD";
+    const RETURNED_LEASE_VIEW_TEST_CHILD: &str = "MJ_TEST_RETURNED_LEASE_VIEW_CHILD";
     #[cfg(unix)]
-    const EXPLICIT_MEMORY_SYNC_TEST_CHILD: &str = "HEL_TEST_EXPLICIT_MEMORY_SYNC_CHILD";
+    const EXPLICIT_MEMORY_SYNC_TEST_CHILD: &str = "MJ_TEST_EXPLICIT_MEMORY_SYNC_CHILD";
     #[cfg(unix)]
-    const SUBMIT_WITHOUT_SYNC_TEST_CHILD: &str = "HEL_TEST_SUBMIT_WITHOUT_SYNC_CHILD";
+    const SUBMIT_WITHOUT_SYNC_TEST_CHILD: &str = "MJ_TEST_SUBMIT_WITHOUT_SYNC_CHILD";
     #[cfg(unix)]
-    const MANAGER_SHUTDOWN_TEST_CHILD: &str = "HEL_TEST_MANAGER_SHUTDOWN_CHILD";
+    const MANAGER_SHUTDOWN_TEST_CHILD: &str = "MJ_TEST_MANAGER_SHUTDOWN_CHILD";
     const LEASED_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
 
     /// Relay server half of the leased-submission tests. It does nothing unless
@@ -3977,7 +3977,7 @@ mod tests {
         )
     }
 
-    /// HEL_DATA_DIR is process-global, so every test that reaches the
+    /// MJ_DATA_DIR is process-global, so every test that reaches the
     /// controller database runs in an exact child with its own data directory.
     #[cfg(unix)]
     fn run_in_isolated_child(marker: &str, test: &str) {
@@ -3985,7 +3985,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &exact_test_name(test), "--nocapture"])
             .env(marker, "1")
-            .env("HEL_DATA_DIR", directory.path())
+            .env("MJ_DATA_DIR", directory.path())
             .output()
             .unwrap();
         assert!(

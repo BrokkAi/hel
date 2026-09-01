@@ -848,7 +848,7 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].program, "sh");
         assert!(commands[0].args[1].contains("container rm --force"));
-        assert!(commands[0].args[1].contains(".cache/hel/git/sessions"));
+        assert!(commands[0].args[1].contains(".cache/mjolnir/git/sessions"));
         assert_eq!(commands[1].args, ["list", "--all", "--quiet"]);
         assert_eq!(persisted.into_inner(), vec![SessionState::Stopped]);
         assert_eq!(
@@ -863,7 +863,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn every_session_ending_retires_its_local_git_broker() {
-        const RETIREMENT_TEST_CHILD: &str = "HEL_TEST_BROKER_RETIREMENT_CHILD";
+        const RETIREMENT_TEST_CHILD: &str = "MJ_TEST_BROKER_RETIREMENT_CHILD";
 
         struct SucceedingExecutor;
 
@@ -877,7 +877,7 @@ mod tests {
             }
         }
 
-        // HEL_DATA_DIR is process-global, so run the half that reads it in an
+        // MJ_DATA_DIR is process-global, so run the half that reads it in an
         // exact child test instead of racing unrelated tests in this process.
         if std::env::var_os(RETIREMENT_TEST_CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
@@ -890,7 +890,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])
                 .env(RETIREMENT_TEST_CHILD, "1")
-                .env("HEL_DATA_DIR", directory.path())
+                .env("MJ_DATA_DIR", directory.path())
                 .output()
                 .unwrap();
             let reported = String::from_utf8_lossy(&output.stdout).into_owned();

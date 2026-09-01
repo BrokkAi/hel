@@ -1,6 +1,6 @@
 ---
 title: Container targets
-description: Set up a disposable container target for hel and start your first isolated session.
+description: Set up a disposable container target for Mjolnir and start your first isolated session.
 ---
 
 ## What container targets give you
@@ -52,7 +52,7 @@ Codex and Claude ACP bridges, and pinned DeepSeek Harness plus
 `dsh-acp-server`. It's published at
 `ghcr.io/brokkai/mjolnir/agent-dev:latest`, public and
 multi-arch for both `linux/amd64` and `linux/arm64`, so the same image name
-works whether hel is running it through Podman, Docker, Apple's `container`
+works whether Mjolnir is running it through Podman, Docker, Apple's `container`
 runtime, or an arm64 SSH host.
 
 You don't need to do anything to get it: `mj setup`'s image prompt already
@@ -66,7 +66,7 @@ customize the image or to work offline:
 ```console
 podman build --pull=always \
   --file containers/Containerfile.agent-dev \
-  --tag localhost/hel/agent-dev:latest \
+  --tag localhost/mjolnir/agent-dev:latest \
   containers
 ```
 
@@ -82,14 +82,14 @@ GitHub origin of the current directory, and which local container runtimes
 are usable. If one or more are usable, it prompts you for:
 
 1. The container image, defaulting to `ghcr.io/brokkai/mjolnir/agent-dev:latest`
-   — press Enter to accept it, or enter `localhost/hel/agent-dev:latest` here
+   — press Enter to accept it, or enter `localhost/mjolnir/agent-dev:latest` here
    if you built the image yourself above.
 
 It creates one ordinary target for every usable runtime (for example, `podman`
 and `docker`). Those targets appear independently in Mjolnir's normal target
 picker; setup does not choose one on your behalf.
 
-A plain image such as `ubuntu:24.04` still works if you enter it here: hel
+A plain image such as `ubuntu:24.04` still works if you enter it here: Mjolnir
 auto-installs Git, GitHub CLI, and Node the first time a session needs them.
 But that installation runs inside every new container, which slows down the
 start of each session. The default agent-dev image avoids that cost.
@@ -104,7 +104,7 @@ policy. Existing running containers are never replaced in place.
 ## Git clone cache
 
 Local Podman, local Docker, SSH Podman, and Apple container targets cache GitHub repository
-objects under the container host user's `~/.cache/hel/git`. Before launch, Mjolnir
+objects under the container host user's `~/.cache/mjolnir/git`. Before launch, Mjolnir
 refreshes a bare mirror and creates an isolated session snapshot whose
 immutable objects are shared with ordinary filesystem hardlinks. The snapshot
 is mounted read-only and the normal in-container clone borrows its objects, so
@@ -117,7 +117,7 @@ the ordinary network clone. The first launch still populates the complete
 mirror. Mjolnir removes session snapshots after their container, removes mirrors
 unused for 30 days, and enforces a 20 GiB least-recently-used soft cap. The
 cache can contain objects from private repositories and is created with
-user-only permissions. You can remove `~/.cache/hel/git/mirrors` while no
+user-only permissions. You can remove `~/.cache/mjolnir/git/mirrors` while no
 launch is updating it; do not remove the `sessions` directory while managed
 containers are running.
 
@@ -136,7 +136,7 @@ mj doctor --json
 This prints a machine-readable array of prerequisite checks. Resolve every
 check reported as `fixable` — each one includes what's wrong and how to fix
 it — then run `mj doctor --json` again. Repeat until none remain. The set of
-checks hel runs is still growing, so treat the `fixable` status as
+checks Mjolnir runs is still growing, so treat the `fixable` status as
 authoritative rather than checking for specific check names.
 
 Once every check passes, run the same command with `--smoke` for an
@@ -176,22 +176,22 @@ directory is mounted using the runtime's isolated mount mode, so a container
 can't write back into your host filesystem through it.
 
 Each attached directory also has a read-only checkbox. Podman and Docker use
-copy-on-write OverlayFS mounts, which some filesystems cannot host: when hel finds
+copy-on-write OverlayFS mounts, which some filesystems cannot host: when Mjolnir finds
 a source on NFS, SMB, FUSE, a FAT-family filesystem, or another overlay, it
 attaches that directory read-only instead and says so while the session
 launches.
 
 ## Two useful facts
 
-If the `gh` CLI on the machine running hel is authenticated, hel continuously
+If the `gh` CLI on the machine running Mjolnir is authenticated, Mjolnir continuously
 syncs its active GitHub token into every live non-local session. That includes
 managed containers, EC2, SSH Podman, and raw SSH targets, and lets `gh` and
 HTTPS Git pushes work without copying SSH keys. The token never goes into a
 recovery archive. Raw SSH targets are therefore inside the token's trust
 boundary; raw localhost sessions are deliberately excluded.
 
-If hel or the host crashes, containers it was managing can be orphaned —
-still running, but no longer tracked in hel's state. Use `mj recover` to
+If Mjolnir or the host crashes, containers it was managing can be orphaned —
+still running, but no longer tracked in Mjolnir's state. Use `mj recover` to
 find and reclaim them:
 
 ```console
@@ -200,9 +200,9 @@ mj recover adopt --session <session-id> --target <target-id>
 mj recover destroy --session <session-id> --target <target-id> --confirm <session-id>
 ```
 
-`scan` lists managed containers that exist but aren't in hel's state. `adopt`
-reconnects one back into hel as a tracked session; add `--profile` and
-`--bundle` when the orphan predates hel's ownership markers and can't be
+`scan` lists managed containers that exist but aren't in Mjolnir's state. `adopt`
+reconnects one back into Mjolnir as a tracked session; add `--profile` and
+`--bundle` when the orphan predates Mjolnir's ownership markers and can't be
 matched to a profile and bundle automatically. `destroy` removes one without
 adopting it first; `--confirm` must repeat the session ID exactly, as a
 safeguard against destroying the wrong container.

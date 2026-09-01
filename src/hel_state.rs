@@ -578,13 +578,13 @@ impl ManagedWorktree {
         }
         let expected_root = self
             .source_repository
-            .join(".hel")
+            .join(".mj")
             .join("worktrees")
             .join(session_id);
         if self.worktree_root != expected_root {
             bail!("managed worktree root does not match the session-owned path");
         }
-        if self.branch != format!("hel/{session_id}") {
+        if self.branch != format!("mj/{session_id}") {
             bail!("managed worktree branch does not match the session id");
         }
         let relative = self
@@ -1213,7 +1213,8 @@ impl HelState {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let body = fs::read(path).with_context(|| format!("read Mjolnir state {}", path.display()))?;
+        let body =
+            fs::read(path).with_context(|| format!("read Mjolnir state {}", path.display()))?;
         let state: Self = serde_json::from_slice(&body)
             .with_context(|| format!("parse Mjolnir state {}", path.display()))?;
         state.validate()?;
@@ -1498,15 +1499,15 @@ mod tests {
         assert_eq!(session.project_name(&config), "raw-project");
 
         session.project_directory = Some(PathBuf::from(
-            "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+            "/home/test/Projects/source/.mj/worktrees/0123456789abcdef",
         ));
         session.managed_worktree = Some(ManagedWorktree {
             source_project_directory: PathBuf::from("/home/test/Projects/source"),
             source_repository: PathBuf::from("/home/test/Projects/source"),
             worktree_root: PathBuf::from(
-                "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+                "/home/test/Projects/source/.mj/worktrees/0123456789abcdef",
             ),
-            branch: "hel/0123456789abcdef".into(),
+            branch: "mj/0123456789abcdef".into(),
             target: ManagedWorktreeTarget::Local,
         });
         assert_eq!(session.project_name(&config), "source");
@@ -1543,21 +1544,21 @@ mod tests {
         );
 
         session.project_directory = Some(PathBuf::from(
-            "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+            "/home/test/Projects/source/.mj/worktrees/0123456789abcdef",
         ));
         session.managed_worktree = Some(ManagedWorktree {
             source_project_directory: PathBuf::from("/home/test/Projects/source/crate"),
             source_repository: PathBuf::from("/home/test/Projects/source"),
             worktree_root: PathBuf::from(
-                "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+                "/home/test/Projects/source/.mj/worktrees/0123456789abcdef",
             ),
-            branch: "hel/0123456789abcdef".into(),
+            branch: "mj/0123456789abcdef".into(),
             target: ManagedWorktreeTarget::Local,
         });
         let source = session.project_source(&config);
         assert_eq!(source.short, "source");
         assert_eq!(source.full, "/home/test/Projects/source");
-        assert!(!source.full.contains(".hel/worktrees"));
+        assert!(!source.full.contains(".mj/worktrees"));
     }
 
     #[test]
