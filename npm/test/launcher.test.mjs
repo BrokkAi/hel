@@ -27,7 +27,6 @@ test("selects each published native package", () => {
   assert.equal(platformPackageName("darwin", "x64"), "@brokkai/mjolnir-darwin-universal");
   assert.equal(platformPackageName("linux", "x64"), "@brokkai/mjolnir-linux-x64-gnu");
   assert.equal(platformPackageName("linux", "arm64"), "@brokkai/mjolnir-linux-arm64-gnu");
-  assert.equal(platformPackageName("android", "arm64"), "@brokkai/mjolnir-android-arm64");
   assert.equal(platformPackageName("win32", "x64"), "@brokkai/mjolnir-win32-x64");
 });
 

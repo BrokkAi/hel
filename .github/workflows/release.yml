@@ -1,46 +1,39 @@
-name: Release Hel
+name: GitHub Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  # Tags are not covered by the branch and pull request triggers on CI, so
+  # nothing else re-checks the tagged tree. Collecting coverage runs the whole
+  # workspace test suite, so this gates the release on the tests passing and on
+  # the coverage baseline holding. Everything downstream of the release
+  # workflow, crates.io and npm included, inherits the gate.
+  coverage:
+    name: Coverage gate
+    uses: ./.github/workflows/coverage.yml
+
   verify-version:
     name: Verify release version
-    runs-on: ubuntu-22.04
-    env:
-      CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Check tag against workspace versions
+        run: node scripts/release-version.mjs check "$GITHUB_REF_NAME"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev musl-tools
-
-      - name: Verify tag, manifests, and lockfile agree
-        run: |
-          node scripts/release-version.mjs check "$GITHUB_REF_NAME"
-          cargo metadata --locked --format-version 1 >/dev/null
-
-      - name: Verify publishable source packages
-        run: |
-          cargo package --locked -p brokk-mj-core
-          CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu \
-            cargo package --locked -p brokk-mj-voice-worker
-
-  build-linux-amd64:
-    name: Build mj for x86_64-unknown-linux-musl
-    needs: verify-version
+  # Session workers run inside disposable Linux targets (containers and
+  # instances), so they are static musl builds of the mj binary regardless of
+  # the controller's platform. Desktop bundles ship both architectures beside
+  # the controller as mj-worker-<triple>, which is where the controller's
+  # worker lookup expects them.
+  build-worker-x64:
+    name: Build worker x86_64-unknown-linux-musl
+    needs: [coverage, verify-version]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -55,40 +48,36 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --assume-yes musl-tools
 
-      - name: Build static controller and worker
+      - name: Build static worker
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked --bin mj --target x86_64-unknown-linux-musl
+        run: cargo build --release --locked --no-default-features --bin mj --target x86_64-unknown-linux-musl
 
       - name: Verify static binary
         run: |
           binary=target/x86_64-unknown-linux-musl/release/mj
           if readelf -lW "$binary" | grep 'Requesting program interpreter' >/dev/null; then
-            echo 'Linux release unexpectedly has a dynamic program interpreter' >&2
+            echo 'Worker unexpectedly has a dynamic program interpreter' >&2
             exit 1
           fi
           if readelf -dW "$binary" | grep '(NEEDED)' >/dev/null; then
-            echo 'Linux release unexpectedly needs a dynamic library' >&2
+            echo 'Worker unexpectedly needs a dynamic library' >&2
             exit 1
           fi
-          nm "$binary" | grep ' T mi_free$' >/dev/null || {
-            echo 'Linux release does not contain mimalloc' >&2
-            exit 1
-          }
           "$binary" --version
 
-      - name: Upload controller
+      - name: Upload worker
         uses: actions/upload-artifact@v7
         with:
-          name: mj-controller-x86_64-unknown-linux-musl
+          name: mj-worker-x86_64-unknown-linux-musl
           path: target/x86_64-unknown-linux-musl/release/mj
           if-no-files-found: error
 
-  build-linux-arm64:
-    name: Build mj for aarch64-unknown-linux-musl
-    needs: verify-version
-    runs-on: ubuntu-22.04-arm
+  build-worker-arm64:
+    name: Build worker aarch64-unknown-linux-musl
+    needs: [coverage, verify-version]
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
 
@@ -102,158 +91,296 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --assume-yes musl-tools
 
-      - name: Build static controller and worker
+      - name: Build static worker
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
           CC_aarch64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked --bin mj --target aarch64-unknown-linux-musl
+        run: cargo build --release --locked --no-default-features --bin mj --target aarch64-unknown-linux-musl
 
       - name: Verify static binary
         run: |
           binary=target/aarch64-unknown-linux-musl/release/mj
           if readelf -lW "$binary" | grep 'Requesting program interpreter' >/dev/null; then
-            echo 'Linux release unexpectedly has a dynamic program interpreter' >&2
+            echo 'Worker unexpectedly has a dynamic program interpreter' >&2
             exit 1
           fi
           if readelf -dW "$binary" | grep '(NEEDED)' >/dev/null; then
-            echo 'Linux release unexpectedly needs a dynamic library' >&2
+            echo 'Worker unexpectedly needs a dynamic library' >&2
             exit 1
           fi
-          nm "$binary" | grep ' T mi_free$' >/dev/null || {
-            echo 'Linux release does not contain mimalloc' >&2
-            exit 1
-          }
           "$binary" --version
 
-      - name: Upload controller
+      - name: Upload worker
         uses: actions/upload-artifact@v7
         with:
-          name: mj-controller-aarch64-unknown-linux-musl
+          name: mj-worker-aarch64-unknown-linux-musl
           path: target/aarch64-unknown-linux-musl/release/mj
           if-no-files-found: error
 
-  build-macos-arm64:
-    name: Build mj for aarch64-apple-darwin
-    needs: verify-version
-    runs-on: macos-14
+  build-linux:
+    name: Build x86_64-unknown-linux-gnu
+    needs: [build-worker-x64, build-worker-arm64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
         with:
-          targets: aarch64-apple-darwin
+          targets: x86_64-unknown-linux-gnu
 
-      - name: Build controller
-        run: cargo build --release --locked --bin mj --target aarch64-apple-darwin
+      - name: Install Linux desktop and audio dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev libwebkit2gtk-4.1-dev
 
-      - name: Upload controller
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Build voice worker
+        run: cargo build --release --locked -p brokk-mj-voice-worker --target x86_64-unknown-linux-gnu
+
+      - name: Download session workers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mj-worker-*
+          path: workers
+
+      - name: Package archive
+        shell: bash
+        run: |
+          name="brokk-mjolnir-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          mkdir "$name"
+          cp "target/x86_64-unknown-linux-gnu/release/mj" "$name/"
+          cp "target/x86_64-unknown-linux-gnu/release/mj-voice-worker" "$name/"
+          cp workers/mj-worker-x86_64-unknown-linux-musl/mj "$name/mj-worker-x86_64-unknown-linux-musl"
+          cp workers/mj-worker-aarch64-unknown-linux-musl/mj "$name/mj-worker-aarch64-unknown-linux-musl"
+          chmod 0755 "$name/mj" "$name/mj-voice-worker" "$name"/mj-worker-*
+          cp README.md LICENSE "$name/"
+          mkdir "$name/licenses"
+          cp licenses/SOURCE.md licenses/OFL-1.1.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/licenses/"
+          cp -R licenses/native "$name/licenses/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: mj-controller-aarch64-apple-darwin
-          path: target/aarch64-apple-darwin/release/mj
+          name: x86_64-unknown-linux-gnu
+          path: |
+            brokk-mjolnir-*.tar.gz
+            brokk-mjolnir-*.tar.gz.sha256
           if-no-files-found: error
 
-  package:
-    name: Package ${{ matrix.target }}
-    needs:
-      - build-linux-amd64
-      - build-linux-arm64
-      - build-macos-arm64
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - aarch64-apple-darwin
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+  build-linux-arm64:
+    name: Build aarch64-unknown-linux-gnu
+    needs: [build-worker-x64, build-worker-arm64]
+    # Build natively on a GitHub-hosted arm64 runner instead of cross. The
+    # cross images ship a libstdc++ too old to link the GCC 11+ symbols in the
+    # prebuilt sherpa-onnx aarch64 static libs; ubuntu-24.04-arm ships GCC 13,
+    # matching the native build path that already succeeds on x86_64.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download controller
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install Linux desktop and audio dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --assume-yes libasound2-dev libwebkit2gtk-4.1-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+
+      - name: Build voice worker
+        run: cargo build --release --locked -p brokk-mj-voice-worker --target aarch64-unknown-linux-gnu
+
+      - name: Download session workers
         uses: actions/download-artifact@v8
         with:
-          name: mj-controller-${{ matrix.target }}
-          path: staging/controller
+          pattern: mj-worker-*
+          path: workers
 
-      - name: Download x86_64 worker
-        uses: actions/download-artifact@v8
-        with:
-          name: mj-controller-x86_64-unknown-linux-musl
-          path: staging/workers/x86_64
-
-      - name: Download aarch64 worker
-        uses: actions/download-artifact@v8
-        with:
-          name: mj-controller-aarch64-unknown-linux-musl
-          path: staging/workers/aarch64
-
-      - name: Create archive and checksum
+      - name: Package archive
         shell: bash
         run: |
-          set -euo pipefail
-          archive="mj-${{ matrix.target }}"
-          mkdir -p "dist/$archive"
-          cp staging/controller/mj "dist/$archive/mj"
-          case '${{ matrix.target }}' in
-            x86_64-unknown-linux-musl)
-              cp staging/workers/aarch64/mj \
-                "dist/$archive/mj-worker-aarch64-unknown-linux-musl"
-              ;;
-            aarch64-unknown-linux-musl)
-              cp staging/workers/x86_64/mj \
-                "dist/$archive/mj-worker-x86_64-unknown-linux-musl"
-              ;;
-            aarch64-apple-darwin)
-              cp staging/workers/x86_64/mj \
-                "dist/$archive/mj-worker-x86_64-unknown-linux-musl"
-              cp staging/workers/aarch64/mj \
-                "dist/$archive/mj-worker-aarch64-unknown-linux-musl"
-              ;;
-          esac
-          cp LICENSE "dist/$archive/"
-          chmod 0755 "dist/$archive/mj" "dist/$archive"/mj-worker-*
-          tar -C dist -czf "$archive.tar.gz" "$archive"
-          sha256sum "$archive.tar.gz" > "$archive.tar.gz.sha256"
+          name="brokk-mjolnir-${GITHUB_REF_NAME}-aarch64-unknown-linux-gnu"
+          mkdir "$name"
+          cp "target/aarch64-unknown-linux-gnu/release/mj" "$name/"
+          cp "target/aarch64-unknown-linux-gnu/release/mj-voice-worker" "$name/"
+          cp workers/mj-worker-x86_64-unknown-linux-musl/mj "$name/mj-worker-x86_64-unknown-linux-musl"
+          cp workers/mj-worker-aarch64-unknown-linux-musl/mj "$name/mj-worker-aarch64-unknown-linux-musl"
+          chmod 0755 "$name/mj" "$name/mj-voice-worker" "$name"/mj-worker-*
+          cp README.md LICENSE "$name/"
+          mkdir "$name/licenses"
+          cp licenses/SOURCE.md licenses/OFL-1.1.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/licenses/"
+          cp -R licenses/native "$name/licenses/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
 
-      - name: Upload release asset
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: mj-release-${{ matrix.target }}
+          name: aarch64-unknown-linux-gnu
           path: |
-            mj-${{ matrix.target }}.tar.gz
-            mj-${{ matrix.target }}.tar.gz.sha256
+            brokk-mjolnir-*.tar.gz
+            brokk-mjolnir-*.tar.gz.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: Build x86_64-pc-windows-msvc
+    needs: [build-worker-x64, build-worker-arm64]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Build voice worker
+        run: cargo build --release --locked -p brokk-mj-voice-worker --target x86_64-pc-windows-msvc
+
+      - name: Download session workers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mj-worker-*
+          path: workers
+
+      - name: Package archive
+        shell: pwsh
+        run: |
+          $name = "brokk-mjolnir-${env:GITHUB_REF_NAME}-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\mj.exe" -Destination $name
+          Copy-Item "target\x86_64-pc-windows-msvc\release\mj-voice-worker.exe" -Destination $name
+          Copy-Item "workers\mj-worker-x86_64-unknown-linux-musl\mj" -Destination "$name\mj-worker-x86_64-unknown-linux-musl"
+          Copy-Item "workers\mj-worker-aarch64-unknown-linux-musl\mj" -Destination "$name\mj-worker-aarch64-unknown-linux-musl"
+          Copy-Item "README.md" -Destination $name
+          Copy-Item "LICENSE" -Destination $name
+          New-Item -ItemType Directory -Path "$name\licenses" | Out-Null
+          $legalFiles = @("licenses\SOURCE.md", "licenses\OFL-1.1.md", "licenses\THIRD_PARTY_LICENSES.html", "licenses\SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt")
+          Copy-Item $legalFiles -Destination "$name\licenses"
+          Copy-Item "licenses\native" -Destination "$name\licenses" -Recurse
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -Path "$name.zip.sha256" -NoNewline
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: x86_64-pc-windows-msvc
+          path: |
+            brokk-mjolnir-*.zip
+            brokk-mjolnir-*.zip.sha256
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS universal
+    needs: [build-worker-x64, build-worker-arm64]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Build x86_64 binary
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Build x86_64 voice worker
+        run: cargo build --release --locked -p brokk-mj-voice-worker --target x86_64-apple-darwin
+
+      - name: Build aarch64 binary
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Build aarch64 voice worker
+        run: cargo build --release --locked -p brokk-mj-voice-worker --target aarch64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/mj \
+            target/aarch64-apple-darwin/release/mj \
+            -output target/universal-apple-darwin/release/mj
+          lipo -info target/universal-apple-darwin/release/mj
+          lipo -create \
+            target/x86_64-apple-darwin/release/mj-voice-worker \
+            target/aarch64-apple-darwin/release/mj-voice-worker \
+            -output target/universal-apple-darwin/release/mj-voice-worker
+          lipo -info target/universal-apple-darwin/release/mj-voice-worker
+
+      - name: Download session workers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mj-worker-*
+          path: workers
+
+      - name: Package archive
+        run: |
+          name="brokk-mjolnir-${GITHUB_REF_NAME}-universal-apple-darwin"
+          mkdir "$name"
+          cp target/universal-apple-darwin/release/mj "$name/"
+          cp target/universal-apple-darwin/release/mj-voice-worker "$name/"
+          cp workers/mj-worker-x86_64-unknown-linux-musl/mj "$name/mj-worker-x86_64-unknown-linux-musl"
+          cp workers/mj-worker-aarch64-unknown-linux-musl/mj "$name/mj-worker-aarch64-unknown-linux-musl"
+          chmod 0755 "$name/mj" "$name/mj-voice-worker" "$name"/mj-worker-*
+          cp README.md LICENSE "$name/"
+          mkdir "$name/licenses"
+          cp licenses/SOURCE.md licenses/OFL-1.1.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/licenses/"
+          cp -R licenses/native "$name/licenses/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: universal-apple-darwin
+          path: |
+            brokk-mjolnir-*.tar.gz
+            brokk-mjolnir-*.tar.gz.sha256
           if-no-files-found: error
 
   release:
-    name: Create GitHub release
-    needs: package
-    runs-on: ubuntu-22.04
+    name: Create GitHub Release
+    needs: [build-linux, build-linux-arm64, build-windows, build-macos]
+    runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: write
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download release assets
+      - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: mj-release-*
-          path: release-assets
+          path: artifacts
           merge-multiple: true
 
-      - name: Publish release assets
+      - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
-            release-assets/mj-*.tar.gz
-            release-assets/mj-*.tar.gz.sha256
+            artifacts/brokk-mjolnir-*.tar.gz
+            artifacts/brokk-mjolnir-*.tar.gz.sha256
+            artifacts/brokk-mjolnir-*.zip
+            artifacts/brokk-mjolnir-*.zip.sha256
 
-      # Releases created with GITHUB_TOKEN do not emit another workflow event.
-      # Dispatch explicitly so crates.io trusted publishing sees a supported
-      # workflow_dispatch trigger.
+      # Events created with GITHUB_TOKEN do not start workflows, while crates.io
+      # rejects trusted-publishing requests from the workflow_run event. An
+      # explicit dispatch is both supported by GitHub and trusted by crates.io.
       - name: Dispatch crates.io publishing
         env:
           GH_TOKEN: ${{ github.token }}
@@ -262,3 +389,12 @@ jobs:
             --ref "$GITHUB_REF_NAME" \
             --raw-field release_tag="$GITHUB_REF_NAME" \
             --raw-field publish=true
+
+      - name: Announce release on Discord
+        continue-on-error: true
+        env:
+          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: bash scripts/announce-discord-release.sh

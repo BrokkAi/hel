@@ -67,7 +67,7 @@ jobs:
         grep -Fx LICENSE /tmp/hel-cli-package-files.txt
         cargo package --locked -p brokk-mj-core
 
-  hel:
+  mjolnir:
     strategy:
       fail-fast: false
       matrix:
