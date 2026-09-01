@@ -11,7 +11,7 @@ Publish the current `master` state, including the corrected Docker guide source 
 - [x] (2026-09-01 12:45Z) Read `.agents/PLANS.md` and `RELEASING.md`; confirmed clean `master`, current version 0.4.1, and latest tag `v0.4.1`.
 - [x] (2026-09-01 12:48Z) Bumped and synchronized version 0.4.2, lockfile, and generated license report.
 - [x] (2026-09-01 12:53Z) Ran version check, locked metadata, formatting, full tests, Clippy with warnings denied, and dirty-candidate package verification for both publishable roots.
-- [ ] Commit and push the release candidate, then wait for exact-commit CI and Coverage success.
+- [ ] Commit and push the release candidate, then wait for exact-commit CI and Coverage success (first candidate `41703fd`: Coverage passed, CI failed because local license generation consolidated duplicate MIT blocks differently from CI; correction in progress).
 - [ ] Recheck the clean release commit, create and push annotated tag `v0.4.2`.
 - [ ] Watch release and publication workflows and verify release assets, crates, and installer.
 
@@ -21,7 +21,7 @@ Publish the current `master` state, including the corrected Docker guide source 
   Evidence: `cargo package --locked -p hel-core` reported the three modified release files and required `--allow-dirty`; both candidate packages subsequently verify-built with that flag. The exact commands remain required on the clean release commit before tagging.
 
 - Observation: Regenerating the license report consolidated duplicate MIT license blocks for `mimalloc` and `libmimalloc-sys`.
-  Evidence: Both crates now share one `MIT License` section in the generated HTML; no dependency version changed except the four Hel workspace packages.
+  Evidence: The local generator made both crates share one `MIT License` section, but exact-commit CI failed `Check shipped notice reports`. The CI-reproducible prior report keeps separate blocks; the correction preserves that structure and changes only the four Hel version links.
 
 ## Decision Log
 
@@ -81,3 +81,5 @@ No product interface changes are required. This release uses the existing Node v
 Revision note (2026-09-01): Created the release execution record after inspecting the authoritative runbook and repository state.
 
 Revision note (2026-09-01): Recorded synchronized artifacts, passing local candidate gates, and Cargo's dirty-tree packaging constraint.
+
+Revision note (2026-09-01): Recorded the first candidate's CI license-report failure and the correction that preserves the previously CI-generated report structure.
