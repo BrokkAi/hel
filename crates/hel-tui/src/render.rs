@@ -729,10 +729,7 @@ fn render_sessions_grid(
                     let used =
                         prefix.chars().count() + target.chars().count() + clock.chars().count();
                     let gap = (column_width as usize).saturating_sub(used).max(1);
-                    Line::styled(
-                        format!("{prefix}{target}{:gap$}{clock}", ""),
-                        facts.style(),
-                    )
+                    Line::styled(format!("{prefix}{target}{:gap$}{clock}", ""), facts.style())
                 }
             };
             frame.render_widget(Paragraph::new(line), rect);
@@ -3030,6 +3027,41 @@ mod tests {
                 "{gone} should be dropped: {lines:?}"
             );
         }
+    }
+
+    /// The grid reads the height threshold from the live frame every render,
+    /// so the same dashboard drawn tall then short switches from the bordered
+    /// five-row form to the bare two-row one — the decision is never cached.
+    /// (Checked on row 0 of the Sessions band; "Sessions" also appears in the
+    /// empty-conversation prompt lower down, so the whole buffer is no test.)
+    #[test]
+    fn the_minimized_grid_reevaluates_the_height_threshold_each_frame() {
+        let mut dashboard = minimized_grid_dashboard(2, 2);
+
+        // Tall: the sessions band is bordered and titled on its top row.
+        let tall = drawn(&mut dashboard, 120, 34);
+        assert!(
+            tall[0].contains('┌') && tall[0].contains("Sessions"),
+            "tall keeps the bordered title: {:?}",
+            tall[0]
+        );
+
+        // Same dashboard, now short: no state carried over, so row 0 is a
+        // borderless, title-less session row.
+        let short = drawn(&mut dashboard, 120, 20);
+        assert!(
+            !short[0].contains('┌') && !short[0].contains("Sessions"),
+            "short drops the title/border: {:?}",
+            short[0]
+        );
+
+        // And back to tall restores the bordered form.
+        let tall_again = drawn(&mut dashboard, 120, 34);
+        assert!(
+            tall_again[0].contains('┌') && tall_again[0].contains("Sessions"),
+            "tall again restores the border: {:?}",
+            tall_again[0]
+        );
     }
 
     /// Mode 2 on a tiny terminal also drops the collapsed Targets and Quota
