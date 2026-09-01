@@ -23,7 +23,7 @@ Running `hel doctor --json --smoke` must verify Docker and the image, and creati
 - [x] (2026-09-01 10:05Z) Added the schema-20 migration and database round trip, plus setup, doctor, server, CLI, TUI, import, README, and rendered documentation integration.
 - [x] (2026-09-01 10:20Z) Added focused behavior tests for Docker preflight, pull policy, OverlayFS provisioning, ownership-safe cleanup, recovery, persistence, setup, and doctor.
 - [x] (2026-09-01 10:45Z) Passed formatting, `git diff --check`, the full host-target test suite, clippy with warnings denied, and the documentation build; also completed a live Docker OverlayFS isolation smoke test.
-- [ ] Commit the implementation, push the branch, open a pull request, and record the PR URL.
+- [x] (2026-09-01 10:55Z) Committed the implementation as `5fc7268`, pushed `local-docker-target`, and opened https://github.com/BrokkAi/hel/pull/18 against `master`.
 
 ## Surprises & Discoveries
 
@@ -66,9 +66,9 @@ Running `hel doctor --json --smoke` must verify Docker and the image, and creati
 
 ## Outcomes & Retrospective
 
-The implementation is complete and awaiting publication. It delivers a first-class local Docker target across configuration, durable state, schema migration, provisioning, checkpoint/resume, recovery, metrics, cleanup, setup, doctor, CLI/TUI, and documentation. Writable attachments use owned and labeled Docker local volumes backed by OverlayFS; read-only attachments remain direct binds. Creation rollback and normal cleanup verify exact resource ownership and remove the container before volumes and backing directories.
+The implementation is complete and published for review. It delivers a first-class local Docker target across configuration, durable state, schema migration, provisioning, checkpoint/resume, recovery, metrics, cleanup, setup, doctor, CLI/TUI, and documentation. Writable attachments use owned and labeled Docker local volumes backed by OverlayFS; read-only attachments remain direct binds. Creation rollback and normal cleanup verify exact resource ownership and remove the container before volumes and backing directories.
 
-Validation passed with 1,869 Rust tests passing and 9 ignored across the full host-target suite, `cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`, formatting, diff checks, a documentation build covering 239 internal links, and a live disposable Docker OverlayFS isolation test. The commit and pull request will be recorded after publication.
+Validation passed with 1,869 Rust tests passing and 9 ignored across the full host-target suite, `cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`, formatting, diff checks, a documentation build covering 239 internal links, and a live disposable Docker OverlayFS isolation test. The implementation commit is `5fc7268`; the pull request is https://github.com/BrokkAi/hel/pull/18.
 
 ## Context and Orientation
 
