@@ -35,7 +35,9 @@ COPY --from=node /usr/local/ /usr/local/
 # libunwind and three Boost runtime libraries) to be worth baking in. `perf` inside a rootless container still depends on the *host*
 # kernel: it needs `kernel.perf_event_paranoid` <= 1 or the container to be run
 # with `--cap-add SYS_ADMIN`. That is a host setting; nothing in this image can
-# or should change it.
+# or should change it. `lcov` comes along for `genhtml`, which renders the lcov
+# file the coverage workflow produces; on Debian it only pulls a handful of
+# small pure-Perl modules.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         bash \
@@ -50,6 +52,7 @@ RUN apt-get update \
         gh \
         heaptrack \
         jq \
+        lcov \
         less \
         libssl-dev \
         linux-perf \
@@ -108,7 +111,7 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
             ;; \
         *) echo "unsupported arch $ARCH" >&2; exit 1 ;; \
     esac \
-    && rustup component add clippy rustfmt \
+    && rustup component add clippy rustfmt llvm-tools-preview \
     && rustup target add "$MUSL" \
     && NEXTEST_ARCHIVE="cargo-nextest-${CARGO_NEXTEST_VERSION}-${MUSL}.tar.gz" \
     && NEXTEST_URL="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${CARGO_NEXTEST_VERSION}/${NEXTEST_ARCHIVE}" \
@@ -152,18 +155,24 @@ RUN apt-get update \
     && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH" \
     && rm -rf /var/lib/apt/lists/* /root/.npm
 
-# Rust profiling front ends. `cargo install --locked` at pinned versions matches
-# how the rest of this image treats tooling: the version moves only when someone
-# edits these lines. The registry and build caches are dropped afterwards
-# because nothing at run time reads them.
+# Rust profiling and coverage front ends. `cargo install --locked` at pinned
+# versions matches how the rest of this image treats tooling: the version moves
+# only when someone edits these lines. The registry and build caches are dropped
+# afterwards because nothing at run time reads them.
 ARG FLAMEGRAPH_VERSION=0.6.14
 ARG SAMPLY_VERSION=0.13.1
+# Mirrors the pin in .github/workflows/coverage.yml; bump both together so a
+# session measures coverage the same way the gate does.
+ARG CARGO_LLVM_COV_VERSION=0.8.7
 RUN cargo install --locked flamegraph@${FLAMEGRAPH_VERSION} \
     && cargo install --locked samply@${SAMPLY_VERSION} \
+    && cargo install --locked cargo-llvm-cov --version ${CARGO_LLVM_COV_VERSION} \
     && rm -rf "${CARGO_HOME:-/usr/local/cargo}/registry" \
     && perf --version \
     && cargo flamegraph --version \
-    && samply --version
+    && samply --version \
+    && cargo llvm-cov --version \
+    && genhtml --version
 
 # The turn-review feature requires this binary; a review whose worker cannot
 # run it fails loudly and names an image rebuild as the fix.
@@ -171,8 +180,9 @@ COPY --from=bifrost /opt/bifrost/bin/bifrost /usr/local/bin/bifrost
 
 # Debian's /etc/profile overwrites PATH, so a login shell drops the Rust image's
 # cargo bin directory and everything installed into it (cargo itself,
-# cargo-nextest, and now cargo-flamegraph and samply). Agent-requested shell
-# commands run through `bash -lc`, so without this they cannot see those tools.
+# cargo-nextest, and now cargo-flamegraph, samply, and cargo-llvm-cov).
+# Agent-requested shell commands run through `bash -lc`, so without this they
+# cannot see those tools.
 RUN printf '%s\n' \
         'case ":${PATH}:" in' \
         '  *:/usr/local/cargo/bin:*) ;;' \

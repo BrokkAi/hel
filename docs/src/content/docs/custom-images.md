@@ -92,6 +92,11 @@ headed Chromium. If your image skips all of this, run
 `npx playwright install --with-deps chromium` inside the session before browser
 tests, which needs root or passwordless `sudo`.
 
+For coverage, the reference image carries the `llvm-tools-preview` rustup
+component, `cargo-llvm-cov` pinned to the same version
+`.github/workflows/coverage.yml` installs, and `lcov` so `genhtml` can render
+the lcov output that workflow produces.
+
 The reference image also carries `perf` (Debian's `linux-perf`),
 `cargo-flamegraph`, `samply`, and `heaptrack`. `perf` depends on the
 host kernel as well as the image: it needs `kernel.perf_event_paranoid` set to 1
