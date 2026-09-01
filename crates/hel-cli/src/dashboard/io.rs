@@ -1108,6 +1108,10 @@ impl DashboardContext {
                 match *result {
                     Ok(chat) => {
                         self.active_chat = Some(chat);
+                        // The context travelled with the attach, which is
+                        // asynchronous; anything the surface learned while it
+                        // was in flight is handed over now.
+                        self.refresh_chat_context();
                         self.dashboard.set_current_session(Some(&session_id));
                         self.dashboard.clear_notice();
                         self.acknowledge_visible_chat();
@@ -1165,6 +1169,7 @@ impl DashboardContext {
                     self.controller = controller;
                     self.dashboard.set_config(self.controller.config.clone());
                     self.dashboard.set_state(self.controller.state.clone());
+                    self.refresh_chat_context();
                     self.dashboard.set_notice(format!(
                         "Container settings saved for {}; applies when it is next recreated.",
                         short_id(&session_id)
@@ -1184,6 +1189,7 @@ impl DashboardContext {
                     self.controller = controller;
                     self.dashboard.set_config(self.controller.config.clone());
                     self.dashboard.set_state(self.controller.state.clone());
+                    self.refresh_chat_context();
                     self.refresh_poll_targets();
                     self.request_quota_refresh();
                     self.dashboard.set_notice(format!("Renamed {what}."));
@@ -1199,6 +1205,7 @@ impl DashboardContext {
                         self.controller = controller;
                         self.dashboard.set_config(self.controller.config.clone());
                         self.dashboard.set_state(self.controller.state.clone());
+                        self.refresh_chat_context();
                         self.refresh_poll_targets();
                     }
                     Err(error) => self
@@ -1212,6 +1219,7 @@ impl DashboardContext {
                     self.controller = controller;
                     self.dashboard.set_config(self.controller.config.clone());
                     self.dashboard.set_state(self.controller.state.clone());
+                    self.refresh_chat_context();
                     self.request_quota_refresh();
                     self.refresh_poll_targets();
                     self.dashboard

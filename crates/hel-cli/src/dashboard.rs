@@ -1462,6 +1462,10 @@ impl DashboardContext {
         let session_id = session_id.to_owned();
         let bundle_id = session_record.bundle_id.clone();
         let draft = session_record.draft_input.clone();
+        let context = hel::hel_chat::ChatSessionContext {
+            config: self.controller.config.clone(),
+            session: session_record,
+        };
         let (persistence_tx, mut persistence_rx) =
             tokio::sync::mpsc::unbounded_channel::<hel::hel_chat::ChatDaemonRequest>();
         let refusals = self.dashboard_io_tx.clone();
@@ -1530,7 +1534,7 @@ impl DashboardContext {
                     hel::hel_chat::ActiveChat::open_with_persistence(
                         managed,
                         &bundle_id,
-                        None,
+                        Some(context),
                         sessions,
                         header,
                         draft,
@@ -1804,6 +1808,20 @@ impl DashboardContext {
         self.controller_changed = true;
     }
 
+    /// Hands the open conversation the surface's current view of the config
+    /// and its own session record. The chat snapshots both when it opens, so
+    /// without this a long-lived chat would keep offering reviewer profiles
+    /// that a config reload has since renamed or removed.
+    pub(crate) fn refresh_chat_context(&mut self) {
+        let Some(chat) = self.active_chat.as_mut() else {
+            return;
+        };
+        chat.refresh_context(
+            &self.controller.config,
+            self.controller.state.sessions.get(chat.session_id()),
+        );
+    }
+
     fn drain_runtime_config(&mut self) {
         let mut latest = None;
         while let Some(config) = self.runtime_config.next_ready() {
@@ -1823,6 +1841,7 @@ impl DashboardContext {
         }
         self.controller.config = config.clone();
         self.dashboard.set_config(config);
+        self.refresh_chat_context();
         self.refresh_poll_targets();
         self.request_quota_refresh();
         self.config_reload_in_flight = true;
@@ -1882,6 +1901,7 @@ impl DashboardContext {
         }
         self.controller.state.sessions = sessions;
         self.dashboard.set_state(self.controller.state.clone());
+        self.refresh_chat_context();
         self.controller_changed = true;
         self.refresh_poll_targets();
     }

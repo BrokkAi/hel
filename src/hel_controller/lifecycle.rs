@@ -77,7 +77,6 @@ impl Controller {
                 manager,
                 LatchExclusivity::HoldThroughClose,
                 CheckpointExportPolicy::ReuseUnchangedArchive,
-                None,
             )
             .await
         {
@@ -908,6 +907,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         let brokers = crate::hel_config::data_dir().join("git-brokers");
         std::fs::create_dir_all(&brokers).unwrap();

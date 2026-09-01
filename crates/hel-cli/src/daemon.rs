@@ -46,6 +46,16 @@ use crate::pollers::{
 pub(crate) const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long a daemon is given to exit after it accepts a stop.
+///
+/// Stopping cancels a token and returns immediately; the daemon then unwinds
+/// its session manager, its phone server and its pollers. That is normally
+/// fast, but a daemon whose database has been migrated out from under it fails
+/// every read while it winds down and has been observed taking over five
+/// seconds — which the previous five-second bound missed by a fraction,
+/// reporting a stop that had in fact worked as `did not stop` and aborting the
+/// restart that depended on it.
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(40);
 
 fn metadata_path() -> PathBuf {
@@ -1402,13 +1412,53 @@ fn epoch_seconds() -> u64 {
         .as_secs()
 }
 
+/// Whether a process has exited but not yet been reaped.
+///
+/// A zombie still answers `kill(pid, 0)`, because its process-table entry
+/// survives until its parent waits for it — so an existence probe alone calls
+/// it alive forever and anything waiting for it to leave waits forever. Hel
+/// spawns its daemon with `spawn_detached`, which drops the `Child` without
+/// waiting, and Rust does not reap on drop; so a daemon spawned by a long-lived
+/// Hel process stays a zombie under it for as long as that process lives. That
+/// is exactly the shape of `hel daemon restart` refusing to restart a daemon
+/// that had already stopped.
+///
+/// Treating a zombie as gone is also safe in the direction that matters: a
+/// zombie's PID cannot be reused until it is reaped, so nothing else can be
+/// occupying that number while this returns true.
+#[cfg(unix)]
+fn process_is_zombie(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system
+        .process(pid)
+        .is_some_and(|process| process.status() == sysinfo::ProcessStatus::Zombie)
+}
+
+/// Wait for a process to leave, within [`STOP_TIMEOUT`].
+///
+/// The error says the process was still running rather than that it "did not
+/// stop": a daemon that is still winding down has not refused, and the two
+/// read very differently to somebody deciding whether to reach for a kill.
+async fn wait_for_exit(pid: u32) -> Result<()> {
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline && process_is_alive(pid) {
+        tokio::time::sleep(RETRY_DELAY).await;
+    }
+    ensure!(!process_is_alive(pid), "process {pid} is still running");
+    Ok(())
+}
+
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: kill(pid, 0) sends no signal and is the standard existence
         // probe. EPERM still means the process exists.
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let exists =
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        exists && !process_is_zombie(pid)
     }
     #[cfg(not(unix))]
     {
@@ -2136,12 +2186,12 @@ impl ManagementClient {
     pub(crate) async fn stop_and_wait(mut self) -> Result<()> {
         let pid = self.inner.metadata.pid;
         self.inner.stop().await?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && process_is_alive(pid) {
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
-        ensure!(!process_is_alive(pid), "Hel daemon {pid} did not stop");
-        Ok(())
+        wait_for_exit(pid).await.with_context(|| {
+            format!(
+                "Hel daemon {pid} accepted the stop but was still running after {}s",
+                STOP_TIMEOUT.as_secs()
+            )
+        })
     }
 }
 
@@ -2239,16 +2289,13 @@ async fn signal_incompatible_daemon(metadata: &DaemonMetadata) -> Result<()> {
                 return Err(error).context("stop incompatible Hel daemon");
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && process_is_alive(metadata.pid) {
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
-        ensure!(
-            !process_is_alive(metadata.pid),
-            "incompatible Hel daemon {} did not stop",
-            metadata.pid
-        );
-        Ok(())
+        wait_for_exit(metadata.pid).await.with_context(|| {
+            format!(
+                "incompatible Hel daemon {} was signalled but was still running after {}s",
+                metadata.pid,
+                STOP_TIMEOUT.as_secs()
+            )
+        })
     }
     #[cfg(not(unix))]
     {
@@ -3266,6 +3313,38 @@ fn session_state_label(state: SessionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A process that has exited but has not been reaped still answers
+    /// `kill(pid, 0)`. Counting it as alive is what made `hel daemon restart`
+    /// refuse to restart a daemon that had already stopped and logged so:
+    /// Hel spawns the daemon with `spawn_detached`, which drops the `Child`
+    /// without waiting, so a daemon spawned by a long-lived Hel process stays
+    /// a zombie under it and the wait never ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_exited_but_was_not_reaped_counts_as_gone() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a process that exits immediately");
+        let pid = child.id();
+
+        // Deliberately not reaped: wait for it to become a zombie rather than
+        // calling wait(), which is what the daemon spawner also never does.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !process_is_zombie(pid) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_is_zombie(pid),
+            "the child never became a zombie, so this check proves nothing"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "an exited but unreaped process was reported as still running"
+        );
+
+        child.wait().expect("reap the child");
+    }
 
     fn test_runtime_state() -> Arc<RuntimeState> {
         let remote = spawn_remote_session_manager().unwrap();

@@ -24,8 +24,7 @@ use crate::hel_session_manager::{
     new_command_id, worker_connect_needs_restart,
 };
 use crate::hel_state::{
-    CheckpointMetadata, HelState, ManagedSessionSnapshot, RecoveryCheckpointPhase, SessionRecord,
-    SessionState,
+    CheckpointMetadata, HelState, ManagedSessionSnapshot, SessionRecord, SessionState,
 };
 use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, ProcessExecutor};
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
@@ -408,7 +407,6 @@ impl Controller {
                 manager,
                 LatchExclusivity::ReleaseAfterLatch,
                 CheckpointExportPolicy::Always,
-                None,
             )
             .await
         {
@@ -482,9 +480,8 @@ impl Controller {
         session_id: &str,
         manager: &SessionManagerControl,
         executor: &(impl CommandExecutor + Sync),
-        progress: &(dyn Fn(RecoveryCheckpointPhase) + Sync),
     ) -> Result<CheckpointArtifact> {
-        self.create_recovery_checkpoint_with_manager(session_id, Some(manager), executor, progress)
+        self.create_recovery_checkpoint_with_manager(session_id, Some(manager), executor)
             .await
     }
 
@@ -493,7 +490,6 @@ impl Controller {
         session_id: &str,
         manager: Option<&SessionManagerControl>,
         executor: &(impl CommandExecutor + Sync),
-        progress: &(dyn Fn(RecoveryCheckpointPhase) + Sync),
     ) -> Result<CheckpointArtifact> {
         let previous_checkpoint = self
             .state
@@ -509,7 +505,6 @@ impl Controller {
                 manager,
                 LatchExclusivity::ReleaseAfterLatch,
                 CheckpointExportPolicy::Always,
-                Some(progress),
             )
             .await?;
         let artifact = latched.artifact.clone();
@@ -565,7 +560,6 @@ impl Controller {
         manager: Option<&SessionManagerControl>,
         exclusivity: LatchExclusivity,
         export_policy: CheckpointExportPolicy,
-        progress: Option<&(dyn Fn(RecoveryCheckpointPhase) + Sync)>,
     ) -> Result<LatchedCheckpoint> {
         let session = self
             .state
@@ -738,9 +732,6 @@ impl Controller {
                 &reconnect,
             )
             .await?;
-        if let Some(progress) = progress {
-            progress(RecoveryCheckpointPhase::Snapshotting);
-        }
         let (barrier, barrier_command_id) = loop {
             let barrier_command_id = new_command_id("checkpoint")?;
             let timeout = if restarted_worker {
@@ -912,11 +903,6 @@ impl Controller {
                     &cursor,
                 )
                 .await?;
-                if completion == CheckpointCompletion::ReleasedAfterCapture
-                    && let Some(progress) = progress
-                {
-                    progress(RecoveryCheckpointPhase::Saving);
-                }
                 let pack_spec = CheckpointPackSpec {
                     protocol_version: CHECKPOINT_STAGING_PROTOCOL_VERSION,
                     relay_root: spec.relay_root.clone(),
@@ -2690,6 +2676,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // A connection that never comes back would hang the suite instead of
         // failing it, so turn a stall into a hard error.
@@ -2785,6 +2773,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // A barrier that never releases would hang the suite instead of failing
         // it, so turn a stall into a hard error.
@@ -2890,6 +2880,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // A rejected release that lost its barrier would hang the suite instead
         // of failing it, so turn a stall into a hard error.
@@ -2972,6 +2964,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // An abandoned barrier that never releases its connection would hang
         // the suite instead of failing it, so turn a stall into a hard error.
@@ -3041,6 +3035,8 @@ mod tests {
             );
             return;
         }
+        // Alone in this child process, so it installs the one writer.
+        let _writer = crate::hel_database::install_isolated_test_writer();
 
         // A latch that never returns would hang the suite instead of failing
         // it, so turn a stall into a hard error.
@@ -3160,7 +3156,6 @@ mod tests {
                 Some(&channels.control),
                 LatchExclusivity::HoldThroughClose,
                 CheckpointExportPolicy::ReuseUnchangedArchive,
-                None,
             )
             .await
             .unwrap();
@@ -3209,7 +3204,6 @@ mod tests {
                 Some(&channels.control),
                 LatchExclusivity::HoldThroughClose,
                 CheckpointExportPolicy::ReuseUnchangedArchive,
-                None,
             )
             .await;
         let Err(error) = changed else {
