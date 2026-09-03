@@ -41,6 +41,12 @@ struct ProxyState {
     upstream: String,
 }
 
+fn desktop_origin(bound: SocketAddr) -> Result<url::Url> {
+    format!("https://{bound}/")
+        .parse()
+        .context("build the desktop viewer origin")
+}
+
 pub(crate) async fn run_desktop_app() -> Result<()> {
     let mut client = daemon::connect_or_start().await?;
     let status = client.status().await?;
@@ -95,9 +101,7 @@ pub(crate) async fn run_desktop_app() -> Result<()> {
         .listening()
         .await
         .context("bind the desktop proxy listener")?;
-    let origin: url::Url = format!("https://localhost:{}/", bound.port())
-        .parse()
-        .context("build the desktop viewer origin")?;
+    let origin = desktop_origin(bound)?;
 
     println!("Opening the Mjolnir desktop viewer at {origin}");
     let (shell_tx, shell_rx) = tokio::sync::oneshot::channel::<mj_desktop::DesktopShellRemote>();
@@ -183,6 +187,12 @@ fn filtered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_origin_uses_the_bound_listener_address() {
+        let origin = desktop_origin("127.0.0.1:43123".parse().unwrap()).unwrap();
+        assert_eq!(origin.as_str(), "https://127.0.0.1:43123/");
+    }
 
     #[test]
     fn hop_by_hop_and_host_headers_are_not_forwarded() {
